@@ -633,7 +633,7 @@ fn compile_and_fit(
 
     let init_params = parsed.model.default_params.clone();
     let mut fit_options = base.quiet();
-    fit_options.n_starts = options.n_starts.max(1);
+    fit_options.n_starts = candidate.n_starts.unwrap_or(options.n_starts).max(1);
     fit_options.threads = Some(threads_per_fit);
     fit_options.cancel = cancel.clone();
 

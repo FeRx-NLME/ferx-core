@@ -189,18 +189,27 @@ pub ferx_core::edit::ModelEdit::AddCovariateRelation(ferx_core::edit::Relation)
 pub ferx_core::edit::ModelEdit::AddIiv
 pub ferx_core::edit::ModelEdit::AddIiv::form: ferx_core::edit::IivForm
 pub ferx_core::edit::ModelEdit::AddIiv::param: alloc::string::String
+pub ferx_core::edit::ModelEdit::AddIov
+pub ferx_core::edit::ModelEdit::AddIov::kappa: alloc::string::String
+pub ferx_core::edit::ModelEdit::AddIov::param: alloc::string::String
+pub ferx_core::edit::ModelEdit::AddIov::variance: f64
 pub ferx_core::edit::ModelEdit::DropCovariateRelation
 pub ferx_core::edit::ModelEdit::DropCovariateRelation::cov: alloc::string::String
 pub ferx_core::edit::ModelEdit::DropCovariateRelation::param: alloc::string::String
 pub ferx_core::edit::ModelEdit::DropIiv
 pub ferx_core::edit::ModelEdit::DropIiv::param: alloc::string::String
+pub ferx_core::edit::ModelEdit::DropIov
+pub ferx_core::edit::ModelEdit::DropIov::param: alloc::string::String
 pub ferx_core::edit::ModelEdit::SeedInits(&'a ferx_core::FitResult)
 pub ferx_core::edit::ModelEdit::SetErrorModel(ferx_core::edit::ErrorSpecText)
 pub ferx_core::edit::ModelEdit::SetFitOption
 pub ferx_core::edit::ModelEdit::SetFitOption::key: alloc::string::String
 pub ferx_core::edit::ModelEdit::SetFitOption::value: alloc::string::String
+pub ferx_core::edit::ModelEdit::SetKappaBlock(alloc::vec::Vec<alloc::string::String>)
 pub ferx_core::edit::ModelEdit::SetOmegaBlock(alloc::vec::Vec<alloc::string::String>)
 pub ferx_core::edit::ModelEdit::SetStructural(ferx_core::edit::StructuralSpec)
+pub ferx_core::edit::ModelEdit::SplitKappaBlock(alloc::vec::Vec<alloc::string::String>)
+pub ferx_core::edit::ModelEdit::SplitOmegaBlock(alloc::vec::Vec<alloc::string::String>)
 #[non_exhaustive] pub struct ferx_core::edit::ErrorSpecText
 pub ferx_core::edit::ErrorSpecText::endpoint: alloc::string::String
 pub ferx_core::edit::ErrorSpecText::exponent: core::option::Option<ferx_core::edit::ThetaDecl>
@@ -241,6 +250,19 @@ impl ferx_core::edit::NewParameter
 pub fn ferx_core::edit::NewParameter::fixed(self) -> Self
 pub fn ferx_core::edit::NewParameter::new(name: impl core::convert::Into<alloc::string::String>, theta: impl core::convert::Into<alloc::string::String>, init: f64, lower: f64, upper: f64) -> Self
 pub fn ferx_core::edit::NewParameter::with_iiv(self, eta: impl core::convert::Into<alloc::string::String>, variance: f64) -> Self
+#[non_exhaustive] pub struct ferx_core::edit::ParameterVariability
+pub ferx_core::edit::ParameterVariability::canonical: bool
+pub ferx_core::edit::ParameterVariability::eta: core::option::Option<alloc::string::String>
+pub ferx_core::edit::ParameterVariability::kappa: core::option::Option<alloc::string::String>
+pub ferx_core::edit::ParameterVariability::mentions: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::edit::ParameterVariability::name: alloc::string::String
+#[non_exhaustive] pub struct ferx_core::edit::RandomEffectBlock
+pub ferx_core::edit::RandomEffectBlock::fixed: bool
+pub ferx_core::edit::RandomEffectBlock::names: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::edit::RandomEffectDecl
+pub ferx_core::edit::RandomEffectDecl::fixed: bool
+pub ferx_core::edit::RandomEffectDecl::name: alloc::string::String
+pub ferx_core::edit::RandomEffectDecl::variance: f64
 pub struct ferx_core::edit::Relation
 pub ferx_core::edit::Relation::center: core::option::Option<ferx_core::CovariateStat>
 pub ferx_core::edit::Relation::covariate: alloc::string::String
@@ -275,6 +297,21 @@ pub ferx_core::edit::TimeVaryingDecl::cutoff: f64
 pub ferx_core::edit::TimeVaryingDecl::theta: ferx_core::edit::ThetaDecl
 impl ferx_core::edit::TimeVaryingDecl
 pub fn ferx_core::edit::TimeVaryingDecl::new(cutoff: f64, theta: ferx_core::edit::ThetaDecl) -> Self
+#[non_exhaustive] pub struct ferx_core::edit::VariabilityText
+pub ferx_core::edit::VariabilityText::kappa_blocks: alloc::vec::Vec<ferx_core::edit::RandomEffectBlock>
+pub ferx_core::edit::VariabilityText::kappas: alloc::vec::Vec<ferx_core::edit::RandomEffectDecl>
+pub ferx_core::edit::VariabilityText::omega_blocks: alloc::vec::Vec<ferx_core::edit::RandomEffectBlock>
+pub ferx_core::edit::VariabilityText::omegas: alloc::vec::Vec<ferx_core::edit::RandomEffectDecl>
+pub ferx_core::edit::VariabilityText::parameters: alloc::vec::Vec<ferx_core::edit::ParameterVariability>
+impl ferx_core::edit::VariabilityText
+pub fn ferx_core::edit::VariabilityText::is_fixed(&self, name: &str) -> bool
+pub fn ferx_core::edit::VariabilityText::kappa_block_of(&self, kappa: &str) -> core::option::Option<&ferx_core::edit::RandomEffectBlock>
+pub fn ferx_core::edit::VariabilityText::omega_block_of(&self, eta: &str) -> core::option::Option<&ferx_core::edit::RandomEffectBlock>
+pub fn ferx_core::edit::VariabilityText::parameter(&self, name: &str) -> core::option::Option<&ferx_core::edit::ParameterVariability>
+pub fn ferx_core::edit::VariabilityText::read(text: &ferx_core::edit::ModelText) -> core::result::Result<Self, alloc::string::String>
+pub fn ferx_core::edit::VariabilityText::variance(&self, name: &str) -> core::option::Option<f64>
+pub fn ferx_core::edit::VariabilityText::with_eta(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferx_core::edit::ParameterVariability>
+pub fn ferx_core::edit::VariabilityText::with_kappa(&self) -> impl core::iter::traits::iterator::Iterator<Item = &ferx_core::edit::ParameterVariability>
 pub mod ferx_core::environment
 pub struct ferx_core::environment::EnvironmentInfo
 pub ferx_core::environment::EnvironmentInfo::arch: alloc::string::String

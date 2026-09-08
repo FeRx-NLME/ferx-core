@@ -110,6 +110,8 @@ website:
           - tools/covsearch.qmd
           - tools/modelsearch.qmd
           - tools/ruvsearch.qmd
+          - tools/iivsearch.qmd
+          - tools/iovsearch.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

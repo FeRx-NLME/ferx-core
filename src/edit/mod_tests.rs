@@ -424,16 +424,76 @@ fn drop_iiv_on_a_non_canonical_expression_is_a_hard_error_naming_the_parameter()
 }
 
 #[test]
-fn drop_iiv_refuses_to_break_a_block_omega() {
+fn drop_iiv_shrinks_a_block_omega_around_the_survivors() {
+    // Pharmpy's `remove_iiv` on a joint distribution drops the row and
+    // column; the same rewrite the pruner applies (`shrink_block`).
     let mut text = base();
     apply(
         &mut text,
-        ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into()]),
+        ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()]),
     );
+    apply(&mut text, ModelEdit::DropIiv { param: "V".into() });
+    let params = text.block_lines("parameters");
+    assert!(
+        params
+            .contains(&"block_omega (ETA_CL, ETA_KA) = [0.09, 0.016431676725155, 0.3]".to_string()),
+        "{params:?}"
+    );
+    assert!(!text.render().contains("ETA_V"));
+    // Down to one survivor: a diagonal declaration again.
+    apply(&mut text, ModelEdit::DropIiv { param: "KA".into() });
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"omega ETA_CL ~ 0.09".to_string()),
+        "{params:?}"
+    );
+    assert!(!text.render().contains("block_omega"));
+}
+
+#[test]
+fn split_omega_block_returns_each_eta_to_its_own_line() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()]),
+    );
+    // One out: the other two stay blocked, the leaver is diagonal at its
+    // block variance.
+    apply(&mut text, ModelEdit::SplitOmegaBlock(vec!["ETA_V".into()]));
+    let params = text.block_lines("parameters");
+    assert!(
+        params
+            .contains(&"block_omega (ETA_CL, ETA_KA) = [0.09, 0.016431676725155, 0.3]".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"omega ETA_V ~ 0.04".to_string()),
+        "{params:?}"
+    );
+    // Every remaining member out: no block is left, and an already-diagonal
+    // name is left as it is.
+    apply(
+        &mut text,
+        ModelEdit::SplitOmegaBlock(vec!["ETA_CL".into(), "ETA_KA".into(), "ETA_V".into()]),
+    );
+    let params = text.block_lines("parameters");
+    assert!(!text.render().contains("block_omega"));
+    assert!(
+        params.contains(&"omega ETA_CL ~ 0.09".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"omega ETA_KA ~ 0.3".to_string()),
+        "{params:?}"
+    );
+    // The model still reads back as three diagonal η.
+    let v = VariabilityText::read(&text).unwrap();
+    assert_eq!(v.omegas.len(), 3);
+    assert!(v.omega_blocks.is_empty());
     let err = text
-        .apply(ModelEdit::DropIiv { param: "CL".into() })
+        .apply(ModelEdit::SplitOmegaBlock(vec!["ETA_NOPE".into()]))
         .unwrap_err();
-    assert!(err.contains("block_omega"), "{err}");
+    assert!(err.contains("ETA_NOPE"), "{err}");
 }
 
 #[test]
@@ -548,10 +608,18 @@ fn a_multi_line_block_omega_is_one_declaration_to_the_duplicate_guards() {
     // parser rejoins it before matching. An editor reading physical lines sees
     // no `block_omega` at all.
     let mut text = ModelText::parse(&multi_line_block_base()).unwrap();
-    let err = text
+    let mut dropped = text.clone();
+    dropped
         .apply(ModelEdit::DropIiv { param: "CL".into() })
-        .unwrap_err();
-    assert!(err.contains("block_omega"), "{err}");
+        .unwrap();
+    assert!(
+        dropped
+            .block_lines("parameters")
+            .contains(&"omega ETA_V ~ 0.04".to_string()),
+        "{:?}",
+        dropped.block_lines("parameters")
+    );
+    assert!(!dropped.render().contains("block_omega"));
     let err = text
         .apply(ModelEdit::AddIiv {
             param: "KA".into(),
@@ -1787,4 +1855,324 @@ fn a_non_finite_initial_value_is_refused_rather_than_written() {
         err.contains("cannot be written as a `.ferx` number"),
         "{err}"
     );
+}
+
+// ── AddIov / DropIov / SetKappaBlock (#1183) ───────────────────────────────
+
+fn add_iov(param: &str, kappa: &str) -> ModelEdit<'static> {
+    ModelEdit::AddIov {
+        param: param.into(),
+        kappa: kappa.into(),
+        variance: 0.009,
+    }
+}
+
+#[test]
+fn add_iov_joins_the_eta_inside_exp_and_declares_the_kappa() {
+    let mut text = base();
+    apply(&mut text, add_iov("CL", "KAPPA_CL"));
+    assert!(
+        text.block_lines("individual_parameters")
+            .contains(&"CL = TVCL * exp(ETA_CL + KAPPA_CL)".to_string()),
+        "{:?}",
+        text.block_lines("individual_parameters")
+    );
+    assert!(text
+        .block_lines("parameters")
+        .contains(&"kappa KAPPA_CL ~ 0.009".to_string()));
+    // Nothing else on the line or in the file moved.
+    assert!(text.render().contains("  V  = TVV  * exp(ETA_V)\n"));
+    assert!(text.render().contains("  omega ETA_CL ~ 0.09\n"));
+}
+
+#[test]
+fn add_iov_on_a_parameter_without_an_eta_appends_the_factor() {
+    let mut text = base();
+    apply(&mut text, ModelEdit::DropIiv { param: "KA".into() });
+    apply(&mut text, add_iov("KA", "KAPPA_KA"));
+    assert!(text
+        .block_lines("individual_parameters")
+        .contains(&"KA = TVKA * exp(KAPPA_KA)".to_string()));
+}
+
+#[test]
+fn drop_iov_is_the_inverse_of_add_iov() {
+    let mut text = base();
+    let before = text.render();
+    apply(&mut text, add_iov("CL", "KAPPA_CL"));
+    apply(&mut text, ModelEdit::DropIov { param: "CL".into() });
+    assert_eq!(text.render(), before);
+}
+
+#[test]
+fn drop_iiv_keeps_the_kappa_and_drop_iov_keeps_the_eta() {
+    let mut text = base();
+    apply(&mut text, add_iov("CL", "KAPPA_CL"));
+    let mut a = text.clone();
+    apply(&mut a, ModelEdit::DropIiv { param: "CL".into() });
+    assert!(a
+        .block_lines("individual_parameters")
+        .contains(&"CL = TVCL * exp(KAPPA_CL)".to_string()));
+    assert!(!a.render().contains("ETA_CL"));
+    assert!(a.render().contains("kappa KAPPA_CL ~ 0.009"));
+
+    let mut b = text.clone();
+    apply(&mut b, ModelEdit::DropIov { param: "CL".into() });
+    assert!(b
+        .block_lines("individual_parameters")
+        .contains(&"CL = TVCL * exp(ETA_CL)".to_string()));
+    assert!(!b.render().contains("KAPPA_CL"));
+
+    // And the κ-only parameter takes its η back *inside* the exp, so the
+    // line is the canonical one again rather than `exp(κ) * exp(η)`.
+    apply(
+        &mut a,
+        ModelEdit::AddIiv {
+            param: "CL".into(),
+            form: IivForm::Exponential {
+                eta: "ETA_CL".into(),
+                variance: 0.09,
+            },
+        },
+    );
+    assert!(a
+        .block_lines("individual_parameters")
+        .contains(&"CL = TVCL * exp(ETA_CL + KAPPA_CL)".to_string()));
+}
+
+#[test]
+fn add_iov_refuses_a_second_kappa_a_declared_name_and_a_non_canonical_eta() {
+    let mut text = base();
+    apply(&mut text, add_iov("CL", "KAPPA_CL"));
+    let err = text.clone().apply(add_iov("CL", "KAPPA_CL2")).unwrap_err();
+    assert!(err.contains("already carries the inter-occasion"), "{err}");
+    let err = text.clone().apply(add_iov("V", "KAPPA_CL")).unwrap_err();
+    assert!(err.contains("already declared"), "{err}");
+
+    let src = BASE.replace("  V  = TVV  * exp(ETA_V)", "  V  = TVV  * (1 + ETA_V)");
+    let err = ModelText::parse(&src)
+        .unwrap()
+        .apply(add_iov("V", "KAPPA_V"))
+        .unwrap_err();
+    assert!(err.contains("`ETA_V`"), "{err}");
+    assert!(err.contains("canonical form"), "{err}");
+
+    // A κ removed from a parameter that has none is refused by name.
+    let err = base()
+        .apply(ModelEdit::DropIov { param: "V".into() })
+        .unwrap_err();
+    assert!(err.contains("carries no κ"), "{err}");
+}
+
+#[test]
+fn drop_iov_keeps_a_kappa_a_second_parameter_still_uses() {
+    let src = BASE
+        .replace(
+            "  CL = TVCL * exp(ETA_CL)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_SIZE)",
+        )
+        .replace(
+            "  V  = TVV  * exp(ETA_V)",
+            "  V  = TVV  * exp(ETA_V + KAPPA_SIZE)",
+        )
+        .replace(
+            "  sigma PROP_ERR",
+            "  kappa KAPPA_SIZE ~ 0.01\n  sigma PROP_ERR",
+        );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::DropIov { param: "CL".into() });
+    assert!(text.render().contains("kappa KAPPA_SIZE ~ 0.01"));
+    apply(&mut text, ModelEdit::DropIov { param: "V".into() });
+    assert!(!text.render().contains("KAPPA_SIZE"));
+}
+
+#[test]
+fn set_kappa_block_replaces_the_diagonal_declarations_and_refuses_a_weight() {
+    let mut text = base();
+    apply(&mut text, add_iov("CL", "KAPPA_CL"));
+    apply(&mut text, add_iov("V", "KAPPA_V"));
+    apply(
+        &mut text,
+        ModelEdit::SetKappaBlock(vec!["KAPPA_V".into(), "KAPPA_CL".into()]),
+    );
+    let params = text.block_lines("parameters");
+    // 0.1 × sqrt(0.009 × 0.009) = 0.0009, and declaration order is kept.
+    assert!(
+        params.contains(&"block_kappa (KAPPA_CL, KAPPA_V) = [0.009, 0.0009, 0.009]".to_string()),
+        "{params:?}"
+    );
+    assert!(!params.iter().any(|l| l.starts_with("kappa ")));
+    // A blocked κ dropped: the block shrinks to the survivor's diagonal line.
+    let mut dropped = text.clone();
+    apply(&mut dropped, ModelEdit::DropIov { param: "CL".into() });
+    assert!(
+        dropped
+            .block_lines("parameters")
+            .contains(&"kappa KAPPA_V ~ 0.009".to_string()),
+        "{:?}",
+        dropped.block_lines("parameters")
+    );
+    assert!(!dropped.render().contains("block_kappa"));
+    // And split: both back on their own lines.
+    let mut split = text.clone();
+    apply(
+        &mut split,
+        ModelEdit::SplitKappaBlock(vec!["KAPPA_CL".into()]),
+    );
+    let params = split.block_lines("parameters");
+    assert!(
+        params.contains(&"kappa KAPPA_V ~ 0.009".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"kappa KAPPA_CL ~ 0.009".to_string()),
+        "{params:?}"
+    );
+
+    let src = BASE
+        .replace(
+            "  CL = TVCL * exp(ETA_CL)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        )
+        .replace(
+            "  V  = TVV  * exp(ETA_V)",
+            "  V  = TVV  * exp(ETA_V + KAPPA_V)",
+        )
+        .replace(
+            "  sigma PROP_ERR",
+            "  kappa KAPPA_CL ~ 0.01 weight = NARM\n  kappa KAPPA_V ~ 0.01\n  sigma PROP_ERR",
+        );
+    let err = ModelText::parse(&src)
+        .unwrap()
+        .apply(ModelEdit::SetKappaBlock(vec![
+            "KAPPA_CL".into(),
+            "KAPPA_V".into(),
+        ]))
+        .unwrap_err();
+    assert!(err.contains("weight"), "{err}");
+}
+
+#[test]
+fn set_structural_shrinks_a_block_kappa_around_the_kappa_that_survive() {
+    let src = TWO_CPT
+        .replace(
+            "  CL = TVCL * exp(ETA_CL)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        )
+        .replace(
+            "  Q  = TVQ  * exp(ETA_Q)",
+            "  Q  = TVQ  * exp(ETA_Q + KAPPA_Q)",
+        )
+        .replace(
+            "  sigma PROP_ERR",
+            "  block_kappa (KAPPA_CL, KAPPA_Q) = [0.02, 0.001, 0.03]\n  sigma PROP_ERR",
+        );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"kappa KAPPA_CL ~ 0.02".to_string()),
+        "{params:?}"
+    );
+    assert!(!text.render().contains("KAPPA_Q"), "{}", text.render());
+    assert!(!text.render().contains("block_kappa"), "{}", text.render());
+}
+
+#[test]
+fn seed_inits_writes_kappa_and_block_kappa_from_omega_iov() {
+    let mut text = base();
+    apply(&mut text, add_iov("CL", "KAPPA_CL"));
+    apply(&mut text, add_iov("V", "KAPPA_V"));
+    apply(&mut text, add_iov("KA", "KAPPA_KA"));
+    apply(
+        &mut text,
+        ModelEdit::SetKappaBlock(vec!["KAPPA_CL".into(), "KAPPA_V".into()]),
+    );
+    let mut fit = fit_with(&[], &[], &[], &[], &[], &[]);
+    fit.kappa_names = vec!["KAPPA_KA".into(), "KAPPA_CL".into(), "KAPPA_V".into()];
+    let mut iov =
+        nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.7, 0.5, 0.6]));
+    iov[(1, 2)] = 0.25;
+    iov[(2, 1)] = 0.25;
+    fit.omega_iov = Some(iov);
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"block_kappa (KAPPA_CL, KAPPA_V) = [0.5, 0.25, 0.6]".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"kappa KAPPA_KA ~ 0.7".to_string()),
+        "{params:?}"
+    );
+    // Without an IOV matrix on the fit, the κ lines are left alone.
+    let plain = fit_with(&[], &[], &[], &[], &[], &[]);
+    let before = text.render();
+    apply(&mut text, ModelEdit::SeedInits(&plain));
+    assert_eq!(text.render(), before);
+}
+
+// ── VariabilityText::read ─────────────────────────────────────────────────
+
+#[test]
+fn variability_text_reads_etas_kappas_blocks_and_the_canonical_flag() {
+    let src = BASE
+        .replace(
+            "  CL = TVCL * exp(ETA_CL)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        )
+        .replace("  V  = TVV  * exp(ETA_V)", "  V  = TVV  * (1 + ETA_V)")
+        .replace("  omega ETA_KA ~ 0.30", "  omega ETA_KA ~ 0.5 (sd) FIX")
+        .replace(
+            "  sigma PROP_ERR",
+            "  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR",
+        );
+    let text = ModelText::parse(&src).unwrap();
+    let v = VariabilityText::read(&text).unwrap();
+    let cl = v.parameter("CL").unwrap();
+    assert_eq!(cl.eta.as_deref(), Some("ETA_CL"));
+    assert_eq!(cl.kappa.as_deref(), Some("KAPPA_CL"));
+    assert!(cl.canonical);
+    let vv = v.parameter("V").unwrap();
+    assert_eq!(vv.eta.as_deref(), Some("ETA_V"));
+    assert!(!vv.canonical, "a proportional η is not the canonical form");
+    assert_eq!(vv.mentions, vec!["ETA_V".to_string()]);
+    let ka = v.parameter("KA").unwrap();
+    assert!(ka.canonical && ka.kappa.is_none());
+    assert!(v.is_fixed("ETA_KA"));
+    assert!(!v.is_fixed("ETA_CL"));
+    assert!((v.variance("ETA_KA").unwrap() - 0.25).abs() < 1e-12);
+    assert_eq!(v.kappas.len(), 1);
+    assert_eq!(v.with_eta().count(), 3);
+    assert_eq!(v.with_kappa().count(), 1);
+    assert!(v.omega_block_of("ETA_CL").is_none());
+
+    // A block reads as one, with its flag, and a parameter with no random
+    // effect at all is canonical when it is a product.
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into()]),
+    );
+    apply(&mut text, ModelEdit::DropIiv { param: "KA".into() });
+    let v = VariabilityText::read(&text).unwrap();
+    assert_eq!(
+        v.omega_block_of("ETA_V").map(|b| b.names.clone()),
+        Some(vec!["ETA_CL".to_string(), "ETA_V".to_string()])
+    );
+    assert!(
+        v.variance("ETA_CL").is_none(),
+        "a blocked η has no diagonal init"
+    );
+    let ka = v.parameter("KA").unwrap();
+    assert!(ka.canonical && ka.eta.is_none() && ka.mentions.is_empty());
+    // Two η on one line: neither is *the* η, and the line is not canonical.
+    let src = BASE.replace(
+        "  CL = TVCL * exp(ETA_CL)",
+        "  CL = TVCL * exp(ETA_CL + ETA_V)",
+    );
+    let v = VariabilityText::read(&ModelText::parse(&src).unwrap()).unwrap();
+    let cl = v.parameter("CL").unwrap();
+    assert!(!cl.canonical);
+    assert_eq!(cl.mentions.len(), 2);
 }

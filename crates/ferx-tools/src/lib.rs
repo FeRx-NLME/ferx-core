@@ -57,6 +57,8 @@ mod tests {
         let _ = assert_default::<crate::search::RunOptions>();
         let _ = assert_default::<crate::modelsearch::ModelsearchOptions>();
         let _ = assert_default::<crate::ruvsearch::RuvsearchOptions>();
+        let _ = assert_default::<crate::iivsearch::IivsearchOptions>();
+        let _ = assert_default::<crate::iovsearch::IovsearchOptions>();
     }
 
     #[test]
@@ -79,6 +81,8 @@ pub mod allometry;
 pub mod bootstrap;
 pub mod covsearch;
 pub mod gam;
+pub mod iivsearch;
+pub mod iovsearch;
 pub mod modelsearch;
 pub mod ruvsearch;
 pub mod search;

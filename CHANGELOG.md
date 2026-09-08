@@ -20,6 +20,46 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx iivsearch` — variability-structure search (Pharmpy `iivsearch`) in `ferx-tools`
+  (#1183).** From a `.ferxsearch` file whose `[space]` names the η to search (`IIV?([V,KA],
+  EXP)`; a plain `IIV(CL, EXP)` keeps that η) and the correlations to try
+  (`COVARIANCE?(IIV, [CL,V,KA])`): the number of η under `top_down_exhaustive`,
+  `bottom_up_stepwise` or `simultaneous_stepwise`, then the block structure under
+  `top_down_exhaustive` — one candidate per full block among the retained η, plus the
+  diagonal model — each step ranked with its parent on the BIC(iiv) (`OFV + n_ω·ln(n_subjects)`,
+  what `bic` means for this tool) behind the strictness gate, and the final model compared
+  with the input. Every candidate is written by the η / block edits from its parent's
+  estimates; a new block starts at the parent's EBE correlations and a block over three or
+  more η gets `[iivsearch] block_retries` extra starts per η. A parameter outside the canonical
+  `P = TVP * exp(ETA_P)` form is refused by name before anything is fitted. Anchored against
+  Pharmpy 2.2.0 through NONMEM 7.5.1 on a simulated dataset: for `top_down_exhaustive` and
+  `bottom_up_stepwise`, the same candidates in the same numbering, the same winner at each
+  step and the same final `[CL,V]` at the same BIC(iiv). `simultaneous_stepwise` agrees on
+  the first step and then parts from Pharmpy, because its `[CL,V]+[KA]` candidate is a mixed
+  block + diagonal ω, which FOCE/FOCEI fit as the full block (#1018, open): ferx selects that
+  candidate where Pharmpy selects `[CL,V]`. The search notes #1018 on any such candidate, and
+  the anchor asserts the divergence so the fix turns it red.
+- **`ferx iovsearch` — inter-occasion variability search (Pharmpy `iovsearch`) in
+  `ferx-tools` (#1183).** A model with a κ on every candidate parameter (`IOV?([CL,V], EXP)`
+  in the `[space]`, or every parameter with a free η by default), then every subset of the
+  optional κ removed — including all of them when a plain `IOV(CL, EXP)` keeps one, since the
+  model left is not the input — ranked with the input on the BIC(random); then, from the
+  winner, every subset of the η that sit beside a κ removed. The κ are declared `disjoint`, `joint`, `same-as-iiv`
+  or `explicit` (`groups`), each at a tenth of its η's fitted variance, and the base must read
+  its occasions itself (`iov_column`). Anchored against Pharmpy 2.2.0 through NONMEM 7.5.1 on a
+  three-occasion dataset: the same candidates, the same `IOV([CL])` winner at the same
+  BIC(random), the same final model.
+- **`ferx-core::edit` grows the κ edits and a structure reader (#1183).** `ModelEdit::AddIov`
+  / `DropIov` write and remove a κ in the canonical `P = TVP * exp(ETA_P + KAPPA_P)` form,
+  `SetKappaBlock` / `SplitKappaBlock` and `SplitOmegaBlock` block and unblock κ and η, and
+  `DropIiv` / `DropIov` now shrink a block around its survivors instead of refusing (Pharmpy's
+  `remove_iiv` on a joint distribution). `VariabilityText::read` reports which parameter carries
+  which η and κ, how they are blocked, which are `FIX`, and whether each line is in the canonical
+  form. `SeedInits` carries `kappa` and `block_kappa` estimates too, and the search seed floors a
+  collapsed κ as it floors a collapsed ω.
+- **`IOV(...)` and `COVARIANCE(IOV, ...)` are searchable MFL features (#1183)**, in the
+  exponential form; the coverage table says so, and `Candidate::starts` lets a search tool ask
+  for more starts on one candidate than the run's default.
 - **`ferx ruvsearch` — residual-error model search (Pharmpy `ruvsearch`) in `ferx-tools`
   (#1182).** From a `.ferxsearch` file with no `[space]` — the candidates are the four
   residual-error forms: IIV on the residual error, a `power` form, a `combined` form and a

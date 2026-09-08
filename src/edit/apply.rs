@@ -29,15 +29,24 @@ use crate::types::{FitResult, PkModel};
 static THETA_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(theta\s+(\w+)\s*\(\s*)([0-9eE.+-]+)(.*)$").unwrap());
 /// `omega NAME ~ value …`, same group layout.
-static OMEGA_RE: LazyLock<Regex> =
+pub(crate) static OMEGA_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(omega\s+(\w+)\s*~\s*)([0-9eE.+-]+)(.*)$").unwrap());
+/// `kappa NAME ~ value …` — an IOV variance — same group layout.
+pub(crate) static KAPPA_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(kappa\s+(\w+)\s*~\s*)([0-9eE.+-]+)(.*)$").unwrap());
 /// `sigma NAME ~ value …`, same group layout.
 static SIGMA_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(sigma\s+(\w+)\s*~\s*)([0-9eE.+-]+)(.*)$").unwrap());
 /// `block_omega (A, B) = [ … ]` — group 2 the names, group 3 the triangle.
-static BLOCK_OMEGA_RE: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static BLOCK_OMEGA_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(block_omega\s*\(([^)]*)\)\s*=\s*)\[([^\]]*)\](.*)$").unwrap()
 });
+/// `block_kappa (A, B) = [ … ]`, same group layout.
+pub(crate) static BLOCK_KAPPA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(block_kappa\s*\(([^)]*)\)\s*=\s*)\[([^\]]*)\](.*)$").unwrap()
+});
+/// The `weight = <expr>` modifier a `kappa` declaration may carry (#1031).
+static WEIGHT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bweight\s*=").unwrap());
 /// `block_sigma (A, B) = [ … ]` — detection only; this module never edits one.
 static BLOCK_SIGMA_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^block_sigma\s*\(").unwrap());
@@ -82,6 +91,15 @@ pub(crate) fn apply(text: &mut ModelText, edit: ModelEdit<'_>) -> Result<(), Str
         ModelEdit::AddIiv { param, form } => add_iiv(text, &param, &form),
         ModelEdit::DropIiv { param } => drop_iiv(text, &param),
         ModelEdit::SetOmegaBlock(names) => set_omega_block(text, &names),
+        ModelEdit::AddIov {
+            param,
+            kappa,
+            variance,
+        } => add_iov(text, &param, &kappa, variance),
+        ModelEdit::DropIov { param } => drop_iov(text, &param),
+        ModelEdit::SetKappaBlock(names) => set_kappa_block(text, &names),
+        ModelEdit::SplitOmegaBlock(names) => split_block(text, &names, RandomEffectKind::Eta),
+        ModelEdit::SplitKappaBlock(names) => split_block(text, &names, RandomEffectKind::Kappa),
         ModelEdit::SetErrorModel(spec) => set_error_model(text, &spec),
         ModelEdit::SeedInits(fit) => seed_inits(text, fit),
         ModelEdit::SetFitOption { key, value } => set_fit_option(text, &key, &value),
@@ -232,6 +250,18 @@ fn find_relation_decl(text: &ModelText, param: &str, cov: &str) -> Option<Range<
 
 // ── η surgery ───────────────────────────────────────────────────────────────
 
+// ── η and κ ─────────────────────────────────────────────────────────────────
+//
+// The canonical form these edits read and write is
+//
+//     P = HEAD * exp(ETA_P)             an η
+//     P = HEAD * exp(ETA_P + KAPPA_P)   an η and a κ (inter-occasion variability)
+//     P = HEAD * exp(KAPPA_P)           a κ alone
+//
+// with `HEAD` a top-level product. Every add / drop below rewrites the
+// trailing `exp(…)` factor and nothing else on the line, so the form is
+// closed under the four edits and a search can apply them in any order.
+
 fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), String> {
     finite(form.variance(), &format!("`omega {}` variance", form.eta()))?;
     let Some((span, rhs)) = find_assignment(text, param) else {
@@ -260,10 +290,22 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
              parameter gets one η here. Drop it first if you mean to replace it."
         ));
     }
+    let kappas = declared_kappas(text);
     let new_rhs = match form {
         IivForm::Exponential { eta, .. } => {
-            require_product(param, &rhs)?;
-            format!("{rhs} * exp({eta})")
+            // A parameter that already carries a κ takes the η *inside* its
+            // `exp(…)`, so the line stays in the one form `DropIiv` can read.
+            match split_trailing_exp(&rhs, &kappas) {
+                Some((head, terms)) => {
+                    let mut terms = terms;
+                    terms.insert(0, eta.clone());
+                    format!("{head} * exp({})", terms.join(" + "))
+                }
+                None => {
+                    require_product(param, &rhs)?;
+                    format!("{rhs} * exp({eta})")
+                }
+            }
         }
         IivForm::Proportional { eta, .. } => {
             require_product(param, &rhs)?;
@@ -282,59 +324,331 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
 }
 
 fn drop_iiv(text: &mut ModelText, param: &str) -> Result<(), String> {
+    drop_random_effect(text, param, RandomEffectKind::Eta)
+}
+
+fn add_iov(text: &mut ModelText, param: &str, kappa: &str, variance: f64) -> Result<(), String> {
+    finite(variance, &format!("`kappa {kappa}` variance"))?;
     let Some((span, rhs)) = find_assignment(text, param) else {
         return Err(format!(
-            "ferx-core::edit: [individual_parameters] declares no `{param}` to take an η from"
+            "ferx-core::edit: [individual_parameters] declares no `{param}` to give a κ to"
         ));
     };
+    if kappa_decl(text, kappa).is_some() {
+        return Err(format!(
+            "ferx-core::edit: `kappa {kappa}` is already declared"
+        ));
+    }
+    if let Some((_, block)) = block_kappa_decl(text, kappa) {
+        return Err(format!(
+            "ferx-core::edit: `{kappa}` is already declared by `{block}`"
+        ));
+    }
+    if let Some(existing) = declared_kappas(text).iter().find(|k| mentions(&rhs, k)) {
+        return Err(format!(
+            "ferx-core::edit: `{param}` already carries the inter-occasion random effect \
+             `{existing}` — a parameter gets one κ here. Drop it first if you mean to replace it."
+        ));
+    }
     let etas = declared_etas(text);
-    // The canonical form: the last top-level factor is `exp(ETA_x)` and
-    // nothing else on the line mentions an η.
-    let (head, eta) = split_trailing_exp_eta(&rhs, &etas).ok_or_else(|| {
+    let new_rhs = match split_trailing_exp(&rhs, &etas) {
+        Some((head, mut terms)) => {
+            terms.push(kappa.to_string());
+            format!("{head} * exp({})", terms.join(" + "))
+        }
+        None => {
+            // No canonical `exp(η)` to join: the parameter must carry no η at
+            // all, or its η is written in a form this edit cannot extend.
+            if let Some(eta) = etas.iter().find(|e| mentions(&rhs, e)) {
+                return Err(format!(
+                    "ferx-core::edit: `{param} = {rhs}` carries `{eta}` outside the canonical \
+                     form `{param} = TVP * exp({eta})`, so a κ cannot be added beside it by \
+                     rewriting the line. Rewrite `{param}` as a product ending in `exp({eta})`, \
+                     or add the κ by hand."
+                ));
+            }
+            require_product(param, &rhs)?;
+            format!("{rhs} * exp({kappa})")
+        }
+    };
+    let stale = text.set_span(&span, &format!("{param} = {new_rhs}"));
+    text.delete_lines(stale);
+    text.append_to_block("parameters", &format!("kappa {kappa} ~ {}", num(variance)));
+    Ok(())
+}
+
+fn drop_iov(text: &mut ModelText, param: &str) -> Result<(), String> {
+    drop_random_effect(text, param, RandomEffectKind::Kappa)
+}
+
+/// Which family of random effect an edit is about; the words differ, the
+/// line surgery does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RandomEffectKind {
+    Eta,
+    Kappa,
+}
+
+impl RandomEffectKind {
+    fn declared(self, text: &ModelText) -> Vec<String> {
+        match self {
+            RandomEffectKind::Eta => declared_etas(text),
+            RandomEffectKind::Kappa => declared_kappas(text),
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            RandomEffectKind::Eta => "η",
+            RandomEffectKind::Kappa => "κ",
+        }
+    }
+
+    /// The diagonal keyword and the block keyword.
+    fn keywords(self) -> (&'static str, &'static str) {
+        match self {
+            RandomEffectKind::Eta => ("omega", "block_omega"),
+            RandomEffectKind::Kappa => ("kappa", "block_kappa"),
+        }
+    }
+
+    fn decl(self, text: &ModelText, name: &str) -> Option<(Range<usize>, String)> {
+        match self {
+            RandomEffectKind::Eta => omega_decl(text, name),
+            RandomEffectKind::Kappa => kappa_decl(text, name),
+        }
+    }
+
+    fn block_decl(self, text: &ModelText, name: &str) -> Option<(Range<usize>, String)> {
+        match self {
+            RandomEffectKind::Eta => block_omega_decl(text, name),
+            RandomEffectKind::Kappa => block_kappa_decl(text, name),
+        }
+    }
+
+    fn diagonal_re(self) -> &'static Regex {
+        match self {
+            RandomEffectKind::Eta => &OMEGA_RE,
+            RandomEffectKind::Kappa => &KAPPA_RE,
+        }
+    }
+
+    fn block_re(self) -> &'static Regex {
+        match self {
+            RandomEffectKind::Eta => &BLOCK_OMEGA_RE,
+            RandomEffectKind::Kappa => &BLOCK_KAPPA_RE,
+        }
+    }
+}
+
+/// `DropIiv` / `DropIov`: take one random effect of `kind` out of `param`'s
+/// trailing `exp(…)`, and its declaration with it when nothing else reads it.
+fn drop_random_effect(
+    text: &mut ModelText,
+    param: &str,
+    kind: RandomEffectKind,
+) -> Result<(), String> {
+    let (diag, block) = kind.keywords();
+    let sym = kind.symbol();
+    let Some((span, rhs)) = find_assignment(text, param) else {
+        return Err(format!(
+            "ferx-core::edit: [individual_parameters] declares no `{param}` to take a {sym} from"
+        ));
+    };
+    let mine = kind.declared(text);
+    let mut others = declared_etas(text);
+    others.extend(declared_kappas(text));
+    // The canonical form: the last top-level factor is `exp(…)` over declared
+    // random effects, and nothing else on the line mentions one.
+    let (head, terms) = split_trailing_exp(&rhs, &others).ok_or_else(|| {
         format!(
             "ferx-core::edit: `{param} = {rhs}` is not in the canonical form \
-             `{param} = TVP * exp(ETA_{param})`, so its η cannot be removed by rewriting the \
-             line. Rewrite `{param}` as a product ending in `exp(<eta>)`, or edit \
-             [individual_parameters] by hand."
+             `{param} = TVP * exp(ETA_{param})` (or `exp(ETA_{param} + KAPPA_{param})`), so its \
+             {sym} cannot be removed by rewriting the line. Rewrite `{param}` as a product \
+             ending in `exp(<random effects>)`, or edit [individual_parameters] by hand."
         )
     })?;
-    if etas.iter().any(|e| e != &eta && mentions(&head, e)) {
+    if others.iter().any(|e| mentions(&head, e)) {
         return Err(format!(
-            "ferx-core::edit: `{param} = {rhs}` mentions more than one random effect; dropping \
-             one by rewriting the line would be a guess about which."
+            "ferx-core::edit: `{param} = {rhs}` mentions a random effect outside its trailing \
+             `exp(…)`; dropping one by rewriting the line would be a guess about which."
         ));
     }
-    if let Some((_, block)) = block_omega_decl(text, &eta) {
-        return Err(format!(
-            "ferx-core::edit: `{eta}` is part of `{block}` — a block_omega cannot have one η \
-             removed from it by line surgery. Redeclare the block without `{eta}` first."
-        ));
-    }
-    let Some((omega, _)) = omega_decl(text, &eta) else {
-        return Err(format!(
-            "ferx-core::edit: `{param}` uses `{eta}`, which has no `omega {eta} ~ …` declaration"
-        ));
+    let of_kind: Vec<&String> = terms.iter().filter(|t| mine.contains(t)).collect();
+    let name = match of_kind.as_slice() {
+        [one] => (*one).clone(),
+        [] => {
+            return Err(format!(
+                "ferx-core::edit: `{param} = {rhs}` carries no {sym} to remove"
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "ferx-core::edit: `{param} = {rhs}` mentions more than one {sym}; dropping one \
+                 by rewriting the line would be a guess about which."
+            ))
+        }
+    };
+    // The declaration: a diagonal line, or a block the random effect is one
+    // member of. A block is *shrunk* around the survivors (a lone survivor
+    // becomes the diagonal declaration it would otherwise be a 1×1 block
+    // of), the same rewrite the pruner applies when a structural swap takes
+    // an η away — Pharmpy's `remove_iiv` on a joint distribution.
+    let (decl_span, decl_code, in_block) = match kind.decl(text, &name) {
+        Some((span, code)) => (span, code, false),
+        None => match kind.block_decl(text, &name) {
+            Some((span, code)) => (span, code, true),
+            None => {
+                return Err(format!(
+                    "ferx-core::edit: `{param}` uses `{name}`, which has no `{diag} {name} ~ …` \
+                     or `{block} (…)` declaration"
+                ))
+            }
+        },
     };
 
-    let mut stale = text.set_span(&span, &format!("{param} = {head}"));
-    // The declaration goes only if nothing else still reads the η. Two
-    // parameters may legally share one — `CL = TVCL * exp(ETA_SIZE)` beside
-    // `V = TVV * exp(ETA_SIZE)` — and deleting it on the first `DropIiv` would
-    // leave the other expression with a random effect the model never declares.
-    // The check runs on the rewritten text, and skips the lines that are on
-    // their way out: they still carry the η this edit just removed.
-    let mut skip: Vec<usize> = omega.clone().collect();
+    let rest: Vec<&String> = terms.iter().filter(|t| **t != name).collect();
+    let new_rhs = if rest.is_empty() {
+        head
+    } else {
+        format!(
+            "{head} * exp({})",
+            rest.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        )
+    };
+    let mut stale = text.set_span(&span, &format!("{param} = {new_rhs}"));
+    // The declaration goes only if nothing else still reads the random
+    // effect. Two parameters may legally share one — `CL = TVCL * exp(ETA_SIZE)`
+    // beside `V = TVV * exp(ETA_SIZE)` — and deleting it on the first drop
+    // would leave the other expression with a random effect the model never
+    // declares. The check runs on the rewritten text, and skips the lines
+    // that are on their way out: they still carry the name this edit just
+    // removed.
+    let mut skip: Vec<usize> = decl_span.clone().collect();
     skip.extend(stale.iter().copied());
-    if !text.identifiers_excluding(&skip).contains(&eta) {
-        stale.extend(omega);
+    if !text.identifiers_excluding(&skip).contains(&name) {
+        if in_block {
+            let names = block_names(&kind.block_re().captures(&decl_code).expect("a block")[2]);
+            let keep: Vec<usize> = (0..names.len()).filter(|k| names[*k] != name).collect();
+            let shrunk = shrink_block(&decl_code, &names, &keep, kind)?;
+            stale.extend(text.set_span(&decl_span, &shrunk));
+        } else {
+            stale.extend(decl_span);
+        }
     }
     text.delete_lines(stale);
     Ok(())
 }
 
-/// Split `… * exp(ETA)` into (`…`, `ETA`) when the right-hand side ends in a
-/// top-level `exp` of a declared η, which is the canonical IIV form.
-fn split_trailing_exp_eta(rhs: &str, etas: &[String]) -> Option<(String, String)> {
+/// `SplitOmegaBlock` / `SplitKappaBlock`: take the named random effects out
+/// of whatever block declares them, each back to its own diagonal
+/// declaration with the variance it had in the block — Pharmpy's
+/// `split_joint_distribution`. A name that is already diagonal is left as it
+/// is; an undeclared one is an error.
+fn split_block(
+    text: &mut ModelText,
+    names: &[String],
+    kind: RandomEffectKind,
+) -> Result<(), String> {
+    let (diag, block) = kind.keywords();
+    for n in names {
+        if kind.decl(text, n).is_none() && kind.block_decl(text, n).is_none() {
+            return Err(format!(
+                "ferx-core::edit: [parameters] declares no `{diag} {n} ~ …` or `{block} (…)` \
+                 naming `{n}` to split"
+            ));
+        }
+    }
+    // One block at a time, re-read after each rewrite since the lines move.
+    loop {
+        let Some((span, code, names_in)) =
+            text.logical_lines("parameters")
+                .into_iter()
+                .find_map(|(span, code)| {
+                    let caps = kind.block_re().captures(&code)?;
+                    let names_in = block_names(&caps[2]);
+                    names_in.iter().any(|m| names.contains(m)).then_some((
+                        span,
+                        code.clone(),
+                        names_in,
+                    ))
+                })
+        else {
+            break;
+        };
+        let leaving: Vec<usize> = (0..names_in.len())
+            .filter(|k| names.contains(&names_in[*k]))
+            .collect();
+        let keep: Vec<usize> = (0..names_in.len())
+            .filter(|k| !leaving.contains(k))
+            .collect();
+        let values = block_values(&code, kind)?;
+        let rest = kind.block_re().captures(&code).expect("a block")[4].to_string();
+        let fixed = FIX_RE.is_match(&rest);
+        // The survivors' block (or diagonal line, or nothing) takes the
+        // declaration's place; each leaver is appended as its own line.
+        let mut stale = Vec::new();
+        let mut leavers: Vec<String> = leaving
+            .iter()
+            .map(|k| {
+                format!(
+                    "{diag} {} ~ {}{}",
+                    names_in[*k],
+                    num(values[k * (k + 1) / 2 + k]),
+                    if fixed { " FIX" } else { "" }
+                )
+            })
+            .collect();
+        if keep.is_empty() {
+            let first = leavers.remove(0);
+            stale.extend(text.set_span(&span, &first));
+        } else {
+            let shrunk = shrink_block(&code, &names_in, &keep, kind)?;
+            stale.extend(text.set_span(&span, &shrunk));
+        }
+        text.delete_lines(stale);
+        for line in leavers {
+            text.append_to_block("parameters", &line);
+        }
+    }
+    Ok(())
+}
+
+/// The lower-triangle values a block declares, checked against its size.
+fn block_values(code: &str, kind: RandomEffectKind) -> Result<Vec<f64>, String> {
+    let caps = kind
+        .block_re()
+        .captures(code)
+        .ok_or_else(|| format!("ferx-core::edit: cannot read `{code}`"))?;
+    let names = block_names(&caps[2]);
+    let values: Vec<f64> = caps[3]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<f64>()
+                .map_err(|_| format!("ferx-core::edit: `{s}` is not a number in `{code}`"))
+        })
+        .collect::<Result<_, _>>()?;
+    let n = names.len();
+    if values.len() != n * (n + 1) / 2 {
+        return Err(format!(
+            "ferx-core::edit: `{code}` names {n} {} but declares {} lower-triangle values. \
+             Redeclare the block by hand.",
+            kind.symbol(),
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
+/// Split `… * exp(A + B)` into (`…`, `[A, B]`) when the right-hand side ends
+/// in a top-level `exp` whose argument is a `+`-sum of bare names all drawn
+/// from `declared` — the canonical random-effect factor.
+pub(crate) fn split_trailing_exp(rhs: &str, declared: &[String]) -> Option<(String, Vec<String>)> {
     let rhs = rhs.trim();
     let factors = top_level_factors(rhs)?;
     let (last, head) = factors.split_last()?;
@@ -344,14 +658,18 @@ fn split_trailing_exp_eta(rhs: &str, etas: &[String]) -> Option<(String, String)
         .trim()
         .strip_prefix('(')?
         .strip_suffix(')')?;
-    let eta = inner.trim();
-    if !etas.iter().any(|e| e == eta) {
+    let terms: Vec<String> = inner.split('+').map(|t| t.trim().to_string()).collect();
+    if terms.is_empty()
+        || terms
+            .iter()
+            .any(|t| !BARE_IDENT_RE.is_match(t) || !declared.iter().any(|d| d == t))
+    {
         return None;
     }
     if head.is_empty() {
         return None;
     }
-    Some((head.join(" * "), eta.to_string()))
+    Some((head.join(" * "), terms))
 }
 
 /// Split a right-hand side into its top-level `*` factors, or `None` when it
@@ -395,7 +713,7 @@ fn top_level_factors(rhs: &str) -> Option<Vec<String>> {
 /// `(A + B) * exp(η)`), which is why this is a precondition rather than a
 /// best-effort rewrite — the same posture `[covariate_model]` takes (#1111).
 /// `/` joins the list because `A / B * exp(η)` reassociates too.
-fn is_top_level_product(rhs: &str) -> bool {
+pub(crate) fn is_top_level_product(rhs: &str) -> bool {
     let bytes: Vec<char> = rhs.chars().collect();
     let mut depth = 0i32;
     for (i, c) in bytes.iter().enumerate() {
@@ -437,7 +755,7 @@ fn require_product(param: &str, rhs: &str) -> Result<(), String> {
     }
 }
 
-// ── block_omega ─────────────────────────────────────────────────────────────
+// ── block_omega / block_kappa ───────────────────────────────────────────────
 
 /// Correlation seeded into the off-diagonal of a freshly blocked omega.
 ///
@@ -448,46 +766,69 @@ fn require_product(param: &str, rhs: &str) -> Result<(), String> {
 const SEED_CORRELATION: f64 = 0.1;
 
 fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String> {
+    set_block(text, names, RandomEffectKind::Eta)
+}
+
+fn set_kappa_block(text: &mut ModelText, names: &[String]) -> Result<(), String> {
+    set_block(text, names, RandomEffectKind::Kappa)
+}
+
+fn set_block(text: &mut ModelText, names: &[String], kind: RandomEffectKind) -> Result<(), String> {
+    let (diag, block) = kind.keywords();
+    let sym = kind.symbol();
     if names.len() < 2 {
-        return Err(
-            "ferx-core::edit: SetOmegaBlock needs at least two η — a 1×1 block is the diagonal \
-             declaration it would replace"
-                .to_string(),
-        );
+        return Err(format!(
+            "ferx-core::edit: Set{}Block needs at least two {sym} — a 1×1 block is the diagonal \
+             declaration it would replace",
+            if kind == RandomEffectKind::Eta {
+                "Omega"
+            } else {
+                "Kappa"
+            }
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     for n in names {
         if !seen.insert(n) {
             return Err(format!(
-                "ferx-core::edit: `{n}` is listed twice in the omega block"
+                "ferx-core::edit: `{n}` is listed twice in the {diag} block"
             ));
         }
     }
-    // Collected per η and then sorted by declaration line: the block takes the
-    // place of the first declaration, so listing the η in *source* order — not
-    // in the caller's argument order — is what keeps each one's index in the
-    // omega matrix, and therefore the meaning of every `eta_names` position, as
-    // it was before the block.
+    // Collected per name and then sorted by declaration line: the block takes
+    // the place of the first declaration, so listing the names in *source*
+    // order — not in the caller's argument order — is what keeps each one's
+    // index in the matrix, and therefore the meaning of every `eta_names` /
+    // `kappa_names` position, as it was before the block.
     let mut slots: Vec<(Range<usize>, &str, f64, bool)> = Vec::with_capacity(names.len());
     for n in names {
-        if let Some((_, block)) = block_omega_decl(text, n) {
+        if let Some((_, decl)) = kind.block_decl(text, n) {
             return Err(format!(
-                "ferx-core::edit: `{n}` is already blocked by `{block}`"
+                "ferx-core::edit: `{n}` is already blocked by `{decl}`"
             ));
         }
-        let Some((span, code)) = omega_decl(text, n) else {
+        let Some((span, code)) = kind.decl(text, n) else {
             return Err(format!(
-                "ferx-core::edit: [parameters] declares no `omega {n} ~ …` to block"
+                "ferx-core::edit: [parameters] declares no `{diag} {n} ~ …` to block"
             ));
         };
-        let variance = omega_variance(&code)?;
+        // A `weight =` modifier (#1031) is a per-κ statement a block cannot
+        // carry — `block_kappa` has no weight — so blocking it would silently
+        // drop the weighting.
+        if WEIGHT_RE.is_match(&code) {
+            return Err(format!(
+                "ferx-core::edit: `{code}` carries a `weight =` modifier, which a `{block}` \
+                 cannot; remove the weight first"
+            ));
+        }
+        let variance = declared_variance(&code, kind)?;
         slots.push((span, n.as_str(), variance, FIX_RE.is_match(&code)));
     }
     slots.sort_by_key(|(span, _, _, _)| span.start);
     let ordered: Vec<&str> = slots.iter().map(|(_, n, _, _)| *n).collect();
     let variances: Vec<f64> = slots.iter().map(|(_, _, v, _)| *v).collect();
-    // `FIX` is a block-level flag: one `block_omega` cannot fix some of its
-    // entries and estimate the others. Dropping it silently would turn fixed
+    // `FIX` is a block-level flag: one block cannot fix some of its entries
+    // and estimate the others. Dropping it silently would turn fixed
     // covariance parameters into estimated ones — a different model, and one
     // whose extra parameters the search would not know it had added.
     let fixed = slots.iter().filter(|(_, _, _, f)| *f).count();
@@ -498,8 +839,8 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
             .map(|(_, n, _, _)| *n)
             .collect();
         return Err(format!(
-            "ferx-core::edit: {} of the η to block are `FIX`ed and {} are not ({}). `FIX` is a \
-             block-level flag, so a mixed block cannot be written; fix or free them all first.",
+            "ferx-core::edit: {} of the {sym} to block are `FIX`ed and {} are not ({}). `FIX` is \
+             a block-level flag, so a mixed block cannot be written; fix or free them all first.",
             fixed,
             free.len(),
             free.join(", ")
@@ -515,7 +856,7 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
     }
     let values: Vec<String> = tri.iter().map(|v| num(*v)).collect();
     let decl = format!(
-        "block_omega ({}) = [{}]{}",
+        "{block} ({}) = [{}]{}",
         ordered.join(", "),
         values.join(", "),
         if fixed > 0 { " FIX" } else { "" }
@@ -535,7 +876,13 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
 /// The variance an `omega NAME ~ v [(sd)]` line declares. `block_omega` is
 /// variance-scale only, so an `(sd)` declaration is squared on the way in.
 fn omega_variance(code: &str) -> Result<f64, String> {
-    let caps = OMEGA_RE
+    declared_variance(code, RandomEffectKind::Eta)
+}
+
+/// The variance an `omega` / `kappa` line declares, on the variance scale.
+pub(crate) fn declared_variance(code: &str, kind: RandomEffectKind) -> Result<f64, String> {
+    let caps = kind
+        .diagonal_re()
         .captures(code)
         .ok_or_else(|| format!("ferx-core::edit: cannot read the variance of `{code}`"))?;
     let raw: f64 = caps[3].parse().map_err(|_| {
@@ -983,6 +1330,29 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
         .map(|s| s.as_str())
         .zip(fit.sigma.iter().copied())
         .collect();
+    // The IOV κ live in their own matrix, indexed by `kappa_names`.
+    let kappa_index: HashMap<&str, usize> = fit
+        .kappa_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let omega_iov = fit.omega_iov.as_ref();
+
+    // The lower triangle of a fitted sub-matrix, by the named indices —
+    // `None` when any entry is not finite.
+    let triangle_of = |matrix: &nalgebra::DMatrix<f64>, idx: &[usize]| -> Option<Vec<String>> {
+        let mut tri = Vec::new();
+        for (a, ia) in idx.iter().enumerate() {
+            for ib in idx.iter().take(a + 1) {
+                tri.push(matrix[(*ia, *ib)]);
+            }
+        }
+        if tri.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(tri.iter().map(|v| num(*v)).collect())
+    };
 
     // A `FIX`ed parameter is a statement about the model, not an estimate to
     // carry over; a vector θ (`theta NAME[...]`) has no single init to write.
@@ -1023,26 +1393,42 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             let value = if SD_RE.is_match(&code) { sd } else { sd * sd };
             stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
         } else if let Some(caps) = BLOCK_OMEGA_RE.captures(&code) {
-            let names: Vec<String> = caps[2]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let idx: Option<Vec<usize>> = names
+            let idx: Option<Vec<usize>> = block_names(&caps[2])
                 .iter()
                 .map(|n| eta_index.get(n.as_str()).copied())
                 .collect();
             let Some(idx) = idx else { continue };
-            let mut tri = Vec::new();
-            for (a, ia) in idx.iter().enumerate() {
-                for ib in idx.iter().take(a + 1) {
-                    tri.push(fit.omega[(*ia, *ib)]);
-                }
-            }
-            if tri.iter().any(|v| !v.is_finite()) {
+            let Some(values) = triangle_of(&fit.omega, &idx) else {
+                continue;
+            };
+            stale.extend(text.set_span(
+                &span,
+                &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4]),
+            ));
+        } else if let Some(caps) = KAPPA_RE.captures(&code) {
+            let (Some(k), Some(iov)) = (kappa_index.get(&caps[2]).copied(), omega_iov) else {
+                continue;
+            };
+            let var = iov[(k, k)];
+            if !var.is_finite() {
                 continue;
             }
-            let values: Vec<String> = tri.iter().map(|v| num(*v)).collect();
+            let value = if SD_RE.is_match(&code) {
+                var.sqrt()
+            } else {
+                var
+            };
+            stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
+        } else if let Some(caps) = BLOCK_KAPPA_RE.captures(&code) {
+            let Some(iov) = omega_iov else { continue };
+            let idx: Option<Vec<usize>> = block_names(&caps[2])
+                .iter()
+                .map(|n| kappa_index.get(n.as_str()).copied())
+                .collect();
+            let Some(idx) = idx else { continue };
+            let Some(values) = triangle_of(iov, &idx) else {
+                continue;
+            };
             stale.extend(text.set_span(
                 &span,
                 &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4]),
@@ -1126,13 +1512,13 @@ fn find_assignment(text: &ModelText, param: &str) -> Option<(Range<usize>, Strin
         })
 }
 
-fn omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
+pub(crate) fn omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
     find_decl(text, "parameters", |c| {
         OMEGA_RE.captures(c).is_some_and(|m| &m[2] == eta)
     })
 }
 
-fn block_omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
+pub(crate) fn block_omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
     find_decl(text, "parameters", |c| {
         BLOCK_OMEGA_RE
             .captures(c)
@@ -1140,26 +1526,53 @@ fn block_omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String
     })
 }
 
+pub(crate) fn kappa_decl(text: &ModelText, kappa: &str) -> Option<(Range<usize>, String)> {
+    find_decl(text, "parameters", |c| {
+        KAPPA_RE.captures(c).is_some_and(|m| &m[2] == kappa)
+    })
+}
+
+pub(crate) fn block_kappa_decl(text: &ModelText, kappa: &str) -> Option<(Range<usize>, String)> {
+    find_decl(text, "parameters", |c| {
+        BLOCK_KAPPA_RE
+            .captures(c)
+            .is_some_and(|m| m[2].split(',').any(|n| n.trim() == kappa))
+    })
+}
+
+/// The names a `block_omega` / `block_kappa` line lists.
+pub(crate) fn block_names(names: &str) -> Vec<String> {
+    names
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Every η the model declares — diagonal `omega` and `block_omega` alike.
-fn declared_etas(text: &ModelText) -> Vec<String> {
+pub(crate) fn declared_etas(text: &ModelText) -> Vec<String> {
+    declared_of(text, RandomEffectKind::Eta)
+}
+
+/// Every κ the model declares — diagonal `kappa` and `block_kappa` alike.
+pub(crate) fn declared_kappas(text: &ModelText) -> Vec<String> {
+    declared_of(text, RandomEffectKind::Kappa)
+}
+
+fn declared_of(text: &ModelText, kind: RandomEffectKind) -> Vec<String> {
     let mut out = Vec::new();
     for (_, code) in text.logical_lines("parameters") {
-        if let Some(caps) = OMEGA_RE.captures(&code) {
+        if let Some(caps) = kind.diagonal_re().captures(&code) {
             out.push(caps[2].to_string());
-        } else if let Some(caps) = BLOCK_OMEGA_RE.captures(&code) {
-            out.extend(
-                caps[2]
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
+        } else if let Some(caps) = kind.block_re().captures(&code) {
+            out.extend(block_names(&caps[2]));
         }
     }
     out
 }
 
 /// Whether `expr` uses `name` as a whole identifier.
-fn mentions(expr: &str, name: &str) -> bool {
+pub(crate) fn mentions(expr: &str, name: &str) -> bool {
     super::IDENT_RE.find_iter(expr).any(|m| m.as_str() == name)
 }
 
@@ -1219,25 +1632,27 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     // `block_omega (A, B) = […]` declares several η in one statement, and
     // declares them nowhere else — so it has to be excluded from the root scan
     // like any other declaration, or each η it names would keep *itself* alive.
-    let mut blocks: Vec<(Vec<String>, Range<usize>, String)> = Vec::new();
+    let mut blocks: Vec<(Vec<String>, Range<usize>, String, RandomEffectKind)> = Vec::new();
     for (span, code) in text.logical_lines("parameters") {
         let declared = THETA_RE
             .captures(&code)
             .or_else(|| OMEGA_RE.captures(&code))
+            .or_else(|| KAPPA_RE.captures(&code))
             .map(|caps| caps[2].to_string());
         if let Some(name) = declared {
             decls.push(Decl { name, span, code });
             continue;
         }
-        let names = BLOCK_OMEGA_RE.captures(&code).map(|caps| {
-            caps[2]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<String>>()
-        });
-        if let Some(names) = names.filter(|n| !n.is_empty()) {
-            blocks.push((names, span, code));
+        let block = BLOCK_OMEGA_RE
+            .captures(&code)
+            .map(|caps| (block_names(&caps[2]), RandomEffectKind::Eta))
+            .or_else(|| {
+                BLOCK_KAPPA_RE
+                    .captures(&code)
+                    .map(|caps| (block_names(&caps[2]), RandomEffectKind::Kappa))
+            });
+        if let Some((names, kind)) = block.filter(|(n, _)| !n.is_empty()) {
+            blocks.push((names, span, code, kind));
         }
     }
     for (span, code) in text.logical_lines("individual_parameters") {
@@ -1258,7 +1673,7 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     for d in decls.iter().chain(relations.iter()) {
         declaration_lines.extend(d.span.clone());
     }
-    for (_, span, _) in &blocks {
+    for (_, span, _, _) in &blocks {
         declaration_lines.extend(span.clone());
     }
     let mut live = text.identifiers_excluding(&declaration_lines);
@@ -1325,7 +1740,7 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     // A `block_omega` that lost an η is rewritten around the ones that are
     // left, rather than kept whole (a random effect no parameter uses) or
     // deleted whole (which would take the live η with it).
-    for (names, span, code) in &blocks {
+    for (names, span, code, kind) in &blocks {
         let keep: Vec<usize> = (0..names.len())
             .filter(|k| live.contains(&names[*k]))
             .collect();
@@ -1336,7 +1751,7 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
             dead_lines.extend(span.clone());
             continue;
         }
-        let decl = shrink_omega_block(code, names, &keep)?;
+        let decl = shrink_block(code, names, &keep, *kind)?;
         dead_lines.extend(text.set_span(span, &decl));
     }
 
@@ -1344,16 +1759,23 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     Ok(())
 }
 
-/// Rewrite `block_omega (A, B, C) = […]` around the η at the indices in
-/// `keep`, which are ascending.
+/// Rewrite `block_omega (A, B, C) = […]` (or `block_kappa`) around the
+/// random effects at the indices in `keep`, which are ascending.
 ///
 /// The triangle is row-major lower-triangular, so entry (a, b) with a ≥ b sits
 /// at `a(a+1)/2 + b` and the kept sub-block is that lookup over the kept
 /// indices — the surviving variances and their covariances, unchanged. A lone
-/// survivor is written back as the diagonal `omega` it would otherwise be a
-/// 1×1 block of, which is not a form the parser accepts.
-fn shrink_omega_block(code: &str, names: &[String], keep: &[usize]) -> Result<String, String> {
-    let caps = BLOCK_OMEGA_RE
+/// survivor is written back as the diagonal `omega` / `kappa` it would
+/// otherwise be a 1×1 block of, which is not a form the parser accepts.
+fn shrink_block(
+    code: &str,
+    names: &[String],
+    keep: &[usize],
+    kind: RandomEffectKind,
+) -> Result<String, String> {
+    let (diag, block) = kind.keywords();
+    let caps = kind
+        .block_re()
         .captures(code)
         .ok_or_else(|| format!("ferx-core::edit: cannot read `{code}`"))?;
     let values: Vec<f64> = caps[3]
@@ -1368,16 +1790,17 @@ fn shrink_omega_block(code: &str, names: &[String], keep: &[usize]) -> Result<St
     let n = names.len();
     if values.len() != n * (n + 1) / 2 {
         return Err(format!(
-            "ferx-core::edit: `{code}` names {n} η but declares {} lower-triangle values, so the \
-             random effect it holds that nothing uses any more cannot be removed from it. \
+            "ferx-core::edit: `{code}` names {n} {} but declares {} lower-triangle values, so \
+             the random effect it holds that nothing uses any more cannot be removed from it. \
              Redeclare the block by hand.",
+            kind.symbol(),
             values.len()
         ));
     }
     let rest = &caps[4];
     if let [k] = keep {
         let var = values[k * (k + 1) / 2 + k];
-        return Ok(format!("omega {} ~ {}{rest}", names[*k], num(var)));
+        return Ok(format!("{diag} {} ~ {}{rest}", names[*k], num(var)));
     }
     let mut tri = Vec::with_capacity(keep.len() * (keep.len() + 1) / 2);
     for (a, ia) in keep.iter().enumerate() {
@@ -1387,7 +1810,7 @@ fn shrink_omega_block(code: &str, names: &[String], keep: &[usize]) -> Result<St
     }
     let kept: Vec<&str> = keep.iter().map(|k| names[*k].as_str()).collect();
     Ok(format!(
-        "block_omega ({}) = [{}]{rest}",
+        "{block} ({}) = [{}]{rest}",
         kept.join(", "),
         tri.join(", ")
     ))

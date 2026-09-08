@@ -1,0 +1,163 @@
+---
+pagetitle: "Inter-occasion variability search"
+description-meta: "Pharmpy iovsearch in ferx — which parameters carry an occasion-level κ, and which η become redundant once they do, searched by brute force from a .ferxsearch file and ranked on the BIC(random)."
+---
+
+# Inter-occasion variability search
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx iovsearch` is Pharmpy's `iovsearch`: a search over which
+[`[individual_parameters]`](../model-file/individual-parameters.qmd) carry an
+inter-occasion random effect — a [`kappa`](../model-file/iov.qmd) — and
+which η become redundant once they do. It is the κ counterpart of
+[iivsearch](iivsearch.qmd), on the same canonical form and the same edit
+layer (`AddIov`, `DropIov`, `DropIiv`, `SetKappaBlock`).
+
+```bash
+ferx iovsearch warfarin.ferxsearch --directory warfarin-iovsearch --threads 8
+```
+
+The [`.ferxsearch` file](search.qmd) may name the candidate parameters in
+a `[space]`; without one they are Pharmpy's default, every parameter
+carrying a free η. An `[iovsearch]` section says how the κ are declared:
+
+```toml
+base = "warfarin.ferx"                # must declare `iov_column = OCC` in [fit_options]
+data = "warfarin_iov.csv"
+
+[space]                               # optional
+mfl = "IOV?([CL,V], EXP)"             # a plain IOV(CL, EXP) keeps that κ in every candidate
+
+[iovsearch]
+distribution  = "same-as-iiv"         # or "disjoint", "joint", "explicit"
+# groups      = [["CL","V"], ["KA"]]  # the κ blocks, with distribution = "explicit"
+# column      = "OCC"                 # optional; must match the base's iov_column
+block_retries = 2
+
+[rank]
+type = "bic"                          # the BIC(random) — what `bic` means here
+
+[run]
+retries = 2
+threads = 8
+```
+
+| key | default | meaning |
+|---|---|---|
+| `distribution` | `same-as-iiv` | how the added κ are declared: `disjoint` one `kappa` line each; `joint` one `block_kappa` over all of them; `same-as-iiv` blocked as their η are (a `block_omega` over some η gives a `block_kappa` over their κ); `explicit` as `groups` says |
+| `groups` | — | the κ blocks by parameter name, with `explicit` |
+| `column` | the base's | the occasion column, checked against the base model's `iov_column` |
+| `block_retries` | `2` | extra starts per κ beyond two in a candidate's largest `block_kappa` |
+| `[rank] type` | `bic` | the BIC(random) — `OFV + n_parameters·ln(n_subjects)`, Pharmpy's `bic_random`; or any other [rank type](search.qmd#ranking-strictness-and-run-settings) |
+| `[rank] cutoff` | none | the improvement over its parent a candidate must show |
+
+**The occasions come from the base model.** `prepare_run` reads the
+dataset's occasion column when the model's `[fit_options]` names it
+(`iov_column = OCC`), and it is that population every candidate is fitted
+to — so the base must declare `iov_column` even though it has no `kappa`
+yet. A base without one is refused with that fix named, as is a `column`
+that disagrees with it, or an occasion column with a single value.
+
+## The algorithm
+
+Pharmpy's (`tools/iovsearch/tool.py`), two steps of brute force:
+
+1. **IOV.** The input is fitted, then `run1` — the input with a κ on
+   *every* candidate parameter, the full-IOV model — then one candidate per
+   non-empty subset of the **optional** κ removed, each derived from the
+   full-IOV model and seeded from its fit (smallest removals first, in
+   alphabetical order of the κ — Pharmpy's numbering). Removing *all* of
+   them is a candidate too whenever a plain `IOV(CL, EXP)` keeps one, since
+   what is left — the forced κ alone — is not the input; with nothing forced
+   it would be the input exactly, which is already ranked, so the
+   enumeration stops at Pharmpy's proper subsets there. The input, the
+   full-IOV model and the candidates are ranked together, with the input
+   as reference; if the input ranks best, the search ends on it.
+2. **IIV.** From the step-1 winner, one candidate per non-empty subset of
+   the η whose parameter also carries a κ, with those η removed — an
+   occasion-level random effect can make the subject-level one redundant,
+   and the line becomes `CL = TVCL * exp(KAPPA_CL)`. The winner and the
+   candidates are ranked; the best is the final model.
+
+Three optional candidate parameters mean one full-IOV model, six removal
+candidates and, from a winner with one κ, one η-removal candidate; one
+forced and one optional mean the full model and the forced-only model. A κ named by a
+plain `IOV(p, EXP)` is never removed; a parameter that already carries a κ
+in the input is left as it is, with a note; an η declared `FIX` is never
+removed.
+
+### What a candidate becomes
+
+A new κ starts at **a tenth of its η's variance** as the parent fitted it
+(Pharmpy's `add_iov`) and is written beside the η in the canonical form:
+
+```
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  kappa KAPPA_CL ~ 0.009
+```
+
+`joint` and `same-as-iiv` write `block_kappa (KAPPA_CL, KAPPA_V) = […]`
+with a 0.1 seed correlation. Removing a κ from a block shrinks the block
+around its survivors; a lone survivor is a `kappa` line again. Every
+candidate parameter must be in the canonical `P = TVP * exp(ETA_P)` form,
+or it is refused by name — see the
+[iivsearch page](iivsearch.qmd#the-space) for the rule.
+
+## Output
+
+The directory holds `models.csv` (one row per fitted model with its
+`description` in Pharmpy's spelling — `IIV([CL]+[KA]+[V]);IOV([CL])` — its
+criterion, Δ against the step's parent, rank within the step, convergence,
+strictness verdict, starts and seconds), `models/<id>.ferx`, `final.ferx`
+with the selected model's estimates written in, `final-fit.yaml` from the
+CLI, and one journalled runner directory per step (`input`, `iov-all`,
+`step-1`, `step-2`) for `--resume`.
+
+## Compared with Pharmpy
+
+The two steps, the candidate sets and their numbering, the κ init, the four
+distributions and the reference-model ranking are Pharmpy 2.2's
+`iovsearch`, read off its source. The deviations:
+
+- **The space.** Pharmpy takes `list_of_parameters`; ferx takes the same
+  list as `IOV?(...)` in the `[space]`, and adds the kept form `IOV(p, EXP)`
+  which Pharmpy has no way to say.
+- **A κ already in the input** is left as it is (Pharmpy's own `TODO`
+  leaves the question open and re-adds it).
+- **`[rank] cutoff`** is an improvement over the parent; Pharmpy reads its
+  `cutoff` only for the likelihood-ratio ranking.
+- **Strictness** is the `[strictness]` gate every search here applies.
+
+### The anchor
+
+`crates/ferx-tools/tests/pharmpy/iovsearch_anchor/` holds a 40-subject
+dataset over three dosing occasions simulated with IOV on CL only
+(κ² = 0.04), an IIV-only input model reading `OCC`, and Pharmpy 2.2.0's runs
+on it through NONMEM 7.5.1 for the `disjoint` and `same-as-iiv`
+distributions (`pharmpy_iovsearch.json`). `tests/iovsearch_pharmpy_anchor.rs`
+replays ferx on the same input (slow-gated). Step 1, ranked on the
+BIC(random):
+
+| model | Pharmpy | ferx |
+|---|---:|---:|
+| `IOV([CL])` — best | 1219.577 | 1219.577 |
+| `IOV([CL]+[V])` | 1222.053 | 1222.048 |
+| `IOV([CL]+[KA]+[V])` (full) | 1225.937 | 1225.738 |
+| input | 1315.980 | 1315.980 |
+
+Both engines pick `IOV([CL])`; in step 2 both fit `IIV([KA]+[V]);IOV([CL])`
+at 1273.951 and keep the parent. Same trajectory, same final model, to
+three decimals on every model both fitted to convergence.
+
+## From Rust
+
+```rust
+use ferx_tools::iovsearch::{run_iovsearch, IovsearchRun};
+use ferx_tools::search::SearchConfig;
+
+let config = SearchConfig::load("warfarin.ferxsearch")?;
+let base = config.load_base()?;
+let result = run_iovsearch(&config, &base, IovsearchRun::default())?;
+println!("{}", ferx_tools::iovsearch::render_summary(&result));
+```

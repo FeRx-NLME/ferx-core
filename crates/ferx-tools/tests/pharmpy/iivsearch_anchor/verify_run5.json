@@ -1,0 +1,14 @@
+{
+ "ofv": 655.4202059723775,
+ "minimization_successful": false,
+ "estimates": {
+  "TVCL": 0.127966,
+  "TVV": 7.60067,
+  "TVKA": 0.994171,
+  "ETA_CL": 0.12715,
+  "IIV_CL_IIV_V": 0.0720953,
+  "IIV_V": 0.0663062,
+  "IIV_KA": 0.00118275,
+  "sigma": 0.0235608
+ }
+}

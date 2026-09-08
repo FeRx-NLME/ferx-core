@@ -1,0 +1,30 @@
+# Inter-occasion variability search over examples/warfarin_iov.ferx (#1183).
+#
+#   ferx iovsearch examples/warfarin_iovsearch.ferxsearch
+#
+# The base model reads its occasions from the OCC column (`iov_column = OCC`
+# in its [fit_options]), which is what lets the candidates be fitted. It
+# already carries a κ on CL, which the search leaves as it is; with no
+# [space] the candidates are every other parameter with a free η — V and
+# KA — so the search asks whether they need occasion-level variability too,
+# and then whether any η beside a κ has become redundant. See
+# docs/tools/iovsearch.qmd.
+
+base = "warfarin_iov.ferx"
+data = "../data/warfarin_iov.csv"
+
+[iovsearch]
+distribution  = "same-as-iiv"   # or "disjoint", "joint", "explicit" (+ groups)
+block_retries = 2
+
+[rank]
+type = "bic"                    # the BIC(random): OFV + n_parameters * ln(n_subjects)
+
+[strictness]
+require_converged  = true
+reject_on_boundary = true
+
+[run]
+threads   = 4
+retries   = 2
+cache_dir = ".ferx-iovsearch"
