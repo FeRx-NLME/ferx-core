@@ -168,6 +168,110 @@ fn apply_to_pins_the_inner_fit_thread_count() {
     assert_eq!(opts.threads, Some(4));
 }
 
+/// Exercise the actual routing, not just the cache: an override must not divert
+/// two independently budgeted calls to one busy worker. Timeouts only guard
+/// against regression deadlocks; successful runs do not sleep.
+#[test]
+fn identical_overrides_preserve_concurrent_fit_capacity() {
+    use std::{sync::mpsc, thread, time::Duration, time::Instant};
+    let options = FitOptions {
+        threads: Some(1),
+        ode_reltol: 1e-11,
+        ..Default::default()
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let mut releases = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = mpsc::channel();
+            releases.push(tx);
+            let entered = entered_tx.clone();
+            let opts = &options;
+            handles.push(scope.spawn(move || {
+                install_on_fit_pool(opts, move || {
+                    assert_eq!(rayon::current_num_threads(), 1);
+                    assert_eq!(
+                        crate::ode::solver::effective_solver_options(Default::default()).reltol,
+                        1e-11
+                    );
+                    entered.send(thread::current().id()).unwrap();
+                    rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                })
+                .unwrap();
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let receive_before_deadline =
+            || entered_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let first = receive_before_deadline();
+        let second = receive_before_deadline();
+        // Unblock both callers before asserting so a failing test joins cleanly.
+        for tx in releases {
+            let _ = tx.send(());
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_ne!(
+            first.unwrap(),
+            second.expect("second fit was serialized onto the first fit's pool")
+        );
+    });
+}
+
+#[test]
+fn fit_routing_rejects_invalid_programmatic_ode_options() {
+    for (options, field) in [
+        (
+            FitOptions {
+                ode_reltol: f64::NAN,
+                ..Default::default()
+            },
+            "ode_reltol",
+        ),
+        (
+            FitOptions {
+                ode_abstol: -1.0,
+                ..Default::default()
+            },
+            "ode_abstol",
+        ),
+        (
+            FitOptions {
+                ode_max_steps: 0,
+                ..Default::default()
+            },
+            "ode_max_steps",
+        ),
+    ] {
+        let err = install_on_fit_pool(&options, || panic!("invalid options reached the fit"))
+            .expect_err("invalid Rust API options");
+        assert!(err.contains(field), "{err}");
+    }
+}
+
+#[test]
+fn nested_ode_scope_stays_on_the_enclosing_fit_pool() {
+    use std::thread;
+    let options = FitOptions {
+        threads: Some(1),
+        ode_reltol: 1e-11,
+        ..Default::default()
+    };
+    let ov = options.ode_solver_override();
+    let pool = ode_override_pool(ov, 1).expect("outer override pool");
+    pool.install(|| {
+        let outer_worker = thread::current().id();
+        let nested_worker =
+            with_fit_ode_scope(&options, || thread::current().id()).expect("nested ODE scope");
+        assert_eq!(
+            nested_worker, outer_worker,
+            "an internal SIR-style scope leased a second pool"
+        );
+    });
+}
+
 // ── end-to-end: what the inner fit actually does with the plan ───────────────
 
 fn one_cpt_model() -> CompiledModel {

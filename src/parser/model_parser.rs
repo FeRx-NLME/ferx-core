@@ -1370,6 +1370,7 @@ impl ThetaRefScope {
     }
 
     /// θ indices referenced so far in this scope.
+    #[cfg(feature = "nn")]
     fn recorded() -> Vec<usize> {
         REFERENCED_THETAS.with(|c| c.borrow().clone())
     }

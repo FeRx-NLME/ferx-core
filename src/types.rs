@@ -6934,10 +6934,11 @@ pub struct FitOptions {
     pub mu_referencing: bool,
     /// Number of rayon worker threads used for the per-subject parallel loops
     /// (inner EBE search, SAEM MH steps, SIR weighting, likelihood reductions).
-    /// `None` (default) leaves rayon's global pool alone, which means one
-    /// worker per logical CPU. `Some(n)` runs the fit inside a scoped local
-    /// pool of `n` threads — so the setting is per-call, not process-wide,
-    /// and different fits can use different thread counts.
+    /// `None` or `Some(0)` uses available cores minus one, clamped to 1..8,
+    /// unless explicitly configured through `configure_global_thread_pool`.
+    /// `Some(n)` for positive `n` exclusively leases a pool of that width for
+    /// this call. Idle pools are reused within a bounded cache; concurrent fits
+    /// keep independent budgets even when their ODE overrides are identical.
     pub threads: Option<usize>,
     /// Number of independent optimizations to run from perturbed starting values.
     /// `1` (default) is a single run — no behaviour change. When `> 1`, runs are

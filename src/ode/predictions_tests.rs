@@ -5173,7 +5173,7 @@ fn infusion_into_non_input_rate_cmt_is_untouched_on_gated_engines() {
 
     for i in 0..obs.len() {
         assert!(plain[i] > 0.0, "obs {i}: reference is degenerate (zero)");
-        for (engine, got) in [
+        for (_engine, got) in [
             ("ode_predictions_with_states", ws_pred[i]),
             ("with_states.state", ws[i][1]),
             ("ode_dense_solve_states", dense[i][1]),
@@ -10588,11 +10588,14 @@ mod break_collision_1186 {
 // measured right on both signs.
 mod lag_arrival_read_1226 {
     use super::*;
+    #[cfg(feature = "survival")]
     use crate::types::{PkModel, MAX_PK_PARAMS, PK_IDX_CL, PK_IDX_F, PK_IDX_LAGTIME, PK_IDX_V};
 
     const DOSE_TIME: f64 = 7.9;
     const OBS_TIME: f64 = 8.2;
+    #[cfg(feature = "survival")]
     const CL: f64 = 1.0;
+    #[cfg(feature = "survival")]
     const V: f64 = 10.0;
 
     /// NONMEM's own `ARR = TDOS + ALAG1` column, printed at 17 significant digits so the
@@ -10613,8 +10616,10 @@ mod lag_arrival_read_1226 {
     const NM_AFTER_ADVAN1: [f64; 2] = [4.5384479528235588E+01, 1.3420678956342749E+02];
     /// `results/lag_arrival_read_before_advan13.tab`, `IPRED = A(1)/V` — the ODE twin of
     /// the analytic ADVAN1 run, at `TOL=9`. Multiplied by `V` to compare as an amount.
+    #[cfg(feature = "survival")]
     const NM_BEFORE_ADVAN13: [f64; 2] = [1.4538447943810009E+01, 1.3420678940629491E+01];
     /// `results/lag_arrival_read_after_advan13.tab`, same columns.
+    #[cfg(feature = "survival")]
     const NM_AFTER_ADVAN13: [f64; 2] = [4.5384479438102048E+00, 1.3420678940629784E+01];
 
     /// 1-cpt IV, one state, amount readout — the ferx twin of `ADVAN1 TRANS2` with no
@@ -10623,6 +10628,7 @@ mod lag_arrival_read_1226 {
     /// only compartment resolves to — and the same slot the analytic
     /// `predict_concentration` arm reads, so every engine below sees one lag from one
     /// number.
+    #[cfg(feature = "survival")]
     fn spec() -> OdeSpec {
         OdeSpec {
             solver_opts: OdeSolverOptions {
@@ -10634,6 +10640,7 @@ mod lag_arrival_read_1226 {
         }
     }
 
+    #[cfg(feature = "survival")]
     fn pk_flat(lag: f64) -> Vec<f64> {
         let mut p = vec![0.0; MAX_PK_PARAMS];
         p[PK_IDX_CL] = CL;
@@ -10649,6 +10656,7 @@ mod lag_arrival_read_1226 {
     /// victim dose lands with the compartment non-empty and the pre/post-dose reads are
     /// 45.38 vs 145.38. On a single-dose fixture the incoming side is `g(x⁻) = 0` and a
     /// pre-dose read of 0.0 is indistinguishable from "nothing has happened yet".
+    #[cfg(feature = "survival")]
     fn doses() -> Vec<DoseEvent> {
         vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -10673,6 +10681,7 @@ mod lag_arrival_read_1226 {
 
     /// Central **amount** at `t` from the closed form: the first dose's residual plus the
     /// second dose iff it has already arrived.
+    #[cfg(feature = "survival")]
     fn closed_form(t: f64, lag: f64, post_dose: bool) -> f64 {
         let ke = CL / V;
         let second = if post_dose {
@@ -10683,6 +10692,7 @@ mod lag_arrival_read_1226 {
         100.0 * (-ke * (t - lag)).exp() + second
     }
 
+    #[cfg(feature = "survival")]
     const ENGINES: [&str; 6] = [
         "ode_predictions",
         "ode_predictions_with_states",
