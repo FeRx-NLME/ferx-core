@@ -4434,13 +4434,13 @@ fn covariance_sensitivities(
     let base_is_ode = ode_at(theta, eta);
     let jet_noise = if base_is_ode {
         if let Some(ode) = model.ode_spec.as_ref() {
-            ode.solver_opts.reltol
+            ode.effective_solver_opts().reltol
         } else {
             model
                 .effective_for(subject)
                 .ode_spec
                 .as_ref()?
-                .solver_opts
+                .effective_solver_opts()
                 .reltol
         }
     } else {
