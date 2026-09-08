@@ -90,11 +90,15 @@ delivers the mass.
 
 The domain is `mtt > 0` and `n ≥ 0`. It is enforced in two places:
 
-- **Typical values** (η = 0, per subject, so covariate relationships are
-  included) are validated at fit time. A non-finite or out-of-domain typical
-  value is rejected with `E_ABSORPTION_DOMAIN` — a clear error, not an opaque
-  `NaN` fit failure. Constrain the parameter so it stays in range, e.g.
-  `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
+- **Typical values** (η = κ = 0) are validated at fit time, at **every record's
+  own snapshot** — that record's covariate values and its `TIME` — because the
+  engine rebuilds this forcing per segment from the last event's snapshot, so a
+  parameter that only leaves the domain at a later observation is one it really
+  does apply ([#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235)). A
+  non-finite or out-of-domain typical value is rejected with
+  `E_ABSORPTION_DOMAIN` — a clear error, not an opaque `NaN` fit failure — and
+  the message names the record. Constrain the parameter so it stays in range,
+  e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
 - **Transient mid-fit excursions** are clamped. With an additive
   parameterisation (`MTT = TVMTT + ETA_MTT`), the inner EBE search or a
   finite-difference step can momentarily push `mtt ≤ 0` / `n < 0` even though the
@@ -537,8 +541,9 @@ Rules for the fraction multiplier:
   is rejected — a single pathway is written bare). This *structural* rule is checked
   at **parse time**, so it fires for every entry point. The *value* checks — each
   fraction in `(0, 1]` and the fractions summing to ≈ 1 (`E_ABSORPTION_FRACTION`) —
-  are evaluated at typical values by `fit()` / `ferx check`, and enforced on
-  `predict()` / `simulate()` as well (#588). Two pathways together still deliver
+  are evaluated at typical values by `fit()` / `ferx check`, at **every record's own
+  snapshot** as for the domain checks above, and enforced on `predict()` /
+  `simulate()` as well (#588, #1235). Two pathways together still deliver
   exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
 - The same multiplier works for `transit`/`weibull`/`first_order` terms, and on
   `zero_order(...)` as part of a `mixed` model — see

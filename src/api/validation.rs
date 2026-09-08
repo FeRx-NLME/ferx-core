@@ -1142,10 +1142,11 @@ pub(crate) fn check_absorption_dosing(
     // Parameter-domain validation (data-level): an out-of-domain or non-finite
     // input-rate parameter (e.g. transit `mtt ≤ 0` / `n < 0`, or igd `mat`/`cv2
     // ≤ 0`) would otherwise propagate as a NaN through the ODE RHS and surface
-    // only as an opaque fit failure. Evaluated on typical values (η = 0) per
-    // subject, so a covariate relationship that pushes a subject's typical
-    // parameter out of range is caught too. Reported once — a single fatal
-    // error already halts the fit.
+    // only as an opaque fit failure. Evaluated on typical values (η = κ = 0) at
+    // every record's own snapshot (#1235), so a covariate relationship — or a
+    // `TIME`-reading expression — that pushes a subject's typical parameter out
+    // of range at *any* record is caught, not only at the t=0 baseline. Reported
+    // once — a single fatal error already halts the fit.
     // Pathway-fraction **value** checks (below): each fraction in (0, 1], and the
     // fractions on a compartment sum to ≈ 1. The companion **structural** rules —
     // every term on a ≥2-pathway compartment must carry a fraction, and a *lone*
@@ -1157,82 +1158,85 @@ pub(crate) fn check_absorption_dosing(
     // check below runs unconditionally on any compartment that carries a fraction.
     use std::collections::BTreeMap;
 
-    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let mut buf = crate::pk::EventPkParams::default();
     'subjects: for subject in &population.subjects {
-        // Typical-value snapshot for an ODE-forcing-rate diagnostic: TIME at the
-        // start of the record (t=0).
-        let pk = (model.pk_param_fn)(
-            &model.default_params.theta,
-            &zero_eta,
-            &subject.covariates,
-            0.0,
-        );
-        for forcing in &ode.input_rate {
-            if let Err(msg) = forcing.validate(&pk.values) {
-                diags.push(
-                    Diagnostic::error(
-                        "E_ABSORPTION_DOMAIN",
-                        format!(
-                            "Built-in absorption input-rate parameter out of domain at typical \
-                             values (subject {}): {msg}. Constrain the parameter so it stays \
-                             positive (e.g. a log-normal `P = TVP * exp(ETA_P)` \
-                             parameterisation).",
-                            subject.id
-                        ),
-                    )
-                    .with_block("odes"),
-                );
-                break 'subjects;
+        // `SnapshotSet::AllRecords`, not `Doses`: the engine rebuilds the input-rate
+        // forcing per *segment* from `pk_now` — the last event's snapshot
+        // (`prepare_input_rates(ode, &ext_params_ed)`) — so these parameters are read at
+        // every record, observations included, and a covariate (or `TIME`) that pushes
+        // `mtt` out of domain only at a later observation is applied there (#1235).
+        for snap in typical_event_snapshots(model, subject, SnapshotSet::AllRecords, &mut buf) {
+            for forcing in &ode.input_rate {
+                if let Err(msg) = forcing.validate(snap.values) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_ABSORPTION_DOMAIN",
+                            format!(
+                                "Built-in absorption input-rate parameter out of domain at \
+                                 typical values (subject {}, {}): {msg}. Constrain the \
+                                 parameter so it stays positive (e.g. a log-normal \
+                                 `P = TVP * exp(ETA_P)` parameterisation).",
+                                subject.id,
+                                snap.record_label(),
+                            ),
+                        )
+                        .with_block("odes"),
+                    );
+                    break 'subjects;
+                }
             }
-        }
 
-        // Pathway-fraction value checks (#388, η = 0, per subject so a covariate on a
-        // fraction is caught too): each fraction in (0, 1], and the fractions on a
-        // compartment sum to ≈ 1. Reported once — a single fatal error halts the fit.
-        let mut frac_sum: BTreeMap<usize, f64> = BTreeMap::new();
-        for forcing in &ode.input_rate {
-            let Some(slot) = forcing.frac_slot else {
-                continue;
-            };
-            let fr = pk.values.get(slot).copied().unwrap_or(1.0);
-            if !(fr > 0.0 && fr <= 1.0) {
-                diags.push(
-                    Diagnostic::error(
-                        "E_ABSORPTION_FRACTION",
-                        format!(
-                            "Pathway fraction out of range at typical values (subject {}): \
-                             {fr} is not in (0, 1]. A `FR*fn(...)` multiplier is a \
-                             dose-splitting fraction — constrain it to (0, 1] (e.g. a logit \
-                             `FR = 1/(1+exp(-X))` parameterisation).",
-                            subject.id
-                        ),
-                    )
-                    .with_block("odes"),
-                );
-                break 'subjects;
+            // Pathway-fraction value checks (#388, η = 0, per record so a covariate on a
+            // fraction is caught too): each fraction in (0, 1], and the fractions on a
+            // compartment sum to ≈ 1. Reported once — a single fatal error halts the fit.
+            let mut frac_sum: BTreeMap<usize, f64> = BTreeMap::new();
+            for forcing in &ode.input_rate {
+                let Some(slot) = forcing.frac_slot else {
+                    continue;
+                };
+                let fr = snap.values.get(slot).copied().unwrap_or(1.0);
+                if !(fr > 0.0 && fr <= 1.0) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_ABSORPTION_FRACTION",
+                            format!(
+                                "Pathway fraction out of range at typical values (subject {}, \
+                                 {}): {fr} is not in (0, 1]. A `FR*fn(...)` multiplier is a \
+                                 dose-splitting fraction — constrain it to (0, 1] (e.g. a logit \
+                                 `FR = 1/(1+exp(-X))` parameterisation).",
+                                subject.id,
+                                snap.record_label(),
+                            ),
+                        )
+                        .with_block("odes"),
+                    );
+                    break 'subjects;
+                }
+                *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
             }
-            *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
-        }
-        for (&cmt, &sum) in &frac_sum {
-            // A lone fractioned term is rejected at parse (`build_ode_spec`), so every
-            // compartment reaching `frac_sum` has ≥2 partitioning terms — the Σ ≈ 1
-            // check needs no ≥2-pathway gate here (avoids the misleading "sum to <FR>,
-            // not 1" a lone term would otherwise trigger; #388 review #1, #588).
-            if (sum - 1.0).abs() > 1e-4 {
-                diags.push(
-                    Diagnostic::error(
-                        "E_ABSORPTION_FRACTION",
-                        format!(
-                            "Pathway fractions on compartment {} sum to {sum} at typical values \
-                             (subject {}), not 1. Declare fractions that partition the dose — \
-                             e.g. a parameter `FR` and a complementary `FR2 = 1 - FR`.",
-                            cmt + 1,
-                            subject.id
-                        ),
-                    )
-                    .with_block("odes"),
-                );
-                break 'subjects;
+            for (&cmt, &sum) in &frac_sum {
+                // A lone fractioned term is rejected at parse (`build_ode_spec`), so every
+                // compartment reaching `frac_sum` has ≥2 partitioning terms — the Σ ≈ 1
+                // check needs no ≥2-pathway gate here (avoids the misleading "sum to <FR>,
+                // not 1" a lone term would otherwise trigger; #388 review #1, #588).
+                if (sum - 1.0).abs() > 1e-4 {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_ABSORPTION_FRACTION",
+                            format!(
+                                "Pathway fractions on compartment {} sum to {sum} at typical \
+                                 values (subject {}, {}), not 1. Declare fractions that \
+                                 partition the dose — e.g. a parameter `FR` and a \
+                                 complementary `FR2 = 1 - FR`.",
+                                cmt + 1,
+                                subject.id,
+                                snap.record_label(),
+                            ),
+                        )
+                        .with_block("odes"),
+                    );
+                    break 'subjects;
+                }
             }
         }
     }
@@ -1647,9 +1651,150 @@ pub(crate) fn check_dose_compartments(
     diags
 }
 
-/// Every dose attribute the **engine** applies at a dose event — bioavailability `F`
-/// and lag time `ALAG`/`LAGTIME`, per dose compartment — must be finite at typical
-/// values, for every subject (#1189).
+/// Which of a subject's per-event `$PK` snapshots a data-level typical-value check
+/// evaluates at (#1235).
+///
+/// **The unifying contract is not "one snapshot set for the file" — it is "each check
+/// evaluates at the snapshots the engine reads *that* quantity at".** Measured, the
+/// checks here do not share one set:
+///
+/// * a lag / `F` / modeled `D{n}`/`R{n}` is read from `pk_at_dose[k]` **only**
+///   (`ode::predictions`' per-dose lag/`F` resolve, the sensitivity twin's `lag_val(k)`,
+///   and [`crate::dosing::resolve_subject_doses_with`]'s `pk_for_dose(k)`), so evaluating
+///   those at an *observation* snapshot would be a false positive — the engine never
+///   applies a lag there;
+/// * a built-in absorption input rate is rebuilt **per segment** from `pk_now`, the last
+///   event's snapshot (`prepare_input_rates(ode, &ext_params_ed)`), so its parameters are
+///   read at every record: dose, observation, EVID=2 and reset alike.
+///
+/// Naming the set at the call site is what keeps that difference visible instead of
+/// collapsing it into one answer that is wrong for one of the two.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SnapshotSet {
+    /// Dose events only, each at its own `dose.time` and covariate snapshot.
+    Doses,
+    /// Every data record — dose, observation, EVID=2 (pk-only) and EVID=3/4 (reset).
+    AllRecords,
+}
+
+/// One record's typical-value `$PK` snapshot, with the context a diagnostic needs to
+/// name *which* record went bad. Borrows `values` from the caller's
+/// [`EventPkParams`](crate::pk::EventPkParams) buffer, so a population sweep costs no
+/// per-record allocation.
+pub(crate) struct EventSnapshot<'a> {
+    /// The `$PK` values the engine resolves at this record — a `PkParams::values`.
+    pub values: &'a [f64],
+    /// The record's time, as the engine passes it to `$PK`.
+    pub time: f64,
+    /// The record kind, for the diagnostic: `dose`, `observation`, `EVID=2 record`,
+    /// `reset record`.
+    pub kind: &'static str,
+    /// 0-based index of the record within its kind.
+    pub index: usize,
+}
+
+impl EventSnapshot<'_> {
+    /// "Which record", for a diagnostic: `dose 2 at TIME=1000`. 1-based within its kind,
+    /// the way a data file reads.
+    pub(crate) fn record_label(&self) -> String {
+        format!("{} {} at TIME={}", self.kind, self.index + 1, self.time)
+    }
+}
+
+/// Materialize the typical-value (η = κ = 0) `$PK` snapshots that `set` names, through
+/// the **engine's own** materializers
+/// ([`compute_event_pk_params_into`](crate::pk::compute_event_pk_params_into), or its
+/// doses-only sibling, which shares the same gate and the same per-dose body) so a check
+/// cannot drift from what the engine resolves.
+///
+/// Going through the engine's builder rather than re-spelling
+/// `(pk_param_fn)(θ, 0, cov, t)` here is deliberate: it carries the per-event/static
+/// decision (`pk::subject_needs_per_event_pk`) rather than a paraphrase of it. That
+/// predicate fires on a time-varying covariate, a covariate that moves only on an EVID=2
+/// row, a reset row's own snapshot, **or a model that reads the `TIME` built-in** — and
+/// it is the last of those a `has_tv_covariates()` paraphrase drops, silently, on a
+/// model with no covariates at all (`ALAG1 = TVLAG*exp(TIME)`). A parameter-static
+/// subject takes the builder's constant arm, so it still costs exactly one `$PK`
+/// evaluation.
+///
+/// `buf` is caller-owned so a population loop allocates once and refills.
+///
+/// Returns empty for a subject with **no records at all** under
+/// [`SnapshotSet::AllRecords`]: the engine evaluates `$PK` nowhere for such a subject and
+/// integrates nothing, so there is no value it could apply.
+pub(crate) fn typical_event_snapshots<'a>(
+    model: &CompiledModel,
+    subject: &Subject,
+    set: SnapshotSet,
+    buf: &'a mut crate::pk::EventPkParams,
+) -> Vec<EventSnapshot<'a>> {
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let theta = &model.default_params.theta;
+    match set {
+        // Doses-only takes the cheap materializer: it shares the full builder's gate and
+        // its per-dose body (`pk::fill_dose_pk_params`, pinned bit-for-bit by
+        // `pk::tests::dose_only_snapshots_match_the_full_event_builder`), but skips the
+        // observation snapshots this set never reads. Going through the full builder
+        // instead measured 102,000 `$PK` evaluations against 2,000 on a synthetic 1000
+        // subjects × (2 doses + 100 observations) — 111.7 ms of `check_model_data` against
+        // 9.9 ms, where the whole check cost 9.0 ms before this widening.
+        SnapshotSet::Doses => {
+            crate::pk::compute_dose_pk_params_into(model, subject, theta, &zero_eta, &mut buf.dose);
+            // The other three stay empty rather than stale: this buffer is reused across
+            // a population, and the `AllRecords` arm below is the only reader.
+            buf.obs.clear();
+            buf.pk_only.clear();
+            buf.reset.clear();
+        }
+        SnapshotSet::AllRecords => {
+            crate::pk::compute_event_pk_params_into(model, subject, theta, &zero_eta, &mut *buf)
+        }
+    }
+    // Downgrade to a shared borrow so the returned snapshots can hold `'a` references
+    // into the buffer the call above just filled.
+    let buf: &'a crate::pk::EventPkParams = buf;
+    let mut out: Vec<EventSnapshot<'a>> = Vec::with_capacity(buf.dose.len());
+    for (k, p) in buf.dose.iter().enumerate() {
+        out.push(EventSnapshot {
+            values: &p.values[..],
+            time: subject.doses[k].time,
+            kind: "dose",
+            index: k,
+        });
+    }
+    if set == SnapshotSet::AllRecords {
+        for (j, p) in buf.obs.iter().enumerate() {
+            out.push(EventSnapshot {
+                values: &p.values[..],
+                time: subject.obs_times[j],
+                kind: "observation",
+                index: j,
+            });
+        }
+        for (m, p) in buf.pk_only.iter().enumerate() {
+            out.push(EventSnapshot {
+                values: &p.values[..],
+                time: subject.pk_only_times[m],
+                kind: "EVID=2 record",
+                index: m,
+            });
+        }
+        for (r, p) in buf.reset.iter().enumerate() {
+            out.push(EventSnapshot {
+                values: &p.values[..],
+                time: subject.reset_times[r],
+                kind: "reset record",
+                index: r,
+            });
+        }
+    }
+    out
+}
+
+/// Every dose attribute the **engine** applies at a dose event — bioavailability `F`,
+/// lag time `ALAG`/`LAGTIME`, and a modeled infusion duration `D{n}` / rate `R{n}`
+/// (#324's coded `RATE`), per dose compartment — must be finite at typical values, at
+/// **every dose record**, for every subject (#1189, widened by #1235).
 ///
 /// A `NaN` lag makes `dose.time + lag` non-finite, and with it every break derived from
 /// it, so the subject's integration timeline cannot be ordered. Until #1189 that
@@ -1663,27 +1808,68 @@ pub(crate) fn check_dose_compartments(
 /// zero `WT`, say. This is the front door for that case: reject before the fit runs,
 /// naming the subject.
 ///
-/// Evaluated at η = 0 and `TIME = 0`, per subject, so a covariate relationship that
-/// pushes one subject's typical attribute non-finite is caught — the same shape as the
-/// per-subject [`InputRateForcing::validate`](crate::pk::absorption::InputRateForcing::validate)
-/// loop in [`check_absorption_dosing`].
+/// Evaluated at η = κ = 0 at **each dose record's own snapshot** — the subject's
+/// covariate values there and that record's `TIME` — via
+/// [`typical_event_snapshots`]`(.., SnapshotSet::Doses, ..)`, which is the engine's own
+/// per-event materializer. So a covariate relationship that pushes one subject's typical
+/// attribute non-finite is caught whether it does so at the first dose or the tenth.
 ///
-/// **Scope, stated because the `TIME = 0` snapshot is a real limit and not a detail.**
-/// This reads the subject's *baseline* covariates only. A time-varying covariate that is
-/// benign at the first record and overflows at a later one is **not** caught here; it
-/// surfaces as the engine-side non-finite subject instead, which is the opaque outcome
-/// this check exists to pre-empt. Widening it to every dose-time snapshot is the obvious
-/// follow-up; it is not done here because the engine guard makes the missed case correct
-/// (just not diagnosed), and because the same `TIME = 0` limitation applies to every
-/// other per-subject typical-value check in this file, so fixing it in one place only
-/// would be misleading. It is a **separate** check rather than an
-/// extension of that loop, deliberately: `check_absorption_dosing` returns early unless
-/// the model has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt
-/// model has nothing to do with absorption.
+/// **Why the snapshot and the time both had to widen (#1235).** The original check
+/// evaluated once, at `(subject.covariates, TIME = 0)`, and both arguments were wrong
+/// relative to what the engine does. Two measured escapes, distinct:
+///
+/// * `ALAG1 = TVLAG*exp(WT)` with `WT` benign at dose 1 and large at dose 2 — the
+///   *covariate* axis;
+/// * `ALAG1 = TVLAG*exp(TIME)` with **no covariates at all** and a late dose — the
+///   *time* axis, since `pk::subject_needs_per_event_pk` fires on the `TIME` built-in
+///   alone, so the engine resolves `$PK` per dose while the check froze it at `0.0`.
+///
+/// Each returned `[]` from `check_model_data` and all-`NaN` from `predict()`. Widening
+/// only one axis leaves the other silently open, which is why the gate is the engine's
+/// predicate rather than a `has_tv_covariates()` paraphrase of it.
+///
+/// It is a **separate** check rather than an extension of the
+/// [`InputRateForcing::validate`](crate::pk::absorption::InputRateForcing::validate) loop
+/// in [`check_absorption_dosing`], deliberately: that one returns early unless the model
+/// has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt model has
+/// nothing to do with absorption. The two also read *different* snapshot sets — see
+/// [`SnapshotSet`].
+///
+/// **Two failure modes, not one, and the second is worse.** A non-finite lag or `F`
+/// makes the timeline unorderable and every prediction `NaN` — loud. A non-finite
+/// modeled `D{n}`/`R{n}` never becomes a `NaN` at all:
+/// [`DoseEvent::resolve_rate`](crate::types::DoseEvent) derives the missing half of the
+/// pair by division, and clamps to `DURATION_FLOOR` / `RATE_FLOOR` (`x > floor` is false
+/// for `NaN`), so the fit returns finite, silently wrong numbers. Measured on a 1-cpt
+/// ODE, `CL/V = 0.1`, `V = 10`, one 100-unit coded-`RATE` dose, observations at
+/// `t = 1, 4, 8`:
+///
+/// | | served | vs the correct infusion |
+/// |---|---|---|
+/// | `D1 = +inf` | `rate = amt/inf = 0` ⇒ not an infusion ⇒ instantaneous bolus | **1.90× high** at `t = 1` |
+/// | `R1 = +inf` | `duration = amt/inf = 0` ⇒ the same bolus | the same |
+/// | `D1 = NaN` | clamped to `DURATION_FLOOR = 1e-8` ⇒ a bolus again | the same |
+/// | `R1 = NaN` | clamped to `RATE_FLOOR = 1e-8` ⇒ `duration = amt/1e-8` | essentially nothing delivered |
+///
+/// The three bolus rows land within **8.2e-7** (1.8e-7 relative — the ODE tolerance) of
+/// the exact bolus solution `10·e^(−0.1t)`. That is why the value check for
+/// `D{n}`/`R{n}` lives here and not only in [`check_modeled_dose_rates`], which
+/// validates that the *slot exists* and never what it holds.
 ///
 /// Only compartments the data actually doses into are examined; a model with neither `F`
 /// nor a lag reads the `PkParams` defaults (1.0 / 0.0), finite by construction, so this
-/// is a no-op there. Reported once: a single fatal error already halts the fit.
+/// is a no-op there, and `D{n}`/`R{n}` is read only for a dose that actually codes
+/// `RATE`. Reported once: a single fatal error already halts the fit.
+///
+/// **There is no per-compartment de-dup, and its removal is part of the fix.** The
+/// original kept a `BTreeSet<usize>` of compartments and skipped a repeat, on the
+/// reasoning that one bad `ALAG{cmt}` should not be reported once per dose record. With
+/// one snapshot per subject that was harmless — every dose read the same value. Once the
+/// snapshot varies per dose it is a defect that defeats the widening on the commonest
+/// shape there is: repeat dosing into one compartment where an *early*, finite dose
+/// claims the key and the later bad one is skipped. It costs nothing to drop — the
+/// per-dose work is two array reads, and the function returns on the first error, so it
+/// never de-duplicated a *message* in the first place.
 ///
 /// **What can actually make one non-finite, measured.** The DSL's arithmetic is
 /// domain-guarded where you would expect: `/` returns `0.0` when the denominator is below
@@ -1696,51 +1882,105 @@ pub(crate) fn check_dose_attr_finiteness(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
+    use crate::types::{DoseAttr, RateMode};
     // NOT gated on `DoseAttrMap::is_empty()`: that reports only whether a
     // *compartment-indexed* attribute (`F1`/`ALAG2`/…) is declared, and the common
     // model spells a bare `lagtime` / `F`, which resolves through `PK_IDX_LAGTIME` /
     // `PK_IDX_F` with an empty indexed map. Gating there would skip exactly the
     // everyday case this exists for.
     let map = model.active_dose_attr_map();
-    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    // What a non-finite value *does*, per attribute. The two differ and the difference is
+    // the point: lag / `F` make the timeline unorderable (loud), while a modeled
+    // duration / rate is clamped to a floor and returns a silently wrong number.
+    const TIMELINE: &str = "The engine applies this at the dose event, so a non-finite \
+         value makes the subject's whole integration timeline non-finite and every \
+         prediction NaN.";
+    const CLAMPED_DURATION: &str = "This never reaches you as a NaN: \
+         `DoseEvent::resolve_rate` derives `rate = amt / duration`, so an infinite \
+         duration gives rate 0 — not an infusion at all — and a NaN is pulled to \
+         DURATION_FLOOR = 1e-8 (`x > floor` is false for NaN). Either way the engine \
+         serves this dose as an instantaneous bolus instead of the infusion the data \
+         asks for, and returns finite, silently wrong numbers (measured 1.90x high at \
+         one elimination half-time on a 1-cpt model).";
+    const CLAMPED_RATE: &str = "This never reaches you as a NaN: \
+         `DoseEvent::resolve_rate` derives `duration = amt / rate`, so an infinite rate \
+         gives duration 0 — an instantaneous bolus — and a NaN is pulled to \
+         RATE_FLOOR = 1e-8 (`x > floor` is false for NaN), spreading the dose over \
+         `amt / 1e-8` time units so that essentially nothing is delivered. Either way \
+         the engine returns finite, silently wrong numbers instead of the infusion the \
+         data asks for.";
+    // One buffer for the population: `typical_event_snapshots` resizes and refills it per
+    // subject, reusing the allocation.
+    let mut buf = crate::pk::EventPkParams::default();
     for subject in &population.subjects {
+        // A **cost** gate, not a correctness one — `SnapshotSet::Doses` already yields
+        // nothing for a doseless subject, so removing this changes no verdict. It earns
+        // its place by skipping the snapshot build entirely: that build is the engine's
+        // own materializer, which resolves `$PK` at every *observation* too, and a
+        // TTE-only subject can carry hundreds of them and not one dose.
         if subject.doses.is_empty() {
             continue;
         }
-        let pk = (model.pk_param_fn)(
-            &model.default_params.theta,
-            &zero_eta,
-            &subject.covariates,
-            0.0,
-        );
-        // De-dup per subject: a regimen repeats the same compartment many times and
-        // one bad `ALAG{cmt}` would otherwise be reported once per dose record.
-        let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        for dose in &subject.doses {
+        // `SnapshotSet::Doses`, not `AllRecords`: the engine reads a lag / `F` / modeled
+        // `D`/`R` at `pk_at_dose[k]` only, so an observation snapshot driving one
+        // non-finite is a value the engine never applies — a false positive.
+        for snap in typical_event_snapshots(model, subject, SnapshotSet::Doses, &mut buf) {
+            let dose = &subject.doses[snap.index];
             let cmt = dose.cmt_1based();
-            if !seen.insert(cmt) {
-                continue;
+            // The modeled infusion parameter, when this dose codes `RATE` (#324). Read
+            // exactly as `resolve_rate` reads it: `indexed_slot` with the **raw** `CMT`
+            // (it maps `0` → `1` itself) and `.get(slot).unwrap_or(0.0)` for a slot past
+            // the end. An *absent* slot is `check_modeled_dose_rates`'s error
+            // (`E_MODELED_{DURATION,RATE}_NO_PARAM`), not this one's, so it is skipped
+            // here rather than reported twice.
+            let modeled = match dose.rate_mode {
+                RateMode::Fixed => None,
+                RateMode::ModeledDuration => Some((
+                    DoseAttr::Duration,
+                    "modeled infusion duration (`D`)",
+                    CLAMPED_DURATION,
+                )),
+                RateMode::ModeledRate => {
+                    Some((DoseAttr::Rate, "modeled infusion rate (`R`)", CLAMPED_RATE))
+                }
             }
-            for (what, value) in [
-                (
+            .and_then(|(attr, what, consequence)| {
+                let slot = map.indexed_slot(attr, dose.cmt_raw())?;
+                Some((
+                    what,
+                    snap.values.get(slot).copied().unwrap_or(0.0),
+                    consequence,
+                ))
+            });
+            for (what, value, consequence) in [
+                Some((
                     "lag time (`lagtime` / `ALAG`)",
-                    map.lagtime(cmt, &pk.values),
-                ),
-                ("bioavailability (`F`)", map.f_bio(cmt, &pk.values)),
-            ] {
+                    map.lagtime(cmt, snap.values),
+                    TIMELINE,
+                )),
+                Some((
+                    "bioavailability (`F`)",
+                    map.f_bio(cmt, snap.values),
+                    TIMELINE,
+                )),
+                modeled,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if !value.is_finite() {
                     return vec![Diagnostic::error(
                         "E_DOSE_ATTR_NONFINITE",
                         format!(
                             "Dose {what} for compartment {cmt} is {value} at typical values \
-                             (subject {}). The engine applies this at the dose event, so a \
-                             non-finite value makes the subject's whole integration timeline \
-                             non-finite and every prediction NaN. The usual cause is an \
+                             (subject {}, {}). {consequence} The usual cause is an \
                              overflowing `exp(...)` — an exponential covariate model on an \
                              unscaled covariate — since `exp` is the one arithmetic here with \
                              no domain guard (`/` by ~0 returns 0, and `ln`/`sqrt` floor their \
-                             argument). Check this subject's covariate values.",
-                            subject.id
+                             argument). Check this subject's covariate values at that record, \
+                             and any `TIME` the expression reads.",
+                            subject.id,
+                            snap.record_label(),
                         ),
                     )
                     .with_block("individual_parameters")];
