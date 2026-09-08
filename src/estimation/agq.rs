@@ -1762,10 +1762,11 @@ impl<'a> SubjectScoreContext<'a> {
                 return Some(g);
             }
         }
-        self.finite_difference_score(subject, eta)
+        let joint_warm = stack_mode(eta, kappas);
+        self.finite_difference_score(subject, &joint_warm)
     }
 
-    fn reconverged_nll(&self, subject: &Subject, xv: &[f64], eta: &[f64]) -> Option<f64> {
+    fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
         use crate::estimation::parameterization::{compute_mu_k, unpack_params};
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
@@ -1778,7 +1779,7 @@ impl<'a> SubjectScoreContext<'a> {
             &p,
             self.options.inner_maxiter,
             self.options.inner_tol,
-            Some(eta),
+            Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
         );
@@ -1800,8 +1801,8 @@ impl<'a> SubjectScoreContext<'a> {
         (nll.is_finite() && nll < NLL_SENTINEL).then_some(nll)
     }
 
-    fn finite_difference_score(&self, subject: &Subject, eta: &[f64]) -> Option<Vec<f64>> {
-        self.reconverged_nll(subject, self.x, eta)?;
+    fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
+        self.reconverged_nll(subject, self.x, joint_warm)?;
         let mut g = vec![0.0; self.x.len()];
         for k in 0..self.x.len() {
             if self.fixed[k] {
@@ -1816,8 +1817,8 @@ impl<'a> SubjectScoreContext<'a> {
             if width.abs() < 1e-16 {
                 continue;
             }
-            let fp = self.reconverged_nll(subject, &xp, eta)?;
-            let fm = self.reconverged_nll(subject, &xm, eta)?;
+            let fp = self.reconverged_nll(subject, &xp, joint_warm)?;
+            let fm = self.reconverged_nll(subject, &xm, joint_warm)?;
             g[k] = (fp - fm) / width;
             if !g[k].is_finite() {
                 return None;

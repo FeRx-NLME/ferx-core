@@ -1191,15 +1191,7 @@ fn find_ebe_iov(
     // BSV mu shift (zeros when no mu-referencing). Kappas are not shifted.
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
 
-    // Initial flat vector: BSV portion is psi-space (warm + mu, defaulting
-    // to mu = prior mode); kappa portion starts at zero (prior mode for IOV).
-    let mut x = vec![0.0; n_flat];
-    x[..n_eta].copy_from_slice(&mu);
-    if let Some(warm) = eta_init {
-        for i in 0..n_eta.min(warm.len()) {
-            x[i] = warm[i] + mu[i];
-        }
-    }
+    let mut x = iov_initial_vector(n_eta, n_flat, &mu, eta_init);
 
     let omega_iov_ref = params.omega_iov.as_ref();
     // One buffer set per EBE solve, shared by its serial objective/line-search/FD
@@ -1455,6 +1447,24 @@ fn find_ebe_iov(
         kappas: kappas_vec,
         hard_reject: false,
     }
+}
+
+/// Build the IOV optimizer seed in `[psi_bsv, kappa_1, ..., kappa_K]` order.
+/// A legacy BSV-only warm start leaves kappas at their prior mode. A full joint
+/// warm start preserves fitted kappas, which is required when covariance-score
+/// finite differences reconverge the subject at nearby population parameters.
+fn iov_initial_vector(n_eta: usize, n_flat: usize, mu: &[f64], warm: Option<&[f64]>) -> Vec<f64> {
+    let mut x = vec![0.0; n_flat];
+    x[..n_eta].copy_from_slice(mu);
+    if let Some(warm) = warm {
+        for i in 0..n_eta.min(warm.len()) {
+            x[i] = warm[i] + mu[i];
+        }
+        if warm.len() == n_flat {
+            x[n_eta..].copy_from_slice(&warm[n_eta..]);
+        }
+    }
+    x
 }
 
 /// Jacobian d(pred)/d(bsv_eta) with kappas fixed. Returns an n_obs × n_eta
