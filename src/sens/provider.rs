@@ -5910,7 +5910,8 @@ fn run_obs<const NA: usize, const N: usize, const ALLOW_EXPLICIT: bool>(
         };
 
         // Analytic Form C readout (#650): replace the central concentration jet with
-        // `y = <expr>` over `Dual2<N>`. The central compartment **amount** is
+        // `y = <expr>` over the current `DualMixed<NA, N>` jet (`NA = N` on the
+        // full `Dual2<N>` path). The central compartment **amount** is
         // `concentration × V` (so a `central / V` readout recovers the concentration and
         // an additive term layers on); the readout's `∂y/∂pk` / `∂²y/∂pk²` then ride the
         // same `pd` chain to `(θ, η)` below. Covariates come from the per-observation
