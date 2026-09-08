@@ -98,7 +98,8 @@ pub mod structure;
 mod report;
 
 pub use report::{
-    final_model_path, models_dir, models_path, render_summary, write_report, MODEL_COLUMNS,
+    final_model_path, models_dir, models_path, render_summary, structure_label, write_report,
+    MODEL_COLUMNS,
 };
 pub use structure::{
     Absorption, Defaults, FeatureKey, IivStrategy, Structure, Template, TransitCount,

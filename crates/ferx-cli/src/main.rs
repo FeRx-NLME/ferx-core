@@ -1,4 +1,5 @@
 mod allometry_cmd;
+mod amd_cmd;
 mod bootstrap_cmd;
 mod bootstrap_progress;
 mod covsearch_cmd;
@@ -35,6 +36,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx iivsearch --help`)
        ferx iovsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx iovsearch --help`)
+       ferx amd       <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx amd --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -155,6 +158,10 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("iovsearch") {
         std::process::exit(iovsearch_cmd::run(&args));
+    }
+    // `ferx amd` (#1184): the whole pipeline, one tool after another.
+    if args.get(1).map(String::as_str) == Some("amd") {
+        std::process::exit(amd_cmd::run(&args));
     }
 
     if args.len() < 2 {
