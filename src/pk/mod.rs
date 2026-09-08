@@ -2556,9 +2556,9 @@ pub fn compute_predictions_with_tv(
 /// `Vec<PkParams>` on every call is the dominant allocator-pressure
 /// source on TV-cov datasets.
 ///
-/// The scratch buffer is **only used on the TV-cov analytical/ODE
-/// path**; the no-TV fast path doesn't touch it. Callers can pass the
-/// same scratch unconditionally — the no-TV path just ignores it.
+/// The scratch buffer is used by per-event analytical/ODE paths, including
+/// time-varying covariates, `TIME`, and resets. Static fast paths do not touch
+/// it. Callers can start with an empty buffer and reuse it unconditionally.
 pub fn compute_predictions_with_tv_into(
     model: &crate::types::CompiledModel,
     subject: &Subject,

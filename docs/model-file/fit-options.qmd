@@ -43,11 +43,15 @@ What runs, how long, and how it is resumed or traced.
 | `checkpoint_interval_secs` | integer | `300` | Minimum wall-clock seconds between checkpoint writes. Larger values reduce I/O overhead but lose more progress on an interrupt; smaller values save more often. Only used when `checkpoint = true`. |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
 
-**Worker reuse for repeated fits.** Default fits share a persistent worker pool.
+#### Worker reuse for repeated fits
+
+Default fits share a persistent worker pool.
 Fits with a positive `threads` value, or fit-level ODE overrides, exclusively
 lease a pool for the call. An idle pool with the same width and solver settings
 can be reused; concurrent fits get independent pools even when their settings
 match. This preserves the per-fit budgets assigned by `PoolPlan`.
+This isolates worker budgets and ODE settings; concurrent fits should still use
+consistent process-wide inner-optimizer and EBE warm-start settings.
 
 Idle pools retain at most twice the automatic thread budget across all settings
 (at most 16 workers). Older idle pools are evicted, and pools wider than that

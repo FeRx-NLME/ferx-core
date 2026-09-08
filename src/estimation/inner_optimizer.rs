@@ -827,9 +827,9 @@ pub fn find_ebe(
     // to re-sort + re-allocate on every call. The EventPkParams scratch
     // recycles the per-event Vec<PkParams> backing storage.
     //
-    // Both are built only when this subject takes the TV-cov event-driven
-    // analytical path — for the no-TV fast path the schedule is None and
-    // event_driven_predictions is never called.
+    // Event parameter storage is allocated lazily by per-event prediction paths.
+    // The schedule is built only when cacheable_schedule permits reuse; a static
+    // fast path needs neither event storage nor a merged schedule.
     let pk_scratch_cell = RefCell::new(pk::EventPkParams::default());
     let schedule = cacheable_schedule(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so

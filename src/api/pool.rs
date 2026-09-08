@@ -387,6 +387,8 @@ impl PoolPlan {
     /// Run `op` on an exclusively leased outer Rayon pool of
     /// [`replicates`](Self::replicates) workers, each with the ferx worker stack
     /// ([`FIT_RAYON_STACK_SIZE`]). Idle pools are reused within a bounded cache.
+    /// The lease lasts until `op` returns. Join any unscoped spawned work before
+    /// returning if it must finish before another caller can reuse the pool.
     ///
     /// Any `par_iter` inside `op` fans out over that pool. Returns `Err` if the
     /// pool cannot be built (e.g. resource limits).

@@ -91,7 +91,7 @@ impl PoolCache {
     }
 }
 
-/// Owns one pool until all work installed by this caller has completed. Returning
+/// Owns one pool until the caller's scoped work has completed. Returning
 /// it on unwind is safe too: Rayon propagates a panic after its scoped work joins.
 pub(crate) struct FitPoolLease<'a> {
     entry: Option<CachedPool>,
