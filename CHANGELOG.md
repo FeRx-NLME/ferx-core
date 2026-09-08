@@ -215,6 +215,10 @@ section of the SDLC for the versioning policy).
   `ofv = NaN` with no warning mentioning the subject, the timeline or `NaN`. The counter reports
   *walks*, not subjects (a subject whose predictions and `[odes]` state readout are both
   requested contributes more than one), and it rides in the warning's `details` payload.
+  `ode_predictions_with_solver_stats` reports it too. The `ode_solver` message no longer ends
+  by recommending a different `ode_method` or looser tolerances when the only thing that went
+  wrong is an abandoned walk: nothing was integrated, so no solver setting changes the
+  outcome, and the message now says that instead.
 - Deeply saturated, over-capacity steady-state input-rate models no longer let
   Anderson acceleration report a huge spurious periodic state when integration
   error hides the positive per-cycle surplus (#867, PR #955).

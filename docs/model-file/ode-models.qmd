@@ -673,6 +673,11 @@ read exactly like a subject there was nothing to integrate for. It is not an `od
 problem and no solver setting fixes it: check the dose records, and any exponential covariate
 model on `ALAG` / `F` / `D` / `R` that can overflow at typical covariate values.
 
+The counter is reported by `fit()`. `predict()`, `simulate()` and `predict_survival()` still
+return `NaN` for such a subject and say nothing about it — the solver-statistics scope those
+counters accumulate into is opened by the fit only. The `NaN` itself is the signal on those
+entry points, as it was before.
+
 #### When the derivatives overflow but the predictions do not
 
 One rejection reason is not about the method at all. A dual number's derivative jets carry

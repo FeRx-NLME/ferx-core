@@ -661,13 +661,28 @@ pub struct OdeSolverStats {
     /// `ode_predictions_with_states` once). Zero on every well-formed fit, so any non-zero value
     /// means some subject's predictions are `NaN` by construction.
     ///
-    /// Recorded on all eight `f64` engine sites — the four dense / event-driven prediction
-    /// walks, the adaptive driver and its frozen replay, the EKF walk, and
-    /// `ode_solve_until_chz_threshold`'s event-time solve, which is not a prediction walk but is
-    /// abandoned for the same reason and would otherwise be the one silent hole. The two
-    /// analytic-sensitivity walks
-    /// (`sens::ode_provider`) carry the same guard but deliberately do **not** bump it: their
-    /// sweep is collected in its own scope from which `fit_inner` copies exactly one field
+    /// Recorded on all eight `f64` engine sites, through
+    /// `ode::predictions::abandon_non_finite_timeline` — the predicate and this counter are one
+    /// call, so a ninth guard cannot be written that detects an unorderable timeline without
+    /// reporting it (pinned by
+    /// `the_bare_timeline_predicates_are_not_called_outside_this_guard`). The eight are the four
+    /// dense / event-driven prediction walks, the adaptive driver and its frozen replay, the EKF
+    /// walk, and `ode_solve_until_chz_threshold`'s event-time solve.
+    ///
+    /// **Three of the eight cannot fire in production today, and that is scope, not an
+    /// oversight.** Outside tests, `SolverStatsScope::enter` appears in exactly two places in
+    /// the tree, both in `api::fit`; `simulate.rs`, `predict.rs` and `sim/adaptive.rs` open
+    /// none. So the adaptive driver, its frozen replay and the CHZ event-time solve — reached
+    /// only under `simulate()` — record into an inactive sink and contribute nothing to any
+    /// warning. They carry the recorder so that wiring a scope onto those paths is a one-line
+    /// change rather than a re-audit, and each is exercised in an explicit scope by its own
+    /// test. Nor is the CHZ one "the one silent hole" it was described as before this
+    /// correction: its sole production caller (`survival::draw_ode_tte_latent`) `panic!`s on
+    /// `SolveFailed`, which is the loudest outcome of the eight.
+    ///
+    /// The two analytic-sensitivity walks (`sens::ode_provider`) carry the same predicate and
+    /// deliberately do **not** bump this: their sweep is collected in its own scope from which
+    /// `fit_inner` copies exactly one field
     /// ([`auto_stiff_rejected_jets`](Self::auto_stiff_rejected_jets)), so a gradient-solve event
     /// deposited here would either be discarded or — if that copy were widened — fire a warning
     /// clause about predictions.

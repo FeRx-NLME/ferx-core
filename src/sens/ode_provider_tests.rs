@@ -10244,6 +10244,16 @@ fn the_static_walk_returns_a_non_finite_value_with_finite_zero_jets() {
     let sens = ode_subject_sensitivities(&m, &s, &[1.0, 10.0], &[0.0])
         .expect("the static walk answers Some for a diverged subject — it does not decline");
 
+    // Non-degeneracy: every assertion below lives inside this loop, so an empty `obs` would
+    // run none of them and the test would pass having checked nothing — and "the walk bails
+    // before recording observations" is exactly the state this test is about.
+    assert_eq!(
+        sens.obs.len(),
+        4,
+        "the walk must return the fixture's four observations, or the loop below asserts \
+         nothing: {:?}",
+        sens.obs.iter().map(|o| o.f).collect::<Vec<_>>()
+    );
     for (j, o) in sens.obs.iter().enumerate() {
         assert!(
             o.f.is_nan(),
@@ -10281,6 +10291,15 @@ fn the_scaled_readout_is_what_masked_the_zero_jets() {
     let s = nan_dose_time_subject(&[1.0, 2.0, 4.0, 8.0]);
     let sens = ode_subject_sensitivities(&m, &s, &[1.0, 10.0], &[0.0, 0.0]).expect("Some");
 
+    // Non-degeneracy, as T5: an empty `obs` would make this control vacuous, and a control
+    // that asserts nothing cannot explain anything.
+    assert_eq!(
+        sens.obs.len(),
+        4,
+        "the walk must return the fixture's four observations, or the loop below asserts \
+         nothing: {:?}",
+        sens.obs.iter().map(|o| o.f).collect::<Vec<_>>()
+    );
     for (j, o) in sens.obs.iter().enumerate() {
         assert!(o.f.is_nan(), "scaled readout, obs {j}: f = {}", o.f);
         assert!(
@@ -10347,6 +10366,14 @@ fn the_event_driven_walk_returns_a_non_finite_value_with_finite_zero_jets() {
          testing nothing",
     );
 
+    // Non-degeneracy, as T5.
+    assert_eq!(
+        sens.obs.len(),
+        8,
+        "the walk must return the fixture's eight observations, or the loop below asserts \
+         nothing: {:?}",
+        sens.obs.iter().map(|o| o.f).collect::<Vec<_>>()
+    );
     for (j, o) in sens.obs.iter().enumerate() {
         assert!(
             o.f.is_nan(),
@@ -10407,6 +10434,15 @@ fn a_diverged_subject_answers_some_rather_than_declining_to_fd() {
          perturbation more expensively, and `integrate_tvcov_g` — the event-driven twin that \
          an estimated lagtime routes to — returns a bare Vec with no `None` channel at all, so \
          `None` here would create the cross-walk asymmetry rather than remove one",
+    );
+    // Non-degeneracy: `.all()` on an empty `obs` is `true`, so without this the DIVERGED
+    // assertion below passes on a walk that returned nothing at all.
+    assert_eq!(
+        sens.obs.len(),
+        3,
+        "the walk must return the fixture's three observations, or `.all()` below is \
+         vacuously true: {:?}",
+        sens.obs.iter().map(|o| o.f).collect::<Vec<_>>()
     );
     assert!(
         sens.obs.iter().all(|o| o.f.is_nan()),

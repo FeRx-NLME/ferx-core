@@ -713,6 +713,13 @@ fn static_walk(subj: &Subject) -> (OdeSolverStats, Vec<f64>) {
 #[test]
 fn the_static_walk_separates_an_abandoned_timeline_from_nothing_to_integrate() {
     let (abandoned, preds) = static_walk(&nan_dose_time_subject("bad"));
+    // `.all()` is vacuously true on an empty `preds`, and "the walk bails before recording
+    // observations" is the state under test — so the length is asserted before the premise.
+    assert_eq!(
+        preds.len(),
+        4,
+        "the fixture must have observations: {preds:?}"
+    );
     assert!(
         preds.iter().all(|p| p.is_nan()),
         "static walk: the fixture must actually be abandoned (NaN predictions), got {preds:?}"
@@ -785,6 +792,12 @@ fn the_event_driven_walk_separates_an_abandoned_timeline_from_nothing_to_integra
     };
 
     let (abandoned, preds) = run(&nan_dose_time_subject("bad"));
+    // As T1: `.all()` on an empty `preds` asserts nothing.
+    assert_eq!(
+        preds.len(),
+        4,
+        "the fixture must have observations: {preds:?}"
+    );
     assert!(
         preds.iter().all(|p| p.is_nan()),
         "event-driven walk: the fixture must actually be abandoned, got {preds:?}"
@@ -883,6 +896,20 @@ fn a_fit_over_an_unorderable_timeline_says_so() {
     // alone, so deleting either recorder would leave this test green (the redundant-gate hole);
     // pinning the count makes each site load-bearing here too, and it is the measurement behind
     // the message's "counts walks, not subjects" clause.
+    //
+    // **The count is asserted to be lane-independent**, and the test carries no feature gate
+    // because of it. The three walks are `ode_predictions` and `ode_predictions_with_states`,
+    // both unconditional in the post-fit sweep. The other five recorders sit on engines this
+    // fixture cannot reach: the scope wraps `compute_subject_results` only (`api/fit.rs:1912`),
+    // so `ode_dense_solve_states`' reachable callers all need a model feature this fixture does
+    // not have (a markov endpoint, a hazard state, a TV-covariate model — its
+    // `api/output_columns.rs` caller runs after the scope closes), the adaptive pair is
+    // `simulate()`-only, and `ode_solve_until_chz_threshold` needs a `chz` slot. That, not the
+    // feature flags themselves, is why `ci` and `ci,markov,nn` both read 3 (checked at
+    // `335cb9e5`, both lanes SUCCESS). If a future change routes one of those into the post-fit
+    // pass this number becomes lane-dependent, and the failure would read as a broken recorder
+    // rather than a feature-sensitive fixture — gate the test then rather than loosening it to
+    // `> 0`.
     assert_eq!(
         abandoned, 3,
         "one NaN-timeline subject is abandoned once per prediction walk the post-fit sweep \
