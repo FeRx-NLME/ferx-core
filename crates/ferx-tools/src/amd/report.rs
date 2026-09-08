@@ -313,10 +313,16 @@ fn status(r: &CandidateRow) -> String {
         return format!("failed: {e}");
     }
     if r.selected {
-        return match &r.note {
-            Some(note) => format!("SELECTED ({note})"),
-            None => "SELECTED".into(),
+        // The gate's verdict is not dropped just because the row won: a step
+        // that had to carry something forward may have carried a model the
+        // gate rejected, and the reader has to see that beside the word.
+        let why = match (&r.note, r.passed) {
+            (Some(note), true) => format!(" ({note})"),
+            (Some(note), false) => format!(" ({note}; failed the gate: {})", r.failures.join("; ")),
+            (None, true) => String::new(),
+            (None, false) => format!(" (failed the gate: {})", r.failures.join("; ")),
         };
+        return format!("SELECTED{why}");
     }
     if !r.passed {
         return format!(

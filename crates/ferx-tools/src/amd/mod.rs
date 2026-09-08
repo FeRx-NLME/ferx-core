@@ -402,7 +402,14 @@ pub struct CandidateRow {
     pub parent: Option<String>,
     /// What the candidate *is*: its structure, its η set, the effect added.
     pub description: String,
-    /// [`Criterion::label`] of what this step ranked on.
+    /// What [`value`](Self::value) is **on**: [`Criterion::label`] of what the
+    /// step ranked on, for a candidate it ranked.
+    ///
+    /// Not always the step's own criterion, because not every row is a fit to
+    /// the data. A ruvsearch CWRES pre-screen candidate is fitted to the
+    /// parent's conditional weighted residuals, so its number is on the CWRES
+    /// pseudo-data scale (`cwres_ofv`) and belongs in a differently-labelled
+    /// column from the data OFVs it must never be compared with.
     pub criterion: &'static str,
     /// The criterion's value; `None` when there is no fit to evaluate it on.
     pub value: Option<f64>,
@@ -888,7 +895,8 @@ pub(crate) fn drive(
         // The step's own criterion, evaluated on the model it started from —
         // the tools report their candidates against their own base, and the
         // pipeline needs the comparison against what it handed them.
-        let value_before = fit_before.as_ref().map(|f| output.criterion.of(f));
+        let criterion = output.criterion;
+        let value_before = fit_before.as_ref().map(|f| criterion.of(f));
         let mut outcome = StepOutcome {
             index: planned.index,
             step: planned.step,
@@ -896,7 +904,7 @@ pub(crate) fn drive(
             dir: planned.dir.clone(),
             skipped: None,
             failed: None,
-            criterion: output.criterion.label(),
+            criterion: criterion.label(),
             value_before,
             value_after: output.value,
             ofv_before: fit_before.as_ref().map(|f| f.ofv),
@@ -909,7 +917,7 @@ pub(crate) fn drive(
         emit(AmdEvent::StepFinished {
             index: planned.index,
             step: planned.step,
-            criterion: output.criterion.label(),
+            criterion: criterion.label(),
             before: value_before,
             after: output.value,
             selected: output.selected.clone(),
@@ -929,7 +937,7 @@ pub(crate) fn drive(
 
         if options.retries == Retries::AllFinal {
             let dir_name = format!("{}-retries", planned.dir);
-            let outcome = retries_pass(
+            let attempt = retries_pass(
                 runner,
                 config,
                 Some(planned.index),
@@ -940,14 +948,30 @@ pub(crate) fn drive(
                 &mut notes,
                 progress,
             );
-            note_retries_failure(&mut notes, &dir_name, outcome);
+            let pass = note_retries_failure(&mut notes, &dir_name, attempt);
+            // The pass belongs to this step — its seconds are in this step's
+            // wall clock and its row is under this step's index — so when it
+            // replaces the fit, the step has to end where it actually ended.
+            // Leaving the pre-retry numbers here makes `steps.csv` disagree
+            // with itself: this row's `ofv_after` against the next row's
+            // `ofv_before`, on exactly the runs where the retry did its job.
+            if pass.improved {
+                outcome.ofv_after = current_fit.as_ref().map(|f| f.ofv);
+                outcome.value_after = current_fit.as_ref().map(|f| criterion.of(f));
+            }
+            if pass.cancelled {
+                outcome.seconds = started.elapsed().as_secs_f64();
+                steps.push(outcome);
+                cancelled = true;
+                break;
+            }
         }
         outcome.seconds = started.elapsed().as_secs_f64();
         steps.push(outcome);
     }
 
     if !cancelled && options.retries == Retries::Final {
-        let outcome = retries_pass(
+        let attempt = retries_pass(
             runner,
             config,
             None,
@@ -958,7 +982,7 @@ pub(crate) fn drive(
             &mut notes,
             progress,
         );
-        note_retries_failure(&mut notes, "retries", outcome);
+        cancelled = note_retries_failure(&mut notes, "retries", attempt).cancelled;
     }
 
     Ok(AmdResult {
@@ -974,14 +998,32 @@ pub(crate) fn drive(
     })
 }
 
+/// What one perturbed-restart pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RetriesOutcome {
+    /// The pass landed lower and its fit was adopted.
+    pub improved: bool,
+    /// The pass was cancelled; the pipeline stops here.
+    pub cancelled: bool,
+}
+
 /// A failed retries pass costs the pass, not the model it was refining — the
-/// selected model and its fit are already in hand.
-fn note_retries_failure(notes: &mut Vec<String>, dir_name: &str, outcome: Result<(), String>) {
-    if let Err(error) = outcome {
-        notes.push(format!(
-            "the retries pass on `{dir_name}` could not be run: {error}; the selected model was \
-             kept"
-        ));
+/// selected model and its fit are already in hand, so the error is a note and
+/// the run carries on as if the pass had not improved anything.
+fn note_retries_failure(
+    notes: &mut Vec<String>,
+    dir_name: &str,
+    outcome: Result<RetriesOutcome, String>,
+) -> RetriesOutcome {
+    match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            notes.push(format!(
+                "the retries pass on `{dir_name}` could not be run: {error}; the selected model \
+                 was kept"
+            ));
+            RetriesOutcome::default()
+        }
     }
 }
 
@@ -1054,7 +1096,7 @@ fn retries_pass(
     rows: &mut Vec<CandidateRow>,
     notes: &mut Vec<String>,
     progress: Option<ProgressFn<'_>>,
-) -> Result<(), String> {
+) -> Result<RetriesOutcome, String> {
     let starts = config.run.retries + 1;
     if starts < 2 {
         notes.push(
@@ -1062,7 +1104,7 @@ fn retries_pass(
              would refit the selected model at its own estimates"
                 .into(),
         );
-        return Ok(());
+        return Ok(RetriesOutcome::default());
     }
     let emit = |event: AmdEvent| {
         if let Some(f) = progress {
@@ -1070,7 +1112,7 @@ fn retries_pass(
         }
     };
     emit(AmdEvent::RetriesStarted { index, starts });
-    let output = runner.fit_one(
+    let mut output = runner.fit_one(
         index.unwrap_or(0),
         "retries",
         dir_name,
@@ -1089,6 +1131,14 @@ fn retries_pass(
              model was kept"
         ));
     }
+    // `fit_one` marks its one candidate selected — right for the pipeline's
+    // start fit, whose model *is* what the run carries forward, and wrong for
+    // a pass whose fit is only adopted when it improves. A rejected pass left
+    // as `selected` prints `SELECTED` beside the note saying it was not taken.
+    for row in &mut output.rows {
+        row.selected = improved;
+    }
+    let cancelled = output.cancelled;
     rows.extend(output.rows);
     notes.extend(output.notes);
     if improved {
@@ -1105,7 +1155,10 @@ fn retries_pass(
         improved,
         ofv: if improved { after } else { before },
     });
-    Ok(())
+    Ok(RetriesOutcome {
+        improved,
+        cancelled,
+    })
 }
 
 /// The config one step is handed: this file, with the space narrowed to the

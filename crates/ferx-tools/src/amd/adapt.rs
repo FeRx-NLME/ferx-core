@@ -406,6 +406,13 @@ fn from_ruvsearch(index: usize, tool: &str, result: RuvsearchResult) -> StepOutp
         .rows
         .iter()
         .map(|r| {
+            // A CWRES pre-screen candidate is fitted to the *parent's
+            // conditional weighted residuals*, not to the data
+            // (`RuvsearchOptions::cwres_prescreen`), so its `ofv` is on the
+            // CWRES pseudo-data scale. Putting it in the pipeline's `ofv`
+            // column would place it beside the data OFVs of every other step
+            // and invite a comparison that means nothing, so it goes in
+            // `value` under its own label and the data columns stay empty.
             let mut row = ranked_row(
                 index,
                 tool,
@@ -417,7 +424,7 @@ fn from_ruvsearch(index: usize, tool: &str, result: RuvsearchResult) -> StepOutp
                 Criterion::Ofv,
                 r.ofv.unwrap_or(f64::NAN),
                 r.ofv.map(|o| o - r.parent_ofv),
-                r.ofv,
+                if r.screened { None } else { r.ofv },
                 None,
                 r.converged,
                 r.passed,
@@ -426,10 +433,26 @@ fn from_ruvsearch(index: usize, tool: &str, result: RuvsearchResult) -> StepOutp
                 r.seconds,
                 r.selected,
             );
-            row.d_ofv = r.ofv.map(|o| o - r.parent_ofv);
+            if r.screened {
+                row.criterion = "cwres_ofv";
+                // `cwres_dofv` is the CWRES *base minus this row*, so its sign
+                // is the opposite of the pipeline's `d` convention (negative
+                // is better). Negated here rather than recomputed, so the
+                // number is the one ruvsearch decided on.
+                row.d_value = r.cwres_dofv.map(|d| -d);
+            } else {
+                row.d_ofv = r.ofv.map(|o| o - r.parent_ofv);
+            }
             row.note = match (&r.note, r.lrt.as_ref()) {
                 (Some(note), _) => Some(note.clone()),
                 (None, Some(lrt)) => Some(format!("p = {:.4} (df {})", lrt.p_value, lrt.df)),
+                // `selected` on a screened row means "this is the feature the
+                // pre-screen chose to refit on the data" — the opposite of
+                // being screened out, which is what every screened row used to
+                // say.
+                (None, None) if r.screened && r.selected => {
+                    Some("chosen by the CWRES pre-screen for the data refit".to_string())
+                }
                 (None, None) if r.screened => Some("screened out on CWRES".to_string()),
                 (None, None) => None,
             };
@@ -575,3 +598,7 @@ fn from_allometry(
         cancelled: result.cancelled,
     }
 }
+
+#[cfg(test)]
+#[path = "adapt_tests.rs"]
+mod tests;

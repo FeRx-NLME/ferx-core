@@ -245,6 +245,13 @@ likelihood-ratio p-value, a CWRES pre-screen decision, an extra start count.
 parent is elsewhere is left blank rather than compared against an unrelated
 model.
 
+`criterion` says what `value` is *on*, which is not always the step's own
+ranking criterion: a [ruvsearch CWRES pre-screen](ruvsearch.qmd) candidate is
+fitted to the parent's conditional weighted residuals, so its number is on the
+CWRES pseudo-data scale. Those rows report `cwres_ofv` in `value` and leave
+`ofv` and `d_ofv` empty, so a number that is not a data OFV never sits in the
+column the rest of the table compares.
+
 ### What else is written
 
 * `final.ferx` — the model the pipeline ended on, seeded from its own
@@ -274,13 +281,19 @@ ferx amd examples/amd_start.ferxsearch --directory amd-run --threads 8
 
 ```
   #   step         criterion          before        after          d  cand  seconds  selected
-  1   structural   bic_mixed        -147.212     -660.287   -513.075     2      0.1  FO, 1 peripheral
-  2   iivsearch    bic_iiv          -689.984    -1168.447   -478.463    17      1.9  [CL]+[KA]+[Q]+[V]+[V2]
-  3   residual     ofv             -1185.453    -1185.453     +0.000     7     10.6  no residual-error feature added
+  1   structural   bic_mixed        -147.212     -660.366   -513.154     2      0.1  FO, 1 peripheral
+  2   iivsearch    bic_iiv          -689.984    -1168.447   -478.463    17      2.0  [CL]+[KA]+[Q]+[V]+[V2]
+  3   residual     ofv             -1185.453    -1185.453     +0.000     7     11.7  no residual-error feature added
   4   iovsearch    -                       -            -          -     -        -  skipped: the starting model declares no `iov_column` in [fit_options], so the dataset's occasions were not read
   5   allometry    -                       -            -          -     -        -  skipped: the search space has no ALLOMETRY statement
-  6   covariates   ofv             -1185.453    -1196.446    -10.994    54      5.4  CL-CRCL-linear (forward step 1); CL-WT-power (forward step 2)
+  6   covariates   ofv             -1185.453    -1196.446    -10.994    54      5.5  CL-CRCL-linear (forward step 1); CL-WT-power (forward step 2)
 ```
+
+A step's `after` is where the step *ended*, its retries pass included. On this
+run only the structural step's pass found anything — 0.08 OFV, which is why
+step 1's `bic_mixed` is `-660.366` rather than the `-660.287` its winning
+candidate scored — and `steps.csv` reads consistently across the join, each
+row's `ofv_after` being the next row's `ofv_before`.
 
 Step by step against what the data were simulated from:
 

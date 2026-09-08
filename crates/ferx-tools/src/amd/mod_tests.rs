@@ -73,6 +73,8 @@ struct Scripted {
     fail_at: Option<usize>,
     /// The retries pass comes back with a fit the strictness gate rejected.
     retries_fail_gate: bool,
+    /// The retries pass comes back cancelled.
+    retries_cancel: bool,
     /// What the retries pass scores relative to the model it was handed.
     retry_delta: f64,
 }
@@ -246,7 +248,7 @@ impl StepRunner for Scripted {
             }],
             selected: vec![],
             notes: vec![],
-            cancelled: false,
+            cancelled: tool == "retries" && self.retries_cancel,
         })
     }
 }
@@ -1143,4 +1145,152 @@ fn a_retries_pass_that_fails_the_gate_is_not_adopted() {
     );
     // The pass is still in the candidate table, with its own row.
     assert!(result.rows.iter().any(|r| r.tool == "retries"));
+}
+
+/// A retries pass that improves the fit belongs to the step it ran under, so
+/// that step has to end where it actually ended.
+///
+/// The assertion is the *invariant*, not one cell: every step's `ofv_after` is
+/// the next step's `ofv_before`. Before the fix, an `all_final` pass that
+/// landed lower left `steps.csv` disagreeing with itself at exactly that
+/// join — and only on the runs where the retry did its job, which is the worst
+/// place for an audit trail to go quiet.
+#[test]
+fn an_improved_all_final_retry_updates_the_step_it_belongs_to() {
+    let mut scripted = Scripted::new();
+    scripted.retry_delta = -4.0;
+    let result = run(&scripted, &AmdOptions::default(), &config());
+
+    let ran: Vec<&StepOutcome> = result.ran().collect();
+    assert_eq!(ran.len(), 6);
+    for (i, s) in ran.iter().enumerate() {
+        assert_eq!(
+            s.ofv_after,
+            Some(scripted.step_ofv(s.index) - 4.0),
+            "step {} ends before its own retries pass",
+            s.index
+        );
+        // The scripted steps rank on the OFV, so the criterion tracks it.
+        assert_eq!(s.value_after, s.ofv_after, "step {}", s.index);
+        if let Some(next) = ran.get(i + 1) {
+            assert_eq!(
+                s.ofv_after, next.ofv_before,
+                "steps {} and {} disagree about the model between them",
+                s.index, next.index
+            );
+        }
+    }
+    assert_eq!(
+        result.final_fit.as_ref().map(|f| f.ofv),
+        ran.last().unwrap().ofv_after
+    );
+}
+
+/// A pass that is **not** adopted leaves the step's numbers alone — the other
+/// half of the pair, so the fix cannot be "always overwrite".
+#[test]
+fn a_retry_that_does_not_improve_leaves_the_step_alone() {
+    let mut scripted = Scripted::new();
+    scripted.retry_delta = 7.0;
+    let result = run(&scripted, &AmdOptions::default(), &config());
+    for s in result.ran() {
+        assert_eq!(
+            s.ofv_after,
+            Some(scripted.step_ofv(s.index)),
+            "step {} took a worse retry",
+            s.index
+        );
+    }
+}
+
+/// The retries row is marked selected only when its fit was adopted.
+///
+/// `fit_one` marks its one candidate selected — right for the pipeline's start
+/// fit, wrong for a pass the caller may reject. A rejected pass left as
+/// `selected` printed `SELECTED` in the summary directly beside the note
+/// saying the previous model was kept.
+#[test]
+fn a_retry_row_is_selected_only_when_its_fit_is_adopted() {
+    let retry_row = |scripted: Scripted| {
+        let result = run(
+            &scripted,
+            &AmdOptions {
+                retries: Retries::Final,
+                ..Default::default()
+            },
+            &config(),
+        );
+        let row = result
+            .rows
+            .iter()
+            .find(|r| r.tool == "retries")
+            .expect("the pass has a row")
+            .clone();
+        (row, result)
+    };
+
+    // Adopted.
+    let mut scripted = Scripted::new();
+    scripted.retry_delta = -4.0;
+    let (row, _) = retry_row(scripted);
+    assert!(row.selected);
+
+    // Rejected because it landed higher.
+    let mut scripted = Scripted::new();
+    scripted.retry_delta = 7.0;
+    let (row, result) = retry_row(scripted);
+    assert!(!row.selected, "a worse retry was marked selected");
+    assert!(result.notes.iter().any(|n| n.contains("did not improve")));
+
+    // Rejected because it failed the gate, however low its OFV.
+    let mut scripted = Scripted::new();
+    scripted.retries_fail_gate = true;
+    scripted.retry_delta = -50.0;
+    let (row, result) = retry_row(scripted);
+    assert!(!row.selected, "a rejected retry was marked selected");
+    assert!(result
+        .notes
+        .iter()
+        .any(|n| n.contains("did not pass the strictness gate")));
+    // And the summary does not print SELECTED for it.
+    let rendered = crate::amd::report::render_summary(&result);
+    assert!(
+        !rendered.contains("3 starts") || !rendered.contains("SELECTED (3 starts)"),
+        "{rendered}"
+    );
+}
+
+/// A cancellation *during* a retries pass stops the pipeline and is reported.
+///
+/// The pass is a fit like any other and the flag can be flipped inside it. It
+/// used to be dropped on the floor: an `all_final` pass advanced into the next
+/// step regardless, and a cancelled final pass left `AmdResult::cancelled`
+/// false, so `ferx amd` exited 0 on a run the user had stopped.
+#[test]
+fn cancellation_during_a_retries_pass_stops_the_pipeline() {
+    // During an intermediate `all_final` pass: no step after it runs.
+    let mut scripted = Scripted::new();
+    scripted.retries_cancel = true;
+    let result = run(&scripted, &AmdOptions::default(), &config());
+    assert!(result.cancelled, "the cancellation was swallowed");
+    assert_eq!(result.steps.len(), 1, "a step ran after the cancellation");
+    assert_eq!(
+        scripted.dirs(),
+        vec!["00-start", "01-modelsearch", "01-modelsearch-retries"]
+    );
+
+    // During the final pass: nothing follows it, but the run is still
+    // cancelled and the CLI's exit code depends on saying so.
+    let mut scripted = Scripted::new();
+    scripted.retries_cancel = true;
+    let result = run(
+        &scripted,
+        &AmdOptions {
+            retries: Retries::Final,
+            ..Default::default()
+        },
+        &config(),
+    );
+    assert!(result.cancelled);
+    assert_eq!(result.ran().count(), 6, "every step ran before the pass");
 }

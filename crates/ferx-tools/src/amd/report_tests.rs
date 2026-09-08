@@ -188,6 +188,33 @@ fn the_summary_shows_every_step_every_candidate_and_the_estimates() {
     );
 }
 
+/// A row the step carried forward *and* the gate rejected says both.
+///
+/// A search that has to return something can hand back a model that failed the
+/// gate — the input it started from, when no candidate passed. Printing
+/// `SELECTED` and stopping there tells the reader the opposite of what the
+/// verdict says.
+#[test]
+fn a_selected_row_that_failed_the_gate_still_says_so() {
+    let mut result = result();
+    result.rows[0].passed = false;
+    result.rows[0].failures = vec!["condition number 1e9 exceeds 1e3".into()];
+    let out = render_summary(&result);
+    assert!(
+        out.contains("SELECTED (failed the gate: condition number 1e9 exceeds 1e3)"),
+        "{out}"
+    );
+    // With a note as well, both are kept.
+    result.rows[0].note = Some("p = 0.0010 (df 1)".into());
+    let out = render_summary(&result);
+    assert!(
+        out.contains(
+            "SELECTED (p = 0.0010 (df 1); failed the gate: condition number 1e9 exceeds 1e3)"
+        ),
+        "{out}"
+    );
+}
+
 /// A step that ran and failed is `failed` in the table with its message, told
 /// apart from a step that never ran at all.
 #[test]
