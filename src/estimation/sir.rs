@@ -477,10 +477,9 @@ pub fn run_sir_core(
     options: &FitOptions,
 ) -> Result<SirResult, String> {
     // #1212: the math kernel is public API in its own right, so it opens the fit-scoped ODE
-    // scope too rather than relying on its caller having done so. Called from `run_sir` or
-    // `fit()` this costs nothing — the threads already carry that override, which the scope
-    // detects — while a direct caller gets the tolerances they passed instead of the spec's
-    // parse-time ones.
+    // scope too rather than relying on its caller having done so. Inside `fit()` the current
+    // worker already carries that override, which the scope detects without leasing a second
+    // pool; a direct caller gets the tolerances it passed instead of the spec's parse-time ones.
     crate::api::with_fit_ode_scope(options, || {
         run_sir_core_scoped(
             model,

@@ -9,6 +9,9 @@ use crate::estimation::covariance::{
 };
 use crate::estimation::parameterization::{compute_bounds, pack_params};
 
+#[path = "focei_pipeline_tests.rs"]
+mod pipeline;
+
 /// The guard-rejected objective (`guard_penalty_value`) must **integrate** the
 /// center-push gradient `g[i] = 100·(xs[i] − c[i])` the closures return alongside it —
 /// otherwise NLopt's More-Thuente line search cannot reconcile `f` and `∇f` and fails on

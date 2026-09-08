@@ -43,6 +43,38 @@ What runs, how long, and how it is resumed or traced.
 | `checkpoint_interval_secs` | integer | `300` | Minimum wall-clock seconds between checkpoint writes. Larger values reduce I/O overhead but lose more progress on an interrupt; smaller values save more often. Only used when `checkpoint = true`. |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
 
+#### Worker reuse for repeated fits
+
+Default fits share a persistent worker pool. Unpinned fits with the same
+fit-level ODE overrides also share a persistent pool keyed by those solver
+settings, so changing a tolerance does not multiply worker counts for concurrent
+calls. A positive `threads` value explicitly budgets the fit and exclusively
+leases a pool for the call; an idle pool with the same width and solver settings
+can be reused, while concurrent pinned fits keep independent budgets. This
+preserves the per-fit budgets assigned by `PoolPlan`.
+This isolates worker budgets and ODE settings; concurrent fits should still use
+consistent process-wide inner-optimizer and EBE warm-start settings.
+
+The caches ordinarily retain at most twice the automatic thread budget across
+all settings (at most 16 workers each). Older entries are evicted. When a single
+pool is wider than that budget, it can remain as the sole most-recent entry so a
+repeated explicit wide configuration still avoids rebuilding its workers.
+Active fits keep their requested width; the idle limits are not process-wide
+limits on concurrent fitting. Worker stacks remain 32 MiB each, which is
+reserved capacity rather than necessarily resident memory.
+
+During FOCE/FOCEI optimization, the same pool serves the inner EBE solves and
+outer gradient evaluations. The main NLopt and built-in BFGS/L-BFGS paths evaluate
+each subject's marginal contribution immediately after its EBE solve. The mixed
+analytic/FD gradient path also finishes each subject's fallback in the same task.
+This reduces synchronization between stages while preserving subject-order
+reductions. Workers still use Rayon's normal idle policy; pool reuse does not
+mean keeping idle CPU cores busy continuously.
+
+IOV inner solves also reuse per-event PK parameter buffer capacity between
+likelihood probes. Each probe still evaluates the current parameters and every
+event's covariates, time, and occasion; stored numerical values are not reused.
+
 ### Outer optimizer {#outer-optimizer}
 
 The population-parameter search: which algorithm, when it stops, and whether a global pre-search runs first. See [Optimizer Choices](#optimizer-choices) for how to pick one.

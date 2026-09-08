@@ -233,10 +233,6 @@ fn mixture_fit_matches_nonmem() {
 // the `mixture_iv_saem.ext` TABLE NO. 1 `-1000000000` row; the OFV is the IMP
 // pass's (TABLE NO. 2). SAEM samples the latent class each E-step (exactly the
 // ferx scheme), so the two engines' estimates and per-subject MIXEST agree.
-const NM_SAEM_TVCL1: f64 = 1.00205;
-const NM_SAEM_TVCL2: f64 = 2.73543;
-const NM_SAEM_TVV: f64 = 9.99346;
-const NM_SAEM_P1: f64 = 0.471245;
 const NM_SAEM_OFV_IMP: f64 = 300.8707;
 
 // Per-subject MIXEST from mixture_iv_saem.sdtab (NONMEM SAEM). Differs from the
