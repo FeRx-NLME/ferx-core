@@ -1,4 +1,4 @@
-//! Integration tests for adaptive Gauss–Hermite quadrature (`method = agq`, #251).
+//! Integration tests for adaptive Gauss–Hermite quadrature (`focei` / `laplace` with `n_agq`, #251).
 //!
 //! Tier-2: every test calls the public `fit()` boundary but returns immediately — either
 //! eval-only (`outer_maxiter = 0`, so the OFV is evaluated at the initial parameters with
@@ -138,6 +138,68 @@ fn agq_method_token_is_rejected_with_migration_note() {
             EstimationMethod::FoceGn,
             "`{token}` must still select Gauss-Newton"
         );
+    }
+}
+
+#[test]
+fn audit_mixture_cannot_silently_ignore_focei_quadrature() {
+    let source = WARFARIN_SRC
+        .replace(
+            "[individual_parameters]",
+            "[mixture]\n  nsub = 2\n  logit(1) = 0\n\n[individual_parameters]",
+        )
+        .replace(
+            "CL = TVCL * exp(ETA_CL)",
+            "CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else 2 * TVCL * exp(ETA_CL)",
+        );
+    let model = parse_model_string(&source).unwrap();
+    assert!(model.mixture.is_some());
+    let pop = warfarin();
+    let options = FitOptions {
+        method: EstimationMethod::FoceI,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    assert!(
+        fit(&model, &pop, &model.default_params, &options).is_ok(),
+        "plain FOCEI mixtures remain supported"
+    );
+    for methods in [
+        vec![],
+        vec![EstimationMethod::Foce, EstimationMethod::FoceI],
+    ] {
+        let opts = FitOptions {
+            n_agq: 3,
+            methods,
+            ..options.clone()
+        };
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("mixture engine does not evaluate quadrature");
+        assert!(err.contains("mixture") && err.contains("n_agq"), "{err}");
+    }
+}
+
+#[test]
+fn audit_zero_nodes_from_rust_api_cannot_change_the_method() {
+    let model = parse_model_string(WARFARIN_SRC).unwrap();
+    let pop = warfarin();
+    for method in [EstimationMethod::FoceI, EstimationMethod::Laplace] {
+        let opts = FitOptions {
+            method,
+            n_agq: 0,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let result = fit(&model, &pop, &model.default_params, &opts);
+        assert!(
+            result.is_err(),
+            "zero nodes must not become plain FOCEI / Laplace"
+        );
+        assert!(result.err().unwrap().contains("n_agq"));
+        let valid = FitOptions { n_agq: 1, ..opts };
+        assert!(fit(&model, &pop, &model.default_params, &valid).is_ok());
     }
 }
 
@@ -970,6 +1032,36 @@ fn focei_iov_grid_cap_reports_focei() {
     );
 }
 
+#[test]
+fn audit_later_quadrature_stage_cannot_bypass_the_iov_grid_cap() {
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).unwrap();
+    let pop = warfarin_iov();
+    // The pre-set cancellation is a fuse: a regression fails with "cancelled"
+    // rather than allocating and evaluating an enormous grid in the test runner.
+    let cancel = ferx_core::cancel::CancelFlag::new();
+    cancel.cancel();
+    for method in [EstimationMethod::FoceI, EstimationMethod::Laplace] {
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            methods: vec![EstimationMethod::Foce, method],
+            n_agq: 21,
+            cancel: Some(cancel.clone()),
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..parsed.fit_options.clone()
+        };
+        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap_err();
+        assert!(err.contains("grid") && err.contains("occasions"), "{err}");
+        assert!(err.contains(&method.label().to_lowercase()), "{err}");
+        let one_node = FitOptions { n_agq: 1, ..opts };
+        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &one_node).unwrap_err();
+        assert!(
+            err.contains("cancelled"),
+            "one-node chain must pass the grid validation: {err}"
+        );
+    }
+}
+
 /// **The AGQ covariance stencil.** Every other AGQ test sets `run_covariance_step = false`,
 /// so the AGQ-marginal FD covariance (differenced through the `pop_nll_opts` seam in
 /// `compute_covariance`, so the standard errors difference the objective AGQ actually
@@ -1606,6 +1698,13 @@ fn agq_eval_only_preserves_the_preceding_stages_parameters() {
     };
     let result = fit(&model, &population, &model.default_params, &chained)
         .expect("[focei, laplace] with agq_eval_only must succeed");
+
+    assert_eq!(
+        result.method,
+        EstimationMethod::FoceI,
+        "an AGQ likelihood readout must not relabel the estimator as Laplace"
+    );
+    assert_eq!(result.method_chain, chained.methods);
 
     assert_eq!(
         result.theta, focei.theta,

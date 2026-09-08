@@ -5,6 +5,21 @@ use crate::types::{
 use std::collections::HashMap;
 
 #[test]
+fn iov_joint_warm_start_preserves_kappas() {
+    let mu = [0.5, -0.25];
+    let bsv_only = iov_initial_vector(2, 6, &mu, Some(&[0.25, 0.5]));
+    assert_eq!(bsv_only, vec![0.75, 0.25, 0.0, 0.0, 0.0, 0.0]);
+
+    let joint = [0.25, 0.5, -0.7, 0.8, 0.9, -1.0];
+    let warm = iov_initial_vector(2, 6, &mu, Some(&joint));
+    assert_eq!(
+        warm,
+        vec![0.75, 0.25, -0.7, 0.8, 0.9, -1.0],
+        "the BSV block is shifted to psi-space while every fitted kappa is retained"
+    );
+}
+
+#[test]
 fn gradient_route_summary_reports_route_taken_not_requested() {
     // make_iov_model has `tv_fn: None` and the default `gradient_method:
     // Auto`. With no `tv_fn`, AD is unavailable, so the route resolves to

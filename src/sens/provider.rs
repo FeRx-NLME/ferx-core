@@ -4331,10 +4331,30 @@ pub fn subject_sensitivities_cov(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
+    covariance_sensitivities(model, subject, theta, eta, false)
+}
+
+/// Covariance jet over the joint eta/kappa vector, using the closed-form IOV walk.
+pub(crate) fn subject_sensitivities_cov_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    b: &[f64],
+) -> Option<SubjectSens> {
+    covariance_sensitivities(model, subject, theta, b, true)
+}
+
+fn covariance_sensitivities(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    iov: bool,
+) -> Option<SubjectSens> {
     // Scope gate. This is **not** redundant with `subject_sensitivities` returning `Some`:
     // that predicate has grown well past the covariance assembly's derivation (LTBS since
     // #665/#673, expression scaling, Form-C readouts, IOV, the event-driven walk). Handing
-    // the Gaussian-only assembly a jet from any of those would not fail — it would return a
+    // the Gaussian-endpoint assembly a jet from any of those would not fail — it would return a
     // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
     // asserted positively here and kept deliberately narrow; everything else keeps the
     // finite-difference covariance, which is correct for all of them.
@@ -4343,7 +4363,7 @@ pub fn subject_sensitivities_cov(
     // and `pop_nll_opts` already encode, rather than derived independently — PR #953 review
     // findings 2/4/5/9 were all the same mistake, a gate written from scratch that then
     // disagreed with the two predicates that had already enumerated this scope.
-    if !analytical_supported(model)
+    if !(if iov { iov_analytical_supported(model) } else { analytical_supported(model) })
         // `gradient = fd` is the user's opt-out from analytic sensitivities. It is the
         // first clause of `analytic_outer_gradient_available` for the same reason: someone
         // who hit a bad `Dual2` result and set this must not still receive a covariance
@@ -4366,14 +4386,15 @@ pub fn subject_sensitivities_cov(
         // every row would be scored against branch 1's sigma.
         || matches!(model.error_spec, crate::types::ErrorSpec::Selected { .. })
         || model.log_transform
-        || model.n_kappa > 0
+        || (!iov && model.n_kappa > 0)
+        || (iov && (model.n_kappa == 0 || model.has_lagtime()))
         || !matches!(model.scaling, ScalingSpec::None)
         || model.analytic_readout.is_some()
         || !model.analytical_init.is_empty()
         || model.residual_error_eta.is_some()
         || !model.residual_correlations.is_empty()
         || model.has_custom_ruv_magnitude()
-        || subject_routes_to_event_walk(model, subject)
+        || (!iov && subject_routes_to_event_walk(model, subject))
         || model
             .indiv_param_partials
             .indiv_param_program
@@ -4410,7 +4431,14 @@ pub fn subject_sensitivities_cov(
     let n_eta = eta.len();
     let n_axes = n_theta + n_eta;
 
-    let mut base = subject_sensitivities(model, subject, theta, eta)?;
+    let evaluate = |t: &[f64], b: &[f64]| {
+        if iov {
+            subject_sensitivities_iov(model, subject, t, b)
+        } else {
+            subject_sensitivities(model, subject, t, b)
+        }
+    };
+    let mut base = evaluate(theta, eta)?;
     let n_obs = base.obs.len();
 
     // One central pair per (θ, η) axis. Axis `c < n_theta` is `θ_c`; `c >= n_theta` is
@@ -4436,8 +4464,8 @@ pub fn subject_sensitivities_cov(
         if !closed_form_at(&tp, &ep) || !closed_form_at(&tm, &em) {
             return None;
         }
-        plus.push(subject_sensitivities(model, subject, &tp, &ep)?);
-        minus.push(subject_sensitivities(model, subject, &tm, &em)?);
+        plus.push(evaluate(&tp, &ep)?);
+        minus.push(evaluate(&tm, &em)?);
         steps.push(h);
     }
 

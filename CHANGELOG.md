@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic IOV and M3 covariance for FOCE, FOCEI, and FOCEI-anchored AGQ** — include all
+  occasion effects, differentiate shared IOV covariance blocks once, and carry censored
+  normal-tail curvature using each method's own marginal definition (PR #955).
+- **Analytic covariance (standard errors) for FOCEI-anchored adaptive Gauss-Hermite
+  quadrature** — `method = focei` with `n_agq > 1` now derives its R-matrix analytically instead
+  of finite-differencing the objective function. The finite-difference stencil it replaces costs
+  `~2·n_free²` reconverged population objectives, **each** of which sweeps the whole `n_agq^d`
+  node grid for every subject; the analytic assembly is a single pass. Standard errors are
+  unchanged in meaning — they still describe the quadrature marginal the fit actually minimised,
+  not the FOCEI one. `method = laplace` is unaffected and keeps the finite-difference covariance:
+  it anchors on the exact conditional Hessian, whose second derivative would need fourth-order
+  sensitivities. Models outside the analytic covariance scope (non-Gaussian
+  endpoints) also keep the existing path, and a poorly identified fit falls back rather than
+  reporting an ill-conditioned analytic result. The quadrature anchor is taken directly
+  from the objective assembly, avoiding an inverse round trip (#251, PR #955).
 - **`ferx iivsearch` — variability-structure search (Pharmpy `iivsearch`) in `ferx-tools`
   (#1183).** From a `.ferxsearch` file whose `[space]` names the η to search (`IIV?([V,KA],
   EXP)`; a plain `IIV(CL, EXP)` keeps that η) and the correlations to try
@@ -115,6 +130,21 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- Deeply saturated, over-capacity steady-state input-rate models no longer let
+  Anderson acceleration report a huge spurious periodic state when integration
+  error hides the positive per-cycle surplus (#867, PR #955).
+- Quadrature S/RSR covariance rejects unavailable subject scores instead of
+  differentiating the optimizer's population EBE penalty. Numerical fallback is
+  local to each subject, preserves fitted η/κ warm starts, honors `cov_inner_tol`,
+  and skips zero-weight covariance nodes; analytic Hessians use a deterministic
+  parallel reduction (#955).
+- Quadrature `covariance_method = s` / `rsr` now use scores of the selected AGQ
+  objective instead of FOCE/FOCEI scores. Mixture FOCEI rejects unsupported
+  `n_agq > 1`, Rust API calls reject `n_agq = 0`, and incomplete AGQ derivatives
+  fall back to full-objective finite differences instead of omitting terms.
+  An explicit AGQ likelihood readout preserves the preceding estimator's method
+  label as well as its parameters and covariance, and later quadrature stages
+  cannot bypass the IOV grid-size limit (#955).
 - **`W_STEADY_STATE_INFUSION` no longer claims a record is served as a single non-SS infusion
   when it is not (#1281).** The warning compared the record's own `AMT/RATE`; the steady-state
   run-in compares the length *after bioavailability*, which on a rate-defined infusion is

@@ -767,7 +767,8 @@ fn test_assemble_score_cross_product_cancelled() {
         &bounds,
         &options,
         &free_idx,
-    );
+    )
+    .expect("cancelled score assembly returns a discarded zero matrix");
     assert!(
         s.iter().all(|v| v.is_finite()),
         "cancelled S must be finite"

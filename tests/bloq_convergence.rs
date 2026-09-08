@@ -52,6 +52,56 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
+/// Analytic FOCEI M3 covariance at the stored NONMEM minimum. NONMEM's full
+/// Laplace curvature is not identical to FOCEI's Gauss-Newton anchor, so this is
+/// reported as a numerical cross-check rather than an equality claim.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored M3 covariance cross-check"
+)]
+fn bloq_m3_analytic_covariance_at_nonmem_minimum() {
+    let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx")).unwrap();
+    let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None).unwrap();
+    let mut initial = model.default_params.clone();
+    initial.theta = vec![0.132801, 7.73139, 0.809824];
+    initial.sigma.values = vec![0.0107600];
+    initial.omega = ferx_core::OmegaMatrix::from_diagonal(
+        &[0.0288494, 0.00954401, 0.335772],
+        initial.omega.eta_names.clone(),
+    );
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        outer_maxiter: 0,
+        inner_maxiter: 500,
+        inner_tol: 1e-10,
+        cov_inner_tol: Some(1e-10),
+        run_covariance_step: true,
+        analytic_cov_hessian: true,
+        verbose: true,
+        ..FitOptions::default()
+    };
+    let result = fit(&model, &population, &initial, &opts).unwrap();
+    let mut got = result.se_theta.unwrap();
+    got.extend(result.se_sigma.unwrap());
+    for i in 0..3 {
+        got.push(ferx_core::types::omega_se_at(&result.se_omega, 3, i, i).unwrap());
+    }
+    let nonmem = [0.00714, 0.240, 0.149, 0.000956, 0.0111, 0.00399, 0.139];
+    for (i, (a, n)) in got.iter().zip(nonmem).enumerate() {
+        let rel = (a - n).abs() / n;
+        eprintln!("M3 SE[{i}] ferx={a} NONMEM={n} rel={rel}");
+        assert!(a.is_finite() && *a > 0.0);
+        let tolerance = if i < 3 { 0.01 } else { 0.20 };
+        assert!(
+            rel < tolerance,
+            "M3 SE[{i}] exceeds the {:.0}% NONMEM band",
+            100.0 * tolerance
+        );
+    }
+}
+
 /// The M3 analytic inner-gradient path (with the auto-reconverged outer gradient)
 /// converges on the real warfarin BLOQ fit and recovers NONMEM's MLE. Exercises
 /// `analytic_eta_nll_gradient`'s M3 branch in a full gradient-based fit.
