@@ -2918,41 +2918,70 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
 ///   2. Only one optimization runs; a re-added fallback would launch a *second*
 ///      full nlopt run from the endpoint, ~doubling the eval count.
 ///
-/// Non-convergence is forced fix-independently: `inner_maxiter = 1` with
-/// `max_unconverged_frac = 0.0` leaves at least one subject's EBEs unconverged
-/// every eval, so the EBE guard rejects every step, the fit never forms a flat
-/// plateau, and it terminates at the `maxeval` ceiling reported non-converged.
-/// (Pre-#960 the original of this test relied on the L-BFGS first-step stall to
-/// be non-converged; that stall is now fixed, so the shape is driven by the
-/// starved inner loop instead — otherwise the fix would have silently converted
-/// this into a converged run and dropped the coverage.)
+/// Non-convergence is forced by the **evaluation budget**: the fit under test is
+/// still descending when `maxeval` runs out, so NLopt returns `MaxEvalReached`,
+/// which is not one of the statuses `optimize_nlopt_once` counts as converged.
+/// That needs a start the model descends from steadily, which is what the
+/// throwaway stage-1 fit produces; from `model.default_params` this model's
+/// opening line search fails and the resulting long flat tail is reclassified as
+/// a converged plateau (#751).
+///
+/// This setup has now been repaired twice, both times because a fix elsewhere
+/// removed the failure it was riding and left the test green but empty. Pre-#960
+/// it relied on the L-BFGS first-step stall. It then moved to a starved inner
+/// loop (`inner_maxiter = 1`, `max_unconverged_frac = 0.0`), which turned out to
+/// starve nothing once #1290 stopped the EBE cache from adopting a
+/// guard-rejected eval's estimates: the guard fired on eval 1 only and the fit
+/// converged at 59.79. Both shapes were *side effects* of defects, which is why
+/// the asserts below now pin the mechanism (`evaluation budget`) and not only
+/// the verdict.
 #[test]
 fn non_convergence_reports_directly_without_second_optimization() {
     let model = make_model();
     let population = make_population(3);
-    let template = &model.default_params;
-    let n = pack_params(template).len();
+    let n = pack_params(&model.default_params).len();
 
     let outer_maxiter = 8;
-    let o = FitOptions {
+    let base = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
         optimizer: Optimizer::NloptLbfgs,
         outer_maxiter,
-        // Starve the inner loop so the EBE guard rejects every outer step and the
-        // fit cannot converge (independent of the #960 first-step cap).
-        inner_maxiter: 1,
-        max_unconverged_frac: 0.0,
         run_covariance_step: false,
         mu_referencing: true,
         ..FitOptions::default()
     };
-    let r = optimize_population(&model, &population, template, &o);
+
+    // Stage 1 exists only to produce a start the fit under test descends from
+    // steadily. From `model.default_params` this model's opening line search
+    // fails almost immediately and NLopt returns `Failure` on a long flat tail,
+    // which #751 reclassifies as a converged plateau — the one shape stage 2
+    // must not have.
+    let stage1 = optimize_population(&model, &population, &model.default_params, &base);
+    let r = optimize_population(&model, &population, &stage1.params, &base);
+    assert!(
+        r.ofv < stage1.ofv - 1.0,
+        "test setup: stage 2 must be mid-descent when the budget runs out \
+         (stage 1 OFV {}, stage 2 OFV {})",
+        stage1.ofv,
+        r.ofv,
+    );
 
     assert!(
         !r.converged,
-        "test setup: a starved-inner-loop fit must not converge (OFV = {})",
+        "test setup: a fit cut off mid-descent must not converge (OFV = {})",
         r.ofv
+    );
+    // Pin the mechanism, not just the verdict: this run is non-converged because
+    // it spent its evaluation budget. Without this, a future change that turned
+    // the shape back into a `Failure`-on-a-plateau would keep the test green for
+    // a different reason — which is how this fixture has silently emptied twice
+    // before (pre-#960 it rode the L-BFGS first-step stall; then a starved inner
+    // loop, which #1290's warm-start anchoring stopped starving).
+    assert!(
+        r.warnings.iter().any(|w| w.contains("evaluation budget")),
+        "expected the maxeval shape; got {:?}",
+        r.warnings
     );
     assert!(
         r.warnings.iter().any(|w| w.contains("did not converge")),
@@ -2960,10 +2989,10 @@ fn non_convergence_reports_directly_without_second_optimization() {
         r.warnings
     );
     // One optimization only. NLopt LD_LBFGS checks `maxeval` only between line
-    // searches, so a single run slightly overruns `outer_maxiter * (n + 1)` (≈45
-    // on this model, budget 40); a re-added fallback would add a *second* full
-    // nlopt run from the endpoint, pushing the total toward ~2× that. Bound at
-    // `2 * budget` cleanly separates the single run (~45) from a doubling (~90).
+    // searches, so a single run can overrun `outer_maxiter * (n + 1)` (budget 40
+    // on this model); a re-added fallback would add a *second* full nlopt run
+    // from the endpoint, pushing the total toward ~2× that. Bound at
+    // `2 * budget` cleanly separates the single run from a doubling.
     let single_budget = outer_maxiter as usize * (n + 1);
     assert!(
         r.n_iterations < 2 * single_budget,
@@ -3170,4 +3199,113 @@ fn genuine_progress_after_guarded_start_is_converged() {
         -286.0,
         true
     ));
+}
+
+// ── EBE warm-start anchoring (#1290) ─────────────────────────────────────────
+
+/// `adopt_warm_start` gates the EBE cache on *improvement*, and a guarded eval
+/// never passes the gate however small its number.
+///
+/// The `!guarded` half is the part that is invisible on a negative-OFV fixture:
+/// a guarded eval's `ofv` is `guard_penalty_value`, a distance-to-center penalty
+/// on its own scale, so on a model whose objective is positive (the common case —
+/// this repo's covariate examples happen to sit around −1000) it lands *below*
+/// `best_ofv` and would otherwise adopt EBEs from a point the EBE guard has
+/// already rejected. Dropping `!guarded` from the predicate reddens the fourth
+/// case below.
+#[test]
+fn adopt_warm_start_takes_only_feasible_improvements() {
+    // Feasible and better than the incumbent: adopt.
+    assert!(adopt_warm_start(false, -1026.0, -1002.0));
+    // Feasible but no better: keep the incumbent's EBEs.
+    assert!(!adopt_warm_start(false, -1002.0, -1026.0));
+    assert!(!adopt_warm_start(false, -1026.0, -1026.0));
+    // Guarded, and its penalty happens to undercut a positive incumbent OFV.
+    assert!(!adopt_warm_start(true, 3.0, 286.0));
+    // First eval (`best_ofv` starts at +∞) seeds the cache.
+    assert!(adopt_warm_start(false, 286.0, f64::INFINITY));
+}
+
+/// Regression test for #1290: a model with covariate thetas came back at its
+/// initial estimates, unchanged to the last decimal, with NLopt L-BFGS reporting
+/// `Failure` on evaluation 1.
+///
+/// The cause was the EBE warm-start cache, not scaling. L-BFGS's first trial
+/// step drove `TVV2` onto its upper bound; ten of the thirty subjects fell back
+/// to Nelder-Mead there, and the EBEs that came back put the cache in a
+/// different basin of the (multimodal, #864/#891) inner problem. Every later
+/// eval inherited it, so the *initial point itself* re-evaluated at −1002.76
+/// instead of the −1026.35 the line search was trying to beat: no step could
+/// show a decrease, and NLopt gave up. `adopt_warm_start` anchors the cache to
+/// the best point seen, which makes the incumbent's objective reproducible.
+///
+/// Fast enough for Tier 1 (1.2 s under the dev profile) — the evaluation budget
+/// is capped at `outer_maxiter` = 3, i.e. 45 evals for this model's 14
+/// coordinates, nowhere near convergence but far past the point where the old
+/// behaviour had already frozen. Under the pre-fix code every theta below is
+/// identical to its init and the OFV is exactly the initial −1026.350403.
+#[test]
+fn covariate_model_leaves_its_initial_estimates_1290() {
+    use crate::api::fit_from_files;
+    use crate::types::{EstimationMethod, FitOptions, Optimizer};
+
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        // `Auto` is what a model file naming no optimizer gets, and it is the
+        // configuration the issue reports: it resolves to NLopt L-BFGS. Note
+        // `Optimizer::Lbfgs` is a *different* path (the built-in BFGS), and the
+        // defect is invisible from there — an earlier draft of this test used it
+        // and passed under the pre-fix code.
+        optimizer: Optimizer::Auto,
+        // 3 × (14 coordinates + 1) = 45 evals. The stall shows up on eval 1, so
+        // this budget is far past it while keeping the test at ~0.1 s (release) /
+        // ~1.2 s (dev).
+        outer_maxiter: 3,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let result = fit_from_files(
+        "examples/two_cpt_oral_covmodel.ferx",
+        Some("data/two_cpt_oral_cov.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("fit should succeed");
+
+    // Initial theta: the five `[parameters]` thetas followed by the three
+    // `[covariate_model]` thetas the desugar appends.
+    let init = [4.0, 40.0, 8.0, 80.0, 1.0, 0.6, 0.3, 0.6];
+    assert_eq!(result.theta.len(), init.len());
+    let max_rel_delta = result
+        .theta
+        .iter()
+        .zip(init.iter())
+        .map(|(t, i)| ((t - i) / i).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_rel_delta > 0.01,
+        "fit stalled at its initial estimates (max relative theta change = \
+         {max_rel_delta:.4e}); this is the #1290 warm-start regression.\n\
+         theta = {:?}\ninit  = {:?}",
+        result.theta,
+        init,
+    );
+
+    // Measured on the fixed code at this budget: −1195.399628. The stall reports
+    // the initial point's −1026.350403 exactly. The bound below sits 95.0 units
+    // above the realised value and 73.7 units below the stall, so it is clear of
+    // both by a comparable margin. `is_finite` first: a diverged solve would make
+    // the `<` comparison false anyway, but says so with a useful message.
+    assert!(
+        result.ofv.is_finite(),
+        "OFV is not finite: {:?}",
+        result.ofv
+    );
+    assert!(
+        result.ofv < -1100.0,
+        "OFV = {:.6} barely left the initial −1026.350403; the warm-start cache \
+         is poisoning the objective again (#1290).",
+        result.ofv,
+    );
 }
