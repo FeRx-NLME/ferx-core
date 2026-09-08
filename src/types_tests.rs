@@ -18,30 +18,81 @@ fn sim_outcome_category_and_count_variants_construct() {
     );
 }
 
-/// `continuous_value()` returns NAN for the non-Gaussian outcomes. The
-/// misuse `debug_assert` fires in debug builds, so this is asserted only when
-/// debug-assertions are off — the profile CI and coverage use (`ci-test`,
-/// which inherits `release`), where the NAN branch is actually taken.
-#[test]
-#[cfg(not(debug_assertions))]
-fn sim_outcome_category_and_count_continuous_value_is_nan() {
-    assert!(SimOutcome::Category { state: 3 }
-        .continuous_value()
-        .is_nan());
-    assert!(SimOutcome::Count { count: 9 }.continuous_value().is_nan());
+/// Calls `f` and reports whether the misuse `debug_assert!` inside it fired.
+///
+/// `continuous_value()` on a non-Gaussian outcome has two correct behaviours and
+/// which one you get is a property of the profile: with the guards live it panics,
+/// with them compiled out it returns NaN. Both matter — the guard is the developer
+/// signal, the NaN is what a release user actually gets — so the tests below assert
+/// whichever the current build promises rather than switching themselves off.
+///
+/// They used to be `#[cfg(not(debug_assertions))]`, which was correct while every
+/// CI profile inherited `release`. #1248 moved the coverage jobs onto `ci-cov`,
+/// where the guards ARE live, and a `cfg`-gated test does not fail there — it
+/// silently stops existing, in the only jobs that ran it. Measured at the time:
+/// three tests, and `src/types.rs:3490` and `:3494` went from 2 hits to 0.
+///
+/// The panic hook is left ALONE, so under a guarded profile each expected panic
+/// prints its message to the test log. That noise is deliberate. The obvious
+/// tidier version — `take_hook`, install a silent one, restore — is not merely
+/// racy in the "a concurrent failure loses its message" sense: `set_hook` is
+/// process-global and these expected-panic paths can run concurrently in the same
+/// lib-test process, so the interleaving where A takes the normal hook, B takes
+/// the *silent* hook A installed, A restores normal and B restores silent leaves
+/// the whole process permanently silenced. Restoring immediately does not help;
+/// only a shared lock would, and three expected panic messages are cheaper than
+/// that machinery. Raised by review on PR #1293.
+fn guard_fired(f: impl FnOnce() -> f64) -> Result<f64, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
 }
 
-/// The TTE `Event` outcome likewise has no continuous value. Same profile
-/// caveat as above (the debug-assert fires in debug builds).
+/// `continuous_value()` on the non-Gaussian outcomes: the misuse guard fires where
+/// `debug_assert!` is live, and the NAN branch is taken where it is not.
 #[test]
-#[cfg(all(feature = "survival", not(debug_assertions)))]
+fn sim_outcome_category_and_count_continuous_value_is_nan() {
+    for out in [
+        SimOutcome::Category { state: 3 },
+        SimOutcome::Count { count: 9 },
+    ] {
+        let got = guard_fired(|| out.continuous_value());
+        if cfg!(debug_assertions) {
+            assert!(
+                got.is_err(),
+                "{out:?}: the misuse `debug_assert!` in continuous_value() did not \
+                 fire, even though this build has debug-assertions on"
+            );
+        } else {
+            assert!(
+                got.expect("no guard in a release-derived build").is_nan(),
+                "{out:?}: continuous_value() must return NAN once the guard is \
+                 compiled out"
+            );
+        }
+    }
+}
+
+/// The TTE `Event` outcome likewise has no continuous value. Same two behaviours
+/// as above.
+#[test]
+#[cfg(feature = "survival")]
 fn sim_outcome_event_continuous_value_is_nan() {
-    assert!(SimOutcome::Event {
+    let out = SimOutcome::Event {
         time: 1.0,
         observed: true,
+    };
+    let got = guard_fired(|| out.continuous_value());
+    if cfg!(debug_assertions) {
+        assert!(
+            got.is_err(),
+            "the misuse `debug_assert!` for the Event outcome did not fire"
+        );
+    } else {
+        assert!(
+            got.expect("no guard in a release-derived build").is_nan(),
+            "continuous_value() on an Event outcome must return NAN once the guard \
+             is compiled out"
+        );
     }
-    .continuous_value()
-    .is_nan());
 }
 
 /// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:

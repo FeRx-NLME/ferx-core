@@ -1,5 +1,5 @@
-//! Guard: the `Check`, `Clippy`, `Format`, `Rustdoc` and `Tests (debug-assertions)` jobs
-//! in `.github/workflows/ci.yml` must run their cargo commands **through
+//! Guard: the `Check`, `Clippy`, `Format` and `Rustdoc` jobs in
+//! `.github/workflows/ci.yml` must run their cargo commands **through
 //! `tools/preflight.sh`**, and that script must actually fail when a gate fails (#1157).
 //!
 //! The point of the script is not documentation — it is that CI executes the same list a
@@ -11,7 +11,7 @@
 //! `--features ci,nn,slow-tests` had been failing to compile for an entire commit,
 //! because the local run and the CI run were not the same set.
 //!
-//! Four invariants:
+//! Five invariants:
 //!
 //!  1. Those jobs contain **no inline `run: cargo …` step**, and neither skip
 //!     themselves (`if:`) nor tolerate failure (`continue-on-error`). Each is a way for
@@ -20,9 +20,25 @@
 //!  3. A failing command makes the script exit non-zero **from every position in the
 //!     list**, not just the last one.
 //!  4. A no-argument run is `ALL_GROUPS` minus `OPT_IN_GROUPS`, and every opt-in group
-//!     is named by a job in `ci.yml` (#344). An opt-in group exists because it runs a
-//!     test suite rather than a compile — `debug-assertions` is the only one — and the
-//!     failure it invites is a gate that runs in neither place.
+//!     is either named by a job in `ci.yml` or pinned by (5). An opt-in group exists
+//!     because it runs a test suite rather than a compile, and the failure it invites
+//!     is a gate that runs in neither place.
+//!  5. **Both modes are exercised per PR.** The two coverage jobs build a profile whose
+//!     `debug-assertions` is ON and arm the canary proving it (#1248); the
+//!     `release-semantics` group builds one where they are OFF and arms the inverse
+//!     canary (#1293). Each is asserted against Cargo.toml, resolving `inherits`.
+//!
+//! (5) is a pair, and the pairing is the point. #344 gave the guards a job of their own;
+//! #1248 retired it in favour of `[profile.ci-cov]`, since dead guards cost not just an
+//! unrun invariant but a permanently-missed block of patch lines. That fix, alone, left
+//! no per-PR job running the crate the way a user's build behaves — several tests assert
+//! one thing under a live guard and another without one, so a mode that no job builds is
+//! a set of assertions nothing checks. Hence the mirror lane, and hence both directions
+//! being pinned here rather than resting on nobody editing a profile.
+//!
+//! (5) is also why (4) has an exception rather than a third delegating job: the coverage
+//! jobs run `cargo llvm-cov`, so they cannot call a preflight group without running the
+//! suite again — which is the 32–42 min that retiring #344's job saved.
 //!
 //! (3) is not hypothetical. The first version of the script returned a status from `run`
 //! and propagated it through a group function and a `case … esac || { …; exit 1; }` —
@@ -90,6 +106,46 @@ fn all_groups() -> Vec<String> {
 /// rather than a compile, so they are named explicitly or run by CI.
 fn opt_in_groups() -> Vec<String> {
     script_array("OPT_IN_GROUPS")
+}
+
+/// Does `[profile.<name>]` in Cargo.toml resolve to `debug-assertions = true`?
+///
+/// Resolves `inherits` transitively, because that is exactly how the guards get
+/// turned off by accident: `ci-cov` inherits `ci-fast` inherits `ci-test`
+/// inherits `release`, and a profile that says nothing takes its parent's answer.
+/// A missing `[profile.<name>]` section means a built-in profile, and the only
+/// built-in with the guards on is `dev`.
+fn profile_has_guards_on(name: &str) -> bool {
+    let src = std::fs::read_to_string(repo_root().join("Cargo.toml")).expect("read Cargo.toml");
+    let mut current = name.to_string();
+    // Bounded: a cycle in `inherits` is a Cargo error, but this test must not hang
+    // on a malformed manifest either.
+    for _ in 0..16 {
+        let header = format!("\n[profile.{current}]\n");
+        let Some(start) = src.find(&header) else {
+            // No section of its own — a built-in profile.
+            return current == "dev";
+        };
+        let rest = &src[start + header.len()..];
+        let body = &rest[..rest.find("\n[").unwrap_or(rest.len())];
+
+        let value = |key: &str| -> Option<String> {
+            body.lines()
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| k.trim() == key)
+                .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        };
+        if let Some(v) = value("debug-assertions") {
+            return v == "true";
+        }
+        match value("inherits") {
+            Some(parent) => current = parent,
+            // A custom profile MUST declare `inherits`, so this is unreachable via
+            // a valid manifest; treat it as "not established" rather than true.
+            None => return false,
+        }
+    }
+    panic!("`inherits` chain from profile `{name}` did not terminate");
 }
 
 fn ci_yml() -> String {
@@ -209,12 +265,13 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         ("clippy", "clippy"),
         ("fmt", "fmt"),
         ("rustdoc", "rustdoc"),
-        // #344. This one is a TEST job, not a compile/lint gate, and it is the
-        // only group a no-argument `tools/preflight.sh` skips — so the workflow
-        // is the only place it is guaranteed to run. That makes delegation
-        // matter more here, not less: an inline `cargo test` in the job would be
-        // a command no developer can reproduce with a documented local call.
-        ("debug-assertions", "debug-assertions"),
+        // NOT `debug-assertions`. It had a job of its own under #344; #1248
+        // retired it, because `[profile.ci-cov]` puts the guards inside the two
+        // coverage jobs that had to run anyway. Those jobs cannot delegate here —
+        // they run `cargo llvm-cov`, not a preflight group — so the invariant for
+        // this group is pinned by `the_debug_assertions_group_builds_a_profile_\
+        // with_the_guards_on` and `the_coverage_jobs_build_the_guarded_profile`
+        // below instead.
     ] {
         let body = job_body(&yml, job);
         let cmds = run_commands(&body);
@@ -553,14 +610,15 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         docs.join("\n  ")
     );
 
-    // The `debug-assertions` group is a gate ONLY because it builds on the default
-    // dev profile (#344). Every named profile in this repo — `release`, `ci-test`,
-    // `ci-fast` — has `debug-assertions` off, `ci-test`/`ci-fast` by inheriting
-    // `release`, so a `--profile`/`--release` flag added to one of these commands
-    // would leave two `cargo test` lines in the list, still run 4000-odd tests,
-    // still take minutes, and compile every `debug_assert!` in the crate back down
-    // to nothing. That is the exact shape of the neutered gate this test exists for:
-    // the command list cannot show it, only its flags can.
+    // The `debug-assertions` group is a gate only while the profile it names
+    // actually has the guards on. Before #1248 that was expressed as a BAN on
+    // `--profile`, because the dev default was the only place `debug_assert!` was
+    // live and every named profile in the repo inherited `release`. #1248 added
+    // `[profile.ci-cov]` — `ci-fast` plus `debug-assertions`/`overflow-checks` —
+    // and pointed both this group and the two coverage jobs at it, so the ban
+    // would now reject the correct command. The property is the same one either
+    // way, so assert it directly against Cargo.toml instead of by proxy: whatever
+    // profile the command selects must be one whose guards are on.
     let dbg = listed_commands("debug-assertions");
     assert!(
         !dbg.is_empty(),
@@ -568,30 +626,51 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     );
     for cmd in &dbg {
         assert!(
-            !cmd.contains("--profile") && !cmd.contains("--release"),
-            "`{cmd}` selects an explicit profile. Every named profile in this repo \
-             inherits `release`, where `debug-assertions = false`, so the guards this \
-             group exists to execute would compile to nothing while the job stayed \
-             green (#344). Drop the flag; the dev default is the gate."
-        );
-        assert!(
             cmd.contains("cargo test "),
             "`{cmd}` is in the `debug-assertions` group but does not RUN anything. \
              A `cargo check`/`clippy` line compiles the assertions and never \
              evaluates them, which is the blind spot, not the fix (#344)."
         );
 
-        // The POSITIVE half, and the one the flag check above cannot supply.
-        // Rejecting `--profile` only rules out the ways of turning the guards off
-        // that are VISIBLE in the command string. Two are not: `[profile.dev]
-        // debug-assertions = false` in Cargo.toml, and a
-        // `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the workflow environment.
-        // Either would leave
-        // this group's two commands intact, run all 4366 tests, and keep every
-        // assertion in this file green while the job verified nothing —
+        // `--release` names a profile whose `debug-assertions` is off by
+        // definition, and no `--profile` at all means the dev default, which is
+        // fine but is NOT what CI measures under any more.
+        assert!(
+            !cmd.contains("--release"),
+            "`{cmd}` builds `release`, where `debug-assertions = false`, so every \
+             guard this group exists to execute compiles to nothing while the run \
+             stays green (#344)."
+        );
+        let profile = cmd
+            .split_whitespace()
+            .skip_while(|w| *w != "--profile")
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{cmd}` selects no `--profile`, so it builds `dev`. That was the \
+                     #344 gate, but since #1248 the guards are measured under \
+                     `ci-cov` — the profile the coverage jobs use. Build the same \
+                     thing CI does, so a local green means what CI means."
+                )
+            });
+        assert!(
+            profile_has_guards_on(profile),
+            "`{cmd}` builds `--profile {profile}`, but `[profile.{profile}]` in \
+             Cargo.toml does not resolve to `debug-assertions = true`. Every profile \
+             in this repo inherits `release` unless it says otherwise, so this group \
+             would run 4000-odd tests, take minutes, and compile every \
+             `debug_assert!` in the crate back down to nothing (#344, #1248)."
+        );
+
+        // The POSITIVE half, and the one the profile check above cannot supply.
+        // Reading Cargo.toml rules out the ways of turning the guards off that are
+        // visible in the manifest. One is not: a
+        // `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS=false` in the environment would
+        // leave this group's two commands intact, run all 4366 tests, and keep
+        // every assertion in this file green while the group verified nothing —
         // an invariant held by absence is exactly what #344 was filed about.
-        // `debug_assertion_canary` (`src/lib_tests.rs`) closes that, but only when armed,
-        // so the arming has to be pinned as tightly as the flags are.
+        // `debug_assertion_canary` (`src/lib_tests.rs`) closes that, but only when
+        // armed, so the arming has to be pinned as tightly as the profile is.
         //
         // `starts_with`, not `contains`: it must be the argv-leading `env` form, so
         // `run` echoes it and `--list` tells the truth about what will run.
@@ -615,6 +694,53 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
          jobs:\n  {}",
         dbg.join("\n  ")
     );
+
+    // The mirror lane (#1293). `release-semantics` is worth having ONLY while it is
+    // the other mode: guards compiled out, release overflow semantics, the way a
+    // user's build behaves. If it ever drifted onto a guarded profile it would
+    // become a second copy of the coverage jobs and the release-only arms of
+    // `continuous_value()` / `max_scaled_deviation()` would go unchecked on PRs
+    // again — green throughout, which is why this is asserted rather than assumed.
+    let rel = listed_commands("release-semantics");
+    assert!(
+        !rel.is_empty(),
+        "the `release-semantics` group lists no commands"
+    );
+    for cmd in &rel {
+        assert!(
+            cmd.contains("cargo test "),
+            "`{cmd}` is in the `release-semantics` group but does not RUN anything."
+        );
+        let profile = cmd
+            .split_whitespace()
+            .skip_while(|w| *w != "--profile")
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{cmd}` selects no `--profile`, so it builds `dev` — which has \
+                     the guards ON and no optimisation, i.e. neither of the two things \
+                     this lane exists to provide (#1293)."
+                )
+            });
+        assert!(
+            !profile_has_guards_on(profile),
+            "`{cmd}` builds `--profile {profile}`, which resolves to \
+             `debug-assertions = true` in Cargo.toml. This lane exists to be the \
+             guards-OFF half of the pair; on a guarded profile it duplicates the \
+             coverage jobs and nothing on the PR exercises release semantics (#1293)."
+        );
+
+        // The runtime half, same argument as the canary arming above: reading
+        // Cargo.toml cannot see a `CARGO_PROFILE_CI_FAST_DEBUG_ASSERTIONS=true` in
+        // the environment.
+        assert!(
+            cmd.starts_with("env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo "),
+            "`{cmd}` does not arm the inverse canary. Prefix it with \
+             `env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1` (in the argument vector, so \
+             `--list` shows it): without it `debug_assertion_canary` in \
+             src/lib_tests.rs cannot tell this lane from a guarded one (#1293)."
+        );
+    }
 
     // Union of every `--features` value in the check group.
     let check = listed_commands("check");
@@ -691,7 +817,7 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 7] = [
+    let expected: [(&str, usize); 8] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
@@ -704,6 +830,12 @@ fn preflight_is_executable_and_lists_every_group() {
         // dropping it would leave those guards exactly as dead as they are in
         // every release-profile job.
         ("debug-assertions", 2),
+        // #1293: one line, `--lib` on the `ci,markov,nn` union. Deliberately not a
+        // matrix like its guards-on twin above — this lane exists to exercise
+        // release semantics, and the union of the production cfgs is enough for
+        // that, where the twin needs both sets because it is chasing guards that
+        // live inside feature-gated modules.
+        ("release-semantics", 1),
     ];
 
     // Every group `--list` actually walks must have an entry above. The loop below
@@ -812,9 +944,36 @@ fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
     // exactly these commands, so that check would have been self-satisfying. Applied
     // to the whole document rather than one job body on purpose: moving the group
     // between jobs is fine, running it nowhere is not.
+    //
+    // ONE documented exception, `debug-assertions` (#1248). Its property — the
+    // `debug_assert!` guards are live where CI measures — moved out of a
+    // delegating job and into `[profile.ci-cov]`, which the two coverage jobs
+    // build under. Those jobs run `cargo llvm-cov`, so they cannot call a
+    // preflight group without running the suite a third time, which is the cost
+    // retiring the job was about. The exception is not a hole: it is discharged
+    // by `the_coverage_jobs_build_the_guarded_profile`, and this list is checked
+    // against that test's existence so the two cannot drift apart.
+    const PINNED_BY_PROFILE: &[&str] = &["debug-assertions"];
+
     let yml = ci_yml();
     let executed = run_commands(&yml);
     for g in &opt_in {
+        if PINNED_BY_PROFILE.contains(&g.as_str()) {
+            let src = std::fs::read_to_string(
+                repo_root()
+                    .join("tests")
+                    .join("preflight_owns_the_fast_gates.rs"),
+            )
+            .expect("read this test file");
+            assert!(
+                src.contains("fn the_coverage_jobs_build_the_guarded_profile("),
+                "group `{g}` is exempted from the delegation rule on the grounds that \
+                 `the_coverage_jobs_build_the_guarded_profile` pins it instead — and \
+                 that test no longer exists. Either restore it or drop `{g}` from \
+                 PINNED_BY_PROFILE, but do not leave the gate resting on a comment."
+            );
+            continue;
+        }
         let want = format!("tools/preflight.sh {g}");
         assert!(
             executed.iter().any(|c| c == &want),
@@ -822,6 +981,76 @@ fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
              is a gate that nothing executes. Naming it in a comment does not count — \
              this reads the `run:` steps.\nrun steps found:\n  {}",
             executed.join("\n  ")
+        );
+    }
+}
+
+/// #1248: the guards run where the coverage is measured.
+///
+/// This is the successor to #344's `Tests (debug-assertions)` job, and it pins
+/// both halves of why that job could go. Every `cargo llvm-cov` invocation whose
+/// report feeds the per-PR **patch** gate must build a profile whose
+/// `debug-assertions` is on, so that (a) the ~180 guards are executed at all, and
+/// (b) their condition lines stop being regions that can never run — permanently
+/// missed patch lines against a 90% gate, which is #1248 itself.
+///
+/// The nightly `coverage` job is deliberately out of scope: it uploads the `slow`
+/// flag, which `codecov.yml` excludes from the patch status, and it stays on
+/// `ci-test` so its 5-60 min Tier-3 fits keep the ThinLTO speedup (#969).
+#[test]
+fn the_coverage_jobs_build_the_guarded_profile() {
+    let yml = ci_yml();
+
+    for job in ["coverage-pr", "endpoints"] {
+        let body = job_body(&yml, job);
+        let cov: Vec<String> = run_commands(&body)
+            .into_iter()
+            .filter(|c| c.contains("cargo llvm-cov"))
+            .collect();
+        assert!(
+            !cov.is_empty(),
+            "job `{job}` runs no `cargo llvm-cov` — it is supposed to be a coverage \
+             job. Did the job key change?"
+        );
+
+        for cmd in &cov {
+            let profile = cmd
+                .split_whitespace()
+                .skip_while(|w| *w != "--profile")
+                .nth(1)
+                .unwrap_or_else(|| panic!("job `{job}`: `{cmd}` names no `--profile` at all"));
+            assert!(
+                profile_has_guards_on(profile),
+                "job `{job}` measures coverage under `--profile {profile}`, which does \
+                 not resolve to `debug-assertions = true` in Cargo.toml. Every \
+                 `debug_assert!` in the crate then compiles to nothing, so its \
+                 invariant goes unchecked (#344) AND its condition lines become \
+                 regions that can never execute — guaranteed-missed patch lines \
+                 against the 90% Codecov gate that no test can ever cover (#1248)."
+            );
+        }
+
+        // The canary, for the same reason the preflight group arms it: reading
+        // Cargo.toml cannot see a `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS=false` in
+        // the environment, and without the canary that would leave every test green
+        // while the guards were dead — #344's failure shape exactly.
+        //
+        // Comment lines are stripped first, and that is load-bearing rather than
+        // tidy: both jobs carry a comment block explaining this very variable, so a
+        // plain `body.contains(...)` is satisfied by the prose and passes with the
+        // `env:` key deleted. Verified by deleting it — the check was green. This
+        // file already warns about the same trap one test up; it caught me anyway.
+        let arms_canary = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .any(|l| l.starts_with("FERX_REQUIRE_DEBUG_ASSERTIONS:"));
+        assert!(
+            arms_canary,
+            "job `{job}` builds a guarded profile but never arms \
+             `debug_assertion_canary` (`src/lib_tests.rs`), so nothing in the run \
+             verifies that `debug_assert!` is actually live. Set \
+             `FERX_REQUIRE_DEBUG_ASSERTIONS: \"1\"` on the coverage step."
         );
     }
 }
