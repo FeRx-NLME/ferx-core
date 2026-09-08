@@ -633,9 +633,14 @@ pub(crate) fn subject_grid_and_weights(
     nodes: &[f64],
     weights: &[f64],
 ) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
-    let stack = Stack::new(model, params, 0);
+    let n_occ = if model.n_kappa > 0 {
+        crate::stats::likelihood::iov_occasion_groups(subject).len()
+    } else {
+        0
+    };
+    let stack = Stack::new(model, params, n_occ);
     let d = stack.d();
-    if d == 0 {
+    if d == 0 || eta_hat.len() != d {
         return None;
     }
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();

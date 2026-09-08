@@ -276,6 +276,128 @@ fn e_matrix(r: usize, c: usize, n: usize) -> DMatrix<f64> {
     e
 }
 
+/// Independent covariance directions. An IOV direction changes the SAME entry in
+/// every occasion block; off-block zeroes never become artificial parameters.
+pub(crate) fn covariance_basis<'a>(
+    params: &ModelParameters,
+    prep: &'a Prep,
+) -> std::borrow::Cow<'a, [DMatrix<f64>]> {
+    match &prep.covariance_prior {
+        Some(prior) => std::borrow::Cow::Borrowed(&prior.basis),
+        None => std::borrow::Cow::Owned(
+            omega_entries(params.omega.diagonal, prep.n_eta)
+                .into_iter()
+                .map(|(r, c)| e_matrix(r, c, prep.n_eta))
+                .collect(),
+        ),
+    }
+}
+
+pub(crate) fn covariance_sensitivities(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    b: &[f64],
+) -> Option<SubjectSens> {
+    if model.n_kappa > 0 {
+        crate::sens::provider::subject_sensitivities_cov_iov(model, subject, theta, b)
+    } else {
+        subject_sensitivities_cov(model, subject, theta, b)
+    }
+}
+
+/// Joint eta/kappa preparation, without duplicating the shared IOV parameters.
+pub(crate) fn prepare_covariance(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    b: &[f64],
+) -> Option<Prep> {
+    if model.n_kappa == 0 {
+        if params.omega_iov.is_some() {
+            return None;
+        }
+        return prepare(model, subject, params, sens, b);
+    }
+    let iov = params.omega_iov.as_ref()?;
+    let (ne, nk) = (model.n_eta, model.n_kappa);
+    let occasions = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    let d = ne + occasions * nk;
+    if b.len() != d || iov.dim() != nk || params.omega.dim() != ne {
+        return None;
+    }
+    let mut matrix = DMatrix::zeros(d, d);
+    matrix
+        .view_mut((0, 0), (ne, ne))
+        .copy_from(&params.omega.matrix);
+    for k in 0..occasions {
+        matrix
+            .view_mut((ne + k * nk, ne + k * nk), (nk, nk))
+            .copy_from(&iov.matrix);
+    }
+    let inv = crate::estimation::importance_sampling::build_joint_omega_inv(
+        &params.omega.inv,
+        &iov.inv,
+        ne,
+        nk,
+        occasions,
+    );
+    let mut basis: Vec<_> = omega_entries(params.omega.diagonal, ne)
+        .into_iter()
+        .map(|(r, c)| e_matrix(r, c, d))
+        .collect();
+    for (r, c) in omega_entries(iov.diagonal, nk) {
+        let mut e = DMatrix::zeros(d, d);
+        for k in 0..occasions {
+            let off = ne + k * nk;
+            e[(off + r, off + c)] = 1.0;
+            e[(off + c, off + r)] = 1.0;
+        }
+        basis.push(e);
+    }
+    let mut prep = crate::estimation::sens_outer_gradient::prepare_stacked(
+        model, subject, params, sens, d, inv, b, None,
+    )?;
+    prep.covariance_prior =
+        Some(crate::estimation::sens_outer_gradient::CovariancePrior { matrix, basis });
+    Some(prep)
+}
+
+/// FOCEI score in the same natural direction order as the Hessian: theta,
+/// base covariance entries, shared IOV covariance entries, then sigma.
+fn covariance_natural_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    prep: &Prep,
+    b: &[f64],
+) -> Vec<f64> {
+    if prep.covariance_prior.is_none() {
+        return subject_natural_gradient(prep, sens, model, subject, params, b);
+    }
+    let core = crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        sens,
+        prep.n_eta,
+        &prep.omega_inv,
+        b,
+        None,
+    )
+    .expect("prepared covariance score");
+    let mut g = crate::estimation::agq_cov_hessian::fixed_b_natural_score(
+        model, subject, params, sens, prep, &core, b,
+    );
+    let ad = subject_anchor_derivatives(model, subject, params, sens, prep, b);
+    for (i, gi) in g.iter_mut().enumerate() {
+        *gi += 0.5 * (&prep.htilde_inv * ad.total_first(i)).trace();
+    }
+    g
+}
+
 /// The full M2 covariance Hessian over the natural `[θ, Ω, σ]` parameters, per
 /// subject. Each entry is `∂²Φ/∂ξ∂ζ|_η̂ − M_ξᵀ H⁻¹ M_ζ` with `M_ζ = ∂²Φ/∂η∂ζ`:
 ///
@@ -347,10 +469,9 @@ pub(crate) fn subject_cov_hessian_parts(
     prep: &Prep,
     eta_hat: &[f64],
 ) -> CovHessianParts {
-    let n_eta = prep.n_eta;
     let n_theta = params.theta.len();
-    let entries = omega_entries(params.omega.diagonal, n_eta);
-    let n_omega = entries.len();
+    let e_mats = covariance_basis(params, prep);
+    let n_omega = e_mats.len();
     let n_sigma = params.sigma.values.len();
     let nt = n_theta;
     let nw = nt + n_omega; // σ offset
@@ -358,10 +479,6 @@ pub(crate) fn subject_cov_hessian_parts(
 
     let omega_inv = &prep.omega_inv;
     let z = omega_inv * DVector::from_column_slice(eta_hat);
-    let e_mats: Vec<DMatrix<f64>> = entries
-        .iter()
-        .map(|&(r, c)| e_matrix(r, c, n_eta))
-        .collect();
 
     // Mode-coupling vectors M_ζ = ∂²Φ/∂η∂ζ for every natural parameter, in order.
     let (m_theta, _) = theta_m_and_u(prep, sens, n_theta);
@@ -581,15 +698,14 @@ fn inner_eta_responses(
     let ne = prep.n_eta;
     let n_obs = prep.n_obs;
     let nt = params.theta.len();
-    let entries = omega_entries(params.omega.diagonal, ne);
-    let n_omega = entries.len();
+    let e_mats = covariance_basis(params, prep);
+    let n_omega = e_mats.len();
     let n_sigma = params.sigma.values.len();
     let nw = nt + n_omega;
     let dim = nt + n_omega + n_sigma;
     let omega_inv = &prep.omega_inv;
     let h_inner_inv = &prep.h_inner_inv;
     let z = omega_inv * DVector::from_column_slice(eta_hat);
-    let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
 
     let a: Vec<DVector<f64>> = sens
         .obs
@@ -896,8 +1012,8 @@ pub(crate) fn subject_anchor_derivatives(
     let ne = prep.n_eta;
     let n_obs = prep.n_obs;
     let nt = params.theta.len();
-    let entries = omega_entries(params.omega.diagonal, ne);
-    let n_omega = entries.len();
+    let e_mats = covariance_basis(params, prep);
+    let n_omega = e_mats.len();
     let n_sigma = params.sigma.values.len();
     let nw = nt + n_omega;
     let dim = nt + n_omega + n_sigma;
@@ -905,7 +1021,6 @@ pub(crate) fn subject_anchor_derivatives(
 
     let omega_inv = &prep.omega_inv;
     let htilde_inv = &prep.htilde_inv;
-    let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
 
     // Per-observation primitives.
     let a: Vec<DVector<f64>> = sens
@@ -1215,8 +1330,11 @@ fn foce_sb_fixed_natural(
     if sens.obs.len() != nq || sens0.obs.len() != nq {
         return None;
     }
-    let entries = omega_entries(params.omega.diagonal, ne);
-    let n_omega = entries.len();
+    let e_mats: Vec<_> = omega_entries(params.omega.diagonal, ne)
+        .into_iter()
+        .map(|(r, c)| e_matrix(r, c, ne))
+        .collect();
+    let n_omega = e_mats.len();
     let sigma = &params.sigma.values;
     let n_sigma = sigma.len();
     let dim = nt + n_omega + n_sigma;
@@ -1256,7 +1374,6 @@ fn foce_sb_fixed_natural(
     let rtilde_inv = rtilde.cholesky()?.inverse();
     let u = &rtilde_inv * &rho;
     let s0 = foce0_sigma(model, &cmts, &f0, sigma);
-    let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
 
     // Per-direction ρ_s (nq) and V_s (nq×nq), s over natural [θ, Ω, σ].
     // B_m[i,l] = ∂²f/∂η_l∂θ_m (at η̂).
@@ -1433,7 +1550,7 @@ fn subject_cov_hessian_foce_natural(
     prep: &Prep,
     eta_hat: &[f64],
 ) -> Option<(Vec<f64>, DMatrix<f64>)> {
-    let ne = model.n_eta;
+    let ne = prep.n_eta;
     let nt = params.theta.len();
     let nq = subject.observations.len();
     if model.bloq_method == crate::types::BloqMethod::M3 && subject.cens.iter().any(|&c| c != 0) {
@@ -1442,14 +1559,18 @@ fn subject_cov_hessian_foce_natural(
     if sens.obs.len() != nq || sens0.obs.len() != nq {
         return None;
     }
-    let entries = omega_entries(params.omega.diagonal, ne);
-    let n_omega = entries.len();
+    let e_mats = covariance_basis(params, prep);
+    let n_omega = e_mats.len();
     let sigma = &params.sigma.values;
     let n_sigma = sigma.len();
     let dim = nt + n_omega + n_sigma;
     let nw = nt + n_omega;
     let nd = dim + ne;
-    let omega = &params.omega.matrix;
+    let omega = prep
+        .covariance_prior
+        .as_ref()
+        .map(|p| &p.matrix)
+        .unwrap_or(&params.omega.matrix);
     let cmts: Vec<usize> = (0..nq).map(|i| subject.obs_cmts[i]).collect();
     let eta_vec = DVector::from_column_slice(eta_hat);
 
@@ -1485,7 +1606,6 @@ fn subject_cov_hessian_foce_natural(
     let rtilde_inv = rtilde.cholesky()?.inverse();
     let u = &rtilde_inv * &rho;
     let s0 = foce0_sigma(model, &cmts, &f0, sigma);
-    let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
 
     // B_m[i,l] = ∂²f/∂η_l∂θ_m ; D_l[i,k] = ∂²f/∂η_k∂η_l (= ∂J/∂η_l).
     let bmats: Vec<DMatrix<f64>> = (0..nt)
@@ -1718,7 +1838,7 @@ fn subject_cov_hessian_foce_natural(
 /// `None` when the subject/model is outside the analytic-covariance scope (the
 /// caller then falls back to the existing FD covariance for the whole population):
 ///
-/// * `subject_sensitivities_cov` declines (ODE, scaling, LTBS, IOV, time-varying
+/// * `covariance_sensitivities` declines (ODE, scaling, LTBS, time-varying
 ///   covariates, oral-infusion, resets, non-fixed doses, non-analytical PK);
 /// * the subject carries M3/BLOQ censored rows (their inner term is `−logΦ`, not
 ///   the Gaussian α/p the M3 assembly assumes).
@@ -1734,14 +1854,14 @@ pub(crate) fn subject_packed_cov_hessian(
     eta_hat: &[f64],
 ) -> Option<DMatrix<f64>> {
     let params = unpack_params(x, template);
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, &params, &sens, eta_hat)?;
+    let sens = covariance_sensitivities(model, subject, &params.theta, eta_hat)?;
+    let prep = prepare_covariance(model, subject, &params, &sens, eta_hat)?;
     // Censored (M3/BLOQ) rows are out of the M3 assembly's scope.
     if prep.et.iter().any(|t| t.censored) {
         return None;
     }
     let h_nat = subject_cov_hessian_natural(model, subject, &params, &sens, &prep, eta_hat);
-    let g_nat = subject_natural_gradient(&prep, &sens, model, subject, &params, eta_hat);
+    let g_nat = covariance_natural_gradient(model, subject, &params, &sens, &prep, eta_hat);
     Some(pack_natural_hessian(&h_nat, &g_nat, x, template))
 }
 
@@ -1762,8 +1882,9 @@ pub(crate) fn subject_packed_cov_hessian(
 /// entry and the packed Cholesky entry share the optimizer's lower-triangle order
 /// ([`omega_entries`] = `pack_params`), so the two index sets line up.
 ///
-/// Non-IOV `[θ, Ω, σ]` block only (IOV is gated out of the analytic covariance
-/// path). `g_nat`/`h_nat` use the symmetric single-parameter Ω convention (an
+/// Natural coordinates are `[θ, Ω_BSV, Ω_IOV, σ]` (omitting IOV when absent);
+/// packed coordinates place the shared IOV Cholesky entries after σ.
+/// `g_nat`/`h_nat` use the symmetric single-parameter Ω convention (an
 /// off-diagonal entry sets both `Ω_{rc}` and `Ω_{cr}`), matching
 /// [`subject_cov_hessian_natural`] and [`super::sens_outer_gradient::subject_omega_gradient`].
 pub(crate) fn pack_natural_hessian(
@@ -1784,6 +1905,68 @@ pub(crate) fn pack_natural_hessian_with_params(
     params: &ModelParameters,
     template: &ModelParameters,
 ) -> DMatrix<f64> {
+    if let Some(iov) = &params.omega_iov {
+        // Use one representative IOV block for the parameter transformation. The
+        // occasion multiplicity is already carried by the tied natural basis.
+        let nt = params.theta.len();
+        let ne = params.omega.dim();
+        let nk = iov.dim();
+        let d = ne + nk;
+        let mut l = DMatrix::zeros(d, d);
+        l.view_mut((0, 0), (ne, ne)).copy_from(&params.omega.chol);
+        l.view_mut((ne, ne), (nk, nk)).copy_from(&iov.chol);
+        let diagonal = params.omega.diagonal && iov.diagonal;
+        let mut names = params.omega.eta_names.clone();
+        names.extend(iov.eta_names.iter().cloned());
+        let omega = crate::types::OmegaMatrix::from_chol_factor(
+            l,
+            names,
+            diagonal,
+            DMatrix::from_element(d, d, true),
+        );
+        let mut expanded = params.clone();
+        expanded.omega = omega;
+        expanded.omega_iov = None;
+        let mut expanded_template = template.clone();
+        expanded_template.omega = expanded.omega.clone();
+        expanded_template.omega_iov = None;
+        let all = omega_entries(diagonal, d);
+        let base: Vec<_> = omega_entries(params.omega.diagonal, ne)
+            .iter()
+            .map(|rc| nt + all.iter().position(|v| v == rc).unwrap())
+            .collect();
+        let occasions: Vec<_> = omega_entries(iov.diagonal, nk)
+            .iter()
+            .map(|&(r, c)| nt + all.iter().position(|v| *v == (ne + r, ne + c)).unwrap())
+            .collect();
+        let sigma: Vec<_> = (0..params.sigma.values.len())
+            .map(|k| nt + all.len() + k)
+            .collect();
+        let natural: Vec<_> = (0..nt)
+            .chain(base.iter().copied())
+            .chain(occasions.iter().copied())
+            .chain(sigma.iter().copied())
+            .collect();
+        let packed: Vec<_> = (0..nt)
+            .chain(base.iter().copied())
+            .chain(sigma.iter().copied())
+            .chain(occasions.iter().copied())
+            .collect();
+        assert_eq!(h_nat.nrows(), natural.len(), "IOV natural direction count");
+        let n = nt + all.len() + sigma.len();
+        let mut h = DMatrix::zeros(n, n);
+        let mut g = vec![0.0; n];
+        for (i, &a) in natural.iter().enumerate() {
+            g[a] = g_nat[i];
+            for (j, &b) in natural.iter().enumerate() {
+                h[(a, b)] = h_nat[(i, j)];
+            }
+        }
+        let transformed = pack_natural_hessian_with_params(&h, &g, &expanded, &expanded_template);
+        return DMatrix::from_fn(packed.len(), packed.len(), |i, j| {
+            transformed[(packed[i], packed[j])]
+        });
+    }
     let n_eta = template.omega.dim();
     let nt = template.theta.len();
     let entries = omega_entries(template.omega.diagonal, n_eta);
@@ -1880,10 +2063,10 @@ pub(crate) fn subject_packed_cov_hessian_foce(
     eta_hat: &[f64],
 ) -> Option<DMatrix<f64>> {
     let params = unpack_params(x, template);
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
-    let zeros = vec![0.0; model.n_eta];
-    let sens0 = subject_sensitivities_cov(model, subject, &params.theta, &zeros)?;
-    let prep = prepare(model, subject, &params, &sens, eta_hat)?;
+    let sens = covariance_sensitivities(model, subject, &params.theta, eta_hat)?;
+    let zeros = vec![0.0; eta_hat.len()];
+    let sens0 = covariance_sensitivities(model, subject, &params.theta, &zeros)?;
+    let prep = prepare_covariance(model, subject, &params, &sens, eta_hat)?;
     if prep.et.iter().any(|t| t.censored) {
         return None;
     }
@@ -1974,6 +2157,334 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
+
+    fn iov_cov_fixture(occasions: usize, block: bool) -> (CompiledModel, Subject) {
+        let mut source = WARFARIN
+            .replace(
+                "sigma PROP_ERR ~ 0.04",
+                "kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.15",
+            )
+            .replace(
+                "CL = TVCL * exp(ETA_CL)",
+                "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+            );
+        if block {
+            source = source
+                .replace(
+                    "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+                    "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+                )
+                .replace("omega ETA_KA ~ 0.30", "")
+                .replace("KA = TVKA * exp(ETA_KA)", "KA = TVKA")
+                .replace(
+                    "kappa KAPPA_CL ~ 0.02",
+                    "block_kappa (KAPPA_CL, KAPPA_V) = [0.02, 0.004, 0.03]",
+                )
+                .replace("V  = TVV  * exp(ETA_V)", "V  = TVV  * exp(ETA_V + KAPPA_V)");
+        }
+        let model = parse_model_string(&source).unwrap();
+        let times: Vec<_> = (0..occasions)
+            .flat_map(|k| [0.5, 2.0, 6.0, 12.0].map(|t| t + 24.0 * k as f64))
+            .collect();
+        let mut subject = warfarin_subject(&model, &model.default_params.theta, &times);
+        subject.doses = (0..occasions)
+            .map(|k| DoseEvent::new(24.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        subject.occasions = (0..occasions)
+            .flat_map(|k| vec![(k + 1) as u32; 4])
+            .collect();
+        subject.dose_occasions = (1..=occasions).map(|k| k as u32).collect();
+        let eta = vec![0.1; model.n_eta];
+        let kappas: Vec<_> = (0..occasions)
+            .map(|k| vec![if k % 2 == 0 { 0.12 } else { -0.08 }; model.n_kappa])
+            .collect();
+        let pred =
+            crate::pk::predict_iov(&model, &subject, &model.default_params.theta, &eta, &kappas);
+        subject.observations = pred
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p * (0.91 + 0.02 * (i % 3) as f64))
+            .collect();
+        (model, subject)
+    }
+
+    fn precise_iov_mode(model: &CompiledModel, subject: &Subject, p: &ModelParameters) -> Vec<f64> {
+        let warm = find_ebe(model, subject, p, 200, 1e-10, None, None, 0);
+        let mut b: Vec<_> = warm
+            .eta
+            .iter()
+            .copied()
+            .chain(warm.kappas.iter().flat_map(|k| k.iter().copied()))
+            .collect();
+        for _ in 0..30 {
+            let sens =
+                crate::sens::provider::subject_sensitivities_iov(model, subject, &p.theta, &b)
+                    .unwrap();
+            let prep = prepare_covariance(model, subject, p, &sens, &b).unwrap();
+            let core = crate::estimation::sens_outer_gradient::score_core(
+                model,
+                subject,
+                p,
+                &sens,
+                prep.n_eta,
+                &prep.omega_inv,
+                &b,
+                None,
+            )
+            .unwrap();
+            let mut g = &prep.omega_inv * DVector::from_column_slice(&b);
+            for (o, e) in sens.obs.iter().zip(&core.et) {
+                for k in 0..b.len() {
+                    g[k] += 0.5 * e.alpha * o.df_deta[k];
+                }
+            }
+            let step = core.h_inner.cholesky().unwrap().solve(&g);
+            for k in 0..b.len() {
+                b[k] -= step[k];
+            }
+            if step.amax() < 1e-12 {
+                return b;
+            }
+        }
+        panic!("IOV mode did not converge tightly");
+    }
+
+    #[test]
+    fn iov_cov_hessian_matches_reconverged_gradient() {
+        use crate::estimation::sens_outer_gradient::{
+            subject_packed_gradient_foce_iov, subject_packed_gradient_iov,
+        };
+        for (occasions, block) in [(1, false), (2, false), (2, true)] {
+            let (model, s) = iov_cov_fixture(occasions, block);
+            let p = &model.default_params;
+            let x = pack_params(p);
+            let b = precise_iov_mode(&model, &s, p);
+            for interaction in [false, true] {
+                let h = if interaction {
+                    subject_packed_cov_hessian(&model, &s, p, &x, &b)
+                } else {
+                    subject_packed_cov_hessian_foce(&model, &s, p, &x, &b)
+                }
+                .expect("IOV covariance in scope");
+                assert_eq!(h.nrows(), x.len());
+                for col in 0..x.len() {
+                    let step = 2e-5 * (1.0 + x[col].abs());
+                    let gradient = |sign: f64| {
+                        let mut xp = x.clone();
+                        xp[col] += sign * step;
+                        let pp = unpack_params(&xp, p);
+                        let bp = precise_iov_mode(&model, &s, &pp);
+                        if interaction {
+                            subject_packed_gradient_iov(&model, &s, p, &xp, &bp)
+                        } else {
+                            subject_packed_gradient_foce_iov(&model, &s, p, &xp, &bp)
+                        }
+                        .unwrap()
+                    };
+                    let gp = gradient(1.0);
+                    let gm = gradient(-1.0);
+                    for row in 0..x.len() {
+                        let fd = (gp[row] - gm[row]) / (2.0 * step);
+                        assert!((h[(row,col)]-fd).abs()<2e-4*h.amax().max(1.0),
+                            "occasions={occasions} block={block} interaction={interaction} ({row},{col}) analytic={} FD={fd}",h[(row,col)]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn iov_agq_cov_hessian_matches_reconverged_objective() {
+        use crate::estimation::agq::{agq_population_nll, gauss_hermite, subject_grid_and_weights};
+        use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
+        use crate::types::{HessianAnchor, Population};
+        let (model, s) = iov_cov_fixture(2, false);
+        let p = &model.default_params;
+        let x = pack_params(p);
+        let b = precise_iov_mode(&model, &s, p);
+        let (nodes, weights) = gauss_hermite(3);
+        let (grid, pi) = subject_grid_and_weights(&model, &s, p, &b, &nodes, &weights).unwrap();
+        assert_eq!(grid.len(), 3usize.pow(b.len() as u32));
+        let h = subject_packed_agq_cov_hessian(&model, &s, p, p, &b, &grid, &pi).unwrap();
+        let pop = Population {
+            subjects: vec![s],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let f = |xv: &[f64]| {
+            let pp = unpack_params(xv, p);
+            let b = precise_iov_mode(&model, &pop.subjects[0], &pp);
+            let eta = DVector::from_column_slice(&b[..model.n_eta]);
+            let kap: Vec<_> = b[model.n_eta..]
+                .chunks(model.n_kappa)
+                .map(DVector::from_column_slice)
+                .collect();
+            agq_population_nll(
+                &model,
+                &pop,
+                &pp,
+                &[eta],
+                &[kap],
+                3,
+                HessianAnchor::GaussNewton,
+            )
+        };
+        let f0 = f(&x);
+        for i in 0..x.len() {
+            for j in i..x.len() {
+                let hi = 3e-4 * (1.0 + x[i].abs());
+                let hj = 3e-4 * (1.0 + x[j].abs());
+                let bump = |si: f64, sj: f64| {
+                    let mut xp = x.clone();
+                    xp[i] += si * hi;
+                    xp[j] += sj * hj;
+                    f(&xp)
+                };
+                let fd = if i == j {
+                    (bump(1.0, 0.0) - 2.0 * f0 + bump(-1.0, 0.0)) / (hi * hi)
+                } else {
+                    (bump(1.0, 1.0) - bump(1.0, -1.0) - bump(-1.0, 1.0) + bump(-1.0, -1.0))
+                        / (4.0 * hi * hj)
+                };
+                assert!(
+                    (h[(i, j)] - fd).abs() < 2e-3 * h.amax().max(1.0),
+                    "IOV AGQ ({i},{j}) analytic={} FD={fd}",
+                    h[(i, j)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iov_cov_hessian_preserves_scope_exclusions() {
+        use crate::estimation::agq_cov_hessian::prepare_mode;
+        let (mut model, mut subject) = iov_cov_fixture(2, false);
+        let params = model.default_params.clone();
+        let x = pack_params(&params);
+        let b = vec![0.1; model.n_eta + 2 * model.n_kappa];
+        let declined = |m: &CompiledModel, s: &Subject| {
+            assert!(subject_packed_cov_hessian(m, s, &params, &x, &b).is_none());
+            assert!(subject_packed_cov_hessian_foce(m, s, &params, &x, &b).is_none());
+            assert!(prepare_mode(m, s, &params, &b).is_none());
+        };
+        model.log_transform = true;
+        declined(&model, &subject);
+        model.log_transform = false;
+        model.bloq_method = BloqMethod::M3;
+        subject.cens[0] = 1;
+        declined(&model, &subject);
+        subject.cens[0] = 0;
+        model.bloq_method = BloqMethod::Drop;
+        model.gradient_method = GradientMethod::Fd;
+        declined(&model, &subject);
+        model.gradient_method = GradientMethod::Auto;
+        assert!(covariance_sensitivities(&model, &subject, &params.theta, &b).is_some());
+
+        let source = WARFARIN
+            .replace(
+                "sigma PROP_ERR ~ 0.04",
+                "kappa KAPPA_CL ~ 0.02\n sigma PROP_ERR ~ 0.04",
+            )
+            .replace(
+                "CL = TVCL * exp(ETA_CL)",
+                "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+            )
+            .replace("proportional(PROP_ERR)", "proportional(PROP_ERR * (TVKA))");
+        let custom = parse_model_string(&source).unwrap();
+        assert!(custom.has_custom_ruv_magnitude());
+        declined(&custom, &subject);
+    }
+
+    #[test]
+    fn iov_cov_hessian_dispatch_preserves_joint_modes_and_method() {
+        use crate::estimation::agq::{gauss_hermite, subject_grid_and_weights};
+        use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
+        use crate::estimation::covariance::analytic_cov_hessian;
+        use crate::types::{EstimationMethod, FitOptions, Population};
+        let (model, s2) = iov_cov_fixture(2, false);
+        let (_, mut s1) = iov_cov_fixture(1, false);
+        s1.id = "one-occasion".into();
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let p = &model.default_params;
+        let x = pack_params(p);
+        let at = unpack_params(&x, p);
+        let modes: Vec<_> = pop
+            .subjects
+            .iter()
+            .map(|s| precise_iov_mode(&model, s, &at))
+            .collect();
+        let eta: Vec<_> = modes
+            .iter()
+            .map(|b| DVector::from_column_slice(&b[..model.n_eta]))
+            .collect();
+        let kap: Vec<Vec<_>> = modes
+            .iter()
+            .map(|b| {
+                b[model.n_eta..]
+                    .chunks(model.n_kappa)
+                    .map(DVector::from_column_slice)
+                    .collect()
+            })
+            .collect();
+        for (method, n_agq, interaction) in [
+            (EstimationMethod::Foce, 1, false),
+            (EstimationMethod::FoceI, 1, true),
+            (EstimationMethod::FoceI, 3, true),
+        ] {
+            let opts = FitOptions {
+                method,
+                n_agq,
+                interaction,
+                ..FitOptions::default()
+            };
+            let actual = analytic_cov_hessian(&model, &pop, p, &x, &eta, &kap, &opts)
+                .expect("IOV route must be used");
+            let mut expected = DMatrix::zeros(x.len(), x.len());
+            for (s, b) in pop.subjects.iter().zip(&modes) {
+                let h = if n_agq > 1 {
+                    let (nodes, weights) = gauss_hermite(n_agq);
+                    let (grid, pi) =
+                        subject_grid_and_weights(&model, s, &at, b, &nodes, &weights).unwrap();
+                    subject_packed_agq_cov_hessian(&model, s, p, &at, b, &grid, &pi)
+                } else if interaction {
+                    subject_packed_cov_hessian(&model, s, p, &x, b)
+                } else {
+                    subject_packed_cov_hessian_foce(&model, s, p, &x, b)
+                }
+                .unwrap();
+                expected += 2.0 * h;
+            }
+            assert_eq!(
+                actual, expected,
+                "the population route must sum the selected NLL Hessians with OFV scaling"
+            );
+            assert!(
+                analytic_cov_hessian(&model, &pop, p, &x, &eta, &[], &opts).is_none(),
+                "missing joint modes must decline"
+            );
+        }
+        for n_agq in [1, 3] {
+            let opts = FitOptions {
+                method: EstimationMethod::Laplace,
+                n_agq,
+                ..FitOptions::default()
+            };
+            assert!(
+                analytic_cov_hessian(&model, &pop, p, &x, &eta, &kap, &opts).is_none(),
+                "IOV must not admit the exact-anchor Laplace covariance"
+            );
+        }
+    }
 
     fn warfarin_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         let n = times.len();
@@ -2661,7 +3172,7 @@ mod tests {
                 .num_threads(n)
                 .build()
                 .unwrap()
-                .install(|| analytic_cov_hessian(&model, &pop, p, &x, &eta, &opts).unwrap())
+                .install(|| analytic_cov_hessian(&model, &pop, p, &x, &eta, &[], &opts).unwrap())
         };
         assert_eq!(run(1), run(3));
     }
@@ -3401,10 +3912,16 @@ mod tests {
                 n_agq,
                 ..FitOptions::default()
             };
-            assert!(
-                analytic_cov_hessian(&model, &population, &params, &x_hat, &eta_hats, &opts)
-                    .is_none()
-            );
+            assert!(analytic_cov_hessian(
+                &model,
+                &population,
+                &params,
+                &x_hat,
+                &eta_hats,
+                &[],
+                &opts
+            )
+            .is_none());
         }
         // One unsupported subject must decline the entire population, including AGQ.
         let mut censored_model = parse_model_string(WARFARIN).expect("parse");
@@ -3422,6 +3939,7 @@ mod tests {
             &params,
             &x_hat,
             &eta_hats,
+            &[],
             &agq_opts
         )
         .is_none());
@@ -3440,7 +3958,7 @@ mod tests {
             };
             opts.verbose = false;
             if analytic {
-                assert!(analytic_cov_hessian(&model, &population, &params, &x_hat, &eta_hats, &opts).is_some(),
+                assert!(analytic_cov_hessian(&model, &population, &params, &x_hat, &eta_hats, &[], &opts).is_some(),
                     "production dispatch must select analytic covariance: interaction={interaction}, n_agq={n_agq}");
             }
             match compute_covariance(

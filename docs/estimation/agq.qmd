@@ -488,13 +488,17 @@ computes for the FOCE/FOCEI covariance. The exact conditional Hessian already co
 ### When it applies
 
 The analytic route is taken when **all** of the following hold; otherwise the fit
-silently keeps the finite-difference covariance, which remains correct.
+keeps the finite-difference covariance, subject to its numerical convergence and step-size limits.
 
 - `method = focei` with `n_agq > 1`.
 - The model is inside the analytic covariance scope shared with FOCE/FOCEI — no
-  censored (M3/BLOQ) observations, no IOV, and a Gaussian endpoint the sensitivity
+  censored (M3/BLOQ) observations, and a Gaussian endpoint the sensitivity
   provider reaches. TTE, categorical endpoints, and custom or time-varying residual
   magnitudes are outside it.
+- Closed-form IOV is supported, including correlated IOV blocks shared across
+  occasions. The assembly uses the full joint mode and quadrature grid and ties
+  the shared covariance derivatives across occasions. IOV with modeled lag,
+  LTBS, or observation scaling remains outside this covariance scope.
 - The subject's anchor is well conditioned. A flat or unidentifiable random-effect
   direction is declined rather than reported: the assembly would otherwise invert a
   near-singular matrix and return standard errors inflated by orders of magnitude.
@@ -505,6 +509,16 @@ is a common and expensive case, but the non-Gaussian endpoints that motivate qua
 in the first place keep the existing path.
 
 ### Covariance validation
+
+For IOV, `tests/iov_analytic_covariance.rs` compares FOCEI R-matrix standard errors
+at the stored NONMEM 7.6.0 beta 1 `MATRIX=R` estimates for warfarin with two
+occasions. All eight SEs agree within 0.44% (the test allows 1%); OFVs are
+308.83426 in ferx and 308.83047 in NONMEM. The control stream and output are
+stored as `tests/nonmem/warfarin_iov_cov_r.{ctl,ext}`. FOCE and FOCEI IOV Hessians
+are also checked against reconverged analytic gradients, including correlated
+BSV and IOV blocks; AGQ-FOCEI is checked against its reconverged quadrature
+objective. The legacy objective stencil was numerically indefinite at this
+reference point, so it is not used as the SE reference.
 
 The shared FOCEI covariance machinery is checked against the stored NONMEM 7.5.1
 `MATRIX=R` reference at the same parameter values, using

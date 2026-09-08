@@ -663,8 +663,8 @@ pub(crate) struct NodeJet {
 
 /// Build [`NodeJet`] at an arbitrary `b`, not necessarily the mode.
 ///
-/// Non-IOV only, matching #953's covariance scope (`analytic_cov_hessian` already declines
-/// `n_kappa > 0`), so `b` is plain `η` and the prior precision is `Ω⁻¹`.
+/// With IOV, `b` stacks `η` and every occasion's `κ`; the joint prior precision
+/// repeats the shared IOV block, while its covariance directions stay tied.
 ///
 /// The load-bearing assumption is that none of the three sources is secretly mode-bound.
 /// `agq::accumulate_fixed_eta_packed_gradient` states it for the provider — *"neither provider
@@ -682,34 +682,45 @@ pub(crate) fn node_jet(
     b: &[f64],
 ) -> Option<NodeJet> {
     use crate::estimation::inner_optimizer::analytic_eta_nll_gradient_with_schedule;
-    use crate::estimation::sens_cov_hessian::subject_cov_hessian_parts;
-    use crate::estimation::sens_outer_gradient::{prepare, score_core};
-    use crate::sens::provider::subject_sensitivities_cov;
+    use crate::estimation::sens_cov_hessian::{
+        covariance_sensitivities, prepare_covariance, subject_cov_hessian_parts,
+    };
+    use crate::estimation::sens_outer_gradient::score_core;
 
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, b)?;
-    let prep = prepare(model, subject, params, &sens, b)?;
+    let sens = covariance_sensitivities(model, subject, &params.theta, b)?;
+    let prep = prepare_covariance(model, subject, params, &sens, b)?;
     let core = score_core(
         model,
         subject,
         params,
         &sens,
-        model.n_eta,
-        &params.omega.inv,
+        prep.n_eta,
+        &prep.omega_inv,
         b,
         model.residual_error_eta,
     )?;
-    let g = analytic_eta_nll_gradient_with_schedule(
-        model,
-        subject,
-        &params.theta,
-        b,
-        &params.omega,
-        &params.sigma.values,
-        &params.residual_correlations,
-        // Event-walk subjects are excluded by subject_sensitivities_cov above.
-        None,
-        core.mult.as_deref(),
-    )?;
+    let g = if model.n_kappa > 0 {
+        let mut g = &prep.omega_inv * DVector::from_column_slice(b);
+        for (obs, e) in sens.obs.iter().zip(&core.et) {
+            for i in 0..prep.n_eta {
+                g[i] += 0.5 * e.alpha * obs.df_deta[i];
+            }
+        }
+        g.iter().copied().collect()
+    } else {
+        analytic_eta_nll_gradient_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            b,
+            &params.omega,
+            &params.sigma.values,
+            &params.residual_correlations,
+            // Event-walk subjects are excluded by subject_sensitivities_cov above.
+            None,
+            core.mult.as_deref(),
+        )?
+    };
     let parts = subject_cov_hessian_parts(model, subject, params, &sens, &prep, b);
     let s = fixed_b_natural_score(model, subject, params, &sens, &prep, &core, b);
     Some(NodeJet {
@@ -783,16 +794,14 @@ pub(crate) fn subject_agq_cov_hessian(
     grid: &[Vec<f64>],
     pi: &[f64],
 ) -> Option<AgqCovTerms> {
-    use crate::estimation::sens_cov_hessian::{omega_entries, subject_anchor_derivatives};
+    use crate::estimation::sens_cov_hessian::{covariance_basis, subject_anchor_derivatives};
     use std::f64::consts::SQRT_2;
-
-    let n_eta = model.n_eta;
-    let n_theta = params.theta.len();
-    let entries = omega_entries(params.omega.diagonal, n_eta);
-    let dim = n_theta + entries.len() + params.sigma.values.len();
 
     // ── at the mode ────────────────────────────────────────────────────────────────────────
     let (sens, prep, anchor) = prepare_mode(model, subject, params, eta_hat)?;
+    let n_eta = prep.n_eta;
+    let dim =
+        params.theta.len() + covariance_basis(params, &prep).len() + params.sigma.values.len();
     // The conditioning screen `regularised_anchor` deliberately does not perform (review
     // finding 1). It is owed *here*, where `S⁻¹` is actually formed: a near-zero `H̃` diagonal —
     // a flat or unidentifiable η direction — is perfectly differentiable, so `regularised_anchor`
@@ -912,10 +921,10 @@ pub(crate) fn prepare_mode(
     crate::estimation::sens_outer_gradient::Prep,
     RegularisedAnchor,
 )> {
-    use crate::estimation::sens_outer_gradient::{prepare, score_core};
-    use crate::sens::provider::subject_sensitivities_cov;
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, params, &sens, eta_hat)?;
+    use crate::estimation::sens_cov_hessian::{covariance_sensitivities, prepare_covariance};
+    use crate::estimation::sens_outer_gradient::score_core;
+    let sens = covariance_sensitivities(model, subject, &params.theta, eta_hat)?;
+    let prep = prepare_covariance(model, subject, params, &sens, eta_hat)?;
     if prep.et.iter().any(|t| t.censored) {
         return None;
     }
@@ -924,8 +933,8 @@ pub(crate) fn prepare_mode(
         subject,
         params,
         &sens,
-        model.n_eta,
-        &params.omega.inv,
+        prep.n_eta,
+        &prep.omega_inv,
         eta_hat,
         model.residual_error_eta,
     )?;
@@ -983,13 +992,12 @@ pub(crate) fn fixed_b_natural_score(
     core: &crate::estimation::sens_outer_gradient::ScoreCore,
     b: &[f64],
 ) -> Vec<f64> {
-    use crate::estimation::sens_cov_hessian::omega_entries;
+    use crate::estimation::sens_cov_hessian::covariance_basis;
     use crate::estimation::sens_outer_gradient::data_sigma_gradient;
 
-    let n_eta = prep.n_eta;
     let n_theta = params.theta.len();
-    let entries = omega_entries(params.omega.diagonal, n_eta);
-    let mut out = Vec::with_capacity(n_theta + entries.len() + params.sigma.values.len());
+    let basis = covariance_basis(params, prep);
+    let mut out = Vec::with_capacity(n_theta + basis.len() + params.sigma.values.len());
 
     // θ: the residual chain through `f`, plus the DIRECT channel a custom / time-varying σ
     // magnitude opens (`R` depending on θ without passing through `f`). Omitting the second is
@@ -1010,12 +1018,9 @@ pub(crate) fn fixed_b_natural_score(
     let bv = DVector::from_column_slice(b);
     let oi = &prep.omega_inv;
     let oib = oi * &bv;
-    for &(r, c) in &entries {
-        let mut e = DMatrix::<f64>::zeros(n_eta, n_eta);
-        e[(r, c)] = 1.0;
-        e[(c, r)] = 1.0;
-        let quad = oib.dot(&(&e * &oib));
-        let tr = (oi * &e).trace();
+    for e in basis.iter() {
+        let quad = oib.dot(&(e * &oib));
+        let tr = (oi * e).trace();
         out.push(0.5 * (tr - quad));
     }
 

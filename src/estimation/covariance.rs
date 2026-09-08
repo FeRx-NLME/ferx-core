@@ -605,6 +605,7 @@ pub(super) fn analytic_cov_hessian(
     template: &ModelParameters,
     x_hat: &[f64],
     eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Option<DMatrix<f64>> {
     use crate::estimation::sens_cov_hessian::{
@@ -639,12 +640,6 @@ pub(super) fn analytic_cov_hessian(
     } else {
         None
     };
-    // IOV is out of scope: the assembly is written over the η-only random-effect block, not
-    // the stacked `[η, κ]` one. `subject_sensitivities_cov` declines `n_kappa > 0` itself,
-    // so this is a fast population-level exit, not the load-bearing check.
-    if model.n_kappa > 0 {
-        return None;
-    }
     // The quadrature rule and parameter unpacking are shared by every subject.
     let agq = agq.map(|n_agq| {
         let (nodes, weights) = crate::estimation::agq::gauss_hermite(n_agq);
@@ -656,7 +651,25 @@ pub(super) fn analytic_cov_hessian(
         .subjects
         .par_iter()
         .zip(eta_hats.par_iter())
-        .map(|(subject, eta_hat)| {
+        .enumerate()
+        .map(|(i, (subject, eta_hat))| {
+            let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
+                let kap = kappas.get(i)?;
+                if kap.len() != crate::stats::likelihood::iov_occasion_groups(subject).len()
+                    || kap.iter().any(|k| k.len() != model.n_kappa)
+                {
+                    return None;
+                }
+                std::borrow::Cow::Owned(
+                    eta_hat
+                        .iter()
+                        .copied()
+                        .chain(kap.iter().flat_map(|k| k.iter().copied()))
+                        .collect(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(eta_hat.as_slice())
+            };
             // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
             // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
             // subject, and for the default `covariance_method = r` there is no later checkpoint
@@ -672,26 +685,15 @@ pub(super) fn analytic_cov_hessian(
                 // Gauss-Hermite rule the objective used, so the Hessian differentiates the grid the
                 // fit actually evaluated — the same reason the proposal jitter is carried.
                 let (grid, pi) = crate::estimation::agq::subject_grid_and_weights(
-                    model,
-                    subject,
-                    params,
-                    eta_hat.as_slice(),
-                    nodes,
-                    weights,
+                    model, subject, params, &b, nodes, weights,
                 )?;
                 crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian(
-                    model,
-                    subject,
-                    template,
-                    params,
-                    eta_hat.as_slice(),
-                    &grid,
-                    &pi,
+                    model, subject, template, params, &b, &grid, &pi,
                 )
             } else if options.interaction {
-                subject_packed_cov_hessian(model, subject, template, x_hat, eta_hat.as_slice())
+                subject_packed_cov_hessian(model, subject, template, x_hat, &b)
             } else {
-                subject_packed_cov_hessian_foce(model, subject, template, x_hat, eta_hat.as_slice())
+                subject_packed_cov_hessian_foce(model, subject, template, x_hat, &b)
             }?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
@@ -945,7 +947,15 @@ pub(crate) fn compute_covariance(
     let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian && !is_mixture {
         // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
-        analytic_cov_hessian(model, population, template, x_hat, &base_eta_hats, options)
+        analytic_cov_hessian(
+            model,
+            population,
+            template,
+            x_hat,
+            &base_eta_hats,
+            &base_kappas,
+            options,
+        )
     } else {
         None
     };
