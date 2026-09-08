@@ -252,25 +252,22 @@ pub fn render_summary(result: &AmdResult) -> String {
             s.dir,
             s.criterion
         );
-        let _ = writeln!(
-            out,
-            "  {:<14} {:<34} {:>12} {:>10} {:>10} {:>4} {:>7}  status",
-            "candidate", "model", "criterion", "d", "dOFV", "rank", "seconds"
-        );
-        for r in rows {
-            let _ = writeln!(
-                out,
-                "  {:<14} {:<34} {:>12} {:>10} {:>10} {:>4} {:>7.1}  {}",
-                truncate(&r.id, 14),
-                truncate(&r.description, 34),
-                dash(r.value),
-                signed(r.d_value),
-                signed(r.d_ofv),
-                r.rank.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-                r.seconds,
-                status(r)
-            );
-        }
+        write_candidate_rows(&mut out, &rows);
+    }
+
+    // The pipeline's own final retries pass (`[amd] retries = "final"`) belongs
+    // to no step, so the sections above — which print a step's rows under the
+    // step's own index — cannot reach it. It is the one row that says whether
+    // the final model's optimum was confirmed, so it gets its own section
+    // rather than living only in `candidates.csv`.
+    let final_retries: Vec<&CandidateRow> = result
+        .rows
+        .iter()
+        .filter(|r| r.tool == "retries" && !result.steps.iter().any(|s| s.index == r.step))
+        .collect();
+    if !final_retries.is_empty() {
+        let _ = writeln!(out, "\nFinal model — retries pass");
+        write_candidate_rows(&mut out, &final_retries);
     }
 
     let notes: Vec<&String> = result
@@ -305,6 +302,30 @@ pub fn render_summary(result: &AmdResult) -> String {
         let _ = writeln!(out, "\n{}", ferx_core::io::output::parameter_table(fit));
     }
     out
+}
+
+/// One block of candidate rows, under the header they share.
+fn write_candidate_rows(out: &mut String, rows: &[&CandidateRow]) {
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "  {:<14} {:<34} {:>12} {:>10} {:>10} {:>4} {:>7}  status",
+        "candidate", "model", "criterion", "d", "dOFV", "rank", "seconds"
+    );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "  {:<14} {:<34} {:>12} {:>10} {:>10} {:>4} {:>7.1}  {}",
+            truncate(&r.id, 14),
+            truncate(&r.description, 34),
+            dash(r.value),
+            signed(r.d_value),
+            signed(r.d_ofv),
+            r.rank.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            r.seconds,
+            status(r)
+        );
+    }
 }
 
 /// The one-word decision on a candidate, and why when it is not `ok`.

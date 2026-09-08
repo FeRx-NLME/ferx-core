@@ -824,6 +824,12 @@ pub(crate) fn drive(
                 .unwrap_or_else(|| "no result".into())
         ));
     }
+    // Before the cancellation check, not after it: `final.ferx` is written on a
+    // cancelled run too, and its documented contract is that it reads and
+    // refits at the fit beside it. Returning here unseeded would write the
+    // model file's *original* initial estimates next to a `final-fit` they do
+    // not reproduce.
+    seed(&mut current, current_fit.as_ref())?;
     if start.cancelled {
         return Ok(AmdResult {
             options: options.clone(),
@@ -837,7 +843,15 @@ pub(crate) fn drive(
             cancelled: true,
         });
     }
-    seed(&mut current, current_fit.as_ref())?;
+
+    // `[run] retries = 0` asks for a single start, so no pass can run at all.
+    // Said once for the pipeline rather than once per step: `retries_pass` is
+    // called from inside the step loop, and pushing it there printed the same
+    // line six times under `Notes:` on a default run, eight under
+    // `reevaluation`.
+    if options.retries != Retries::Skip && config.run.retries + 1 < 2 {
+        notes.push(SINGLE_START_NOTE.to_string());
+    }
 
     let total = plan.iter().filter(|p| p.skipped.is_none()).count();
     let mut ran = 0usize;
@@ -922,9 +936,30 @@ pub(crate) fn drive(
             after: output.value,
             selected: output.selected.clone(),
         });
+        // The model and its fit move together. A step that changed the model
+        // but could not fit it leaves the pipeline without a referent, and the
+        // *previous* model's fit is not one: seeding from it writes another
+        // model's estimates into this text, the retries pass then compares its
+        // OFV against a `before` from a different model — the one comparison
+        // this module is allowed to make on the OFV *because* it is the same
+        // model text — and `final-fit.yaml` ends up describing something other
+        // than `final.ferx`. A step that came back with the same model text is
+        // a different case: the fit in hand is still that model's own.
+        let changed = output.model.render() != current.render();
         current = output.model;
-        if output.fit.is_some() {
-            current_fit = output.fit;
+        match output.fit {
+            Some(fit) => current_fit = Some(fit),
+            None if changed && current_fit.is_some() => {
+                notes.push(format!(
+                    "step {} ({}) selected a model it came back with no fit for, so the previous \
+                     model's fit was dropped rather than carried onto it; the Δs after this step \
+                     have no referent",
+                    planned.index,
+                    planned.step.label()
+                ));
+                current_fit = None;
+            }
+            None => {}
         }
         seed(&mut current, current_fit.as_ref())?;
 
@@ -941,6 +976,7 @@ pub(crate) fn drive(
                 runner,
                 config,
                 Some(planned.index),
+                planned.index,
                 &dir_name,
                 &mut current,
                 &mut current_fit,
@@ -971,10 +1007,17 @@ pub(crate) fn drive(
     }
 
     if !cancelled && options.retries == Retries::Final {
+        // The final pass belongs to no step, so its row is filed one past the
+        // last step's index rather than at `0`, which is the start fit's — a
+        // row at `0` is printed by no section of the summary and sits under the
+        // start step in `candidates.csv`, hiding the one row that says whether
+        // the final model's optimum was confirmed.
+        let row_step = plan.iter().map(|p| p.index).max().unwrap_or(0) + 1;
         let attempt = retries_pass(
             runner,
             config,
             None,
+            row_step,
             "retries",
             &mut current,
             &mut current_fit,
@@ -1049,6 +1092,11 @@ pub(crate) const INIT_STALL_NOTE: &str =
      outcome rather than a failed fit. It still applies to the pipeline\'s own start fit, and \
      every other gate applies throughout";
 
+/// Why no retries pass ran, said once in a run whose `[run] retries` is 0.
+pub(crate) const SINGLE_START_NOTE: &str =
+    "the retries pass was not run: `[run] retries = 0` asks for a single start, which would refit \
+     the selected model at its own estimates";
+
 fn skipped_outcome(planned: &PlannedStep, reason: String) -> StepOutcome {
     StepOutcome {
         index: planned.index,
@@ -1089,7 +1137,12 @@ fn seed(model: &mut ModelText, fit: Option<&FitResult>) -> Result<(), String> {
 fn retries_pass(
     runner: &dyn StepRunner,
     config: &SearchConfig,
+    // The step the pass belongs to, or `None` for the pipeline's own final
+    // pass — what the progress event reports.
     index: Option<usize>,
+    // The step index the pass's `CandidateRow` is filed under: the step's own
+    // for a per-step pass, one past the last step for the final one.
+    row_step: usize,
     dir_name: &str,
     current: &mut ModelText,
     current_fit: &mut Option<FitResult>,
@@ -1098,12 +1151,8 @@ fn retries_pass(
     progress: Option<ProgressFn<'_>>,
 ) -> Result<RetriesOutcome, String> {
     let starts = config.run.retries + 1;
+    // Why, once for the whole run, is `SINGLE_START_NOTE` in `drive`.
     if starts < 2 {
-        notes.push(
-            "the retries pass was not run: `[run] retries = 0` asks for a single start, which \
-             would refit the selected model at its own estimates"
-                .into(),
-        );
         return Ok(RetriesOutcome::default());
     }
     let emit = |event: AmdEvent| {
@@ -1112,14 +1161,7 @@ fn retries_pass(
         }
     };
     emit(AmdEvent::RetriesStarted { index, starts });
-    let mut output = runner.fit_one(
-        index.unwrap_or(0),
-        "retries",
-        dir_name,
-        config,
-        current,
-        starts,
-    )?;
+    let mut output = runner.fit_one(row_step, "retries", dir_name, config, current, starts)?;
     let before = current_fit.as_ref().map(|f| f.ofv);
     let after = output.fit.as_ref().map(|f| f.ofv);
     let improved = output.passed

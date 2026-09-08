@@ -69,6 +69,10 @@ struct Scripted {
     cancel_at: Option<usize>,
     /// The start fit comes back with no fit at all.
     no_start_fit: bool,
+    /// The start fit comes back cancelled.
+    start_cancel: bool,
+    /// The step (by pipeline index) that selects a model it has no fit for.
+    no_fit_at: Option<usize>,
     /// The step (by pipeline index) whose tool returns an error.
     fail_at: Option<usize>,
     /// The retries pass comes back with a fit the strictness gate rejected.
@@ -174,12 +178,13 @@ impl StepRunner for Scripted {
                 selected: true,
             },
         ];
+        let fitted = self.no_fit_at != Some(index);
         Ok(StepOutput {
             model: derived,
-            fit: Some(moved_fit(ofv)),
+            fit: fitted.then(|| moved_fit(ofv)),
             criterion: Criterion::Ofv,
-            value: Some(ofv),
-            passed: true,
+            value: fitted.then_some(ofv),
+            passed: fitted,
             rows,
             selected: vec![format!("{} choice", step.label())],
             notes: vec![],
@@ -248,7 +253,10 @@ impl StepRunner for Scripted {
             }],
             selected: vec![],
             notes: vec![],
-            cancelled: tool == "retries" && self.retries_cancel,
+            cancelled: match tool {
+                "retries" => self.retries_cancel,
+                _ => self.start_cancel,
+            },
         })
     }
 }
@@ -678,6 +686,128 @@ fn a_single_start_makes_the_retries_pass_pointless_and_it_says_so() {
         result.notes.iter().any(|n| n.contains("retries = 0")),
         "{:?}",
         result.notes
+    );
+
+    // The note is the pipeline's, said once, not each step's. Under the default
+    // `all_final` policy the pass is attempted once per step, and pushing the
+    // note from inside the pass printed the same line six times under `Notes:`
+    // — eight under `reevaluation`.
+    let result = run(&Scripted::new(), &AmdOptions::default(), &config);
+    assert_eq!(
+        result
+            .notes
+            .iter()
+            .filter(|n| n.contains("retries = 0"))
+            .count(),
+        1,
+        "{:?}",
+        result.notes
+    );
+}
+
+/// `[amd] retries = "final"` runs one pass on the pipeline's final model, and
+/// its row is the only one that says whether that model's optimum was
+/// confirmed. It belongs to no step, so it is filed one past the last step and
+/// printed in its own section: filed at `0` — the start fit's index — no
+/// section of the summary reaches it and `candidates.csv` files it under the
+/// start step.
+#[test]
+fn the_final_retries_row_is_filed_past_the_last_step_and_printed() {
+    let scripted = Scripted::new();
+    let result = run(
+        &scripted,
+        &AmdOptions {
+            retries: Retries::Final,
+            ..Default::default()
+        },
+        &config(),
+    );
+    let last = result.steps.iter().map(|s| s.index).max().expect("steps");
+    let rows: Vec<&CandidateRow> = result.rows.iter().filter(|r| r.tool == "retries").collect();
+    assert_eq!(rows.len(), 1, "one pass, one row");
+    assert_eq!(
+        rows[0].step,
+        last + 1,
+        "the final pass must not be filed under the start fit"
+    );
+    let printed = render_summary(&result);
+    assert!(
+        printed.contains("Final model — retries pass"),
+        "the final pass has no section:\n{printed}"
+    );
+    assert_eq!(
+        printed
+            .matches(&format!("{} starts", config().run.retries + 1))
+            .count(),
+        1,
+        "the pass's row is printed exactly once:\n{printed}"
+    );
+}
+
+/// A step that comes back with a model it has no fit for leaves the pipeline
+/// without a referent, and the *previous* model's fit is not one: carried onto
+/// the new model it seeds another model's estimates into it, hands the next Δ
+/// a `before` from a different model, and leaves `final-fit` describing
+/// something other than `final.ferx`.
+#[test]
+fn a_step_that_cannot_fit_its_selection_drops_the_previous_fit() {
+    let scripted = Scripted {
+        no_fit_at: Some(2),
+        ..Scripted::new()
+    };
+    let options = AmdOptions {
+        retries: Retries::Skip,
+        ..Default::default()
+    };
+    let result = run(&scripted, &options, &config());
+    let after = result
+        .steps
+        .iter()
+        .find(|s| s.index == 3)
+        .expect("step 3 ran");
+    assert_eq!(
+        after.ofv_before, None,
+        "step 3's Δ was taken against a model it did not start from"
+    );
+    assert_eq!(after.value_before, None);
+    assert!(
+        result.notes.iter().any(|n| n.contains("no fit for")),
+        "{:?}",
+        result.notes
+    );
+
+    // And when it is the last step, the run ends with no final fit rather than
+    // with `final-fit.yaml` describing a different model than `final.ferx`.
+    let scripted = Scripted {
+        no_fit_at: Some(6),
+        ..Scripted::new()
+    };
+    let result = run(&scripted, &options, &config());
+    assert!(
+        result.final_fit.is_none(),
+        "the fit beside `final.ferx` is another model's"
+    );
+}
+
+/// A run cancelled during its start fit still writes `final.ferx`, whose
+/// contract is that it reads and refits at the fit beside it. Returning before
+/// the seed left the model file's *original* initial estimates next to a
+/// `final-fit` they do not reproduce.
+#[test]
+fn a_cancelled_start_still_leaves_a_seeded_final_model() {
+    let scripted = Scripted {
+        start_cancel: true,
+        ..Scripted::new()
+    };
+    let result = run(&scripted, &AmdOptions::default(), &config());
+    assert!(result.cancelled);
+    let mut expected = warfarin();
+    crate::search::seed::seed_from(&mut expected, &moved_fit(scripted.start_ofv)).unwrap();
+    assert_eq!(result.final_model.render(), expected.render());
+    assert_ne!(
+        result.final_model.render(),
+        warfarin().render(),
+        "`final.ferx` kept the model file's own initial estimates"
     );
 }
 

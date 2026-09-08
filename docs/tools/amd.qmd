@@ -238,6 +238,11 @@ result is surprising:
 `d_value`, `ofv`, `d_ofv`, `rank`, `converged`, `passed`, `failures`, `error`,
 `note`, `seconds`, `selected`.
 
+The pipeline's own fits share the table: the start fit under `step` 0, a
+per-step retries pass under its step's number, and the final pass
+(`[amd] retries = "final"`) one past the last step — it belongs to no step, and
+the printed report gives it its own *Final model — retries pass* section.
+
 `failures` is the strictness gate's own words, `error` is why there is no fit
 at all, and `note` carries whatever the step said about the candidate — a
 likelihood-ratio p-value, a CWRES pre-screen decision, an extra start count.
