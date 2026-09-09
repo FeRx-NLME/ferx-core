@@ -836,6 +836,63 @@ fn drop_covariate_relation_removes_the_line_and_its_orphaned_theta() {
         .contains(&"CL = TVCL * exp(ETA_CL)".to_string()));
 }
 
+/// covsearch's backward step removes a whole relation rather than zeroing its
+/// θ, so it is indifferent to which categorical form the relation carries
+/// (#1312).
+///
+/// That is worth pinning rather than assuming, because the null moved with the
+/// form: an elimination implemented as "set θ to 0" would be correct for
+/// `categorical` and would leave a `categorical2` relation at a factor of
+/// *zero*. `DropCovariateRelation` is keyed on the `(parameter, covariate)`
+/// pair and deletes the line, which is why the new form needs no change there.
+#[test]
+fn dropping_a_categorical2_relation_removes_it_like_any_other() {
+    let src = BASE
+        .replace(
+            "[covariates]\n  WT continuous",
+            "[covariate_model]\n  CL ~ SEX categorical2(ref = mode)\n  V ~ WT power(center = \
+             median)\n\n[covariates]\n  WT continuous\n  SEX categorical(levels = [0, 1])",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta THETA_CL_SEX_1(0.999, 0.0, 6.0)\n  theta \
+             THETA_V_WT(0.75, 0.01, 5.0)",
+        );
+    let mut text = ModelText::parse(&src).expect("the seeded model must parse");
+    // Non-degeneracy: the relation and its θ are there to start with, so the
+    // assertions below are not passing on an empty block.
+    assert_eq!(text.block_lines("covariate_model").len(), 2);
+    assert!(text
+        .block_lines("parameters")
+        .iter()
+        .any(|l| l.contains("THETA_CL_SEX_1")));
+
+    apply(
+        &mut text,
+        ModelEdit::DropCovariateRelation {
+            param: "CL".into(),
+            cov: "SEX".into(),
+        },
+    );
+
+    // The line is gone — not neutralised by a `fix`, which for this form would
+    // have to be `fix = 1` and not the `fix = 0` an offset form would take.
+    assert_eq!(
+        text.block_lines("covariate_model"),
+        vec!["V ~ WT power(center = median)"]
+    );
+    let params = text.block_lines("parameters");
+    assert!(
+        !params.iter().any(|l| l.contains("THETA_CL_SEX_1")),
+        "the orphaned θ must go with the relation: {params:?}"
+    );
+    // …and the other relation is untouched.
+    assert!(
+        params.iter().any(|l| l.starts_with("theta THETA_V_WT(")),
+        "{params:?}"
+    );
+}
+
 #[test]
 fn dropping_a_relation_that_is_not_there_names_the_pair() {
     let err = base()
