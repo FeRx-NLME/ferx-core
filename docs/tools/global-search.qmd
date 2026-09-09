@@ -82,8 +82,11 @@ value. A covariate axis is one `(parameter, covariate)` pair from the
 `COVARIATE?` statements, with `none` as its first allele and each listed
 form after it, so `COVARIATE?(@IIV, WT, [pow,lin])` on a model whose `CL`,
 `V` and `KA` carry an η is three axes of three alleles. A `COVARIATE(...)`
-without the `?` is forced onto every candidate and is not an axis; a pair
-the base model already declares is kept as written and noted.
+without the `?` is forced onto every candidate and is not an axis — and a
+structural allele that removes its parameter (`COVARIATE(KA, WT, pow)` on
+an `ABSORPTION(INST)` candidate) leaves no model that carries it, so that
+point is refused rather than fitted without the relation; a pair the base
+model already declares is kept as written and noted.
 
 Decoding a genome is the same edit the stepwise tools make. The structural
 alleles become one `pk` template swap from the input model through

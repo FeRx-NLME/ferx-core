@@ -756,11 +756,26 @@ impl<'a> Evaluator<'a> {
                     .map_err(|e| format!("forcing {}: {e}", effect.label()))?;
                 effects.push(effect.clone());
             } else {
-                self.note(format!(
-                    "forced effect {} is dropped on candidates without a `{}` parameter",
-                    effect.label(),
-                    effect.parameter
-                ));
+                // A `COVARIATE(...)` without the `?` is part of every model
+                // the space describes. A structural allele that removes its
+                // parameter leaves no model that carries it, so the point is
+                // not in the space — refused, never fitted without the
+                // relation, never selected.
+                return Ok(Decoded {
+                    model,
+                    structure,
+                    effects,
+                    features,
+                    non_influential,
+                    cost,
+                    starts,
+                    problem: Some(format!(
+                        "the forced effect {} needs a `{}` parameter, which this structure \
+                         does not declare",
+                        effect.label(),
+                        effect.parameter
+                    )),
+                });
             }
         }
         for (axis, allele) in space.axes.iter().zip(genome) {
@@ -1239,23 +1254,9 @@ pub(crate) fn search(
         .iter()
         .map(|(id, (text, _))| (id.clone(), text.clone()))
         .collect();
-    // A duplicate's text is its own (it was decoded), its fit its
-    // representative's.
-    let (final_model, final_fit) = match store.remove(&final_id) {
-        Some(pair) => pair,
-        None => {
-            let rep = rows[winner]
-                .duplicate_of
-                .clone()
-                .and_then(|rep| store.get(&rep).cloned());
-            (
-                rep.as_ref()
-                    .map(|(t, _)| t.clone())
-                    .unwrap_or_else(|| space.input_model.clone()),
-                rep.and_then(|(_, f)| f),
-            )
-        }
-    };
+    let (final_model, final_fit) =
+        final_model_and_fit(&final_id, rows[winner].duplicate_of.as_deref(), &mut store)
+            .unwrap_or_else(|| (space.input_model.clone(), None));
     if final_fit.is_none() {
         notes.push(format!(
             "{final_id}: the fit is not in the journal cache, so final-fit.yaml cannot be \
@@ -1278,6 +1279,28 @@ pub(crate) fn search(
         notes,
         cancelled,
     })
+}
+
+/// The selected model's text and fit out of the store.
+///
+/// A duplicate's text is its own (it was decoded), but its fit is its
+/// representative's: a cross-batch duplicate is stored as `(text, None)`,
+/// so when the store has no fit under the winner's own id the
+/// representative's is taken. Without that fallback a winning duplicate
+/// wrote a `final.ferx` at its starting values and no `final-fit.yaml`
+/// while the fit sat one row over.
+fn final_model_and_fit(
+    final_id: &str,
+    duplicate_of: Option<&str>,
+    store: &mut HashMap<String, (ModelText, Option<FitResult>)>,
+) -> Option<(ModelText, Option<FitResult>)> {
+    let rep: Option<(ModelText, Option<FitResult>)> =
+        duplicate_of.and_then(|rep| store.get(rep).cloned());
+    match store.remove(final_id) {
+        Some((text, Some(fit))) => Some((text, Some(fit))),
+        Some((text, None)) => Some((text, rep.and_then(|(_, f)| f))),
+        None => rep,
+    }
 }
 
 /// Where a search run's files go by default: `<config stem>-globalsearch`

@@ -498,10 +498,13 @@ pub fn neighbours(g: &Genome, alleles: &[usize]) -> Vec<Genome> {
 }
 
 /// Steepest one-gene descent from `g`: evaluate every neighbour, move to
-/// the best if it improves on the current fitness, repeat. Bounded by the
-/// number of points a descent can visit without cycling — every move is a
-/// strict improvement, so that bound is the space size, but a cap keeps a
-/// pathological oracle from running forever.
+/// the best if it improves on the current fitness, repeat until none does.
+///
+/// Every move is a strict improvement, so a descent visits each point at
+/// most once and the number of rounds is bounded by the size of the space
+/// — that is the loop bound, not a smaller cap: a 65-axis binary landscape
+/// descending from all-ones needs 65 moves, and a cap of 64 returned one
+/// move short of the optimum the documentation promised.
 fn downhill(
     alleles: &[usize],
     mut g: Genome,
@@ -510,7 +513,8 @@ fn downhill(
     oracle: &mut dyn Oracle,
 ) -> Result<(Genome, f64, bool), String> {
     let mut moved = false;
-    for round in 1..=64 {
+    let rounds = space_size(alleles).unwrap_or(usize::MAX);
+    for round in 1..=rounds {
         let candidates = neighbours(&g, alleles);
         if candidates.is_empty() {
             break;

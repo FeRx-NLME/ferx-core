@@ -895,3 +895,80 @@ fn default_dir_sits_next_to_the_config() {
         std::path::PathBuf::from("runs/warfarin-globalsearch")
     );
 }
+
+// ── review findings on PR #1299 ─────────────────────────────────────────────
+
+#[test]
+fn a_forced_effect_on_a_parameter_the_structure_removed_makes_the_point_unbuildable() {
+    // `COVARIATE(KA, WT, pow)` without the `?` is part of every model in the
+    // space; an INST candidate has no KA, so it is not a model of the space
+    // — refused, never fitted without the relation, never selected.
+    let space = space_with(
+        "ABSORPTION([INST,FO])",
+        &[effect("KA", "WT", CovariateEffect::Pow, false)],
+        &[],
+    );
+    let script = ScriptedFitter::new(key, &[("input", 500.0), ("INST;P0", 400.0), ("P0", 490.0)]);
+    let result = run(&script, space, &options(Algorithm::Exhaustive));
+    let inst = result
+        .rows
+        .iter()
+        .find(|r| r.description == "ABSORPTION=INST")
+        .unwrap();
+    assert!(inst.error.is_some(), "{inst:?}");
+    assert!(
+        inst.error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("forced effect KA-WT-power"),
+        "{:?}",
+        inst.error
+    );
+    assert_eq!(inst.fitness, Penalties::default().crash);
+    assert!(inst.rank.is_none());
+    assert!(!inst.selected);
+    // Only the FO point was submitted, and it carries the relation.
+    let submitted = script.candidates_in("candidates");
+    assert_eq!(submitted.len(), 1);
+    assert!(submitted[0].model.render().contains("KA ~ WT power"));
+    assert_eq!(result.final_id, submitted[0].id);
+    assert!(result.final_model.render().contains("KA ~ WT power"));
+}
+
+#[test]
+fn a_selected_cross_batch_duplicate_takes_its_representatives_fit() {
+    // The store holds `(text, None)` for a cross-batch duplicate; when it
+    // wins, the fit is its representative's.
+    let text = ModelText::parse(BASE).unwrap();
+    let fit = crate::search::test_support::converged_fit(123.0);
+    let mut store: HashMap<String, (ModelText, Option<ferx_core::FitResult>)> = HashMap::new();
+    store.insert("run1".into(), (text.clone(), Some(fit)));
+    store.insert("run3".into(), (text.clone(), None));
+    let (model, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
+    assert_eq!(model.render(), text.render());
+    assert_eq!(fit.map(|f| f.ofv), Some(123.0));
+    // A representative without a fit (a resumed row whose cache is gone)
+    // still yields the duplicate's text, and no fit.
+    let mut store: HashMap<String, (ModelText, Option<ferx_core::FitResult>)> = HashMap::new();
+    store.insert("run1".into(), (text.clone(), None));
+    store.insert("run3".into(), (text.clone(), None));
+    let (_, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
+    assert!(fit.is_none());
+    // A winner missing from the store altogether falls back to its
+    // representative's pair, or to nothing.
+    let mut store: HashMap<String, (ModelText, Option<ferx_core::FitResult>)> = HashMap::new();
+    store.insert(
+        "run1".into(),
+        (
+            text.clone(),
+            Some(crate::search::test_support::converged_fit(7.0)),
+        ),
+    );
+    let (_, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
+    assert_eq!(fit.map(|f| f.ofv), Some(7.0));
+    assert!(final_model_and_fit("run9", None, &mut store).is_none());
+
+    // The real-fit reproduction of the review's seed-1 case is
+    // `tests/globalsearch_end_to_end.rs::a_winning_duplicate_still_hands_back_its_fit`.
+}

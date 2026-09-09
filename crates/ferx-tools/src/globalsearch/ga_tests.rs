@@ -413,3 +413,20 @@ fn the_toml_section_overlays_the_defaults() {
     let e = toml::from_str::<GaOptions>("generation = 3").unwrap_err();
     assert!(e.to_string().contains("unknown field `generation`"), "{e}");
 }
+
+#[test]
+fn the_downhill_search_is_not_capped_short_of_a_local_optimum() {
+    // A 65-axis binary additive landscape descending from all ones needs
+    // 65 strictly improving one-gene moves; a hard cap of 64 stopped at
+    // fitness 1 with an improving neighbour still available.
+    let alleles = vec![2usize; 65];
+    let mut oracle = Landscape::new(|g: &Genome| g.iter().sum::<usize>() as f64);
+    let start: Genome = vec![1; 65];
+    let (g, f, moved) = downhill(&alleles, start, 65.0, "hill", &mut oracle).unwrap();
+    assert!(moved);
+    assert_eq!(f, 0.0);
+    assert_eq!(g, vec![0; 65]);
+    for n in neighbours(&g, &alleles) {
+        assert!((oracle.f)(&n) >= f, "a neighbour of the optimum is better");
+    }
+}
