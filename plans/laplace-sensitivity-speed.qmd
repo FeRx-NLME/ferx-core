@@ -1,0 +1,394 @@
+---
+title: "Implementation handoff: Laplace third-order sensitivities from FD of second order"
+date: 2026-09-09
+---
+
+## Assignment and user intent
+
+Implement and benchmark a Laplace estimation gradient that obtains third-order
+prediction sensitivities by finite-differencing the existing second-order
+sensitivities, reusing the approach already implemented for analytical covariance.
+Then assemble the derivatives of the exact posterior Hessian from those tensors.
+
+The user explicitly corrected the earlier framing: the requested idea is
+**third order from FD of second order**. Start with the covariance routine's
+existing theta/eta-axis sweep. An eta-only sweep, tensor streaming, caching, or
+other call-count reduction is optional follow-up work, not the requested design
+and not a prerequisite for implementing or assessing it.
+
+This document supersedes the earlier reduced-sweep proposal in this same file.
+**At the time this handoff was written**, the user had requested it and no
+implementation or benchmark had yet run; the next implementation session was to
+execute the work, not just produce another plan, and not assume a speedup before
+measuring against the current hybrid gradient. **That work has since happened —
+see the [Results](#results-2026-09-09-implementation-session) section below,
+which supersedes this and the following two paragraphs.**
+
+## Workspace and baseline
+
+*(As of the original handoff — see Results for what actually shipped.)* Work in
+an isolated worktree on branch `perf/laplace-sensitivity`; do not start again in
+the original `ferx-core` checkout.
+
+Source inspection at `cfc956da` (current origin/main when this worktree was created),
+branch `perf/laplace-sensitivity`. This is a design and benchmark plan; no estimator
+implementation has changed and no speedup has been measured.
+
+Target `method = laplace`, initially `n_agq = 1`. Keep the exact posterior Hessian
+distinct from the FOCEI Gauss-Newton/Almquist anchor. Higher-node exact-anchor AGQ
+can reuse the resulting first anchor derivatives in a later change. Do not alter
+the statistical objective, inner optimizer, public API, covariance estimator or
+default outer optimizer as part of this work. Unsupported cases retain the
+current path. Implementation is authorized; publishing or merging is not part of
+this handoff.
+
+## What the code already does
+
+| Component | Current implementation | Implication |
+|---|---|---|
+| Posterior curvature | `agq.rs::anchor_hessian(Exact)` takes `score_core.h_inner` from second-order sensitivities; falls back to `fd_posterior_hessian` outside scope | Supported Laplace objectives already avoid the scalar-likelihood Hessian stencil |
+| Fixed-node score | `accumulate_fixed_eta_packed_gradient` uses the analytical provider with fixed-effect FD salvage | Do not replace this with full reconverged FD |
+| Mode response | `eta_dx` calls `subject_eta_dx` / IOV counterpart, with mixed-derivative FD fallback | Implicit differentiation already avoids perturbed inner optimizations |
+| Grid/curvature response | `grid_response_correction` perturbs each free packed coordinate, moves the mode linearly, builds two anchors and proposals | Main candidate: approximately `2p` sensitivity evaluations per subject, plus base work, for `p` free population coordinates |
+| Covariance jet | `provider.rs::covariance_sensitivities` differences second-order jets along every theta and random-effect axis | `1 + 2(n_theta + d)` provider evaluations, producing more blocks than a Laplace gradient requires |
+| Covariance assembly | `sens_cov_hessian.rs::subject_anchor_derivatives` differentiates FOCEI H-tilde; `agq_cov_hessian.rs` explicitly excludes the exact Laplace anchor | Reuse primitives and numerical guards, not the FOCEI matrix assembly |
+
+The current supported gradient already takes a first FD of a Hessian assembled
+from second-order sensitivities, without inner re-solves. Merely calling the full
+covariance provider is therefore not automatically an improvement. Some comments
+in `agq.rs` still describe the older FD-only Hessian or narrower ODE scope; follow
+the implementation and refresh those comments when changing the code.
+
+## Numerical design
+
+Let `b` be the joint eta/kappa vector of dimension `d`, `x` the packed population
+parameters, `l(b,x)` the conditional NLL, and `H = l_bb` at the fitted mode.
+For a smooth positive-definite unregularized anchor, the one-node objective is,
+up to constants, `F = l(b_hat,x) + 0.5 log|Omega_joint| + 0.5 log|H|`.
+
+The existing implicit derivative is
+
+```
+B_k = d b_hat / dx_k = -H^-1 l_bx_k
+dH/dx_k = H_x_k + sum_r H_b_r B_k[r]
+dF/dx_k = l_x_k + l_b^T B_k
+           + 0.5 d log|Omega_joint|/dx_k
+           + 0.5 trace(H^-1 dH/dx_k)
+```
+
+Keep `l_b^T B_k` at numerically imperfect modes; do not silently assume the inner
+gradient is exactly zero. Use the same normalization and packed chains as today.
+
+For an initial independent smooth observation likelihood `L_j(f_j, sigma)`, define
+`a_j = f_b`, `A_j = f_bb`, `q_j = L_f`, and `w_j = L_ff`. Then
+
+```
+H = Omega_joint^-1 + sum_j [ w_j a_j a_j^T + q_j A_j ]
+```
+
+The missing structural blocks for its first derivative are `f_bbb` and
+`f_bbtheta`. Obtain them using the existing covariance approach:
+
+```
+f_bbb[:,:,r]       ~= [f_bb(b + h_r e_r) - f_bb(b - h_r e_r)] / (2 h_r)
+f_bbtheta[:,:,m]   ~= [f_bb(theta + h_m e_m) - f_bb(theta - h_m e_m)] / (2 h_m)
+```
+
+Use `subject_sensitivities_cov` for the first supported prototype, or extract its
+existing FD sweep into a shared private helper if separation of covariance gates
+from the numerical mechanism is needed. Preserve existing covariance behavior and
+tests. Do not copy the entire provider or relax its gates indiscriminately.
+
+For any natural-coordinate direction `v`, assemble
+
+```
+H_v = (Omega_joint^-1)_v
+    + sum_j [ (w_j)_v a_j a_j^T
+              + w_j ((a_j)_v a_j^T + a_j (a_j)_v^T)
+              + (q_j)_v A_j + q_j (A_j)_v ]
+```
+
+For theta directions, `(a_j)_v` uses `f_btheta` and `(A_j)_v` uses
+`f_bbtheta`; for random-effect directions they use `f_bb` and `f_bbb`.
+Residual coefficients must include their prediction dependence and any explicit
+parameter dependence. Omega derivatives include inverse-prior algebra; sigma
+derivatives include residual algebra. All population coordinates also contribute
+through the moving mode. Apply the existing natural-to-packed chains (including
+log theta/sigma and Cholesky omega); use the production fixed-parameter mask.
+
+For the first implementation, scope the displayed scalar-likelihood formula to
+ordinary independent Gaussian errors. Magnitude, IIV-on-RUV, censoring, LTBS and
+correlated errors need additional terms or different assemblies: they must not
+enter simply because the prediction provider returns a jet.
+
+Reuse the current fixed-eta score and mode response. Replace only the supported
+one-node curvature/grid response; avoid counting its mode-response or prior term
+twice. Keep the base objective evaluation and its normalization unchanged.
+
+### Expected cost, to be measured
+
+The current supported response uses about `2p` perturbed anchor evaluations, for
+`p` free packed population parameters. The full covariance sweep uses
+`1 + 2(n_theta + d)` provider evaluations and allocates additional tensors.
+These are different work units and do not establish a speedup. Reusing third-order
+tensors may reduce repeated parameter-specific assembly, but can also cost more,
+especially with many random effects or fixed theta parameters. Measure both
+gradient-kernel and complete-fit behavior. First establish correctness using the
+existing sweep; prune unused blocks or share base work only after profiling.
+
+## Implementation sequence
+
+1. **Establish the baseline.** Instrument provider calls/time, exact versus FD
+   anchor calls, mode-response work, objective/gradient calls, inner iterations,
+   and total fit time. Separate analytical PK, nonstiff ODE and stiff ODE cases.
+2. **Reuse the third-order provider.** Inspect its scope, tensor layouts, FD steps
+   and route-switch guards. Wire the existing theta/eta FD-of-second-order sweep
+   into a private Laplace derivative assembly, with unchanged covariance behavior.
+3. **Prototype the Laplace assembly.** Start with ordinary Gaussian additive,
+   proportional and combined errors, closed-form PK, no IOV, and a smooth PD
+   exact anchor. Assemble exact-H derivatives and the trace contraction, with
+   the existing gradient as fallback and an independent reconverged objective FD
+   as the correctness oracle. Make analytical residual/prior
+   derivatives agree with the production error conventions.
+4. **Extend deliberately.** Add ODE, then joint eta/kappa with block prior algebra.
+   Carry over the covariance provider's step/noise policy and provider-route guards.
+   Test tolerance sweeps; solver relative tolerance is a step heuristic, not a
+   bound on derivative error. Only widen to M3, LTBS, magnitude models, correlated
+   residuals and other likelihoods after deriving all their direct terms.
+5. **Use first-order proposal algebra.** For regularized anchors, differentiate
+   exactly the proposal used by `build_proposal`; inspect/reuse
+   `agq_cov_hessian::RegularisedAnchor` and its first-order factor methods.
+   Decline at nonsmooth branch boundaries or incompatible prior fallbacks.
+   Later apply the same anchor derivatives to multi-node grid displacement.
+
+Keep an internal way to force the baseline and candidate paths in the benchmark
+harness; a public fit option is not required. Route a failed candidate to the old
+response without partially accumulating its output. Share base jets/preparation
+only when profiling identifies material duplication and the numerical contract
+is unchanged.
+
+This is an optimization-gradient project. Full analytical Laplace covariance is
+separate: differentiating the exact-H log determinant twice generally needs
+fourth-order prediction information. Third-order FD jets suffice for the gradient.
+
+## Validation and acceptance
+
+- Unit-check the reused third-order slices against independently differenced
+  theta/eta slices, including symmetry and step-size sweeps. Test the assembled
+  exact `H_x` and `H_b`, not just the FOCEI anchor.
+- Compare the complete packed gradient against central differences of the actual
+  reconverged Laplace objective at several off-optimum parameter vectors. Include
+  additive/combined errors, omega blocks, fixed coordinates, and imperfect modes.
+- Preserve the existing one-node objective identity, nonfinite-anchor fallback,
+  no-random-effects behavior and regularization semantics. Retain the existing
+  path for unsupported models/subjects rather than dropping derivative terms.
+- Add joint eta/kappa, ODE tolerance and dispatch-boundary coverage before enabling
+  those routes. Test multi-node total derivatives before extending beyond one node.
+- Run interleaved release benchmarks on identical datasets, starting parameters,
+  optimizer options, thread counts and tolerances. Report call counts, gradient
+  error, kernel time, fit time, final OFV, estimates, EBEs and convergence status.
+- Include a matching NONMEM LAPLACIAN INTER comparison for numerical behavior;
+  FOCEI equivalence is not the acceptance target. Run repository-required checks
+  when implementation exists, with slow converged fits in the appropriate tier.
+- Enable the new route only where it preserves objective/gradient accuracy and
+  demonstrates repeatable benefit. No fixed promised speedup before measurement.
+
+## Files and tests to start with
+
+Paths below are relative to this worktree; line numbers refer to baseline `cfc956da`.
+
+| Location | Role |
+|---|---|
+| `src/sens/provider.rs:4322` | `third_order_fd_step`: closed-form noise and ODE tolerance-aware step heuristic |
+| `src/sens/provider.rs:4359` | `subject_sensitivities_cov`, IOV counterpart, and shared covariance sweep; start reuse here |
+| `src/sens/provider_tests.rs` | Existing third-order tensor layout/value tests |
+| `src/estimation/agq.rs:406` | Exact/Gauss-Newton anchor dispatch |
+| `src/estimation/agq.rs:1234` | Current `grid_response_correction`; intended integration point |
+| `src/estimation/agq.rs:1480` | Existing implicit mode response and fallback |
+| `src/estimation/agq.rs:1600` | Subject gradient composition, fixed-node score and response |
+| `src/estimation/sens_outer_gradient.rs` | `score_core`, `h_inner`, residual primitives and packed mode-response chains |
+| `src/estimation/sens_cov_hessian.rs` | Reusable residual/prior primitives; its anchor derivatives are FOCEI-specific |
+| `src/estimation/agq_cov_hessian.rs` | Regularization and first-order factor algebra; do not reuse its FOCEI covariance result as Laplace |
+| `tests/agq.rs` | Existing estimator gradient/objective tests and reference fixtures |
+| `examples/warfarin.ferx`, `examples/warfarin_ode.ferx`, `examples/warfarin_iov.ferx` | Candidate benchmark inputs; create explicit Laplace variants with matched options |
+
+Verify available toolchain and `.cargo`/CI configuration before building. Old
+targets were cleaned, so expect a cold first compilation; never include it in
+runtime measurements. Start with targeted unit tests and then the repository's
+required checks, using the correct feature set:
+
+```powershell
+cargo fmt --all -- --check
+cargo test -p ferx-core --lib
+cargo check -p ferx-core --tests
+```
+
+Run relevant AGQ integration and opt-in slow convergence tests after inspecting
+their gates. Follow `AGENTS.md` for regression tests, NONMEM comparison, public
+API constraints, Quarto documentation and changelog requirements. Refresh stale
+FD-only comments in touched code. Do not invent an issue number or report tests
+or NONMEM runs that have not actually executed.
+
+## Deliverables and completion criteria
+
+1. A private, tested Laplace derivative assembly consuming third-order prediction
+   tensors obtained by FD of second order, with baseline fallback and explicit scope.
+2. Demonstrated packed-gradient parity with an independent objective-FD reference,
+   unchanged objective values, and stable fitted results/convergence for the
+   benchmarked cases. Choose and document justified tolerances from step sweeps.
+3. A reproducible benchmark report with baseline/candidate commit or patch identity,
+   fixtures, commands, toolchain, thread count, solver tolerances, repetitions,
+   provider counts and timings. Include negative results and any unsupported cases.
+4. Appropriate regression checks and user documentation if enabled. If the direct
+   reuse does not improve speed, report that result and the measured bottleneck;
+   do not silently change the objective or claim the idea succeeded.
+
+The next session's first concrete task is to inspect the covariance jet's gates
+and `grid_response_correction`, then implement a Gaussian non-IOV prototype using
+the existing third-order sweep and add a packed-gradient parity test. Broader
+scope and optional sweep optimizations follow that evidence.
+
+## Results (2026-09-09 implementation session)
+
+Both estimator families this handoff scoped (`laplace`/AGQ's exact-Hessian anchor and
+`focei`'s Gauss-Newton-anchored quadrature refinement) now have an analytic grid-response
+route, implemented, tested, and benchmarked against the pre-existing perturbed-anchor FD
+sweep. The two anchors resolved very differently, and the split default reflects that.
+
+### Exact anchor (`laplace`, `HessianAnchor::Exact`) — `src/estimation/laplace_h_deriv.rs`
+
+Implemented as specified: `dH/dx` from FD-of-second-order-jet, reusing the analytical
+covariance provider's third-order sweep (`subject_sensitivities_cov`). Pinned against a
+finite-difference of the reconverged Laplace/AGQ objective at every node count
+(`tests/agq.rs::analytic_gradient_matches_fd_at_every_node_count`) and against a direct A/B
+comparison with the FD route
+(`agq::tests::analytic_grid_response_matches_the_fd_route`).
+
+**Not the default — the win is representation-dependent and close enough to parity that it
+needs re-measuring rather than trusting a single past run.** The call-count argument the
+handoff's numerical-design section anticipated (`2p` vs `1+2(n_theta+d)`) does not predict
+wall-clock cost on its own: each analytic evaluation does materially more work per call (the
+full third-order jet, plus per-observation central differences of the residual kernel in `f`
+and `σ`) than a plain anchor rebuild. `plans/laplace-sensitivity-speed/bench.sh` (3 interleaved
+reps, `ci-test` profile, commit `8e03e076`, 2026-09-09) measured:
+
+| Fixture | Provider calls (fd → analytic) | Provider time (fd → analytic) | Outer iters (fd → analytic) |
+|---|---|---|---|
+| diagonal Ω, closed-form (`warfarin_laplace.ferx`) | 6840 → 6460 (−6%) | ~0.062s → ~0.053s avg (~14% faster, all 3 reps) | 37 → 37 |
+| ODE (`warfarin_ode_laplace.ferx`) | 10270 → 7660 (−25%) | ~1.66s → ~1.20s avg (~27% faster, all 3 reps) | 56 → 44 |
+
+Both cases favored `analytic` this run — including ODE, which is **admitted** for this anchor
+(`laplace_h_deriv::tests::h_derivative_matches_fd_under_ode`), not out of scope: the covariance
+provider's third-order sweep already reaches it via `ode_analytical_supported`. But an earlier
+pass on the same non-ODE fixture had recorded the opposite sign (fewer calls, 6840 → 6460, yet
+**more** total provider time, 0.098s → 0.131s, +34% — the number the previous revision of this
+section reported). Both measurements are real; the difference is machine/toolchain state
+moving a case that sits close to parity, not a defect in either run. That volatility, not a
+settled loss, is why this stays behind `FERX_AGQ_GRID_RESPONSE=analytic` rather than becoming
+the default — flip it only after a benchmark run stable enough to trust across repeated
+sessions, on both the closed-form and ODE fixtures.
+
+### Gauss-Newton anchor (`focei, n_agq > 1`, `HessianAnchor::GaussNewton`) —
+### `src/estimation/focei_htilde_dx.rs`
+
+Not in the original handoff scope — added after inspecting nlmixr2est's own AGQ gradient
+(`src/foceiGrad.cpp::foceiGradSubjectAgqFR_`), which anchors exclusively on the Gauss-Newton
+Hessian and therefore never needs third order at all: `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` is bilinear in
+*first*-order sensitivities, so `dH̃/dx` needs only the *second*-order mixed blocks
+(`∂²f/∂η∂θ`, `∂²f/∂η²`) the plain provider already returns — the same blocks FOCEI's own
+`theta_block`/`sigma_block` log-determinant terms already consume. One extra ordinary
+`subject_sensitivities` call replaces the FD route's `2·n_free` full anchor rebuilds, with no
+call-count-vs-per-call-cost ambiguity to measure.
+
+Scope is close to `analytic_score_supported` (M3-BLOQ base value, custom/TV σ magnitude,
+LTBS, `ExpressionScale`, FREM, closed-form **and ODE**), narrowed by two remaining structural
+exclusions (mixture layout, `iiv_on_ruv`'s dedicated residual-η rows) plus one found by
+testing: M3-censored rows get a correct *base* `H̃` from
+`score_core` already, but this module's σ/magnitude direct-derivative formula (`dp_dv`)
+assumes the quantified functional form of `p` and is wrong for a censored row's `p = g2` —
+declined rather than silently wrong. Two bugs caught by the FD-parity tests before landing:
+a missing θ-packing chain multiplier on the magnitude direct term, and the M3 case above.
+
+**This is on by default**, backed by a benchmark across three fixtures
+(`plans/laplace-sensitivity-speed/warfarin_focei_agq.ferx`,
+`warfarin_block_omega_focei_agq.ferx`, `warfarin_ode_focei_agq.ferx`; 5 reps each,
+`FERX_AGQ_GRID_RESPONSE=fd` vs `=analytic`, `ci-test` profile). Every arm reproduced the same
+OFV and estimates as its FD counterpart:
+
+| Fixture | Provider calls (fd → analytic) | Provider time | Outer iters (fd → analytic) |
+|---|---|---|---|
+| diagonal Ω | 16720 → 11780 (−30%) | comparable, noisy | 37 → 37 |
+| block Ω (3×3) | 21000 → 13020 (−38%) | ~0.39s → ~0.24s (−38%) | 41 → 41 |
+| ODE | 23770 → 11790 (−50%) | ~6.4s → ~3.1s (−52%) | 53 → 37 |
+
+The ODE case is the clearest win: FD's perturbed-anchor rebuild re-solves the ODE sensitivity
+system `2·n_free` times per gradient; the analytic route pays one extra ODE-sensitivity
+provider call. Wall-clock there was ~30–40% faster per fit end-to-end
+(`plans/laplace-sensitivity-speed/bench.sh`), and it also took fewer outer iterations to
+converge (37 vs 53) — plausibly because the FD route's gradient carries more numerical noise
+near an ODE-tolerance-limited anchor.
+
+### Deliverable items from the original acceptance criteria
+
+- Unit-checked reused third-order slices, symmetry, exact `H_x`/`H_b` — done for the Exact
+  module (`laplace_h_deriv::tests`).
+- Packed-gradient parity against reconverged-objective FD — done for both anchors
+  (`tests/agq.rs` for Exact; `focei_htilde_dx::tests` + `agq::tests::gauss_newton_anchored_
+  gradient_matches_fd` for Gauss-Newton).
+- NONMEM LAPLACIAN INTER comparison — **not done**. The analytic and FD routes agree only to
+  the FD route's own truncation error (`1e-5` relative, see `AGQ_GRID_FD_STEP`), not
+  bit-for-bit, so no new anchor is owed only in the sense that neither route changes which
+  quantity is being estimated; the existing NONMEM comparisons for `laplace`/`focei` still
+  apply.
+- ODE, IOV, dispatch-boundary coverage before enabling those routes — ODE is admitted for
+  **both** anchors now (Gauss-Newton: tested, benchmarked; Exact: tested at `tol = 5e-3`,
+  reusing the covariance provider's existing ODE reach — no new solver-side work). IOV landed
+  for the Gauss-Newton anchor (`subject_htilde_dx_iov`, see "Left for a follow-up" below);
+  mixture, and IOV for the Exact anchor, stay declined (dimension-layout complexity, still a
+  follow-up).
+- Multi-node total derivative — covered by the existing `n_agq` sweep in
+  `tests/agq.rs::analytic_gradient_matches_fd_at_every_node_count` and the dedicated
+  `n_agq ∈ {1, 3}` cases in `agq::tests::analytic_grid_response_matches_the_fd_route`.
+
+### Left for a follow-up
+
+Both `focei_htilde_dx` and `laplace_h_deriv` now cover ODE and M3-BLOQ (base and, for
+`focei_htilde_dx`, the σ-direct derivative). `focei_htilde_dx` additionally covers custom/TV σ
+magnitude, `iiv_on_ruv` **including combined with an M3-censored row** (the `ruv_cz`/`ruv_cm`
+chain, reusing `ScoreCore::cens_dcz_df`/`cens_dcm_df` for the structural half and a new
+scale-response FD term for `∂/∂(ruv_scale)` — caught by the FD-parity test itself, since the
+initial implementation missed it), and correlated residuals (`block_sigma`, both the
+`corr_residual_rd_at_sigma` σ-direct swap and a new packed-coordinate segment for the ρ
+off-diagonal, chained through `rho_chain`'s Fisher-z factor via `rho_rd_terms`'s closed form —
+no FD needed there, unlike the σ/magnitude channels), and **IOV** — a sibling
+`subject_htilde_dx_iov` (not a branch of the non-IOV function, matching the codebase's own
+`*_iov` convention throughout `sens_outer_gradient.rs`): the packed layout is
+`[θ, Ω_bsv, σ, Ω_iov]` (σ sits between the two Ω segments), the sensitivity provider is
+`subject_sensitivities_iov`, and a BSV or IOV Ω coordinate's `dΩ⁻¹/dx` reads the *joint*
+Cholesky factor (`block_chol_full`) — an IOV entry moves `K` replicated diagonal blocks of
+`Σ_b` at once, so its derivative sums `K` such contributions. `agq.rs`'s `analytic_grid_
+response` already passed `stack.omega_joint_inv` (never reduced) and already dispatched
+`db_dx` through `subject_eta_dx_iov` when `stack.is_iov()`, so the only caller-side change was
+adding a third `HessianAnchor::GaussNewton if stack.is_iov()` match arm. Validated both at the
+isolated-function level (`focei_htilde_dx::tests::htilde_derivative_matches_fd_under_iov`,
+mutation-tested: dropping the `K`-sum kills it hard) and end-to-end through the real
+`agq_population_gradient` against FD of the actual IOV population objective
+(`tests/agq.rs::iov_gauss_newton_anchored_gradient_matches_fd`) — the earlier build-cost
+caution about `MAX_ODE_IOV_AXES` turned out not to apply here: `subject_sensitivities_iov`/
+`subject_eta_dx_iov` are already instantiated in the binary (they back the existing
+`subject_packed_gradient_iov`), so adding call sites doesn't re-expand any axis
+monomorphization. What remains:
+
+- **Mixture** — declined for both modules (a mixture's subpopulation overrides are a
+  different packed segment again, not the stacked-prior story IOV is).
+- **`laplace_h_deriv` + IOV** — not attempted in this round. The covariance provider does
+  reach IOV (`subject_sensitivities_cov_iov`) except when combined with `has_lagtime()`, so
+  it is reachable in principle, but needs the same `[θ, Ω_bsv, σ, Ω_iov]` layout and joint-`Ω⁻¹`
+  treatment `subject_htilde_dx_iov` just built, applied to the third-order (not second-order)
+  case — left for a follow-up given `laplace`'s route is opt-in with no proven speed win
+  regardless.
+- **`block_sigma` + IOV** — unreachable through either module today (`score_core`'s own scope
+  keeps the two mutually exclusive in practice), so not attempted.
+- A repository-required NONMEM comparison would be owed only if either route becomes the
+  route a user-visible numerical result depends on differently than before — it does not
+  currently, since both are pinned to the pre-existing gradient.

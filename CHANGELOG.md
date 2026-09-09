@@ -19,6 +19,27 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles
+  its `½·log|H̃|` grid-response gradient term analytically instead of rebuilding the anchor at
+  `x ± h` for every free population parameter.** `H̃` is bilinear in first-order prediction
+  sensitivities, so unlike the exact-anchor Laplace case its derivative needs no third-order
+  jet — one extra ordinary analytic-provider evaluation replaces `2·n_free` perturbed-anchor
+  rebuilds. The analytic and finite-difference routes agree to within the finite-difference
+  route's own truncation error (and this is on by default); converged estimates, OFVs and
+  standard errors may move within the convergence tolerance since the optimizer trajectory
+  itself changes (e.g. an ODE fixture converges in 37 outer iterations instead of 53); measured
+  on warfarin fixtures: 30–50% fewer
+  analytic-provider calls, and on an ODE model roughly 2× less provider time and ~30% faster
+  wall-clock, converging in fewer outer iterations. Also covers custom/time-varying σ
+  magnitude, `iiv_on_ruv` (including combined with an M3-censored row), M3-BLOQ including its
+  σ-direct derivative, correlated residuals (`block_sigma`), and **IOV** (the stacked `[η, κ]`
+  system, via a dedicated joint-prior assembly) — only mixture models keep the pre-existing
+  finite-difference route. `laplace`/AGQ's exact-Hessian
+  anchor gained the same analytic route for closed-form and **ODE** models (opt-in via
+  `FERX_AGQ_GRID_RESPONSE=analytic` — no repeatable wall-clock win was measured there, so it
+  is not the default; its value is an exact, FD-noise-free gradient) (#251).
+
 ### Added
 - **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or
   exhaustive enumeration, ranked on pyDarwin's penalized fitness (#1185, P6 of #1175).**
