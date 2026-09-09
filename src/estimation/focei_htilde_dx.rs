@@ -168,13 +168,17 @@ pub(crate) fn subject_htilde_dx(
         sp[s] += h;
         let mut sm = sigma.to_vec();
         sm[s] -= h;
+        let frem_override_p =
+            build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sp);
+        let frem_override_m =
+            build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sm);
         for (j, o) in sens.obs.iter().enumerate() {
             let cmt = err_keys[j];
-            let frem_p = build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sp)
+            let frem_p = frem_override_p
                 .as_ref()
                 .and_then(|ov| ov.get(j))
                 .and_then(|v| *v);
-            let frem_m = build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sm)
+            let frem_m = frem_override_m
                 .as_ref()
                 .and_then(|ov| ov.get(j))
                 .and_then(|v| *v);

@@ -1543,8 +1543,10 @@ fn fd_grid_response(
 /// `None` — with `out` untouched — whenever the anchor is not differentiable
 /// ([`crate::estimation::agq_cov_hessian::regularised_anchor`] declines at a jitter branch
 /// crossing or a non-PD `S`), is too ill-conditioned for `S⁻¹` to be contracted against its
-/// own derivative, or the model is outside
-/// [`crate::estimation::laplace_h_deriv::subject_h_inner_dx`]'s scope.
+/// own derivative, or the model is outside the scope of the per-anchor `dH/dx` provider this
+/// dispatches to: [`crate::estimation::laplace_h_deriv::subject_h_inner_dx`] for
+/// [`HessianAnchor::Exact`], [`crate::estimation::focei_htilde_dx::subject_htilde_dx`] for
+/// [`HessianAnchor::GaussNewton`].
 #[allow(clippy::too_many_arguments)]
 fn analytic_grid_response(
     anchor: HessianAnchor,
