@@ -76,6 +76,31 @@ fn params_with_sigma(sigma_line: &str) -> String {
     )
 }
 
+/// A two-eta model, so a `block_omega` has an off-diagonal to be out of box on.
+/// `model_with_parameters`' one-eta model cannot express one at all, which is
+/// why the `OmegaOffDiagonal` arm had no fixture until #1309's review.
+fn block_omega_model(omega_line: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n\
+         \x20 theta TVCL(5.0, 0.001, 100.0)\n\
+         \x20 theta TVV(50.0, 0.1, 500.0)\n\
+         \x20 {omega_line}\n\
+         \x20 sigma PROP_ERR ~ 0.04\n\
+         \n\
+         [individual_parameters]\n\
+         CL = TVCL * exp(ETA_CL)\n\
+         V  = TVV * exp(ETA_V)\n\
+         \n\
+         [structural_model]\n\
+         pk one_cpt_iv(cl=CL, v=V)\n\
+         \n\
+         [error_model]\n\
+         DV ~ proportional(PROP_ERR)\n"
+    );
+    crate::parser::model_parser::parse_model_string(&src)
+        .unwrap_or_else(|e| panic!("model must parse: {e}\n--- source ---\n{src}"))
+}
+
 /// The check as an ordinary fit would run it (`outer_maxiter` > 0, so the
 /// eval-only exemption does not apply).
 fn box_diags(params_block: &str) -> Vec<Diagnostic> {
@@ -304,6 +329,15 @@ fn a_sigma_start_outside_either_rail_is_a_warning_that_does_not_refuse_the_fit()
         );
         assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
         assert!(msg.contains("PROP_ERR"), "{msg}");
+        // The remedy quotes the interval `unpinned_bounds` actually pushed.
+        // Before #1309's review it carried its own `(-8.0).exp()` / `5.0.exp()`
+        // literals, so moving the rail would have left the message naming the
+        // old one with nothing to catch it: these are `SIGMA_PACK_LOWER` and
+        // `SIGMA_PACK_UPPER` read back, at three digits.
+        assert!(
+            msg.contains("inside (3.355e-4, 1.484e2)"),
+            "{line}: the remedy must quote the rails the box uses — {msg}"
+        );
         assert!(
             crate::diagnostics::first_error(&diags).is_ok(),
             "{line}: `fit()` must not refuse this"
@@ -532,5 +566,234 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_ten() {
     assert_eq!(
         found_refs, allowed,
         "the set of shipped out-of-box coordinates changed"
+    );
+}
+
+// ── T15 (#1309 review): an EMPTY box, which used to abort the process ──────
+
+/// Regression: `coordinates_outside_bounds` returning `None` for `lower >
+/// upper` and nothing else claiming it.
+///
+/// That is not a benign skip. `clamp_to_bounds` calls `f64::clamp`, which
+/// **panics** on `min > max`, and every optimizer entry clamps the start before
+/// its first evaluation — so an empty box aborted the process with
+/// `min > max, or either was NaN` from `core/src/num/f64.rs` instead of
+/// producing a diagnostic. Measured on all three arms below at `d8ae4412`.
+///
+/// Three causes, one variable each, and the third is the one that makes this
+/// more than a typo guard: `theta TVCL(1e-12, 1e-13, 1e-11)` is an ordinary
+/// declaration of a small parameter, with its own lower bound below its own
+/// upper, and it is ferx's `1e-10` packing floor — substituted for the declared
+/// lower — that empties the box.
+#[test]
+fn a_theta_whose_packed_box_is_empty_is_an_error_not_a_panic() {
+    for (line, cause) in [
+        // The declaration itself is empty: bounds swapped.
+        ("theta TVCL(1.0, 5.0, 2.0)", "declared range is empty"),
+        // Legal declaration, entirely above ferx's 1e9 cap.
+        ("theta TVCL(5e9, 2e9, 1e12)", "entirely above"),
+        // Legal declaration, entirely below ferx's 1e-10 floor.
+        ("theta TVCL(1e-12, 1e-13, 1e-11)", "entirely below"),
+    ] {
+        let params = params_with_theta(line);
+        let model = model_with_parameters(&params);
+        let p = &model.default_params;
+
+        // The premise: the box really is empty. Asserted so the test cannot go
+        // green by the predicate having stopped firing.
+        let start = pack_with_bounds(p);
+        assert!(
+            start.bounds.lower[0] > start.bounds.upper[0],
+            "{line}: premise — packed lower {} must exceed upper {}",
+            start.bounds.lower[0],
+            start.bounds.upper[0]
+        );
+
+        let diags = check_packed_start_in_box(p, &FitOptions::default());
+        let msg = only_message(&diags);
+        assert_eq!(diags[0].code, "E_THETA_BOUNDS_INVERTED");
+        assert!(diags[0].is_error(), "{line}: {msg}");
+        assert!(msg.contains("TVCL"), "{line}: {msg}");
+        assert!(msg.contains("empty optimizer box"), "{line}: {msg}");
+        assert!(
+            msg.contains(cause),
+            "{line}: the message must name *which* of the three causes, got {msg}"
+        );
+        // And `fit()` refuses, which is the whole point — `first_error` is the
+        // exact predicate it applies.
+        assert!(
+            crate::diagnostics::first_error(&diags).is_err(),
+            "{line}: the fit must stop here rather than in the clamp"
+        );
+    }
+
+    // The differential half, on the arm closest to a working declaration: one
+    // number moved so the box is non-empty, and the check goes silent.
+    assert!(
+        box_diags(&params_with_theta("theta TVCL(1e-12, 1e-13, 1e-9)")).is_empty(),
+        "an upper bound above the 1e-10 floor leaves a representable box"
+    );
+}
+
+/// The empty-box error is **not** exempt at `outer_maxiter = 0`, unlike every
+/// other verdict this check ships.
+///
+/// The eval-only exemption exists because a clamped start does not *stick*
+/// without a search. An empty box is not clamped at all — it panics — and
+/// `evaluate_at_initial_params` clamps as well, so exempting it would leave
+/// exactly the aborting case unreported. Asserted as a straddle against the
+/// out-of-box error on the same fixture shape, which *is* exempt.
+#[test]
+fn the_empty_box_error_survives_the_eval_only_exemption() {
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+
+    let empty = model_with_parameters(&params_with_theta("theta TVCL(1.0, 5.0, 2.0)"));
+    let d = check_packed_start_in_box(&empty.default_params, &eval_only);
+    assert_eq!(d.len(), 1, "an empty box is reported even at maxiter = 0");
+    assert_eq!(d[0].code, "E_THETA_BOUNDS_INVERTED");
+
+    // The other side of the straddle: a merely out-of-box start on the same
+    // model shape stays exempt, so this test pins the *difference* rather than
+    // the exemption having been deleted wholesale.
+    let outside = model_with_parameters(&params_with_theta("theta TVCL(0.05, 0.1, 10.0)"));
+    assert!(
+        check_packed_start_in_box(&outside.default_params, &eval_only).is_empty(),
+        "a clamped-but-orderable start is still exempt at maxiter = 0"
+    );
+}
+
+// ── T13 (#1309 review): the Ω off-diagonal arm ─────────────────────────────
+
+/// Regression: the `PackedCoordKind::OmegaOffDiagonal` arm of
+/// `check_packed_start_in_box`, which no test at any tier reached when this PR
+/// was first reviewed. Replacing its body with `unreachable!()` left the whole
+/// suite green — 203 binaries, 5893 tests — and Codecov independently reported
+/// ten uncovered lines in `api/validation.rs`.
+///
+/// `block_omega (ETA_CL, ETA_V) = [1.0, 15.0, 400.0]` is positive definite
+/// (`det = 400 − 225 = 175`) and its Cholesky is `L₁₁ = 1`, `L₂₁ = 15`,
+/// `L₂₂ = √175 ≈ 13.2`. Only `L₂₁` is out of box: both diagonals pack to
+/// `ln(1) = 0` and `ln(13.2) = 2.58`, comfortably inside `±6`, so the single
+/// diagnostic is the off-diagonal and the fixture cannot pass by accident.
+#[test]
+fn an_omega_off_diagonal_above_its_rail_is_reported_as_a_warning() {
+    let model = block_omega_model("block_omega (ETA_CL, ETA_V) = [1.0, 15.0, 400.0]");
+    let p = &model.default_params;
+
+    // The premise, measured rather than assumed: exactly one coordinate is out
+    // of box and it is the off-diagonal.
+    let start = pack_with_bounds(p);
+    let kinds = coordinate_kinds(p);
+    let hits: Vec<_> = coordinates_outside_bounds(&start, &kinds)
+        .map(|h| (h.kind, h.side))
+        .collect();
+    assert_eq!(
+        hits,
+        vec![(PackedCoordKind::OmegaOffDiagonal, BoxSide::Above)],
+        "the fixture must isolate the off-diagonal: {hits:?}"
+    );
+
+    let diags = check_packed_start_in_box(p, &FitOptions::default());
+    let msg = only_message(&diags);
+    assert!(
+        !diags[0].is_error(),
+        "either rail is a runaway, not a collapse"
+    );
+    assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
+    assert!(
+        msg.contains("Cholesky element"),
+        "the off-diagonal arm names the coordinate it clamps: {msg}"
+    );
+    assert!(
+        msg.contains("1.500e1"),
+        "the element, at three digits: {msg}"
+    );
+    assert!(msg.contains("rail of 1e1"), "the rail: {msg}");
+    assert!(msg.contains("covariances"), "the remedy: {msg}");
+
+    // The differential half: the same block with a covariance inside the rail
+    // is silent, so the assertions above cannot be passing on a blanket
+    // rejection of `block_omega`.
+    let ok = block_omega_model("block_omega (ETA_CL, ETA_V) = [1.0, 5.0, 400.0]");
+    assert!(
+        check_packed_start_in_box(&ok.default_params, &FitOptions::default()).is_empty(),
+        "L₂₁ = 5 is inside ±10"
+    );
+}
+
+// ── T14 (#1309 review): a block Ω diagonal is not a declared variance ──────
+
+/// Regression: the Ω-diagonal arm printing `exp(2·packed)` as "a variance".
+///
+/// On a **diagonal** Ω that is exactly the variance. On a `block_omega` the
+/// packed coordinate is `ln(L_ii)`, and `L_ii²` is what is left of the eta's
+/// variance once the off-diagonals are accounted for — a number that appears
+/// nowhere in the model file. Measured before the fix, on this fixture: the
+/// message read *"ETA_V starts at a variance of 2.8888888888888864e5"* while
+/// the declaration says `4e5`.
+///
+/// `block_omega (ETA_CL, ETA_V) = [0.09, 100.0, 4e5]` is positive definite
+/// (`det = 36000 − 10000 = 26000`); `L₂₂ = √(4e5 − 100²/0.09) ≈ 537.5`, which
+/// packs to `6.29` against the `+6` rail. `L₂₁ = 333` is over its own rail too,
+/// so the test asserts on the diagonal entry specifically rather than on
+/// `only_message`.
+#[test]
+fn a_block_omega_diagonal_is_reported_as_a_cholesky_diagonal_not_a_variance() {
+    let model = block_omega_model("block_omega (ETA_CL, ETA_V) = [0.09, 100.0, 4e5]");
+    let p = &model.default_params;
+    let diags = check_packed_start_in_box(p, &FitOptions::default());
+
+    let diag = diags
+        .iter()
+        .find(|d| d.message.contains("Cholesky diagonal"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a block Ω diagonal must be described as one: {:#?}",
+                diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(diag.code, "W_INIT_OUTSIDE_BOUNDS");
+    assert!(diag.message.contains("`block_omega`"), "{}", diag.message);
+    // The mechanism, not just the wording: the number quoted is L₂₂², and the
+    // message says so rather than calling it ETA_V's variance.
+    assert!(
+        diag.message.contains("L² = 2.889e5"),
+        "quote L², at three digits: {}",
+        diag.message
+    );
+    assert!(
+        !diag.message.contains("a variance of"),
+        "must not claim the declared variance on a block: {}",
+        diag.message
+    );
+    assert!(
+        diag.message.contains("not the variance declared for it"),
+        "and must say why: {}",
+        diag.message
+    );
+
+    // The control: the identical rail hit on a **diagonal** Ω, where `L_ii²`
+    // really is the declared variance, keeps the plain wording. Without this
+    // arm the assertion above passes for a fix that dropped "a variance of"
+    // everywhere.
+    let diagonal = box_diags(&params_with_omega("omega ETA_CL ~ 1e8"));
+    let dmsg = only_message(&diagonal);
+    assert!(
+        dmsg.contains("a variance of 1.000e8"),
+        "a diagonal Ω keeps the variance wording, and there L_ii² *is* the \
+         declared 1e8: {dmsg}"
+    );
+    assert!(
+        !dmsg.contains("Cholesky diagonal"),
+        "and does not borrow the block wording: {dmsg}"
+    );
+    // #1309 review: every computed number is at three digits. `{:e}` printed
+    // this rail as `1.6275479141900392e5`.
+    assert!(
+        dmsg.contains("rail of 1.628e5"),
+        "the rail, at three digits: {dmsg}"
     );
 }

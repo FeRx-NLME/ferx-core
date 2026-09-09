@@ -73,15 +73,18 @@ pub(crate) fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: 
         }
 }
 
-/// The cap [`theta_guard_is_internal`] found on `side`, on the natural scale —
-/// the number to quote in a diagnostic. Never `exp()` of the packed bound: that
-/// round-trip turns `1e9` into `9.999999999999993e8`.
-pub(crate) fn theta_internal_cap(side: BoxSide) -> f64 {
-    match side {
-        BoxSide::Below => THETA_PACK_FLOOR,
-        BoxSide::Above => THETA_PACK_CEIL,
-    }
-}
+/// Packed lower rail for a SIGMA coordinate: `exp(-8) ≈ 3.4e-4`.
+///
+/// Named because three places spell it — [`unpinned_bounds`], which pushes it;
+/// the start-side diagnostic, which quotes the interval back at the user; and
+/// the docs tables. Before #1309's review the diagnostic carried its own
+/// literal `-8.0`, so moving the rail would have left the message quoting the
+/// old one with nothing to catch it.
+pub(crate) const SIGMA_PACK_LOWER: f64 = -8.0;
+
+/// Packed upper rail for a SIGMA coordinate: `exp(5) ≈ 148`. See
+/// [`SIGMA_PACK_LOWER`].
+pub(crate) const SIGMA_PACK_UPPER: f64 = 5.0;
 
 /// Unconstrained-space bound for a Fisher-z (`atanh ρ`) residual-correlation
 /// coordinate (#847). `tanh(3) ≈ 0.995_05`, so `1 − ρ² ≥ 9.9e-3`.
@@ -649,7 +652,16 @@ pub(crate) struct PackedStart {
     pub(crate) fixed: Vec<bool>,
 }
 
-/// Pack `template`, bound it, and mask its FIX coordinates in one pass.
+/// Pack `template`, bound it, and mask its FIX coordinates in one **call**.
+///
+/// Not in one traversal, and the distinction is worth keeping straight: the
+/// body still walks the template once per product (`pack_params`,
+/// `packed_fixed_mask`, `unpinned_bounds`) plus once more to apply the FIX pin.
+/// What #1252 needed was not fewer traversals — measured, all fourteen call
+/// sites together are 0.0034% of a fit — but that the three products stop being
+/// computed and discarded: [`compute_bounds`] built the packed vector and the
+/// FIX mask internally and threw both away, leaving each caller to rebuild one
+/// or two of them immediately afterwards, from arithmetic that had to agree.
 ///
 /// Byte-for-byte what `(pack_params, compute_bounds, packed_fixed_mask)`
 /// produce separately — [`compute_bounds`] is now this function with two of its
@@ -761,10 +773,21 @@ pub(crate) fn coordinates_outside_bounds<'a>(
             start.bounds.upper.get(index)?,
             kinds.get(index)?,
         );
-        // A degenerate or non-finite box cannot place anything. The packed
-        // value itself is left to speak: `±inf` really is outside, and `NaN`
-        // compares false either way.
-        if !lower.is_finite() || !upper.is_finite() || lower > upper {
+        // An **unbounded** box places nothing: `theta_lower = -inf` /
+        // `theta_upper = +inf` is what `model_parser` gives an auto-declared
+        // theta, and `clamp(-inf, inf)` is a well-defined no-op, so there is
+        // genuinely nothing to report. The packed value is left to speak
+        // otherwise: `±inf` really is outside, and `NaN` compares false either
+        // way.
+        if !lower.is_finite() || !upper.is_finite() {
+            return None;
+        }
+        // An **empty** box is a different thing, and declining it here is not
+        // benign: `clamp_to_bounds` calls `f64::clamp`, which panics on
+        // `min > max`. It is claimed by `coordinates_with_inverted_bounds`
+        // below, whose diagnostic is an error precisely so the fit stops here
+        // rather than in the clamp (#1309 review).
+        if lower > upper {
             return None;
         }
         let (bound, side) = if packed < lower {
@@ -781,6 +804,70 @@ pub(crate) fn coordinates_outside_bounds<'a>(
             bound,
             side,
         })
+    })
+}
+
+/// A packed coordinate whose **box itself** is empty — `lower > upper`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InvertedBox {
+    /// Index into the packed vector.
+    pub(crate) index: usize,
+    /// What kind of quantity the coordinate holds. Only [`PackedCoordKind::Theta`]
+    /// is reachable through the parser; see [`coordinates_with_inverted_bounds`].
+    pub(crate) kind: PackedCoordKind,
+    /// The packed lower bound — the larger of the two.
+    pub(crate) lower: f64,
+    /// The packed upper bound.
+    pub(crate) upper: f64,
+}
+
+/// Every packed coordinate whose box is **empty**: `lower > upper`, so no value
+/// is inside it and `clamp_to_bounds` cannot clamp into it (#1309 review).
+///
+/// This is not a variant of "outside the box" — there is no side to be outside
+/// of — and it is not cosmetic. `clamp_to_bounds` calls [`f64::clamp`], which
+/// **panics** on `min > max`; every optimizer entry point clamps the start
+/// before its first evaluation, `evaluate_at_initial_params` included, so an
+/// empty box aborts the process rather than producing a diagnostic. Reporting
+/// it as an error is what stops the fit before the clamp.
+///
+/// **Only THETA can reach this**, and the reason is worth stating because it is
+/// what keeps the check from needing a per-kind message: every other segment's
+/// bounds are compile-time constants ([`unpinned_bounds`] pushes `±6`, `±10`,
+/// `[-8, 5]` and `±RHO_Z_BOUND`), and [`pack_with_bounds`] pins a FIX-ed
+/// coordinate to `lower == upper`, which is equal, not inverted. The iterator
+/// is written over every coordinate anyway, so a future rail that could invert
+/// is reported rather than silently skipped.
+///
+/// With `theta_lower <= theta_upper` the box still inverts in two ways, both
+/// from caps [`unpinned_bounds`] applies and the declaration does not mention:
+/// `theta_lower > `[`THETA_PACK_CEIL`] and `theta_upper < `[`THETA_PACK_FLOOR`].
+/// `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter — is the
+/// second, and it packs to `lower = -23.03` against `upper = -25.33`.
+pub(crate) fn coordinates_with_inverted_bounds<'a>(
+    start: &'a PackedStart,
+    kinds: &'a [PackedCoordKind],
+) -> impl Iterator<Item = InvertedBox> + 'a {
+    (0..start.packed.len()).filter_map(move |index| {
+        // Same short-vector guard as `coordinates_outside_bounds`.
+        let (&lower, &upper, &kind) = (
+            start.bounds.lower.get(index)?,
+            start.bounds.upper.get(index)?,
+            kinds.get(index)?,
+        );
+        // `!(lower <= upper)` rather than `lower > upper` so a `NaN` bound is
+        // caught too: `clamp` panics on a `NaN` min or max just as it does on
+        // an inverted pair, and `NaN > x` is false.
+        if lower.is_nan() || upper.is_nan() || lower > upper {
+            Some(InvertedBox {
+                index,
+                kind,
+                lower,
+                upper,
+            })
+        } else {
+            None
+        }
     })
 }
 
@@ -844,8 +931,8 @@ fn unpinned_bounds(template: &ModelParameters) -> PackedBounds {
 
     // Sigma bounds (log-transformed)
     for _ in 0..n_sigma {
-        lower.push(-8.0); // exp(-8) ≈ 3e-4
-        upper.push(5.0); // exp(5) ≈ 148
+        lower.push(SIGMA_PACK_LOWER); // exp(-8) ≈ 3e-4
+        upper.push(SIGMA_PACK_UPPER); // exp(5) ≈ 148
     }
 
     // IOV bounds: diagonal same as BSV diagonal; off-diagonal same as BSV off-diagonal.
@@ -870,8 +957,8 @@ fn unpinned_bounds(template: &ModelParameters) -> PackedBounds {
             upper.push(6.0);
         }
         for _ in 0..mix.sigma_override_addr.len() {
-            lower.push(-8.0);
-            upper.push(5.0);
+            lower.push(SIGMA_PACK_LOWER);
+            upper.push(SIGMA_PACK_UPPER);
         }
     }
 
@@ -1587,6 +1674,53 @@ mod tests {
             "a ρ slot is bounded symmetrically, so it takes the off-diagonal kind"
         );
         assert_eq!(segs.rho_start(), segs.total() - 1);
+    }
+
+    /// #1309 review. `coordinates_with_inverted_bounds` claims exactly the
+    /// boxes `clamp_to_bounds` cannot clamp into, and `coordinates_outside_bounds`
+    /// claims none of them — the two are disjoint by construction, and the
+    /// second's `lower > upper` skip is only safe because the first exists.
+    ///
+    /// Driven off a hand-built `PackedStart` rather than a model file: the
+    /// unbounded (`±inf`) and `NaN` rows are shapes the parser cannot produce
+    /// for a THETA, and they are the two that decide whether the skip in
+    /// `coordinates_outside_bounds` is a silent drop or a routed one.
+    #[test]
+    fn an_empty_or_unorderable_box_is_claimed_by_the_inverted_walk_and_by_nothing_else() {
+        // [inverted, NaN lower, NaN upper, unbounded, ordinary-but-outside, inside]
+        let start = PackedStart {
+            packed: vec![0.0, 0.0, 0.0, 5.0, -3.0, 0.5],
+            bounds: PackedBounds {
+                lower: vec![2.0, f64::NAN, -1.0, f64::NEG_INFINITY, -1.0, 0.0],
+                upper: vec![1.0, 1.0, f64::NAN, f64::INFINITY, 1.0, 1.0],
+            },
+            fixed: vec![false; 6],
+        };
+        let kinds = vec![PackedCoordKind::Theta; 6];
+
+        let inverted: Vec<usize> = coordinates_with_inverted_bounds(&start, &kinds)
+            .map(|h| h.index)
+            .collect();
+        assert_eq!(
+            inverted,
+            vec![0, 1, 2],
+            "an inverted pair and either bound being NaN all panic `f64::clamp`"
+        );
+
+        let outside: Vec<(usize, BoxSide)> = coordinates_outside_bounds(&start, &kinds)
+            .map(|h| (h.index, h.side))
+            .collect();
+        assert_eq!(
+            outside,
+            vec![(4, BoxSide::Below)],
+            "index 3 is unbounded (clamp(-inf, inf) is a no-op), index 5 is inside, \
+             and 0..=2 belong to the inverted walk"
+        );
+
+        // Disjoint, asserted rather than read off the two lists above.
+        for (i, _) in &outside {
+            assert!(!inverted.contains(i), "coordinate {i} claimed twice");
+        }
     }
 
     /// A two-sigma template carrying one `block_sigma` off-diagonal (#847).

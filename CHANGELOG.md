@@ -291,6 +291,15 @@ section of the SDLC for the versioning policy).
   now `#[non_exhaustive]`, so the `_` arm is required from here on and the next
   form — level grouping — will be genuinely additive.
 
+- **`fit()` now refuses a `theta` whose initial estimate is strictly outside its own
+  declared range (#1251).** It previously accepted the model and clamped the start
+  onto the bound, so a model file that fitted before now stops with
+  `E_THETA_INIT_OUTSIDE_BOUNDS` before the first objective evaluation. No model
+  shipped with ferx is affected — the exact predicate over every `.ferx` in the
+  repository finds none — but a model file of your own with a mistyped bound will now
+  be reported instead of quietly fitted from somewhere else. `maxiter = 0` runs are
+  exempt, as for `E_OMEGA_INIT_AT_RAIL`.
+
 ### Fixed
 - The `{model}.tmp` checkpoint written by a **deterministic** stage (`foce`, `focei`,
   `laplace`, `gn`, `gn_hybrid`) now stores the **best** point that stage has reached,
@@ -327,6 +336,14 @@ section of the SDLC for the versioning policy).
   by every site on either engine that turns a rate on or off: four of the walk's rate-*on*
   sites spelled it inline as `cmt_raw() >= 1` and the rate-*off* saltation at the
   infusion-window end asked nothing at all.
+- **A `theta` whose declared range cannot be represented no longer aborts the fit
+  (#1251).** `theta TVCL(1.0, 5.0, 2.0)` — bounds swapped — and
+  `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter whose whole range
+  falls below ferx's internal `1e-10` packing floor — both produce an empty optimizer
+  box, and the bound clamp panicked on it. ferx now reports
+  `E_THETA_BOUNDS_INVERTED`, naming which of the three causes applies. It is the one
+  start-side check with no `maxiter = 0` exemption, because an evaluation-only run
+  clamps the start too.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so

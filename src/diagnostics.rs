@@ -43,6 +43,7 @@
 //! | `E_SIGMA_ORDER_MISMATCH`  | a single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order |
 //! | `E_OMEGA_INIT_AT_RAIL`    | a **free** `omega` / `kappa` / `[mixture] omega(k)` variance whose initial value packs onto the optimizer's `-6` lower rail (variance ≤ 6.1e-6, `~ 0.0` included) — clamped there and not estimable; `FIX` it or start it higher (#1229) |
 //! | `E_THETA_INIT_OUTSIDE_BOUNDS` | a `theta` whose initial value is strictly outside its **own declared** range — clamped onto the bound and fitted from there; NM-TRAN refuses the identical stream (error 24) (#1251) |
+//! | `E_THETA_BOUNDS_INVERTED` | a `theta` whose packed box is **empty** — bounds swapped, or a declared range lying entirely outside ferx's `1e-10` / `1e9` packing caps. No start can be placed in it, and the clamp has no interval to clamp into. The only start-side check with no `maxiter = 0` exemption (#1251) |
 //! | `W_INIT_OUTSIDE_BOUNDS`   | an initial estimate strictly outside one of ferx's **internal** rails (the hidden `1e9` θ cap, the Ω `±6` / off-diagonal `±10` guards, the Σ `[-8, 5]` guard) — clamped there before the first objective evaluation (#1251) |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |

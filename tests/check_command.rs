@@ -1230,3 +1230,93 @@ fn a_start_past_the_hidden_theta_cap_warns_from_both_check_and_fit() {
 
     let _ = std::fs::remove_file(&model_path);
 }
+
+/// #1309 review. An **empty** packed box reaches `fit()` as an `Err`, not as a
+/// process abort.
+///
+/// This is the assertion the unit tests cannot make. `clamp_to_bounds` calls
+/// `f64::clamp`, which panics on `min > max`, and every optimizer entry clamps
+/// the start before its first objective evaluation — so before the fix this
+/// declaration took the process down with `min > max, or either was NaN` from
+/// `core/src/num/f64.rs` rather than returning anything. `expect_err` passing
+/// *is* the proof that the diagnostic now runs first; a regression re-panics
+/// and the test binary dies rather than failing quietly.
+///
+/// Both non-typo causes are exercised, because they are reached by different
+/// arithmetic: a range wholly above ferx's `1e9` cap, and one wholly below its
+/// `1e-10` floor. The second is an ordinary declaration of a small parameter.
+#[test]
+fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+
+    for (tag, theta_line, cause) in [
+        (
+            "swapped",
+            "theta TVCL(1.0, 5.0, 2.0)",
+            "declared range is empty",
+        ),
+        ("above_cap", "theta TVCL(5e9, 2e9, 1e12)", "entirely above"),
+        (
+            "below_floor",
+            "theta TVCL(1e-12, 1e-13, 1e-11)",
+            "entirely below",
+        ),
+    ] {
+        let model_path = temp_model(&format!("box_empty_{tag}"), &box_model_src(theta_line));
+
+        // `fit()` **first**, deliberately. If the report assertion came first
+        // it would fail on the missing code and return before ever calling
+        // `fit()` — so a regression would look like an ordinary assertion
+        // failure rather than like the abort this test exists to prevent.
+        // In this order the mutation that removes the check reproduces the
+        // original defect: the binary dies in `clamp_to_bounds` with
+        // `min > max, or either was NaN`.
+        let model = parse_full_model_file(&model_path).unwrap().model;
+        let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+            .expect_err("an empty box must be refused, not clamped into");
+
+        // …and at `maxiter = 0`, which is where the abort was reachable even
+        // though every other start-side check is exempt there:
+        // `evaluate_at_initial_params` clamps before it evaluates.
+        let eval_only = FitOptions {
+            outer_maxiter: 0,
+            ..FitOptions::default()
+        };
+        let err0 = fit(&model, &pop, &model.default_params, &eval_only)
+            .expect_err("the empty-box error is not exempt at maxiter = 0");
+        assert_eq!(err0, err, "{tag}: same refusal at maxiter = 0");
+
+        let report = validate_model_file(model_path.to_str().unwrap(), None);
+        assert!(!report.valid, "{tag}: {:?}", report.diagnostics);
+        let d = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "E_THETA_BOUNDS_INVERTED")
+            .unwrap_or_else(|| panic!("{tag}: code absent: {:?}", report.diagnostics));
+        assert!(d.message.contains(cause), "{tag}: {}", d.message);
+        assert_eq!(
+            d.message, err,
+            "{tag}: check and fit must agree byte for byte"
+        );
+
+        let _ = std::fs::remove_file(&model_path);
+    }
+
+    // The differential half: one number moved so the box is non-empty, and the
+    // same model fits. Without it the three arms above would pass for a check
+    // that rejected every model it saw.
+    let ok_path = temp_model(
+        "box_empty_control",
+        &box_model_src("theta TVCL(1e-12, 1e-13, 1e-9)"),
+    );
+    let ok_report = validate_model_file(ok_path.to_str().unwrap(), None);
+    assert!(
+        !ok_report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_THETA_BOUNDS_INVERTED"),
+        "an upper bound above the 1e-10 floor leaves a representable box: {:?}",
+        ok_report.diagnostics
+    );
+    let _ = std::fs::remove_file(&ok_path);
+}
