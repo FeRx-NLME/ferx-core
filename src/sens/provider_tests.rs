@@ -4890,6 +4890,35 @@ fn provider_lagtime_matches_production() {
     }
 }
 
+/// A closed-form event walk must carry a lagged SS bolus's previous-cycle tail
+/// from the dose record to its arrival while WT changes inside that window. This
+/// makes the record-time phase seed and the following event-walk propagation both
+/// live, so agreement covers the value, gradient, and Hessian rather than the
+/// flat-covariate cancellation case.
+#[test]
+fn closed_form_event_walk_ss_bolus_lag_matches_production() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
+    let subject = tvcov_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+        &[70.0],
+        &[0.25, 0.5, 1.0, 2.0, 6.0],
+        &[70.0, 76.0, 84.0, 66.0, 92.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+
+    assert!(subject.has_tv_covariates());
+    assert!(subject_routes_to_event_walk(&model, &subject));
+    assert!(!ss_lagtime_walk_unsupported(&model, &subject));
+    check_full_provider_vs_fd(
+        &model,
+        &subject,
+        &[0.22, 11.0, 1.4, 0.75, 0.8],
+        &[0.12, -0.08, 0.15, 0.10],
+    );
+}
+
 /// Reset + lagtime: a dose recorded *before* a reset but *arriving after* it
 /// (via lagtime) must contribute to the post-reset segment, exactly as the
 /// production event-driven walk applies it. The reset exclusion keys on the
@@ -5560,19 +5589,12 @@ fn lagtime_with_fixed_infusion_matches_fd_of_production() {
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
-/// **SS × lagtime still declines to FD**, per-subject. Production loads the periodic
-/// trough at the dose *record*, at phase `II − ALAG`, and lets the walk carry it to the
-/// lagged arrival (#1121, `ss_state_at_phase_event_driven` at `EventKind::DoseRecord`);
-/// the closed-form dual walk has no twin of that seed and still equilibrates at the
-/// arrival, so serving this would disagree with production in *value*, not just in
-/// derivative. Deliberately a hard decline, not an approximation — a lagged non-SS
-/// subject on the same model stays analytic.
-///
-/// The decline predates #1121 and survives it: before, production patched the
-/// pre-arrival *predictions* in a post-hoc pass the dual had no twin for; now it seeds
-/// the *state* and the dual has no twin for that. Same gap, different construct.
+/// **SS bolus × lagtime × live TV covariate is analytic.** Production loads the periodic
+/// state at the dose record and the dual walk mirrors that seed, then propagates it under
+/// each subsequent WT snapshot until the lagged arrival. This is the non-flat-covariate
+/// route the old FD fallback protected.
 #[test]
-fn lagtime_with_ss_dose_declines_to_fd() {
+fn lagtime_with_ss_bolus_uses_analytic_sensitivities() {
     let model = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
     let ss = tvcov_subject(
         vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
@@ -5587,13 +5609,41 @@ fn lagtime_with_ss_dose_declines_to_fd() {
     let theta = [0.22, 11.0, 1.4, 0.7, 0.8];
     let eta = [0.12, -0.08, 0.15, 0.10];
     assert!(
-        subject_sensitivities(&model, &ss, &theta, &eta).is_none(),
-        "SS + lagtime on the walk must decline to FD (no dual twin of the SS record-time seed)"
+        subject_sensitivities(&model, &ss, &theta, &eta).is_some(),
+        "SS bolus + lagtime on the walk must use the record-time dual seed"
     );
     assert!(
-        subject_eta_grad(&model, &ss, &theta, &eta).is_none(),
-        "inner must decline in lockstep with the outer (no split scope)"
+        subject_eta_grad(&model, &ss, &theta, &eta).is_some(),
+        "inner must use the same SS-bolus route as the outer provider"
     );
+    check_full_provider_vs_fd(&model, &ss, &theta, &eta);
+}
+
+/// Production clamps a lagged SS record phase to zero for `ALAG ≥ II`, retaining the
+/// post-pulse peak rather than flowing the system backward. The live WT snapshots keep the
+/// event walk non-flat, and the lag is well above II so central FD does not straddle the kink.
+#[test]
+fn ss_bolus_lag_at_least_interval_matches_production() {
+    let source = ONECPT_ORAL_LAG_TVCOV.replace("TVLAG(0.75, 0.01, 5.0)", "TVLAG(15.0, 0.01, 30.0)");
+    let model = parse_model_string(&source).expect("parse long-lag TV-cov model");
+    let subject = tvcov_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+        &[70.0],
+        &[0.25, 2.0, 6.0, 11.0, 14.0, 18.0],
+        &[70.0, 76.0, 84.0, 66.0, 92.0, 80.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    let theta = [0.22, 11.0, 1.4, 15.0, 0.8];
+    let eta = [0.12, -0.08, 0.15, 0.0];
+    let lag = theta[3] * eta[3].exp();
+    assert!(
+        lag > subject.doses[0].ii,
+        "fixture must take the clamped phase branch"
+    );
+    assert!(subject_sensitivities(&model, &subject, &theta, &eta).is_some());
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
 /// An observation sampled **exactly at a lagged bolus arrival** gets the one-sided analytic

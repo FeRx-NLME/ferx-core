@@ -19,6 +19,10 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+
+- **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
+
 ### Added
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
