@@ -64,11 +64,13 @@ pub fn run_foce_gn(
     let mut trust_radius: f64 = 1.0; // TR initial radius (in scaled space)
     let delta_max: f64 = 10.0; // TR maximum radius
 
-    let bounds = compute_bounds(init_params);
-    let mut x = pack_params(init_params);
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        fixed: fixed_mask,
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let n_packed = x.len();
-    let fixed_mask = packed_fixed_mask(init_params);
 
     // Scaling: computed once from initial x; x itself stays in real packed space
     // throughout the GN loop. Scaling only affects the linear system solve so

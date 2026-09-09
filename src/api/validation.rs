@@ -3902,24 +3902,18 @@ fn rail_variance_is_the_floor(template: &ModelParameters, i: usize) -> bool {
 ///
 /// `coordinate_kinds` decides *whether* a
 /// coordinate qualifies; the segment boundaries below only decide *which
-/// keyword* to print, and they are re-derived the way `packed_len` derives them
-/// because the packed vector carries no provenance. All three live arms
-/// (`omega`, `kappa`, `[mixture] omega(2)`) are pinned by a sibling test
-/// asserting that keyword in the message, so a layout change that moves a
-/// segment reddens rather than silently mislabelling a declaration.
+/// keyword* to print, and they come from
+/// [`packed_segments`](crate::estimation::parameterization) — the one
+/// derivation of the packed layout (#1252) — because the packed vector carries
+/// no provenance. All three live arms (`omega`, `kappa`, `[mixture] omega(2)`)
+/// are pinned by a sibling test asserting that keyword in the message, so a
+/// layout change that moves a segment reddens rather than silently
+/// mislabelling a declaration.
 fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<VarianceDecl>> {
-    use crate::estimation::parameterization::{
-        coordinate_kinds, omega_packed_len, PackedCoordKind,
-    };
+    use crate::estimation::parameterization::{coordinate_kinds, packed_segments, PackedCoordKind};
 
-    let n_theta = template.theta.len();
-    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-    let n_sigma = template.sigma.values.len();
-    let n_iov = template
-        .omega_iov
-        .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let iov_end = n_theta + n_omega + n_sigma + n_iov;
+    let segs = packed_segments(template);
+    let iov_end = segs.mixture_omega_start();
 
     coordinate_kinds(template)
         .iter()
@@ -3928,7 +3922,7 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
             if *kind != PackedCoordKind::OmegaDiagonal {
                 return None;
             }
-            if i < n_theta + n_omega {
+            if i < segs.sigma_start() {
                 Some(VarianceDecl::Omega {
                     block: !template.omega.diagonal,
                 })
@@ -4013,9 +4007,7 @@ pub(crate) fn check_variance_init_rails(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<Diagnostic> {
-    use crate::estimation::parameterization::{
-        compute_bounds, coordinate_names, pack_params, packed_fixed_mask,
-    };
+    use crate::estimation::parameterization::{coordinate_names, pack_with_bounds, PackedStart};
 
     // A clamped start is only trapped when something searches — an eval-only
     // run clamps too, it just does not hold. See `outer_search_runs`.
@@ -4023,9 +4015,11 @@ pub(crate) fn check_variance_init_rails(
         return Vec::new();
     }
 
-    let packed = pack_params(init_params);
-    let bounds = compute_bounds(init_params);
-    let fixed = packed_fixed_mask(init_params);
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+    } = pack_with_bounds(init_params);
     let decls = variance_decl_by_coordinate(init_params);
     // Built only if something actually fires: `coordinate_names` allocates a
     // `String` per coordinate, and this runs on the successful path of every

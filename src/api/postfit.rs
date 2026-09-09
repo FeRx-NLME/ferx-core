@@ -1238,13 +1238,14 @@ pub(crate) fn packed_guard_side(
 /// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
 fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
     use crate::estimation::parameterization::{
-        compute_bounds, coordinate_kinds, coordinate_names, coordinate_values, pack_params,
-        packed_fixed_mask,
+        coordinate_kinds, coordinate_names, coordinate_values, pack_with_bounds, PackedStart,
     };
 
-    let packed = pack_params(params);
-    let bounds = compute_bounds(params);
-    let fixed = packed_fixed_mask(params);
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+    } = pack_with_bounds(params);
     let names = coordinate_names(params);
     let estimates = coordinate_values(params);
     let kinds = coordinate_kinds(params);
