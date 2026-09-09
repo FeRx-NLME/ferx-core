@@ -398,8 +398,8 @@ pub(crate) fn packed_held_mask(template: &ModelParameters) -> Vec<bool> {
 /// always `false`. Layout mirrors [`packed_fixed_mask`]:
 /// `[theta, Ω (lower-tri col-major), sigma, Ω_IOV (lower-tri col-major)]`.
 pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
-    let mut mask = vec![false; packed_len(template)];
-    let n_theta = template.theta.len();
+    let segs = packed_segments(template);
+    let mut mask = vec![false; segs.total()];
 
     // Mark the lower-triangle off-diagonals of `om` that are structural zeros,
     // walking the same column-major order `packed_fixed_mask` / `pack_params` use.
@@ -416,12 +416,10 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
         }
     };
 
-    mark(&mut mask, &template.omega, n_theta);
+    mark(&mut mask, &template.omega, segs.omega_start());
 
     if let Some(ref iov) = template.omega_iov {
-        let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-        let iov_start = n_theta + n_omega + template.sigma.values.len();
-        mark(&mut mask, iov, iov_start);
+        mark(&mut mask, iov, segs.iov_start());
     }
 
     mask
@@ -490,20 +488,82 @@ pub(crate) fn coordinate_kinds(template: &ModelParameters) -> Vec<PackedCoordKin
     kinds
 }
 
+/// Length of each segment of the packed vector, in [`pack_params`] order:
+/// `[theta, Ω, sigma, Ω_IOV, mixture-Ω, mixture-Σ, ρ]`.
+///
+/// The packed vector carries no provenance, so every consumer that needs to
+/// know *which kind of declaration* a coordinate came from has to re-derive
+/// these boundaries. Before #1252 three places did so independently
+/// ([`packed_len`], `omega_structural_zero_mask`'s `iov_start`, and
+/// `api::validation::variance_decl_by_coordinate`), each with its own copy of
+/// the `omega_packed_len` / `map_or(0, …)` arithmetic. One derivation, so a
+/// layout change moves every consumer together — and the offsets are only ever
+/// spelled once, here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackedSegments {
+    pub(crate) theta: usize,
+    pub(crate) omega: usize,
+    pub(crate) sigma: usize,
+    pub(crate) iov: usize,
+    pub(crate) mixture_omega: usize,
+    pub(crate) mixture_sigma: usize,
+    pub(crate) rho: usize,
+}
+
+impl PackedSegments {
+    /// First Ω coordinate (== the θ count).
+    pub(crate) fn omega_start(self) -> usize {
+        self.theta
+    }
+    /// First Σ coordinate.
+    pub(crate) fn sigma_start(self) -> usize {
+        self.omega_start() + self.omega
+    }
+    /// First Ω_IOV coordinate.
+    pub(crate) fn iov_start(self) -> usize {
+        self.sigma_start() + self.sigma
+    }
+    /// First `[mixture]` Ω-override coordinate — i.e. one past the last Ω_IOV.
+    pub(crate) fn mixture_omega_start(self) -> usize {
+        self.iov_start() + self.iov
+    }
+    /// First `[mixture]` Σ-override coordinate.
+    pub(crate) fn mixture_sigma_start(self) -> usize {
+        self.mixture_omega_start() + self.mixture_omega
+    }
+    /// First `block_sigma` residual-correlation coordinate (#847) — they are
+    /// packed last.
+    pub(crate) fn rho_start(self) -> usize {
+        self.mixture_sigma_start() + self.mixture_sigma
+    }
+    /// Total packed length.
+    pub(crate) fn total(self) -> usize {
+        self.rho_start() + self.rho
+    }
+}
+
+/// Per-segment lengths of `template`'s packed vector. See [`PackedSegments`].
+pub(crate) fn packed_segments(template: &ModelParameters) -> PackedSegments {
+    let (mixture_omega, mixture_sigma) = template.mixture.as_ref().map_or((0, 0), |mix| {
+        (mix.omega_override_addr.len(), mix.sigma_override_addr.len())
+    });
+    PackedSegments {
+        theta: template.theta.len(),
+        omega: omega_packed_len(template.omega.dim(), template.omega.diagonal),
+        sigma: template.sigma.values.len(),
+        iov: template
+            .omega_iov
+            .as_ref()
+            .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal)),
+        mixture_omega,
+        mixture_sigma,
+        rho: template.residual_correlations.len(),
+    }
+}
+
 /// Compute the number of packed parameters
 pub fn packed_len(template: &ModelParameters) -> usize {
-    let n_theta = template.theta.len();
-    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-    let n_sigma = template.sigma.values.len();
-    let n_iov = template
-        .omega_iov
-        .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let n_mixture = template.mixture.as_ref().map_or(0, |mix| {
-        mix.omega_override_addr.len() + mix.sigma_override_addr.len()
-    });
-    let n_rho = template.residual_correlations.len();
-    n_theta + n_omega + n_sigma + n_iov + n_mixture + n_rho
+    packed_segments(template).total()
 }
 
 /// Index of the first `block_sigma` residual-correlation coordinate in the
@@ -511,7 +571,57 @@ pub fn packed_len(template: &ModelParameters) -> usize {
 /// since they are packed last. Callers that assemble or read a ρ slot must go
 /// through this rather than re-deriving the offset.
 pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
-    packed_len(template) - template.residual_correlations.len()
+    packed_segments(template).rho_start()
+}
+
+/// A packed start, the box it is optimized inside, and its FIX mask — the three
+/// vectors every optimizer entry point needs, produced together (#1252).
+///
+/// [`compute_bounds`] cannot build the box without *also* building the packed
+/// vector and the FIX mask (a FIX-ed coordinate is pinned at its own packed
+/// value), and before #1252 it discarded both, leaving each of its fourteen
+/// production callers to recompute one or two of them immediately afterwards.
+/// This is the shape that hands them back.
+///
+/// It is also the substrate the two box predicates share: the post-fit
+/// `runaway_guard_estimates` (is the **estimate** on a guard?) and the
+/// start-side `check_packed_start_in_box` (is the **start** outside the box?)
+/// walk the same three vectors and differ only in the comparison.
+pub(crate) struct PackedStart {
+    /// [`pack_params`] of the template.
+    pub(crate) packed: Vec<f64>,
+    /// [`compute_bounds`] of the template — FIX coordinates already pinned.
+    pub(crate) bounds: PackedBounds,
+    /// [`packed_fixed_mask`] of the template.
+    pub(crate) fixed: Vec<bool>,
+}
+
+/// Pack `template`, bound it, and mask its FIX coordinates in one pass.
+///
+/// Byte-for-byte what `(pack_params, compute_bounds, packed_fixed_mask)`
+/// produce separately — [`compute_bounds`] is now this function with two of its
+/// three results dropped, so there is no second copy of the box to drift.
+pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
+    let packed = pack_params(template);
+    let fixed = packed_fixed_mask(template);
+    let mut bounds = unpinned_bounds(template);
+
+    // Pin any FIX parameters to their packed (log-space) initial value.
+    // We build the box first, then overwrite lower=upper=packed[i] for fixed
+    // indices. Box-before-overwrite is correct even for block Cholesky
+    // off-diagonals, whose "packed" value is the raw L[i,j] (not log-transformed).
+    for (i, &is_fixed) in fixed.iter().enumerate() {
+        if is_fixed {
+            bounds.lower[i] = packed[i];
+            bounds.upper[i] = packed[i];
+        }
+    }
+
+    PackedStart {
+        packed,
+        bounds,
+        fixed,
+    }
 }
 
 /// Compute box constraints for the packed parameter vector.
@@ -519,7 +629,19 @@ pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
 /// Parameters marked FIX are given `lower == upper == packed_value`, which
 /// pins them for every optimizer that respects box bounds (NLopt SLSQP/L-BFGS/MMA,
 /// the hand-rolled BFGS, and the Gauss-Newton clamp on proposed steps).
+///
+/// A caller that also needs the packed vector or the FIX mask — which is every
+/// production caller — should use [`pack_with_bounds`] and take `.bounds` from
+/// it rather than pairing this with a second [`pack_params`] walk (#1252).
 pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
+    pack_with_bounds(template).bounds
+}
+
+/// The box *before* FIX coordinates are pinned to their packed value — the
+/// declared-θ / rail arithmetic on its own. Private because a caller that saw
+/// this box would judge a FIX-ed coordinate against a rail it is never
+/// optimized against; [`pack_with_bounds`] is the only way in.
+fn unpinned_bounds(template: &ModelParameters) -> PackedBounds {
     let n_theta = template.theta.len();
     let n_eta = template.omega.dim();
     let n_sigma = template.sigma.values.len();
@@ -598,19 +720,6 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     for _ in 0..template.residual_correlations.len() {
         lower.push(-RHO_Z_BOUND);
         upper.push(RHO_Z_BOUND);
-    }
-
-    // Pin any FIX parameters to their packed (log-space) initial value.
-    // We pack first, then overwrite lower=upper=packed[i] for fixed indices.
-    // Pack-before-overwrite is correct even for block Cholesky off-diagonals,
-    // whose "packed" value is the raw L[i,j] (not log-transformed).
-    let packed = pack_params(template);
-    let fixed_mask = packed_fixed_mask(template);
-    for i in 0..fixed_mask.len() {
-        if fixed_mask[i] {
-            lower[i] = packed[i];
-            upper[i] = packed[i];
-        }
     }
 
     PackedBounds { lower, upper }
@@ -1085,6 +1194,238 @@ mod tests {
         let template = make_template();
         // 2 theta + 2 diagonal omega + 1 sigma = 5
         assert_eq!(packed_len(&template), 5);
+    }
+
+    // ── #1252: `pack_with_bounds` / `packed_segments` ───────────────────────
+
+    /// A template carrying **every** packed segment at once, each with a free
+    /// coordinate (so its rail is observable) *and* a FIX-ed one (so the pin
+    /// is): θ in both packings plus a FIX, a 3×3 `block_omega` with the third
+    /// eta FIX-ed, two Σ with the second FIX-ed, a diagonal Ω_IOV with the
+    /// second κ FIX-ed, **three** `[mixture]` Ω overrides and **two** Σ
+    /// overrides (one FIX-ed each), and one `block_sigma` ρ.
+    ///
+    /// Not a model anyone would write — a block Ω under a `[mixture]` is not
+    /// something the parser emits. That is the point: this is a test of the
+    /// *packer's layout*, and the only way one walk can be shown to visit
+    /// every segment is to give it every segment.
+    ///
+    /// The two mixture segments have **different** lengths on purpose. With two
+    /// of each, swapping `mixture_omega` and `mixture_sigma` in
+    /// `packed_segments` left the whole suite green — a mutation the fixture,
+    /// not the assertion, was blind to.
+    ///
+    /// Packed layout, 19 coordinates:
+    /// `[θ×3 | Ω×6 | Σ×2 | Ω_IOV×2 | mixΩ×3 | mixΣ×2 | ρ×1]`.
+    fn make_all_segments_template() -> ModelParameters {
+        let om = DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.09, 0.02, 0.01, 0.02, 0.04, 0.005, 0.01, 0.005, 0.16],
+        );
+        let eta_names: Vec<String> = vec!["eta_cl".into(), "eta_v".into(), "eta_ka".into()];
+        let omega = OmegaMatrix::from_matrix(om, eta_names.clone(), false);
+        let iov =
+            OmegaMatrix::from_diagonal(&[0.05, 0.06], vec!["kappa_cl".into(), "kappa_v".into()]);
+        let sigma = SigmaVector {
+            values: vec![0.3, 1.0],
+            names: vec!["sig_prop".into(), "sig_add".into()],
+        };
+        let mix_class = |v: f64| OmegaMatrix::from_diagonal(&[v, 0.04, 0.16], eta_names.clone());
+        ModelParameters {
+            theta: vec![10.0, -0.8, 0.8],
+            theta_names: vec!["tvcl".into(), "gamma".into(), "tvf".into()],
+            // `gamma`'s negative lower bound is what selects identity packing.
+            theta_lower: vec![0.01, -3.0, 0.1],
+            theta_upper: vec![1000.0, 3.0, 1.0],
+            theta_fixed: vec![false, false, true],
+            omega,
+            omega_fixed: vec![false, false, true],
+            sigma,
+            sigma_fixed: vec![false, true],
+            omega_iov: Some(iov),
+            kappa_fixed: vec![false, true],
+            mixture: Some(crate::types::MixtureParams {
+                omega: vec![mix_class(0.09), mix_class(0.25), mix_class(0.36)],
+                sigma: vec![
+                    SigmaVector {
+                        values: vec![0.3, 1.0],
+                        names: vec!["sig_prop".into(), "sig_add".into()],
+                    },
+                    SigmaVector {
+                        values: vec![0.5, 1.0],
+                        names: vec!["sig_prop".into(), "sig_add".into()],
+                    },
+                    SigmaVector {
+                        values: vec![0.7, 1.0],
+                        names: vec!["sig_prop".into(), "sig_add".into()],
+                    },
+                ],
+                omega_override_addr: vec![(1, 0), (2, 0), (1, 1)],
+                omega_override_fixed: vec![false, false, true],
+                sigma_override_addr: vec![(1, 0), (2, 0)],
+                sigma_override_fixed: vec![false, true],
+            }),
+            residual_correlations: vec![ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 0.42,
+            }],
+            residual_correlation_fixed: vec![false],
+        }
+    }
+
+    /// T1 (#1252). One walk produces the packed vector, the box and the FIX
+    /// mask, and each is what the three separate functions produce.
+    ///
+    /// The `packed` / `fixed` halves are compared against `pack_params` /
+    /// `packed_fixed_mask` — genuinely separate walks. The **box** is not
+    /// compared against `compute_bounds`, which is now this function with two
+    /// results dropped and would agree with itself whatever it did; it is
+    /// pinned against the rails spelled out in `unpinned_bounds`, per segment,
+    /// so dropping a segment from that walk reddens here rather than merely
+    /// shifting both sides of a self-comparison.
+    #[test]
+    fn pack_with_bounds_agrees_with_the_three_separate_walks() {
+        let t = make_all_segments_template();
+        let start = pack_with_bounds(&t);
+
+        // 3 θ + 6 Ω (3×3 lower triangle) + 2 Σ + 2 Ω_IOV + 3 mixΩ + 2 mixΣ + 1 ρ
+        assert_eq!(start.packed.len(), 19, "every segment must be present");
+        assert_eq!(start.bounds.lower.len(), 19);
+        assert_eq!(start.bounds.upper.len(), 19);
+        assert_eq!(start.fixed.len(), 19);
+
+        // Bit-for-bit against the separate walks, not merely close: the whole
+        // point of #1252 is that nothing downstream can tell the difference.
+        let separate_packed = pack_params(&t);
+        let separate_fixed = packed_fixed_mask(&t);
+        for i in 0..19 {
+            assert_eq!(
+                start.packed[i].to_bits(),
+                separate_packed[i].to_bits(),
+                "packed[{i}]"
+            );
+            assert_eq!(start.fixed[i], separate_fixed[i], "fixed[{i}]");
+        }
+
+        // The FIX mask this template declares, per segment.
+        assert_eq!(
+            start.fixed,
+            vec![
+                false, false, true, // θ: tvf is FIX
+                false, false, true, false, true, true, // Ω: eta_ka FIX ⇒ (2,0),(2,1),(2,2)
+                false, true, // Σ
+                false, true, // Ω_IOV
+                false, false, true, // mixture Ω overrides
+                false, true,  // mixture Σ overrides
+                false, // ρ
+            ]
+        );
+
+        // The box, segment by segment. Free coordinates carry their rail;
+        // FIX-ed coordinates are pinned to their own packed value.
+        let (lo, hi) = (&start.bounds.lower, &start.bounds.upper);
+        // θ0 log-packed (lower ≥ 0): the declared range in log space.
+        assert_relative_eq!(lo[0], 0.01f64.ln(), epsilon = 1e-12);
+        assert_relative_eq!(hi[0], 1000.0f64.ln(), epsilon = 1e-12);
+        // θ1 identity-packed (negative lower): the declared range verbatim.
+        assert_relative_eq!(lo[1], -3.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[1], 3.0, epsilon = 1e-12);
+        // Ω diagonals [-6, 6], off-diagonals [-10, 10].
+        assert_relative_eq!(lo[3], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[3], 6.0, epsilon = 1e-12);
+        assert_relative_eq!(lo[4], -10.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[4], 10.0, epsilon = 1e-12);
+        assert_relative_eq!(lo[6], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[6], 6.0, epsilon = 1e-12);
+        // Σ [-8, 5].
+        assert_relative_eq!(lo[9], -8.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[9], 5.0, epsilon = 1e-12);
+        // Ω_IOV diagonal, same rails as the BSV diagonal.
+        assert_relative_eq!(lo[11], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[11], 6.0, epsilon = 1e-12);
+        // Mixture Ω override takes the Ω-diagonal rail; Σ override the Σ rail.
+        assert_relative_eq!(lo[13], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[13], 6.0, epsilon = 1e-12);
+        assert_relative_eq!(lo[16], -8.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[16], 5.0, epsilon = 1e-12);
+        // ρ in Fisher-z space.
+        assert_relative_eq!(lo[18], -RHO_Z_BOUND, epsilon = 1e-12);
+        assert_relative_eq!(hi[18], RHO_Z_BOUND, epsilon = 1e-12);
+
+        // Every FIX-ed coordinate is pinned to its own packed value — and the
+        // pin is *observable*, i.e. it is not merely the rail it would have
+        // carried anyway. Without the second half a `pack_with_bounds` that
+        // forgot to pin would still pass on a coordinate sitting on its rail.
+        for i in 0..19 {
+            if !start.fixed[i] {
+                continue;
+            }
+            assert_eq!(lo[i].to_bits(), start.packed[i].to_bits(), "lower pin @{i}");
+            assert_eq!(hi[i].to_bits(), start.packed[i].to_bits(), "upper pin @{i}");
+            assert!(
+                lo[i] > -5.9 && hi[i] < 5.9,
+                "the pin at {i} must be distinguishable from the rail it replaced, got {}",
+                lo[i]
+            );
+        }
+    }
+
+    /// T2 (#1252). `packed_segments` names the same boundaries the packed
+    /// vector actually has.
+    ///
+    /// `pack_params` and `coordinate_names` are two walks of the layout that do
+    /// not consult `packed_segments`, so they are the oracle: an off-by-one in
+    /// any segment start puts a boundary on the wrong coordinate *name*, which
+    /// is what this asserts, rather than on an arithmetic identity that would
+    /// shift on both sides together.
+    #[test]
+    fn packed_segments_boundaries_land_on_the_right_coordinates() {
+        let t = make_all_segments_template();
+        let segs = packed_segments(&t);
+        let names = coordinate_names(&t);
+        let kinds = coordinate_kinds(&t);
+
+        assert_eq!(segs.total(), pack_params(&t).len());
+        assert_eq!(segs.total(), packed_len(&t));
+        assert_eq!(segs.total(), names.len());
+        assert_eq!(segs.rho_start(), rho_packed_start(&t));
+
+        assert_eq!(
+            (
+                segs.theta,
+                segs.omega,
+                segs.sigma,
+                segs.iov,
+                segs.mixture_omega,
+                segs.mixture_sigma,
+                segs.rho
+            ),
+            (3, 6, 2, 2, 3, 2, 1)
+        );
+
+        // Each start lands on the first coordinate of its segment, identified
+        // by the name the *other* walk gives it.
+        assert_eq!(names[0], "tvcl");
+        assert_eq!(names[segs.omega_start()], "eta_cl");
+        assert_eq!(names[segs.sigma_start()], "sig_prop");
+        assert_eq!(names[segs.iov_start()], "kappa_cl");
+        // Mixture overrides and ρ have no distinct declared name, so they are
+        // identified by kind and by the coordinate *before* them belonging to
+        // the previous segment.
+        assert_eq!(names[segs.mixture_omega_start() - 1], "kappa_v");
+        assert_eq!(
+            kinds[segs.mixture_omega_start()],
+            PackedCoordKind::OmegaDiagonal
+        );
+        assert_eq!(kinds[segs.mixture_sigma_start()], PackedCoordKind::Sigma);
+        assert_eq!(
+            kinds[segs.rho_start()],
+            PackedCoordKind::OmegaOffDiagonal,
+            "a ρ slot is bounded symmetrically, so it takes the off-diagonal kind"
+        );
+        assert_eq!(segs.rho_start(), segs.total() - 1);
     }
 
     /// A two-sigma template carrying one `block_sigma` off-diagonal (#847).
