@@ -237,10 +237,25 @@ pub(crate) fn subject_htilde_dx(
     let mut sigma_row_derivs: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
     // Companion `∂g_j/∂σ_s` for a quantified row's `iiv_on_ruv` term (`g = d/R`), and
     // `∂(ruv_cz)_j/∂σ_s`/`∂(ruv_cm)_j/∂σ_s` for a censored row's (module doc). All three are
-    // only populated, and only read, when `core.ruv.is_some()`.
-    let mut sigma_row_derivs_g: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
-    let mut sigma_row_derivs_cz: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
-    let mut sigma_row_derivs_cm: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
+    // only populated, and only read, when `core.ruv.is_some()` — the uncommon case — so their
+    // `3 · n_sigma` heap allocations are skipped otherwise, on the path this module exists to
+    // make cheap.
+    let ruv_active = core.ruv.is_some();
+    let mut sigma_row_derivs_g: Vec<Vec<f64>> = if ruv_active {
+        vec![vec![0.0; n_obs]; n_sigma]
+    } else {
+        Vec::new()
+    };
+    let mut sigma_row_derivs_cz: Vec<Vec<f64>> = if ruv_active {
+        vec![vec![0.0; n_obs]; n_sigma]
+    } else {
+        Vec::new()
+    };
+    let mut sigma_row_derivs_cm: Vec<Vec<f64>> = if ruv_active {
+        vec![vec![0.0; n_obs]; n_sigma]
+    } else {
+        Vec::new()
+    };
     // Correlated residual (`block_sigma`): `score_core`'s `corr_diag` already builds the
     // correlation-aware `(R_jj, ∂R_jj/∂f_j)` for `et.r`/`et.d`, so the σ-direct precompute
     // must difference the SAME correlation-aware function, not the plain per-endpoint one —
@@ -422,7 +437,11 @@ pub(crate) fn subject_htilde_dx(
                 if frem_var.is_none() {
                     if et.censored {
                         let s = core.ruv_scale;
-                        let hs = 1e-6 * s.max(1.0);
+                        // `sigma_fd_step`'s relative-with-floor step, not an absolute `1e-6`:
+                        // `s = exp(2·η̂_ruv)` can be far below 1 for an outer-loop excursion
+                        // (`η̂_ruv < -6.9` ⇒ `s < 1e-6`), where an absolute step made `s - hs`
+                        // negative and handed `m3_censored_outer` a negative variance.
+                        let hs = sigma_fd_step(s);
                         let y = subject.observations[j];
                         let f = o.f;
                         let at = |scale: f64| -> (f64, f64, f64) {
@@ -641,9 +660,25 @@ pub(crate) fn subject_htilde_dx_iov(
     };
 
     let mut sigma_row_derivs: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
-    let mut sigma_row_derivs_g: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
-    let mut sigma_row_derivs_cz: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
-    let mut sigma_row_derivs_cm: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
+    // `sigma_row_derivs_g`/`_cz`/`_cm` are only populated, and only read, when
+    // `core.ruv.is_some()` — the uncommon case — so skip their `3 · n_sigma` heap allocations
+    // otherwise, on the path this module exists to make cheap.
+    let ruv_active = core.ruv.is_some();
+    let mut sigma_row_derivs_g: Vec<Vec<f64>> = if ruv_active {
+        vec![vec![0.0; n_obs]; n_sigma]
+    } else {
+        Vec::new()
+    };
+    let mut sigma_row_derivs_cz: Vec<Vec<f64>> = if ruv_active {
+        vec![vec![0.0; n_obs]; n_sigma]
+    } else {
+        Vec::new()
+    };
+    let mut sigma_row_derivs_cm: Vec<Vec<f64>> = if ruv_active {
+        vec![vec![0.0; n_obs]; n_sigma]
+    } else {
+        Vec::new()
+    };
     for s in 0..n_sigma {
         let h = sigma_fd_step(sigma[s]);
         let mut sp = sigma.to_vec();
@@ -786,7 +821,11 @@ pub(crate) fn subject_htilde_dx_iov(
                 if frem_var.is_none() {
                     if et.censored {
                         let s = core.ruv_scale;
-                        let hs = 1e-6 * s.max(1.0);
+                        // `sigma_fd_step`'s relative-with-floor step, not an absolute `1e-6`:
+                        // `s = exp(2·η̂_ruv)` can be far below 1 for an outer-loop excursion
+                        // (`η̂_ruv < -6.9` ⇒ `s < 1e-6`), where an absolute step made `s - hs`
+                        // negative and handed `m3_censored_outer` a negative variance.
+                        let hs = sigma_fd_step(s);
                         let y = subject.observations[j];
                         let f = o.f;
                         let at = |scale: f64| -> (f64, f64, f64) {
@@ -1189,6 +1228,115 @@ mod tests {
         let mut template = model.default_params.clone();
         template.theta = theta.to_vec();
         assert_matches_fd(&model, &subject, &template, &[0.05, -0.03, 0.08, 0.0], 1e-5);
+    }
+
+    /// Same fixture, but with `η̂_ruv` pushed negative enough (`ruv_scale =
+    /// exp(2·η̂_ruv) ≈ 8.3e-7`, just under the old fixed `1e-6` half-step) that the
+    /// σ-direct precompute's *absolute* `1e-6` half-step used to make `s - hs` negative —
+    /// a negative variance handed to `m3_censored_outer`, `NaN` from the inner `sqrt`, and
+    /// the whole subject silently declining to the FD anchor sweep. Regression test for the
+    /// fix: the precompute now uses `sigma_fd_step`'s relative-with-floor step, the same one
+    /// `sigma_block` uses.
+    ///
+    /// Bypasses `assert_matches_fd`'s usual `subject_eta_dx` call for `db_dx`: at this
+    /// `η̂_ruv`, `subject_eta_dx`'s OWN inner Hessian (an unrelated computation this test
+    /// doesn't exercise) is too ill-conditioned for `nalgebra`'s Cholesky, and declines —
+    /// not a defect of the fix under test. `subject_htilde_dx` and the `htilde_at` FD
+    /// oracle are both generic in `db_dx` (never invert it, just use it to move `b` along a
+    /// caller-supplied direction), so any fixed vector makes a valid parity check as long as
+    /// both sides use the same one. Pick one with a nonzero η_ruv component so the fixed
+    /// `ds_dx = 2·s·bₖ[rr]` term is actually exercised.
+    #[test]
+    fn htilde_derivative_matches_fd_under_iiv_on_ruv_with_censored_row_and_tiny_ruv_scale() {
+        const RUV_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+"#;
+        let mut model = parse_model_string(RUV_MODEL).expect("parse");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        let theta = [0.22, 11.0, 1.4];
+        let mut subject = fixture_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let n = subject.observations.len();
+        subject.cens[n - 1] = 1;
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let b_hat = [0.05, -0.03, 0.08, -7.0];
+        // Zero the censored row's residual at `b_hat` (`z = eps/√R = 0` regardless of how
+        // small `R` gets): `R` already carries `ruv_scale ≈ 8.3e-7`, so any of the fixture's
+        // usual nonzero residuals put `|z|` in the hundreds — the extreme Gaussian tail's own
+        // curvature there is sharp enough that no reasonably-sized FD step recovers a stable
+        // derivative, which is a limit of central-difference validation at that regime, not
+        // a defect of the fix under test.
+        let f_last = crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &b_hat[..3]);
+        subject.observations[n - 1] = f_last[n - 1];
+
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let omega_inv = params.omega.inv.clone();
+        let n_eta = params.omega.dim();
+        // `db_dx[k][rr]` must move `b_ruv` by much less than `s ≈ 8.3e-7` itself over the
+        // outer FD step (`~1e-5`), or the *outer* central difference sees the kernel's own
+        // sharp curvature at that scale and stops being a valid linear approximation —
+        // `1e-4` keeps the implied `Δb_ruv` two orders below `s`.
+        let db_dx: Vec<DVector<f64>> = x
+            .iter()
+            .map(|_| DVector::from_vec(vec![0.0, 0.0, 0.0, 1e-4]))
+            .collect();
+
+        let analytic = subject_htilde_dx(
+            &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx,
+        )
+        .expect("in scope");
+
+        // `s ≈ 8.3e-7` is below `sigma_fd_step`'s own `1e-6` relative-step floor, so it falls
+        // back to a `0.5·s` HALF-step (the guard that keeps `s - hs > 0`, the fix this test
+        // pins) rather than a small one — central-difference truncation error at a 50%
+        // relative step is naturally percent-scale, not the `1e-5`–`1e-6` this module's other
+        // parity tests hold in the well-conditioned regime. Measured worst case at this input:
+        // ~1.17e-2 (coord 3, entry (0,0)); `2e-2` keeps headroom without being loose enough to
+        // pass a broken derivative (an unfixed `NaN`/panicking entry fails outright, and this
+        // regime has no smaller-`hs` alternative to tighten against — `sigma_fd_step` already
+        // is the smallest step that keeps the argument positive).
+        let tol = 2e-2;
+        for k in 0..x.len() {
+            let step = 1e-5 * (1.0 + x[k].abs());
+            let mut xp = x.clone();
+            xp[k] += step;
+            let mut xm = x.clone();
+            xm[k] -= step;
+            let bp: Vec<f64> = (0..n_eta).map(|i| b_hat[i] + step * db_dx[k][i]).collect();
+            let bm: Vec<f64> = (0..n_eta).map(|i| b_hat[i] - step * db_dx[k][i]).collect();
+            let fd = (htilde_at(&model, &subject, &template, &xp, &bp)
+                - htilde_at(&model, &subject, &template, &xm, &bm))
+                / (2.0 * step);
+            let scale = fd.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            for i in 0..n_eta {
+                for m in 0..n_eta {
+                    assert!(
+                        (analytic[k][(i, m)] - fd[(i, m)]).abs() / scale < tol,
+                        "coord {k} entry ({i},{m}): analytic {} vs FD {} (scale {scale})",
+                        analytic[k][(i, m)],
+                        fd[(i, m)]
+                    );
+                }
+            }
+        }
     }
 
     /// Correlated residual (`block_sigma`): the σ-direct precompute must difference the

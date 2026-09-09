@@ -17,16 +17,18 @@ other call-count reduction is optional follow-up work, not the requested design
 and not a prerequisite for implementing or assessing it.
 
 This document supersedes the earlier reduced-sweep proposal in this same file.
-The user requested this handoff; no implementation or benchmark has yet run.
-The next implementation session should execute the work, not just produce another
-plan. Do not assume a speedup before measuring against the current hybrid gradient.
+**At the time this handoff was written**, the user had requested it and no
+implementation or benchmark had yet run; the next implementation session was to
+execute the work, not just produce another plan, and not assume a speedup before
+measuring against the current hybrid gradient. **That work has since happened —
+see the [Results](#results-2026-09-09-implementation-session) section below,
+which supersedes this and the following two paragraphs.**
 
 ## Workspace and baseline
 
-Work in `C:/package/ferx/wt-laplace-sensitivity`, branch
-`perf/laplace-sensitivity`. The isolated worktree already exists; do not start
-again in the original `ferx-core` checkout. Read its `AGENTS.md` before editing.
-At handoff, the only change is this untracked plan file; no code is committed.
+*(As of the original handoff — see Results for what actually shipped.)* Work in
+an isolated worktree on branch `perf/laplace-sensitivity`; do not start again in
+the original `ferx-core` checkout.
 
 Source inspection at `cfc956da` (current origin/main when this worktree was created),
 branch `perf/laplace-sensitivity`. This is a design and benchmark plan; no estimator
@@ -262,16 +264,29 @@ finite-difference of the reconverged Laplace/AGQ objective at every node count
 comparison with the FD route
 (`agq::tests::analytic_grid_response_matches_the_fd_route`).
 
-**No repeatable wall-clock win found, and it is not the default.** The call-count argument
-the handoff's numerical-design section anticipated (`2p` vs `1+2(n_theta+d)`) does not
-predict wall-clock cost: measured on `warfarin.ferx` (diagonal Ω, `n_free = n_theta + n_eta`
-exactly), the analytic route made fewer analytic-provider calls (6840 → 6460) but **more**
-total provider *time* (0.098s → 0.131s, +34%) — each evaluation does materially more work
-per call (the full third-order jet, plus per-observation central differences of the residual
-kernel in `f` and `σ`) than a plain anchor rebuild. Kept behind
-`FERX_AGQ_GRID_RESPONSE=analytic` for further benchmarking; ODE is out of scope for now
-(needs its own parity test before admission — the covariance provider's third-order step
-widens to solver `reltol` there).
+**Not the default — the win is representation-dependent and close enough to parity that it
+needs re-measuring rather than trusting a single past run.** The call-count argument the
+handoff's numerical-design section anticipated (`2p` vs `1+2(n_theta+d)`) does not predict
+wall-clock cost on its own: each analytic evaluation does materially more work per call (the
+full third-order jet, plus per-observation central differences of the residual kernel in `f`
+and `σ`) than a plain anchor rebuild. `plans/laplace-sensitivity-speed/bench.sh` (3 interleaved
+reps, `ci-test` profile, commit `8e03e076`, 2026-09-09) measured:
+
+| Fixture | Provider calls (fd → analytic) | Provider time (fd → analytic) | Outer iters (fd → analytic) |
+|---|---|---|---|
+| diagonal Ω, closed-form (`warfarin_laplace.ferx`) | 6840 → 6460 (−6%) | ~0.062s → ~0.053s avg (~14% faster, all 3 reps) | 37 → 37 |
+| ODE (`warfarin_ode_laplace.ferx`) | 10270 → 7660 (−25%) | ~1.66s → ~1.20s avg (~27% faster, all 3 reps) | 56 → 44 |
+
+Both cases favored `analytic` this run — including ODE, which is **admitted** for this anchor
+(`laplace_h_deriv::tests::h_derivative_matches_fd_under_ode`), not out of scope: the covariance
+provider's third-order sweep already reaches it via `ode_analytical_supported`. But an earlier
+pass on the same non-ODE fixture had recorded the opposite sign (fewer calls, 6840 → 6460, yet
+**more** total provider time, 0.098s → 0.131s, +34% — the number the previous revision of this
+section reported). Both measurements are real; the difference is machine/toolchain state
+moving a case that sits close to parity, not a defect in either run. That volatility, not a
+settled loss, is why this stays behind `FERX_AGQ_GRID_RESPONSE=analytic` rather than becoming
+the default — flip it only after a benchmark run stable enough to trust across repeated
+sessions, on both the closed-form and ODE fixtures.
 
 ### Gauss-Newton anchor (`focei, n_agq > 1`, `HessianAnchor::GaussNewton`) —
 ### `src/estimation/focei_htilde_dx.rs`
@@ -320,13 +335,17 @@ near an ODE-tolerance-limited anchor.
 - Packed-gradient parity against reconverged-objective FD — done for both anchors
   (`tests/agq.rs` for Exact; `focei_htilde_dx::tests` + `agq::tests::gauss_newton_anchored_
   gradient_matches_fd` for Gauss-Newton).
-- NONMEM LAPLACIAN INTER comparison — **not done**. No numerical behavior changed (both
-  routes are pinned to agree bit-consistent with the pre-existing gradient), so no new
-  anchor is owed; the existing NONMEM comparisons for `laplace`/`focei` still apply.
+- NONMEM LAPLACIAN INTER comparison — **not done**. The analytic and FD routes agree only to
+  the FD route's own truncation error (`1e-5` relative, see `AGQ_GRID_FD_STEP`), not
+  bit-for-bit, so no new anchor is owed only in the sense that neither route changes which
+  quantity is being estimated; the existing NONMEM comparisons for `laplace`/`focei` still
+  apply.
 - ODE, IOV, dispatch-boundary coverage before enabling those routes — ODE is admitted for
   **both** anchors now (Gauss-Newton: tested, benchmarked; Exact: tested at `tol = 5e-3`,
-  reusing the covariance provider's existing ODE reach — no new solver-side work). IOV/mixture
-  stays declined for both modules (dimension-layout complexity, still a follow-up).
+  reusing the covariance provider's existing ODE reach — no new solver-side work). IOV landed
+  for the Gauss-Newton anchor (`subject_htilde_dx_iov`, see "Left for a follow-up" below);
+  mixture, and IOV for the Exact anchor, stay declined (dimension-layout complexity, still a
+  follow-up).
 - Multi-node total derivative — covered by the existing `n_agq` sweep in
   `tests/agq.rs::analytic_gradient_matches_fd_at_every_node_count` and the dedicated
   `n_agq ∈ {1, 3}` cases in `agq::tests::analytic_grid_response_matches_the_fd_route`.
@@ -373,14 +392,3 @@ monomorphization. What remains:
 - A repository-required NONMEM comparison would be owed only if either route becomes the
   route a user-visible numerical result depends on differently than before — it does not
   currently, since both are pinned to the pre-existing gradient.
-
-## Workspace cleanup
-
-Six prior registered worktrees and their build caches were removed. Their feature
-branches were retained; detached pool baselines received `archive/20260909-*`
-branches. Untracked scripts/results were saved in three named
-`cleanup-20260909-*` Git stashes; their object IDs are recorded in
-`C:/package/ferx/cleanup-archive-20260909/stashes.txt`.
-The broken `wt-main-audit` checkout was moved intact into that archive directory.
-The two research probe Cargo targets were cleaned (81.7 MiB combined); research
-source directories remain. The original `ferx-core` checkout remains untouched.

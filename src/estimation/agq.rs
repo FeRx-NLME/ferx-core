@@ -128,13 +128,18 @@ enum GridResponseOverride {
 
 fn grid_response_override() -> GridResponseOverride {
     static E: std::sync::OnceLock<GridResponseOverride> = std::sync::OnceLock::new();
-    *E.get_or_init(
-        || match std::env::var("FERX_AGQ_GRID_RESPONSE").as_deref() {
-            Ok("fd") => GridResponseOverride::ForceFd,
-            Ok("analytic") => GridResponseOverride::ForceAnalytic,
-            _ => GridResponseOverride::Auto,
+    *E.get_or_init(|| match std::env::var("FERX_AGQ_GRID_RESPONSE") {
+        Err(_) => GridResponseOverride::Auto,
+        Ok(v) => match v.as_str() {
+            "fd" => GridResponseOverride::ForceFd,
+            "analytic" => GridResponseOverride::ForceAnalytic,
+            // A typo here (e.g. "analytical") must not silently fall back to `Auto`: that
+            // makes the "candidate" arm of an A/B benchmark identical to the baseline and
+            // reports "no difference" — exactly the failure mode this variable exists to
+            // avoid.
+            other => panic!("FERX_AGQ_GRID_RESPONSE must be \"fd\" or \"analytic\", got {other:?}"),
         },
-    )
+    })
 }
 
 /// Whether the analytic grid response is the default for this anchor, absent an override.
@@ -2555,21 +2560,27 @@ mod tests {
         }
     }
 
-    /// The analytic grid response must (a) actually engage on an in-scope Laplace model and
-    /// (b) return what the finite-difference baseline returns.
+    /// The analytic grid response must (a) actually engage on an in-scope model and (b)
+    /// return what the finite-difference baseline returns — for **both** anchors, including
+    /// [`HessianAnchor::GaussNewton`], the one this PR turns on by default.
     ///
     /// Both halves matter, and the end-to-end
     /// `tests/agq.rs::analytic_gradient_matches_fd_at_every_node_count` sees neither: it
     /// passes identically whether the analytic route runs or silently declines to the FD
     /// route it is compared against. So this drives `analytic_grid_response` and
     /// `fd_grid_response` directly, at the same anchor, mode response and node gradients, and
-    /// asserts the analytic one returned `Some` before comparing.
+    /// asserts the analytic one returned `Some` before comparing. Parameterising over both
+    /// anchors (rather than testing `Exact` alone) matters more for `GaussNewton`: it is the
+    /// default-on route, so a later tightening of `subject_htilde_dx`'s scope gate or of
+    /// `is_well_conditioned` that made it decline on every real model would otherwise pass the
+    /// whole suite silently and revert the entire performance claim to the `2·n_free` FD
+    /// sweep.
     ///
     /// The tolerance is set by the **FD** side, not the analytic one: `AGQ_GRID_FD_STEP` is
     /// `1e-5`, so its truncation on `log|H|` is around `1e-6` relative — which is why this is
     /// `1e-5` and not tighter. The analytic route is the more accurate of the two here (the
-    /// dedicated `laplace_h_deriv` parity test measures `dH/dx` itself against a
-    /// finer-grained reference).
+    /// dedicated `laplace_h_deriv`/`focei_htilde_dx` parity tests measure `dH/dx`/`dH̃/dx`
+    /// themselves against a finer-grained reference).
     #[test]
     fn analytic_grid_response_matches_the_fd_route() {
         use crate::estimation::inner_optimizer::find_ebe;
@@ -2588,127 +2599,141 @@ mod tests {
         let b_hat = ebe.eta.as_slice();
         let fixed = packed_fixed_mask(&template);
 
-        // `n_agq = 1` (Laplace, where the response *is* the whole `½·d log|H|/dx` term) and
-        // `n_agq = 3` (where `M_k·z_j` node displacement is live and `z = 0` no longer hides
-        // the factor algebra).
-        for n in [1usize, 3usize] {
-            let (nodes, log_weights) = gauss_hermite(n);
-            let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
-            let schedule = cacheable_schedule(&model, &subject);
-            let h = anchor_hessian(
-                HessianAnchor::Exact,
-                &model,
-                &subject,
-                &params,
-                &stack,
-                b_hat,
-                &mut scratch,
-                schedule.as_ref(),
-            )
-            .expect("exact anchor");
-            let proposal = build_proposal(&h, &stack.omega_joint_inv, stack.d()).expect("proposal");
-            let (bs, terms) = agq_nodes_and_terms(
-                &model,
-                &subject,
-                &params,
-                &stack,
-                b_hat,
-                &nodes,
-                &log_weights,
-                &proposal,
-                &mut scratch,
-                schedule.as_ref(),
-            );
-            let lse = logsumexp(&terms);
-            let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
-
-            let db_dx = eta_dx(
-                &model,
-                &subject,
-                &params,
-                &template,
-                &stack,
-                &x,
-                b_hat,
-                &mut scratch,
-                schedule.as_ref(),
-            )
-            .expect("mode response");
-            let mult = model.ruv_obs_mult(&subject, &params.theta);
-            let node_grads: Vec<Vec<f64>> = bs
-                .iter()
-                .map(|b| {
-                    node_nll_gradient(
-                        &model,
-                        &subject,
-                        &params,
-                        &stack,
-                        b,
-                        schedule.as_ref(),
-                        mult.as_deref(),
-                    )
-                    .expect("node gradient")
-                })
-                .collect();
-
-            let mut analytic = vec![0.0f64; x.len()];
-            analytic_grid_response(
-                HessianAnchor::Exact,
-                &model,
-                &subject,
-                &params,
-                &template,
-                &stack,
-                &h,
-                &x,
-                b_hat,
-                &nodes,
-                &db_dx,
-                &node_grads,
-                &softmax,
-                &mut analytic,
-            )
-            .expect("the analytic route must engage on an in-scope Laplace model");
-
-            let mut fd = vec![0.0f64; x.len()];
-            fd_grid_response(
-                &model,
-                &subject,
-                &params,
-                &template,
-                &stack,
-                HessianAnchor::Exact,
-                &x,
-                b_hat,
-                &nodes,
-                &log_weights,
-                &db_dx,
-                Some(&node_grads),
-                &softmax,
-                &fixed,
-                &mut scratch,
-                schedule.as_ref(),
-                &mut fd,
-            )
-            .expect("the FD baseline must be available");
-
-            let scale = fd.iter().fold(1e-3f64, |m, v| m.max(v.abs()));
-            for k in 0..x.len() {
-                assert!(
-                    (analytic[k] - fd[k]).abs() / scale < 1e-5,
-                    "n_agq = {n}, coord {k}: analytic {} vs FD {} (scale {scale})",
-                    analytic[k],
-                    fd[k]
+        for anchor in [HessianAnchor::Exact, HessianAnchor::GaussNewton] {
+            // `n_agq = 1` (Laplace, where the response *is* the whole `½·d log|H|/dx` term)
+            // and `n_agq = 3` (where `M_k·z_j` node displacement is live and `z = 0` no longer
+            // hides the factor algebra).
+            for n in [1usize, 3usize] {
+                let (nodes, log_weights) = gauss_hermite(n);
+                let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+                let schedule = cacheable_schedule(&model, &subject);
+                let h = anchor_hessian(
+                    anchor,
+                    &model,
+                    &subject,
+                    &params,
+                    &stack,
+                    b_hat,
+                    &mut scratch,
+                    schedule.as_ref(),
+                )
+                .expect("anchor Hessian");
+                let proposal =
+                    build_proposal(&h, &stack.omega_joint_inv, stack.d()).expect("proposal");
+                let (bs, terms) = agq_nodes_and_terms(
+                    &model,
+                    &subject,
+                    &params,
+                    &stack,
+                    b_hat,
+                    &nodes,
+                    &log_weights,
+                    &proposal,
+                    &mut scratch,
+                    schedule.as_ref(),
                 );
+                let lse = logsumexp(&terms);
+                let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
+
+                let db_dx = eta_dx(
+                    &model,
+                    &subject,
+                    &params,
+                    &template,
+                    &stack,
+                    &x,
+                    b_hat,
+                    &mut scratch,
+                    schedule.as_ref(),
+                )
+                .expect("mode response");
+                let mult = model.ruv_obs_mult(&subject, &params.theta);
+                let node_grads: Vec<Vec<f64>> = bs
+                    .iter()
+                    .map(|b| {
+                        node_nll_gradient(
+                            &model,
+                            &subject,
+                            &params,
+                            &stack,
+                            b,
+                            schedule.as_ref(),
+                            mult.as_deref(),
+                        )
+                        .expect("node gradient")
+                    })
+                    .collect();
+
+                let mut analytic = vec![0.0f64; x.len()];
+                analytic_grid_response(
+                    anchor,
+                    &model,
+                    &subject,
+                    &params,
+                    &template,
+                    &stack,
+                    &h,
+                    &x,
+                    b_hat,
+                    &nodes,
+                    &db_dx,
+                    &node_grads,
+                    &softmax,
+                    &mut analytic,
+                )
+                .unwrap_or_else(|| {
+                    panic!("the analytic route must engage on an in-scope model ({anchor:?})")
+                });
+
+                let mut fd = vec![0.0f64; x.len()];
+                fd_grid_response(
+                    &model,
+                    &subject,
+                    &params,
+                    &template,
+                    &stack,
+                    anchor,
+                    &x,
+                    b_hat,
+                    &nodes,
+                    &log_weights,
+                    &db_dx,
+                    Some(&node_grads),
+                    &softmax,
+                    &fixed,
+                    &mut scratch,
+                    schedule.as_ref(),
+                    &mut fd,
+                )
+                .expect("the FD baseline must be available");
+
+                let scale = fd.iter().fold(1e-3f64, |m, v| m.max(v.abs()));
+                for k in 0..x.len() {
+                    assert!(
+                        (analytic[k] - fd[k]).abs() / scale < 1e-5,
+                        "{anchor:?}, n_agq = {n}, coord {k}: analytic {} vs FD {} (scale {scale})",
+                        analytic[k],
+                        fd[k]
+                    );
+                }
             }
         }
     }
 
     /// The FD route must stay reachable: a model outside `laplace_h_deriv`'s scope (here an
     /// M3-censored row) has to decline rather than assemble a plausible wrong `dH/dx`.
+    ///
+    /// `analytic_grid_response` has two earlier, anchor-agnostic declines
+    /// (`regularised_anchor`, `!is_well_conditioned()`) before it ever reaches the
+    /// `Exact` → `subject_h_inner_dx` dispatch this test names. Asserting only
+    /// `analytic_grid_response(...).is_none()` cannot tell "declined at the M3 scope gate"
+    /// apart from "declined at the conditioning screen" — both leave `out` untouched. So this
+    /// pins the intended gate directly by also calling `subject_h_inner_dx` itself, the way
+    /// the sibling module's `censored_rows_decline` does.
     #[test]
     fn out_of_scope_models_decline_to_the_fd_grid_response() {
         use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::laplace_h_deriv::subject_h_inner_dx;
         use crate::estimation::parameterization::{pack_params, unpack_params};
         use crate::types::BloqMethod;
 
@@ -2725,6 +2750,7 @@ mod tests {
         let params = unpack_params(&x, &template);
         let stack = Stack::new(&model, &params, 0);
         let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        let b_hat = ebe.eta.as_slice();
         let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
         let h = anchor_hessian(
             HessianAnchor::Exact,
@@ -2732,13 +2758,30 @@ mod tests {
             &subject,
             &params,
             &stack,
-            ebe.eta.as_slice(),
+            b_hat,
             &mut scratch,
             None,
         )
         .expect("exact anchor");
         let (nodes, _lw) = gauss_hermite(1);
         let db_dx = vec![nalgebra::DVector::zeros(stack.d()); x.len()];
+
+        assert!(
+            subject_h_inner_dx(
+                &model,
+                &subject,
+                &params,
+                &template,
+                &stack.omega_joint_inv,
+                &x,
+                b_hat,
+                &db_dx,
+            )
+            .is_none(),
+            "the M3-censored row must decline at laplace_h_deriv's own scope gate, not at a \
+             conditioning screen further down"
+        );
+
         let node_grads = vec![vec![0.0f64; stack.d()]];
         let mut out = vec![0.0f64; x.len()];
         assert!(
@@ -2751,7 +2794,7 @@ mod tests {
                 &stack,
                 &h,
                 &x,
-                ebe.eta.as_slice(),
+                b_hat,
                 &nodes,
                 &db_dx,
                 &node_grads,

@@ -25,8 +25,11 @@ section of the SDLC for the versioning policy).
   `x ± h` for every free population parameter.** `H̃` is bilinear in first-order prediction
   sensitivities, so unlike the exact-anchor Laplace case its derivative needs no third-order
   jet — one extra ordinary analytic-provider evaluation replaces `2·n_free` perturbed-anchor
-  rebuilds. Estimates, OFVs and standard errors are unchanged (the two routes are pinned
-  bit-consistent, and this is on by default); measured on warfarin fixtures: 30–50% fewer
+  rebuilds. The analytic and finite-difference routes agree to within the finite-difference
+  route's own truncation error (and this is on by default); converged estimates, OFVs and
+  standard errors may move within the convergence tolerance since the optimizer trajectory
+  itself changes (e.g. an ODE fixture converges in 37 outer iterations instead of 53); measured
+  on warfarin fixtures: 30–50% fewer
   analytic-provider calls, and on an ODE model roughly 2× less provider time and ~30% faster
   wall-clock, converging in fewer outer iterations. Also covers custom/time-varying σ
   magnitude, `iiv_on_ruv` (including combined with an M3-censored row), M3-BLOQ including its

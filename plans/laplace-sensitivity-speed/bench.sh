@@ -9,9 +9,18 @@
 #
 #   * `laplace, n_agq=1` (`HessianAnchor::Exact`) — `estimation::laplace_h_deriv`, needs the
 #     covariance provider's third-order jet. `fd` is the unconditional DEFAULT here (see
-#     `agq::use_analytic_grid_response`); `analytic` is opt-in only, because the measured
-#     wall-clock benchmark on diagonal-Ω warfarin showed no repeatable win (fewer calls,
-#     6840 → 6460, but MORE total provider time, 0.098s → 0.131s, +34%).
+#     `agq::use_analytic_grid_response`); `analytic` stays opt-in because the win is
+#     representation-dependent, not because it loses outright: 3 interleaved reps on this
+#     binary (`8e03e076`, 2026-09-09) —
+#       diagonal-Ω, analytic 1cpt (`warfarin_laplace.ferx`):  6840→6460 calls,  provider time
+#         0.070/0.061/0.055s → 0.053/0.057/0.050s (~14% faster, all 3 reps)
+#       ODE (`warfarin_ode_laplace.ferx`):                    10270→7660 calls, provider time
+#         ~1.66s → ~1.20s avg (~27% faster, all 3 reps; also fewer outer iterations, 56→44,
+#         so the two routes do not walk the identical path — see CHANGELOG)
+#     Both cases now favor `analytic`; keep re-measuring before flipping the default, since
+#     an earlier pass on this same non-ODE case had recorded the opposite sign (+34% slower) —
+#     numbers this close to parity are sensitive to machine/toolchain state, which is exactly
+#     why this script exists rather than a one-line claim.
 #   * `focei, n_agq=3` (`HessianAnchor::GaussNewton`) — `estimation::focei_htilde_dx`, needs
 #     no third order at all (`H̃` is bilinear in first-order sensitivities), so it costs one
 #     extra plain `subject_sensitivities` call, independent of `n_free`. `analytic` is the
@@ -21,10 +30,12 @@
 # arms; runs are interleaved (baseline, candidate, …) so a machine that warms up or throttles
 # biases neither arm.
 #
-# ODE models are benchmarked only for the GaussNewton (`focei`) case:
-# `laplace_h_deriv::subject_h_inner_dx` declines ODE outright (needs the covariance
-# provider's third order, not yet extended there), but `focei_htilde_dx::subject_htilde_dx`
-# has no such restriction (the base provider is representation-agnostic).
+# ODE models are benchmarked for both anchors: `laplace_h_deriv::subject_h_inner_dx` admits
+# ODE (the covariance provider's third-order sweep already reaches it via
+# `ode_analytical_supported`), and `focei_htilde_dx::subject_htilde_dx` does too (the base
+# provider is representation-agnostic). This is the configuration where the `Exact` route is
+# most likely to win: each FD-perturbed anchor rebuild is a full re-integration — confirmed
+# above, ~27% less provider time on `warfarin_ode_laplace.ferx`.
 #
 # `FERX_PROFILE=1` prints the analytic provider's call count and total time — the
 # deterministic, noise-free primary metric (see the module doc in `estimation/agq.rs`); wall
@@ -63,20 +74,21 @@ run() { # run <label> <model> <env-assignment...>
   local label="$1" model="$2"; shift 2
   local log="$OUT/$label.log"
   local t0 t1
-  t0=$(python -c 'import time;print(time.time())')
+  t0=$(python3 -c 'import time;print(time.time())')
   ( cd "$OUT" && FERX_PROFILE=1 "$@" "$OLDPWD/$BIN" "$OLDPWD/$model" --data "$OLDPWD/$DATA" ) \
     >"$log" 2>&1 || { echo "FAILED: $label"; sed -n '1,40p' "$log"; return 1; }
-  t1=$(python -c 'import time;print(time.time())')
+  t1=$(python3 -c 'import time;print(time.time())')
   local ofv iters provider
   ofv=$(grep -Eo 'OFV[^0-9-]*(-?[0-9.]+)' "$log" | tail -1 | grep -Eo '\-?[0-9.]+$' || echo NA)
   iters=$(grep -Eio 'iterations?[^0-9]*([0-9]+)' "$log" | tail -1 | grep -Eo '[0-9]+$' || echo NA)
   provider=$(grep -o 'subject_sensitivities): [0-9]* calls, [0-9.]*s' "$log" | tail -1 || echo "NA")
   printf '%-28s %8.2fs  OFV=%-14s iters=%-5s %s\n' \
-    "$label" "$(python -c "print($t1-$t0)")" "$ofv" "$iters" "$provider"
+    "$label" "$(python3 -c "print($t1-$t0)")" "$ofv" "$iters" "$provider"
 }
 
 for model in plans/laplace-sensitivity-speed/warfarin_laplace.ferx \
              plans/laplace-sensitivity-speed/warfarin_block_omega_laplace.ferx \
+             plans/laplace-sensitivity-speed/warfarin_ode_laplace.ferx \
              plans/laplace-sensitivity-speed/warfarin_focei_agq.ferx \
              plans/laplace-sensitivity-speed/warfarin_block_omega_focei_agq.ferx \
              plans/laplace-sensitivity-speed/warfarin_ode_focei_agq.ferx; do
