@@ -28,8 +28,13 @@ section of the SDLC for the versioning policy).
   rebuilds. Estimates, OFVs and standard errors are unchanged (the two routes are pinned
   bit-consistent, and this is on by default); measured on warfarin fixtures: 30–50% fewer
   analytic-provider calls, and on an ODE model roughly 2× less provider time and ~30% faster
-  wall-clock, converging in fewer outer iterations. `laplace`/AGQ's exact-Hessian anchor is
-  unaffected — it genuinely needs the third-order jet and stays on its existing route (#251).
+  wall-clock, converging in fewer outer iterations. Also covers custom/time-varying σ
+  magnitude, `iiv_on_ruv` (except combined with an M3-censored row), and M3-BLOQ including its
+  σ-direct derivative — anything still outside scope (IOV/mixture, correlated `block_sigma`
+  residuals) keeps the pre-existing finite-difference route. `laplace`/AGQ's exact-Hessian
+  anchor gained the same analytic route for closed-form and **ODE** models (opt-in via
+  `FERX_AGQ_GRID_RESPONSE=analytic` — no repeatable wall-clock win was measured there, so it
+  is not the default; its value is an exact, FD-noise-free gradient) (#251).
 
 ### Added
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,

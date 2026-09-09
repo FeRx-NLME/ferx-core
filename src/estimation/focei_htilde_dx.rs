@@ -34,25 +34,42 @@
 //! (`et.dr_dtheta`/`et.dd_dtheta`), independent of `f`; `σ` itself moves `R`/`d` directly too.
 //! Both use the same closed form as `βⱼ = dpⱼ/df`, substituting the direction's `(∂R/∂v,
 //! ∂d/∂v)` for `(d, d2)` — see [`dp_dv`]. That formula is specific to the **quantified**
-//! functional form `p = 1/R + ½(d/R)²`; an M3-censored row's `p = g2` comes from the
-//! `−logΦ(z)` kernel instead, and `dp_dv` does not apply to it — see the censored exclusion
-//! below.
+//! functional form `p = 1/R + ½(d/R)²`. An M3-censored row's `p = g2` comes from the
+//! `−logΦ(z)` kernel instead (`et.censored`), whose `∂g2/∂σ` has no such closed form — the
+//! σ-direct precompute below central-differences `m3_censored_outer`'s `g2` output directly
+//! for those rows (mirroring `sens_outer_gradient::sigma_block`'s censored `kern_at`
+//! closure), rather than routing them through `dp_dv`. A censored row can never carry an
+//! active magnitude on the same subject — `score_core` itself declines that combination — so
+//! the direct-θ branch above never needs the equivalent swap.
+//!
+//! # `iiv_on_ruv`'s residual-eta row
+//!
+//! `H̃[rr,rr] += 2.0` is constant (contributes nothing to `dH̃/dx`); `H̃[rr,l] += gⱼ·a_{jl}`
+//! for `l ≠ rr` is not, where `gⱼ = dⱼ/Rⱼ` is scale-free (`ruv_scale` cancels in the ratio).
+//! `dg/dx_k` follows the same quotient-rule shape as `dp_dv`, substituted per direction — see
+//! [`dg_dv`]. `a[rr] = 0` structurally (the prediction never depends on `η_ruv`), so the
+//! generic `p·aaᵀ` loop above already leaves the `rr` row/col untouched; this is a pure
+//! addition, not a special case of it. A FREM pseudo-observation row has no `η_ruv`
+//! dependence at all (`score_core`'s own `ruv.filter(|_| frem_var.is_none())`), so it is
+//! skipped the same way here. A censored row's residual-eta entries are the `ruv_cz`/`ruv_cm`
+//! chain instead of `(g, 2.0)` — a chain this module does not build — so that combination is
+//! declined outright rather than silently using the wrong formula.
 //!
 //! # Scope
 //!
-//! Everything [`score_core`] itself supports analytically — M3-BLOQ (base value only, see
-//! below), custom/TV σ magnitude, LTBS, `ExpressionScale`, FREM, closed-form **and ODE** —
-//! minus four structural exclusions this assembly does not (yet) build:
+//! Everything [`score_core`] itself supports analytically — M3-BLOQ (including the σ-direct
+//! derivative, see above), `iiv_on_ruv` (see above), custom/TV σ magnitude, LTBS,
+//! `ExpressionScale`, FREM, closed-form **and ODE** — minus two structural exclusions this
+//! assembly does not (yet) build:
 //!
 //! * **IOV / mixture** — the packed-layout decode below assumes exactly
 //!   `[θ…, Ω lower-tri…, σ…]`;
-//! * **`iiv_on_ruv`** — its `H̃` rows are the dedicated `(g, 2.0)` residual-η structure, not
-//!   the generic `p·aaᵀ` form;
 //! * **correlated residuals (`block_sigma`)** — the σ-direction `∂R/∂σ` needs the
-//!   correlation-aware variance, not the plain scalar one this module differences;
-//! * **M3-censored rows** — `score_core` gives a correct *base* `p = g2`/`β = dg2/df` (the
-//!   `H̃` matrix `anchor_hessian` builds from them is fine), but this module's σ/magnitude
-//!   `dp_dv` assumes the quantified form of `p` and would be silently wrong on `g2`.
+//!   correlation-aware variance, not the plain scalar one this module differences.
+//!
+//! A censored row combined with `iiv_on_ruv` is also declined (see above) — a per-subject
+//! runtime decline, not a model-level one, exactly like `score_core`'s own magnitude ×
+//! M3-censored bail.
 //!
 //! Anything outside returns `None` and the caller keeps the finite-difference grid response.
 
@@ -65,7 +82,8 @@ use crate::estimation::parameterization::{lower_tri_entries, packed_len};
 use crate::estimation::sens_outer_gradient::{score_core, sigma_fd_step, theta_dx_chain};
 use crate::sens::provider::subject_sensitivities;
 use crate::stats::likelihood::build_frem_r_override;
-use crate::stats::residual_error::residual_rd;
+use crate::stats::residual_error::{residual_rd, residual_rd2};
+use crate::stats::special::m3_censored_outer;
 use crate::types::{CompiledModel, ModelParameters, Subject};
 
 /// `∂p/∂v = -Rᵥ/R² + d·dᵥ/R² - d²·Rᵥ/R³`, for any direction `v` of `p = 1/R + ½(d/R)²`
@@ -79,6 +97,15 @@ fn dp_dv(r: f64, d: f64, rv: f64, dv: f64) -> f64 {
     let inv_r2 = inv_r * inv_r;
     let inv_r3 = inv_r2 * inv_r;
     -rv * inv_r2 + d * dv * inv_r2 - d * d * rv * inv_r3
+}
+
+/// `∂g/∂v = (dᵥ·R − d·Rᵥ)/R²`, the quotient rule for `g = d/R` (`iiv_on_ruv`'s scale-free
+/// residual-eta coupling, `H̃[ruv,l] += g·a_l`). `dg/df = dg_dv(r, d, d, d2)` — same
+/// substitution pattern as [`dp_dv`], reused across the structural-`f`, magnitude-direct-θ
+/// and σ directions.
+#[inline]
+fn dg_dv(r: f64, d: f64, rv: f64, dv: f64) -> f64 {
+    (dv * r - d * rv) / (r * r)
 }
 
 /// The total derivative `dH̃/dx_k` of the Gauss-Newton Hessian, one `d × d` matrix per
@@ -114,7 +141,6 @@ pub(crate) fn subject_htilde_dx(
         || model.n_kappa > 0
         || params.omega_iov.is_some()
         || template.mixture.is_some()
-        || model.residual_error_eta.is_some()
         || !params.residual_correlations.is_empty()
         || !analytic_score_supported(model)
     {
@@ -136,32 +162,56 @@ pub(crate) fn subject_htilde_dx(
         b_hat,
         model.residual_error_eta,
     )?;
-    // Excluded by the model-level gate above; assert rather than re-test (CLAUDE.md: two
-    // redundant gates cover for each other).
-    debug_assert!(
-        core.ruv.is_none(),
-        "ruv excluded by residual_error_eta gate above"
-    );
-    // M3-censored rows: `score_core` already gives a correct BASE `p = g2`/`β = dg2/df` for
-    // them (the `−logΦ(z)` kernel FD it always does), so the base `H̃` matrix this module
-    // starts from is fine. But `dp_dv` below assumes the QUANTIFIED functional form
-    // `p = 1/R + ½(d/R)²` — wrong for `g2`, which has no such closed form — so the σ-direct
-    // and magnitude-direct terms would be silently wrong on a censored row. Decline rather
-    // than build the censored kernel's own σ/θ derivative chain here; `sigma_block`'s
-    // `kern_at` closure is the pattern a future extension would reuse.
-    if core.et.iter().any(|t| t.censored) {
+    // `iiv_on_ruv`'s residual-eta row/col is well-defined on a quantified row (`g = d/R`,
+    // scale-free — see `dg_dv` below), but a censored row's residual-eta entries are the
+    // `ruv_cz`/`ruv_cm` chain (`ErrTerms` doc), a third derivative chain this module does
+    // not build. Mirrors `score_core`'s own decline of magnitude × M3-censored.
+    if core.ruv.is_some() && core.et.iter().any(|t| t.censored) {
         return None;
     }
-
     let sigma = &params.sigma.values;
     let err_keys = model.error_spec.obs_keys(subject);
+    // FREM pseudo-observation rows carry no η_ruv dependence at all (`score_core`'s own
+    // `ruv.filter(|_| frem_var.is_none())`), so the residual-eta row/col addition below must
+    // skip them the same way.
+    let frem_r_base = build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma);
+    // `∂²R/∂f²` per observation, needed only for `iiv_on_ruv`'s `g = d/R` structural chain
+    // (`dg_dv(r, d, d, d2)`) — not otherwise read by this module, so left empty when
+    // `iiv_on_ruv` is inactive (the common case).
+    let d2_row: Vec<f64> = if core.ruv.is_some() {
+        sens.obs
+            .iter()
+            .enumerate()
+            .map(|(j, o)| {
+                let cmt = err_keys[j];
+                let mult_row: Option<&[f64]> = core
+                    .mult
+                    .as_ref()
+                    .and_then(|m| m.get(j))
+                    .map(|v| v.as_slice());
+                let (_, _, d2) = residual_rd2(&model.error_spec, cmt, o.f, sigma, mult_row);
+                d2 * core.ruv_scale
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    // σ-direction `(∂R/∂σ_s, ∂d/∂σ_s)` per observation, hoisted once — independent of `k`,
-    // exactly as `laplace_h_deriv::residual_row_derivs` hoists its analogue. A FREM
+    // `∂p_j/∂σ_s` per observation, hoisted once — independent of `k`, exactly as
+    // `laplace_h_deriv::residual_row_derivs` hoists its analogue. Stores the finished `dp`
+    // (not the raw `(∂R/∂σ, ∂d/∂σ)` pair) because a censored row's `p = g2` does not go
+    // through `dp_dv` at all — its own kernel is central-differenced directly, mirroring
+    // `sens_outer_gradient::sigma_block`'s censored `kern_at` closure. A FREM
     // pseudo-observation row's variance is the dedicated `EPSCOV²` override, not
     // `error_spec`, so it gets its own branch (mirrors `sigma_block`'s `frem_row` arm) —
-    // `d ≡ 0` there since the override is constant in `f`.
-    let mut sigma_row_derivs: Vec<Vec<(f64, f64)>> = vec![Vec::with_capacity(n_obs); n_sigma];
+    // `d ≡ 0` there since the override is constant in `f`. Censored takes priority over the
+    // FREM/quantified branches, matching `sigma_block`'s row-dispatch order.
+    let mut sigma_row_derivs: Vec<Vec<f64>> = vec![Vec::with_capacity(n_obs); n_sigma];
+    // Companion `∂g_j/∂σ_s` for `iiv_on_ruv`'s `g = d/R` (only populated, and only read,
+    // when `core.ruv.is_some()`; a censored row never reaches this vector at all, since that
+    // combination with `iiv_on_ruv` is declined above — pushed as `0.0` regardless so the
+    // two per-sigma vectors stay index-aligned with `sigma_row_derivs`).
+    let mut sigma_row_derivs_g: Vec<Vec<f64>> = vec![Vec::with_capacity(n_obs); n_sigma];
     for s in 0..n_sigma {
         let h = sigma_fd_step(sigma[s]);
         let mut sp = sigma.to_vec();
@@ -174,6 +224,20 @@ pub(crate) fn subject_htilde_dx(
             build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sm);
         for (j, o) in sens.obs.iter().enumerate() {
             let cmt = err_keys[j];
+            let et = &core.et[j];
+            if et.censored {
+                let y = subject.observations[j];
+                let f = o.f;
+                let kern_at = |sa: &[f64]| -> f64 {
+                    let r = model.error_spec.variance_at(cmt, f, sa) * core.ruv_scale;
+                    let d = model.error_spec.dvar_df(cmt, f, sa) * core.ruv_scale;
+                    let d2 = model.error_spec.d2var_df2(cmt, f, sa) * core.ruv_scale;
+                    let (_g1, g2, _cz, _cm) = m3_censored_outer(y, f, r, d, d2, et.cens_sign);
+                    g2
+                };
+                sigma_row_derivs[s].push((kern_at(&sp) - kern_at(&sm)) / (2.0 * h));
+                continue;
+            }
             let frem_p = frem_override_p
                 .as_ref()
                 .and_then(|ov| ov.get(j))
@@ -195,7 +259,10 @@ pub(crate) fn subject_htilde_dx(
                 let scale = core.ruv_scale;
                 (scale * (vp - vm) / (2.0 * h), scale * (dp - dm) / (2.0 * h))
             };
-            sigma_row_derivs[s].push((r_sig, d_sig));
+            sigma_row_derivs[s].push(dp_dv(et.r, et.d, r_sig, d_sig));
+            if core.ruv.is_some() {
+                sigma_row_derivs_g[s].push(dg_dv(et.r, et.d, r_sig, d_sig));
+            }
         }
     }
 
@@ -262,13 +329,63 @@ pub(crate) fn subject_htilde_dx(
                 }
             }
             if sigma_idx < n_sigma {
-                let (rv, dv) = sigma_row_derivs[sigma_idx][j];
-                dp += dp_dv(et.r, et.d, rv, dv) * dsigma;
+                dp += sigma_row_derivs[sigma_idx][j] * dsigma;
+            }
+
+            // `iiv_on_ruv`'s residual variance scale `s = exp(2·η_ruv)` moves `p` even at
+            // fixed `f`: `p(s) = 1/(s·R₀) + ½(D₀/R₀)²` (the `(d/R)²` term is scale-invariant,
+            // so only the `1/R` piece survives), giving `dp/ds = −1/(r·s)`. Chaining through
+            // `ds/dx_k = 2·s·bₖ[rr]` collapses to `−2·bₖ[rr]/r` — no `s` term survives the
+            // product. `r`/`d` already carry `s` at the current point, so this is on top of
+            // (not instead of) `et.beta·φ`. Skipped for a FREM row, whose `R = EPSCOV²`
+            // never carries `ruv_scale` at all (`score_core`'s own `(v, 0.0, 0.0)` branch).
+            if let Some(rr) = core.ruv {
+                let frem_var = frem_r_base
+                    .as_ref()
+                    .and_then(|ov| ov.get(j))
+                    .and_then(|v| *v);
+                if frem_var.is_none() {
+                    dp += -2.0 * bk[rr] / et.r;
+                }
             }
 
             for i in 0..n_eta {
                 for m in 0..n_eta {
                     dh[(i, m)] += dp * a[i] * a[m] + p * (psi[i] * a[m] + a[i] * psi[m]);
+                }
+            }
+
+            // `iiv_on_ruv` (#474): `H̃[rr,rr] += 2.0` is constant, so contributes nothing;
+            // `H̃[rr,l] += g·a_l` (`g = d/R`, scale-free) for `l ≠ rr` is not, and `a[rr] = 0`
+            // structurally means the generic `p·aaᵀ` loop above already left `dh`'s `rr`
+            // row/col untouched — so this only ADDS, never overwrites. Declined above for a
+            // censored row and skipped here for a FREM pseudo-observation (module doc).
+            if let Some(rr) = core.ruv {
+                let frem_var = frem_r_base
+                    .as_ref()
+                    .and_then(|ov| ov.get(j))
+                    .and_then(|v| *v);
+                if frem_var.is_none() {
+                    let (r, d) = (et.r, et.d);
+                    let mut dg = dg_dv(r, d, d, d2_row[j]) * phi;
+                    if theta_idx < n_theta && !et.dr_dtheta.is_empty() {
+                        let (rv, dv) = (et.dr_dtheta[theta_idx], et.dd_dtheta[theta_idx]);
+                        if rv != 0.0 || dv != 0.0 {
+                            dg += dg_dv(r, d, rv, dv) * dtheta;
+                        }
+                    }
+                    if sigma_idx < n_sigma {
+                        dg += sigma_row_derivs_g[sigma_idx][j] * dsigma;
+                    }
+                    let g = d / r;
+                    for l in 0..n_eta {
+                        if l == rr {
+                            continue;
+                        }
+                        let contrib = dg * a[l] + g * psi[l];
+                        dh[(rr, l)] += contrib;
+                        dh[(l, rr)] += contrib;
+                    }
                 }
             }
         }
@@ -363,7 +480,7 @@ mod tests {
             params.omega.dim(),
             &omega_inv,
             b,
-            None,
+            model.residual_error_eta,
         )
         .expect("score_core")
         .htilde
@@ -431,11 +548,13 @@ mod tests {
         assert_matches_fd(&model, &subject, &template, &[0.05, -0.03, 0.08], 1e-5);
     }
 
-    /// M3-censored: the base `p = g2`/`β = dg2/df` `score_core` computes are fine, but this
-    /// module's σ/magnitude-direct `dp_dv` assumes the quantified functional form of `p` —
-    /// wrong for `g2`. Must decline rather than build a plausible wrong `H̃` derivative.
+    /// M3-censored: `p = g2` comes from the `−logΦ(z)` kernel rather than the quantified
+    /// `dp_dv` closed form, so the σ-direct precompute central-differences `m3_censored_outer`
+    /// directly for these rows (module doc). `htilde_at`'s FD oracle goes through the exact
+    /// same `score_core` the analytic route reads `p`/`β` from, so this is a real parity
+    /// check, not a tautology.
     #[test]
-    fn m3_censored_rows_decline() {
+    fn htilde_derivative_matches_fd_under_m3_censoring() {
         let (mut model, subject, template) =
             setup(MODEL, &[0.22, 11.0, 1.4], &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         model.bloq_method = crate::types::BloqMethod::M3;
@@ -443,16 +562,7 @@ mod tests {
         let n = subject.observations.len();
         subject.cens[n - 1] = 1;
         subject.cens[n - 2] = 1;
-        let x = pack_params(&template);
-        let params = unpack_params(&x, &template);
-        let omega_inv = params.omega.inv.clone();
-        let b_hat = [0.05, -0.03, 0.08];
-        let db_dx = vec![DVector::zeros(3); x.len()];
-        assert!(
-            subject_htilde_dx(&model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx)
-                .is_none(),
-            "an M3 censored row must decline to the finite-difference route"
-        );
+        assert_matches_fd(&model, &subject, &template, &[0.05, -0.03, 0.08], 1e-6);
     }
 
     /// A custom/time-varying σ magnitude: the direct-θ `dp_dv` channel must be live.
@@ -535,9 +645,11 @@ mod tests {
         }
     }
 
-    /// `iiv_on_ruv` has its own `H̃` row structure; must decline.
+    /// `iiv_on_ruv`: `H̃[rr,rr]` is constant (contributes nothing) and `H̃[rr,l]`'s `g = d/R`
+    /// quotient rule (`dg_dv`, module doc) must match `htilde_at`'s FD oracle, which reads
+    /// the same `(g, 2.0)` structure straight from `score_core`.
     #[test]
-    fn iiv_on_ruv_declines() {
+    fn htilde_derivative_matches_fd_under_iiv_on_ruv() {
         const RUV_MODEL: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -559,6 +671,41 @@ mod tests {
   iiv_on_ruv = ETA_RUV
 "#;
         let (model, subject, template) = setup(RUV_MODEL, &[0.22, 11.0, 1.4], &[0.5, 2.0, 8.0]);
+        assert_matches_fd(&model, &subject, &template, &[0.05, -0.03, 0.08, 0.0], 1e-5);
+    }
+
+    /// The one combination this module still declines: `iiv_on_ruv` on a subject with an
+    /// M3-censored row needs the `ruv_cz`/`ruv_cm` chain instead of `(g, 2.0)` (module doc).
+    #[test]
+    fn iiv_on_ruv_with_censored_row_declines() {
+        const RUV_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+"#;
+        let mut model = parse_model_string(RUV_MODEL).expect("parse");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        let theta = [0.22, 11.0, 1.4];
+        let mut subject = fixture_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let n = subject.observations.len();
+        subject.cens[n - 1] = 1;
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
         let x = pack_params(&template);
         let params = unpack_params(&x, &template);
         let omega_inv = params.omega.inv.clone();
@@ -567,7 +714,7 @@ mod tests {
         assert!(
             subject_htilde_dx(&model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx)
                 .is_none(),
-            "iiv_on_ruv must decline to the finite-difference route"
+            "iiv_on_ruv combined with a censored row must decline to the finite-difference route"
         );
     }
 }

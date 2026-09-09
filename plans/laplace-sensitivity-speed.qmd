@@ -323,20 +323,35 @@ near an ODE-tolerance-limited anchor.
 - NONMEM LAPLACIAN INTER comparison — **not done**. No numerical behavior changed (both
   routes are pinned to agree bit-consistent with the pre-existing gradient), so no new
   anchor is owed; the existing NONMEM comparisons for `laplace`/`focei` still apply.
-- ODE, IOV, dispatch-boundary coverage before enabling those routes — IOV/mixture stay
-  declined for both new modules (dimension-layout complexity, follow-up); ODE is admitted
-  for Gauss-Newton (tested, benchmarked) and declined for Exact (not yet tested).
+- ODE, IOV, dispatch-boundary coverage before enabling those routes — ODE is admitted for
+  **both** anchors now (Gauss-Newton: tested, benchmarked; Exact: tested at `tol = 5e-3`,
+  reusing the covariance provider's existing ODE reach — no new solver-side work). IOV/mixture
+  stays declined for both modules (dimension-layout complexity, still a follow-up).
 - Multi-node total derivative — covered by the existing `n_agq` sweep in
   `tests/agq.rs::analytic_gradient_matches_fd_at_every_node_count` and the dedicated
   `n_agq ∈ {1, 3}` cases in `agq::tests::analytic_grid_response_matches_the_fd_route`.
 
 ### Left for a follow-up
 
-- Extend `laplace_h_deriv` to ODE (needs its own parity test; the existing third-order step
-  heuristic already handles ODE solver tolerance, this is untested wiring, not new math).
-- Extend `focei_htilde_dx` to IOV, `iiv_on_ruv`, correlated `block_sigma`, and M3-censored
-  σ/magnitude derivatives (the base `H̃` value is already correct there; only the direct
-  σ/θ derivative chain is missing).
+Both `focei_htilde_dx` and `laplace_h_deriv` now cover ODE, M3-BLOQ (base and, for
+`focei_htilde_dx`, the σ-direct derivative), custom/TV σ magnitude (`focei_htilde_dx` only —
+`laplace_h_deriv` is bounded by the covariance provider's own magnitude exclusion, not a gap
+in this module), and `iiv_on_ruv` (`focei_htilde_dx` only, minus the one still-declined
+combination below). What remains:
+
+- **IOV / mixture** — declined for both modules (dimension-layout complexity: the packed
+  coordinate decode assumes `[θ…, Ω lower-tri…, σ…]`, and a stacked `[η, κ]` layout needs its
+  own decode plus the joint `Ω⁻¹`, which `laplace_h_deriv`'s covariance provider
+  (`subject_sensitivities_cov_iov`) already reaches but this module does not yet consume).
+- **`iiv_on_ruv` combined with an M3-censored row** (`focei_htilde_dx` only) — the residual-eta
+  row/col becomes the `ruv_cz`/`ruv_cm` chain instead of `(g, 2.0)`, a chain this module does
+  not build; declined rather than silently applying the wrong formula.
+- **Correlated residuals (`block_sigma`)** — declined for both; the σ-direction `∂R/∂σ` needs
+  the correlation-aware variance (`corr_residual_diag`/`corr_residual_rd_at_sigma`), not the
+  plain scalar one either module differences.
+- `laplace_h_deriv` still declines custom/TV σ magnitude and `iiv_on_ruv` outright — both are
+  excluded one level up, by `subject_sensitivities_cov`'s own gate, not by a restriction this
+  module owns; extending either means extending the covariance provider first.
 - A repository-required NONMEM comparison would be owed only if either route becomes the
   route a user-visible numerical result depends on differently than before — it does not
   currently, since both are pinned to the pre-existing gradient.

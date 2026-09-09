@@ -81,7 +81,10 @@
 //! Deliberately the *intersection* of the covariance provider's gate (which already excludes
 //! LTBS, expression scaling, Form-C readouts, FREM, `iiv_on_ruv`, custom σ magnitude,
 //! correlated residuals, non-Gaussian endpoints and `gradient = fd`) with three further
-//! restrictions this assembly owns:
+//! restrictions this assembly owns. **ODE is admitted** — `covariance_sensitivities` (via
+//! `ode_analytical_supported`) reaches it, so this module does too; `third_order_fd_step`
+//! widening the FD step to the solver's `reltol` there is genuine integration noise, not a
+//! formula gap (`h_derivative_matches_fd_under_ode`, `tol = 5e-3` vs `1e-5` closed-form).
 //!
 //! * **no M3-censored row** — the `−logΦ(z)` kernel's `q`/`w` are `2·g1`/`2·g2`, whose third
 //!   `f`-derivative and σ-derivatives are a different chain than `err_terms`;
@@ -164,14 +167,6 @@ pub(crate) fn subject_h_inner_dx(
         || template.mixture.is_some()
         || model.residual_error_eta.is_some()
         || !params.residual_correlations.is_empty()
-        // ODE is left to the finite-difference route for now. `covariance_sensitivities`
-        // (via `ode_analytical_supported`) *does* admit it — the third-order jet is
-        // available — but `third_order_fd_step` widens the FD step to the solver's
-        // `reltol` there, so `dH/dx` carries integration noise the closed-form case does
-        // not. The implementation plan staged this deliberately ("Extend deliberately. Add
-        // ODE, then joint eta/kappa…"); admit it once an ODE-scoped parity test like
-        // `h_derivative_matches_central_difference_of_the_anchor` exists.
-        || model.ode_spec.is_some()
     {
         return None;
     }
@@ -716,11 +711,14 @@ mod tests {
         );
     }
 
-    /// ODE models are staged out for now (module doc): `covariance_sensitivities` admits
-    /// them, but their third-order step widens to the solver `reltol`, and no ODE-scoped
-    /// parity test exists yet.
+    /// ODE models: `covariance_sensitivities` (via `ode_analytical_supported`) admits them —
+    /// the third-order jet is available from the augmented solve — so this module does too.
+    /// `third_order_fd_step` widens the FD step to the solver's `reltol` on this route, which
+    /// is genuine integration noise rather than a formula error, so the tolerance here is
+    /// looser than the closed-form cases (measured, mirroring
+    /// `focei_htilde_dx::tests::htilde_derivative_matches_fd_under_ode`).
     #[test]
-    fn ode_models_decline() {
+    fn h_derivative_matches_fd_under_ode() {
         const ODE_MODEL: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -742,24 +740,9 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
-        let model = parse_model_string(ODE_MODEL).expect("parse");
+        let (model, subject, template) = setup(ODE_MODEL, &[0.22, 11.0, 1.4], &[0.5, 2.0, 8.0]);
         assert!(model.ode_spec.is_some(), "fixture must be an ODE model");
-        let theta = [0.22, 11.0, 1.4];
-        let subject = fixture_subject(&model, &theta, &[0.5, 2.0, 8.0]);
-        let mut template = model.default_params.clone();
-        template.theta = theta.to_vec();
-        let x = pack_params(&template);
-        let params = unpack_params(&x, &template);
-        let omega_inv = params.omega.inv.clone();
-        let b_hat = [0.05, -0.03, 0.08];
-        let db_dx = vec![DVector::zeros(3); x.len()];
-        assert!(
-            subject_h_inner_dx(
-                &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx,
-            )
-            .is_none(),
-            "ODE models must decline to the finite-difference route"
-        );
+        assert_matches_fd(&model, &subject, &template, &[0.05, -0.03, 0.08], 5e-3);
     }
 
     /// A custom residual-magnitude model (#484/#576) needs its own direct-θ channel this
