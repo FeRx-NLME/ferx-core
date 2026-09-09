@@ -16592,20 +16592,31 @@ fn current_nn_axis_base() -> Option<usize> {
 /// factorization [`crate::estimation::nn_theta_gradient`] uses with a bias finite
 /// difference (#1300). The caller owns the axis budget: every `base + flat` must be
 /// below the dual width `M` it dispatched on, or `T::var` indexes past the jet.
-#[cfg(feature = "nn")]
+///
+/// Purely crate-internal bookkeeping on the evaluator's thread-local — it adds nothing
+/// to the public `PkNum` contract, which external implementors must keep compiling
+/// against (PR #1301 review).
 pub(crate) struct ModelNnAxisGuard(Option<usize>);
 
-#[cfg(feature = "nn")]
 impl ModelNnAxisGuard {
     /// Seed NN outputs on axes `base..base + n_outputs_total` for the current thread,
     /// restoring the previous setting on drop.
+    #[cfg(feature = "nn")]
     pub(crate) fn enter(base: usize) -> Self {
         let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(Some(base)));
         ModelNnAxisGuard(prev)
     }
+
+    /// Lift NN outputs as constants again for the guard's scope, restoring the previous
+    /// setting on drop. For a value pass that runs *inside* a seeded evaluation over a
+    /// jet-free type — the `Dual2<0>` cov-static fold in `eval_cov_static_f64` — where a
+    /// seed would index past an empty jet. A no-op when nothing is seeded.
+    fn suspend() -> Self {
+        let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(None));
+        ModelNnAxisGuard(prev)
+    }
 }
 
-#[cfg(feature = "nn")]
 impl Drop for ModelNnAxisGuard {
     fn drop(&mut self) {
         MODEL_NN_AXIS_BASE.with(|cell| cell.set(self.0));
@@ -19222,29 +19233,23 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                 // that yields `∂p/∂(θ,η)`; without one the output is a constant, as it
                 // always was (exact for `∂/∂η` — see `ModelNnGuard`).
                 match current_nn_axis_base() {
-                    // A jet-free instantiation (`f64`, or the `Dual2<0>` value pass the
-                    // cov-static fold runs) has no axis to seed; the value is all it carries.
-                    Some(base) if T::N_AXES > 0 => {
+                    Some(base) => {
                         let flat: usize = nn_outputs
                             .iter()
                             .take(nn_i as usize)
                             .map(Vec::len)
                             .sum::<usize>()
                             + out_i as usize;
-                        // An axis past the jet is a wiring bug in the caller's width budget
-                        // (`nn_param_derivatives_at_cov`), never a runtime condition; fail
-                        // loudly rather than silently lift the output to a constant, which
-                        // would report a zero `∂/∂z` as analytic.
-                        assert!(
-                            base + flat < T::N_AXES,
-                            "Op::PushNnOutput axis {} exceeds the dual width {} (nn_idx={nn_i}, \
-                             output_idx={out_i}, axis base {base})",
-                            base + flat,
-                            T::N_AXES
-                        );
+                        // The caller owns the width budget (`nn_param_derivatives_at_cov`
+                        // dispatches on exactly `n_base + n_eta + n_z`); an axis past the jet
+                        // is a wiring bug, and `var`'s bounds check fails it loudly rather
+                        // than lifting the output to a constant, which would report a zero
+                        // `∂/∂z` as analytic. The zero-width cov-static value pass runs with
+                        // seeding suspended (`ModelNnAxisGuard::suspend` in
+                        // `eval_cov_static_f64`), so it never reaches this arm.
                         push!(T::var(v, base + flat));
                     }
-                    _ => push!(k(v)),
+                    None => push!(k(v)),
                 }
             }
             // The level index is integer-valued data, so its jet is empty and
@@ -20537,6 +20542,11 @@ impl IndivParamProgram {
         // the `.value` field is computed independently of the axis count, so a
         // `Dual2<0>` `.value` is bit-for-bit equal to what either unfolded path
         // computes for the same slot — keeping the fold exactly identical (#485).
+        // A cov-static slot never reads a network output (`Op::PushNnOutput` is dynamic,
+        // `bytecode_is_dynamic`), but this zero-width pass may run inside a seeded
+        // evaluation (`ModelNnAxisGuard`); suspend the seeding for its duration so a
+        // future static read could not seed an axis a `Dual2<0>` does not have.
+        let _no_nn_axes = ModelNnAxisGuard::suspend();
         let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
         let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
         let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
