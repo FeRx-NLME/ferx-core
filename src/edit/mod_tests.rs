@@ -8,7 +8,7 @@
 //! written by hand.
 
 use super::*;
-use crate::types::{CovariateForm, CovariateStat};
+use crate::types::{CovariateForm, CovariateOp, CovariateStat};
 
 /// The model every edit test starts from: one-compartment oral, three θ, three
 /// η, a proportional error model — deliberately comment- and alignment-heavy,
@@ -214,6 +214,7 @@ fn canonical_hash_changes_for_every_semantic_edit() {
             parameter: "CL".into(),
             covariate: "WT".into(),
             form: CovariateForm::Power,
+            op: CovariateOp::Multiply,
             center: Some(CovariateStat::Literal(70.0)),
             fix: None,
             thetas: vec![],
@@ -742,6 +743,7 @@ fn power_on_wt() -> Relation {
         parameter: "CL".into(),
         covariate: "WT".into(),
         form: CovariateForm::Power,
+        op: CovariateOp::Multiply,
         center: Some(CovariateStat::Median),
         fix: None,
         thetas: vec![RelationTheta {
@@ -2599,4 +2601,43 @@ fn a_stale_alias_is_still_dropped_when_the_binding_moves() {
     // The parameter it bridged to is unreferenced now and goes with it.
     assert!(!out.contains("TLAG"), "{out}");
     assert!(!out.contains("TVLAG("), "{out}");
+}
+
+#[test]
+fn the_additive_operator_is_rendered_as_a_trailing_token_and_parses_back() {
+    // The operator has to survive an edit → text → parse round trip: a search
+    // that proposes an additive relation writes the line here and reads the
+    // relation back off the parsed model.
+    let mut add = power_on_wt();
+    add.op = CovariateOp::Add;
+    add.center = Some(CovariateStat::Literal(70.0));
+    assert_eq!(
+        add.render(),
+        "CL ~ WT power(center = 70) + => THETA_CL_WT(0.75, 0.01, 5.0)"
+    );
+    // `*` is the default and is left unwritten, so an edit passing a
+    // multiplicative relation through does not rewrite the line.
+    let mut mul = add.clone();
+    mul.op = CovariateOp::Multiply;
+    assert_eq!(
+        mul.render(),
+        "CL ~ WT power(center = 70) => THETA_CL_WT(0.75, 0.01, 5.0)"
+    );
+
+    let mut text = base();
+    apply(&mut text, ModelEdit::AddCovariateRelation(add.clone()));
+    let parsed = crate::parser::model_parser::parse_full_model(&text.render())
+        .unwrap_or_else(|e| panic!("the edited model must parse: {e}"));
+    let relations = parsed
+        .model
+        .covariate_model
+        .as_ref()
+        .expect("the block is recorded")
+        .relations
+        .clone();
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].op, CovariateOp::Add);
+    // …and back out again: `From<&CovariateRelation>` is what a search uses to
+    // re-propose a relation it found in the parent model.
+    assert_eq!(Relation::from(&relations[0]).op, CovariateOp::Add);
 }

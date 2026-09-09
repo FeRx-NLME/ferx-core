@@ -3808,6 +3808,44 @@ pub fn parse_full_model_with(
                 mu_ref_disabled.join(", ")
             ));
         }
+
+        // Same warning, different cause: an additive (`+`) `[covariate_model]`
+        // relation (#1313) makes the typical value a *sum*, which
+        // `detect_mu_refs` does not match — so the parameter's eta silently
+        // loses its mu-ref anchor and SAEM falls back to the numerical M-step.
+        // That is the safe direction (the covariate effect stays in the
+        // expression; #619 was the effect being dropped), but it is a
+        // performance cliff a user should not have to infer from a slow fit.
+        // Only a parameter that actually carries an eta is worth naming.
+        let additive_params: Vec<String> = match &model.covariate_model {
+            Some(spec) => {
+                let mut out: Vec<String> = Vec::new();
+                for rel in &spec.relations {
+                    if rel.op != crate::types::CovariateOp::Add || out.contains(&rel.parameter) {
+                        continue;
+                    }
+                    let bears_eta = indiv_stmts.iter().any(|s| {
+                        matches!(s, Statement::Assign(name, expr)
+                            if *name == rel.parameter
+                                && extract_eta_indices(expr).iter().any(|&i| i < n_eta))
+                    });
+                    if bears_eta {
+                        out.push(rel.parameter.clone());
+                    }
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+        if !additive_params.is_empty() {
+            model.parse_warnings.push(format!(
+                "Mu-referencing disabled for parameter(s) with an additive (`+`) \
+                 [covariate_model] relation: {}. The typical value is a sum, so it is not \
+                 log-linear in one theta and SAEM/IMP use the numerical M-step for these etas; \
+                 FOCE/FOCEI are unaffected. Use a multiplicative relation to keep mu-referencing.",
+                additive_params.join(", ")
+            ));
+        }
     }
 
     // ── [derived] block ──

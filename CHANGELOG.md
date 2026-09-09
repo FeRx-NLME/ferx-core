@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Additive (`+`) covariate effects in `[covariate_model]` (#1313).** A trailing operator
+  token makes a relation a term added to the parameter instead of a factor on it —
+  `CL ~ WT linear(center = 70) +` desugars to `CL = TVCL * exp(ETA_CL) + THETA_CL_WT*(WT - 70)`.
+  `*` stays the default. ferx's additive template drops the leading `1` the multiplicative
+  one carries, so θ = 0, a covariate at its centre and a missing covariate all mean "no
+  effect" (the missing-value guard is `else 0.0` under `+`, `else 1.0` under `*`).
+  Multiplicative and additive relations may be mixed on one parameter, and an additive
+  relation carries no top-level-product requirement. Mu-referencing switches off for a
+  parameter with an additive relation — the typical value is a sum — and the parser warns.
+  This is the last MFL operator: `COVARIATE(..., +)` is no longer a search coverage gap, and
+  `ferx covsearch` explores `CL-WT-linear-add` as a candidate of its own. **Note:** Pharmpy
+  reuses the multiplicative template under `+`, so a model translated from Pharmpy will not
+  reproduce its equations; `ferx search` says so on any space that asks for `+`.
 - **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or
   exhaustive enumeration, ranked on pyDarwin's penalized fitness (#1185, P6 of #1175).**
   The `.ferxsearch` space is laid out as one grid — every structural category an axis with

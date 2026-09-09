@@ -231,7 +231,7 @@ silently.
 | `LAGTIME(ON / OFF)` | ✓ | `lagtime=` binding |
 | `COVARIATE(..., lin / piece_lin / exp / pow / cat)` | ✓ | `[covariate_model]` forms `linear` / `hockey` / `exponential` / `power` / `categorical` |
 | `COVARIATE(..., cat2 / custom)` | ✗ | no second categorical form; a search cannot invent an `expr(...)` |
-| `COVARIATE(..., +)` | ✗ | relations are multiplicative factors on a top-level product |
+| `COVARIATE(..., +)` | ✓ | the block's trailing operator token — but ferx's additive effect is [null at θ = 0](../model-file/covariate-model.qmd#multiplicative-and-additive-effects) where Pharmpy's is not, so a `+` space carries a note saying the equations will not match Pharmpy's |
 | `ALLOMETRY(c, ref)` | ✓ | `power(center = ref, fix = 0.75)` |
 | `IIV(p, EXP / ADD / PROP)` | ✓ | `ferx-core::edit` add / drop η; [iivsearch](iivsearch.qmd) searches the `EXP` form only |
 | `IIV(p, LOG / RE_LOG)` | ✗ | the edit layer writes `exp`, `add` and `prop` forms only |

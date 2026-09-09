@@ -12,8 +12,8 @@
 //! links to the table.
 
 use super::mfl::{
-    AbsorptionMode, CovariateEffect, CovariateOp, DepotMode, Feature, Mfl, Mode, Modes,
-    PeripheralKind, TransitCounts, VariabilityEffect,
+    AbsorptionMode, CovariateEffect, DepotMode, Feature, Mfl, Mode, Modes, PeripheralKind,
+    TransitCounts, VariabilityEffect,
 };
 
 /// Where the coverage table lives, appended to every gap error.
@@ -177,7 +177,7 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
             }
         }
         Feature::Lagtime(_) => {}
-        Feature::Covariate { effects, op, .. } => {
+        Feature::Covariate { effects, .. } => {
             // The covariate wildcard is Pharmpy's four continuous forms, not
             // the full enum — `cat2` and `custom` have to be asked for by name.
             let effects = match effects {
@@ -202,14 +202,11 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
                     _ => {}
                 }
             }
-            if *op == CovariateOp::Add {
-                gap(
-                    gaps,
-                    "COVARIATE(..., +)".into(),
-                    "`[covariate_model]` relations are multiplicative factors on a \
-                     top-level product; an additive (`+`) effect has no spelling",
-                );
-            }
+            // The `+` operator is covered as of #1313 — the block spells it as
+            // a trailing operator token. It is *not* Pharmpy-identical: ferx's
+            // additive template is null-at-zero. `resolve` says so in a note;
+            // it is a semantic divergence, not a coverage gap, so it must not
+            // refuse the space.
         }
         Feature::Allometry { .. } => {}
         Feature::DirectEffect(_) => gap(

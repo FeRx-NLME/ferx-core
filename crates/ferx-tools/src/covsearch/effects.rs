@@ -9,9 +9,14 @@
 //! for a continuous covariate, the most common level for a categorical one —
 //! and the θ left to the block's defaults, which are PsN's inits and bounds
 //! verbatim. Nothing here invents a number.
+//!
+//! MFL's operator argument — `COVARIATE?(CL, WT, lin, +)` — maps onto the
+//! block's trailing operator token (#1313). ferx's additive effect is
+//! null-at-zero where Pharmpy's is not, which the coverage check states as a
+//! note rather than a gap; see [`ferx_core::CovariateOp`].
 
 use ferx_core::edit::Relation;
-use ferx_core::{CovariateForm, CovariateStat};
+use ferx_core::{CovariateForm, CovariateOp, CovariateStat};
 
 use crate::search::mfl::{CovariateEffect, Mode as _};
 use crate::search::CovariateEffectSpec;
@@ -19,13 +24,18 @@ use crate::search::CovariateEffectSpec;
 /// One effect the search can add to or remove from a model.
 ///
 /// A [`CovariateEffectSpec`] narrowed to what covsearch handles: the
-/// coverage check (#1179) has already refused `cat2`, `custom` and the `+`
-/// operator, so this is the remaining five forms on a multiplicative factor.
+/// coverage check (#1179) has already refused `cat2` and `custom`, so this is
+/// the remaining five forms under either operator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effect {
     pub parameter: String,
     pub covariate: String,
     pub form: CovariateForm,
+    /// Whether the effect is a factor on the parameter or a term added to it.
+    /// Part of the effect's identity, not of its pair: `CL ~ WT linear` and
+    /// `CL ~ WT linear +` are two candidates competing for the one
+    /// `[covariate_model]` line the pair is allowed.
+    pub op: CovariateOp,
 }
 
 impl Effect {
@@ -48,17 +58,15 @@ impl Effect {
                 ))
             }
         };
-        if spec.op != crate::search::mfl::CovariateOp::Multiply {
-            return Err(format!(
-                "covsearch: an additive (`+`) effect on {}-{} has no `[covariate_model]` \
-                 spelling; the coverage check should have refused it",
-                spec.parameter, spec.covariate
-            ));
-        }
+        let op = match spec.op {
+            crate::search::mfl::CovariateOp::Multiply => CovariateOp::Multiply,
+            crate::search::mfl::CovariateOp::Add => CovariateOp::Add,
+        };
         Ok(Effect {
             parameter: spec.parameter.clone(),
             covariate: spec.covariate.clone(),
             form,
+            op,
         })
     }
 
@@ -78,9 +86,17 @@ impl Effect {
         self.form.label()
     }
 
-    /// `CL-WT-power`: the effect's short name in candidate ids and messages.
+    /// `CL-WT-power`, or `CL-WT-power-add` for an additive effect: the
+    /// effect's short name in candidate ids and messages.
+    ///
+    /// The suffix appears only under `+` so every id a multiplicative search
+    /// produced before #1313 is unchanged — and so two candidates on the same
+    /// pair and form, differing only in operator, cannot collide.
     pub fn label(&self) -> String {
-        format!("{}-{}", self.pair_key(), self.form_label())
+        match self.op {
+            CovariateOp::Multiply => format!("{}-{}", self.pair_key(), self.form_label()),
+            CovariateOp::Add => format!("{}-{}-add", self.pair_key(), self.form_label()),
+        }
     }
 
     /// The `[covariate_model]` line this effect adds.
@@ -98,6 +114,7 @@ impl Effect {
             parameter: self.parameter.clone(),
             covariate: self.covariate.clone(),
             form: self.form.clone(),
+            op: self.op,
             center: Some(center),
             fix: None,
             thetas: Vec::new(),
@@ -165,7 +182,27 @@ mod tests {
         let e =
             Effect::from_spec(&spec(CovariateEffect::Custom, CovariateOp::Multiply)).unwrap_err();
         assert!(e.contains("`custom`"), "{e}");
-        let e = Effect::from_spec(&spec(CovariateEffect::Pow, CovariateOp::Add)).unwrap_err();
-        assert!(e.contains("additive (`+`) effect on CL-WT"), "{e}");
+        // A form gap is a form gap under either operator.
+        let e = Effect::from_spec(&spec(CovariateEffect::Cat2, CovariateOp::Add)).unwrap_err();
+        assert!(e.contains("`cat2` on CL-WT"), "{e}");
+    }
+
+    #[test]
+    fn the_mfl_operator_becomes_the_blocks_trailing_operator_token() {
+        let mul = Effect::from_spec(&spec(CovariateEffect::Pow, CovariateOp::Multiply)).unwrap();
+        assert_eq!(mul.op, ferx_core::CovariateOp::Multiply);
+        assert_eq!(mul.relation().op, ferx_core::CovariateOp::Multiply);
+        assert_eq!(mul.label(), "CL-WT-power");
+
+        let add = Effect::from_spec(&spec(CovariateEffect::Pow, CovariateOp::Add)).unwrap();
+        assert_eq!(add.op, ferx_core::CovariateOp::Add);
+        // The operator has to reach the relation the candidate writes, not just
+        // the effect: `relation()` is the only thing the model text sees.
+        assert_eq!(add.relation().op, ferx_core::CovariateOp::Add);
+        // The two are one candidate each and must not collide on their id: the
+        // pair is the same, and one `[covariate_model]` line is all it gets.
+        assert_eq!(add.label(), "CL-WT-power-add");
+        assert_eq!(add.pair(), mul.pair());
+        assert_ne!(add.label(), mul.label());
     }
 }
