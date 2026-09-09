@@ -3278,6 +3278,43 @@ fn provider_matches_fd_of_production_predictor() {
     check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
 }
 
+/// A model with **no θ at all** on the TV-cov walk: the chunked outer walk (#1300) seeds
+/// its θ columns in chunks, and an empty column set must still run exactly one chunk of
+/// width `n_eta` — not zero chunks, which would return no `SubjectSens` and drop the
+/// subject to FD for no reason. Pinned against FD of the production predictor.
+#[test]
+fn tvcov_zero_theta_model_walks_one_empty_chunk() {
+    const NO_THETA: &str = r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = 0.2 * (WT / 70) * exp(ETA_CL)
+  V = 10 * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = parse_model_string(NO_THETA).expect("parse");
+    assert_eq!(model.n_theta, 0, "fixture must declare no theta");
+    let mut subject = oral_subject(&[1.0, 4.0, 8.0, 24.0]);
+    subject.covariates = HashMap::from([("WT".to_string(), 70.0)]);
+    subject.obs_covariates = [70.0, 80.0, 90.0, 95.0]
+        .iter()
+        .map(|&w| HashMap::from([("WT".to_string(), w)]))
+        .collect();
+    subject.dose_covariates = vec![HashMap::from([("WT".to_string(), 70.0)])];
+    assert!(subject.has_tv_covariates());
+    assert!(subject_routes_to_event_walk(&model, &subject));
+    assert!(
+        subject_sensitivities(&model, &subject, &[], &[0.1, -0.05]).is_some(),
+        "an empty θ set must still walk one chunk"
+    );
+    check_full_provider_vs_fd(&model, &subject, &[], &[0.1, -0.05]);
+}
+
 // ── #860 Phase A6: closed-form MR analytic gradient ──────────────────────────
 //
 // `subject_sensitivities`/`subject_eta_grad` now try the no-integration MR

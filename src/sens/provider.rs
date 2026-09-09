@@ -2982,58 +2982,76 @@ fn nn_param_derivatives_at_cov(
     const_dispatch!(
         m_dim;
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
-        |M| {
-            let p = prog.eval_param_duals::<M>(theta, eta, cov);
-            let ni = p.len();
-            let mut dp_deta = vec![vec![0.0; n_eta]; ni];
-            let mut dp_dtheta = vec![vec![0.0; n_theta]; ni];
-            let mut d2p_deta2 = vec![vec![vec![0.0; n_eta]; n_eta]; ni];
-            let mut d2p_detadtheta = vec![vec![vec![0.0; n_theta]; n_eta]; ni];
-            for i in 0..ni {
-                let g = &p[i].grad;
-                let h = &p[i].hess;
-                for m in 0..n_base {
-                    dp_dtheta[i][m] = g[m];
+        |M| Some(nn_param_derivatives_body::<M>(prog, cov, theta, eta, n_base, n_eta, n_theta, &jacs))
+    )
+}
+
+/// The dual-width-`M` body of [`nn_param_derivatives_at_cov`] (`M = n_base + n_eta +
+/// n_z`), called under a live `ModelNnGuard` + `ModelNnAxisGuard`. `jacs` is one
+/// `(weights_offset, ∂a/∂w)` per network in `covariate_nns` order — the order the
+/// evaluator numbers the output axes from `n_base + n_eta`.
+#[cfg(feature = "nn")]
+#[allow(clippy::too_many_arguments)]
+fn nn_param_derivatives_body<const M: usize>(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+    n_base: usize,
+    n_eta: usize,
+    n_theta: usize,
+    jacs: &[(usize, nalgebra::DMatrix<f64>)],
+) -> crate::sens::ode_provider::ParamDerivs {
+    let z_base = n_base + n_eta;
+    let p = prog.eval_param_duals::<M>(theta, eta, cov);
+    let ni = p.len();
+    let mut dp_deta = vec![vec![0.0; n_eta]; ni];
+    let mut dp_dtheta = vec![vec![0.0; n_theta]; ni];
+    let mut d2p_deta2 = vec![vec![vec![0.0; n_eta]; n_eta]; ni];
+    let mut d2p_detadtheta = vec![vec![vec![0.0; n_theta]; n_eta]; ni];
+    for i in 0..ni {
+        let g = &p[i].grad;
+        let h = &p[i].hess;
+        for m in 0..n_base {
+            dp_dtheta[i][m] = g[m];
+        }
+        for k in 0..n_eta {
+            dp_deta[i][k] = g[n_base + k];
+            for l in 0..n_eta {
+                d2p_deta2[i][k][l] = h[n_base + k][n_base + l];
+            }
+            for m in 0..n_base {
+                d2p_detadtheta[i][k][m] = h[n_base + k][m];
+            }
+        }
+        // Weight columns by the chain rule through this snapshot's outputs.
+        let mut z0 = z_base;
+        for (w_off, jz) in jacs {
+            let (n_out, n_w) = jz.shape();
+            for j in 0..n_w {
+                let col = w_off + j;
+                let mut d = 0.0;
+                for kz in 0..n_out {
+                    d += g[z0 + kz] * jz[(kz, j)];
                 }
+                dp_dtheta[i][col] = d;
                 for k in 0..n_eta {
-                    dp_deta[i][k] = g[n_base + k];
-                    for l in 0..n_eta {
-                        d2p_deta2[i][k][l] = h[n_base + k][n_base + l];
+                    let mut dd = 0.0;
+                    for kz in 0..n_out {
+                        dd += h[n_base + k][z0 + kz] * jz[(kz, j)];
                     }
-                    for m in 0..n_base {
-                        d2p_detadtheta[i][k][m] = h[n_base + k][m];
-                    }
-                }
-                // Weight columns by the chain rule through this snapshot's outputs.
-                let mut z0 = z_base;
-                for (w_off, jz) in &jacs {
-                    let (n_out, n_w) = jz.shape();
-                    for j in 0..n_w {
-                        let col = w_off + j;
-                        let mut d = 0.0;
-                        for kz in 0..n_out {
-                            d += g[z0 + kz] * jz[(kz, j)];
-                        }
-                        dp_dtheta[i][col] = d;
-                        for k in 0..n_eta {
-                            let mut dd = 0.0;
-                            for kz in 0..n_out {
-                                dd += h[n_base + k][z0 + kz] * jz[(kz, j)];
-                            }
-                            d2p_detadtheta[i][k][col] = dd;
-                        }
-                    }
-                    z0 += n_out;
+                    d2p_detadtheta[i][k][col] = dd;
                 }
             }
-            Some(crate::sens::ode_provider::ParamDerivs {
-                dp_deta,
-                dp_dtheta,
-                d2p_deta2,
-                d2p_detadtheta,
-            })
+            z0 += n_out;
         }
-    )
+    }
+    crate::sens::ode_provider::ParamDerivs {
+        dp_deta,
+        dp_dtheta,
+        d2p_deta2,
+        d2p_detadtheta,
+    }
 }
 
 #[cfg(not(feature = "nn"))]
@@ -3064,20 +3082,31 @@ fn nn_param_eta_derivatives_at_cov(
     const_dispatch!(
         n_eta;
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
-        |N| {
-            let p = prog.eval_param_eta_grad::<N>(theta, eta, cov);
-            let ni = p.len();
-            let dp_deta: Vec<Vec<f64>> = (0..ni)
-                .map(|i| (0..n_eta).map(|k| p[i].grad[k]).collect())
-                .collect();
-            Some(crate::sens::ode_provider::ParamDerivs {
-                dp_deta,
-                dp_dtheta: vec![Vec::new(); ni],
-                d2p_deta2: vec![Vec::new(); ni],
-                d2p_detadtheta: vec![Vec::new(); ni],
-            })
-        }
+        |N| Some(nn_param_eta_derivatives_body::<N>(prog, cov, theta, eta, n_eta))
     )
+}
+
+/// The dual-width-`N` body of [`nn_param_eta_derivatives_at_cov`] (`N = n_eta`), called
+/// under a live `ModelNnGuard`.
+#[cfg(feature = "nn")]
+fn nn_param_eta_derivatives_body<const N: usize>(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+    n_eta: usize,
+) -> crate::sens::ode_provider::ParamDerivs {
+    let p = prog.eval_param_eta_grad::<N>(theta, eta, cov);
+    let ni = p.len();
+    let dp_deta: Vec<Vec<f64>> = (0..ni)
+        .map(|i| (0..n_eta).map(|k| p[i].grad[k]).collect())
+        .collect();
+    crate::sens::ode_provider::ParamDerivs {
+        dp_deta,
+        dp_dtheta: vec![Vec::new(); ni],
+        d2p_deta2: vec![Vec::new(); ni],
+        d2p_detadtheta: vec![Vec::new(); ni],
+    }
 }
 
 #[cfg(not(feature = "nn"))]
