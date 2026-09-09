@@ -1,0 +1,42 @@
+# Benchmark fixture: a full 3×3 block-Ω warfarin, exact-anchor Laplace.
+#
+# Same structural/error model and data as examples/warfarin.ferx, but every η pair is
+# correlated (`block_omega` over all three), which is where the cost model in
+# `agq::prefer_analytic_grid_response` predicts the analytic grid response wins:
+#
+#   n_theta = 3, d = n_eta = 3, n_free = n_theta + n_omega(6) + n_sigma(1) = 10
+#   FD:       2·n_free            = 20 perturbed-anchor rebuilds
+#   analytic: 1 + 2·(n_theta + d) = 13 provider evaluations
+#
+# vs. the diagonal-Ω `warfarin_laplace.ferx`, where the two costs are equal by
+# construction (`n_free = n_theta + d = 7` there too).
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  block_omega (ETA_CL, ETA_V, ETA_KA) = [
+    0.09,
+    0.02, 0.04,
+    0.01, 0.01, 0.30
+  ]
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  n_agq      = 3
+  maxiter    = 300
+  covariance = false

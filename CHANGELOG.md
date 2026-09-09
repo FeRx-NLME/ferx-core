@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles
+  its `½·log|H̃|` grid-response gradient term analytically instead of rebuilding the anchor at
+  `x ± h` for every free population parameter.** `H̃` is bilinear in first-order prediction
+  sensitivities, so unlike the exact-anchor Laplace case its derivative needs no third-order
+  jet — one extra ordinary analytic-provider evaluation replaces `2·n_free` perturbed-anchor
+  rebuilds. Estimates, OFVs and standard errors are unchanged (the two routes are pinned
+  bit-consistent, and this is on by default); measured on warfarin fixtures: 30–50% fewer
+  analytic-provider calls, and on an ODE model roughly 2× less provider time and ~30% faster
+  wall-clock, converging in fewer outer iterations. `laplace`/AGQ's exact-Hessian anchor is
+  unaffected — it genuinely needs the third-order jet and stays on its existing route (#251).
+
 ### Added
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
