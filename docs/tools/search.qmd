@@ -63,7 +63,7 @@ cache_dir = ".ferx-search"
 | `[strictness]` | the gate a fit must pass before its criterion is trusted — every key is optional and overlays the engine default |
 | `[run]` | threads, retries (perturbed starts per candidate on top of the exact one, as in Pharmpy), journal directory, resume |
 
-A tool section — `[covsearch]`, `[modelsearch]`, `[iivsearch]`, `[iovsearch]`,
+A tool section — `[covsearch]`, `[modelsearch]`, `[globalsearch]`, `[iivsearch]`, `[iovsearch]`,
 `[ruvsearch]`, `[structsearch]` or `[allometry]` — is kept for the tool that
 owns it; this loader does not know its schema. Any other table is an error
 naming the sections the file takes, so a misspelt `[strictnes]` cannot be
@@ -267,7 +267,7 @@ lower-is-better:
 | `aic` | `FitResult::aic` |
 | `bic` / `bic_mixed` | the mixed BIC — Pharmpy's default and the one its structural and IIV searches rank on |
 | `bic_iiv`, `bic_random`, `bic_fixed` | the other three `calculate_bic` conventions (#1177) |
-| `penalized` | pyDarwin-style penalized fitness: accepted by the parser so the format is stable, refused at load until #1175 P6 |
+| `penalized` | pyDarwin's penalized fitness (#1185): OFV + 10 per estimated θ / Ω / σ element + 100 per failure (non-convergence, no covariance step, \|r\| > 0.95, condition number > 1000), `[rank.penalties]` overlaying any charge — see [Global model search](global-search.qmd#penalized-fitness). The default for `globalsearch`; usable by every tool |
 
 `cutoff` is the improvement a candidate must show over its parent, on the
 criterion's own scale; how a tool applies it (a ΔOFV in an SCM step, a ΔBIC in
@@ -286,7 +286,12 @@ underneath it so the machine is not oversubscribed), `retries` (perturbed
 starts per candidate on top of the fit from the exact initials — Pharmpy's
 meaning, so `n_starts = retries + 1`; default 2, i.e. three starts; `0` is a
 single fit), `cache_dir` (the journal a `resume = true` run picks up from,
-relative to the file) and `resume`.
+relative to the file), `resume`, and `reuse_from` (a list of *other*
+searches' directories, relative to the file, whose cached fits every step
+of this run may reuse — a candidate another tool already fitted to the same
+data with the same settings is re-scored under this file's `[rank]` and
+`[strictness]` rather than fitted again; see
+[One runner, one cache](global-search.qmd#one-runner-one-cache)).
 
 ## From Rust
 

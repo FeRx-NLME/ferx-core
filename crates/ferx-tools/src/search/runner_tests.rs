@@ -1407,3 +1407,274 @@ fn a_per_candidate_start_count_is_a_floor_under_the_runs() {
     assert_eq!(effective_starts(&plain, &none), 1);
     assert_eq!(effective_starts(&plain.starts(4), &none), 4);
 }
+
+// ── fits reused across directories (#1185) ──────────────────────────────────
+
+/// A first run in `dir` under one criterion, fitting `ids` with an OFV
+/// derived from the id; the fits are what a later run should find.
+fn seed_dir(dir: &std::path::Path, ids: &[&str], criterion: Criterion) -> Vec<Candidate> {
+    let candidates: Vec<Candidate> = ids
+        .iter()
+        .map(|id| candidate(id, &format!("[parameters]\ntheta CL = {}\n", id.len())))
+        .collect();
+    let options = RunOptions {
+        criterion,
+        ..lenient()
+    };
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(dir)
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            Ok(converged_fit(100.0 + c.id.len() as f64))
+        })
+        .expect("seed run");
+    assert_eq!(report.fitted, ids.len());
+    candidates
+}
+
+#[test]
+fn a_run_reuses_fits_from_another_directory_and_rescores_them() {
+    // A "modelsearch" run under OFV, in a nested step directory the way a
+    // tool lays its run out…
+    let other = tempfile::tempdir().expect("tempdir");
+    let step = other.path().join("layer-1");
+    let seeded = seed_dir(&step, &["a", "bb"], Criterion::Ofv);
+
+    // …and a second run, under AIC, that shares one candidate with it and
+    // adds one, pointed at the tool's *root* directory.
+    let mut candidates = vec![seeded[1].clone()];
+    candidates.push(candidate("ccc", "[parameters]\ntheta CL = 3\n"));
+    let options = RunOptions {
+        criterion: Criterion::Aic,
+        ..lenient()
+    };
+    let recorder = Recorder::new();
+    let report = Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            recorder.record(&c.id);
+            Ok(converged_fit(100.0 + c.id.len() as f64))
+        })
+        .expect("run");
+    assert_eq!(
+        recorder.ids(),
+        vec!["ccc"],
+        "the shared candidate was refitted"
+    );
+    assert_eq!((report.fitted, report.reused), (1, 1));
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let bb = &report.results[0];
+    assert!(bb.reused);
+    assert_eq!(bb.ofv, Some(102.0));
+    // Re-scored under *this* run's criterion, not carried over from the
+    // other run's OFV ranking.
+    assert_eq!(bb.criterion, converged_fit(102.0).aic);
+    assert!(bb.fit.is_some(), "the cached fit came along");
+    assert!(bb.verdict.passed);
+    assert!(!report.results[1].reused);
+}
+
+#[test]
+fn a_reused_fit_is_journalled_as_the_runs_own_and_a_later_resume_needs_no_other_directory() {
+    let other = tempfile::tempdir().expect("tempdir");
+    let seeded = seed_dir(other.path(), &["a"], Criterion::Ofv);
+    let own = tempfile::tempdir().expect("tempdir");
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(own.path())
+        .reuse_from(other.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &lenient(), |_, _| {
+            panic!("nothing should be fitted")
+        })
+        .expect("run");
+    assert_eq!((report.fitted, report.reused), (0, 1));
+    assert!(journal::fit_path(own.path(), &seeded[0].hash()).exists());
+
+    // The other directory can go; the run's own journal carries the fit.
+    drop(other);
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(own.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &options, |_, _| {
+            panic!("nothing should be fitted")
+        })
+        .expect("resume");
+    assert_eq!((report.fitted, report.reused), (0, 1));
+    assert!(report.results[0].fit.is_some());
+}
+
+#[test]
+fn a_directory_whose_fits_are_not_this_runs_is_skipped_with_a_warning() {
+    let other = tempfile::tempdir().expect("tempdir");
+    let seeded = seed_dir(other.path(), &["a"], Criterion::Ofv);
+
+    // A different start count: the same model text fitted from a
+    // different number of starts is a different number.
+    let options = RunOptions {
+        n_starts: 3,
+        ..lenient()
+    };
+    let recorder = Recorder::new();
+    let report = Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &options, |c, _| {
+            recorder.record(&c.id);
+            Ok(converged_fit(1.0))
+        })
+        .expect("run");
+    assert_eq!(recorder.ids(), vec!["a"]);
+    assert_eq!(report.reused, 0);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("not reusing fits") && w.contains("starts per candidate")),
+        "{:?}",
+        report.warnings
+    );
+
+    // A different dataset.
+    let recorder = Recorder::new();
+    let report = Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(&seeded, &population(&["1", "2"]), &lenient(), |c, _| {
+            recorder.record(&c.id);
+            Ok(converged_fit(1.0))
+        })
+        .expect("run");
+    assert_eq!(recorder.ids(), vec!["a"]);
+    assert!(
+        report.warnings.iter().any(|w| w.contains("the dataset")),
+        "{:?}",
+        report.warnings
+    );
+
+    // A directory with no search in it at all.
+    let empty = tempfile::tempdir().expect("tempdir");
+    let report = Runner::new()
+        .threads(1)
+        .reuse_from(empty.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(1.0))
+        })
+        .expect("run");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no search directory found")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn a_model_failure_row_is_reused_only_under_the_same_scoring_and_the_own_journal_wins() {
+    // A row without a fit says nothing a re-score can read, so it is taken
+    // only when the other run scored the same way.
+    let other = tempfile::tempdir().expect("tempdir");
+    let broken = candidate("broken", "[parameters]\ntheta CL = 3\n");
+    Runner::new()
+        .threads(1)
+        .cache_dir(other.path())
+        .run_with_fitter(
+            std::slice::from_ref(&broken),
+            &population(&["1"]),
+            &lenient(),
+            |_, _| Err(CandidateError::model("does not compile")),
+        )
+        .expect("seed");
+
+    let recorder = Recorder::new();
+    let report = Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(
+            std::slice::from_ref(&broken),
+            &population(&["1"]),
+            &lenient(),
+            |c, _| {
+                recorder.record(&c.id);
+                Err(CandidateError::model("does not compile"))
+            },
+        )
+        .expect("run");
+    assert!(recorder.ids().is_empty(), "the model failure was trusted");
+    assert!(report.results[0].reused);
+    assert!(report.results[0].error.is_some());
+
+    let recorder = Recorder::new();
+    let options = RunOptions {
+        criterion: Criterion::Aic,
+        ..lenient()
+    };
+    Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(
+            std::slice::from_ref(&broken),
+            &population(&["1"]),
+            &options,
+            |c, _| {
+                recorder.record(&c.id);
+                Err(CandidateError::model("does not compile"))
+            },
+        )
+        .expect("run");
+    assert_eq!(
+        recorder.ids(),
+        vec!["broken"],
+        "under another criterion a fitless row is not trusted"
+    );
+
+    // The run's own journal outranks a foreign one holding the same hash.
+    let own = tempfile::tempdir().expect("tempdir");
+    let a = seed_dir(own.path(), &["a"], Criterion::Ofv);
+    let foreign = tempfile::tempdir().expect("tempdir");
+    seed_dir(foreign.path(), &["a"], Criterion::Ofv);
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(own.path())
+        .reuse_from(foreign.path())
+        .run_with_fitter(&a, &population(&["1"]), &options, |_, _| {
+            panic!("nothing should be fitted")
+        })
+        .expect("run");
+    assert_eq!(report.reused, 1);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+#[test]
+fn a_pre_run_cancel_keeps_what_the_reuse_directories_said() {
+    let empty = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("c0", "[parameters]\ntheta CL = 1\n")];
+    let flag = CancelFlag::new();
+    flag.cancel();
+    let report = Runner::new()
+        .cancel(flag)
+        .reuse_from(empty.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            panic!("nothing may be fitted after a pre-run cancel");
+        })
+        .expect("run");
+    assert!(report.cancelled);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no search directory found")),
+        "{:?}",
+        report.warnings
+    );
+}

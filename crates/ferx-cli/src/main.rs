@@ -4,6 +4,7 @@ mod bootstrap_cmd;
 mod bootstrap_progress;
 mod covsearch_cmd;
 mod gam_cmd;
+mod globalsearch_cmd;
 mod iivsearch_cmd;
 mod iovsearch_cmd;
 mod modelsearch_cmd;
@@ -38,6 +39,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx iovsearch --help`)
        ferx amd       <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx amd --help`)
+       ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx globalsearch --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -162,6 +165,10 @@ fn main() {
     // `ferx amd` (#1184): the whole pipeline, one tool after another.
     if args.get(1).map(String::as_str) == Some("amd") {
         std::process::exit(amd_cmd::run(&args));
+    }
+    // `ferx globalsearch` (#1185): GA / exhaustive over one grid, penalized fitness.
+    if args.get(1).map(String::as_str) == Some("globalsearch") {
+        std::process::exit(globalsearch_cmd::run(&args));
     }
 
     if args.len() < 2 {

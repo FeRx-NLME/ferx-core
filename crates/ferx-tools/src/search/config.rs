@@ -55,6 +55,7 @@ use serde::Deserialize;
 use super::candidate::{Criterion, RunOptions};
 use super::coverage::check_coverage;
 use super::mfl::Mfl;
+use super::penalty::Penalties;
 use super::resolve::{resolve, ModelContext, Resolved};
 use super::runner::Runner;
 
@@ -69,6 +70,7 @@ pub const EXTENSION: &str = "ferxsearch";
 pub const TOOL_SECTIONS: &[&str] = &[
     "amd",
     "covsearch",
+    "globalsearch",
     "modelsearch",
     "iivsearch",
     "iovsearch",
@@ -119,6 +121,13 @@ pub struct RankConfig {
     /// default.
     #[serde(default)]
     pub cutoff: Option<f64>,
+    /// `[rank.penalties]`: the schedule a `penalized` criterion charges
+    /// (#1185). Every key is optional and overlays pyDarwin's defaults;
+    /// `None` is the defaults. Read whatever the type, since the two
+    /// search-level charges (non-influential genes, crashes) apply to a
+    /// global search under any criterion.
+    #[serde(default)]
+    pub penalties: Option<Penalties>,
 }
 
 /// `[rank] type`. `bic` is the mixed BIC, Pharmpy's default.
@@ -133,9 +142,8 @@ pub enum RankType {
     BicIiv,
     BicRandom,
     BicFixed,
-    /// pyDarwin-style penalized fitness — parsed so the file format is
-    /// stable, but not implemented until #1175 P6. Loading a file that asks
-    /// for it is an error.
+    /// pyDarwin-style penalized fitness (#1185): `OFV` plus the
+    /// [`Penalties`] schedule, `[rank.penalties]` overlaying the defaults.
     Penalized,
 }
 
@@ -143,6 +151,19 @@ impl RankConfig {
     /// The rank type, with the file's silence read as [`RankType::default`].
     pub fn kind_or_default(&self) -> RankType {
         self.kind.unwrap_or_default()
+    }
+
+    /// The penalty schedule: `[rank.penalties]` over pyDarwin's defaults.
+    pub fn penalties(&self) -> Penalties {
+        self.penalties.unwrap_or_default()
+    }
+
+    /// The runner criterion this file ranks on, with its own schedule
+    /// behind a `penalized` type. Fails on a schedule that does not
+    /// validate.
+    pub fn criterion(&self) -> Result<Criterion, String> {
+        self.penalties().validate()?;
+        Ok(self.kind_or_default().criterion_with(self.penalties()))
     }
 }
 
@@ -161,23 +182,20 @@ impl RankType {
         }
     }
 
-    /// The runner criterion this ranks on.
-    pub fn criterion(&self) -> Result<Criterion, String> {
-        Ok(match self {
+    /// The runner criterion, with `penalties` behind a `penalized` type
+    /// (ignored by every other type). There is deliberately no
+    /// schedule-less form: a caller that has a rank type has the file it
+    /// came from, and [`RankConfig::criterion`] reads the schedule off it.
+    pub fn criterion_with(&self, penalties: Penalties) -> Criterion {
+        match self {
             RankType::Ofv => Criterion::Ofv,
             RankType::Aic => Criterion::Aic,
             RankType::Bic | RankType::BicMixed => Criterion::Bic(BicType::Mixed),
             RankType::BicIiv => Criterion::Bic(BicType::Iiv),
             RankType::BicRandom => Criterion::Bic(BicType::Random),
             RankType::BicFixed => Criterion::Bic(BicType::Fixed),
-            RankType::Penalized => {
-                return Err(
-                    "[rank] type = \"penalized\" is not implemented yet (#1175 P6); use ofv, \
-                     aic or one of the bic variants"
-                        .into(),
-                )
-            }
-        })
+            RankType::Penalized => Criterion::Penalized(penalties),
+        }
     }
 }
 
@@ -246,6 +264,14 @@ pub struct RunConfig {
     /// Reuse journalled candidates from `cache_dir`.
     #[serde(default)]
     pub resume: bool,
+    /// Other searches' directories — relative to the config file — whose
+    /// cached fits every step of this run may reuse (#1185): a candidate
+    /// another tool already fitted to the same data with the same settings
+    /// is re-scored under this file's `[rank]` and `[strictness]` rather
+    /// than fitted again. Read recursively, so a tool's run directory is one
+    /// entry.
+    #[serde(default)]
+    pub reuse_from: Vec<PathBuf>,
 }
 
 fn default_retries() -> usize {
@@ -259,6 +285,7 @@ impl Default for RunConfig {
             retries: default_retries(),
             cache_dir: None,
             resume: false,
+            reuse_from: Vec::new(),
         }
     }
 }
@@ -360,8 +387,8 @@ impl SearchConfig {
                 },
             ),
         };
-        // Fail on an unimplemented rank type at load, not after the first fit.
-        raw.rank.kind_or_default().criterion()?;
+        // A bad penalty schedule fails at load, not after the first fit.
+        raw.rank.criterion()?;
         Ok(SearchConfig {
             base: dir.join(&raw.base),
             data: raw.data.map(|d| dir.join(d)),
@@ -399,9 +426,8 @@ impl SearchConfig {
         RunOptions {
             criterion: self
                 .rank
-                .kind_or_default()
                 .criterion()
-                .expect("rank type validated at load"),
+                .expect("rank config validated at load"),
             strictness: self.strictness.strictness(),
             // Pharmpy's retries are on top of the exact-initials fit.
             n_starts: self.run.retries + 1,
@@ -410,7 +436,8 @@ impl SearchConfig {
         }
     }
 
-    /// A [`Runner`] with this file's thread count and cache directory.
+    /// A [`Runner`] with this file's thread count, cache directory and
+    /// reuse directories.
     pub fn runner(&self) -> Runner {
         let mut runner = Runner::new();
         if let Some(t) = self.run.threads {
@@ -419,7 +446,19 @@ impl SearchConfig {
         if let Some(dir) = &self.run.cache_dir {
             runner = runner.cache_dir(self.dir.join(dir));
         }
+        for dir in self.reuse_dirs() {
+            runner = runner.reuse_from(dir);
+        }
         runner
+    }
+
+    /// `[run] reuse_from`, resolved against the file's directory.
+    pub fn reuse_dirs(&self) -> Vec<PathBuf> {
+        self.run
+            .reuse_from
+            .iter()
+            .map(|d| self.dir.join(d))
+            .collect()
     }
 
     /// Read the base model and its dataset.

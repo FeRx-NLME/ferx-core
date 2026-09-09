@@ -47,6 +47,9 @@ pub(crate) struct RunnerFitter<'a> {
     pub cancel: Option<CancelFlag>,
     pub data: &'a Population,
     pub options: RunOptions,
+    /// Other searches' directories whose fits every step may reuse
+    /// ([`Runner::reuse_from`], #1185).
+    pub reuse_from: Vec<PathBuf>,
 }
 
 impl StepFitter for RunnerFitter<'_> {
@@ -66,6 +69,9 @@ impl StepFitter for RunnerFitter<'_> {
         }
         if let Some(flag) = &self.cancel {
             runner = runner.cancel(flag.clone());
+        }
+        for dir in &self.reuse_from {
+            runner = runner.reuse_from(dir.clone());
         }
         runner.run(candidates, data, &self.options)
     }
