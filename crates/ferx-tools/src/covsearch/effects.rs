@@ -4,7 +4,8 @@
 //! The `.ferxsearch` space says `COVARIATE?(CL, WT, pow)`; the candidate says
 //! `CL ~ WT power(center = median)`. The mapping is the one the search page
 //! publishes (`lin` → `linear`, `piece_lin` → `hockey`, `exp` →
-//! `exponential`, `pow` → `power`, `cat` → `categorical`), with the centre
+//! `exponential`, `pow` → `power`, `cat` → `categorical`, `cat2` →
+//! `categorical2`), with the centre
 //! written out as the data-derived statistic PsN's `scm` uses — the median
 //! for a continuous covariate, the most common level for a categorical one —
 //! and the θ left to the block's defaults, which are PsN's inits and bounds
@@ -19,8 +20,8 @@ use crate::search::CovariateEffectSpec;
 /// One effect the search can add to or remove from a model.
 ///
 /// A [`CovariateEffectSpec`] narrowed to what covsearch handles: the
-/// coverage check (#1179) has already refused `cat2`, `custom` and the `+`
-/// operator, so this is the remaining five forms on a multiplicative factor.
+/// coverage check (#1179) has already refused `custom` and the `+` operator,
+/// so this is the remaining six forms on a multiplicative factor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effect {
     pub parameter: String,
@@ -38,7 +39,8 @@ impl Effect {
             CovariateEffect::Exp => CovariateForm::Exponential,
             CovariateEffect::Pow => CovariateForm::Power,
             CovariateEffect::Cat => CovariateForm::Categorical,
-            CovariateEffect::Cat2 | CovariateEffect::Custom => {
+            CovariateEffect::Cat2 => CovariateForm::Categorical2,
+            CovariateEffect::Custom => {
                 return Err(format!(
                     "covsearch: `{}` on {}-{} has no `[covariate_model]` form; the coverage \
                      check should have refused it",
@@ -91,7 +93,7 @@ impl Effect {
     /// form, computed from the data it is bound to.
     pub fn relation(&self) -> Relation {
         let center = match self.form {
-            CovariateForm::Categorical => CovariateStat::Mode,
+            CovariateForm::Categorical | CovariateForm::Categorical2 => CovariateStat::Mode,
             _ => CovariateStat::Median,
         };
         Relation {
@@ -136,6 +138,11 @@ mod tests {
                 CovariateForm::Categorical,
                 "categorical",
             ),
+            (
+                CovariateEffect::Cat2,
+                CovariateForm::Categorical2,
+                "categorical2",
+            ),
         ];
         for (mfl, form, label) in cases {
             let e = Effect::from_spec(&spec(mfl, CovariateOp::Multiply)).unwrap();
@@ -156,12 +163,16 @@ mod tests {
 
         let cat = Effect::from_spec(&spec(CovariateEffect::Cat, CovariateOp::Multiply)).unwrap();
         assert_eq!(cat.relation().center, Some(CovariateStat::Mode));
+
+        // `cat2` centres on the reference level too — the shapes differ only
+        // in the non-reference branch (#1312).
+        let cat2 = Effect::from_spec(&spec(CovariateEffect::Cat2, CovariateOp::Multiply)).unwrap();
+        assert_eq!(cat2.relation().center, Some(CovariateStat::Mode));
+        assert!(cat2.relation().thetas.is_empty());
     }
 
     #[test]
     fn forms_without_a_block_spelling_are_refused_by_name() {
-        let e = Effect::from_spec(&spec(CovariateEffect::Cat2, CovariateOp::Multiply)).unwrap_err();
-        assert!(e.contains("`cat2` on CL-WT"), "{e}");
         let e =
             Effect::from_spec(&spec(CovariateEffect::Custom, CovariateOp::Multiply)).unwrap_err();
         assert!(e.contains("`custom`"), "{e}");

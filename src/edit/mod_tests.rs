@@ -776,6 +776,14 @@ fn relation_rendering_uses_the_keyword_each_form_actually_takes() {
     categorical.thetas.clear();
     assert_eq!(categorical.render(), "CL ~ WT categorical(ref = mode)");
 
+    // #1312: `categorical2` centres on `ref` as well — rendering it with
+    // `center` would be a parse error on the way back in.
+    let mut categorical2 = power_on_wt();
+    categorical2.form = CovariateForm::Categorical2;
+    categorical2.center = Some(CovariateStat::Mode);
+    categorical2.thetas.clear();
+    assert_eq!(categorical2.render(), "CL ~ WT categorical2(ref = mode)");
+
     let mut none = power_on_wt();
     none.form = CovariateForm::None;
     none.thetas.clear();

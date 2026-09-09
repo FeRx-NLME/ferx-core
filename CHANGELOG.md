@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`categorical2` — a second `[covariate_model]` categorical form, Pharmpy MFL's
+  `cat2` (#1312).** `categorical2(ref = r)` contributes `θ_k` at each non-reference
+  level and `1` at the reference, where `categorical` contributes `1 + θ_k`. Same
+  degrees of freedom (one θ per non-reference level) and an exact
+  reparameterization — `θ_cat2 = 1 + θ_cat` gives the same OFV on the same data —
+  so it is a choice of how θ reads, not a cheaper test: the θ is the multiplicative
+  factor itself (`θ = 1.3` → "30% higher") and bounded below at `0`, where
+  `1 + θ` with `θ < −1` can turn the parameter negative. Defaults are the image of
+  `categorical`'s under that map: init `0.999`, bounds `(0, 6)` — the bounds
+  Pharmpy uses verbatim. Note the **null moves with the form**: `fix = 1` is "no
+  effect" for `categorical2` where `fix = 0` is for `categorical`. Search spaces
+  now resolve `COVARIATE?(CL, SEX, cat2)` instead of reporting a coverage gap.
 - **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or
   exhaustive enumeration, ranked on pyDarwin's penalized fitness (#1185, P6 of #1175).**
   The `.ferxsearch` space is laid out as one grid — every structural category an axis with

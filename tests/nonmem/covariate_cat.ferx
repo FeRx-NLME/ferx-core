@@ -1,0 +1,36 @@
+; ferx side of the #1312 `categorical` twin of the NONMEM anchor.
+;
+; The whole covariate effect is the one `[covariate_model]` line: it generates
+; `THETA_CL_SEX_1` at the form's defaults — init -0.001, bounds (-1, 5) — and the
+; factor `if (SEX == 1) 1 + THETA_CL_SEX_1 else 1`. `tests/nonmem/covariate_cat.ctl`
+; writes that same model out by hand in `$PK`, from the same starting values.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 20.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[covariates]
+  SEX categorical(levels = [0, 1])
+
+[covariate_model]
+  CL ~ SEX categorical(ref = 0)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei

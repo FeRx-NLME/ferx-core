@@ -136,6 +136,159 @@ fn categorical_contrasts_every_non_reference_level() {
 }
 
 #[test]
+fn categorical2_is_the_factor_itself_not_an_offset() {
+    // #1312: Pharmpy MFL's `cat2`. Same θ count and the same reference branch
+    // as `categorical`; the non-reference branch is `θ_k`, not `1 + θ_k`.
+    let s = spec(
+        "  SEX categorical(levels = [0, 1, 2])",
+        "  CL ~ SEX categorical2(ref = 0)",
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else \
+         if (SEX == 2) THETA_CL_SEX_2 else 1) else 1.0) * exp(ETA_CL)"
+    );
+    // The θ names and level suffixes are the `categorical` scheme unchanged —
+    // only the shape moved.
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1, 2])",
+        "  CL ~ SEX categorical(ref = 0)",
+    );
+    let names = |s: &CovariateModelSpec| -> Vec<String> {
+        s.relations[0]
+            .thetas
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    };
+    assert_eq!(names(&s), names(&cat));
+    assert_eq!(
+        s.relations[0]
+            .thetas
+            .iter()
+            .map(|t| t.level)
+            .collect::<Vec<_>>(),
+        vec![Some(1.0), Some(2.0)]
+    );
+}
+
+#[test]
+fn categorical2_takes_its_own_init_and_bounds_not_categoricals() {
+    // The null moves from θ = 0 to θ = 1, so inheriting `categorical`'s
+    // defaults would start the relation at a *factor* of −0.001. The bounds
+    // are the image of (−1, 5) under θ₂ = 1 + θ₁, which is also Pharmpy's
+    // `cat2` pair verbatim; the init is the image of ferx's own −0.001, so
+    // the two forms start at the identical model.
+    let s = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0)",
+    );
+    assert_eq!(
+        s.generated_thetas,
+        vec!["  theta THETA_CL_SEX_1(0.999, 0, 6)"]
+    );
+    // Explicitly *not* the `categorical` defaults — a fallthrough to that arm
+    // would emit these instead.
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0)",
+    );
+    assert_eq!(
+        cat.generated_thetas,
+        vec!["  theta THETA_CL_SEX_1(-0.001, -1, 5)"]
+    );
+    assert_ne!(s.generated_thetas, cat.generated_thetas);
+}
+
+#[test]
+fn categorical2_answers_to_ref_and_to_the_categorical_kind_check() {
+    // `ref`, not `center` — the same keyword `categorical` takes.
+    let e = err(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(center = 0)",
+    );
+    assert!(e.contains("centres on `ref`"), "{e}");
+
+    // A continuous column refuses it, and names the form that was written.
+    let e = err("  WT continuous", "  CL ~ WT categorical2(ref = 0)");
+    assert!(e.contains("`categorical2(...)` on `WT`"), "{e}");
+
+    // And a categorical column accepts it where a continuous form is refused.
+    let e = err(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX power(center = 0)",
+    );
+    assert!(e.contains("continuous form"), "{e}");
+}
+
+#[test]
+fn categorical2_needs_levels_and_reports_its_own_name() {
+    let e = err("  SEX categorical", "  CL ~ SEX categorical2(ref = 0)");
+    assert!(
+        e.contains("`categorical2(...)` on `SEX` needs its levels"),
+        "{e}"
+    );
+
+    let e = err(
+        "  SEX categorical(levels = [1])",
+        "  CL ~ SEX categorical2(ref = 1)",
+    );
+    assert!(e.contains("`CL ~ SEX categorical2(...)`"), "{e}");
+    assert!(e.contains("nothing to estimate"), "{e}");
+}
+
+#[test]
+fn categorical2_and_categorical_agree_at_the_matching_theta() {
+    // The reparameterization identity θ₂ = 1 + θ₁ read off the generated text:
+    // substituting the same numbers gives the same factor at every level. Here
+    // θ₁ = 0.25 and θ₂ = 1.25 are both fixed, so the two lines are two
+    // spellings of the same model.
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) => T(0.25, -1, 5)",
+    );
+    let cat2 = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0) => T(1.25, 0, 6)",
+    );
+    assert_eq!(
+        cl_line(&cat),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + T else 1) else 1.0) * exp(ETA_CL)"
+    );
+    assert_eq!(
+        cl_line(&cat2),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) T else 1) else 1.0) * exp(ETA_CL)"
+    );
+    // 1 + 0.25 == 1.25: the non-reference factor is the same number, and the
+    // reference branch is `1` in both.
+    assert_eq!(
+        cat.relations[0].thetas[0].init + 1.0,
+        cat2.relations[0].thetas[0].init
+    );
+}
+
+#[test]
+fn fix_on_categorical2_pins_the_factor_not_the_offset() {
+    // `fix = v` pins every θ at `v` for both forms, but the *null* differs:
+    // `fix = 1` is "no effect" for `categorical2` where `fix = 0` is for
+    // `categorical`. Nothing in the block reinterprets the number, and this
+    // pins that it does not.
+    let s = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0, fix = 1)",
+    );
+    assert_eq!(
+        s.generated_thetas,
+        vec!["  theta THETA_CL_SEX_1(1, 0, 6) FIX"]
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else 1) else 1.0) \
+         * exp(ETA_CL)"
+    );
+}
+
+#[test]
 fn none_declares_no_theta_and_leaves_the_expression_alone() {
     // A search writes `none` to record "tested, rejected"; the generated model
     // must round-trip through the parser unchanged.
