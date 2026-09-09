@@ -33,6 +33,15 @@
 //!   than needing a manual delete. What is refitted is decided by
 //!   [`CandidateError::retryable`]: a model that does not compile is remembered,
 //!   a fit the *machine* failed is tried again.
+//! * **One cache across tools.** A run may also [`reuse_from`](Runner::reuse_from)
+//!   other search directories (#1185): every journal found under them — a
+//!   modelsearch's layers, a covsearch's steps, a global search's
+//!   generations — is read, and a candidate whose canonical hash a fit there
+//!   carries is **re-scored** under this run's criterion and gate rather than
+//!   fitted again. Those directories are read-only and never locked; what
+//!   makes a fit reusable is the same dataset, start count and fit settings
+//!   ([`SearchManifest::same_fits`]), and a directory that fails that test is
+//!   skipped with a warning naming why.
 //! * **Cancellation.** A flipped [`CancelFlag`] stops the run *between*
 //!   candidates and returns what finished, with [`RunReport::cancelled`] set.
 //!   Its partial rows go to `candidates.partial.csv`, never over the complete
@@ -128,6 +137,7 @@ pub struct Runner {
     threads: usize,
     cache_dir: Option<PathBuf>,
     cancel: Option<CancelFlag>,
+    reuse_from: Vec<PathBuf>,
 }
 
 impl Runner {
@@ -157,6 +167,17 @@ impl Runner {
     /// completion after the user has asked to stop.
     pub fn cancel(mut self, flag: CancelFlag) -> Self {
         self.cancel = Some(flag);
+        self
+    }
+
+    /// Another search's directory whose cached fits this run may reuse
+    /// (#1185) — read recursively, so a tool's whole run directory (with its
+    /// per-step subdirectories) is one argument. May be given more than
+    /// once; earlier directories win a hash both hold. Independent of the
+    /// cache directory and of [`RunOptions::resume`]: a run with no
+    /// directory of its own still reuses, in memory.
+    pub fn reuse_from(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.reuse_from.push(dir.into());
         self
     }
 
@@ -248,6 +269,28 @@ impl Runner {
             .map(|record| (record.hash.as_str(), record))
             .collect();
 
+        // ── fits from other directories ─────────────────────────────────────
+        // Read after the run's own journal, which wins: a hash the resume
+        // already holds is not looked for elsewhere. The manifest is built
+        // here even without a cache directory, since the compatibility test
+        // is what makes a foreign fit *this* run's fit.
+        let mut warnings: Vec<String> = Vec::new();
+        let mut foreign: HashMap<String, Foreign> = HashMap::new();
+        if !self.reuse_from.is_empty() {
+            let own = manifest
+                .clone()
+                .unwrap_or_else(|| SearchManifest::new(options, data));
+            let wanted: HashSet<&str> = hashes
+                .iter()
+                .enumerate()
+                .filter(|(i, h)| duplicate_of[*i].is_none() && !reused.contains_key(h.as_str()))
+                .map(|(_, h)| h.as_str())
+                .collect();
+            for root in &self.reuse_from {
+                load_foreign(root, &own, &wanted, &mut foreign, &mut warnings);
+            }
+        }
+
         // Checked before the journal is opened, not after: opening it rewrites
         // the journal file, and a run cancelled before it started must not be
         // what truncates the previous run's recovery data.
@@ -278,6 +321,7 @@ impl Runner {
         let todo: Vec<usize> = (0..candidates.len())
             .filter(|i| duplicate_of[*i].is_none())
             .filter(|i| !reused.contains_key(hashes[*i].as_str()))
+            .filter(|i| !foreign.contains_key(hashes[*i].as_str()))
             .collect();
 
         // Candidates that cost alike are planned together, heaviest group
@@ -360,12 +404,27 @@ impl Runner {
             fitted.extend(done);
         }
 
+        // ── assembly of the foreign fits, re-scored under this run ──────────
+        // Journalled as this run's own rows — fit file included — so the
+        // directory stands on its own afterwards and a later resume of it
+        // does not need the other directory to still exist.
+        let mut by_index: HashMap<usize, CandidateResult> = fitted.into_iter().collect();
+        for i in (0..candidates.len()).filter(|i| duplicate_of[*i].is_none()) {
+            let Some(f) = foreign.remove(hashes[i].as_str()) else {
+                continue;
+            };
+            let result = foreign_result(&candidates[i], &hashes[i], f, options);
+            if let Some(j) = &journal {
+                j.append(&record_of(&result), result.fit.as_ref());
+            }
+            by_index.insert(i, result);
+        }
+
         // Closed before the table is written, and the point at which a write
         // failure inside the parallel loop surfaces. It is a *warning*, not a
         // run failure: the journal exists so a future run need not repeat these
         // fits, and returning `Err` here would throw away the very fits it
         // failed to protect.
-        let mut warnings: Vec<String> = Vec::new();
         if let Some(j) = journal {
             if let Err(e) = j.into_result() {
                 warnings.push(format!(
@@ -375,11 +434,11 @@ impl Runner {
         }
 
         // ── assembly, in submission order ───────────────────────────────────
-        let mut by_index: HashMap<usize, CandidateResult> = fitted.into_iter().collect();
         let mut outcomes: HashMap<usize, CandidateResult> = HashMap::new();
         let mut n_reused = 0usize;
         for i in (0..candidates.len()).filter(|i| duplicate_of[*i].is_none()) {
             if let Some(result) = by_index.remove(&i) {
+                n_reused += usize::from(result.reused);
                 outcomes.insert(i, result);
             } else if let Some(record) = reused.get(hashes[i].as_str()) {
                 n_reused += 1;
@@ -576,6 +635,138 @@ fn reused_result(
         }),
         duplicate_of: None,
         reused: true,
+    }
+}
+
+/// A fit found in another search's directory (#1185): the cached
+/// `FitResult` to re-score, or — for a candidate that never produced one
+/// and whose row was written under the same criterion and gate — the row
+/// itself.
+enum Foreign {
+    Fit { fit: Box<FitResult>, seconds: f64 },
+    Row(CandidateRecord),
+}
+
+/// Walk `root` for search directories and collect, for every hash in
+/// `wanted` not yet found, what can be reused from them.
+///
+/// A directory is a search directory when it holds a manifest; it is
+/// skipped, with a warning naming the field, when its fits are not this
+/// run's ([`SearchManifest::same_fits`]). A row whose fit file is gone is
+/// reused only when it carries no fit by nature (a model failure) *and* the
+/// directory scored under the same criterion and gate; anything else is
+/// left to be fitted. Bounded to a few levels deep, which covers every
+/// tool's `<run>/<step>/` layout.
+fn load_foreign(
+    root: &Path,
+    own: &SearchManifest,
+    wanted: &HashSet<&str>,
+    found: &mut HashMap<String, Foreign>,
+    warnings: &mut Vec<String>,
+) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    collect_search_dirs(root, 0, &mut dirs);
+    if dirs.is_empty() {
+        warnings.push(format!(
+            "no search directory found under `{}` to reuse fits from",
+            root.display()
+        ));
+        return;
+    }
+    for dir in dirs {
+        let disk = match SearchManifest::read(&journal::manifest_path(&dir)) {
+            Ok(m) => m,
+            Err(e) => {
+                warnings.push(format!("not reusing fits from `{}`: {e}", dir.display()));
+                continue;
+            }
+        };
+        if let Err(e) = own.same_fits(&disk, &dir) {
+            warnings.push(e);
+            continue;
+        }
+        let same_scores = own.same_scores(&disk);
+        let mut seen: HashSet<String> = HashSet::new();
+        for record in journal::read_records(&journal::journal_path(&dir)) {
+            if record.error.is_some() && record.retryable {
+                continue;
+            }
+            if !seen.insert(record.hash.clone()) {
+                continue;
+            }
+            if !wanted.contains(record.hash.as_str()) || found.contains_key(&record.hash) {
+                continue;
+            }
+            if record.has_fit {
+                if let Some(fit) = journal::load_fit(&dir, &record.hash) {
+                    found.insert(
+                        record.hash.clone(),
+                        Foreign::Fit {
+                            fit: Box::new(fit),
+                            seconds: record.seconds,
+                        },
+                    );
+                }
+            } else if record.error.is_some() && same_scores {
+                found.insert(record.hash.clone(), Foreign::Row(record));
+            }
+        }
+    }
+}
+
+/// Every directory under `root` (itself included) that holds a manifest,
+/// to `MAX_REUSE_DEPTH` levels.
+fn collect_search_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const MAX_REUSE_DEPTH: usize = 4;
+    if journal::manifest_path(dir).exists() {
+        out.push(dir.to_path_buf());
+    }
+    if depth >= MAX_REUSE_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    children.sort();
+    for child in children {
+        collect_search_dirs(&child, depth + 1, out);
+    }
+}
+
+/// A foreign fit as this run's result: scored under *this* run's criterion
+/// and judged by *this* run's gate, with the seconds the other run spent.
+fn foreign_result(
+    candidate: &Candidate,
+    hash: &str,
+    foreign: Foreign,
+    options: &RunOptions,
+) -> CandidateResult {
+    match foreign {
+        Foreign::Fit { fit, seconds } => {
+            let verdict = check_strictness(&fit, &options.strictness);
+            let criterion = options.criterion.of(&fit);
+            CandidateResult {
+                id: candidate.id.clone(),
+                hash: hash.to_string(),
+                parent: candidate.parent.clone(),
+                features: candidate.features.clone(),
+                ofv: Some(fit.ofv),
+                converged: Some(fit.converged),
+                fit: Some(*fit),
+                verdict,
+                criterion,
+                seconds,
+                error: None,
+                duplicate_of: None,
+                reused: true,
+            }
+        }
+        Foreign::Row(record) => reused_result(candidate, &record, None),
     }
 }
 

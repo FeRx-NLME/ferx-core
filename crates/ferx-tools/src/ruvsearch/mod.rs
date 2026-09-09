@@ -464,6 +464,7 @@ pub fn run_ruvsearch(
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_base(base, &options)?;
     let result = search(&fitter, space, &options, run.progress)?;

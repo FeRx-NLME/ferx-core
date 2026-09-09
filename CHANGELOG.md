@@ -20,6 +20,24 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or
+  exhaustive enumeration, ranked on pyDarwin's penalized fitness (#1185, P6 of #1175).**
+  The `.ferxsearch` space is laid out as one grid — every structural category an axis with
+  its values as alleles, every `COVARIATE?` pair an axis with `none` and each of its forms —
+  and searched globally: `[globalsearch] algorithm = "exhaustive"` fits every point, `"ga"`
+  runs a seeded genetic algorithm (tournament selection, one-point crossover, mutation,
+  elitism, fitness sharing, a periodic one-gene downhill search; every knob under
+  `[globalsearch.ga]`). `[rank] type = "penalized"` is now implemented for **every** search
+  tool: OFV + 10 per estimated θ / Ω / σ element + 100 for non-convergence, a failed or
+  absent covariance step, a parameter correlation above 0.95 or a condition number above
+  1000, with `[rank.penalties]` overlaying any charge. The global search charges three
+  more things the criterion cannot see — a gene that changes nothing in the rendered model,
+  a candidate that cannot be built, and a fit the strictness gate refused — so an
+  unselectable model steers the search without winning it. Candidates go through the same
+  runner, journal and canonical-hash dedup as the stepwise tools; `--resume` on the seeded GA
+  refits nothing. `models.csv`, `generations.csv`, `final.ferx` and every candidate under
+  `models/` are written; `docs/tools/global-search.qmd` says when a global search beats the
+  stepwise tools and when it does not.
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences

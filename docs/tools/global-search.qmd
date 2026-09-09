@@ -1,0 +1,346 @@
+---
+pagetitle: "Global model search"
+description-meta: "pyDarwin in ferx — a genetic algorithm or exhaustive enumeration over one grid of structural and covariate choices, ranked on pyDarwin's penalized fitness, sharing the runner and the fit cache with the stepwise search tools."
+---
+
+# Global model search
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx globalsearch` is what ferx takes from
+[pyDarwin](https://github.com/certara/pyDarwin): a **global** search over
+the model space — a genetic algorithm (GA) or exhaustive enumeration —
+ranked on pyDarwin's **penalized fitness**. Where
+[modelsearch](modelsearch.qmd) walks the structural axis and
+[covsearch](covsearch.qmd) the covariate axis, each one step at a time from
+the last winner, this tool lays both out as **one grid** and searches it
+without a path: every structural category the space names is an axis with
+the category's values as alleles, every optional `COVARIATE?` pair is an
+axis with `none` and each of its forms, and a candidate is a point of the
+grid — a *genome*, one allele per axis.
+
+```bash
+ferx globalsearch warfarin.ferxsearch --directory warfarin-globalsearch --threads 8
+```
+
+What to search over comes from a [`.ferxsearch` file](search.qmd). Its
+structural and `COVARIATE?` statements are the grid, `[rank]` the criterion
+(`penalized` by default for this tool), and a `[globalsearch]` section picks
+the algorithm and its knobs:
+
+```toml
+base = "warfarin.ferx"
+data = "warfarin.csv"
+
+[space]
+mfl = """
+ABSORPTION(FO); PERIPHERALS(0..1); LAGTIME([OFF,ON])
+COVARIATE?(@IIV, WT, [pow,lin])
+"""
+
+[globalsearch]
+algorithm    = "ga"                   # or "exhaustive"
+iiv_strategy = "absorption_delay"     # or "add_diagonal", "no_add"
+max_models   = 500                    # the largest grid `exhaustive` will enumerate
+
+[globalsearch.ga]
+population_size = 20
+generations     = 10
+seed            = 12345
+
+[rank]
+type = "penalized"                    # the default here; bic / aic / ofv work too
+
+[rank.penalties]                      # optional: overlay pyDarwin's defaults
+theta = 10
+convergence = 100
+
+[strictness]
+require_converged = true
+
+[run]
+retries   = 2
+threads   = 8
+cache_dir = "warfarin-globalsearch"
+```
+
+| key | default | meaning |
+|---|---|---|
+| `algorithm` | `ga` | `ga` or `exhaustive`, [below](#the-algorithms) |
+| `iiv_strategy` | `absorption_delay` | how η is given to the parameters a structural move introduces — modelsearch's key, same meanings |
+| `max_models` | 500 | `exhaustive` refuses a grid larger than this, naming the size; the GA has no cap |
+| `[globalsearch.ga]` | | the GA's knobs, [below](#the-genetic-algorithm) |
+| `[rank] type` | `penalized` | any of the [rank types](search.qmd#ranking-strictness-and-run-settings) |
+| `[rank.penalties]` | pyDarwin's | the [penalty schedule](#penalized-fitness), under any rank type |
+
+## The grid
+
+The grid is the product of its axes. A structural axis is one MFL category
+with the values the space lists — `PERIPHERALS(0..2)` is an axis of three
+alleles — and a category the space does not name keeps the input model's
+value. A covariate axis is one `(parameter, covariate)` pair from the
+`COVARIATE?` statements, with `none` as its first allele and each listed
+form after it, so `COVARIATE?(@IIV, WT, [pow,lin])` on a model whose `CL`,
+`V` and `KA` carry an η is three axes of three alleles. A `COVARIATE(...)`
+without the `?` is forced onto every candidate and is not an axis; a pair
+the base model already declares is kept as written and noted.
+
+Decoding a genome is the same edit the stepwise tools make. The structural
+alleles become one `pk` template swap from the input model through
+`ferx-core::edit` — the same
+[template table, parameter defaults and `[odes]` candidates](modelsearch.qmd#the-space)
+as modelsearch, cost tiers and extra starts included — and each covariate
+allele becomes one `[covariate_model]` line, centred as
+[covsearch](covsearch.qmd#what-the-effects-become) writes it. Every
+candidate is seeded from the input model's fit.
+
+Two kinds of point cannot be a model, and both are rows in the table rather
+than silent gaps:
+
+- **Unbuildable structures** — a lag time on a bolus, a transit chain with
+  Weibull absorption, the pairs Pharmpy's table refuses — get the crash
+  value and are never submitted.
+- **A dead gene** — a covariate on a parameter the structural choice
+  removed, `KA ~ WT` on an `ABSORPTION(INST)` candidate — renders to the
+  same model as `none`. The relation is not written, the runner fits that
+  model once (the second genome is a duplicate of the first), and the gene
+  is charged pyDarwin's *non-influential* penalty so the simpler genotype
+  wins the tie.
+
+Covariate-only grids work on any model with a `[covariates]` block; a
+structural axis needs a `pk NAME(...)` base, as modelsearch does.
+
+## The algorithms
+
+**`exhaustive`.** Every point of the grid, fitted in one batch — the
+runner's thread plan, cost grouping and dedup apply to the whole grid at
+once. The size is the product of the allele counts and is printed before
+the input is fitted; above `max_models` the run refuses rather than
+truncates.
+
+### The genetic algorithm
+
+pyDarwin's GA, integer-coded (one gene per axis holding an allele index)
+rather than bit-coded, which is the same search space without the bit
+strings that encode nothing between two alleles:
+
+1. An initial population of `population_size` distinct random genomes.
+2. Each generation: evaluate, carry the `elites` best unchanged, then fill
+   the population by **tournament selection** (size `tournament_size`) on
+   the *shared* fitness, **one-point crossover** with probability
+   `crossover_rate`, and **mutation** with probability `mutation_rate` per
+   child — each gene replaced by another allele of its axis with
+   probability `gene_mutation_probability`.
+3. Every `downhill_period` generations, and once more at the end when
+   `final_downhill` is set, the best `niches` individuals at least
+   `niche_radius` apart (Hamming distance) are polished by a **one-gene
+   downhill search**: every single-gene neighbour is evaluated, the best
+   replaces the individual if it improves, until none does.
+
+**Fitness sharing** keeps the population from collapsing onto one basin: for
+selection only, an individual's fitness is raised by `niche_penalty` times
+its crowding — Goldberg–Richardson's `Σ 1 − (d/r)^α` over the other
+individuals within `niche_radius`, with `α = sharing_alpha`. Ranking and the
+report use the raw fitness.
+
+| `[globalsearch.ga]` key | default | pyDarwin's name |
+|---|---|---|
+| `population_size` | 20 | `population_size` |
+| `generations` | 10 | `num_generations` |
+| `crossover_rate` | 0.95 | `crossover_rate` |
+| `mutation_rate` | 0.95 | `mutation_rate` |
+| `gene_mutation_probability` | 0.1 | `attribute_mutation_probability` |
+| `elites` | 2 | `elitist_num` |
+| `tournament_size` | 2 | `selection_size` |
+| `downhill_period` | 5 | `downhill_period` (0 = never) |
+| `niches` | 2 | `num_niches` |
+| `niche_radius` | 2 | `niche_radius` |
+| `niche_penalty` | 20 | `niche_penalty` |
+| `sharing_alpha` | 0.1 | `sharing_alpha` |
+| `final_downhill` | true | `final_downhill_search` |
+| `seed` | 12345 | `random_seed` |
+
+The GA is **seeded**, so the same file on the same data proposes the same
+genomes in the same order — which is what lets `--resume` reuse every
+batch's journal. The population is capped at the grid's size, and a genome
+the GA proposes twice costs one fit: every evaluated point is cached by
+genome and by canonical model hash.
+
+## Penalized fitness
+
+`[rank] type = "penalized"` is pyDarwin's ranking, now a criterion every
+search tool can use: the OFV plus a charge for every estimated parameter
+and for every way the fit went wrong. The inputs are the ones the
+[strictness gate](search.qmd#ranking-strictness-and-run-settings) already
+reads, so this is a scoring function over an existing verdict.
+
+| `[rank.penalties]` key | default | charged when |
+|---|---|---|
+| `theta` | 10 | per estimated θ |
+| `omega` | 10 | per estimated Ω element (IOV κ included; a 2×2 block is three) |
+| `sigma` | 10 | per estimated σ element |
+| `convergence` | 100 | `converged = false` |
+| `covariance` | 100 | the covariance step failed, was not requested, or delivered no matrix |
+| `correlation` | 100 | any parameter \|r\| > `max_correlation` (0.95) |
+| `condition_number` | 100 | the condition number exceeds `max_condition_number` (1000), or is NaN |
+| `non_influential` | 0.00001 | per dead gene ([above](#the-grid)) |
+| `crash` | 99 999 999 | the fitness of a candidate that produced no fit: unbuildable, does not compile, or `fit()` failed |
+| `gate` | 100 | a fit the `[strictness]` gate refused — ferx's own, [below](#the-gate-and-the-penalties) |
+
+Every key is optional and overlays the defaults; the whole schedule is
+recorded in the run manifest, so a resume under different charges is
+refused rather than mixing two scorings. The `covariance` charge is uniform
+when no candidate runs a covariance step, in which case it changes no
+ranking; turn `covariance = true` on in the base model's `[fit_options]` for
+the correlation and condition-number charges to have anything to read.
+
+### The gate and the penalties
+
+pyDarwin has penalties only; ferx has a strictness *gate* as well, and the
+two are kept distinct on purpose. The gate decides **eligibility** — a
+candidate that fails it is never selected, whatever its fitness. The
+penalties decide **rank** among the eligible, and they also give an
+ineligible candidate a finite fitness so the GA can still learn from it: a
+gate-failed fit is charged `gate` on top of its criterion (on top of the
+per-failure charges under `penalized`, deliberately — the gate is a stronger
+statement than any one of them), a candidate with no fit gets `crash`. A
+model the search can never select therefore steers it without winning it,
+and the `fitness` column of the table is the criterion plus these charges.
+Set `gate = 0` to rank an ineligible fit on its criterion alone, or relax
+`[strictness]` for pyDarwin's own posture where every failure is a charge
+and nothing is excluded.
+
+## When a global search beats stepwise, and when it does not
+
+A stepwise search — SCM, reduced-stepwise modelsearch, AMD's pipeline —
+walks one axis at a time from the last winner. That is the right tool when
+the axes are close to **separable**: whether `CL` scales with weight does
+not much depend on whether there is a second compartment, so the two
+questions can be answered in turn, on far fewer fits than any global
+method needs.
+
+A global search pays off when the axes **interact**: a covariate effect
+that is only significant once the right absorption model is in place, a
+lag time that only beats a transit chain with two compartments, a
+correlation between an omega structure and an error model. Stepwise
+commits to one axis before it has seen the other and can lock in a local
+optimum; the GA's population holds several partial answers at once and
+crossover combines them. The test suite's own landscape has exactly that
+shape — a shallow basin a hill climb ends in, and a deeper one two genes
+away that only the population crosses to.
+
+The price is fits. On a grid small enough to enumerate (a few hundred
+points, analytic templates, a dataset that evaluates in seconds) run
+`exhaustive` and read the whole table — it is the only method that
+*proves* an optimum. On a bigger grid the GA evaluates
+`population_size × (generations + 1)` points plus the downhill rounds, of
+which the cache saves the repeats; a stepwise search of the same space is
+typically an order of magnitude fewer. When the interaction is not there,
+the GA finds what stepwise finds, later.
+
+Two things a global search does not change. **Multiplicity**: a 200-point
+grid overfits harder than a 10-step SCM, and the penalized fitness is a
+heuristic guard, not a correction — treat a global winner as a hypothesis
+to confirm, as the [epic](https://github.com/FeRx-NLME/ferx-core/issues/1175)
+says of every search. And **optimizer fragility**: a stalled or locally
+trapped fit is a wrong number in the fitness, so `[run] retries` and the
+gate apply to every candidate here exactly as they do in the stepwise tools.
+
+## One runner, one cache
+
+Every candidate goes through the [shared runner](search.qmd): the same
+canonical-hash identity, the same journal, the same strictness gate and
+retries, the same thread plan and `[odes]` cost tiers. Two consequences:
+
+- **`--resume`** refits nothing the run's own directory already holds. The
+  GA is seeded, so a resumed run proposes the same genomes and finds every
+  batch in its journal.
+- **`--reuse-from DIR`** (or `[run] reuse_from = [...]`) points a run at
+  *another* search's directory — a modelsearch run, a covsearch run, an
+  earlier global search — and a candidate whose canonical text a fit there
+  carries is **re-scored** under this run's criterion and gate rather than
+  fitted again. The directories are read recursively (a tool's whole run
+  directory is one entry) and never written or locked; what makes a fit
+  reusable is the same dataset, start count and fit settings, and a
+  directory that fails that test is skipped with a warning naming why. A
+  reused fit is journalled as the run's own, so the other directory need
+  not outlive it. The stepwise tools take the same `[run] reuse_from`, so
+  a modelsearch run after a global search reuses the global search's fits
+  too.
+
+## Output
+
+Into `--directory` (default `{search}-globalsearch` next to the `.ferxsearch`
+file, or `[run] cache_dir`):
+
+| file | contents |
+|---|---|
+| `models.csv` | one row per model — the input and every grid point evaluated: `id`, `parent`, `step`, `genome`, `absorption`, `elimination`, `peripherals`, `transits`, `lagtime`, `covariates`, `n_parameters`, `ofv`, `criterion`, `fitness`, `rank`, `converged`, `passed`, `failures`, `error`, `seconds`, `selected`, `non_influential`, `duplicate_of`, `reused` |
+| `generations.csv` | the GA's trajectory: per generation the best genome, its fitness, the mean fitness, and how many individuals the downhill search moved |
+| `final.ferx` | the selected model, with its own estimates written into the initial values |
+| `final-fit.yaml` | its estimates |
+| `models/<id>.ferx` | every model as it was fitted |
+| `input/`, `candidates/` (exhaustive) or `generation-{g}/`, `downhill-{g}-{k}-{round}/` (GA) | one [runner directory](search.qmd) per batch: `candidates.csv`, the journal and the cached fits |
+
+The **input is ranked but never selected**: it is fitted for reference and
+as the seed of every candidate, and its own grid point — when the grid has
+one — is a candidate in its own right. When no candidate passes the gate,
+the input is the final model and the notes say so.
+
+## Compared with pyDarwin
+
+The penalized fitness reproduces pyDarwin's documented schedule
+term-for-term (the unit tests pin each charge on a hand-computed fixture),
+and the GA is the same construction — tournament selection, one-point
+crossover, mutation, elitism, fitness sharing, a periodic and final
+downhill search — over integer genes instead of bit strings. Three things
+are deliberately not taken:
+
+- **The template + tokens file pair.** It exists to compensate for not
+  having a structured model object. ferx has a parser and an
+  [edit layer](https://github.com/FeRx-NLME/ferx-core/issues/1176); a
+  candidate is a typed edit, and the same edit the stepwise tools make.
+- **GP / RF / GBRT surrogates.** They pay off when each fit is a NONMEM
+  subprocess costing minutes. ferx fits in-process, so the surrogate's own
+  overhead is a large fraction of what it saves.
+- **The grid run manager.** Single-machine rayon is the scope.
+
+And one thing ferx adds: the strictness gate beside the penalties, with
+the `gate` charge that reconciles the two ([above](#the-gate-and-the-penalties)).
+
+There is no NONMEM run to anchor a search *algorithm* against; what is
+anchored is the agreement of the GA with exhaustive enumeration — on a
+known landscape in the algorithm's own tests, and on a real grid of
+evaluations end to end (`tests/globalsearch_end_to_end.rs`) — and every
+candidate's numbers come from the same `fit()` the
+[modelsearch](modelsearch.qmd#compared-with-nonmem) and
+[covsearch](covsearch.qmd#compared-with-psn-scm) anchors already pin to
+NONMEM and PsN.
+
+## From Rust
+
+```rust
+use ferx_tools::globalsearch::{run_globalsearch, GlobalsearchRun};
+use ferx_tools::search::SearchConfig;
+
+let cfg = SearchConfig::load("warfarin.ferxsearch")?;
+let base = cfg.load_base()?;
+let result = run_globalsearch(&cfg, &base, GlobalsearchRun {
+    dir: Some("warfarin-globalsearch".into()),
+    ..GlobalsearchRun::default()
+})?;
+for row in result.ranked() {
+    println!("{} {} {:.3} fitness {:.3} rank {:?}",
+        row.id, row.description, row.criterion, row.fitness, row.rank);
+}
+for g in &result.generations {
+    println!("generation {}: best {:.3}", g.index, g.best_fitness);
+}
+println!("{}", result.final_model.render());
+```
+
+`GlobalsearchRun` also takes a `threads` override, a `CancelFlag` that stops
+the search between batches with what it has, `reuse_from` directories, and
+a progress callback (`GlobalsearchEvent`). The penalized criterion on its
+own is `ferx_tools::search::Penalties` — `score(&fit)` for the number,
+`terms(&fit)` for what it was charged for.

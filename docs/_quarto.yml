@@ -114,6 +114,7 @@ website:
           - tools/iivsearch.qmd
           - tools/iovsearch.qmd
           - tools/amd.qmd
+          - tools/global-search.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

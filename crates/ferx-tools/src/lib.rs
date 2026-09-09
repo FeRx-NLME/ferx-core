@@ -60,6 +60,7 @@ mod tests {
         let _ = assert_default::<crate::iivsearch::IivsearchOptions>();
         let _ = assert_default::<crate::iovsearch::IovsearchOptions>();
         let _ = assert_default::<crate::amd::AmdOptions>();
+        let _ = assert_default::<crate::globalsearch::GlobalsearchOptions>();
     }
 
     #[test]
@@ -83,6 +84,7 @@ pub mod amd;
 pub mod bootstrap;
 pub mod covsearch;
 pub mod gam;
+pub mod globalsearch;
 pub mod iivsearch;
 pub mod iovsearch;
 pub mod modelsearch;

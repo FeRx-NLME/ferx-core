@@ -811,3 +811,98 @@ fn modelsearch_runs_a_search_and_writes_its_files() {
     let models = std::fs::read_to_string(run.join("models.csv")).unwrap();
     assert_eq!(models.lines().count(), 5, "{models}");
 }
+
+// ── ferx globalsearch (#1185) ───────────────────────────────────────────────
+
+#[test]
+fn globalsearch_help_usage_and_a_file_meant_for_another_tool() {
+    let out = ferx()
+        .args(["globalsearch", "--help"])
+        .output()
+        .expect("run ferx globalsearch --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for word in [
+        "genetic algorithm",
+        "exhaustive",
+        "penalized",
+        "population_size",
+        "generations",
+        "max_models",
+        "--directory",
+        "--resume",
+    ] {
+        assert!(stdout.contains(word), "help does not mention {word}");
+    }
+    let out = ferx().args(["globalsearch"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx globalsearch"));
+
+    // A variability file is refused by name, before the dataset is read.
+    let out = ferx()
+        .args(["globalsearch", "examples/warfarin_iivsearch.ferxsearch"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not an axis globalsearch lays out"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Data:"), "{stderr}");
+}
+
+/// A whole global search from the command line, on evaluations
+/// (`maxiter = 0`) so it is seconds: the input, an eight-point grid over a
+/// structural and a covariate axis, and the files a user reads afterwards.
+#[test]
+fn globalsearch_runs_an_exhaustive_search_and_writes_its_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("wt.ferx"), ONE_CPT_WT).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let config = format!(
+        "base = \"wt.ferx\"\ndata = \"{}\"\n[space]\n\
+         mfl = \"PERIPHERALS(0..1); LAGTIME([OFF,ON]); COVARIATE?(CL, WT, pow)\"\n\
+         [globalsearch]\nalgorithm = \"exhaustive\"\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
+
+    let out = ferx()
+        .args([
+            "globalsearch",
+            &dir.path().join("wt.ferxsearch").to_string_lossy(),
+        ])
+        .output()
+        .expect("run ferx globalsearch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        stderr.contains("Grid:       8 points over 3 axes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Algorithm:  exhaustive, ranked on penalized"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("candidates: fitting 8 new models of 8 proposed"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("CL-WT: none | power"), "{stdout}");
+    assert!(stdout.contains("SELECTED"), "{stdout}");
+    assert!(stdout.contains("Final model:"), "{stdout}");
+
+    let run = dir.path().join("wt-globalsearch");
+    assert!(run.join("models.csv").exists(), "{stderr}");
+    assert!(run.join("generations.csv").exists());
+    assert!(run.join("final.ferx").exists());
+    assert!(run.join("final-fit.yaml").exists());
+    assert!(run.join("input/candidates.csv").exists());
+    assert!(run.join("candidates/candidates.csv").exists());
+    let models = std::fs::read_to_string(run.join("models.csv")).unwrap();
+    assert_eq!(models.lines().count(), 1 + 1 + 8, "{models}");
+}
