@@ -968,7 +968,72 @@ fn a_selected_cross_batch_duplicate_takes_its_representatives_fit() {
     let (_, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
     assert_eq!(fit.map(|f| f.ofv), Some(7.0));
     assert!(final_model_and_fit("run9", None, &mut store).is_none());
+}
 
-    // The real-fit reproduction of the review's seed-1 case is
-    // `tests/globalsearch_end_to_end.rs::a_winning_duplicate_still_hands_back_its_fit`.
+#[test]
+fn a_run_whose_winner_is_a_cross_batch_duplicate_hands_back_the_fit() {
+    // The review's case (PR #1299): on INST/FO × KA-WT the two INST genomes
+    // render to one model; when the dead-gene one is fitted first and the
+    // clean one is proposed in a later batch, the clean one is a cross-batch
+    // duplicate stored without a fit — and, carrying no non-influential
+    // charge, it outranks its representative and wins. The GA is seeded, so
+    // the seeds are walked until a run has exactly that shape; the fixture
+    // asserts the shape was reached, so it cannot go green by missing it.
+    let mut reached = false;
+    for seed in 1..=200u64 {
+        let space = space_with(
+            "ABSORPTION([INST,FO])",
+            &[effect("KA", "WT", CovariateEffect::Pow, true)],
+            &[],
+        );
+        let script =
+            ScriptedFitter::new(key, &[("input", 500.0), ("INST;P0", 400.0), ("P0", 490.0)]);
+        let options = GlobalsearchOptions {
+            ga: GaOptions {
+                population_size: 2,
+                generations: 3,
+                elites: 1,
+                downhill_period: 0,
+                final_downhill: false,
+                seed,
+                ..GaOptions::default()
+            },
+            ..options(Algorithm::Ga)
+        };
+        let result = run(&script, space, &options);
+        let winner = result.row(&result.final_id).unwrap();
+        let Some(rep) = winner.duplicate_of.clone() else {
+            continue;
+        };
+        let rep_row = result.row(&rep).unwrap();
+        if rep_row.step == winner.step {
+            continue; // a within-batch duplicate: the runner's report has the fit
+        }
+        reached = true;
+        assert_eq!(
+            winner.description, "ABSORPTION=INST;KA-WT=none",
+            "seed {seed}"
+        );
+        assert_eq!(rep_row.non_influential, 1, "seed {seed}");
+        assert_eq!(
+            result.final_fit.as_ref().map(|f| f.ofv),
+            Some(400.0),
+            "seed {seed}: {} (duplicate of {rep}) came back without its fit",
+            winner.id
+        );
+        assert!(
+            !result
+                .notes
+                .iter()
+                .any(|n| n.contains("not in the journal cache")),
+            "seed {seed}: {:?}",
+            result.notes
+        );
+        break;
+    }
+    assert!(
+        reached,
+        "no seed produced a run whose winner is a cross-batch duplicate; the fixture cannot \
+         see the defect it exists to catch"
+    );
 }
