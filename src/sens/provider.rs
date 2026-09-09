@@ -3546,6 +3546,25 @@ pub fn subject_sensitivities_tvcov(
     let pd_pk_only: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.pk_only_times.len())
         .map(|m| pd_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
+    // The per-event f64 PK values, once per subject under the same per-event time guard —
+    // shared by every chunk's `PkDual` seeding, the modeled-dose window resolution and the
+    // readout's extra slots (#1300 follow-up: on a DCM each of these is a network forward
+    // pass, and the chunks used to repeat it).
+    let pk_at = |time: f64,
+                 cov: &std::collections::HashMap<String, f64>|
+     -> crate::types::PkParams {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
+        (model.pk_param_fn)(theta, eta, cov, time)
+    };
+    let pk_dose: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| pk_at(subject.doses[k].time, subject.dose_cov(k)))
+        .collect();
+    let pk_obs: Vec<crate::types::PkParams> = (0..subject.obs_times.len())
+        .map(|j| pk_at(subject.obs_times[j], subject.obs_cov(j)))
+        .collect();
+    let pk_pk_only: Vec<crate::types::PkParams> = (0..subject.pk_only_times.len())
+        .map(|m| pk_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .collect();
 
     // The θ columns are seeded in chunks of at most `MAX_TVCOV_AXES - n_eta`, each chunk
     // walked with the η axes alongside so the mixed `∂²f/∂η∂θ` block comes out of the same
@@ -3569,8 +3588,8 @@ pub fn subject_sensitivities_tvcov(
             m_dim;
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
             |M| run_obs_tvcov::<M>(
-                model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, cols,
-                &pd_dose, &pd_obs, &pd_pk_only, readout, into,
+                model, subject, prog, &slot_row, n_eta, n_theta, cols, &pd_dose, &pd_obs,
+                &pd_pk_only, &pk_dose, &pk_obs, &pk_pk_only, readout, into,
             )
         )?);
     }
@@ -3606,7 +3625,8 @@ pub fn subject_sensitivities_tvcov(
 /// The dual-width-`M` inner of [`subject_sensitivities_tvcov`] for one **θ-column
 /// chunk** (`M = theta_cols.len() + n_eta`). For each event, takes the pre-evaluated
 /// program derivatives `∂p/∂(θ, η)` at that event's covariate snapshot (`pd_dose` /
-/// `pd_obs` / `pd_pk_only`, full θ width), seeds the PK-param duals on the chunk's axes
+/// `pd_obs` / `pd_pk_only`, full θ width) and the pre-evaluated f64 PK values at the same
+/// snapshots (`pk_dose` / `pk_obs` / `pk_pk_only`), seeds the PK-param duals on the chunk's axes
 /// (`θ_{theta_cols[c]} → c`, `η_k → theta_cols.len() + k`), runs the event-driven
 /// sensitivity walk over `Dual2<M>`, and scatters `∂conc/∂(θ_chunk, η)` into the standard
 /// `(n_eta, n_theta)` [`SubjectSens`] — into `into` when an earlier chunk built it (only
@@ -3616,8 +3636,6 @@ pub fn subject_sensitivities_tvcov(
 fn run_obs_tvcov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
     prog: &crate::parser::model_parser::IndivParamProgram,
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
@@ -3626,6 +3644,9 @@ fn run_obs_tvcov<const M: usize>(
     pd_dose: &[crate::sens::ode_provider::ParamDerivs],
     pd_obs: &[crate::sens::ode_provider::ParamDerivs],
     pd_pk_only: &[crate::sens::ode_provider::ParamDerivs],
+    pk_dose: &[crate::types::PkParams],
+    pk_obs: &[crate::types::PkParams],
+    pk_pk_only: &[crate::types::PkParams],
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
     into: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
@@ -3643,16 +3664,12 @@ fn run_obs_tvcov<const M: usize>(
     // chunk's `(θ, η)` dual axes (`θ_{theta_cols[c]} → c`, `η_k → n_cols + k`); constants
     // otherwise. The θ-θ Hessian block is unused downstream (left zero), mirroring the
     // IOV / scale seeders.
-    // A `TIME`-built-in structural parameter resolves `Op::PushTime` from the model-time
-    // thread-local; the f64 `pk_param_fn` value here is evaluated under the per-event
-    // time exactly as the derivatives were (#486 / #610).
-    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    // Both the derivatives and the f64 values were evaluated by the caller under each
+    // event's own time guard (a `TIME`-built-in parameter reads the model-time
+    // thread-local, #486 / #610), so nothing here re-enters it.
     let mk = |pd: &crate::sens::ode_provider::ParamDerivs,
-              time: f64,
-              cov: &std::collections::HashMap<String, f64>|
+              pk: &crate::types::PkParams|
      -> PkDual<Dual2<M>> {
-        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
             pd_row_dual2_cols::<M>(pd, i, val, theta_cols, n_eta)
         };
@@ -3678,37 +3695,22 @@ fn run_obs_tvcov<const M: usize>(
     // covariate snapshot (the `*_cov` accessors fall back to the static map when a
     // particular event carries no snapshot).
     let pk_at_dose: Vec<PkDual<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| mk(&pd_dose[k], subject.doses[k].time, subject.dose_cov(k)))
+        .map(|k| mk(&pd_dose[k], &pk_dose[k]))
         .collect();
     let pk_at_obs: Vec<PkDual<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| mk(&pd_obs[j], subject.obs_times[j], subject.obs_cov(j)))
+        .map(|j| mk(&pd_obs[j], &pk_obs[j]))
         .collect();
     let pk_at_pk_only: Vec<PkDual<Dual2<M>>> = (0..subject.pk_only_times.len())
-        .map(|m| {
-            mk(
-                &pd_pk_only[m],
-                subject.pk_only_times[m],
-                subject.pk_only_cov(m),
-            )
-        })
+        .map(|m| mk(&pd_pk_only[m], &pk_pk_only[m]))
         .collect();
 
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
     // schedule's break times, and build the per-dose duals so the injected rate and
     // the moving infusion-end boundary carry their `(θ,η)` jets. The per-dose f64 PK
-    // params are evaluated once (`dose_pk`) and shared by the resolved window and the
-    // dual's value, rather than re-running `pk_param_fn` per dose (#486 review #4).
-    // Fixed subjects borrow `subject.doses` and pass no duals (identical to the
-    // pre-#486 path).
-    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
-        .map(|k| {
-            let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
-                uses_time,
-                subject.doses[k].time,
-            );
-            (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time)
-        })
-        .collect();
+    // params are the caller's hoisted `pk_dose` (one `pk_param_fn` per dose per subject,
+    // shared with the dual's value and every chunk). Fixed subjects borrow
+    // `subject.doses` and pass no duals (identical to the pre-#486 path).
+    let dose_pk: &[crate::types::PkParams] = pk_dose;
     let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
     // Lagtime on the event walk (#486): the schedule shifts each arrival to `t + ALAG`
     // (production parity) and the walk threads `∂ALAG` through the dual sub-interval
@@ -3776,10 +3778,7 @@ fn run_obs_tvcov<const M: usize>(
     } else {
         (0..subject.obs_times.len())
             .map(|j| {
-                let cov = subject.obs_cov(j);
-                let t = subject.obs_times[j];
-                let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, t);
-                let pk = (model.pk_param_fn)(theta, eta, cov, t);
+                let pk = pk_obs[j];
                 let extras = ro_slots
                     .iter()
                     .map(|&s| {
