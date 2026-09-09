@@ -1,3 +1,6 @@
+use crate::estimation::finite_difference::{
+    adaptive_first_derivative, shi_central_vector_derivative, AxisBounds,
+};
 use crate::pk;
 #[cfg(test)]
 use crate::stats::likelihood::individual_nll_iov;
@@ -737,6 +740,56 @@ pub fn find_ebe(
     mu_k: Option<&[f64]>,
     restarts: usize,
 ) -> EbeResult {
+    find_ebe_with_fd_config(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        InnerFdConfig::fixed(),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InnerFdConfig {
+    pub method: InnerFdMethod,
+    pub objective_noise_abs: Option<f64>,
+    pub prediction_noise_abs: Option<f64>,
+}
+
+impl InnerFdConfig {
+    pub(crate) fn fixed() -> Self {
+        Self {
+            method: InnerFdMethod::Fixed,
+            objective_noise_abs: None,
+            prediction_noise_abs: None,
+        }
+    }
+
+    pub(crate) fn from_options(options: &FitOptions) -> Self {
+        Self {
+            method: options.inner_fd_method,
+            objective_noise_abs: options.inner_fd_objective_noise_abs,
+            prediction_noise_abs: options.inner_fd_prediction_noise_abs,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_ebe_with_fd_config(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    fd_config: InnerFdConfig,
+) -> EbeResult {
     let n_eta = model.n_eta;
 
     if inner_profile_enabled() {
@@ -747,7 +800,9 @@ pub fn find_ebe(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        return find_ebe_iov(model, subject, params, max_iter, tol, eta_init, mu_k);
+        return find_ebe_iov(
+            model, subject, params, max_iter, tol, eta_init, mu_k, fd_config,
+        );
     }
 
     // mu: shift vector (zeros when no mu-referencing)
@@ -878,7 +933,7 @@ pub fn find_ebe(
     let profile = inner_profile_enabled();
     let agrad = |e: &[f64]| -> Vec<f64> {
         if !use_analytic {
-            return gradient_fd(&obj, e, n_eta);
+            return gradient_fd_config(&obj, e, n_eta, fd_config);
         }
         let t0 = std::time::Instant::now();
         match analytic_eta_nll_gradient_with_schedule(
@@ -902,7 +957,7 @@ pub fn find_ebe(
                 g
             }
             None => {
-                let g = gradient_fd(&obj, e, n_eta);
+                let g = gradient_fd_config(&obj, e, n_eta, fd_config);
                 GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
                 if profile {
                     PROFILE_INNER_FD_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1138,13 +1193,14 @@ pub fn find_ebe(
             // FD Jacobian fallback for models the analytic provider doesn't cover.
             let mut scratch = pk_scratch_cell.borrow_mut();
             let t0 = std::time::Instant::now();
-            let j = compute_jacobian_fd(
+            let j = compute_jacobian_fd_config(
                 model,
                 subject,
                 &params.theta,
                 &eta_true,
                 &mut scratch,
                 schedule.as_ref(),
+                fd_config,
             );
             GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
             j
@@ -1179,6 +1235,7 @@ fn find_ebe_iov(
     tol: f64,
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
+    fd_config: InnerFdConfig,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -1262,7 +1319,7 @@ fn find_ebe_iov(
     // convergence — see the matching note in `find_ebe`.
     let agrad = |p: &[f64]| -> Vec<f64> {
         if !analytic_iov_inner {
-            return gradient_fd(&obj, p, n_flat);
+            return gradient_fd_config(&obj, p, n_flat, fd_config);
         }
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
@@ -1285,7 +1342,7 @@ fn find_ebe_iov(
             mult.as_deref(),
         ) {
             Some(g) => g,
-            None => gradient_fd(&obj, p, n_flat),
+            None => gradient_fd_config(&obj, p, n_flat, fd_config),
         }
     };
 
@@ -1432,7 +1489,14 @@ fn find_ebe_iov(
             _ => {
                 let kappas_slices: Vec<Vec<f64>> =
                     kappas_vec.iter().map(|k| k.as_slice().to_vec()).collect();
-                compute_jacobian_fd_iov(model, subject, &params.theta, &bsv_eta, &kappas_slices)
+                compute_jacobian_fd_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    &bsv_eta,
+                    &kappas_slices,
+                    fd_config,
+                )
             }
         }
     };
@@ -1482,6 +1546,7 @@ fn compute_jacobian_fd_iov(
     theta: &[f64],
     eta: &[f64],
     kappas: &[Vec<f64>],
+    fd_config: InnerFdConfig,
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
@@ -1491,6 +1556,33 @@ fn compute_jacobian_fd_iov(
 
     for col in 0..n_eta {
         let h_step = eps * (1.0 + eta[col].abs());
+        if fd_config.method == InnerFdMethod::Shi {
+            if let Some(noise) = fd_config.prediction_noise_abs {
+                if let Some(column) = shi_central_vector_derivative(
+                    eta[col],
+                    h_step,
+                    AxisBounds {
+                        lower: f64::NEG_INFINITY,
+                        upper: f64::INFINITY,
+                    },
+                    noise,
+                    |value| {
+                        eta_pert[col] = value;
+                        let predictions = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+                        eta_pert[col] = eta[col];
+                        predictions
+                            .iter()
+                            .all(|v| v.is_finite())
+                            .then_some(predictions)
+                    },
+                ) {
+                    for row in 0..n_obs {
+                        h[(row, col)] = column[row];
+                    }
+                    continue;
+                }
+            }
+        }
         eta_pert[col] = eta[col] + h_step;
         let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
         eta_pert[col] = eta[col] - h_step;
@@ -3269,11 +3361,43 @@ fn backtracking_line_search(
 
 /// Central finite difference gradient (optimized step size)
 fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
+    gradient_fd_config(obj, x, n, InnerFdConfig::fixed())
+}
+
+fn gradient_fd_config(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    n: usize,
+    config: InnerFdConfig,
+) -> Vec<f64> {
     let t0 = std::time::Instant::now();
     let mut g = vec![0.0; n];
     let mut x_work = x.to_vec();
     for i in 0..n {
         let h = 1e-7 * (1.0 + x[i].abs());
+        if config.method == InnerFdMethod::Shi {
+            if let Some(noise) = config.objective_noise_abs {
+                if let Some(d) = adaptive_first_derivative(
+                    OuterFdMethod::Shi,
+                    x[i],
+                    h,
+                    AxisBounds {
+                        lower: f64::NEG_INFINITY,
+                        upper: f64::INFINITY,
+                    },
+                    noise,
+                    |v| {
+                        x_work[i] = v;
+                        let y = obj(&x_work);
+                        x_work[i] = x[i];
+                        y.is_finite().then_some(y)
+                    },
+                ) {
+                    g[i] = d;
+                    continue;
+                }
+            }
+        }
         x_work[i] = x[i] + h;
         let fp = obj(&x_work);
         x_work[i] = x[i] - h;
@@ -3300,6 +3424,26 @@ fn compute_jacobian_fd(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
+    compute_jacobian_fd_config(
+        model,
+        subject,
+        theta,
+        eta,
+        scratch,
+        schedule,
+        InnerFdConfig::fixed(),
+    )
+}
+
+fn compute_jacobian_fd_config(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    fd_config: InnerFdConfig,
+) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
     let eps = 1e-6;
@@ -3309,6 +3453,35 @@ fn compute_jacobian_fd(
 
     for j in 0..n_eta {
         let h_step = eps * (1.0 + eta[j].abs());
+        if fd_config.method == InnerFdMethod::Shi {
+            if let Some(noise) = fd_config.prediction_noise_abs {
+                if let Some(column) = shi_central_vector_derivative(
+                    eta[j],
+                    h_step,
+                    AxisBounds {
+                        lower: f64::NEG_INFINITY,
+                        upper: f64::INFINITY,
+                    },
+                    noise,
+                    |value| {
+                        eta_pert[j] = value;
+                        let predictions = pk::compute_predictions_with_tv_into_with_schedule(
+                            model, subject, theta, &eta_pert, scratch, schedule,
+                        );
+                        eta_pert[j] = eta[j];
+                        predictions
+                            .iter()
+                            .all(|v| v.is_finite())
+                            .then_some(predictions)
+                    },
+                ) {
+                    for i in 0..n_obs {
+                        h[(i, j)] = column[i];
+                    }
+                    continue;
+                }
+            }
+        }
 
         eta_pert[j] = eta[j] + h_step;
         let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
@@ -3392,6 +3565,7 @@ pub fn run_inner_loop_warm(
         mu_k,
         min_obs,
         restarts,
+        InnerFdConfig::fixed(),
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)
@@ -3411,6 +3585,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
+    fd_config: InnerFdConfig,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -3427,7 +3602,9 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            let ebe = find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts);
+            let ebe = find_ebe_with_fd_config(
+                model, subject, params, max_iter, tol, init, mu_k, restarts, fd_config,
+            );
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })

@@ -3000,6 +3000,21 @@ pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, populati
 pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
     let chain = options.method_chain();
     let mut diags = Vec::new();
+    if options.outer_fd_method != OuterFdMethod::Fixed && options.outer_fd_noise_abs.is_none() {
+        diags.push(Diagnostic::error(
+            "E_OUTER_FD_NOISE_REQUIRED",
+            "outer_fd_method = shi/gill requires a positive outer_fd_noise_abs estimate",
+        ));
+    }
+    if options.inner_fd_method != InnerFdMethod::Fixed
+        && (options.inner_fd_objective_noise_abs.is_none()
+            || options.inner_fd_prediction_noise_abs.is_none())
+    {
+        diags.push(Diagnostic::error(
+            "E_INNER_FD_NOISE_REQUIRED",
+            "inner_fd_method = shi requires positive inner_fd_objective_noise_abs and inner_fd_prediction_noise_abs estimates",
+        ));
+    }
 
     // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
     // variable to integrate over, so every estimator whose objective *is* an

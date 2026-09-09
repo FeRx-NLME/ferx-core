@@ -264,6 +264,7 @@ fn inner_map_completes_each_subject_before_returning_its_buffers() {
         None,
         0,
         0,
+        InnerFdConfig::fixed(),
         |subject, ebe| {
             (
                 subject.id.clone(),
