@@ -5731,6 +5731,141 @@ const ONECPT_TRANSIT_MODEL: &str = r#"
   method = focei
 "#;
 
+/// The mixed analytic closed-form walk must retain every output bit from the
+/// full `Dual2` walk. The program orders rows alphabetically (`CL, MTT, NTR, V`),
+/// so the two IIV rows (`CL`, `V`) require the non-trivial permutation
+/// `[0, 2, 3, 1]`; this exercises both retained η-η and η-θ Hessian blocks while
+/// dropping the IIV-free `MTT/NTR` square block (issue #829).
+#[test]
+fn analytic_transit_mixed_matches_full_dual2_bit_for_bit() {
+    let model = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
+    let subject = subject_with_doses_and_resets(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 80.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.5, 2.0, 8.0, 12.5, 16.0, 24.0],
+        Vec::new(),
+    );
+    let theta = [5.0, 50.0, 1.0, 3.0];
+    let eta = [0.1, -0.05];
+    let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+    let (pd, slots) = resolve_param_derivs(&model, &subject, &theta, &eta, &pk).expect("pd");
+    assert_eq!(slots.len(), 4);
+
+    let full_seed = seed_dim_from_slots(&slots);
+    let full = run_obs::<4, 4, false>(
+        &full_seed,
+        &pk,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        None,
+        &subject,
+        &pd,
+        None,
+        model.n_eta,
+        model.n_theta,
+        None,
+    );
+
+    let mut is_iiv = [false; 4];
+    for i in 0..4 {
+        is_iiv[i] = pd.dp_deta[i].iter().any(|&v| v != 0.0);
+    }
+    assert_eq!(is_iiv, [true, false, false, true]);
+    let axis_of = [0, 2, 3, 1];
+    let mixed_seed = seed_dim_from_slots_with_axes(&slots, &axis_of);
+    let mixed = run_obs::<2, 4, true>(
+        &mixed_seed,
+        &pk,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        None,
+        &subject,
+        &pd,
+        Some((&axis_of, &is_iiv)),
+        model.n_eta,
+        model.n_theta,
+        None,
+    );
+    MIXED_ANALYTIC_RUNS.with(|runs| runs.set(0));
+    subject_sensitivities(&model, &subject, &theta, &eta).expect("dispatcher serves transit");
+    MIXED_ANALYTIC_RUNS.with(|runs| {
+        assert_eq!(runs.get(), 1);
+    });
+
+    assert_eq!(full.len(), mixed.len());
+    for (obs_i, (a, b)) in full.iter().zip(&mixed).enumerate() {
+        let assert_bits = |lhs: &[f64], rhs: &[f64], field: &str| {
+            assert_eq!(
+                lhs.len(),
+                rhs.len(),
+                "{field} length at observation {obs_i}"
+            );
+            for (i, (&x, &y)) in lhs.iter().zip(rhs).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{field}[{i}] at observation {obs_i}: {x:.17e} != {y:.17e}"
+                );
+            }
+        };
+        assert_eq!(a.f.to_bits(), b.f.to_bits(), "f at observation {obs_i}");
+        assert_bits(&a.df_deta, &b.df_deta, "df_deta");
+        assert_bits(&a.d2f_deta2, &b.d2f_deta2, "d2f_deta2");
+        assert_bits(&a.df_dtheta, &b.df_dtheta, "df_dtheta");
+        assert_bits(&a.d2f_deta_dtheta, &b.d2f_deta_dtheta, "d2f_deta_dtheta");
+    }
+}
+
+/// A lagtime disables the hand-written explicit kernel, so this ordinary oral
+/// model exercises the broadened generic-walk eligibility rather than the
+/// transit/IG-specific route that originally motivated issue #829.
+#[test]
+fn analytic_lagtime_generic_walk_uses_mixed_hessian() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.4, 0.0, 4.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+  LAGTIME = TVLAG
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+    )
+    .expect("parse lagtime model");
+    let subject = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 1.0, 2.0, 4.0, 8.0],
+    );
+
+    MIXED_ANALYTIC_RUNS.with(|runs| runs.set(0));
+    subject_sensitivities(&model, &subject, &[5.0, 50.0, 1.0, 0.4], &[0.1, -0.05])
+        .expect("lagtime generic walk is analytic");
+    MIXED_ANALYTIC_RUNS.with(|runs| assert_eq!(runs.get(), 1));
+}
+
 /// A `one_cpt_transit` subject with time-varying covariates is served by the model's ODE
 /// `transit()` equivalent (`effective_for` routes it there), NOT the closed form — the
 /// closed form assumes constant parameters over each absorption window, and the

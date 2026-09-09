@@ -514,6 +514,9 @@ section of the SDLC for the versioning policy).
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
 ### Performance
+- Generic analytical FOCEI gradients with exactly four or six differentiated PK
+  parameters, one or two of them IIV-bearing, now omit the unused Hessian block
+  among IIV-free parameters (#829).
 - Allocate per-event PK scratch storage only when the prediction path needs it,
   reducing allocation traffic for static-model FOCE/FOCEI fits (#1283).
 - IOV inner optimization reuses per-event PK parameter buffers across likelihood
