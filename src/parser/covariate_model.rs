@@ -261,8 +261,8 @@ fn parse_relation_line(
     };
     if form_src.is_empty() {
         return Err(format!(
-            "[covariate_model]: `{param} ~ {covariate}` states no form — expected one of \
-             none, linear, linear_relative, exponential, power, hockey, categorical, expr"
+            "[covariate_model]: `{param} ~ {covariate}` states no form — expected one of {}",
+            form_list()
         ));
     }
     let decl = ctx
@@ -399,9 +399,9 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
         }
         other => {
             return Err(format!(
-                "[covariate_model]: unknown form `{other}`{} — expected one of none, linear, \
-                 linear_relative, exponential, power, hockey, categorical, categorical2, expr",
-                did_you_mean(other)
+                "[covariate_model]: unknown form `{other}`{} — expected one of {}",
+                did_you_mean(other),
+                form_list()
             ))
         }
     };
@@ -1229,19 +1229,8 @@ fn join_names(names: &[String]) -> String {
 
 /// A one-edit-away suggestion for a misspelled form name.
 fn did_you_mean(word: &str) -> String {
-    const FORMS: &[&str] = &[
-        "none",
-        "linear",
-        "linear_relative",
-        "exponential",
-        "power",
-        "hockey",
-        "categorical",
-        "categorical2",
-        "expr",
-    ];
     let lower = word.to_lowercase();
-    match FORMS
+    match FORM_SPELLINGS
         .iter()
         .filter(|f| levenshtein(&lower, f) <= 2)
         .min_by_key(|f| levenshtein(&lower, f))
@@ -1249,6 +1238,32 @@ fn did_you_mean(word: &str) -> String {
         Some(best) => format!(" (did you mean `{best}`?)"),
         None => String::new(),
     }
+}
+
+/// Every form the block accepts, in the order the diagnostics list them.
+///
+/// The two "expected one of …" messages and [`did_you_mean`] all read this one
+/// array. They used to carry their own copies, and #1312 added `categorical2`
+/// to two of the three — the missing-form diagnostic kept listing eight forms
+/// and quietly hid the new one from anyone who left the form off. A single list
+/// removes that failure mode rather than fixing one instance of it;
+/// `every_form_the_parser_accepts_is_offered_by_both_diagnostics` pins that it
+/// stays complete.
+const FORM_SPELLINGS: &[&str] = &[
+    "none",
+    "linear",
+    "linear_relative",
+    "exponential",
+    "power",
+    "hockey",
+    "categorical",
+    "categorical2",
+    "expr",
+];
+
+/// `FORM_SPELLINGS` as the diagnostics render it.
+fn form_list() -> String {
+    FORM_SPELLINGS.join(", ")
 }
 
 /// Levenshtein distance, for the did-you-mean above only.

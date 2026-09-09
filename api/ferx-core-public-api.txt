@@ -2144,7 +2144,7 @@ pub ferx_core::types::CovarianceStatus::Computed
 pub ferx_core::types::CovarianceStatus::Failed
 pub ferx_core::types::CovarianceStatus::NotRequested
 pub ferx_core::types::CovarianceStatus::SirFallback
-pub enum ferx_core::types::CovariateForm
+#[non_exhaustive] pub enum ferx_core::types::CovariateForm
 pub ferx_core::types::CovariateForm::Categorical
 pub ferx_core::types::CovariateForm::Categorical2
 pub ferx_core::types::CovariateForm::Exponential
@@ -3362,7 +3362,7 @@ pub ferx_core::CovarianceStatus::Computed
 pub ferx_core::CovarianceStatus::Failed
 pub ferx_core::CovarianceStatus::NotRequested
 pub ferx_core::CovarianceStatus::SirFallback
-pub enum ferx_core::CovariateForm
+#[non_exhaustive] pub enum ferx_core::CovariateForm
 pub ferx_core::CovariateForm::Categorical
 pub ferx_core::CovariateForm::Categorical2
 pub ferx_core::CovariateForm::Exponential

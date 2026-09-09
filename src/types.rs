@@ -1497,6 +1497,14 @@ impl CovariateDecl {
 /// it — `θ_rel = c·θ_abs` for the former, `θ_cat2 = 1 + θ_cat` for the latter —
 /// so the pair gives the same OFV on the same data and differs only in the
 /// scale θ and its SE are reported on. `Categorical2` is Pharmpy MFL's `cat2`.
+/// `#[non_exhaustive]`: adding a variant to a public enum breaks any downstream
+/// exhaustive `match`, which is what made #1312's `Categorical2` a breaking
+/// change rather than an additive one. Level grouping (`groups = [[1,2],[3,4]]`,
+/// the out-of-scope note on that issue) is the next variant, so the attribute
+/// goes in with the release that already breaks — from here on a new form is
+/// genuinely additive. Variants stay constructible; only downstream exhaustive
+/// matching is forbidden, so a caller writes a `_` arm.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CovariateForm {

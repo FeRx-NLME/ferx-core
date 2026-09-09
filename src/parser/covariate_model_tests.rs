@@ -777,6 +777,73 @@ fn a_relation_that_states_no_form_lists_the_forms() {
     assert!(e.contains("linear_relative"), "{e}");
 }
 
+/// Both "expected one of …" diagnostics must offer **every** form the parser
+/// accepts, and the list must stay complete when a variant is added.
+///
+/// This is the regression #1312 left behind on its first pass: `categorical2`
+/// went into the unknown-form message and into `did_you_mean`, but not into the
+/// missing-form message, which kept listing eight forms. The old test asserted
+/// only that `linear_relative` appeared, so it stayed green while the feature
+/// was invisible to anyone who left the form off.
+///
+/// The guard has two halves, and it needs both. `FORM_SPELLINGS` is now the
+/// single list the diagnostics render, so the first half — every spelling is
+/// offered by both messages — could not fail on its own today. The second half
+/// is what makes the pair non-redundant: every `CovariateForm` variant's label
+/// must *be* in that list, driven by an exhaustive `match`, so a new variant is
+/// a compile error here until it is listed and a test failure until the
+/// diagnostics print it.
+#[test]
+fn every_form_the_parser_accepts_is_offered_by_both_diagnostics() {
+    let missing_form = err("  WT continuous", "  CL ~ WT");
+    let unknown_form = err("  WT continuous", "  CL ~ WT nonsense");
+    for spelling in FORM_SPELLINGS {
+        assert!(
+            missing_form.contains(spelling),
+            "the missing-form message omits `{spelling}`: {missing_form}"
+        );
+        assert!(
+            unknown_form.contains(spelling),
+            "the unknown-form message omits `{spelling}`: {unknown_form}"
+        );
+    }
+
+    // …and the list covers the enum. The `match` is exhaustive on purpose: a
+    // new variant does not compile until it is named here.
+    let every_variant = [
+        CovariateForm::None,
+        CovariateForm::Linear,
+        CovariateForm::LinearRelative,
+        CovariateForm::Exponential,
+        CovariateForm::Power,
+        CovariateForm::Hockey,
+        CovariateForm::Categorical,
+        CovariateForm::Categorical2,
+        CovariateForm::Expr("(WT/70)^0.75".into()),
+    ];
+    for form in &every_variant {
+        // The exhaustive arm that forces a new variant into `every_variant`.
+        match form {
+            CovariateForm::None
+            | CovariateForm::Linear
+            | CovariateForm::LinearRelative
+            | CovariateForm::Exponential
+            | CovariateForm::Power
+            | CovariateForm::Hockey
+            | CovariateForm::Categorical
+            | CovariateForm::Categorical2
+            | CovariateForm::Expr(_) => {}
+        }
+        assert!(
+            FORM_SPELLINGS.contains(&form.label()),
+            "`{}` is a form of the enum but not of FORM_SPELLINGS, so no diagnostic \
+             offers it",
+            form.label()
+        );
+    }
+    assert_eq!(every_variant.len(), FORM_SPELLINGS.len());
+}
+
 #[test]
 fn two_relations_generating_the_same_theta_name_is_an_error() {
     // Each relation owns its θ; sharing one would couple two lines and defeat
