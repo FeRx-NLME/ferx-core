@@ -1239,8 +1239,10 @@ fn equilibrate_ss_g<T: PkNum>(
     // homogeneous disposition over the *same* bounds, whose columns are the monodromy `M`.
     //
     // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse sits at
-    // t = 0), so its arrival is not a moving boundary: no lag duals. A subject that pairs SS with
-    // a lagtime declines to FD upstream (`ss_lagtime_walk_unsupported`).
+    // t = 0), so its arrival is not a moving boundary: no lag duals. That still holds for the
+    // lagged SS bolus which now reaches here via `ss_bolus_state_at_phase_g`: the trough is
+    // lag-independent by construction, and the lag enters only through the seed phase applied
+    // at that call site.
     let advance = |u0: &[T], forced: bool| -> Option<Vec<T>> {
         let mut s = u0.to_vec();
         if forced && !is_inf {
@@ -1330,15 +1332,20 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
     if cmt_idx >= n_states {
         return state;
     }
-    // The value path uses `dosing::ss_seed_phase` here. Keep its clamp and the
-    // dual branch together: beyond `lag >= II`, the clamped phase is locally
-    // constant, so retaining `-d(lag)` would differentiate a function production
-    // does not predict and a negative step would propagate the PK system backward.
-    let phase = if crate::dosing::ss_seed_phase(dose, lag.val()) > 0.0 {
-        T::from_f64(dose.ii) - lag
-    } else {
-        T::from_f64(0.0)
-    };
+    // Production's phase is `dosing::ss_seed_phase` = `(II − lag).max(0)`, and this dual's
+    // `phase.val()` *is* `II − lag`. The clamp therefore needs exactly **one** gate, and the
+    // `phase.val() > 0.0` below is it: skipping the step leaves the seed at the post-pulse
+    // peak — production's clamped value — and drops the `−d(lag)` jet with it, since the jet
+    // reaches the state only through `apply_step_g`. Writing the clamp a second time into
+    // `phase` itself would reject exactly these inputs, so neither copy could fail on its own
+    // (#1229, "two redundant gates cover for each other"). Measured: with the single gate
+    // below removed, `ss_bolus_lag_at_least_interval_matches_production` fails; with the
+    // clamp *also* written into `phase`, it passed.
+    //
+    // Past `lag >= II` the clamped phase is locally constant, so keeping `−d(lag)` would
+    // differentiate a function production does not predict, and the negative step would
+    // propagate the PK system backward.
+    let phase = T::from_f64(dose.ii) - lag;
     state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
     if phase.val() > 0.0 {
         apply_step_g(
@@ -1480,7 +1487,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // snapshot above. State jumps at the arrival, not here (#1073).
                 let d = &eff_doses[ev.orig_idx];
                 let lag = schedule.dose_lagtimes[ev.orig_idx];
-                if d.rate <= 0.0 && crate::dosing::ss_seeded_at_record(d, lag) {
+                if crate::dosing::ss_bolus_seeded_at_record(d, lag) {
                     let lag_dual = dose_lag_dual
                         .get(ev.orig_idx)
                         .copied()
@@ -1496,10 +1503,10 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // after #1073 is the next record's (#1073).
                 let dose_pk = pk_at_dose[ev.orig_idx];
                 let lag = schedule.dose_lagtimes[ev.orig_idx];
-                if d.ss
-                    && d.ii > 0.0
-                    && !(d.rate <= 0.0 && crate::dosing::ss_seeded_at_record(d, lag))
-                {
+                // The exact complement of the `DoseRecord` seed above, read from the same
+                // predicate: the walk must not both seed and re-equilibrate (which would
+                // discard the propagation), nor do neither.
+                if d.ss && d.ii > 0.0 && !crate::dosing::ss_bolus_seeded_at_record(d, lag) {
                     // #486: forward this dose's modeled-window dual (if any) so the SS
                     // equilibration threads `∂D`/`∂R` into the trough, matching the current
                     // pulse handled by the main walk. `None` for a fixed infusion / bolus.

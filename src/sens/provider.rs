@@ -2829,8 +2829,17 @@ fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subject) -> bool 
 /// a previous-cycle residual rate window after the record; until that forcing is dualized, it
 /// remains a hard decline to FD rather than an approximation.
 ///
-/// (The CF *static* superposition path does serve SS × lagtime, via `lagged_elapsed`'s
-/// pre-arrival wrap — only the walk is affected.)
+/// This gate is consulted from the four **walk** entry points only, so widening it leaves the
+/// CF *static* superposition path alone — that path reaches SS × lagtime without passing here.
+/// Do not read that as the static path being correct. `lagged_elapsed` still implements the
+/// pre-#1121 semantics on both sides of the arrival: it *wraps* the pre-arrival phase where
+/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
+/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and it always takes the collapsed
+/// `C_ss(t − t_eff)` where production splits into tail + arrival once
+/// `!crate::dosing::ss_arrival_is_trough`. Both divergences are confined to `ALAG > II`, where
+/// `subject_sensitivities` returns `Some` on predictions measured up to ~19 % from
+/// production's. Pre-existing, and untouched by #1311, which changes the walk alone; it needs
+/// its own fix and its own anchor.
 fn ss_lagtime_walk_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
     model.has_lagtime() && subject.doses.iter().any(|d| d.ss && d.is_infusion())
 }
