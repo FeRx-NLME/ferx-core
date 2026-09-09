@@ -1,0 +1,53 @@
+# Global model search over examples/amd_start.ferx (#1185).
+#
+#   ferx globalsearch examples/amd_start_globalsearch.ferxsearch --threads 8
+#
+# Where modelsearch and covsearch walk one axis of the model space at a time,
+# this lays the structural categories and the optional covariate pairs out as
+# ONE grid and searches it globally: pyDarwin's genetic algorithm by default,
+# or every point with `algorithm = "exhaustive"`. On this base (one
+# compartment, η on CL and V, WT and CRCL declared) the grid is
+#   PERIPHERALS (0, 1) x LAGTIME (OFF, ON)
+#   x CL-WT, CL-CRCL, V-WT, V-CRCL (none, power, linear each)
+# = 2 x 2 x 3^4 = 324 points; the GA below evaluates a fraction of them.
+# `data/two_cpt_oral_cov.csv` was simulated from a two-compartment model with
+# CL~WT, CL~CRCL and V1~WT effects (examples/two_cpt_oral_covmodel.ferx), so
+# there is something real to find on every axis.
+#
+# Ranking is pyDarwin's penalized fitness: OFV + 10 per estimated parameter
+# + 100 per failure (non-convergence, no covariance step, |r| > 0.95,
+# condition number > 1000). `[rank.penalties]` changes any charge; `type =
+# "bic"` ranks on the mixed BIC instead. See docs/tools/global-search.qmd for
+# when a global search beats the stepwise tools, and when it does not.
+
+base = "amd_start.ferx"
+data = "../data/two_cpt_oral_cov.csv"
+
+[space]
+mfl = """
+PERIPHERALS(0..1); LAGTIME([OFF,ON])
+COVARIATE?(@IIV, @CONTINUOUS, [pow,lin])
+"""
+
+[globalsearch]
+algorithm    = "ga"                   # or "exhaustive" (raise max_models to 324)
+iiv_strategy = "absorption_delay"     # eta on a new lag time only
+
+[globalsearch.ga]
+population_size = 12
+generations     = 4
+seed            = 1185
+
+[rank]
+type = "penalized"                    # the default for this tool
+
+[strictness]
+require_converged    = true
+max_condition_number = 1000.0
+max_correlation      = 0.95
+reject_on_boundary   = true
+
+[run]
+threads   = 8
+retries   = 1
+cache_dir = ".ferx-globalsearch"
