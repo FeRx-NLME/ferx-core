@@ -97,8 +97,8 @@ use crate::search::fitter::{RunnerFitter, StepFitter};
 use crate::search::mfl::{Feature, Mode, Modes, Operand, VariabilityEffect, VariabilityLevel};
 use crate::search::seed::seed_from;
 use crate::search::{
-    BaseModel, Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, RankType,
-    RunReport, SearchConfig,
+    BaseModel, Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, Penalties,
+    RankType, RunReport, SearchConfig,
 };
 
 mod report;
@@ -201,6 +201,8 @@ pub struct IivsearchOptions {
     /// show to replace it. `None` — Pharmpy's default — takes any
     /// improvement.
     pub cutoff: Option<f64>,
+    /// `[rank.penalties]`, read behind a `penalized` rank type (#1185).
+    pub penalties: Penalties,
 }
 
 impl Default for IivsearchOptions {
@@ -213,6 +215,7 @@ impl Default for IivsearchOptions {
             starts: crate::search::RunOptions::default().n_starts,
             rank: RankType::BicIiv,
             cutoff: None,
+            penalties: Penalties::default(),
         }
     }
 }
@@ -240,6 +243,7 @@ impl IivsearchOptions {
                 Some(other) => other,
             },
             cutoff: config.rank.cutoff,
+            penalties: config.rank.penalties(),
         };
         options.validate()?;
         Ok(options)
@@ -286,7 +290,7 @@ impl IivsearchOptions {
         if self.starts == 0 {
             return Err("[run] retries: the starts per candidate must be at least 1".into());
         }
-        self.rank.criterion()?;
+        self.penalties.validate()?;
         Ok(())
     }
 
@@ -300,9 +304,7 @@ impl IivsearchOptions {
 
     /// The runner criterion this ranks on.
     pub fn criterion(&self) -> Criterion {
-        self.rank
-            .criterion()
-            .expect("validated: the rank type has a criterion")
+        self.rank.criterion_with(self.penalties)
     }
 
     /// The starts a candidate whose largest block has `block_size` η gets.
@@ -953,6 +955,7 @@ pub fn run_iivsearch(
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base)?;
     let result = search(&fitter, space, &options, run.progress)?;

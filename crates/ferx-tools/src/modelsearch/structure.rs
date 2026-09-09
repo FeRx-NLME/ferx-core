@@ -761,7 +761,7 @@ pub fn allowed(
 /// with every absorption, and so does ferx. `SEQ-ZO-FO` is in Pharmpy's table
 /// twice and in none of ferx's, because it is not a coordinate ferx builds at
 /// all — the coverage check refuses it before a path is enumerated.
-fn pharmpy_incompatible(a: &FeatureKey, b: &FeatureKey) -> bool {
+pub(crate) fn pharmpy_incompatible(a: &FeatureKey, b: &FeatureKey) -> bool {
     use FeatureKey::*;
     let pair = |x: &FeatureKey, y: &FeatureKey| {
         matches!(

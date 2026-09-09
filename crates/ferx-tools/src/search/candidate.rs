@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use ferx_core::edit::ModelText;
 
+use super::penalty::Penalties;
+
 /// The search-space coordinates of one candidate: `ABSORPTION = FO`,
 /// `CL-WT = pow`, `PERIPHERALS = 1`, …
 ///
@@ -228,7 +230,10 @@ pub(crate) fn hex(bytes: &[u8; 32]) -> String {
 /// `calculate_bic` conventions; see [`BicType`]. Every variant is
 /// **lower-is-better**, which is what lets a search compare them without
 /// knowing which one it was configured with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: [`Penalized`](Self::Penalized) carries its schedule, which is
+/// `f64`s.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Criterion {
     /// The objective function value itself. Only comparable between nested
@@ -239,6 +244,9 @@ pub enum Criterion {
     Aic,
     /// `ferx_core::bic(result, kind)`.
     Bic(BicType),
+    /// pyDarwin's penalized fitness: `OFV` plus a charge per estimated
+    /// parameter and per failure — see [`Penalties`] (#1185).
+    Penalized(Penalties),
 }
 
 impl Default for Criterion {
@@ -256,10 +264,11 @@ impl Criterion {
             Criterion::Ofv => result.ofv,
             Criterion::Aic => result.aic,
             Criterion::Bic(kind) => bic(result, *kind),
+            Criterion::Penalized(p) => p.score(result),
         }
     }
 
-    /// A short stable label for the table header and the run manifest.
+    /// A short stable label for the table header.
     pub fn label(&self) -> &'static str {
         match self {
             Criterion::Ofv => "ofv",
@@ -268,8 +277,53 @@ impl Criterion {
             Criterion::Bic(BicType::Iiv) => "bic_iiv",
             Criterion::Bic(BicType::Random) => "bic_random",
             Criterion::Bic(BicType::Fixed) => "bic_fixed",
+            Criterion::Penalized(_) => "penalized",
         }
     }
+
+    /// What the run manifest records, so a resume under a different
+    /// criterion is refused: the [`label`](Self::label), plus the whole
+    /// schedule for a penalized criterion — two penalized runs with
+    /// different charges score the same fit differently, and the label
+    /// alone would let one reuse the other's rows.
+    pub fn manifest_key(&self) -> String {
+        match self {
+            Criterion::Penalized(p) => format!("{}{}", self.label(), penalty_key(p)),
+            other => other.label().to_string(),
+        }
+    }
+
+    /// The penalty schedule, for a search that charges the two
+    /// search-level penalties (non-influential genes, crashes) itself.
+    /// `None` for every other criterion.
+    pub fn penalties(&self) -> Option<Penalties> {
+        match self {
+            Criterion::Penalized(p) => Some(*p),
+            _ => None,
+        }
+    }
+}
+
+/// `{theta=10,omega=10,…}` — every field of the schedule, in order, in
+/// Rust's shortest round-trippable float spelling so the key is stable.
+fn penalty_key(p: &Penalties) -> String {
+    format!(
+        "{{theta={},omega={},sigma={},convergence={},covariance={},correlation={},\
+         max_correlation={},condition_number={},max_condition_number={},non_influential={},\
+         crash={},gate={}}}",
+        p.theta,
+        p.omega,
+        p.sigma,
+        p.convergence,
+        p.covariance,
+        p.correlation,
+        p.max_correlation,
+        p.condition_number,
+        p.max_condition_number,
+        p.non_influential,
+        p.crash,
+        p.gate
+    )
 }
 
 /// How the candidates in one [`run`](super::Runner::run) are fitted and judged.

@@ -21,9 +21,47 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles
+  its `½·log|H̃|` grid-response gradient term analytically instead of rebuilding the anchor at
+  `x ± h` for every free population parameter.** `H̃` is bilinear in first-order prediction
+  sensitivities, so unlike the exact-anchor Laplace case its derivative needs no third-order
+  jet — one extra ordinary analytic-provider evaluation replaces `2·n_free` perturbed-anchor
+  rebuilds. The analytic and finite-difference routes agree to within the finite-difference
+  route's own truncation error (and this is on by default); converged estimates, OFVs and
+  standard errors may move within the convergence tolerance since the optimizer trajectory
+  itself changes (e.g. an ODE fixture converges in 37 outer iterations instead of 53); measured
+  on warfarin fixtures: 30–50% fewer
+  analytic-provider calls, and on an ODE model roughly 2× less provider time and ~30% faster
+  wall-clock, converging in fewer outer iterations. Also covers custom/time-varying σ
+  magnitude, `iiv_on_ruv` (including combined with an M3-censored row), M3-BLOQ including its
+  σ-direct derivative, correlated residuals (`block_sigma`), and **IOV** (the stacked `[η, κ]`
+  system, via a dedicated joint-prior assembly) — only mixture models keep the pre-existing
+  finite-difference route. `laplace`/AGQ's exact-Hessian
+  anchor gained the same analytic route for closed-form and **ODE** models (opt-in via
+  `FERX_AGQ_GRID_RESPONSE=analytic` — no repeatable wall-clock win was measured there, so it
+  is not the default; its value is an exact, FD-noise-free gradient) (#251).
+
 - **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
 
 ### Added
+- **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or
+  exhaustive enumeration, ranked on pyDarwin's penalized fitness (#1185, P6 of #1175).**
+  The `.ferxsearch` space is laid out as one grid — every structural category an axis with
+  its values as alleles, every `COVARIATE?` pair an axis with `none` and each of its forms —
+  and searched globally: `[globalsearch] algorithm = "exhaustive"` fits every point, `"ga"`
+  runs a seeded genetic algorithm (tournament selection, one-point crossover, mutation,
+  elitism, fitness sharing, a periodic one-gene downhill search; every knob under
+  `[globalsearch.ga]`). `[rank] type = "penalized"` is now implemented for **every** search
+  tool: OFV + 10 per estimated θ / Ω / σ element + 100 for non-convergence, a failed or
+  absent covariance step, a parameter correlation above 0.95 or a condition number above
+  1000, with `[rank.penalties]` overlaying any charge. The global search charges three
+  more things the criterion cannot see — a gene that changes nothing in the rendered model,
+  a candidate that cannot be built, and a fit the strictness gate refused — so an
+  unselectable model steers the search without winning it. Candidates go through the same
+  runner, journal and canonical-hash dedup as the stepwise tools; `--resume` on the seeded GA
+  refits nothing. `models.csv`, `generations.csv`, `final.ferx` and every candidate under
+  `models/` are written; `docs/tools/global-search.qmd` says when a global search beats the
+  stepwise tools and when it does not.
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences
@@ -534,6 +572,7 @@ section of the SDLC for the versioning policy).
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
 ### Performance
+- **`[covariate_nn]` models with a time-varying network input are analytic on both FOCE/FOCEI loops.** The event-driven sensitivity walk no longer counts the generated weight thetas against its dual-width cap: it seeds the declared thetas, etas and one axis per network output, chains the weight columns in per event through the network's backprop Jacobian, and walks the theta columns in chunks. Subjects that used to fall back to reconverged finite differences (~300× per objective evaluation on the vancomycin DCM) now take the exact gradient; models without a network are numerically unchanged. The network forward pass and backprop also drop their per-call `nalgebra` matrix rebuilds for plain slice loops (bit-identical outputs), and the chunked walk evaluates each event's PK values once per subject rather than once per chunk (#1300).
 - Generic analytical FOCEI gradients with exactly four or six differentiated PK
   parameters, one or two of them IIV-bearing, now omit the unused Hessian block
   among IIV-free parameters (#829).
