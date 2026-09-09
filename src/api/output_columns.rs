@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -39,32 +38,28 @@ use std::time::Instant;
 /// Time after the most recent **absorbed** dose at time `t` (SS-aware), shifting
 /// each dose by its own lag from `dose_lagtimes`. Missing entries — a slice
 /// shorter than `subject.doses`, or `&[]` — default to zero lag. Returns NaN when
-/// no dose has been absorbed by `t`. Shared by the per-observation TAD column and
+/// no dose has a referent at `t`. Shared by the per-observation TAD column and
 /// the model-based integral grid so both apply identical per-dose-lag logic.
+///
+/// Delegates to [`crate::dosing::tad_at`], which folds the same per-dose
+/// [`crate::dosing::tad_referent`] the ODE predictors integrate under — so the reported
+/// column and the injected `TAD` cannot disagree. They did before #1126: inside a seeded
+/// steady-state dose's pre-arrival window this fold had no candidate at all and the sdtab
+/// cell came out **blank**, while the predictors were integrating under an anchor of their
+/// own. `tad_at`'s no-referent answer is `NaN`, the sdtab convention, rather than the
+/// predictors' first-arrival fallback, which exists to keep an integration finite and would
+/// report a negative `TAD` in a column that means "not yet dosed".
+///
+/// Kept as a named wrapper rather than inlined at its two call sites (the per-observation
+/// column and the `[derived]` integral grid) because those call it with a `&Subject` and the
+/// doc above is what they are reading.
+///
+/// Not to be confused with `io::output`'s sdtab **fallback**, which is the branch taken when
+/// no lagged per-observation `TAD` was computed at all: that one reads
+/// [`crate::types::Subject::data_tad`], which is lag-free and carries #1182's tie convention.
+/// This is the lag-aware column those values populate.
 fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
-    let last_dose_eff = subject
-        .doses
-        .iter()
-        .enumerate()
-        .filter_map(|(d, dose)| {
-            let lag = dose_lagtimes.get(d).copied().unwrap_or(0.0);
-            if dose.time + lag > t + 1e-12 {
-                return None;
-            }
-            let eff = if dose.ss && dose.ii > 0.0 {
-                let elapsed = t - (dose.time + lag);
-                t - elapsed.rem_euclid(dose.ii)
-            } else {
-                dose.time + lag
-            };
-            Some(eff)
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-    if last_dose_eff.is_finite() {
-        t - last_dose_eff
-    } else {
-        f64::NAN
-    }
+    crate::dosing::tad_at(&subject.doses, dose_lagtimes, t)
 }
 
 /// Compute TAFD (time after first dose) and TAD (time after last dose, SS-aware)
@@ -135,12 +130,17 @@ pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
 
 /// Compute all [derived] and [output] columns post-fit, storing results in
 /// each SubjectResult's `extra_columns` field.
+/// `mixest` (#985) is the fitted per-subject mixture class (0-based); `None` for
+/// non-mixture fits. `[derived]` / `[output]` expressions and `pk_param_fn` can
+/// branch on `MIXNUM`, so each subject's columns are evaluated under its own class
+/// guard rather than the class-1 default.
 pub(crate) fn compute_extra_output_columns(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
     kappas_per_subject: &[Vec<DVector<f64>>],
     subjects: &mut [SubjectResult],
+    mixest: Option<&[usize]>,
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
 
@@ -151,6 +151,9 @@ pub(crate) fn compute_extra_output_columns(
         .collect();
 
     for (si, sr) in subjects.iter_mut().enumerate() {
+        let _mix_guard = mixest
+            .and_then(|m| m.get(si))
+            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
         let subject = &population.subjects[si];
         let eta_hat = sr.eta.as_slice();
         let n_obs = sr.ipred.len();
@@ -600,8 +603,35 @@ pub(crate) fn compute_extra_output_columns(
                                 // represent parameters that vary along the grid, while
                                 // ipred honours each event's time via the event-driven
                                 // path. Return empty so every grid point evaluates to
-                                // NaN — the same convention as IOV/TV/reset above, and
-                                // consistent with compute_predictions_with_states (#610).
+                                // NaN — the same convention as IOV/TV/reset above.
+                                //
+                                // **Deliberately the narrow predicate.** The condition
+                                // this arm needs is "the PK *snapshot* is not valid
+                                // across the grid", which is a property of
+                                // `pk_param_fn` — exactly what the narrow predicate
+                                // asks. An `[odes]` RHS that reads `TAD`/`TAFD`/`T`/
+                                // `TIME` does *not* make `pk_param_fn` time-dependent:
+                                // the clock it reads is the solver's, and the dense
+                                // driver sets its own `TAD` anchor at every segment
+                                // boundary — `apply_segment_boundary` calling
+                                // `tad_anchor`, which carries #1073's finite
+                                // first-arrival fallback. (Not `integrate_segment`:
+                                // that is the *event-driven* engine's, and the dense
+                                // driver never calls it.) For such a model the `t=0`
+                                // snapshot is exact and the dense arm below returns a
+                                // correct number, so widening to
+                                // `pk::model_uses_time_anywhere` here would replace it
+                                // with an all-NaN column.
+                                //
+                                // Nor is `compute_predictions_with_states` a precedent
+                                // for widening: its ODE branch has two arms and *both*
+                                // return populated states — `uses_time` routes to
+                                // `ode_predictions_event_driven_with_states`, which
+                                // still computes states via `ode_dense_solve_states`.
+                                // The `vec![]` convention lives only in its analytical
+                                // branch. Widening here would make a `[derived]`
+                                // integral NaN while the adjacent per-obs
+                                // `compartments[i]` column stayed finite.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
                                 // Time-independent params: one snapshot (t=0) is exact
@@ -615,6 +645,15 @@ pub(crate) fn compute_extra_output_columns(
                                     subject,
                                     &grid_times,
                                 )
+                            } else if model.is_algebraic() {
+                                // A compartment-free model (#811) has no compartments to
+                                // report on the grid, and its `pk_model` is a placeholder the
+                                // superposition below would read as a real one — returning
+                                // all-zero one-compartment amounts as if they were this
+                                // model's state. Empty → NaN, the convention every other
+                                // out-of-scope case here uses. Mirrors the per-obs branch in
+                                // `compute_predictions_with_states`.
+                                vec![]
                             } else if !model.analytical_init.is_empty() {
                                 // Analytical model + [initial_conditions] baseline (#521):
                                 // the superposition state reconstruction does not seed the

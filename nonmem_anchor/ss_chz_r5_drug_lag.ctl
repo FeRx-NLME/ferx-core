@@ -1,0 +1,62 @@
+$PROBLEM SS dose x ODE-accumulated hazard (#1220 item 1) -- r5_drug_lag: mid-record SS dose with ALAG1 = 24 > II = 12
+;
+; NO $PK ALAG HERE, ON PURPOSE. The ferx twin (ss_chz_ss2_lag.csv +
+; ss_chz_drug_lag_fit.ferx) carries ALAG1 = 24; this train is a plain pulse
+; train placed at that side's lagged ARRIVALS. For lag >= II ferx clamps the
+; seed phase to 0 and so does NONMEM, so an SS record means "pulses ending on
+; the record, then this dose's own pulse at t + lag" -- NOT a shifted train.
+; No shifted train reproduces it; an earlier draft with ALAG1 = 14 on both
+; sides was 2.4x off at ferx t = 49.9.
+;
+; TWO DELIBERATE HOLES, both load-bearing -- do not "repair" either:
+;   * train5.csv has NO dose at T = 612 (ferx t = 12). The ferx record that
+;     would arrive there precedes the first record, so that pulse exists on
+;     neither side.
+;   * ss_chz_ss2_lag.csv has NO record at 216 or 228. 216's lagged arrival
+;     (240) is the second SS record's own seed pulse; carrying both would
+;     dose it twice.
+; The IPRED comparison in tests/ss_chz_nonmem_anchor.rs is what catches a
+; mistake in either, which is why that test reads IPRED before H.
+$INPUT ID TIME DV EVID AMT CMT RATE MDV SS II
+$DATA train5.csv IGNORE=@
+$SUBROUTINES ADVAN13 TOL=9
+$MODEL
+  COMP=(DEPOT,DEFDOSE)
+  COMP=(CENTRAL)
+  COMP=(CHZ)
+$PK
+  CL   = THETA(1)*EXP(ETA(1))
+  V    = THETA(2)
+  KA   = THETA(3)
+  H0   = THETA(4)
+  BETA = THETA(5)
+  K20  = CL/V
+  TREC = 600
+$DES
+  CONCD   = A(2)/V
+  DADT(1) = -KA*A(1)
+  DADT(2) =  KA*A(1) - K20*A(2)
+  GATE = 0
+  IF (T.GE.TREC) GATE = 1
+  DADT(3) =  GATE*H0*EXP(BETA*CONCD)
+$ERROR
+  CONC = A(2)/V
+  HAZ  = H0*EXP(BETA*CONC)
+  CHZ  = A(3)
+  SUR  = EXP(-CHZ)
+  IPRED = CONC
+  F_FLAG = 0
+  IF (CMT.EQ.3) F_FLAG = 1
+  Y = IPRED*(1.0 + EPS(1))
+  IF (CMT.EQ.3.AND.DV.EQ.1) Y = SUR*HAZ
+  IF (CMT.EQ.3.AND.DV.EQ.0) Y = SUR
+$THETA
+  1.00 FIX
+  10.0 FIX
+  1.00 FIX
+  0.02 FIX
+  0.5 FIX
+$OMEGA 0 FIX
+$SIGMA 0.01
+$ESTIMATION METHOD=1 LAPLACE INTER NUMERICAL SLOW MAXEVAL=0 POSTHOC PRINT=1 NOABORT
+$TABLE ID TIME CMT DV EVID IPRED CHZ HAZ MDV NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE15.8 FILE=ss_chz_r5_drug_lag.tab

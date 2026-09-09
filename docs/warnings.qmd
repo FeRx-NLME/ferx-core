@@ -1,3 +1,7 @@
+---
+pagetitle: "ferx warnings and diagnostic codes"
+---
+
 # Warnings
 
 A fit collects non-fatal issues into two parallel channels on `FitResult`:
@@ -35,7 +39,11 @@ when empty.
 
 ## Warning codes {#warning-codes}
 
-Each `WarningCode` token, what it flags, and a typical response.
+Each `WarningCode` token, what it flags, and a typical response. The groups below
+are for reading convenience only — the token is what a consumer branches on, and
+a code never moves between groups in a way that changes its `category` string.
+
+### Convergence and covariance {#codes-convergence}
 
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
@@ -45,19 +53,46 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `covariance_step` | Info | Covariance-step informational note (e.g. evaluation cost). | None. |
 | `condition_number` | Critical | Ill-conditioned covariance / high condition number. | Over-parameterized — drop a random effect or covariate. |
 | `optimizer_health` | Warning | Trust-radius collapse / degeneracy. | Try a different optimizer or re-scale parameters. |
+| `vi_bad_basin` | Critical | VI's final ELBO tightness check found that a flat objective is an unusable variational bound, not convergence. | Reject the fit; use better starting values or initialize VI from a fitted point with `method = [focei, vi]`. |
+
+### Residual and random-effect diagnostics {#codes-residuals}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. |
 | `eta_normality` | Warning | ETA departs from normality. | Consider a mixture or transform. |
+
+### Censoring, resampling, and experimental features {#codes-methods}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `experimental` | Warning | An experimental feature (SDE, neural-network) was used. | Treat results with caution; validate. |
 | `bloq_method` | Warning | BLOQ / M3 censoring caveat. | Confirm the censoring semantics match intent. |
 | `sir` | Warning | SIR failed or was requested without a covariance. | Ensure a covariance exists before requesting SIR. |
 | `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
+
+### Shrinkage and parameter identifiability {#codes-identifiability}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
 | `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
 | `boundary_estimate` | Warning | One or more THETA estimates are pinned to an optimizer bound. | Non-identifiability or a too-tight bound — inspect; relax the bound or simplify. |
+| `parameter_at_runaway_guard` | Critical / Warning | A free coordinate is pinned to a hidden optimizer guard (implicit THETA cap, OMEGA / SIGMA rail), with a `verdict` the side does not decide. | `collapse` (`Warning`): remove or simplify it. `runaway` (`Critical`): `converged: false` — reject; revisit model, data, inits; for SIGMA, rescale DV. |
 | `inflated_rse` | Warning | One or more THETA estimates have RSE > ~50%. | Imprecisely estimated — often over-parameterization; consider simplifying. |
 | `high_correlation` | Warning | One or more THETA (fixed-effect) pairs have \|correlation\| ≥ 0.95. | Over-parameterization / non-identifiability — fix or remove one of each pair. |
+
+### Dataset and model structure {#codes-structure}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
 | `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
+
+### Run configuration and informational notes {#codes-run}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `gradient_fallback` | Info | A gradient / sampler fallback was taken. | None; note the slower path. |
 | `mu_referencing` | Warning / Info | Missing or partial mu-referencing. | Prefer `CL = TVCL * exp(ETA_CL)` forms for SAEM/Bayes. |
 | `optimizer_config` | Warning / Info | `global_search` config note or failure. | Check the global-search setup if disabled unexpectedly. |
@@ -65,8 +100,20 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `cancelled` | Info | Run cancelled by the user. | None. |
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
 | `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. |
+
+### Absorption diagnostics {#codes-absorption}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `flip_flop` | Warning | A transit / inverse-Gaussian absorption closed form entered the flip-flop regime (disposition rate ≥ the tilting abscissa). Either auto-rerouted to the ODE twin (informational) or — for a twin-less model at a subject's fitted EBE (#785) — a silently degenerate likelihood contribution. | Rewrite as an explicit ODE `transit()`/`igd()` model (which reroutes per subject), or check the named subject's MTT/CL (transit) or MAT/CV²/CL (IG) estimates. |
+| `absorption_twin_declined` | Warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model keeps no ODE fallback (#1008). The fit itself is an ordinary closed-form fit; what is lost is the reroute, so a subject needing it (time-varying covariates, a `TIME`-dependent parameter, IOV, SS / infusion doses, the flip-flop regime) is rejected with an explicit error. | Read the quoted reason — usually an individual parameter named after a twin state (`CENTRAL`, `PERIPH`); rename it to restore the twin. |
+
+### Solver, numerics, and unclassified {#codes-solver}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
 | `flat_parameter` | Warning | A non-fixed THETA has an ≈ 0 outer gradient at the initial estimate — it never reaches the objective (unmapped, or dropped from the structural / scaling model). The pre-flight guard froze it at its initial value so the remaining parameters could estimate, instead of the whole fit dying on an eval-1 optimizer `Failure` (#826). | Map the named parameter into the model, or remove it. Its reported estimate is just its initial value (SE = N/A). |
+| `ode_solver` | Warning / Info | The ODE solver's own health at the final estimates (#1080). **Warning** when steps clamped at the minimum step size (a stability-limited segment whose un-integrated tail is freeze-padded), when a segment stopped before its requested end, when `ode_stiff_abort_after` cut segments short, or when `ode_method = auto` discarded an escalation and re-solved it explicitly — including when only its **analytic derivatives** overflowed, its values staying finite — and when that re-solve failed too. Also **Warning** when a prediction walk was abandoned *before integrating* because the subject's timeline could not be ordered — a `NaN` or infinite dose time, lagtime, route lag, or infusion duration (#1234). That case is the only one here whose predictions are `NaN` rather than merely inaccurate, and it leaves every step counter at zero, so it is reported by its own counter (`abandoned_non_finite_timeline`) rather than inferred from the others. **Info** when `auto` escalated and everything worked (a separate `W_ODE_SOLVER_ESCALATION_NOTE` token, so the severity survives re-classification) — routine on a stiff model, but a decision you never asked for and cannot otherwise see. Both severities report how many segments changed stepper **part-way through** (`ode_auto_switch`, default on): steps before a switch were taken by a different method than those after. | A rejected escalation means the probe was right about the stiffness and wrong about the method: name `ode_method = rodas5p` (or `rosenbrock23`). Non-zero `auto_stiff_rejected_jets` is the exception: the method worked, the *sensitivities* overflowed — check units and scaling, not `ode_method`. Non-zero `auto_fallback_failed`: neither attempt gave a usable trajectory; do not trust the fit. Clamps with no rejection mean the explicit stepper is stability-limited — try a stiff method, or loosen `ode_reltol` / `ode_abstol`. Non-zero `abandoned_non_finite_timeline` is not a solver setting at all: some subject's timeline is unorderable, so check the dose records and any exponential covariate model on `ALAG` / `F` / `D` / `R` for a value that overflows at typical covariates. |
 | `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
 
 ## Details payloads {#details}
@@ -82,9 +129,11 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
 | `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
 | `boundary_estimate` | `parameters` (array of `{parameter, estimate, bound, side}`) |
+| `parameter_at_runaway_guard` | `guard_space` (`"packed"`), `parameters` (array of `{parameter, estimate, packed_estimate, packed_guard, side, verdict}`) |
 | `inflated_rse` | `threshold_pct`, `parameters` (array of `{parameter, estimate, se, rse_pct}`) |
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
+| `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
 | `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
 | `condition_number` | `condition_number` |
 

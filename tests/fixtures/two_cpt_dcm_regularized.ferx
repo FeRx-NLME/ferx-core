@@ -1,0 +1,51 @@
+# Two-cpt oral DCM with a small MLP mapping (WT, CRCL) → the five PK params.
+#
+# Shared fixture for the covariate-NN regularization tests
+# (`src/nn/mod.rs::regularizer_fit_tests`, `tests/nn_regularization.rs`, and the
+# trust-region end-to-end gradient check), loaded with `include_str!` so the
+# three cannot drift. Pair with `data/two_cpt_oral_cov.csv`.
+#
+# `center` / `scale` are load-bearing, not cosmetic. `WT` runs 45–90 and `CRCL`
+# 46–82 on that dataset, so on raw inputs the Glorot-initialised first layer
+# produces pre-activations spanning ±170 — `tanh` is clipped at ±1 for every
+# subject and the network is constant *by saturation* before the fit starts,
+# making a λ = 0 baseline flat for the wrong reason. z-scoring puts layer 1 in
+# tanh's responsive band. The `nn_smooth` curvature grid is built in this same
+# normalised input space, which is also what makes the fixture a non-degenerate
+# check of that: a grid built on raw covariates would probe the saturated region
+# and the penalty would silently read ≈ 0.
+
+[parameters]
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]
+  outputs    = [CL, V1, Q, V2, KA]
+  layers     = [4]
+  activation = tanh
+  output     = softplus
+  center     = [70, 86]
+  scale      = [12, 23]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
+  Q  = TYPICAL_PK.Q  * exp(ETA_Q)
+  V2 = TYPICAL_PK.V2 * exp(ETA_V2)
+  KA = TYPICAL_PK.KA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  maxiter = 50
+  covariance = false

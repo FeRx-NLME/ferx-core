@@ -18,30 +18,81 @@ fn sim_outcome_category_and_count_variants_construct() {
     );
 }
 
-/// `continuous_value()` returns NAN for the non-Gaussian outcomes. The
-/// misuse `debug_assert` fires in debug builds, so this is asserted only when
-/// debug-assertions are off — the profile CI and coverage use (`ci-test`,
-/// which inherits `release`), where the NAN branch is actually taken.
-#[test]
-#[cfg(not(debug_assertions))]
-fn sim_outcome_category_and_count_continuous_value_is_nan() {
-    assert!(SimOutcome::Category { state: 3 }
-        .continuous_value()
-        .is_nan());
-    assert!(SimOutcome::Count { count: 9 }.continuous_value().is_nan());
+/// Calls `f` and reports whether the misuse `debug_assert!` inside it fired.
+///
+/// `continuous_value()` on a non-Gaussian outcome has two correct behaviours and
+/// which one you get is a property of the profile: with the guards live it panics,
+/// with them compiled out it returns NaN. Both matter — the guard is the developer
+/// signal, the NaN is what a release user actually gets — so the tests below assert
+/// whichever the current build promises rather than switching themselves off.
+///
+/// They used to be `#[cfg(not(debug_assertions))]`, which was correct while every
+/// CI profile inherited `release`. #1248 moved the coverage jobs onto `ci-cov`,
+/// where the guards ARE live, and a `cfg`-gated test does not fail there — it
+/// silently stops existing, in the only jobs that ran it. Measured at the time:
+/// three tests, and `src/types.rs:3490` and `:3494` went from 2 hits to 0.
+///
+/// The panic hook is left ALONE, so under a guarded profile each expected panic
+/// prints its message to the test log. That noise is deliberate. The obvious
+/// tidier version — `take_hook`, install a silent one, restore — is not merely
+/// racy in the "a concurrent failure loses its message" sense: `set_hook` is
+/// process-global and these expected-panic paths can run concurrently in the same
+/// lib-test process, so the interleaving where A takes the normal hook, B takes
+/// the *silent* hook A installed, A restores normal and B restores silent leaves
+/// the whole process permanently silenced. Restoring immediately does not help;
+/// only a shared lock would, and three expected panic messages are cheaper than
+/// that machinery. Raised by review on PR #1293.
+fn guard_fired(f: impl FnOnce() -> f64) -> Result<f64, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
 }
 
-/// The TTE `Event` outcome likewise has no continuous value. Same profile
-/// caveat as above (the debug-assert fires in debug builds).
+/// `continuous_value()` on the non-Gaussian outcomes: the misuse guard fires where
+/// `debug_assert!` is live, and the NAN branch is taken where it is not.
 #[test]
-#[cfg(all(feature = "survival", not(debug_assertions)))]
+fn sim_outcome_category_and_count_continuous_value_is_nan() {
+    for out in [
+        SimOutcome::Category { state: 3 },
+        SimOutcome::Count { count: 9 },
+    ] {
+        let got = guard_fired(|| out.continuous_value());
+        if cfg!(debug_assertions) {
+            assert!(
+                got.is_err(),
+                "{out:?}: the misuse `debug_assert!` in continuous_value() did not \
+                 fire, even though this build has debug-assertions on"
+            );
+        } else {
+            assert!(
+                got.expect("no guard in a release-derived build").is_nan(),
+                "{out:?}: continuous_value() must return NAN once the guard is \
+                 compiled out"
+            );
+        }
+    }
+}
+
+/// The TTE `Event` outcome likewise has no continuous value. Same two behaviours
+/// as above.
+#[test]
+#[cfg(feature = "survival")]
 fn sim_outcome_event_continuous_value_is_nan() {
-    assert!(SimOutcome::Event {
+    let out = SimOutcome::Event {
         time: 1.0,
         observed: true,
+    };
+    let got = guard_fired(|| out.continuous_value());
+    if cfg!(debug_assertions) {
+        assert!(
+            got.is_err(),
+            "the misuse `debug_assert!` for the Event outcome did not fire"
+        );
+    } else {
+        assert!(
+            got.expect("no guard in a release-derived build").is_nan(),
+            "continuous_value() on an Event outcome must return NAN once the guard \
+             is compiled out"
+        );
     }
-    .continuous_value()
-    .is_nan());
 }
 
 /// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:
@@ -150,10 +201,12 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         pk_only_times: vec![],
         pk_only_covariates: vec![],
         reset_times: vec![],
+        reset_covariates: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         // Row 0 = PK observation, row 1 = covariate pseudo-observation.
         fremtype: vec![0, 100],
         obs_records: vec![],
@@ -201,10 +254,12 @@ fn sim_residual_variance_applies_custom_magnitude() {
         pk_only_times: vec![],
         pk_only_covariates: vec![],
         reset_times: vec![],
+        reset_covariates: Vec::new(),
         cens: vec![0],
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         fremtype: vec![0],
         obs_records: vec![],
     };
@@ -478,11 +533,102 @@ fn classify_warning_flat_parameter_is_warning() {
     assert_eq!(w.source_method.as_deref(), Some("parameters"));
 }
 
+/// #1008: a declined absorption ODE twin gets its own code rather than the `general`
+/// fallback, so a consumer (the R wrapper, an agent) can branch on "this model kept no
+/// ODE fallback" instead of matching prose. Built through the real emitter rather than a
+/// pasted copy, so a reworded message cannot drift away from the token it is keyed on.
+#[test]
+fn classify_warning_absorption_twin_declined_is_warning() {
+    let w = classify_warning(&super::absorption_twin_declined_warning(
+        "[odes]: name `CENTRAL` collides with a previously-declared state (case-insensitive); \
+         state, individual-parameter, and ODE-block intermediate names must all be distinct.",
+    ));
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "absorption_twin_declined");
+}
+
+/// The decline arm sits ahead of *every* prose arm because the message carries the twin
+/// parser's own error text verbatim (#1027 review). A twin error that happens to contain a
+/// substring a later arm matches — here `"ill-conditioned"`, which would otherwise classify
+/// `Critical` / `condition_number` — must still read as a twin decline.
+#[test]
+fn classify_warning_twin_decline_beats_prose_arms_in_the_reason() {
+    for reason in [
+        "[odes]: the Jacobian is ill-conditioned at the initial state",
+        "the fit did not converge in the re-emitted [fit_options]",
+        "covariance failed to parse",
+        "condition number check rejected the block",
+    ] {
+        let w = classify_warning(&super::absorption_twin_declined_warning(reason));
+        assert_eq!(
+            w.category.as_str(),
+            "absorption_twin_declined",
+            "a twin decline whose reason says {reason:?} must not be claimed by a prose arm"
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+    }
+}
+
+/// The reason round-trips out of the warning verbatim, so the up-front rejection messages
+/// in `api::validation` can quote it (#1027 review). Also pins the terminator normalisation:
+/// a reason with no sentence-ending punctuation gets one, so it cannot run into the fixed
+/// text around it.
+#[test]
+fn absorption_twin_decline_reason_round_trips() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    assert_eq!(
+        super::absorption_twin_decline_reason(&model),
+        None,
+        "a model with no decline warning has no reason"
+    );
+    model
+        .parse_warnings
+        .push(super::absorption_twin_declined_warning(
+            "two parameters map to the V slot",
+        ));
+    assert_eq!(
+        super::absorption_twin_decline_reason(&model),
+        Some("two parameters map to the V slot."),
+        "the reason comes back verbatim, with a terminator added"
+    );
+    // An already-terminated reason is not double-punctuated.
+    let terminated = super::absorption_twin_declined_warning("names must all be distinct.");
+    assert!(
+        terminated.ends_with("names must all be distinct."),
+        "got: {terminated}"
+    );
+}
+
 #[test]
 fn classify_warning_dw_is_warning() {
     let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
     assert_eq!(w.severity, WarningSeverity::Warning);
     assert_eq!(w.category.as_str(), "dw_autocorrelation");
+}
+
+#[test]
+fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
+    // #1021: the proposal-conditioning notes are prefixed `SIR:` / `SIR fallback:`
+    // and match none of the older "sir failed" / "sir requested" phrasings. The
+    // shrinkage one also name-drops "the covariance step", so it must not be
+    // claimed by a covariance arm.
+    let w = classify_warning(
+        "SIR: proposal was shrunk in 3 direction(s) so draws stay inside the parameter \
+         bounds [TVKA -0.74 (sd 6.15e3 → 2.89e0)]. Those directions come from \
+         eigenvalue-floored (non-identified) curvature in the covariance step; the SIR \
+         CIs along them understate the true uncertainty.",
+    );
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+    assert_eq!(w.severity, WarningSeverity::Warning);
+
+    let w = classify_warning(
+        "SIR: proposal covariance is rank-deficient beyond the FIX-ed parameters: 1 \
+         direction(s) carry no uncertainty [TVCL +0.71, TVV -0.70].",
+    );
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+
+    let w = classify_warning("SIR fallback: proposal was shrunk in 1 direction(s).");
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
 }
 
 #[test]
@@ -582,6 +728,39 @@ fn classify_warning_eta_shrinkage_is_word_bounded() {
     );
 }
 
+#[test]
+fn classify_warning_recognizes_internal_runaway_guard() {
+    let warning =
+        classify_warning("Internal optimizer parameter guard reached by estimate(s): PROP_ERR");
+    assert_eq!(warning.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(warning.severity, WarningSeverity::Warning);
+
+    // #1118: each listed hit carries its verdict, and a runaway — the one that
+    // demotes `converged` — classifies Critical even when the entry reaches this
+    // path as a flat string (a spliced multi-start warning, say) instead of the
+    // native typed entry.
+    let upper = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
+         (estimate 148.4132; packed coordinate 5.0000 at upper guard, runaway).",
+    );
+    assert_eq!(upper.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(upper.severity, WarningSeverity::Critical);
+
+    let lower = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
+         (estimate 0.0003; packed coordinate -8.0000 at lower guard, collapse).",
+    );
+    assert_eq!(lower.severity, WarningSeverity::Warning);
+
+    // #1205 review: the verdict, not the side, is what carries the severity —
+    // an Ω off-diagonal at its *lower* rail is a runaway and must reach Critical.
+    let off_diag = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): ETA_CL~ETA_V \
+         (estimate -10.0000; packed coordinate -10.0000 at lower guard, runaway).",
+    );
+    assert_eq!(off_diag.severity, WarningSeverity::Critical);
+}
+
 /// #778: the `WarningCode` serde token is a public API an agent / the R
 /// wrapper pins against. This snapshot fails loudly if a variant's token
 /// drifts, and asserts `as_str()` and the serde representation agree.
@@ -595,6 +774,7 @@ fn warning_code_tokens_are_stable() {
         (CovarianceRegularized, "covariance_regularized"),
         (ConditionNumber, "condition_number"),
         (OptimizerHealth, "optimizer_health"),
+        (ViBadBasin, "vi_bad_basin"),
         (DwAutocorrelation, "dw_autocorrelation"),
         (EtaNormality, "eta_normality"),
         (Experimental, "experimental"),
@@ -604,6 +784,7 @@ fn warning_code_tokens_are_stable() {
         (EpsShrinkage, "eps_shrinkage"),
         (EtaShrinkage, "eta_shrinkage"),
         (BoundaryEstimate, "boundary_estimate"),
+        (ParameterAtRunawayGuard, "parameter_at_runaway_guard"),
         (InflatedRse, "inflated_rse"),
         (HighCorrelation, "high_correlation"),
         (DataQuality, "data_quality"),
@@ -746,6 +927,49 @@ fn classify_warning_roundtrips_every_engine_message() {
         ),
         (
             "SIR requested but covariance matrix is not available",
+            Warning,
+            "sir",
+        ),
+        // #972: the stranded-SIR-after-a-failed-covariance-step message names
+        // the covariance step and the Hessian, both of which earlier arms in the
+        // chain sniff for. It must still route to "sir", not to
+        // "covariance_failed" / "optimizer_health".
+        (
+            "SIR requested but the covariance step did not succeed and no usable SIR \
+             proposal could be built from it, so SIR could not run — see the \
+             covariance warning above for the cause.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR requested but not run: Bayesian estimation reports posterior \
+             credible intervals instead of a Hessian-based covariance, which SIR \
+             would have to draw from.",
+            Warning,
+            "sir",
+        ),
+        // #1021: proposal-conditioning diagnostics. The shrinkage message names
+        // "the covariance step", which earlier arms sniff for — it must still
+        // route to "sir".
+        (
+            "SIR: proposal was shrunk in 3 direction(s) so draws stay inside the \
+             parameter bounds [TVKA -0.74 (sd 6.15e3 → 2.89e0)]. Those directions \
+             come from eigenvalue-floored (non-identified) curvature in the \
+             covariance step; the SIR CIs along them understate the true uncertainty.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR: proposal covariance is rank-deficient beyond the FIX-ed \
+             parameters: 1 direction(s) carry no uncertainty [TVCL +0.71, TVV -0.70]. \
+             SIR holds those parameter combinations at their ML values, so their CIs \
+             are not explored — they are not identified by the data.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR fallback: proposal was shrunk in 1 direction(s) so draws stay inside \
+             the parameter bounds [ADD_ERR +0.99 (sd 4.36e3 → 2.17e0)].",
             Warning,
             "sir",
         ),
@@ -1115,11 +1339,15 @@ fn d2var_df2_scaled_scales_by_mprop_squared() {
     // reproduces the unscaled value; additive stays 0 at any mult.
     let combined = ErrorSpec::Single(ErrorModel::Combined);
     let sigma = [0.3, 2.0];
-    let base = combined.d2var_df2(1, &sigma);
-    assert!((combined.d2var_df2_scaled(1, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
-    assert!((combined.d2var_df2_scaled(1, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
+    // A prediction well away from 0: the combined variance `(f·σ₁)² + σ₂²`
+    // stays far above the `MIN_VARIANCE` floor, so `d2var_df2` returns the raw
+    // `2·σ₁²` and the m² scaling below is unaffected by the floor gate (#958).
+    let f = 5.0;
+    let base = combined.d2var_df2(1, f, &sigma);
+    assert!((combined.d2var_df2_scaled(1, f, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
+    assert!((combined.d2var_df2_scaled(1, f, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
     assert_eq!(
-        ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, &[0.5], &[4.0]),
+        ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, f, &[0.5], &[4.0]),
         0.0
     );
 }
@@ -1642,10 +1870,12 @@ fn bare_subject(id: &str) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: Vec::new(),
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     }
@@ -2197,15 +2427,15 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     // rather than be silently dropped at the twin source's parse default.
     use crate::parser::model_parser::parse_model_string;
 
-    // Lazy branch: sync BEFORE the twin is built, so the override is applied at build time.
-    let mut lazy = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    // The override must reach the twin (built at parse time since #1008).
+    let mut model = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
     assert!(
-        lazy.absorption_ode_equivalent.is_some(),
+        model.absorption_ode_equivalent.is_some(),
         "one_cpt_transit carries an ODE twin"
     );
-    assert!(lazy.n_kappa > 0, "model has IOV");
+    assert!(model.n_kappa > 0, "model has IOV");
     assert!(
-        lazy.ode_spec.is_none(),
+        model.ode_spec.is_none(),
         "the closed-form transit primary is analytic"
     );
 
@@ -2213,11 +2443,11 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     opts.ode_reltol = 1e-10;
     opts.ode_abstol = 1e-11;
     opts.ode_max_steps = 77_777;
-    lazy.sync_ode_solver_opts(&opts);
+    model.sync_ode_solver_opts(&opts);
 
     // IOV ⇒ every subject reroutes to the twin; its OdeSpec must carry the *call-time*
     // tolerances, not the source's 1e-8 / 5000.
-    let twin = lazy.effective_for(&bare_subject("1"));
+    let twin = model.effective_for(&bare_subject("1"));
     let so = twin
         .ode_spec
         .as_ref()
@@ -2244,35 +2474,552 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
         "un-synced twin keeps its source max_steps"
     );
 
-    // Already-built branch: build the twin first, THEN sync — the override must still land
-    // on the cached model (a second fit reusing the model with new tolerances).
-    let mut prebuilt = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
-    let built_reltol = prebuilt
-        .effective_for(&bare_subject("3"))
-        .ode_spec
-        .as_ref()
-        .unwrap()
-        .solver_opts
-        .reltol;
-    assert_eq!(
-        built_reltol, 1e-8,
-        "twin builds at source tol before any sync"
-    );
+    // Re-sync: a second fit reusing the same owned model with *different* tolerances must
+    // overwrite the first sync's stamp, not keep it. (Before #1008 this block tested a
+    // sync-before-build vs sync-after-build ordering; the twin is now always built by the
+    // time anyone can sync, so the only distinction left worth pinning is second-sync-wins.)
     let mut tight = FitOptions::default();
     tight.ode_reltol = 1e-12;
     tight.ode_abstol = 1e-13;
     tight.ode_max_steps = 4242;
-    prebuilt.sync_ode_solver_opts(&tight);
-    let rso = prebuilt
-        .effective_for(&bare_subject("4"))
+    model.sync_ode_solver_opts(&tight);
+    let rso = model
+        .effective_for(&bare_subject("3"))
         .ode_spec
         .as_ref()
         .unwrap()
         .solver_opts;
-    assert_eq!(
-        rso.reltol, 1e-12,
-        "sync after build updates the already-built twin"
-    );
+    assert_eq!(rso.reltol, 1e-12, "a second sync overwrites the first");
     assert_eq!(rso.abstol, 1e-13);
     assert_eq!(rso.max_steps, 4242);
+}
+
+// ── #1111: the `[covariate_model]` data types ──────────────────────────────
+
+/// Every `label()` spelling is what the fit YAML and the block text both use,
+/// so a renamed arm silently changes a written file and the text a user has to
+/// type back. Pinned as data, one assert per variant.
+#[test]
+fn covariate_form_labels_are_the_block_spellings() {
+    let cases = [
+        (CovariateForm::None, "none"),
+        (CovariateForm::Linear, "linear"),
+        (CovariateForm::LinearRelative, "linear_relative"),
+        (CovariateForm::Exponential, "exponential"),
+        (CovariateForm::Power, "power"),
+        (CovariateForm::Hockey, "hockey"),
+        (CovariateForm::Categorical, "categorical"),
+        (CovariateForm::Expr("(WT/70)^0.75".into()), "expr"),
+    ];
+    for (form, label) in &cases {
+        assert_eq!(&form.label(), label);
+    }
+    // Only `categorical` reads a categorical column; the check against the
+    // `[covariates]` declaration is keyed on this.
+    assert!(CovariateForm::Categorical.is_categorical());
+    assert!(!CovariateForm::Power.is_categorical());
+    assert!(!CovariateForm::Expr("1".into()).is_categorical());
+}
+
+#[test]
+fn covariate_stat_labels_and_literals_round_trip() {
+    let cases = [
+        (CovariateStat::Median, "median"),
+        (CovariateStat::Mean, "mean"),
+        (CovariateStat::Min, "min"),
+        (CovariateStat::Max, "max"),
+        (CovariateStat::Mode, "mode"),
+    ];
+    for (stat, label) in &cases {
+        assert_eq!(&stat.label(), label);
+        // A symbolic statistic is not a literal — that is what defers the
+        // relation until a population has been summarised.
+        assert_eq!(stat.literal(), None);
+    }
+    assert_eq!(CovariateStat::Literal(70.0).label(), "70");
+    assert_eq!(CovariateStat::Literal(70.0).literal(), Some(70.0));
+}
+
+#[test]
+fn a_covariate_summary_resolves_every_statistic_it_names() {
+    let summary = CovariateSummary {
+        median: 70.0,
+        mean: 72.5,
+        min: 50.0,
+        max: 95.0,
+        mode: 70.0,
+        levels: vec![50.0, 70.0, 95.0],
+    };
+    assert_eq!(summary.value_of(CovariateStat::Median), 70.0);
+    assert_eq!(summary.value_of(CovariateStat::Mean), 72.5);
+    assert_eq!(summary.value_of(CovariateStat::Min), 50.0);
+    assert_eq!(summary.value_of(CovariateStat::Max), 95.0);
+    assert_eq!(summary.value_of(CovariateStat::Mode), 70.0);
+    // A literal ignores the summary entirely, so a bound model and a
+    // file-literal one build the same expression.
+    assert_eq!(summary.value_of(CovariateStat::Literal(1.5)), 1.5);
+}
+
+#[test]
+fn declared_levels_are_readable_and_auto_is_not() {
+    assert_eq!(
+        CovariateLevels::Declared(vec![0.0, 1.0]).declared(),
+        Some(&[0.0, 1.0][..])
+    );
+    // `auto` has no levels until a population has been seen — that `None` is
+    // what leaves the relation unresolved rather than generating zero θ.
+    assert_eq!(CovariateLevels::Auto.declared(), None);
+    // The pre-`levels` shape of every `[covariates]` line.
+    let decl = CovariateDecl::new("WT", CovariateKind::Continuous);
+    assert_eq!(decl.name, "WT");
+    assert_eq!(decl.kind, CovariateKind::Continuous);
+    assert_eq!(decl.levels, None);
+}
+
+// ── #1064: scale guardrails for models with hundreds of θ ──────────────────
+mod theta_block_scale_guards {
+    use crate::io::output::compact_theta_blocks;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM};
+
+    /// A gather model with `len` levels — an FD-gradient model by construction
+    /// (the analytic provider caps at `MAX_SCALE_AXES` axes).
+    fn wide_model(len: usize) -> crate::types::CompiledModel {
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[{len}](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[PLA_IDX]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        crate::parser::model_parser::parse_full_model(&content)
+            .unwrap()
+            .model
+    }
+
+    #[test]
+    fn free_packed_dim_counts_theta_omega_and_sigma() {
+        let model = wide_model(10);
+        // 12 θ + 1 Ω element + 1 σ.
+        assert_eq!(model.free_packed_dim(), 14);
+    }
+
+    #[test]
+    fn free_packed_dim_matches_separate_packed_masks() {
+        let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0) FIX
+  omega ETA_CL ~ 0.09
+  block_omega (ETA_V, ETA_KA) = [0.04, 0.01, 0.16]
+  kappa KAPPA_CL ~ 0.02
+  kappa KAPPA_V ~ 0.03 FIX
+  sigma ADD_ERR ~ 0.1 FIX
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(ADD_ERR, PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(content)
+            .unwrap()
+            .model;
+        let p = &model.default_params;
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
+        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
+        let exact = fixed
+            .iter()
+            .zip(&structural)
+            .filter(|(f, z)| !**f && !**z)
+            .count();
+        assert_eq!(model.free_packed_dim(), exact);
+        assert_eq!(exact, 7);
+    }
+
+    #[test]
+    fn free_packed_dim_ignores_fixed_omega_coordinates() {
+        // The review case for this guard (#1095): 14 fixed diagonal etas plus
+        // two free thetas and one free sigma is *three* free coordinates. The
+        // original formula counted a dense triangular Omega regardless of FIX
+        // flags and returned 108 — enough on its own to flip `optimizer = auto`
+        // and the default covariance estimator on a model that has nothing to do
+        // with level blocks. This is the assertion that would have caught it.
+        let etas: String = (1..=14)
+            .map(|i| format!("  omega ETA_{i} ~ 0.09 FIX\n"))
+            .collect();
+        let sum: Vec<String> = (1..=14).map(|i| format!("ETA_{i}")).collect();
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+{etas}  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp({})
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+            sum.join(" + ")
+        );
+        let model = crate::parser::model_parser::parse_full_model(&content)
+            .unwrap()
+            .model;
+        assert_eq!(model.n_eta, 14);
+        assert_eq!(
+            model.free_packed_dim(),
+            3,
+            "two free thetas and one free sigma; every omega coordinate is fixed"
+        );
+        // And therefore neither scale guard fires on it.
+        assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
+        assert!(model.free_packed_dim() <= COV_HESSIAN_MAX_DIM);
+    }
+
+    #[test]
+    fn auto_keeps_bobyqa_at_ordinary_dimension() {
+        // The guard must not disturb the historical `auto` behaviour on the
+        // models everything else in this codebase is: `gradient = fd` removes
+        // the analytic gradient, so BOBYQA is what `auto` has always picked.
+        let mut model = wide_model(4);
+        model.gradient_method = crate::types::GradientMethod::Fd;
+        assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::Bobyqa,
+            "small models must be unaffected by the scale guard"
+        );
+    }
+
+    #[test]
+    fn auto_still_prefers_the_analytic_gradient_at_ordinary_dimension() {
+        // A small gather model keeps its exact analytic gradient, so `auto`
+        // resolves to the gradient-based optimizer exactly as it would without
+        // the block.
+        let model = wide_model(4);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    #[test]
+    fn auto_refuses_bobyqa_above_the_dimension_threshold() {
+        // BOBYQA interpolates a quadratic over the whole space; at several
+        // hundred θ the interpolation set alone is the whole budget.
+        let model = wide_model(BOBYQA_MAX_DIM + 10);
+        assert!(model.free_packed_dim() > BOBYQA_MAX_DIM);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    #[test]
+    fn an_explicit_optimizer_is_never_overridden_by_the_guard() {
+        let model = wide_model(BOBYQA_MAX_DIM + 10);
+        for opt in [
+            Optimizer::Bobyqa,
+            Optimizer::Slsqp,
+            Optimizer::Mma,
+            Optimizer::TrustRegion,
+        ] {
+            assert_eq!(opt.resolve_auto(&model, true), opt);
+        }
+    }
+
+    #[test]
+    fn a_wide_gather_model_bails_out_of_the_analytic_dual_ladder() {
+        // The `Dual2<M>` dispatch runs `1..=MAX_SCALE_AXES` axes. A
+        // several-hundred-θ block is past the table, and the contract there is
+        // a clean decline — the caller then finite-differences that subject —
+        // never a truncation to the first 24 axes, which would be a wrong
+        // gradient nothing else in the tree could contradict.
+        let model = wide_model(400);
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let theta = vec![1.0; model.n_theta];
+        let cov = std::collections::HashMap::from([("PLA_IDX".to_string(), 1.0)]);
+        assert!(crate::sens::ode_provider::param_derivatives_at_cov(
+            prog,
+            &model,
+            &cov,
+            &theta,
+            &[0.0]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_narrow_gather_model_stays_in_analytic_sens_scope() {
+        // The gather itself must not knock a model out of scope — `∂f/∂θ_k`
+        // through it is exact under `Dual2` (pinned against finite differences
+        // in `sens::provider::tests::theta_gather_sens`).
+        let model = wide_model(3);
+        assert!(
+            crate::sens::provider::sens_supported(&model),
+            "a gather is analytically differentiable; only the axis count gates dispatch"
+        );
+    }
+
+    #[test]
+    fn cov_hessian_threshold_is_above_the_bobyqa_one() {
+        // The covariance step is quadratic in n where the optimizer is only
+        // linear, but it runs once — so it tolerates more, not less.
+        assert!(COV_HESSIAN_MAX_DIM > BOBYQA_MAX_DIM);
+    }
+
+    #[test]
+    fn compact_theta_blocks_finds_only_large_contiguous_blocks() {
+        let mut names = vec!["TVCL".to_string()];
+        names.extend((1..=30).map(|i| format!("PLACEBO[{i}]")));
+        names.push("TVV".to_string());
+        // A small block stays inline.
+        names.extend((1..=3).map(|i| format!("SMALL[{i}]")));
+        let blocks = compact_theta_blocks(&names);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "PLACEBO");
+        assert_eq!(blocks[0].1, 1..31);
+    }
+
+    #[test]
+    fn compact_theta_blocks_ignores_a_model_with_no_blocks() {
+        let names = vec!["TVCL".to_string(), "TVV".to_string()];
+        assert!(compact_theta_blocks(&names).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #518: the unsupported-keys warning is model-aware for the `ode_*` knobs.
+//
+// #517 fixed a false positive by adding the ODE-solver keys to `framework_keys()`,
+// which suppresses the "not used by method" warning *unconditionally* — including on
+// an analytical model, where `sync_ode_solver_opts` is a no-op and the keys really do
+// nothing. `unsupported_keys_warnings_with_model` restores that diagnostic without
+// bringing the false positive back.
+// ---------------------------------------------------------------------------
+
+/// Build a `FitOptions` whose `user_set_keys` names exactly `keys` (the field the
+/// warning layer reads); the values themselves are irrelevant to the warning.
+fn opts_with_user_set_keys(keys: &[&str]) -> FitOptions {
+    FitOptions {
+        user_set_keys: keys.iter().map(|k| k.to_string()).collect(),
+        ..FitOptions::default()
+    }
+}
+
+#[test]
+fn ode_solver_keys_are_a_subset_of_framework_keys() {
+    // The two lists are separate on purpose — `framework_keys` suppresses the
+    // *method*-level warning, `ode_solver_keys` selects the *model*-conditional
+    // notice — but an `ode_*` key missing from the former would draw the old
+    // spurious "not used by method FOCEI" warning again (#516/#517). Pin the
+    // subset relation so the lists cannot drift apart.
+    let fw = framework_keys();
+    for k in ode_solver_keys() {
+        assert!(
+            fw.contains(k),
+            "`{k}` is in ode_solver_keys() but not framework_keys() — it would \
+             spuriously warn as method-unsupported"
+        );
+    }
+}
+
+#[test]
+fn analytical_model_warns_that_ode_solver_keys_have_no_effect() {
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(&["ode_reltol"]);
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+
+    assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
+    // Pinned in full, not by `contains`. This string is user-facing — it reaches the
+    // CLI and the fit YAML verbatim — and a `\`-continuation in the source silently
+    // keeps the next line's indentation unless the escape is exactly right, which is
+    // how a run of 18 spaces shipped in review. A substring check cannot see that.
+    assert_eq!(
+        w[0],
+        "fit option `ode_reltol` configures the ODE integrator, but this model has \
+         no `[odes]` block (and no closed-form absorption ODE twin), so it has no \
+         effect."
+    );
+    // The method-level phrasing would be the wrong diagnosis here: the key is
+    // fine for FOCEI, it is the *model* that never integrates.
+    assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
+}
+
+#[test]
+fn analytical_model_warns_once_per_distinct_ode_solver_key() {
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    // Every key in the list must be covered, and a duplicate must not double up.
+    let mut keys: Vec<&str> = ode_solver_keys().to_vec();
+    keys.push("ode_reltol");
+    let opts = opts_with_user_set_keys(&keys);
+
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+    assert_eq!(
+        w.len(),
+        ode_solver_keys().len(),
+        "one notice per distinct key, got: {w:?}"
+    );
+    for k in ode_solver_keys() {
+        assert!(
+            w.iter().any(|m| m.contains(k)),
+            "no notice named `{k}`: {w:?}"
+        );
+    }
+    // No notice may carry a run of whitespace. The exact-message assertion above
+    // pins one key's text; this covers the other five, and any key added later.
+    for m in &w {
+        assert!(
+            !m.contains("  "),
+            "notice contains a run of spaces — check the `\\` line continuations: {m:?}"
+        );
+    }
+}
+
+#[test]
+fn ode_model_does_not_warn_on_ode_solver_keys() {
+    // The #517 regression guard, at the model tier: `sync_ode_solver_opts` does
+    // apply these here, so neither the method-level nor the model-level layer
+    // may say a word.
+    let model = test_helpers::ode_model(GradientMethod::Auto);
+    assert!(model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(ode_solver_keys());
+    assert!(
+        opts.unsupported_keys_warnings_with_model(&model).is_empty(),
+        "ODE model warned on solver keys: {:?}",
+        opts.unsupported_keys_warnings_with_model(&model)
+    );
+}
+
+#[test]
+fn closed_form_absorption_twin_suppresses_the_ode_solver_key_notice() {
+    // The predicate is *not* `is_ode_based()`. A closed-form transit primary is
+    // analytic (`ode_spec == None`) but carries an absorption ODE twin (#814) that
+    // `sync_ode_solver_opts` also stamps, so the keys are live and "this model has
+    // no `[odes]` block" would be a false positive of the kind #517 removed.
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    assert!(!model.is_ode_based(), "the transit primary is analytic");
+    assert!(
+        model.absorption_ode_equivalent.is_some(),
+        "it carries a twin"
+    );
+    assert!(model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(ode_solver_keys());
+    assert!(
+        opts.unsupported_keys_warnings_with_model(&model).is_empty(),
+        "twin-carrying analytic model warned: {:?}",
+        opts.unsupported_keys_warnings_with_model(&model)
+    );
+}
+
+#[test]
+fn model_aware_warnings_keep_the_method_level_ones() {
+    // The model layer only *appends*: a genuinely method-unsupported key must still
+    // produce its own warning alongside the ODE notice.
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    let opts = opts_with_user_set_keys(&["n_convergence", "ode_abstol"]);
+
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+    assert_eq!(w.len(), 2, "got: {w:?}");
+    assert!(
+        w.iter()
+            .any(|m| m.contains("n_convergence") && m.contains("is not used by method")),
+        "lost the method-level warning: {w:?}"
+    );
+    assert!(
+        w.iter().any(|m| m.contains("ode_abstol")),
+        "lost the model-level notice: {w:?}"
+    );
+    // The model-agnostic entry point is unchanged — it still sees only the
+    // method-level miss, which is what keeps the public API's contract stable.
+    let base = opts.unsupported_keys_warnings();
+    assert_eq!(base.len(), 1, "got: {base:?}");
+    assert!(base[0].contains("n_convergence"), "got: {}", base[0]);
+}
+
+/// `FitOptions::non_interaction_stage` is the one `iiv_on_ruv` predicate
+/// `fit()` and `ruvsearch` share (#1182). It walks the whole chain — `method`
+/// is the *last* stage of a chained fit, so reading it alone lets a
+/// `[foce, focei]` chain propose a candidate `fit()` then refuses at its
+/// first stage (review of #1273).
+#[test]
+fn non_interaction_stage_walks_the_whole_method_chain() {
+    let single = |method: EstimationMethod, interaction: bool| FitOptions {
+        method,
+        interaction,
+        ..Default::default()
+    };
+    assert_eq!(
+        single(EstimationMethod::Foce, false).non_interaction_stage(),
+        Some(EstimationMethod::Foce)
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceI, true).non_interaction_stage(),
+        None
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceGn, false).non_interaction_stage(),
+        Some(EstimationMethod::FoceGn)
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceGn, true).non_interaction_stage(),
+        None
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceGnHybrid, false).non_interaction_stage(),
+        Some(EstimationMethod::FoceGnHybrid)
+    );
+    for m in [
+        EstimationMethod::Laplace,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+    ] {
+        assert_eq!(single(m, false).non_interaction_stage(), None, "{m:?}");
+    }
+    // A chain: the parser leaves `method` at the last stage, so the predicate
+    // must not read it alone.
+    let chain = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::FoceI],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), Some(EstimationMethod::Foce));
+    let chain = FitOptions {
+        method: EstimationMethod::Saem,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::Saem],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), Some(EstimationMethod::Foce));
+    let chain = FitOptions {
+        method: EstimationMethod::Imp,
+        interaction: true,
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), None);
 }

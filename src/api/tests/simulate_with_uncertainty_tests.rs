@@ -11,6 +11,8 @@ use std::collections::HashMap;
 fn tiny_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -25,8 +27,10 @@ fn tiny_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "uncertainty_smoke".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -53,6 +57,7 @@ fn tiny_model() -> CompiledModel {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -71,6 +76,7 @@ fn tiny_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -86,6 +92,7 @@ fn tiny_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -189,10 +196,12 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     };
@@ -357,10 +366,12 @@ fn tiny_population() -> Population {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -383,6 +394,9 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
     let n_packed = crate::estimation::parameterization::packed_len(template);
     let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
     FitResult {
+        residual_correlation_fixed: Vec::new(),
+        se_residual_correlations: None,
+        covariate_relations: Vec::new(),
         restored_from_checkpoint: false,
         method: EstimationMethod::FoceI,
         method_chain: vec![EstimationMethod::FoceI],
@@ -398,6 +412,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         omega: template.omega.matrix.clone(),
         sigma: template.sigma.values.clone(),
         sigma_names: template.sigma.names.clone(),
+        residual_correlations: Vec::new(),
         error_model: ErrorModel::Proportional,
         covariance_matrix: Some(cov),
         se_theta: None,
@@ -424,10 +439,13 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
+        vi: None,
         omega_iov: None,
         kappa_names: vec![],
         kappa_fixed: vec![],
         kappa_init_as_sd: vec![],
+        kappa_weights: Vec::new(),
+        kappa_weight_typical: Vec::new(),
         se_kappa: None,
         shrinkage_kappa: vec![],
         shrinkage_kappa_by_occ: vec![],
@@ -460,6 +478,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sigma_types: vec![],
         cov_eigenvalues: None,
         cov_condition_number: None,
+        bic_inputs: Default::default(),
         eta_log_transformed: vec![],
         omega_param_corr: None,
         omega_iov_param_corr: None,
@@ -491,6 +510,9 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        left_init: None,
+        omega_is_diagonal: None,
+        kappa_is_diagonal: None,
     }
 }
 
@@ -1024,6 +1046,25 @@ fn theta_boundary_side_detects_bounds() {
     assert_eq!(side(0.0, -1.0, 1.0), None);
     assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
     assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
+    // Identity-packed with PsN's scm bounds for a power / exponential
+    // covariate θ, (-100, 1e6): an estimate near 1 is interior. Judged by
+    // its distance to each bound on that bound's scale — as a fraction of
+    // the range it would sit at 1e-4 and read as "at the lower bound", which
+    // excluded every candidate of the first covsearch run (#1180).
+    assert_eq!(side(1.05, -100.0, 1e6), None);
+    assert_eq!(side(0.7, -100.0, 1e6), None);
+    assert_eq!(side(-50.0, -100.0, 1e6), None);
+    assert_eq!(side(-99.95, -100.0, 1e6), Some("lower"));
+    assert_eq!(side(999_500.0, -100.0, 1e6), Some("upper"));
+    // A bound of zero on the identity path uses an absolute tolerance.
+    assert_eq!(side(-0.0005, -5.0, 0.0), Some("upper"));
+    assert_eq!(side(-0.5, -5.0, 0.0), None);
+    // …capped by the range: on a narrow identity interval the midpoint is
+    // interior, and only the ends themselves are at a bound (review of #1238).
+    assert_eq!(side(0.0, -1e-4, 1e-4), None);
+    assert_eq!(side(-1e-4, -1e-4, 1e-4), Some("lower"));
+    assert_eq!(side(1e-4 - 1e-8, -1e-4, 1e-4), Some("upper"));
+    assert_eq!(side(0.5e-4, -1e-4, 1e-4), None);
     // Log-packed (lower >= 0): "at bound" is within a constant factor.
     assert_eq!(side(1.0, 0.001, 1000.0), None);
     assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));
@@ -1133,6 +1174,240 @@ fn boundary_estimate_warning_emits_typed_entry_with_details() {
     // A fixed theta at its bound is not reported.
     params.theta_fixed[0] = true;
     assert!(super::boundary_estimate_warning(&params).is_none());
+}
+
+#[test]
+fn packed_guard_side_requires_an_exact_non_degenerate_hit() {
+    assert_eq!(
+        super::packed_guard_side(-8.0, -8.0, 5.0),
+        Some(("lower", -8.0))
+    );
+    assert_eq!(
+        super::packed_guard_side(5.0, -8.0, 5.0),
+        Some(("upper", 5.0))
+    );
+    assert_eq!(super::packed_guard_side(5.0 - 1e-12, -8.0, 5.0), None);
+    // An optimizer can hit the rail exactly in scaled space but recover a
+    // packed value one ULP away through `(bound / scale) * scale`.
+    let scale = 10.0_f64.ln();
+    let recovered = (-8.0 / scale) * scale;
+    assert_ne!(recovered, -8.0);
+    assert_eq!(
+        super::packed_guard_side(recovered, -8.0, 5.0),
+        Some(("lower", -8.0))
+    );
+    assert_eq!(super::packed_guard_side(1.0, 1.0, 1.0), None);
+    assert_eq!(super::packed_guard_side(f64::NAN, -8.0, 5.0), None);
+}
+
+#[test]
+fn runaway_guard_warning_reports_sigma_and_skips_fixed_or_nearby_values() {
+    use crate::types::WarningCode;
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+
+    params.sigma.values[0] = 5.0_f64.exp();
+    let mut converged = true;
+    let (msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("sigma guard hit");
+    assert!(msg.contains("implementation rail"));
+    // #1118: an implementation rail cannot be an interior optimum.
+    assert!(!converged, "a runaway hit is not a converged fit");
+    assert!(msg.contains("Reported converged: false"));
+    // The Σ ceiling is reachable by a sound model on unscaled data, so the
+    // message names the remediation the generic advice does not (#1205 review).
+    assert!(msg.contains("rescale DV"));
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Critical);
+    assert_eq!(entry.category, WarningCode::ParameterAtRunawayGuard);
+    let details = entry.details.as_ref().expect("details");
+    assert_eq!(details["guard_space"], "packed");
+    assert_eq!(details["parameters"][0]["side"], "upper");
+    assert_eq!(details["parameters"][0]["verdict"], "runaway");
+    assert_eq!(details["parameters"][0]["packed_estimate"], 5.0);
+    assert_eq!(details["parameters"][0]["packed_guard"], 5.0);
+
+    // FIX creates lower == upper at this value, but is intentional and excluded.
+    params.sigma_fixed[0] = true;
+    let mut converged = true;
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged, "no hit must leave the flag alone");
+
+    // A free value arbitrarily near the safety rail is still an interior result.
+    params.sigma_fixed[0] = false;
+    params.sigma.values[0] = (5.0_f64 - 1e-12).exp();
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged);
+
+    // The lower rail has opposite meaning and remediation: collapse to zero.
+    params.sigma.values[0] = (-8.0_f64).exp();
+    let (msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("sigma lower guard hit");
+    assert!(msg.contains("collapsed toward zero"));
+    assert!(msg.contains("removing or simplifying"));
+    // #1118: a collapsed component is a modelling decision, not a runaway — the
+    // fit still converged and the entry stays a plain warning. The Σ-ceiling
+    // remediation is for the ceiling only and must not ride along.
+    assert!(converged, "a collapse hit must not demote convergence");
+    assert!(!msg.contains("converged: false"));
+    assert!(!msg.contains("rescale DV"));
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    let hit = &entry.details.as_ref().unwrap()["parameters"][0];
+    assert_eq!(hit["side"], "lower");
+    assert_eq!(hit["verdict"], "collapse");
+}
+
+#[test]
+fn runaway_guard_warning_reports_omega_cholesky_guard_and_skips_fixed() {
+    use crate::types::{OmegaMatrix, WarningCode};
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+    params.omega_fixed = vec![false; params.omega.dim()];
+
+    let mut chol = params.omega.chol.clone();
+    chol[(0, 0)] = 6.0_f64.exp();
+    params.omega = OmegaMatrix::from_chol_factor(
+        chol,
+        params.omega.eta_names.clone(),
+        params.omega.diagonal,
+        params.omega.free_mask.clone(),
+    );
+
+    let mut converged = true;
+    let (_msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("omega guard hit");
+    assert!(!converged);
+    assert_eq!(entry.category, WarningCode::ParameterAtRunawayGuard);
+    let hit = &entry.details.as_ref().unwrap()["parameters"][0];
+    assert_eq!(hit["parameter"], params.omega.eta_names[0].as_str());
+    assert_eq!(hit["packed_estimate"], 6.0);
+    assert_eq!(hit["packed_guard"], 6.0);
+    assert_eq!(hit["side"], "upper");
+    assert!((hit["estimate"].as_f64().unwrap() - 12.0_f64.exp()).abs() < 1e-6);
+
+    // A simultaneous lower collapse and upper runaway gets advice for both.
+    params.sigma.values[0] = (-8.0_f64).exp();
+    let mut converged = true;
+    let (msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("mixed guard hits");
+    assert!(msg.contains("Collapse hits"));
+    assert!(msg.contains("Runaway hits"));
+    // A mixed set still contains a runaway hit, so the fit is demoted.
+    assert!(!converged);
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Critical);
+
+    params.sigma.values[0] = 1.0;
+    params.omega_fixed[0] = true;
+    let mut converged = true;
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged);
+}
+
+/// #1205 review: an Ω off-diagonal is the raw `L[i,j]` bounded symmetrically at
+/// ±10, so the *lower* rail there is a correlation runaway, not a collapse
+/// toward zero. Keying the verdict on the side alone reported that runaway as
+/// `converged: true` with advice to remove the component.
+#[test]
+fn omega_off_diagonal_lower_rail_is_a_runaway_not_a_collapse() {
+    use crate::types::{OmegaMatrix, WarningSeverity};
+    use nalgebra::DMatrix;
+
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+
+    // A 2×2 block Ω whose off-diagonal ran to the negative rail.
+    let mut chol = DMatrix::<f64>::identity(2, 2);
+    chol[(1, 0)] = -10.0;
+    params.omega = OmegaMatrix::from_chol_factor(
+        chol,
+        vec!["ETA_CL".into(), "ETA_V".into()],
+        false,
+        DMatrix::from_element(2, 2, true),
+    );
+    params.omega_fixed = vec![false; 2];
+
+    let mut converged = true;
+    let (msg, entry) = super::runaway_guard_warning(&mut converged, &params)
+        .expect("omega off-diagonal at its lower rail");
+    assert_eq!(
+        entry.details.as_ref().unwrap()["parameters"][0]["side"],
+        "lower",
+        "the hit is factually on the lower rail"
+    );
+    assert_eq!(
+        entry.details.as_ref().unwrap()["parameters"][0]["verdict"],
+        "runaway",
+        "but a symmetric rail means it ran away, not collapsed"
+    );
+    assert!(
+        !converged,
+        "a runaway must demote convergence on either rail"
+    );
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert!(msg.contains("implementation rail"));
+    assert!(!msg.contains("collapsed toward zero"));
+
+    // The classifier must reach the same severity from the flat message alone,
+    // which is all a spliced multi-start warning carries.
+    assert_eq!(
+        crate::types::classify_warning(&msg).severity,
+        WarningSeverity::Critical
+    );
+}
+
+#[test]
+fn hidden_theta_caps_use_internal_guard_warning_not_user_boundary_warning() {
+    use crate::types::WarningCode;
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+    params.theta_fixed = vec![false; params.theta.len()];
+    params.theta_lower[0] = 0.0;
+    params.theta_upper[0] = f64::INFINITY;
+
+    params.theta[0] = 1e9;
+    assert!(super::boundary_estimate_warning(&params).is_none());
+    let mut converged = true;
+    let (upper_msg, upper_entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("hidden theta upper cap");
+    assert!(upper_msg.contains("implementation rail"));
+    // The Σ remediation is Σ-specific; a THETA cap must not pick it up.
+    assert!(!upper_msg.contains("rescale DV"));
+    assert!(!converged);
+    assert_eq!(upper_entry.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(
+        upper_entry.details.as_ref().unwrap()["parameters"][0]["parameter"],
+        params.theta_names[0].as_str()
+    );
+
+    params.theta[0] = 1e-10;
+    assert!(super::boundary_estimate_warning(&params).is_none());
+    let mut converged = true;
+    let (lower_msg, lower_entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("hidden theta lower cap");
+    assert!(lower_msg.contains("collapsed toward zero"));
+    assert!(converged);
+    assert_eq!(
+        lower_entry.details.as_ref().unwrap()["parameters"][0]["side"],
+        "lower"
+    );
+
+    // A genuine finite user bound keeps the existing warning and remediation.
+    params.theta_lower[0] = 0.1;
+    params.theta_upper[0] = 100.0;
+    params.theta[0] = 0.1;
+    assert!(super::boundary_estimate_warning(&params).is_some());
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+
+    // FIX'd hidden-cap coordinates remain intentional and excluded.
+    params.theta_lower[0] = 0.0;
+    params.theta_upper[0] = f64::INFINITY;
+    params.theta[0] = 1e9;
+    params.theta_fixed[0] = true;
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged, "a FIX'd cap must not demote convergence");
 }
 
 #[test]
@@ -1282,4 +1557,94 @@ fn asymptotic_errors_without_covariance_step() {
     };
     let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
     assert!(err.contains("covariance"));
+}
+
+// ---------------------------------------------------------------------------
+// #529 — `Default` at the R boundary
+// ---------------------------------------------------------------------------
+
+/// Pin every field of the derived `Default`. The R wrapper builds this struct
+/// with `..Default::default()`, so these values are the ones a field it does
+/// *not* name silently takes.
+#[test]
+fn simulate_uncertainty_options_default_values() {
+    let d = SimulateUncertaintyOptions::default();
+    assert_eq!(d.n_uncertainty_draws, 0);
+    assert_eq!(d.n_sim_per_draw, 0);
+    assert_eq!(d.method, UncertaintyMethod::Asymptotic);
+    assert_eq!(d.seed, None);
+}
+
+/// The point of #529: a spread construction that names only the fields the
+/// caller cares about must behave identically to the exhaustive literal it
+/// replaces. Run both through `simulate_with_uncertainty` with the same seed
+/// and require bit-identical predictions — an oracle that fails if a future
+/// field's default silently changes the simulation rather than merely
+/// compiling.
+#[test]
+fn spread_default_matches_exhaustive_literal() {
+    let model = tiny_model();
+    let pop = tiny_population();
+    let fit = synthetic_fit(&model.default_params);
+
+    let exhaustive = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 3,
+        n_sim_per_draw: 2,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(42),
+    };
+    let spread = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 3,
+        n_sim_per_draw: 2,
+        seed: Some(42),
+        ..Default::default()
+    };
+
+    let a = simulate_with_uncertainty(&model, &pop, &fit, &exhaustive).unwrap();
+    let b = simulate_with_uncertainty(&model, &pop, &fit, &spread).unwrap();
+
+    // Non-degenerate: the comparison is worthless on an empty or all-zero run.
+    assert_eq!(a.len(), 3 * 2 * 2 * 3);
+    assert!(a
+        .iter()
+        .all(|r| r.ipred.is_finite() && r.outcome.continuous_value().is_finite()));
+    assert!(a.iter().any(|r| r.ipred != 0.0));
+
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.id, y.id);
+        assert_eq!(x.time, y.time);
+        assert_eq!(x.draw, y.draw);
+        assert_eq!(x.sim, y.sim);
+        assert_eq!(x.ipred.to_bits(), y.ipred.to_bits());
+        assert_eq!(
+            x.outcome.continuous_value().to_bits(),
+            y.outcome.continuous_value().to_bits()
+        );
+    }
+}
+
+/// #529, trait-level half: the options types `ferx-core` exposes at the R
+/// boundary really do resolve `Default`, so the wrapper can spread them.
+///
+/// This is a **named spot check, not the inventory guard** — the list is
+/// hand-written, so adding a new options struct does not change it and this
+/// test would stay green. Discovery is
+/// `every_public_options_type_implements_default` in
+/// `tests/public_api_boundary.rs` (A4), which scans `src/` and `crates/` for
+/// every `*Options` declaration and fails on one lacking `Default`. The two
+/// are complementary: the scan is textual and sees types nobody registered,
+/// this one is a real trait bound and would catch a `Default` that exists in
+/// source but does not apply to the type (a `cfg`-ed out impl, say).
+#[test]
+fn every_public_options_struct_implements_default() {
+    fn assert_default<T: Default>() -> T {
+        T::default()
+    }
+    let _ = assert_default::<crate::types::FitOptions>();
+    let _ = assert_default::<crate::io::fitrx::SaveFitOptions>();
+    let _ = assert_default::<crate::ode::solver::OdeSolverOptions>();
+    let _ = assert_default::<crate::api::simulate::SimulateOptions>();
+    let _ = assert_default::<SimulateUncertaintyOptions>();
+    let _ = assert_default::<crate::AdaptiveSimulateOptions>();
 }

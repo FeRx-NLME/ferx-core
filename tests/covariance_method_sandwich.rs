@@ -102,9 +102,13 @@ fn covariance_rsr_assembles_finite_ses_fast() {
 }
 
 #[test]
+// Re-enabled (#960): mode 1 (L-BFGS first-step overshoot → fit stuck at init)
+// fixed by `cap_scaled_gradient` on the opening L-BFGS eval; mode 2 (FD-of-OFV
+// knife-edge, SE(TVCL) 0.0071↔121 on a ~3e-5 θ shift) cured by the analytic
+// covariance Hessian (#436, default-on). Back on the standard slow-tests gate.
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow: full FOCEI fit ×3 for covariance_method R/S/RSR; opt in with --features slow-tests"
+    ignore = "slow full-FOCEI-fit ×3 covariance SE consistency check (#960): opt in with --features slow-tests"
 )]
 fn covariance_methods_produce_consistent_ses_on_warfarin() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
@@ -174,18 +178,20 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 /// held to 15%. A factor-of-2 error in the score scale would push the `s` SEs
 /// ~29–41% off systematically — well outside these bands (issue #266 note).
 #[test]
+// The `s` (pure cross-product) estimator is a 10-subject outer-product and is
+// inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹` draws its `R` from
+// the analytic covariance Hessian (#436, default-on) — a noise-free R with no FD
+// step to condition, so it is stable near the optimum. This fixture relies on the
+// default `Auto` optimizer (→ analytic-gradient NLopt L-BFGS) converging, which
+// the #960 first-step cap now delivers.
+//
+// Re-enabled (#960): mode 1 fixed by `cap_scaled_gradient` on the opening L-BFGS
+// gradient eval; mode 2 (the old FD-of-OFV knife-edge) removed by the analytic
+// Hessian. Back on the standard slow-tests gate.
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored FOCEI s/rsr covariance SE cross-check (#266/#335): opt in with --features slow-tests"
+    ignore = "slow NONMEM-anchored s/rsr covariance SE cross-check (#266/#335/#960): opt in with --features slow-tests"
 )]
-// Re-enabled (#335): the `s` (pure cross-product) estimator is a 10-subject
-// outer-product and is inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹`
-// draws its `R` from the reconverged-OFV second-difference stencil (the sole R
-// path since #639). That stencil is only well-conditioned at a true stationary
-// point, so this fixture relies on the default `Auto` optimizer (→ analytic-
-// gradient NLopt L-BFGS) converging; the earlier `covariance_ofv_hessian = false`
-// override that routed this anchor onto the now-removed analytical-gradient
-// stencil is gone.
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     assert!(

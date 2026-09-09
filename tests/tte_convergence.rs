@@ -645,6 +645,192 @@ fn joint_pktte_event_times_match_model_survival() {
     );
 }
 
+/// [`joint_pktte_sim_template`] with the single dose replaced by an `SS=1` record.
+///
+/// The only difference is `ss = true, ii`, which is the whole point: it routes every subject
+/// through the steady-state equilibration on a system that carries an injected
+/// `d/dt(__chz_<cmt>)` accumulator. An `SS=1` dose means "the infinite past was periodic up to
+/// here" and not "keep dosing", so there is deliberately no further dose record — the profile
+/// decays from the steady-state peak over the horizon.
+fn joint_pktte_ss_sim_template(n: usize, horizon: f64, ii: f64) -> Population {
+    use ferx_core::types::{DoseEvent, EventType, ObsRecord};
+    let pk_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0];
+    let dose_levels = [20.0, 40.0, 80.0];
+    let subjects = (0..n)
+        .map(|i| {
+            let amt = dose_levels[i % dose_levels.len()];
+            let mut s = common::subject(
+                &i.to_string(),
+                vec![DoseEvent::new(0.0, amt, 1, 0.0, true, ii)],
+                pk_times.clone(),
+                vec![0.0; pk_times.len()],
+                vec![2; pk_times.len()],
+            );
+            s.obs_records = vec![ObsRecord::Event {
+                time: horizon,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            }];
+            s
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+/// **The Tier-3 gap #1210 left open: a joint PK-TTE population fit to convergence under
+/// `SS=1` dosing.**
+///
+/// Everything else guarding #1210 is an *evaluation* — the Tier-1 arms call the equilibration
+/// directly, and the NONMEM anchor runs at `maxiter = 0`. Nothing ran the outer loop to
+/// convergence on a joint model whose doses carry `SS=1`, which is precisely the object whose
+/// objective the bug moved (by `2 * H_runin`: 24.0 on the anchor fixture, ~2537 on its
+/// drug-driven arm). Measured before this test existed: of 96 slow-gated tests, **none**
+/// combined an `SS=1` dose with an `[event_model]` hazard.
+///
+/// Same SSE shape as [`joint_pktte_sse_recovers_pk_and_omega`], and the same scope: it asserts
+/// the **identifiable** parameters — the PK fixed effects and `omega^2(CL)`, which the
+/// continuous observations pin — and deliberately not `(H0, BETA)`, which are collinear at a
+/// single-occasion design. What it adds is the SS route into all of it.
+///
+/// It fails loudly under the pre-#1210 engine, and not subtly: with the run-in banked, `H(0)`
+/// starts above every `-log U`, so the sampler fires every subject's event at `t = 0` and the
+/// assertions below trip before any parameter band is reached.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn joint_pktte_ss_dosing_sse_recovers_pk_and_omega() {
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    // 100, not the sibling's 300, and the difference is measured rather than taste. Every
+    // subject here carries an `SS=1` dose, and a joint model's inner gradient is FD, so each
+    // FD perturbation of each subject re-runs a steady-state equilibration — a cost the
+    // non-SS sibling does not pay at all. At N = 300 this fit was still running after 30 min
+    // wall / 230 min CPU with no sign of finishing, which is past what a nightly job should
+    // hold. 100 subjects x 7 observations still identifies the PK fixed effects and omega^2
+    // sharply, which is all this arm asserts.
+    const N: usize = 100;
+    const HORIZON: f64 = 24.0;
+    const II: f64 = 12.0;
+    const SEED: u64 = 20260903;
+
+    let truth = parse_model_string(ODE_TTE_TRUTH).expect("truth model must parse");
+    let template = joint_pktte_ss_sim_template(N, HORIZON, II);
+
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("joint PK-TTE simulation under SS dosing must succeed");
+
+    let event_times: Vec<f64> = sims
+        .iter()
+        .filter_map(|r| match r.outcome {
+            SimOutcome::Event {
+                observed: true,
+                time,
+                ..
+            } => Some(time),
+            _ => None,
+        })
+        .collect();
+    let n_events = event_times.len();
+    eprintln!("[SSE-SS] events = {n_events}/{N}");
+
+    // The #1210 signature, asserted directly rather than left to the parameter bands: a banked
+    // run-in puts `H(0)` above every `-log U`, so every draw crosses at the first step.
+    for t in &event_times {
+        assert!(
+            t.is_finite() && *t > 0.0,
+            "a simulated event landed at t = {t}; an event at the record's own start is the \
+             signature of a cumulative hazard that begins above -log U (#1210), not a draw"
+        );
+    }
+    assert!(
+        n_events > N / 10 && n_events < N - N / 10,
+        "expected a mix of events and censors under SS dosing; got {n_events}/{N}"
+    );
+
+    let fit_pop = joint_pktte_pop_from_sims(&template, &sims);
+    let model = parse_model_string(ODE_TTE_FIT).expect("fit model must parse");
+    // Local options rather than the shared `fit_opts()`: **no covariance step**. This arm
+    // asserts theta / omega^2 recovery and never reads an SE, so the FD-of-OFV Hessian is
+    // pure cost — and an expensive one here, where every objective evaluation re-runs a
+    // steady-state equilibration per subject. Everything else is `fit_opts()`: FOCEI,
+    // `outer_maxiter = 500`, i.e. still run-to-convergence, which is the point of the arm.
+    // The shared helper is left alone so the sibling tests keep reporting SEs.
+    let opts_fit = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let r = fit(&model, &fit_pop, &model.default_params, &opts_fit)
+        .expect("SS-dosed joint SSE fit must succeed");
+
+    let (cl, v, ka, h0, beta) = (r.theta[0], r.theta[1], r.theta[2], r.theta[3], r.theta[4]);
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[SSE-SS] CL={cl:.4}(1.0) V={v:.4}(10) KA={ka:.4}(1) H0={h0:.5}(0.02; collinear) \
+         BETA={beta:.4}(0.30; collinear) omega^2={omega2:.4}(0.09) OFV={:.3}",
+        r.ofv
+    );
+    assert!(
+        r.ofv.is_finite(),
+        "SS-dosed joint fit OFV is not finite: {}",
+        r.ofv
+    );
+
+    // **Deliberately NOT asserted here: the absence of an SS non-convergence warning.**
+    // It is asserted at `maxiter = 0` instead, by
+    // `ss_chz_nonmem_anchor::a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective`,
+    // and that is the right place for it. Measured here: a run-to-convergence fit *does*
+    // collect the #867 warning, because the optimizer legitimately visits theta where no
+    // periodic steady state exists at `II = 12` —
+    //
+    //   "per-cycle carryover is not contracting (ratio ~ 1.000), indicating no periodic
+    //    steady state exists — the mean input rate meets or exceeds the maximum elimination"
+    //
+    // — which is a true statement about that theta, not #1210's spurious one. The two are
+    // indistinguishable by message text, so asserting emptiness across an optimization would
+    // be asserting that the optimizer never explores a slow-elimination corner. The final
+    // estimates are healthy (`ke = 0.102`, `KA = 1.01`), which is what this arm checks.
+
+    // Measured, then banded around the measurement with truth inside:
+    // CL/V = 0.101679 (truth 0.1), KA = 1.0121 (1.0), omega^2 = 0.0932 (0.09).
+    //
+    // **`CL` and `V` are asserted only through their ratio, and that is identifiability, not
+    // laxity.** This model carries no `[scaling]` block, so the observable is the central
+    // *amount*, which is a function of `ka` and `ke = CL/V` and not of `V` separately. `V`
+    // enters only through the hazard's `BETA * (central / V)` — the same `H0`/`BETA` ridge
+    // this file already declines to band — and `CL = ke * V` rides along with it. Measured:
+    // `CL = 0.5843` and `V = 5.7465`, both ~0.575x truth, with their ratio exact to 1.7%.
+    // A band on `CL` alone would be a wide "sane-range" guard on a non-identified parameter,
+    // which is precisely what `joint_pktte_sse_recovers_pk_and_omega` warns against.
+    let ke = cl / v;
+    assert!(
+        (0.095..0.108).contains(&ke),
+        "CL/V not recovered: {ke} (truth 0.1; CL={cl}, V={v})"
+    );
+    assert!(
+        (0.95..1.08).contains(&ka),
+        "KA not recovered: {ka} (truth 1.0)"
+    );
+    assert!(
+        (0.07..0.115).contains(&omega2),
+        "omega^2(CL) not recovered: {omega2} (truth 0.09)"
+    );
+}
+
 /// **Slice 2.2 SSE** — license-free round-trip validator for the joint PK-TTE
 /// generative path. Simulate a dataset from known (θ, Ω) with ferx's own ODE
 /// event-time sampler, rebuild a fit population, and refit from a perturbed start.

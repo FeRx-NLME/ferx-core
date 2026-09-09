@@ -1,0 +1,56 @@
+[package]
+name = "ferx-tools"
+version = "0.3.1"
+edition = "2021"
+description = "Model-development tooling on top of ferx-core: bootstrap, covariate search, cross-validation"
+license = "MIT"
+authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
+repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "bootstrap", "covariate-search", "cross-validation"]
+categories = ["science", "mathematics", "simulation"]
+
+[dependencies]
+# `default-features = false` is load-bearing, not tidiness: without it a
+# member-scoped or `--workspace` command resolves `ferx-core` to
+# `(<requested features>, default)` — a DIFFERENT unit from the root steps'
+# `--no-default-features`, so CI recompiles all of `ferx-core` a second time
+# instead of linking the rlib it just built, and `--no-default-features` is
+# silently defeated for `ferx-core` everywhere (harmless only while
+# `default = []`; `survival` is slated to become default-on).
+ferx-core = { path = "../..", version = "0.3.1", default-features = false }
+csv = "1.3"
+nalgebra = "0.35"
+rand = "0.10"
+rayon = "1.10"
+# `bootstrap_run.json` only — the manifest a `--resume` checks itself against
+# (#1143). Both are already in the workspace's lockfile via `ferx-core`, so this
+# adds no crate to the build.
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip` is load-bearing, not tidiness. Without it `serde_json`
+# parses floats with a fast algorithm accurate only to within 1 ULP, so a
+# journalled criterion or OFV can come back one bit different from the one the
+# interrupted run computed — and a resumed run whose whole promise is "the same
+# numbers" would report a different score, invisibly, since the CSV prints six
+# decimals. Caught by `search_runner_end_to_end`: -200.28784144636055 read back
+# as -200.28784144636057.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# The `.ferxsearch` search configuration (#1179) is TOML — the space a search
+# runs over is configuration, not model, so it lives in its own file rather
+# than a `.ferx` block. Only the `search::config` module reads it.
+toml = "1"
+
+# `search.lock` staleness only: `kill(pid, 0)` is how a search directory whose
+# owner was hard-killed is taken over instead of needing a manual delete —
+# resuming after a kill is the case the journal exists for. Already in the
+# workspace lockfile (via `tempfile` and `rand`), so this adds no crate to the
+# build; non-unix targets compile a `cfg` fallback and never take a lock over.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# Heavy convergence tests (5–60 min wall). Default `cargo test` ignores them;
+# a nightly/manual job opts in with --features slow-tests.
+slow-tests = []
+
+[dev-dependencies]
+tempfile = "3"

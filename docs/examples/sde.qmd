@@ -1,3 +1,7 @@
+---
+pagetitle: "Stochastic differential equation model example"
+---
+
 # Stochastic Differential Equations (SDE)
 
 This example extends a one-compartment ODE model with a `[diffusion]` block that adds continuous process noise (SDE / EKF). The complete model file is [`examples/warfarin_sde.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_sde.ferx).

@@ -7,7 +7,7 @@
 # We use the LAST table in the .phi (METHOD=IMP EONLY moments).
 #
 # Run from the repo root after:
-#   cargo run --release -- examples/warfarin_saem_conddist.ferx --data data/warfarin.csv
+#   cargo run --release -p ferx-cli -- examples/warfarin_saem_conddist.ferx --data data/warfarin.csv
 # Then (requires NM_PASS env var with the klebsiella SSH password):
 #   NM_PASS=<pw> Rscript tests/reference/saem_conddist/parse_nm_conddist.R
 

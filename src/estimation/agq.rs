@@ -22,7 +22,7 @@
 //! 1. **`n_agq = 1` is exactly Laplace.** The one-point rule is `z = 0`, `w = √π`, so the
 //!    sum collapses to `(2π)^(d/2) · |H|^(−1/2) · exp(l_i(η̂))` — the Laplace approximation,
 //!    term for term. This is not an approximation of an approximation; it is an identity,
-//!    and [`tests::one_node_agq_equals_laplace`] pins it.
+//!    and `tests::one_node_agq_equals_laplace` pins it.
 //! 2. **No Gaussian-residual assumption.** `l_i` is evaluated through
 //!    [`individual_nll_into_with_schedule`], the model's *actual* likelihood — so
 //!    time-to-event and categorical endpoints are integrated as faithfully as Gaussian
@@ -47,7 +47,7 @@
 //!
 //! `H` is the Hessian of the *true* integrand, obtained by central differences of
 //! `individual_nll`. It is deliberately **not**
-//! [`crate::estimation::importance_sampling::compute_posterior_hessian`], which builds the
+//! `crate::estimation::importance_sampling::compute_posterior_hessian`, which builds the
 //! Gauss-Newton form `Ω⁻¹ + JᵀR⁻¹J`: that carries no curvature at all from TTE or
 //! categorical endpoints, i.e. it is blind on exactly the models AGQ is here to serve, and
 //! would scale their grids by `Ω` alone. Note the grid scaling only affects *accuracy at
@@ -268,6 +268,9 @@ impl Stack {
                 b,
                 &params.omega,
                 &params.sigma.values,
+                // AGQ holds the `block_sigma` off-diagonals at their declared
+                // value (#847); `params` carries exactly that.
+                &params.residual_correlations,
                 scratch,
                 schedule,
             );
@@ -578,8 +581,113 @@ fn agq_nodes_and_terms(
     (bs, terms)
 }
 
+/// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
+///
+/// A thin entry point over [`agq_subject_nll`] that owns the `Stack` and the Gauss-Hermite rule,
+/// so callers outside this module can evaluate the objective the covariance differentiates. #251's
+/// finite-difference oracle needs exactly this: differencing `F_i` in packed space is the only
+/// check that sees the whole assembly, including the `√2` node scaling that the `n_agq = 1`
+/// reduction cannot (its node is `z = 0`).
+///
+/// `#[cfg(test)]` because it genuinely has no production caller — the objective is reached through
+/// [`agq_population_nll`] there. Shipping it unconditionally would emit a `dead_code` warning on
+/// every downstream build, which is the exact complaint PR #955's review raised against the first
+/// version of `agq_cov_hessian`.
+#[cfg(test)]
+pub(crate) fn agq_subject_objective(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    n_agq: usize,
+) -> f64 {
+    let stack = Stack::new(model, params, 0);
+    let (nodes, weights) = gauss_hermite(n_agq);
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    agq_subject_nll(
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        &nodes,
+        &log_weights,
+        HessianAnchor::GaussNewton,
+    )
+}
+
+/// The quadrature abscissae `z_j` and their softmax weights `π_j` for one subject, on exactly the
+/// grid the objective evaluates.
+///
+/// #251's analytic covariance differentiates `F`, so it must contract against *these* weights —
+/// the ones the fit actually used — not a freshly-normalised set. Returning both from a single
+/// sweep is what guarantees `z_j` and `π_j` refer to the same node.
+///
+/// `None` when the subject is outside the Gauss-Newton anchor's scope, matching
+/// [`agq_subject_nll`]'s own bail.
+pub(crate) fn subject_grid_and_weights(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    nodes: &[f64],
+    weights: &[f64],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>)> {
+    let n_occ = if model.n_kappa > 0 {
+        crate::stats::likelihood::iov_occasion_groups(subject).len()
+    } else {
+        0
+    };
+    let stack = Stack::new(model, params, n_occ);
+    let d = stack.d();
+    if d == 0 || eta_hat.len() != d {
+        return None;
+    }
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    let schedule = cacheable_schedule(model, subject);
+    let h = anchor_hessian(
+        HessianAnchor::GaussNewton,
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        &mut scratch,
+        schedule.as_ref(),
+    )?;
+    let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
+    let (_bs, terms) = agq_nodes_and_terms(
+        model,
+        subject,
+        params,
+        &stack,
+        eta_hat,
+        nodes,
+        &log_weights,
+        &proposal,
+        &mut scratch,
+        schedule.as_ref(),
+    );
+    let lse = logsumexp(&terms);
+    if !lse.is_finite() {
+        return None;
+    }
+    let pi: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
+    // Only covariance needs the abscissae. Reconstruct them in the same tested order
+    // instead of allocating a second coordinate vector on every objective sweep.
+    let zs = (0..terms.len())
+        .map(|j| {
+            let mut z = vec![0.0; d];
+            grid_z_at(j, nodes, d, &mut z);
+            z
+        })
+        .collect();
+    Some((zs, pi))
+}
+
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
-/// OFV, exactly as it does [`crate::estimation::outer_optimizer::pop_nll`].
+/// OFV, exactly as it does `crate::estimation::outer_optimizer::pop_nll`.
 ///
 /// Parallel over subjects (the grid sweep stays serial *within* a subject, matching
 /// importance sampling), then reduced **serially in subject order** — a rayon `.sum()`
@@ -736,25 +844,42 @@ pub fn analytic_score_supported(model: &CompiledModel) -> bool {
 ///
 /// * the fixed-η score is analytic where the provider reaches
 ///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
-///   ([`accumulate_fixed_b_packed_gradient_fd`]) — the latter is correct for any likelihood
+///   (`accumulate_fixed_b_packed_gradient_fd`) — the latter is correct for any likelihood
 ///   ferx can evaluate, including TTE and categorical; and
 /// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
-///   provider reaches and finite-differenced otherwise ([`eta_dx`]).
+///   provider reaches and finite-differenced otherwise (`eta_dx`).
 ///
 /// Crucially **neither path re-solves the inner loop**, which is the cost that makes
 /// `reconverged_fd_gradient` expensive. Letting the models AGQ exists for — non-Gaussian
 /// endpoints, which are precisely the ones outside the `Dual2` provider — fall back to that
 /// gradient would have made the headline use case the slow one.
 ///
-/// **Node-count independent.** With [`grid_response_correction`] supplying the `∂Φ/∂H·dH/dx`
+/// **Node-count independent.** With `grid_response_correction` supplying the `∂Φ/∂H·dH/dx`
 /// term, the gradient is the exact total derivative at every `n_agq`, `n_agq = 1` included
 /// (where that term is exactly `½·d log|H|/dx`, the Laplace log-determinant).
 pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
     // Kept as a predicate (rather than inlining `true`) so a future model class that genuinely
     // cannot supply `∂nll/∂x` at fixed η has one place to opt out; `population_gradient`'s
     // `reconverged_fd_gradient` fallback stays wired up behind it.
-    let _ = model;
-    true
+    //
+    // #847: an **estimated** `block_sigma` off-diagonal is exactly such a class. The AGQ score
+    // assembles θ / Ω / σ / Ω_iov blocks and nothing else — neither
+    // `accumulate_fixed_eta_packed_gradient` nor the fixed-b FD salvage
+    // (`accumulate_fixed_b_packed_gradient_fd`, which differences only the θ and σ coordinates)
+    // writes the trailing ρ slot. The quadrature objective *does* depend on ρ (`Stack::nll_at`
+    // scores at `params.residual_correlations`), so returning a gradient with a hard zero
+    // there would leave the optimizer no reason to move ρ and let it report convergence at a
+    // point that is not stationary in it. Declining sends AGQ/Laplace to
+    // `reconverged_fd_gradient`, which differences every free packed coordinate — slower, and
+    // correct. A `FIX`ed block is unaffected: its ρ carries no free coordinate to miss.
+    //
+    // Extending the score with a ρ block is tracked in #1216 alongside the estimator-threading
+    // work; until then this is the loud fallback CLAUDE.md asks a scope gap to take.
+    !model
+        .default_params
+        .residual_correlation_fixed
+        .iter()
+        .any(|&fixed| !fixed)
 }
 
 /// Finite-differenced θ/σ score at a **fixed η** — the universal fallback when the analytic
@@ -804,9 +929,10 @@ fn accumulate_fixed_b_packed_gradient_fd(
         xm[k] -= h;
         let d = (nll_at(&unpack_params(&xp, template)) - nll_at(&unpack_params(&xm, template)))
             / (2.0 * h);
-        if d.is_finite() {
-            out[k] += weight * d;
+        if !d.is_finite() {
+            return None;
         }
+        out[k] += weight * d;
     }
     Some(())
 }
@@ -1040,26 +1166,26 @@ fn accumulate_fixed_eta_packed_gradient(
     Some(())
 }
 
-/// The **grid-response** term `∂Φ/∂H · dH/dx`, the one piece the fixed-node score omits.
+/// The **grid response**: movement of both the anchor and the mode, omitted by the fixed-node score.
 ///
-/// Writing `F = Φ(x, H(x))` with the nodes built from `H`, the exact total derivative is
+/// Writing `F = Φ(x, η̂(x), H(x, η̂(x)))`, the total derivative is
 ///
 /// ```text
-///   dF/dx = ∂Φ/∂x|_H          ← the fixed-node score (analytic; see above)
+///   dF/dx = ∂Φ/∂x|_grid       ← the fixed-node score
 ///         + ∂Φ/∂H · dH/dx     ← this function
-///         + ∂Φ/∂η̂ · dη̂/dx     ← = Σ_j ŵ_j ∇_η nll(η_j), the posterior-mean score = 0
+///         + ∂Φ/∂η̂ · dη̂/dx    ← this function too
 /// ```
 ///
-/// The `∂Φ/∂η̂` factor is the posterior-mean score, which is zero by the Bartlett identity —
-/// exactly so at `n_agq = 1`, where η̂ *is* the mode. So the `H`-response is all that stands
-/// between the fixed-node score and the exact gradient. It is not a small correction: without
-/// it the gradient is 26% wrong at `n_agq = 1`.
+/// The finite-grid posterior-mean score `∂Φ/∂η̂ = Σ_j ŵ_j ∇_η nll(η_j)` is generally
+/// nonzero. Bartlett's identity for an exact integral cannot remove this term from a finite
+/// quadrature rule. At one node it vanishes by mode stationarity; the anchor still has its
+/// own mode dependence. Both responses are retained below.
 ///
 /// It is computed by central-differencing `Φ` in `x` **through the grid alone**: the grid
 /// (`η̂`, `H`) is rebuilt at the perturbed parameters while `nll` stays at the original ones,
 /// which isolates the response term from the direct dependence already covered analytically.
 ///
-/// **`H` depends on `x` twice, and both halves matter.** `H = ∂²nll/∂η²|_{η̂(x)}` varies with
+/// **`H` depends on `x` twice, and both halves matter.** The selected anchor varies with
 /// `x` explicitly (through θ/Ω/σ) *and* implicitly through the mode `η̂(x)`. Differencing only
 /// the explicit half is not a partial improvement — it is **worse than omitting the term
 /// entirely** (26% → 62% on warfarin at n = 1), because the two halves substantially cancel.
@@ -1100,8 +1226,10 @@ fn accumulate_fixed_eta_packed_gradient(
 /// old code differenced a **finite-differenced** quantity in `x`: with the analytic `h_inner`
 /// anchor, `H` is exact and the remaining FD is of an exact function.
 ///
-/// Falls back to the previous `phi_grid` re-sweep when the per-node gradient is out of the
-/// provider's scope (TTE, categorical, …) — the same all-or-nothing boundary the anchor uses.
+/// Uses the `phi_grid` re-sweep when the per-node gradient is unavailable. If a perturbed
+/// anchor/proposal or any correction is invalid, returns `None`: the outer dispatcher then
+/// finite-differences the complete quadrature objective with the same anchor. It must never
+/// silently omit a coordinate's grid response and return a partial gradient.
 #[allow(clippy::too_many_arguments)]
 fn grid_response_correction(
     model: &CompiledModel,
@@ -1180,8 +1308,13 @@ fn grid_response_correction(
             anchor_hessian(anchor, model, subject, &pp, &sp, &ep, scratch, schedule),
             anchor_hessian(anchor, model, subject, &pm, &sm, &em, scratch, schedule),
         ) else {
-            continue; // GN anchor out of scope at this perturbed point — no correction
+            return None; // let the caller difference the full quadrature objective
         };
+        // A non-finite anchor can otherwise be hidden by build_proposal's prior-scale
+        // fallback. It is not a usable input to the grid derivative.
+        if hp.iter().chain(hm.iter()).any(|v| !v.is_finite()) {
+            return None;
+        }
 
         // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
         // analytically by the fixed-η score — but the grid (centre and scale) is the
@@ -1195,7 +1328,7 @@ fn grid_response_correction(
                     build_proposal(&hp, &sp.omega_joint_inv, d),
                     build_proposal(&hm, &sm.omega_joint_inv, d),
                 ) else {
-                    continue; // degenerate perturbed Hessian contributes no correction
+                    return None;
                 };
                 let mut acc =
                     0.5 * (prop_p.log_det_inv_scale - prop_m.log_det_inv_scale) / (2.0 * step);
@@ -1245,14 +1378,15 @@ fn grid_response_correction(
                     schedule,
                 );
                 let (Some(phip), Some(phim)) = (phip, phim) else {
-                    continue; // a degenerate perturbed Hessian contributes no correction
+                    return None;
                 };
                 (phip - phim) / (2.0 * step)
             }
         };
-        if r.is_finite() {
-            out[k] += r;
+        if !r.is_finite() {
+            return None;
         }
+        out[k] += r;
     }
     Some(())
 }
@@ -1319,6 +1453,8 @@ fn node_nll_gradient(
             b,
             &params.omega,
             &params.sigma.values,
+            // AGQ holds ρ at the declaration; `params` carries it (#847).
+            &params.residual_correlations,
             schedule,
             mult,
         )
@@ -1549,8 +1685,187 @@ fn agq_subject_packed_gradient(
     Some(())
 }
 
-/// Analytic packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if any subject is
-/// outside the provider's scope (all-or-nothing, matching `population_gradient_sens`).
+/// Shared quadrature inputs for subject scores. No synthetic population or optimizer
+/// penalty is involved in the numerical score: failed inner solves decline the score.
+pub(crate) struct SubjectScoreContext<'a> {
+    model: &'a CompiledModel,
+    template: &'a ModelParameters,
+    x: &'a [f64],
+    options: &'a crate::types::FitOptions,
+    bounds: &'a crate::estimation::parameterization::PackedBounds,
+    params: ModelParameters,
+    nodes: Vec<f64>,
+    log_weights: Vec<f64>,
+    fixed: Vec<bool>,
+    force_fd: bool,
+}
+
+impl<'a> SubjectScoreContext<'a> {
+    pub(crate) fn new(
+        model: &'a CompiledModel,
+        template: &'a ModelParameters,
+        x: &'a [f64],
+        options: &'a crate::types::FitOptions,
+        bounds: &'a crate::estimation::parameterization::PackedBounds,
+        force_fd: bool,
+    ) -> Self {
+        let (nodes, weights) = gauss_hermite(options.agq_nodes().expect("quadrature stage"));
+        Self {
+            model,
+            template,
+            x,
+            options,
+            bounds,
+            params: crate::estimation::parameterization::unpack_params(x, template),
+            nodes,
+            log_weights: weights.iter().map(|w| w.ln()).collect(),
+            fixed: crate::estimation::parameterization::packed_fixed_mask(template),
+            force_fd: force_fd || !analytic_gradient_available(model),
+        }
+    }
+
+    /// Negative-log-likelihood score, with per-subject numerical salvage.
+    pub(crate) fn score(
+        &self,
+        subject: &Subject,
+        eta: &[f64],
+        kappas: &[nalgebra::DVector<f64>],
+    ) -> Option<Vec<f64>> {
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return None;
+        }
+        if !self.force_fd {
+            let stack = Stack::new(self.model, &self.params, kappas.len());
+            let b = stack_mode(eta, kappas);
+            let mut g = vec![0.0; self.x.len()];
+            if agq_subject_packed_gradient(
+                self.model,
+                subject,
+                &self.params,
+                self.template,
+                &stack,
+                self.x,
+                &b,
+                &self.nodes,
+                &self.log_weights,
+                self.options.hessian_anchor(),
+                &mut g,
+            )
+            .is_some()
+                && g.iter().all(|v| v.is_finite())
+            {
+                for (g, fixed) in g.iter_mut().zip(&self.fixed) {
+                    if *fixed {
+                        *g = 0.0;
+                    }
+                }
+                return Some(g);
+            }
+        }
+        let joint_warm = stack_mode(eta, kappas);
+        self.finite_difference_score(subject, &joint_warm)
+    }
+
+    fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
+        use crate::estimation::parameterization::{compute_mu_k, unpack_params};
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return None;
+        }
+        let p = unpack_params(xv, self.template);
+        let mu = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
+        let ebe = crate::estimation::inner_optimizer::find_ebe(
+            self.model,
+            subject,
+            &p,
+            self.options.inner_maxiter,
+            self.options.inner_tol,
+            Some(joint_warm),
+            Some(&mu),
+            self.options.inner_restarts,
+        );
+        if ebe.hard_reject || !ebe.converged || !ebe.nll.is_finite() || ebe.nll >= NLL_SENTINEL {
+            return None;
+        }
+        let stack = Stack::new(self.model, &p, ebe.kappas.len());
+        let b = stack_mode(ebe.eta.as_slice(), &ebe.kappas);
+        let nll = agq_subject_nll(
+            self.model,
+            subject,
+            &p,
+            &stack,
+            &b,
+            &self.nodes,
+            &self.log_weights,
+            self.options.hessian_anchor(),
+        );
+        (nll.is_finite() && nll < NLL_SENTINEL).then_some(nll)
+    }
+
+    fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
+        self.reconverged_nll(subject, self.x, joint_warm)?;
+        let mut g = vec![0.0; self.x.len()];
+        for k in 0..self.x.len() {
+            if self.fixed[k] {
+                continue;
+            }
+            let h = 1e-4 * (1.0 + self.x[k].abs());
+            let mut xp = self.x.to_vec();
+            let mut xm = self.x.to_vec();
+            xp[k] = (self.x[k] + h).min(self.bounds.upper[k]);
+            xm[k] = (self.x[k] - h).max(self.bounds.lower[k]);
+            let width = xp[k] - xm[k];
+            if width.abs() < 1e-16 {
+                continue;
+            }
+            let fp = self.reconverged_nll(subject, &xp, joint_warm)?;
+            let fm = self.reconverged_nll(subject, &xm, joint_warm)?;
+            g[k] = (fp - fm) / width;
+            if !g[k].is_finite() {
+                return None;
+            }
+        }
+        Some(g)
+    }
+}
+
+/// Use analytic scores where possible and reconverge only subjects needing numerical scores.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn population_gradient_mixed(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    bounds: &crate::estimation::parameterization::PackedBounds,
+    options: &crate::types::FitOptions,
+    force_fd: bool,
+) -> Option<Vec<f64>> {
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
+    let scores: Vec<_> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            context.score(
+                s,
+                eta_hats[i].as_slice(),
+                kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            )
+        })
+        .collect();
+    let mut result = vec![0.0; x.len()];
+    for score in scores {
+        for (out, g) in result.iter_mut().zip(score?) {
+            *out += 2.0 * g;
+        }
+    }
+    result.iter().all(|v| v.is_finite()).then_some(result)
+}
+
+/// Packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if a complete finite gradient
+/// cannot be formed for any subject. Unavailable analytic ingredients use the numerical
+/// routes above; a failure there declines the whole gradient rather than omitting terms.
 ///
 /// Parallel over subjects; the per-subject gradients are reduced **serially in subject
 /// order** so the result cannot depend on the thread count (#703), exactly as
@@ -1614,6 +1929,114 @@ pub fn agq_population_gradient(
 mod tests {
     use super::*;
     use crate::parser::model_parser::parse_model_string;
+
+    #[test]
+    fn audit_invalid_perturbed_anchor_declines_the_gradient() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::parameterization::pack_params;
+        let source = M3_MODEL.replace("TVCL(0.2,", "TVCL(0.2000001,").replace(
+            "CL = TVCL * exp(ETA_CL)",
+            "CL = (TVCL - 0.2)^0.5 * exp(ETA_CL)",
+        );
+        let model = parse_model_string(&source).unwrap();
+        let params = &model.default_params;
+        let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
+        let ebe = find_ebe(&model, &subject, params, 200, 1e-11, None, None, 0);
+        let x = pack_params(params);
+        let stack = Stack::new(&model, params, 0);
+        let mut xm = x.clone();
+        xm[0] -= AGQ_GRID_FD_STEP * (1.0 + x[0].abs());
+        let pm = crate::estimation::parameterization::unpack_params(&xm, params);
+        let sm = Stack::new(&model, &pm, 0);
+        let mut scratch = pk::EventPkParams::default();
+        let hm = anchor_hessian(
+            HessianAnchor::GaussNewton,
+            &model,
+            &subject,
+            &pm,
+            &sm,
+            ebe.eta.as_slice(),
+            &mut scratch,
+            None,
+        );
+        assert!(
+            hm.is_none_or(|h| h.iter().any(|v| !v.is_finite())),
+            "fixture must actually have an invalid perturbed anchor"
+        );
+        let (nodes, weights) = gauss_hermite(3);
+        let lw: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+        let base = agq_subject_nll(
+            &model,
+            &subject,
+            params,
+            &stack,
+            ebe.eta.as_slice(),
+            &nodes,
+            &lw,
+            HessianAnchor::GaussNewton,
+        );
+        assert!(
+            base.is_finite() && base < NLL_SENTINEL,
+            "base quadrature must be valid"
+        );
+        let mut out = vec![0.0; x.len()];
+        assert!(
+            agq_subject_packed_gradient(
+                &model,
+                &subject,
+                params,
+                params,
+                &stack,
+                &x,
+                ebe.eta.as_slice(),
+                &nodes,
+                &lw,
+                HessianAnchor::GaussNewton,
+                &mut out
+            )
+            .is_none(),
+            "an invalid perturbed anchor must not silently lose its grid response"
+        );
+        // The production fallback must still differentiate FOCEI quadrature, not FOCEI.
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let bounds = crate::estimation::parameterization::compute_bounds(params);
+        let gradient = |interval| {
+            let opts = crate::types::FitOptions {
+                method: crate::types::EstimationMethod::FoceI,
+                n_agq: 3,
+                reconverge_gradient_interval: interval,
+                inner_tol: 1e-11,
+                inner_maxiter: 200,
+                ..crate::types::FitOptions::default()
+            };
+            let mut index = 0;
+            crate::estimation::outer_optimizer::population_gradient(
+                &x,
+                1,
+                params,
+                &model,
+                &pop,
+                std::slice::from_ref(&ebe.eta),
+                std::slice::from_ref(&ebe.h_matrix),
+                &[vec![]],
+                &bounds,
+                &opts,
+                &mut index,
+            )
+        };
+        assert_eq!(
+            gradient(0),
+            gradient(1),
+            "analytic failure must use the explicit quadrature FD path"
+        );
+    }
 
     // --- Phase 0 (#251): the analytic fixed-b score reaches full FOCE/FOCEI scope -------
     //
@@ -1742,10 +2165,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -1938,10 +2363,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: pk_times
                 .iter()
                 .map(|_| 0u16)
@@ -1994,6 +2421,7 @@ mod tests {
                     e,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     s,
                     None,
                 )
@@ -2209,6 +2637,123 @@ mod tests {
             *errs.last().unwrap() < 1e-5,
             "21-node AGQ error {} too large (truth {want})",
             errs.last().unwrap()
+        );
+    }
+
+    /// `AGQ(1, GaussNewton)` **is** the FOCEI marginal — pinned, and its residual measured.
+    ///
+    /// This identity is the framing the analytic AGQ covariance Hessian (#251) is built on:
+    /// `F_agq = F_focei + Δ`, where `Δ` is purely the quadrature refinement and vanishes at
+    /// one node. If the identity did not hold, the decomposition would be assembling a
+    /// second derivative of the wrong object. Nothing in the repo pinned it — the existing
+    /// tests pin the *Exact*-anchor AGQ(1) against NONMEM `LAPLACIAN`, which is the other
+    /// anchor, and the `d == 0` degenerate case.
+    ///
+    /// The residual is **not zero**, and the reason is load-bearing for the derivative work:
+    /// `build_proposal` regularises with a per-dimension relative jitter
+    /// `Λᵢᵢ = max(1e-6·|Hᵢᵢ|, 1e-10)`, so the objective's log-determinant term is
+    /// `½log|H̃ + Λ|`, not `½log|H̃|`. To first order the gap is `½·1e-6·tr((H̃+Λ)⁻¹diag|H̃|)`,
+    /// i.e. `~½·1e-6·d` — small, but a *systematic* offset, not noise. Any "exact" analytic
+    /// derivative of this objective must therefore differentiate `H̃ + Λ`; differentiating
+    /// `H̃` alone would be wrong at the same relative order and would show up as a
+    /// consistent bias no amount of step-size tuning removes.
+    ///
+    /// The assertion is two-sided on purpose: an upper bound catches the identity breaking,
+    /// and a lower bound catches the jitter silently disappearing (which would make a future
+    /// `H̃`-only derivative look correct here while being wrong in general).
+    #[test]
+    fn agq_one_node_gauss_newton_is_the_focei_marginal_up_to_the_proposal_jitter() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::stats::likelihood::foce_subject_nll;
+
+        let model = parse_model_string(M3_MODEL).expect("parse");
+        let theta = [0.22, 11.0, 1.4];
+        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        let focei = foce_subject_nll(
+            &model,
+            &subject,
+            &params.theta,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            &params.residual_correlations,
+            true,
+        );
+
+        let stack = Stack::new(&model, &params, 0);
+        // `gauss_hermite` returns **weights**, not log-weights — the production call sites
+        // take `.ln()` themselves. Destructuring straight into `log_weights` costs a silent
+        // `d·(√π − ln√π) = 1.2·d` offset in the objective.
+        let (nodes, weights) = gauss_hermite(1);
+        let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+        let agq = agq_subject_nll(
+            &model,
+            &subject,
+            &params,
+            &stack,
+            ebe.eta.as_slice(),
+            &nodes,
+            &log_weights,
+            HessianAnchor::GaussNewton,
+        );
+
+        let d = stack.d();
+        assert_eq!(d, 3, "fixture must have 3 random effects");
+
+        // The closed form AGQ(1) must reduce to, stated independently of `agq_subject_nll`
+        // so the test pins the *reduction* and not merely its own arithmetic.
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let schedule = cacheable_schedule(&model, &subject);
+        let nll_at_mode = stack.nll_at(
+            &model,
+            &subject,
+            &params,
+            ebe.eta.as_slice(),
+            &mut scratch,
+            schedule.as_ref(),
+        );
+        let h_anchor = anchor_hessian(
+            HessianAnchor::GaussNewton,
+            &model,
+            &subject,
+            &params,
+            &stack,
+            ebe.eta.as_slice(),
+            &mut scratch,
+            schedule.as_ref(),
+        )
+        .expect("gauss-newton anchor in scope");
+        let proposal = build_proposal(&h_anchor, &stack.omega_joint_inv, d).expect("proposal");
+        let laplace_closed_form = nll_at_mode + 0.5 * proposal.log_det_inv_scale;
+        assert!(
+            (agq - laplace_closed_form).abs() < 1e-12,
+            "AGQ(1) must reduce to nll(b̂) + ½log|H_reg| exactly: agq={agq}, \
+             closed form={laplace_closed_form}"
+        );
+
+        let gap = (agq - focei).abs();
+
+        // Upper bound: a few times the first-order jitter estimate `½·1e-6·d`. Anything
+        // larger means the two are no longer the same marginal.
+        let jitter_scale = 0.5e-6 * d as f64;
+        assert!(
+            gap < 20.0 * jitter_scale,
+            "AGQ(1, GaussNewton) must be the FOCEI marginal: agq={agq}, focei={focei}, \
+             gap={gap:.3e}, expected < {:.3e}",
+            20.0 * jitter_scale
+        );
+        // Lower bound: the jitter is really there. If this trips, `build_proposal` stopped
+        // regularising and the derivative work below can drop its `Λ` terms.
+        assert!(
+            gap > 1e-9,
+            "expected a non-zero proposal-jitter offset, got gap={gap:.3e} — if \
+             `build_proposal` no longer jitters, the analytic AGQ derivative may \
+             differentiate H̃ directly"
         );
     }
 

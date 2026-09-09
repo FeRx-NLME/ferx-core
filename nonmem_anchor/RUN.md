@@ -29,7 +29,7 @@ nmfe75 freijer_biphasic_ig.ctl freijer_biphasic_ig.lst
 
 ```bash
 # objective at NONMEM's optimum (the anchor), or a free fit:
-cargo run --release -- nonmem_anchor/biphasic_ig_fit.ferx --data data/biphasic_ig_oral.csv
+cargo run --release -p ferx-cli -- nonmem_anchor/biphasic_ig_fit.ferx --data data/biphasic_ig_oral.csv
 # the slow-gated acceptance test:
 cargo test --test biphasic_igd_nonmem_anchor --features slow-tests
 ```

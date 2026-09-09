@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped, read_nonmem_csv_routed,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    MissingDvPolicy, ObsRouting, SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -46,6 +45,15 @@ pub(crate) fn log_transform_observations(pop: &mut Population) -> usize {
     let mut n_nonpos = 0usize;
     for subject in &mut pop.subjects {
         for v in &mut subject.observations {
+            // A non-finite DV is left alone. `f64::max` returns the *non-NaN*
+            // operand, so `NaN.max(LTBS_FLOOR).ln()` would quietly turn a NaN
+            // design placeholder (#957) into a finite, extreme "observation" and
+            // let a mis-routed simulation population fit to completion. Leave it
+            // non-finite so `E_NONFINITE_DV` (and any downstream `is_finite`
+            // guard) still sees it.
+            if !v.is_finite() {
+                continue;
+            }
             if *v <= 0.0 {
                 n_nonpos += 1;
             }
@@ -77,7 +85,7 @@ fn paths_equivalent(a: &str, b: &str) -> bool {
 ///
 /// - Neither given → `Err` (nothing to fit against).
 /// - Only one given → that one, no warning.
-/// - Both given and equal (see [`paths_equivalent`]) → the shared path, no
+/// - Both given and equal (see `paths_equivalent`) → the shared path, no
 ///   warning.
 /// - Both given and different → `external_path` wins; a warning is returned
 ///   (not printed — see "Warning and Error Conventions" in CLAUDE.md) for the
@@ -115,15 +123,63 @@ pub fn run_model_with_data(
     run_model_with_data_inits(model_path, data_path, None)
 }
 
-/// Like [`run_model_with_data`], but lets the caller (e.g. the CLI's
-/// `--inits-from-nca` flag) override the model file's `inits_from_nca` fit
-/// option. When `inits_override` is `None` the model-file value is used as-is;
-/// when `Some(method)` it forces that NCA strategy regardless of the file.
-pub fn run_model_with_data_inits(
+/// A model file and its dataset, parsed and read but **not yet fitted** — every
+/// input [`fit`] needs, assembled by [`prepare_run`].
+///
+/// Getting from a `.ferx` file to a fittable state is not one call: the data
+/// path has to be resolved against the model's own `[data]` block, the
+/// `[data_selection]` filter compiled, the population read through the model's
+/// covariate declarations and column map, `theta NAME[...]` level blocks bound
+/// against the data (which re-parses the model with the real θ count, #1064),
+/// and the initial [`ModelParameters`] built from the parsed model. A caller
+/// that wants any of that *without* fitting — a tool running many fits over
+/// resampled data, an R caller inspecting or `predict()`ing a model — previously
+/// had to run a fit to get there.
+///
+/// The fields are the entrypoint's own intermediate state, made public rather
+/// than reconstructed: [`run_model_with_data_inits`] is implemented on top of
+/// this, so there is one code path and a tool cannot silently diverge from what
+/// the CLI does.
+pub struct PreparedRun {
+    /// The parsed model, with `theta NAME[...]` blocks bound to the data and
+    /// `gradient_method` resolved onto `parsed.model`.
+    pub parsed: ParsedModel,
+    /// The dataset, filtered by `[data_selection]` and carrying any level-index
+    /// columns synthesized during binding.
+    pub population: Population,
+    /// Initial parameter estimates from the model file, ready to pass to [`fit`].
+    pub init_params: ModelParameters,
+    /// The covariate table, when the model declares covariates.
+    pub covariate_table: Option<CovariateTable>,
+    /// The dataset actually read, after resolving `data_path` against `[data]`.
+    pub data_path: String,
+    /// Set when an explicit `data_path` overrode the model's `[data] path`.
+    pub data_path_warning: Option<String>,
+    /// SHA-256 of the model file, `None` if it could not be hashed.
+    pub model_hash: Option<String>,
+    /// SHA-256 of the dataset, `None` if it could not be hashed.
+    pub data_hash: Option<String>,
+}
+
+/// Parse a model file and read its dataset, stopping short of the fit.
+///
+/// See [`PreparedRun`]. `data_path` is `None` to rely on the model's `[data]`
+/// block; when both are given the argument wins and
+/// [`PreparedRun::data_path_warning`] records it.
+///
+/// Unlike [`run_model_with_data`] this is **quiet** — it prints nothing — because
+/// its caller may be running it hundreds of times.
+pub fn prepare_run(model_path: &str, data_path: Option<&str>) -> Result<PreparedRun, String> {
+    prepare_run_with_inits(model_path, data_path, None)
+}
+
+/// [`prepare_run`] with the CLI's `--inits-from-nca` override, which has to be
+/// applied before `build_init_params` reads the parsed model.
+pub fn prepare_run_with_inits(
     model_path: &str,
     data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
-) -> Result<(FitResult, Population), String> {
+) -> Result<PreparedRun, String> {
     use crate::parser::model_parser::parse_full_model_file;
 
     let mut parsed = parse_full_model_file(Path::new(model_path))?;
@@ -132,28 +188,35 @@ pub fn run_model_with_data_inits(
         parsed.fit_options.inits_from_nca = Some(method);
     }
 
-    eprintln!("Model: {}", parsed.model.name);
-
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
-    let data_path = data_path.as_str();
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
     let (mut population, covariate_table) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
-        data_path,
+        &data_path,
         None,
         iov_col,
         sel_filter.as_ref(),
         &parsed.column_map,
     )?;
-    eprintln!(
-        "Data:  {} subjects, {} observations from {}",
-        population.subjects.len(),
-        population.n_obs(),
-        data_path
-    );
+
+    // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
+    // combination, so its level count is a property of the data. Bind it now —
+    // this synthesizes the per-record index column on every subject and
+    // re-parses the model with the real θ count — before anything reads
+    // `parsed.model`'s parameter vector.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+        // #1111: and resolve any symbolic `[covariate_model]` statistic
+        // (`center = median`, `ref = mode`, `levels = auto`) against the same
+        // dataset, which likewise re-parses so the desugared expression carries
+        // the resolved constant.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
+    }
 
     let init_params = build_init_params(&parsed);
     // Sync the resolved gradient method from fit_options onto the model so
@@ -172,7 +235,50 @@ pub fn run_model_with_data_inits(
     // stamping below — so we still hash each file only once. Errors are
     // non-fatal: a missing hash just disables the resume/integrity checks.
     let model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
-    let data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    let data_hash = crate::io::hash::sha256_file(Path::new(&data_path)).ok();
+
+    Ok(PreparedRun {
+        parsed,
+        population,
+        init_params,
+        covariate_table,
+        data_path,
+        data_path_warning,
+        model_hash,
+        data_hash,
+    })
+}
+
+/// Like [`run_model_with_data`], but lets the caller (e.g. the CLI's
+/// `--inits-from-nca` flag) override the model file's `inits_from_nca` fit
+/// option. When `inits_override` is `None` the model-file value is used as-is;
+/// when `Some(method)` it forces that NCA strategy regardless of the file.
+pub fn run_model_with_data_inits(
+    model_path: &str,
+    data_path: Option<&str>,
+    inits_override: Option<crate::suggest_start::NcaInit>,
+) -> Result<(FitResult, Population), String> {
+    let PreparedRun {
+        mut parsed,
+        mut population,
+        init_params,
+        covariate_table,
+        data_path,
+        data_path_warning,
+        model_hash,
+        data_hash,
+    } = prepare_run_with_inits(model_path, data_path, inits_override)?;
+    let data_path = data_path.as_str();
+
+    // Printed here rather than in `prepare_run`, which is used by tools running
+    // hundreds of fits and must stay silent.
+    eprintln!("Model: {}", parsed.model.name);
+    eprintln!(
+        "Data:  {} subjects, {} observations from {}",
+        population.subjects.len(),
+        population.n_obs(),
+        data_path
+    );
 
     // Checkpoint / restart (#755): write `{model_stem}.tmp` next to the CLI
     // outputs and resume from it on a re-run of the same model + data. Disabled
@@ -231,6 +337,81 @@ pub(crate) fn derive_output_occasions(
 
 /// Run a model file with simulated data (from [simulation] block).
 /// Returns (FitResult, Population) so caller can write sdtab.
+/// What [`simulation_design_covariates`] returns: the population's covariate
+/// names, in declaration order, plus one covariate map per synthetic subject.
+pub(crate) type SimulationDesignCovariates = (Vec<String>, Vec<HashMap<String, f64>>);
+
+/// Resolve `[simulation] covariate NAME = ...` into the population's covariate
+/// names plus one covariate map per synthetic subject (#1083).
+///
+/// A simulated trial exists to invent arms that are in no dataset — *"what would
+/// a 300-subject arm of this design look like?"* — so there is no row to read
+/// `NARM` or `WPSE` from, and the covariates the design turns on have to be
+/// stated as part of the design. Requiring them is the convention: an unresolved
+/// weight has no defensible default (a silent `1` gives a simulated arm the
+/// variability of a single-subject arm, a silent `0` gives it none, and
+/// `BinOp::Div` underflows to `0.0` rather than `inf`, so neither shows up as a
+/// `NaN`).
+///
+/// The missing-value report is deliberately *not* the shared `check_covariates`
+/// message: on this path there is no data file, so "not found in data … Available
+/// covariate columns: (none)" reads as a typo report on a column that was never
+/// going to exist, and it names no fix.
+///
+/// Returned in declaration order. The per-subject vector has one entry per
+/// subject; the parser has already broadcast a scalar and checked every list
+/// against `n_subjects`, so a short list cannot reach here.
+///
+/// Subject-level only: `obs_cov` / `dose_cov` fall back to `Subject::covariates`
+/// when the per-record vectors are empty, and a synthetic arm's design covariates
+/// — its size, its reported standard error — are constant over the arm by
+/// construction.
+pub(crate) fn simulation_design_covariates(
+    sim_spec: &SimulationSpec,
+    model: &CompiledModel,
+) -> Result<SimulationDesignCovariates, String> {
+    let names: Vec<String> = sim_spec.covariates.iter().map(|(n, _)| n.clone()).collect();
+
+    let missing: Vec<&str> = model
+        .referenced_covariates
+        .iter()
+        // A a level block index column (#1064) is synthesized per record by
+        // `bind_theta_levels` from the design's own covariates and observation
+        // grid — it is not something the user can state, so demanding it here
+        // would make every level-block model unsimulatable, naming a column with a
+        // reserved `__level_` prefix as the fix.
+        .filter(|name| !crate::api::levels::is_level_index_column(name))
+        .filter(|name| !names.iter().any(|n| n == *name))
+        .map(|s| s.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "[simulation]: the model references covariate(s) {} that the simulation design \
+             does not supply. A simulated trial invents arms that are in no dataset, so their \
+             covariates — an arm size behind `weight = N`, a reported standard error behind \
+             `weight = SE`, a body weight — are part of the design and must be stated: add \
+             `covariate {} = <value>` (or `= [v1, ...]`, one per subject) to [simulation].",
+            missing
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing[0],
+        ));
+    }
+
+    let per_subject: Vec<HashMap<String, f64>> = (0..sim_spec.n_subjects)
+        .map(|i| {
+            sim_spec
+                .covariates
+                .iter()
+                .map(|(n, vals)| (n.clone(), vals[i]))
+                .collect()
+        })
+        .collect();
+    Ok((names, per_subject))
+}
+
 pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), String> {
     use crate::parser::model_parser::parse_full_model_file;
     use std::collections::HashMap;
@@ -335,6 +516,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     } else {
         0
     };
+    // Per-subject covariate values from `[simulation] covariate NAME = ...` (#1083).
+    let (sim_covariate_names, sim_subject_covariates) =
+        simulation_design_covariates(&sim_spec, &parsed.model)?;
+    let subject_covariates = |i: usize| -> HashMap<String, f64> {
+        sim_subject_covariates
+            .get(i - 1)
+            .cloned()
+            .unwrap_or_default()
+    };
+
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -355,16 +546,18 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             obs_raw_times: Vec::new(),
             observations: vec![0.0; n_gauss],
             obs_cmts: vec![1; n_gauss],
-            covariates: HashMap::new(),
+            covariates: subject_covariates(i),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n_gauss],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             // One right-censored template row per cause CMT, at the administrative
             // horizon (overwritten by the draw). Empty when the model has no TTE
@@ -408,14 +601,30 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             obs_records: Vec::new(),
         })
         .collect();
-    let template = Population {
+    let mut template = Population {
         subjects,
-        covariate_names: vec![],
+        covariate_names: sim_covariate_names,
         dv_column: "dv".into(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
     };
+
+    // #1064: bind level blocks against the synthetic design, exactly as
+    // the data path binds them against a dataset — the levels come from the
+    // `[simulation]` covariates and observation grid. Every level gets the
+    // declaration's broadcast init, since the DSL has no way to state per-level
+    // simulation values; a design that needs distinct ones should use the
+    // explicit `theta NAME[N]` form and its own index column.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
+        // #1111: the simulation design is the dataset here, so a symbolic
+        // covariate statistic resolves against the simulated covariates.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
+    }
+    let template = template;
 
     // Simulate
     eprintln!(
@@ -675,6 +884,10 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
     model
         .referenced_covariates
         .iter()
+        // A a level block index column (#1064) is synthesized by
+        // `bind_theta_levels` after the read, never present in the CSV — asking
+        // the reader for it would fail on a column the user never wrote.
+        .filter(|c| !crate::api::levels::is_level_index_column(c))
         .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
         .collect()
@@ -743,27 +956,22 @@ pub(crate) fn build_selection_filter_merged(
     SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
 }
 
-/// Read a [`Population`] from `data_path` using the correct reader for `model`.
+/// The non-Gaussian row routing a dataset needs for `model`: every CMT the model
+/// declares as a TTE / binary / CTMM endpoint, plus the design-row DV placeholder
+/// per CTMM endpoint and the missing-DV policy. Empty routing sets for a
+/// Gaussian-only model.
 ///
-/// When the model declares a `[covariates]` block this routes through the strict
-/// reader (validates declared columns exist + are numeric, builds the table, and
-/// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
-/// it falls back to the lenient reader with `fallback_columns` (the legacy
-/// `covariate_columns` argument, or `None` for auto-detect).
-///
-/// When the model contains `[event_model]` blocks (TTE endpoints), TTE rows are
-/// automatically routed to `subject.obs_records` instead of the Gaussian parallel
-/// vectors. Library consumers (e.g. the R glue) should call this instead of the
-/// individual `read_nonmem_csv*` functions so that TTE routing is applied.
-pub fn read_population_for(
-    model: &CompiledModel,
-    covariate_decls: &Option<Vec<CovariateDecl>>,
-    data_path: &str,
-    fallback_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    column_map: &[(String, String)],
-) -> Result<(Population, Option<CovariateTable>), String> {
+/// This is the **only** place the routing is derived from a model. Every reader
+/// call that has a model in hand must go through it — the file-based
+/// [`read_population_for`] family, and [`read_population_routed_by`] for the
+/// `.fitrx` reload and the `run_covariance` / `run_sir` re-read — because a
+/// population read *without* it carries the endpoint's rows as Gaussian
+/// observations and no event records, which `fit()` then rejects with
+/// `E_ENDPOINT_UNROUTED` (#1199).
+fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRouting {
+    // Nothing to route without `survival`: no non-Gaussian endpoint can be parsed.
+    #[cfg(not(feature = "survival"))]
+    let _ = model;
     // Extract TTE CMTs from model endpoints so the reader can route TTE rows
     // to obs_records instead of the Gaussian parallel Vecs.
     #[cfg(feature = "survival")]
@@ -791,90 +999,165 @@ pub fn read_population_for(
     // binary-only `Vec` above, and the two are equal today only because CTMM `--simulate`
     // is rejected upstream. When CTMM simulation lands (#820) they diverge.
     let discrete_cmts: std::collections::HashSet<usize> = {
-        let mut discrete: std::collections::HashSet<usize> =
-            model.binary_cmts().into_iter().collect();
+        let discrete: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
         #[cfg(feature = "markov")]
-        discrete.extend(model.ctmm_cmts());
+        let discrete = discrete.into_iter().chain(model.ctmm_cmts()).collect();
         discrete
     };
     #[cfg(not(feature = "survival"))]
     let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    if tte_cmts.is_empty() && discrete_cmts.is_empty() {
-        // Gaussian-only model: use the existing (faster) path without TTE overhead.
-        match (covariate_decls, filter) {
-            (Some(decls), Some(sel)) => {
-                let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_filtered_mapped(
-                    Path::new(data_path),
-                    decls,
-                    &extra,
-                    iov_column,
-                    sel,
-                    column_map,
-                )?;
-                Ok((pop, Some(table)))
+    // One reader call covers every combination: the routing sets are empty for a
+    // Gaussian-only model (so no row is routed to `obs_records`), and the reader
+    // builds the covariate read set from `decls` when the model declares
+    // `[covariates]`, from `fallback_columns` otherwise.
+    // Placeholder DV code for an integer-coded design row: the endpoint's first
+    // declared state code, so a `state_codes` table that is not 0-based (e.g.
+    // `1`/`2`) never gets an undecodable `0` placeholder. Only CTMM declares
+    // codes; Binary is `{0,1}` and keeps the `0` default.
+    #[cfg(feature = "markov")]
+    let design_states: HashMap<usize, usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| match ep {
+            EndpointLikelihood::Ctmm { state_codes, .. } => {
+                state_codes.first().map(|&code| (cmt, code))
             }
-            (Some(decls), None) => {
-                let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_mapped(
-                    Path::new(data_path),
-                    decls,
-                    &extra,
-                    iov_column,
-                    column_map,
-                )?;
-                Ok((pop, Some(table)))
-            }
-            (None, Some(sel)) => Ok((
-                read_nonmem_csv_filtered_mapped(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    sel,
-                    column_map,
-                )?,
-                None,
-            )),
-            (None, None) => Ok((
-                read_nonmem_csv_mapped(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    column_map,
-                )?,
-                None,
-            )),
-        }
-    } else {
-        // Model has TTE endpoints: use TTE-aware reader so obs_records are populated.
-        match covariate_decls {
-            Some(decls) => {
-                let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_tte(
-                    Path::new(data_path),
-                    decls,
-                    &extra,
-                    iov_column,
-                    filter,
-                    &tte_cmts,
-                    &discrete_cmts,
-                    column_map,
-                )?;
-                Ok((pop, Some(table)))
-            }
-            None => {
-                let pop = read_nonmem_csv_filtered_tte(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    filter,
-                    &tte_cmts,
-                    &discrete_cmts,
-                    column_map,
-                )?;
-                Ok((pop, None))
-            }
-        }
-    }
+            _ => None,
+        })
+        .collect();
+    #[cfg(not(feature = "markov"))]
+    let design_states: HashMap<usize, usize> = HashMap::new();
+
+    ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
+        .with_missing_dv(missing_dv)
+        .with_design_states(design_states)
+}
+
+/// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`
+/// but no `ParsedModel`: the `.fitrx` reload (`io::fitrx::load_fit`) and the
+/// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path`. The same
+/// reader call as [`read_population_for`] with no covariate declarations and no
+/// row filter, so the population comes back the way the original fit saw it —
+/// the endpoint's rows as event records, not as Gaussian observations (#1199).
+pub(crate) fn read_population_routed_by(
+    model: &CompiledModel,
+    data_path: &Path,
+    iov_column: Option<&str>,
+    column_map: &[(String, String)],
+) -> Result<Population, String> {
+    read_nonmem_csv_routed(
+        data_path,
+        None,
+        None,
+        &[],
+        iov_column,
+        None,
+        &obs_routing_for(model, MissingDvPolicy::Skip),
+        column_map,
+    )
+    .map(|(population, _)| population)
+}
+
+/// Read a [`Population`] from `data_path` using the correct reader for `model`.
+///
+/// When the model declares a `[covariates]` block this routes through the strict
+/// reader (validates declared columns exist + are numeric, builds the table, and
+/// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
+/// it falls back to the lenient reader with `fallback_columns` (the legacy
+/// `covariate_columns` argument, or `None` for auto-detect).
+///
+/// When the model contains `[event_model]` blocks (TTE endpoints), TTE rows are
+/// automatically routed to `subject.obs_records` instead of the Gaussian parallel
+/// vectors. Library consumers (e.g. the R glue) should call this instead of the
+/// individual `read_nonmem_csv*` functions so that TTE routing is applied.
+pub fn read_population_for(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
+    read_population_for_policy(
+        model,
+        covariate_decls,
+        data_path,
+        fallback_columns,
+        iov_column,
+        filter,
+        column_map,
+        MissingDvPolicy::Skip,
+    )
+}
+
+/// [`read_population_for`] for a dataset that will be **simulated from** rather
+/// than fitted (#957).
+///
+/// Identical in every respect but one: an `EVID=0`, `MDV=0` record whose `DV`
+/// cell is missing (`.` / `NA` / blank) is kept as a **design point** — a
+/// sampling time whose observation has not been generated yet — instead of being
+/// skipped as a forgotten `MDV=1` (#258). Writing `DV = .` at every sampling time
+/// is the natural way to express a design (and is what NONMEM's `$SIMULATION`
+/// accepts), so the fitting reading would otherwise return zero simulated rows
+/// for the most idiomatic template there is.
+///
+/// The kept row carries a placeholder DV (`NaN` for a Gaussian endpoint, the
+/// endpoint's first declared state code for an integer-coded one) which the
+/// simulated value replaces; do **not** pass the returned population to [`fit`].
+/// That contract is enforced, not merely documented: a non-finite observation is
+/// rejected by `E_NONFINITE_DV` ([`check_model_data`]) at `fit()` entry.
+/// `MDV=1` still excludes the record — that is the user explicitly saying it is
+/// not an observation.
+pub fn read_population_for_simulation(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
+    read_population_for_policy(
+        model,
+        covariate_decls,
+        data_path,
+        fallback_columns,
+        iov_column,
+        filter,
+        column_map,
+        MissingDvPolicy::KeepAsDesign,
+    )
+}
+
+/// Shared body of [`read_population_for`] (fit: `MissingDvPolicy::Skip`) and
+/// [`read_population_for_simulation`] (`KeepAsDesign`). The policy is the only
+/// difference between them.
+#[allow(clippy::too_many_arguments)]
+fn read_population_for_policy(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+    missing_dv: MissingDvPolicy,
+) -> Result<(Population, Option<CovariateTable>), String> {
+    let routing = obs_routing_for(model, missing_dv);
+    let (decls, extra) = match covariate_decls {
+        Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
+        None => (None, Vec::new()),
+    };
+    read_nonmem_csv_routed(
+        Path::new(data_path),
+        fallback_columns,
+        decls,
+        &extra,
+        iov_column,
+        filter,
+        &routing,
+        column_map,
+    )
 }

@@ -1,3 +1,7 @@
+---
+pagetitle: "LOQ-censored observations in ferx"
+---
+
 # LOQ-Censored Observations
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -91,6 +95,11 @@ The M3 censored likelihood is differentiated with **exact analytic sensitivities
 The censored *moments* follow each method's own approximation. Under **FOCE** (non-interaction, Sheiner–Beal) the tail probability uses the linearized-**marginal** moments — mean $f_0 = f(\hat\eta) - H\hat\eta$ and variance $\tilde R_{jj} = H_j\Omega H_j^\top + R^0$, the same moments the quantified rows use (#646, matching Monolix's linearization likelihood and first-order/Tobit theory) — so plain FOCE stays a self-consistent Sheiner–Beal objective. **FOCEI** instead evaluates the tail at the *conditional* $f(\hat\eta)$ and residual variance $R^0$ — the same conditional censored treatment NONMEM's `METHOD=1 LAPLACE` M3 uses (the only way NONMEM runs M3). Note that ferx's FOCEI is a first-order (Gauss–Newton) conditional method: it drops the $\partial^2 f/\partial\eta^2$ curvature term that *full* Laplace keeps, so it matches NONMEM's Laplace M3 only **up to that FOCEI-vs-Laplace second-order term** (ferx has no full-Laplace M3 mode yet). The two are therefore genuinely different — each correct for its own approximation — and give different optima on censored data, most visibly when between-subject variance is large (so $H\Omega H^\top$ dominates $R^0$).
 
 Because NONMEM cannot run M3 under a non-Laplace (FOCE) method — `$ERROR F_FLAG=1` forces the LAPLACIAN (i.e. conditional) estimation method — the FOCE-M3 marginal objective has **no NONMEM reference** to anchor against. It is validated instead by (a) self-consistency: its analytic packed gradient matches reconverged finite differences of the objective to ~1e-6 for non-IOV/IOV × closed-form/ODE (`population_packed_gradient_m3_foce_matches_fd`, `iov_m3_foce_*`); and (b) the first-order / Tobit theory and the Monolix-linearization precedent above. For a NONMEM-comparable BLQ likelihood, use **FOCEI**, whose conditional censored term is the one NONMEM's `METHOD=1 LAPLACE` M3 uses — matching it up to the FOCEI-vs-Laplace second-order term (§ [FOCE / FOCEI](../estimation/foce.qmd)).
+
+The analytical covariance R-matrix supports M3 on closed-form and `[odes]` models for FOCE,
+FOCEI, and FOCEI-anchored AGQ, including combined with IOV. It differentiates
+FOCE's linearized-marginal tail and FOCEI/AGQ's conditional tail separately.
+Exact-anchor Laplace retains the numerical covariance path.
 
 As a cross-check on the ODE path, `examples/warfarin_iov_ode_bloq.ferx` and the closed-form `examples/warfarin_iov_bloq.ferx` fit the same IOV + M3 dataset (`data/warfarin_iov_bloq.csv`) and converge to the same optimum — `TVCL`/`TVV`/`TVKA` and every variance component agree to ~6 significant figures (the closed-form path is itself anchored to NONMEM). The two OFVs differ only at the fourth significant figure, reflecting the closed-form-vs-RK45 prediction difference amplified through the censored marginal near the limit. This cross-check is enforced in CI by the `iov_m3_ode_matches_closed_form_estimates` convergence test (`tests/iov_convergence.rs`), so the ODE leg inherits the closed-form path's NONMEM anchoring at the estimate level and a regression cannot pass unnoticed.
 

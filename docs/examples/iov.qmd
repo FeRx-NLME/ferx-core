@@ -1,3 +1,7 @@
+---
+pagetitle: "Inter-occasion variability example"
+---
+
 # Inter-Occasion Variability (IOV)
 
 This example extends the one-compartment oral warfarin model to account for occasion-to-occasion variability in clearance. The complete model file is `examples/warfarin_iov.ferx`.

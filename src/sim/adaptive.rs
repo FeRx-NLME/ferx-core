@@ -1,6 +1,6 @@
 //! Vocabulary for state-reactive ("adaptive" / feedback) dosing simulation (#391).
 //!
-//! The *types* the reactive driver ([`crate::ode::predictions::ode_predictions_adaptive`])
+//! The *types* the reactive driver (`crate::ode::predictions::ode_predictions_adaptive`)
 //! and the public [`crate::api::simulate_adaptive`] entry point are built on. The
 //! shapes here are deliberately the public API surface:
 //!
@@ -339,7 +339,7 @@ pub struct AdaptiveRun {
 /// One row per `(subject, draw, sim)` — the same key as the trajectory, ledger,
 /// and decision-log rows in [`crate::AdaptiveSimulationResult`], so a metrics row
 /// joins to exactly the run it summarizes. Every field is computed by
-/// [`compute_subject_metrics`] from that run's realized dose ledger and decision
+/// `compute_subject_metrics` from that run's realized dose ledger and decision
 /// log **alone** — no re-integration — so each number is a direct, auditable
 /// function of the recorded artifacts (the same "reproduce it from the artifacts"
 /// contract as the decision log).
@@ -353,7 +353,7 @@ pub struct AdaptiveRun {
 ///
 /// `#[non_exhaustive]`: new outcome metrics (#391 S2.x) land additively without a
 /// breaking change. Within `ferx-core` it is still constructed normally (only
-/// [`compute_subject_metrics`] builds it); the attribute forces downstream crates
+/// `compute_subject_metrics` builds it); the attribute forces downstream crates
 /// (`ferx-r`) to read fields rather than rely on an exhaustive struct literal.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -703,6 +703,19 @@ pub struct AdaptiveDosingSpec {
     /// (the signal is then the noised model output named by `assay_cmt`, not a
     /// re-typed expression). The `when` rules compare the keyword `signal` to it.
     pub observe: Option<String>,
+    /// Covariate names the model's `[covariates]` block declares, captured at parse
+    /// time (empty when the block is absent).
+    ///
+    /// `observe` is stored as a raw string and compiled only at simulate time, by
+    /// `sim::adaptive_control::compile_observe`, through the very same
+    /// `build_y_output_fn` a `[scaling]` Form C readout uses. That compiler needs the
+    /// declarations to apply the `T` / `t` name precedence — a declared `T` is a data
+    /// column, not the model-time built-in (#1028) — and they are not otherwise
+    /// reachable from a `CompiledModel` (`referenced_covariates` holds names the model
+    /// *reads*, which is a declared-and-unreferenced `T` short). Carried here so
+    /// `observe` and `[scaling]` resolve the name identically, rather than the same
+    /// model reading the column in one block and the clock in the other.
+    pub observe_declared_covariates: Vec<String>,
     /// Titrate on the assay-noised measurement of a model output (`true`) rather
     /// than a latent expression (`false`, the default). When set, the signal's
     /// value *and* its σ both come from the output named by `assay_cmt`, so they
@@ -779,7 +792,7 @@ impl AdaptiveDosingSpec {
     /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
     /// reach the controller without going through the parser. The parser calls
     /// this on the spec it assembles, and
-    /// [`compile_adaptive`](crate::sim::adaptive_control::compile_adaptive) calls
+    /// `compile_adaptive` calls
     /// it again as the safety net for hand-built specs — so neither path can drive
     /// the controller with a contradiction (a `Level` step without a `levels`
     /// ladder, a `start_dose` outside `dose_bounds`, a rung outside `dose_bounds`,
@@ -1109,6 +1122,7 @@ mod tests {
     fn base_spec() -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
             observe: Some("central".to_string()),
+            observe_declared_covariates: Vec::new(),
             with_assay_error: false,
             assay_cmt: None,
             at: vec![24.0],

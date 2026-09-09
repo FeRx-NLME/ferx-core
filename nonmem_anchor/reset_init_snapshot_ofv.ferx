@@ -1,0 +1,37 @@
+# ferx twin of nonmem_anchor/reset_init_snapshot_F.ctl (#1133) -- the OFV arm.
+#
+# Same data and structure as the value arms, but ETA_BASE sits INSIDE the init seed under
+# a non-zero omega. The FOCEI `h` matrix is the analytic Jacobian, so a wrong d(init)/d(eta)
+# at the reset moves the EBE and therefore the objective -- which is what makes the
+# sensitivity path externally anchorable here rather than only twin-checked.
+#
+# `WT` reaches the prediction ONLY through the `init(central)` seed — `CL` and `V`
+# are plain thetas — so any divergence from NONMEM here is the reset re-seed's
+# snapshot and nothing else.
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVBASE(10.0, 0.0, 1e15)
+  omega ETA_BASE ~ 0.09
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  BASE = TVBASE * WT * exp(ETA_BASE)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central)  = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

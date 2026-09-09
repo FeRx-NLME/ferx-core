@@ -45,6 +45,16 @@ fn param_corr_fallback(
 }
 
 /// Summary statistics over an NN's flat weight vector for the compact
+/// Comma-separated `{:.6}` rendering of a float vector, for the
+/// `center:` / `scale:` lines of the `neural_networks:` YAML block.
+#[cfg(feature = "nn")]
+fn fmt_f64_list(v: &[f64]) -> String {
+    v.iter()
+        .map(|x| format!("{:.6}", x))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `neural_networks:` section in the fit YAML / CLI output. Empty input
 /// yields all zeros (defensive — shouldn't happen in practice because
 /// the parser refuses zero-weight NNs).
@@ -72,6 +82,53 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 /// Print NONMEM-style results to stderr
+/// Level count above which a θ level block (#1064) is reported as its
+/// own compact section instead of one entry per level in the θ table.
+///
+/// A four-level block reads better inline, exactly as it did before the
+/// feature existed; an unstructured placebo effect with 800 levels would bury
+/// the structural parameters it exists to protect.
+pub(crate) const THETA_BLOCK_COMPACT_MIN: usize = 20;
+
+/// The θ index ranges of the large vector / level blocks in `names`.
+///
+/// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
+/// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket.
+/// Levels of a block are contiguous by construction.
+pub(crate) fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
+    let block_of = |n: &String| -> Option<String> {
+        n.strip_suffix(']')
+            .and_then(|r| r.split_once('['))
+            .map(|(b, _)| b.to_string())
+    };
+    let mut out: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        let Some(block) = block_of(&names[i]) else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        while i < names.len() && block_of(&names[i]).as_deref() == Some(block.as_str()) {
+            i += 1;
+        }
+        if i - start >= THETA_BLOCK_COMPACT_MIN {
+            out.push((block, start..i));
+        }
+    }
+    out
+}
+
+/// `(min, median, max)` of a slice, for the compact block summary. The median
+/// is the lower of the two middle values on an even count — the levels are a
+/// nuisance block, not a quantity anyone interpolates.
+fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
+}
+
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
@@ -110,6 +167,14 @@ pub fn print_results(result: &FitResult) {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: a θ level block with hundreds of levels is a nuisance
+    // block — the point is what it absorbs, not the individual values. Keep it
+    // out of the main table and summarise it below, so the structural
+    // parameters it exists to protect stay readable.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     // Theta estimates
     eprintln!("\n--- THETA Estimates ---");
     eprintln!(
@@ -118,7 +183,7 @@ pub fn print_results(result: &FitResult) {
     );
     eprintln!("{}", "-".repeat(52));
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -141,6 +206,23 @@ pub fn print_results(result: &FitResult) {
             }
         };
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
+    }
+
+    // Compact θ level block summary (#1064). Only independently estimated
+    // contrast coefficients live in `FitResult`; dependent levels are derived.
+    if !theta_blocks.is_empty() {
+        eprintln!("\n--- THETA BLOCKS ---");
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            eprintln!(
+                "{}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
+                block,
+                range.len(),
+                mn,
+                med,
+                mx
+            );
+        }
     }
 
     // Compact NN-weight summary block (Option E). Skipped when no
@@ -173,8 +255,15 @@ pub fn print_results(result: &FitResult) {
     }
 
     // Omega estimates
-    eprintln!("\n--- OMEGA Estimates ---");
     let n_eta = result.omega.nrows();
+    // A fixed-effects-only fit (`n_eta = 0`, #989) has no Omega to report. Printing
+    // the header above an empty body reads as an estimation that failed rather than
+    // one that was never asked for, so suppress the whole section; the loops below
+    // are already no-ops at 0. Mirrors the `if n_eta > 0` guard the YAML writer's
+    // `--- OMEGA ---` section already carries.
+    if n_eta > 0 {
+        eprintln!("\n--- OMEGA Estimates ---");
+    }
     let show_cv = !matches!(
         result.covariance_status,
         CovarianceStatus::Failed | CovarianceStatus::SirFallback
@@ -316,6 +405,25 @@ pub fn print_results(result: &FitResult) {
                 );
             } else {
                 eprintln!("  {:<20} = {:.6}  SE = {}", label, var, se_str);
+            }
+            // Sample-size-weighted IOV (#1031): the estimate above is the
+            // *unweighted* γ² — the quantity a published MBMA reports — so
+            // print the effective SD at the median arm alongside it. A raw
+            // γ of 2.0 on a logit scale reads as alarming until it is divided.
+            if let Some(Some(w)) = result.kappa_weights.get(i) {
+                match result.kappa_weight_typical.get(i).copied().flatten() {
+                    Some(n) if n > 0.0 && var >= 0.0 => eprintln!(
+                        "  {:<20}   weight = {}  →  SD = {:.4} at {} = {:.4} (κ ~ N(0, {}/{}))",
+                        "",
+                        w,
+                        var.sqrt() / n.sqrt(),
+                        w,
+                        n,
+                        name,
+                        w
+                    ),
+                    _ => eprintln!("  {:<20}   weight = {} (κ ~ N(0, {}/{}))", "", w, name, w),
+                }
             }
         }
         // Off-diagonal covariances/correlations (block_kappa)
@@ -604,6 +712,11 @@ pub fn format_summary(result: &FitResult) -> String {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: large θ level blocks get their own compact section.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     // --- THETA ---
     let _ = writeln!(out, "\n--- THETA ---");
     let _ = writeln!(
@@ -612,7 +725,7 @@ pub fn format_summary(result: &FitResult) -> String {
         "Parameter", "Estimate", "SE", "%RSE"
     );
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -639,6 +752,21 @@ pub fn format_summary(result: &FitResult) -> String {
             "  {:<16} {:>12.6} {:>12} {:>8}",
             label, est, se_str, rse_str
         );
+    }
+    if !theta_blocks.is_empty() {
+        let _ = writeln!(out, "\n--- THETA BLOCKS ---");
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            let _ = writeln!(
+                out,
+                "  {}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
+                block,
+                range.len(),
+                mn,
+                med,
+                mx
+            );
+        }
     }
 
     // --- OMEGA ---
@@ -1088,6 +1216,17 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| !s.npde.is_empty() || !s.npd.is_empty());
 
+    // Mixture (#977): emit MIXEST + PMIX_1..PMIX_K only for a mixture fit. `K` is
+    // the posterior-vector length (identical across subjects for a given model).
+    let n_mix_classes = result
+        .subjects
+        .iter()
+        .find_map(|s| s.pmix.as_ref().map(|p| p.len()))
+        .unwrap_or(0);
+    let any_mixture = n_mix_classes > 0;
+    let mut mixest_col = Vec::with_capacity(n_total);
+    let mut pmix_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n_total); n_mix_classes];
+
     for (si, sr) in result.subjects.iter().enumerate() {
         let subj = &population.subjects[si];
         for j in 0..sr.ipred.len() {
@@ -1116,6 +1255,14 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
+            if any_mixture {
+                // Subject-level scalars repeated across the subject's obs rows.
+                mixest_col.push(sr.mixest.map(|c| c as f64).unwrap_or(f64::NAN));
+                for (k, col) in pmix_cols.iter_mut().enumerate() {
+                    let p = sr.pmix.as_ref().and_then(|v| v.get(k)).copied();
+                    col.push(p.unwrap_or(f64::NAN));
+                }
+            }
         }
     }
 
@@ -1147,6 +1294,14 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("EBE_OFV".to_string(), ebe_ofv_col),
         ("N_OBS".to_string(), n_obs_col),
     ]);
+    if any_mixture {
+        // MIXEST (most-probable class) then PMIX_1..PMIX_K (posterior weights),
+        // mirroring the NONMEM `MIXEST` / per-class probability table layout.
+        cols.push(("MIXEST".to_string(), mixest_col));
+        for (k, col) in pmix_cols.into_iter().enumerate() {
+            cols.push((format!("PMIX_{}", k + 1), col));
+        }
+    }
 
     // NOTE: sdtab intentionally does NOT emit ETA1..ETAn columns. Per-subject
     // EBEs live in `fit$ebe_etas` on the R side; sdtab is strictly
@@ -1189,25 +1344,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
                     if !sr.per_obs_tad.is_empty() {
                         return sr.per_obs_tad[j];
                     }
-                    let obs_t = subj.obs_times[j];
-                    let last_eff = subj
-                        .doses
-                        .iter()
-                        .filter(|d| d.time <= obs_t + 1e-12)
-                        .map(|d| {
-                            if d.ss && d.ii > 0.0 {
-                                let elapsed = obs_t - d.time;
-                                obs_t - elapsed.rem_euclid(d.ii)
-                            } else {
-                                d.time
-                            }
-                        })
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    if last_eff.is_finite() {
-                        obs_t - last_eff
-                    } else {
-                        f64::NAN
-                    }
+                    // The data-derived TAD under NONMEM's record-order
+                    // convention (a dose at the observation's TIME is the most
+                    // recent dose), the same tie rule as the lag-aware column
+                    // above. The `[error_model]` `TAD` built-in reads Pharmpy's
+                    // grouping instead — see `Subject::time_after_dose` (#1182).
+                    subj.time_after_dose_at_or_before(j)
                 })
             })
             .collect();
@@ -1572,15 +1714,25 @@ fn yaml_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Build the ordered parameter name list that matches `pack_params` layout:
-/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+/// Whether the fit's Ω and κ blocks are packed as diagonals or full Cholesky
+/// lower triangles, as `(omega_diagonal, kappa_diagonal)`.
 ///
-/// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
-/// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
-/// For a full-block omega/kappa the column-major lower-triangle entries are
-/// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
-/// (i > j) off-diagonal (`L_ij`, not log-transformed).
-fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
+/// Read from `FitResult::omega_is_diagonal` / `kappa_is_diagonal` when the
+/// fit recorded them (#1177). A bundle saved before that, or a hand-built
+/// result, falls back to inferring the layout from the size `n` of a
+/// packed-space matrix on the result (its covariance matrix) — the count of
+/// coordinates left after θ and σ — which is a guess: it ignores any trailing
+/// mixture-override / `block_sigma` coordinates, and when `n_eta == n_kappa >
+/// 1` with exactly one of the two a block, both assignments give the same
+/// count and the block is assumed to be Ω. Labels only; nothing that gates a
+/// candidate reads the inferred layout.
+pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
+    if let Some(od) = result.omega_is_diagonal {
+        let kd = result
+            .kappa_is_diagonal
+            .unwrap_or(result.kappa_names.len() <= 1);
+        return (od, kd);
+    }
     let n_theta = result.theta_names.len();
     let n_eta = result.omega.nrows();
     let n_sigma = result.sigma_names.len();
@@ -1609,11 +1761,25 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
         (true, false, n_omega_diag + n_kappa_full),
         (false, false, n_omega_full + n_kappa_full),
     ];
-    let (omega_diagonal, kappa_diagonal) = combos
+    combos
         .iter()
         .find(|(_, _, size)| *size == n_remaining)
         .map(|(od, kd, _)| (*od, *kd))
-        .unwrap_or((n_eta <= 1, n_kappa <= 1));
+        .unwrap_or((n_eta <= 1, n_kappa <= 1))
+}
+
+/// Build the ordered parameter name list that matches `pack_params` layout:
+/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+///
+/// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
+/// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
+/// For a full-block omega/kappa the column-major lower-triangle entries are
+/// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
+/// (i > j) off-diagonal (`L_ij`, not log-transformed).
+pub(crate) fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
+    let n_eta = result.omega.nrows();
+    let n_kappa = result.kappa_names.len();
+    let (omega_diagonal, kappa_diagonal) = packed_layout(result, n);
 
     let mut names: Vec<String> = Vec::with_capacity(n);
 
@@ -1733,9 +1899,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: an unstructured-placebo block can carry hundreds of coefficients. Four
+    // keys each would bury the structural parameters under 3,200 lines of
+    // nuisance, so a large block is emitted below as a compact coefficient list
+    // under `theta_blocks:` rather than as top-level keys.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     writeln!(f, "\ntheta:").map_err(|e| e.to_string())?;
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -1758,6 +1932,42 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
                     writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
                 }
+            }
+        }
+    }
+
+    if !theta_blocks.is_empty() {
+        writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_free_coefficients: {}", range.len()).map_err(|e| e.to_string())?;
+            writeln!(f, "    min: {:.6}", mn).map_err(|e| e.to_string())?;
+            writeln!(f, "    median: {:.6}", med).map_err(|e| e.to_string())?;
+            writeln!(f, "    max: {:.6}", mx).map_err(|e| e.to_string())?;
+            writeln!(f, "    coefficients:").map_err(|e| e.to_string())?;
+            for i in range.clone() {
+                let label = result.theta_names[i]
+                    .strip_prefix(&format!("{block}["))
+                    .and_then(|r| r.strip_suffix(']'))
+                    .unwrap_or(&result.theta_names[i]);
+                let se = result.se_theta.as_ref().map(|v| v[i]);
+                match se {
+                    Some(se) => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
+                        label,
+                        result.theta[i],
+                        se,
+                        rse_pct(result.theta[i], se)
+                    ),
+                    None => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
+                }
+                .map_err(|e| e.to_string())?;
             }
         }
     }
@@ -1791,6 +2001,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    outputs: [{}]", nn.output_names.join(", "))
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
+            // Emitted only when the model actually normalises, so a plain network's
+            // block is byte-identical to before. The reported weights are meaningless
+            // without the `(x − center) / scale` they were fitted under, so a consumer
+            // reconstructing the network from this file must see both vectors.
+            if nn.input_center.iter().any(|c| *c != 0.0) || nn.input_scale.iter().any(|s| *s != 1.0)
+            {
+                writeln!(f, "    center: [{}]", fmt_f64_list(&nn.input_center))
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "    scale: [{}]", fmt_f64_list(&nn.input_scale))
+                    .map_err(|e| e.to_string())?;
+            }
             // Summary statistics over the trained weight values.
             let w_slice = &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
             let (mn, mx, mean, sd) = weight_summary(w_slice);
@@ -1803,6 +2024,62 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
 
     let n_eta = result.omega.nrows();
+    // #1111: the `[covariate_model]` relation table — what covariate model ran,
+    // what each symbolic centring statistic resolved to, and each generated θ
+    // with its estimate and SE. Emitted so a covariate search reads the run's
+    // covariate model back from the fit output instead of re-parsing the model
+    // file. Absent for the models that declare no such block.
+    if !result.covariate_relations.is_empty() {
+        writeln!(f, "\ncovariate_model:").map_err(|e| e.to_string())?;
+        for rel in &result.covariate_relations {
+            writeln!(f, "  - parameter: {}", yaml_quote(&rel.parameter))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    covariate: {}", yaml_quote(&rel.covariate))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    form: {}", yaml_quote(&rel.form)).map_err(|e| e.to_string())?;
+            if let Some(center) = rel.center {
+                // Both forms: the value the expression was built with, and the
+                // statistic it was written as — a run launched symbolically is
+                // reproducible only if the output says which median it landed on.
+                match rel.center_source.as_deref() {
+                    Some(src) if src != format!("{center}") => {
+                        writeln!(f, "    center: {center}  # resolved from {src}")
+                    }
+                    _ => writeln!(f, "    center: {center}"),
+                }
+                .map_err(|e| e.to_string())?;
+            }
+            if let Some(expr) = &rel.expression {
+                writeln!(f, "    expression: {}", yaml_quote(expr)).map_err(|e| e.to_string())?;
+            }
+            // `none` and `expr` generate no θ. A bare `thetas:` key parses as
+            // `null`, not as an empty list, which disagrees with the `Vec`
+            // field on `FitResult` — emit the explicit empty sequence.
+            if rel.thetas.is_empty() {
+                writeln!(f, "    thetas: []").map_err(|e| e.to_string())?;
+            } else {
+                writeln!(f, "    thetas:").map_err(|e| e.to_string())?;
+            }
+            for theta in &rel.thetas {
+                writeln!(f, "      - name: {}", yaml_quote(&theta.name))
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "        estimate: {:.6}", theta.estimate)
+                    .map_err(|e| e.to_string())?;
+                match theta.se {
+                    Some(se) => writeln!(f, "        se: {se:.6}"),
+                    None => writeln!(f, "        se: null"),
+                }
+                .map_err(|e| e.to_string())?;
+                if theta.fixed {
+                    writeln!(f, "        fixed: true").map_err(|e| e.to_string())?;
+                }
+                if let Some(level) = theta.level {
+                    writeln!(f, "        level: {level}").map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+
     writeln!(f, "\nomega:").map_err(|e| e.to_string())?;
     for i in 0..n_eta {
         let var = result.omega[(i, i)];
@@ -1903,6 +2180,74 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
                 None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
             }
+        }
+    }
+
+    if !result.residual_correlations.is_empty() {
+        writeln!(f, "\nblock_sigma:").map_err(|e| e.to_string())?;
+        for (k, corr) in result.residual_correlations.iter().enumerate() {
+            let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_i index {} is out of bounds",
+                    corr.sigma_i
+                )
+            })?;
+            let name_j = result.sigma_names.get(corr.sigma_j).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_j index {} is out of bounds",
+                    corr.sigma_j
+                )
+            })?;
+            let sigma_i = result.sigma.get(corr.sigma_i).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_i index {} has no estimate",
+                    corr.sigma_i
+                )
+            })?;
+            let sigma_j = result.sigma.get(corr.sigma_j).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_j index {} has no estimate",
+                    corr.sigma_j
+                )
+            })?;
+            // Since #847 a bare `block_sigma (...) = [...]` **estimates** the
+            // off-diagonal (NONMEM `$SIGMA BLOCK(n)`); only `... FIX` pins it. A
+            // pre-#847 `FitResult` carries no flags at all, and back then every
+            // correlation was fixed by construction — hence the `true` default.
+            let correlation_fixed = result
+                .residual_correlation_fixed
+                .get(k)
+                .copied()
+                .unwrap_or(true);
+            // The covariance `rho·sigma_i·sigma_j` is fixed only when *all three*
+            // factors are: a free rho or a free SD moves it during the fit.
+            let sigma_is_fixed = |i: usize| result.sigma_fixed.get(i).copied().unwrap_or(false);
+            let covariance_fixed =
+                correlation_fixed && sigma_is_fixed(corr.sigma_i) && sigma_is_fixed(corr.sigma_j);
+            writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
+            writeln!(f, "    covariance: {:.6}", corr.rho * sigma_i * sigma_j)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    covariance_fixed: {}", covariance_fixed).map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation: {:.6}", corr.rho).map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation_fixed: {}", correlation_fixed)
+                .map_err(|e| e.to_string())?;
+            // SE on the natural rho scale. `~` for a FIXed correlation and for a
+            // fit whose covariance step did not run — the same convention the
+            // theta/omega/sigma blocks above use.
+            let corr_se = if correlation_fixed {
+                None
+            } else {
+                result
+                    .se_residual_correlations
+                    .as_ref()
+                    .and_then(|v| v.get(k))
+                    .copied()
+            };
+            match corr_se {
+                Some(se) => writeln!(f, "    correlation_se: {:.6}", se),
+                None => writeln!(f, "    correlation_se: ~"),
+            }
+            .map_err(|e| e.to_string())?;
         }
     }
 
@@ -2019,6 +2364,100 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "      ess_bulk: {:.1}", s.ess_bulk).map_err(|e| e.to_string())?;
             writeln!(f, "      ess_tail: {:.1}", s.ess_tail).map_err(|e| e.to_string())?;
             writeln!(f, "      mcse: {:.6}", s.mcse).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // VI section. The ELBO is reported here rather than as the OFV because it is a
+    // lower bound — see `ViResult`. `elbo_trace` is emitted in full: judging whether
+    // a stochastic optimizer has settled needs the trace, not a final value.
+    if let Some(ref v) = result.vi {
+        writeln!(f, "\nvi:").map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # -2*ELBO is a bound on -2 log L, NOT an OFV: it is not"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # comparable with a FOCE/SAEM objective or across families."
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(f, "  neg_two_elbo: {:.6}", v.neg_two_elbo).map_err(|e| e.to_string())?;
+        writeln!(f, "  data_term: {:.6}", v.data_term).map_err(|e| e.to_string())?;
+        writeln!(f, "  kl_term: {:.6}", v.kl_term).map_err(|e| e.to_string())?;
+        writeln!(f, "  family: {}", v.family).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_iterations: {}", v.n_iterations).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_mc_samples: {}", v.n_mc_samples).map_err(|e| e.to_string())?;
+        writeln!(f, "  kl: {}", v.kl).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_kl_fallback_subjects: {}", v.n_kl_fallback_subjects)
+            .map_err(|e| e.to_string())?;
+        writeln!(f, "  converged: {}", v.converged).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_fd_subjects: {}", v.n_fd_subjects).map_err(|e| e.to_string())?;
+        // Read alongside `converged`, not after it: a flat objective cannot tell a
+        // converged fit from a stuck one, and this can. ~1 is ideal.
+        // Emitted only when set, so an ordinary VI fit's YAML is unchanged. When it is
+        // set, everything else under `vi:` describes VI's parameter point rather than the
+        // one this file reports — see `ViResult::superseded_by`.
+        if let Some(ref by) = v.superseded_by {
+            writeln!(f, "  superseded_by: {}", yaml_quote(by)).map_err(|e| e.to_string())?;
+        }
+        writeln!(f, "  elbo_tightness_ratio: {:.3}", v.elbo_tightness_ratio)
+            .map_err(|e| e.to_string())?;
+        writeln!(f, "  elbo_trace:").map_err(|e| e.to_string())?;
+        for t in &v.elbo_trace {
+            writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
+        }
+
+        // Per-subject variational posterior. This is the object VI produces that no other
+        // method here does — FOCE and Laplace need a Hessian for the covariance — so it is
+        // emitted rather than left reachable only from the Rust/R API. Keyed by subject ID
+        // so a row can be matched back to the data without relying on ordering.
+        //
+        // `eta_covs` is the *variational* covariance, which is known to understate the true
+        // posterior variance (see docs/estimation/vi.qmd). It is for individual-level
+        // reporting and shrinkage, not a route to population standard errors.
+        if !v.eta_means.is_empty() {
+            writeln!(f, "  eta_names: [{}]", result.eta_names.join(", "))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "  eta_posterior:").map_err(|e| e.to_string())?;
+            for (i, mean) in v.eta_means.iter().enumerate() {
+                let id = result
+                    .subjects
+                    .get(i)
+                    .map(|s| s.id.as_str())
+                    .unwrap_or("unknown");
+                // Quoted: a subject ID is free-form data — `001` would otherwise parse
+                // back as the integer 1, and `a: b` or `#x` would change the document's
+                // shape or truncate the value, defeating the point of keying by the
+                // original ID.
+                writeln!(f, "    - id: {}", yaml_quote(id)).map_err(|e| e.to_string())?;
+                let means: Vec<String> = mean.iter().map(|m| format!("{:.6}", m)).collect();
+                writeln!(f, "      mean: [{}]", means.join(", ")).map_err(|e| e.to_string())?;
+                // Full covariance, row by row: the off-diagonals are the point of a
+                // full-rank family, so a diagonal-only summary would discard what
+                // distinguishes it from `mean_field`.
+                if let Some(cov) = v.eta_covs.get(i) {
+                    writeln!(f, "      cov:").map_err(|e| e.to_string())?;
+                    for row in cov {
+                        let cells: Vec<String> = row.iter().map(|c| format!("{:.8}", c)).collect();
+                        writeln!(f, "        - [{}]", cells.join(", "))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                // Per-occasion kappa means, when the model has IOV. Omitted entirely
+                // otherwise rather than emitted as an empty list.
+                if let Some(kappas) = v.kappa_means.get(i) {
+                    if !kappas.is_empty() {
+                        writeln!(f, "      kappa_means:").map_err(|e| e.to_string())?;
+                        for occ in kappas {
+                            let cells: Vec<String> =
+                                occ.iter().map(|k| format!("{:.6}", k)).collect();
+                            writeln!(f, "        - [{}]", cells.join(", "))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2221,6 +2660,9 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
+            covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
@@ -2236,6 +2678,7 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma,
             sigma_names: (0..n).map(|i| format!("EPS_{}", i + 1)).collect(),
+            residual_correlations: Vec::new(),
             error_model,
             covariance_matrix: None,
             se_theta: None,
@@ -2262,10 +2705,13 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
@@ -2298,6 +2744,7 @@ mod tests {
             sigma_types,
             cov_eigenvalues: None,
             cov_condition_number: None,
+            bic_inputs: Default::default(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -2329,6 +2776,9 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 
@@ -2383,6 +2833,85 @@ mod tests {
         assert!(s.contains("EPS shrinkage: 8.0%"));
         assert!(s.contains("Warnings: 1"));
         assert!(s.contains("heads up"));
+    }
+
+    #[test]
+    fn block_summary_reports_min_median_max_over_the_sorted_values() {
+        // The median is the lower of the two middle values on an even count —
+        // these are a nuisance block, not a quantity anyone interpolates.
+        assert_eq!(block_summary(&[3.0, -1.0, 2.0]), (-1.0, 2.0, 3.0));
+        assert_eq!(block_summary(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.0, 4.0));
+        assert_eq!(block_summary(&[7.5]), (7.5, 7.5, 7.5));
+    }
+
+    #[test]
+    fn a_small_block_stays_inline_in_the_theta_table() {
+        // Below `THETA_BLOCK_COMPACT_MIN` the behaviour must be exactly what it
+        // was before level blocks existed: one row per θ, no block section.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let n = THETA_BLOCK_COMPACT_MIN - 1;
+        r.theta = (1..=n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n).map(|i| format!("SMALL[L={i}]")).collect();
+        r.theta_fixed = vec![false; n];
+        r.se_theta = None;
+
+        assert!(compact_theta_blocks(&r.theta_names).is_empty());
+        let summary = format_summary(&r);
+        assert!(!summary.contains("THETA BLOCKS"), "{summary}");
+        assert!(summary.contains("SMALL[L=1]"), "{summary}");
+    }
+
+    #[test]
+    fn print_results_renders_the_compact_block_section() {
+        // `print_results` writes to stderr, so this asserts it runs the block
+        // branch without panicking on the slicing rather than on its text —
+        // the YAML and summary paths above cover the wording.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let n = THETA_BLOCK_COMPACT_MIN + 2;
+        r.theta = (1..=n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n).map(|i| format!("PLACEBO[L={i}]")).collect();
+        r.theta_fixed = vec![false; n];
+        r.se_theta = Some(vec![0.01; n]);
+        print_results(&r);
+
+        let blocks = compact_theta_blocks(&r.theta_names);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1.len(), n);
+    }
+
+    #[test]
+    fn two_adjacent_blocks_are_reported_separately() {
+        // Runs are keyed on the name before the bracket, so two blocks sitting
+        // next to each other in the θ vector must not merge into one.
+        let n = THETA_BLOCK_COMPACT_MIN;
+        let mut names: Vec<String> = (1..=n).map(|i| format!("A[L={i}]")).collect();
+        names.extend((1..=n).map(|i| format!("B[L={i}]")));
+        let blocks = compact_theta_blocks(&names);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "A");
+        assert_eq!(blocks[1].0, "B");
+        assert_eq!(blocks[0].1, 0..n);
+        assert_eq!(blocks[1].1, n..2 * n);
+    }
+
+    #[test]
+    fn compact_theta_output_reports_free_coefficients_not_levels() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = (1..=21).map(|i| i as f64).collect();
+        r.theta_names = (1..=21).map(|i| format!("PLACEBO[L={i}]")).collect();
+        r.theta_fixed = vec![false; 21];
+        r.se_theta = None;
+
+        let summary = format_summary(&r);
+        assert!(summary.contains("PLACEBO  21 free coefficients"));
+        assert!(!summary.contains("PLACEBO  21 levels"));
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(yaml.contains("n_free_coefficients: 21"));
+        assert!(yaml.contains("coefficients:"));
+        assert!(!yaml.contains("n_levels:"));
     }
 
     #[test]
@@ -2484,8 +3013,49 @@ mod tests {
             weights_offset: 1,
             input_names: vec!["WT".to_string(), "CRCL".to_string()],
             output_names: vec!["CL".to_string(), "V".to_string()],
+            input_center: vec![0.0, 0.0],
+            input_scale: vec![1.0, 1.0],
         }];
         base
+    }
+
+    /// The fitted weights are only interpretable alongside the `(x − center) / scale` they
+    /// were fitted under, so a normalised network must report both vectors — and an
+    /// un-normalised one must not grow two identity lines it never needed.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn yaml_reports_nn_normalization_only_when_the_model_declares_it() {
+        let write = |result: &FitResult| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fit.yaml");
+            write_estimates_yaml(result, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+
+        // Identity transform (the default): no `center:` / `scale:` lines at all.
+        let plain = write(&make_nn_result());
+        assert!(
+            !plain.contains("    center: ["),
+            "an un-normalised network must not report a center:\n{plain}"
+        );
+        assert!(
+            !plain.contains("    scale: ["),
+            "an un-normalised network must not report a scale:\n{plain}"
+        );
+
+        // Declared normalisation: both vectors, in input order.
+        let mut result = make_nn_result();
+        result.neural_networks[0].input_center = vec![70.0, 90.0];
+        result.neural_networks[0].input_scale = vec![15.0, 30.0];
+        let yaml = write(&result);
+        assert!(
+            yaml.contains("    center: [70.000000, 90.000000]"),
+            "center missing or misformatted:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    scale: [15.000000, 30.000000]"),
+            "scale missing or misformatted:\n{yaml}"
+        );
     }
 
     #[cfg(feature = "nn")]
@@ -2663,6 +3233,8 @@ mod tests {
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
+            pmix: None,
+            mixest: None,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
@@ -2781,10 +3353,12 @@ mod tests {
             pk_only_times: vec![],
             pk_only_covariates: vec![],
             reset_times: vec![],
+            reset_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -2793,6 +3367,9 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
+            covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
@@ -2808,6 +3385,7 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma: vec![0.1],
             sigma_names: vec!["eps".to_string()],
+            residual_correlations: Vec::new(),
             error_model: ErrorModel::Proportional,
             covariance_matrix: None,
             se_theta: None,
@@ -2834,10 +3412,13 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
@@ -2870,6 +3451,7 @@ mod tests {
             sigma_types,
             cov_eigenvalues: None,
             cov_condition_number: None,
+            bic_inputs: Default::default(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -2901,6 +3483,9 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 
@@ -3013,6 +3598,63 @@ mod tests {
         assert!(
             cols.iter().all(|(name, _)| name != "NPDE" && name != "NPD"),
             "NPDE/NPD columns should be absent when npde_nsim = 0"
+        );
+    }
+
+    #[test]
+    fn sdtab_mixture_columns_present_and_repeated_across_obs() {
+        // Two subjects, class-2 and class-1 winners; posteriors repeat across each
+        // subject's observation rows (subject-level scalars), MIXEST is 1-based.
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.pmix = Some(vec![0.2, 0.8]);
+        s0.mixest = Some(2);
+        let mut s1 = sdtab_subject_result("2", 1);
+        s1.pmix = Some(vec![0.9, 0.1]);
+        s1.mixest = Some(1);
+        let result = minimal_sdtab_result(vec![s0, s1]);
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("1", 2, vec![1, 1]),
+                sdtab_subject("2", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let col = |name: &str| {
+            cols.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name} column should be present for a mixture fit"))
+        };
+        // 3 rows total (2 + 1), subject-level values repeated per row.
+        assert_eq!(col("MIXEST"), vec![2.0, 2.0, 1.0]);
+        assert_eq!(col("PMIX_1"), vec![0.2, 0.2, 0.9]);
+        assert_eq!(col("PMIX_2"), vec![0.8, 0.8, 0.1]);
+    }
+
+    #[test]
+    fn sdtab_mixture_columns_absent_for_non_mixture_fit() {
+        // sdtab_subject_result leaves pmix/mixest None (the non-mixture default).
+        let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        assert!(
+            cols.iter()
+                .all(|(name, _)| name != "MIXEST" && !name.starts_with("PMIX_")),
+            "MIXEST/PMIX_* columns should be absent for a non-mixture fit"
         );
     }
 
@@ -3155,6 +3797,8 @@ mod tests {
             ofv_contribution: 3.0,
             cens: vec![0, 1],
             n_obs: 2,
+            pmix: None,
+            mixest: None,
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
             compartment_states: Vec::new(),
@@ -3348,6 +3992,158 @@ mod tests {
     /// theta/omega/sigma, eta/eps/kappa shrinkage (with a NaN entry), a
     /// computed covariance, and a warning. Drives the maximal branch coverage
     /// of both `print_results` and `write_estimates_yaml` in one pass.
+    /// The per-subject variational posterior reaches the YAML.
+    ///
+    /// `FitResult::vi::eta_means` / `eta_covs` were previously reachable only from the Rust
+    /// and R APIs, which made the CLI unable to support any per-subject comparison against
+    /// another tool — the concrete blocker was Tier 2 of `VI_VALIDATION.md` Anchor B.
+    ///
+    /// Three things are asserted, and the ID keying is the one that matters most: a row that
+    /// could not be matched back to a subject would be useless for exactly the comparison
+    /// this emission exists to enable.
+    #[test]
+    fn vi_per_subject_posterior_is_emitted_with_ids_and_full_covariance() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        r.subjects = vec![
+            sdtab_subject_result("subj-A", 1),
+            sdtab_subject_result("subj-B", 1),
+        ];
+        r.vi = Some(ViResult {
+            neg_two_elbo: -12.5,
+            data_term: -20.0,
+            kl_term: 3.75,
+            n_iterations: 100,
+            converged: true,
+            family: "full_rank".into(),
+            n_mc_samples: 8,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 0,
+            elbo_trace: vec![1.0, 0.5],
+            eta_means: vec![vec![0.25, -0.5], vec![-0.125, 0.75]],
+            // Deliberately non-diagonal: a diagonal-only emission would pass a
+            // weaker test and would discard what a full-rank family is for.
+            eta_covs: vec![
+                vec![vec![0.04, 0.01], vec![0.01, 0.09]],
+                vec![vec![0.16, -0.02], vec![-0.02, 0.25]],
+            ],
+            kappa_means: vec![Vec::new(), Vec::new()],
+            n_fd_subjects: 0,
+            elbo_tightness_ratio: 1.02,
+            superseded_by: None,
+        });
+
+        let dir = std::env::temp_dir().join(format!("ferx_vi_yaml_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml writes");
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            out.contains("eta_names: [ETA_CL, ETA_V]"),
+            "eta names must be emitted so the vectors below can be read; got:\n{out}"
+        );
+        // Keyed by ID, in subject order. Quoted, because a subject ID is free-form data.
+        assert!(
+            out.contains("- id: \"subj-A\"") && out.contains("- id: \"subj-B\""),
+            "each posterior must carry its subject id; got:\n{out}"
+        );
+        assert!(
+            out.contains("mean: [0.250000, -0.500000]"),
+            "variational means must round-trip; got:\n{out}"
+        );
+        // The off-diagonal is the assertion with teeth.
+        assert!(
+            out.contains("- [0.04000000, 0.01000000]")
+                && out.contains("- [0.01000000, 0.09000000]"),
+            "the full covariance including off-diagonals must be emitted; got:\n{out}"
+        );
+        assert!(
+            !out.contains("kappa_means"),
+            "a non-IOV fit must not emit an empty kappa_means block; got:\n{out}"
+        );
+    }
+
+    /// Subject IDs that mean something else in YAML must survive the round trip.
+    ///
+    /// The point of keying the posterior by ID is that a row can be matched back to the
+    /// data. An unquoted `001` parses back as the integer `1`, `a: b` changes the
+    /// document's shape, `#x` truncates to nothing, and an embedded quote can make the
+    /// file unparseable — each of which defeats that. The IDs here are all real shapes
+    /// (zero-padded numeric IDs are the norm in NONMEM datasets).
+    #[test]
+    fn vi_posterior_ids_are_quoted_and_escaped() {
+        let ids = ["001", "a: b", "#x", "say \"hi\"", "true"];
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.eta_names = vec!["ETA_CL".into()];
+        r.subjects = ids.iter().map(|id| sdtab_subject_result(id, 1)).collect();
+        r.vi = Some(ViResult {
+            neg_two_elbo: -1.0,
+            data_term: -2.0,
+            kl_term: 0.5,
+            n_iterations: 10,
+            converged: true,
+            family: "full_rank".into(),
+            n_mc_samples: 8,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 0,
+            elbo_trace: vec![1.0],
+            eta_means: ids.iter().map(|_| vec![0.0]).collect(),
+            eta_covs: ids.iter().map(|_| vec![vec![0.01]]).collect(),
+            kappa_means: ids.iter().map(|_| Vec::new()).collect(),
+            n_fd_subjects: 0,
+            elbo_tightness_ratio: 1.0,
+            superseded_by: None,
+        });
+
+        let dir = std::env::temp_dir().join(format!("ferx_vi_ids_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml writes");
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for id in ["001", "a: b", "#x", "true"] {
+            assert!(
+                out.contains(&format!("- id: \"{id}\"")),
+                "id {id:?} must be emitted as a quoted YAML string; got:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("- id: \"say \\\"hi\\\"\""),
+            "an embedded quote must be escaped, not left to break the document; got:\n{out}"
+        );
+
+        // Every subject is still present and on its own row: one ID swallowing the next
+        // is the failure mode an unquoted `a: b` would produce.
+        assert_eq!(
+            out.matches("- id: ").count(),
+            ids.len(),
+            "expected one row per subject; got:\n{out}"
+        );
+    }
+
+    /// A non-VI fit emits no `eta_posterior` block at all.
+    #[test]
+    fn non_vi_fits_emit_no_eta_posterior() {
+        let r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let dir = std::env::temp_dir().join(format!("ferx_novi_yaml_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml writes");
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !out.contains("eta_posterior"),
+            "only a VI fit has a variational posterior to report; got:\n{out}"
+        );
+    }
+
     fn comprehensive_result() -> FitResult {
         let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.1, 0.5]);
         // theta: one free (with SE), one fixed.
@@ -3484,6 +4280,164 @@ mod tests {
         assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
     }
 
+    /// The `[covariate_model]` echo has to be readable as YAML *and* agree
+    /// with the `Vec` fields on `FitResult` (#1111 review).
+    ///
+    /// A relation with no θ — `none`, `expr` — emitted a bare `thetas:`, which
+    /// YAML reads as `null` rather than as an empty sequence, so a consumer
+    /// deserializing into `Vec<CovariateThetaEstimate>` failed on exactly the
+    /// relations the block generates nothing for. The categorical level and
+    /// the `expr` body are the other two pieces a caller cannot otherwise
+    /// recover without re-parsing the model file.
+    #[test]
+    fn write_yaml_covariate_model_keeps_levels_expression_and_empty_theta_list() {
+        let mut r = comprehensive_result();
+        r.covariate_relations = vec![
+            CovariateRelationEstimate {
+                parameter: "CL".to_string(),
+                covariate: "SEX".to_string(),
+                form: "categorical".to_string(),
+                center_source: Some("mode".to_string()),
+                center: Some(0.0),
+                expression: None,
+                thetas: vec![CovariateThetaEstimate {
+                    name: "THETA_CL_SEX_1".to_string(),
+                    estimate: 0.25,
+                    se: Some(0.05),
+                    fixed: false,
+                    level: Some(1.0),
+                }],
+            },
+            CovariateRelationEstimate {
+                parameter: "V".to_string(),
+                covariate: "WT".to_string(),
+                form: "expr".to_string(),
+                center_source: None,
+                center: None,
+                expression: Some("1 + 0.1 * WT".to_string()),
+                thetas: Vec::new(),
+            },
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("\ncovariate_model:"), "{yaml}");
+        // The categorical θ names its level…
+        assert!(yaml.contains("        level: 1"), "{yaml}");
+        // …the `expr` relation carries the expression that actually ran…
+        assert!(yaml.contains("    expression: \"1 + 0.1 * WT\""), "{yaml}");
+        // …and its empty θ list is an empty *sequence*, not `null`.
+        assert!(yaml.contains("    thetas: []"), "{yaml}");
+        // (A relation that does generate θ still opens a block sequence.)
+        assert!(yaml.contains("    thetas:\n      - name:"), "{yaml}");
+    }
+
+    #[test]
+    fn write_yaml_emits_reconstructible_block_sigma() {
+        // Index order mirrors what `build_residual_correlations` actually
+        // emits: `sigma_i` is the block's *row* name and `sigma_j` its
+        // *column* name, so `block_sigma (PROP_ERR, ADD_ERR)` yields (1, 0)
+        // and the key `ADD_ERR__PROP_ERR`. Pinning (0, 1) would assert an
+        // ordering the parser can never produce, hiding an i/j swap.
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![false, false];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("\nblock_sigma:"), "{yaml}");
+        assert!(yaml.contains("  ADD_ERR__PROP_ERR:"), "{yaml}");
+        assert!(yaml.contains("    covariance: 0.100000"), "{yaml}");
+        assert!(yaml.contains("    correlation: 0.500000"), "{yaml}");
+        // A `FitResult` with no `residual_correlation_fixed` is one written
+        // before #847, when every `block_sigma` off-diagonal was fixed by
+        // construction — so it must still read as fixed, with no SE.
+        assert!(yaml.contains("    correlation_fixed: true"), "{yaml}");
+        assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
+        assert!(yaml.contains("    correlation_se: ~"), "{yaml}");
+    }
+
+    /// #847: a bare `block_sigma` estimates its off-diagonal, so the YAML must
+    /// report it as free and carry its natural-scale SE.
+    #[test]
+    fn write_yaml_reports_estimated_block_sigma_correlation() {
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![false, false];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        r.residual_correlation_fixed = vec![false];
+        r.se_residual_correlations = Some(vec![0.031_25]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    correlation_fixed: false"), "{yaml}");
+        assert!(yaml.contains("    correlation_se: 0.031250"), "{yaml}");
+        // A free rho keeps the covariance free even when both SDs are pinned.
+        assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
+    }
+
+    /// A free rho makes the covariance free even with both sigma SDs `FIX`ed —
+    /// the covariance is `rho·sigma_i·sigma_j`, so all three factors must be
+    /// pinned before it is (#847).
+    #[test]
+    fn write_yaml_block_sigma_covariance_free_when_only_sigmas_fixed() {
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![true, true];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        r.residual_correlation_fixed = vec![false];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    correlation_fixed: false"), "{yaml}");
+        assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
+    }
+
+    #[test]
+    fn write_yaml_block_sigma_marks_covariance_fixed_when_sigmas_are_fixed() {
+        // `block_sigma (...) = [...] FIX` marks every sigma in the block fixed,
+        // so the covariance those SDs scale is fixed as well.
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![true, true];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        r.residual_correlation_fixed = vec![true];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    covariance_fixed: true"), "{yaml}");
+        assert!(yaml.contains("    correlation_fixed: true"), "{yaml}");
+        // A pinned correlation reports no SE, like every other FIXed coordinate.
+        assert!(yaml.contains("    correlation_se: ~"), "{yaml}");
+    }
+
     #[test]
     fn write_yaml_splits_timing_per_method_chain_stage() {
         // #713: a chained fit (e.g. `[focei, imp]`) should report each stage's
@@ -3574,6 +4528,25 @@ mod tests {
                 .contains("npde_seed"),
             "npde_seed line should be absent when NPDE did not run"
         );
+    }
+
+    /// A weighted kappa (#1031) prints the weight and, when the dataset gave
+    /// one, the effective SD at the median arm — the number that makes a raw
+    /// γ readable. Both arms (typical known / unknown) are exercised.
+    #[test]
+    fn print_results_reports_a_weighted_kappa() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 4.0));
+        r.kappa_names = vec!["KAPPA_EMAX".to_string()];
+        r.kappa_fixed = vec![false];
+        r.kappa_init_as_sd = vec![true];
+        r.kappa_weights = vec![Some("NARM".to_string())];
+        r.kappa_weight_typical = vec![Some(400.0)];
+        print_results(&r);
+        // No typical arm size (an empty or all-non-finite weight column):
+        // the weight still prints, without the derived SD.
+        r.kappa_weight_typical = vec![None];
+        print_results(&r);
     }
 
     #[test]

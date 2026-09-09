@@ -18,7 +18,7 @@
 # so (f(x+h) - 2f(x) + f(x-h)) / h^2 = 0.
 #
 # Run with:
-#   cargo run --release -- examples/warfarin_cov_ghost.ferx --data data/warfarin.csv
+#   cargo run --release -p ferx-cli -- examples/warfarin_cov_ghost.ferx --data data/warfarin.csv
 
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)

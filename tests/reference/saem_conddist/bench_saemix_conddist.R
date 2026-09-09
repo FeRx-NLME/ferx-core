@@ -4,7 +4,7 @@
 # effects (eta) on the log scale.
 #
 # Run from the repo root after:
-#   cargo run --release -- examples/warfarin_saem_conddist.ferx --data data/warfarin.csv
+#   cargo run --release -p ferx-cli -- examples/warfarin_saem_conddist.ferx --data data/warfarin.csv
 # Then:
 #   Rscript tests/reference/saem_conddist/bench_saemix_conddist.R
 #

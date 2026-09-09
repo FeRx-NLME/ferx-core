@@ -35,13 +35,13 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::estimation::parameterization::{
-    block_chol_full, chol_pack, lower_tri_entries, packed_fixed_mask, theta_packs_log,
-    unpack_params,
+    block_chol_full, chol_pack, lower_tri_entries, packed_fixed_mask, rho_chain, rho_packed_start,
+    theta_packs_log, unpack_params,
 };
 use crate::sens::provider::{subject_sensitivities, ObsSens, SubjectSens};
 use crate::stats::residual_error::{residual_rd, residual_rd2};
 use crate::stats::special::m3_censored_outer;
-use crate::types::{CompiledModel, ModelParameters, Population, Subject};
+use crate::types::{CompiledModel, ModelParameters, Population, ResidualCorrelation, Subject};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
@@ -370,9 +370,15 @@ fn censored_sigma_m_terms(
     (dg1, ruv_sig, l_sig)
 }
 
-/// Shared per-subject quantities the θ/Ω/Σ gradient blocks all consume, built
-/// once from the provider sensitivities at the EBE.
+/// Joint prior and its independent natural covariance directions for covariance assembly.
+pub(crate) struct CovariancePrior {
+    pub(crate) matrix: DMatrix<f64>,
+    pub(crate) basis: Vec<DMatrix<f64>>,
+}
+
+/// Shared per-subject quantities the theta/omega/sigma gradient blocks consume.
 pub(crate) struct Prep {
+    pub(crate) covariance_prior: Option<CovariancePrior>,
     pub(crate) n_eta: usize,
     pub(crate) n_obs: usize,
     pub(crate) et: Vec<ErrTerms>,
@@ -461,11 +467,11 @@ fn corr_residual_diag(
     subject: &Subject,
     sens: &SubjectSens,
     sigma: &[f64],
+    corr: &[ResidualCorrelation],
 ) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     use crate::stats::residual_error::{
         compute_d2r_df2_matrices, compute_dr_df_matrices, compute_r_matrix_with_correlations,
     };
-    let corr = &model.residual_correlations;
     let es = &model.error_spec;
     // #669: per-observation endpoint keys must come from the covariate selector
     // (`obs_keys`), not the raw CMT column — a `Selected` spec keys endpoints by
@@ -539,9 +545,9 @@ fn corr_residual_rd_at_sigma(
     subject: &Subject,
     ipreds: &[f64],
     sigma: &[f64],
+    corr: &[ResidualCorrelation],
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::stats::residual_error::compute_dr_df_matrices;
-    let corr = &model.residual_correlations;
     let es = &model.error_spec;
     let n = ipreds.len();
     // #669: selector-resolved endpoint keys, not the raw CMT column (see
@@ -607,6 +613,11 @@ pub(crate) fn prepare(
 /// path needs both; the FOCE (Sheiner–Beal) marginal only reads `∂R/∂θ`, so it
 /// passes `None` and skips the `slopes` lookup and the `4·coeff·coeff'·…`
 /// accumulation entirely (#486 review).
+///
+/// The formula itself lives with the rest of the residual-variance math in
+/// [`crate::stats::residual_error::magnitude_dvar_dtheta`], which since #1182
+/// also carries the `power(...)` exponent's `∂R/∂p · ∂p/∂θ` term; this is the
+/// call-site alias the three gradient paths share.
 #[allow(clippy::too_many_arguments)]
 fn mag_variance_dtheta(
     error_spec: &crate::types::ErrorSpec,
@@ -617,39 +628,19 @@ fn mag_variance_dtheta(
     mult_grad_row: &[Vec<f64>],
     n_theta: usize,
     ruv_scale: f64,
-    mut dd_dtheta: Option<&mut Vec<f64>>,
+    dd_dtheta: Option<&mut Vec<f64>>,
 ) -> Vec<f64> {
-    let loadings = error_spec.sigma_loadings(cmt, f, sigma.len());
-    let slopes = if dd_dtheta.is_some() {
-        error_spec.sigma_loading_slopes(cmt, sigma.len())
-    } else {
-        Vec::new()
-    };
-    let mut dr_dtheta = vec![0.0f64; n_theta];
-    for &(idx, coeff) in &loadings {
-        let sg = sigma.get(idx).copied().unwrap_or(0.0);
-        let mv = mult_row.get(idx).copied().unwrap_or(1.0);
-        let Some(dmi) = mult_grad_row.get(idx) else {
-            continue;
-        };
-        let coeff_p = if dd_dtheta.is_some() {
-            slopes
-                .iter()
-                .find(|&&(i, _)| i == idx)
-                .map(|&(_, s)| s)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
-            let dmdt = dmdt_raw * ruv_scale;
-            dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
-            if let Some(dd) = dd_dtheta.as_deref_mut() {
-                dd[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
-            }
-        }
-    }
-    dr_dtheta
+    crate::stats::residual_error::magnitude_dvar_dtheta(
+        error_spec,
+        cmt,
+        f,
+        sigma,
+        mult_row,
+        mult_grad_row,
+        n_theta,
+        ruv_scale,
+        dd_dtheta,
+    )
 }
 
 /// The magnitude direct-θ derivative of the data-term coefficient `α` for one
@@ -749,7 +740,10 @@ pub(crate) fn data_sigma_gradient(
     let sigma = &params.sigma.values;
     let n_sigma = sigma.len();
     let err_keys = model.error_spec.obs_keys(subject);
-    let correlated = !model.residual_correlations.is_empty();
+    // The **live** correlations (#847): a non-`FIX` `block_sigma` moves ρ, so the
+    // σ FD has to differentiate the variance at the ρ the optimizer is proposing.
+    let corrs = &params.residual_correlations;
+    let correlated = !corrs.is_empty();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     let mut out = vec![0.0f64; n_sigma];
 
@@ -761,8 +755,12 @@ pub(crate) fn data_sigma_gradient(
         sm[k] -= h;
         let (corr_sp, corr_sm) = if correlated {
             (
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sp)),
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sm)),
+                Some(corr_residual_rd_at_sigma(
+                    model, subject, &ipreds, &sp, corrs,
+                )),
+                Some(corr_residual_rd_at_sigma(
+                    model, subject, &ipreds, &sm, corrs,
+                )),
             )
         } else {
             (None, None)
@@ -918,8 +916,14 @@ pub(crate) fn score_core(
     // per-obs `(r, d, d2)` diagonals once (block_sigma excludes M3/ruv/IOV, so
     // `ruv_scale = 1`). `None` bails to FD (a rare off-diagonal R). Everything else in
     // the assembly is unchanged — see `corr_residual_diag`.
-    let corr_diag = if !model.residual_correlations.is_empty() {
-        Some(corr_residual_diag(model, subject, sens, sigma)?)
+    let corr_diag = if !params.residual_correlations.is_empty() {
+        Some(corr_residual_diag(
+            model,
+            subject,
+            sens,
+            sigma,
+            &params.residual_correlations,
+        )?)
     } else {
         None
     };
@@ -987,7 +991,7 @@ pub(crate) fn score_core(
             let kern_at = |ff: f64| -> (f64, f64, f64) {
                 let rr_ = model.error_spec.variance_at(cmt, ff, sigma) * ruv_scale;
                 let dd = model.error_spec.dvar_df(cmt, ff, sigma) * ruv_scale;
-                let dd2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
+                let dd2 = model.error_spec.d2var_df2(cmt, ff, sigma) * ruv_scale;
                 let (_g1, g2, cz, cm) = m3_censored_outer(y, ff, rr_, dd, dd2, cens);
                 (g2, cz, cm)
             };
@@ -1119,7 +1123,7 @@ pub(crate) fn score_core(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_stacked(
+pub(crate) fn prepare_stacked(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -1214,7 +1218,7 @@ fn prepare_stacked(
             let kern_scaled = |ff: f64, ss: f64| -> (f64, f64, f64) {
                 let r = model.error_spec.variance_at(cmt, ff, sigma) * ss;
                 let d = model.error_spec.dvar_df(cmt, ff, sigma) * ss;
-                let d2 = model.error_spec.d2var_df2(cmt, sigma) * ss;
+                let d2 = model.error_spec.d2var_df2(cmt, ff, sigma) * ss;
                 let (_g1, g2, cz, cm) = m3_censored_outer(y, ff, r, d, d2, cens);
                 (g2, cz, cm)
             };
@@ -1255,6 +1259,7 @@ fn prepare_stacked(
     }
 
     Some(Prep {
+        covariance_prior: None,
         n_eta,
         n_obs,
         et,
@@ -1543,7 +1548,10 @@ fn sigma_block(
     // correlation-aware variance / `∂R/∂f` (which carry the within-observation cross
     // term), not the plain scalar error functions. Diagonal-R only (guaranteed by
     // `corr_residual_diag`'s guard in `prepare_stacked`).
-    let correlated = !model.residual_correlations.is_empty();
+    // The **live** correlations (#847): a non-`FIX` `block_sigma` moves ρ, so the
+    // σ FD has to differentiate the variance at the ρ the optimizer is proposing.
+    let corrs = &params.residual_correlations;
+    let correlated = !corrs.is_empty();
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     // Custom / time-varying residual-magnitude (#484/#576): `mult(θ)` is fixed
     // while perturbing σ (it doesn't depend on σ), so the σ±h FD below must hold
@@ -1573,8 +1581,12 @@ fn sigma_block(
         // Correlation-aware `(R_jj, ∂R_jj/∂f_j)` at σ±h, built once per σ_k.
         let (corr_sp, corr_sm) = if correlated {
             (
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sp)),
-                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sm)),
+                Some(corr_residual_rd_at_sigma(
+                    model, subject, &ipreds, &sp, corrs,
+                )),
+                Some(corr_residual_rd_at_sigma(
+                    model, subject, &ipreds, &sm, corrs,
+                )),
             )
         } else {
             (None, None)
@@ -1614,7 +1626,7 @@ fn sigma_block(
                 let kern_at = |sa: &[f64]| -> (f64, f64, f64) {
                     let r = model.error_spec.variance_at(cmt, f, sa) * prep.ruv_scale;
                     let d = model.error_spec.dvar_df(cmt, f, sa) * prep.ruv_scale;
-                    let d2 = model.error_spec.d2var_df2(cmt, sa) * prep.ruv_scale;
+                    let d2 = model.error_spec.d2var_df2(cmt, f, sa) * prep.ruv_scale;
                     let (_g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, prep.et[j].cens_sign);
                     (g2, cz, cm)
                 };
@@ -1718,6 +1730,105 @@ fn sigma_block(
             resp += prep.g_eta[l] * deta[l];
         }
         grad[k] = fixed + 0.5 * resp;
+    }
+    grad
+}
+
+/// Per-observation `(∂R_jj/∂ρ_k, ∂d_j/∂ρ_k)` for every `block_sigma`
+/// off-diagonal, indexed `[k][j]` (#847). Thin wrapper over the closed forms in
+/// [`crate::stats::residual_error::dvar_drho`], transposed into the
+/// correlation-major layout the ρ blocks below iterate in.
+///
+/// Diagonal-`R` only, which is what the analytic scope guarantees: `prepare` /
+/// `prepare_stacked` bail to FD through `corr_residual_diag` when any off-diagonal
+/// survives, so ρ can only reach here through the within-observation `combined`
+/// cross term.
+fn rho_rd_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    sigma: &[f64],
+    corrs: &[ResidualCorrelation],
+) -> Vec<Vec<(f64, f64)>> {
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut out = vec![vec![(0.0, 0.0); sens.obs.len()]; corrs.len()];
+    let mut row = vec![(0.0, 0.0); corrs.len()];
+    for (j, obs) in sens.obs.iter().enumerate() {
+        crate::stats::residual_error::dvar_drho(
+            &model.error_spec,
+            err_keys[j],
+            obs.f,
+            sigma,
+            corrs,
+            &mut row,
+        );
+        for (k, &t) in row.iter().enumerate() {
+            out[k][j] = t;
+        }
+    }
+    out
+}
+
+/// Per-`block_sigma`-off-diagonal packed gradient `∂Fᵢ/∂z_k` for the **FOCEI**
+/// marginal, in `pack_params` order (#847).
+///
+/// ρ is the exact analogue of a σ coordinate: it enters only through the residual
+/// variance, so this is [`sigma_block`]'s plain (non-censored, non-FREM) row with
+/// `(∂R/∂ρ, ∂d/∂ρ)` in place of `(∂R/∂σ, ∂d/∂σ)` — the same data + `lnR` term, the
+/// same `log|H̃|` term, and the same EBE-response `M` accumulation. Unlike
+/// `sigma_block` it needs no branches: `block_sigma` is mutually exclusive with
+/// M3 censoring, FREM rows, `iiv_on_ruv`, custom residual magnitude and IOV, each
+/// rejected up front, so every row here is the plain Sheiner–Beal term and
+/// `prep.ruv_scale == 1` (kept in the expressions anyway, for parity with
+/// `sigma_block` should one of those exclusions ever be lifted).
+///
+/// The optimizer coordinate is the Fisher-z `z = atanh(ρ)`, so the returned
+/// gradient carries the `dρ/dz = 1 − ρ²` chain.
+fn rho_block(
+    prep: &Prep,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+) -> Vec<f64> {
+    let corrs = &params.residual_correlations;
+    let mut grad = vec![0.0f64; corrs.len()];
+    if corrs.is_empty() || sens.obs.is_empty() {
+        return grad;
+    }
+    let n_eta = prep.n_eta;
+    let terms = rho_rd_terms(model, subject, sens, &params.sigma.values, corrs);
+
+    for (k, per_obs) in terms.iter().enumerate() {
+        let mut fixed = 0.0;
+        let mut m_vec = DVector::<f64>::zeros(n_eta);
+        for (j, obs) in sens.obs.iter().enumerate() {
+            let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+            let (dr, dd) = per_obs[j];
+            let r_rho = prep.ruv_scale * dr;
+            let d_rho = prep.ruv_scale * dd;
+            let inv_r = 1.0 / r;
+            let inv_r2 = inv_r * inv_r;
+            let inv_r3 = inv_r2 * inv_r;
+
+            // data + lnR:  ½ Rρ (R − ε²)/R²
+            fixed += 0.5 * r_rho * (r - eps * eps) * inv_r2;
+            // log|H̃|:  ½ (∂p/∂ρ) q ,  ∂p/∂ρ = −Rρ/R² + d·dρ/R² − d²Rρ/R³
+            let dp = -r_rho * inv_r2 + d * d_rho * inv_r2 - d * d * r_rho * inv_r3;
+            fixed += 0.5 * dp * prep.q[j];
+            // EBE response M[m] += ½ (∂α/∂ρ) ∂f/∂η_m
+            let dalpha = dalpha_dsigma(r, d, eps, r_rho, d_rho);
+            for m in 0..n_eta {
+                m_vec[m] += 0.5 * dalpha * obs.df_deta[m];
+            }
+        }
+
+        let deta = -(&prep.h_inner_inv * m_vec);
+        let mut resp = 0.0;
+        for l in 0..n_eta {
+            resp += prep.g_eta[l] * deta[l];
+        }
+        grad[k] = (fixed + 0.5 * resp) * rho_chain(corrs[k].rho);
     }
     grad
 }
@@ -1925,6 +2036,18 @@ pub fn subject_packed_gradient(
         g[sigma_start + k] = g_sigma[k] * params.sigma.values[k];
     }
 
+    // ρ: the `block_sigma` off-diagonals (#847), packed last — `rho_packed_start`
+    // owns that offset, so this never re-derives it from n_theta/n_omega/n_sigma
+    // (which would land on the mixture segment for a mixture model). The Fisher-z
+    // chain is already applied inside `rho_block`.
+    let rho_start = rho_packed_start(template);
+    for (k, &val) in rho_block(&prep, model, subject, &params, &sens)
+        .iter()
+        .enumerate()
+    {
+        g[rho_start + k] = val;
+    }
+
     Some(g)
 }
 
@@ -2002,6 +2125,13 @@ pub fn population_gradient_sens(
 /// block stalled SLSQP/L-BFGS/MMA well above the derivative-free optimum
 /// (focei-slsqp-fixed-ebe-gradient-bias). Caller scales each entry by 2 and
 /// zeroes fixed coordinates when assembling the population sum.
+///
+/// `mixture_class` (1-based) is `Some(k)` for the mixture outer gradient (#977):
+/// the `MIXTURE_CLASS` thread-local is set **inside** each rayon worker's closure
+/// so `MIXNUM` branches in the typical value resolve to class `k`. The guard the
+/// mixture objective set on the *calling* thread does not reach rayon workers, so
+/// without this every class's analytic sensitivity would silently read the
+/// default class 1. `None` leaves the thread-local at its default (non-mixture).
 pub fn per_subject_packed_gradients(
     model: &CompiledModel,
     population: &Population,
@@ -2009,12 +2139,16 @@ pub fn per_subject_packed_gradients(
     x: &[f64],
     eta_hats: &[DVector<f64>],
     interaction: bool,
+    mixture_class: Option<usize>,
 ) -> Vec<Option<Vec<f64>>> {
     population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
+            // Set the mixture-class thread-local on *this* worker thread (the
+            // outer-thread guard does not propagate into rayon workers).
+            let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
             if interaction {
                 subject_packed_gradient(model, subject, template, x, eta_hats[i].as_slice())
             } else {
@@ -2120,10 +2254,10 @@ pub fn subject_packed_gradient_foce(
     // analytic FOCE scope, so `R̃ = JΩJᵀ + diag(R⁰)` is unchanged apart from the
     // correlation-aware `(r0,d0)`; a rare off-diagonal bails per-subject to FD via
     // `corr_residual_diag` → `None`. (FOCE is first-order in R — no `∂²R/∂f²`.)
-    let correlated = !model.residual_correlations.is_empty();
-    let corr = &model.residual_correlations;
+    let correlated = !params.residual_correlations.is_empty();
+    let corr = &params.residual_correlations;
     let corr_rd0 = if correlated {
-        Some(corr_residual_diag(model, subject, &sens0, sigma)?)
+        Some(corr_residual_diag(model, subject, &sens0, sigma, corr)?)
     } else {
         None
     };
@@ -2363,6 +2497,25 @@ pub fn subject_packed_gradient_foce(
         fixed[sigma_start + k] = nat * sigma[k];
     }
 
+    // ρ (`block_sigma` off-diagonals, #847). The FOCE marginal is first-order in
+    // R, so ρ enters only through `R⁰` — frozen at f(η=0), hence the closed forms
+    // are taken at `sens0`, exactly like the σ loop's `f0act`. Same
+    // `½ ∂R⁰/∂ρ (R̃⁻¹ᵢᵢ − uᵢ²)` shape, with the Fisher-z chain. No censored
+    // companion term: `block_sigma` + M3 is rejected up front, so `cg` carries no
+    // ρ block to add.
+    if !params.residual_correlations.is_empty() {
+        let rho_start = rho_packed_start(template);
+        let rho_terms = rho_rd_terms(model, subject, &sens0, sigma, &params.residual_correlations);
+        for (k, per_obs) in rho_terms.iter().enumerate() {
+            let mut nat = 0.0;
+            for (i, &j) in quant.iter().enumerate() {
+                let (dr0, _) = per_obs[j];
+                nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
+            }
+            fixed[rho_start + k] = nat * rho_chain(params.residual_correlations[k].rho);
+        }
+    }
+
     // Coupling c = ∂F/∂η̂: SB part over quant rows + the marginal censored coupling
     // (`cg.coupling`; the tail's η̂-response through both the marginal mean and R̃ⱼⱼ — #646).
     //   SB: u·P_k + tr(R̃⁻¹ Dk ΩJᵀ) − u·(Dk ΩJᵀ u),  P_k[i]=(Aⱼη̂)_k, Dk[i,l]=Aⱼ[k,l].
@@ -2600,7 +2753,7 @@ pub fn subject_eta_dx_iov(
 /// `foce_subject_nll_iov(interaction = false)` builds (the stacked analogue of the
 /// non-IOV `subject_packed_gradient_foce`). `quant` maps an SB-local row to its
 /// original obs index. The marginal contributions are shared via
-/// [`censored_marginal_foce_grad`].
+/// `censored_marginal_foce_grad`.
 pub fn subject_packed_gradient_foce_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -2947,7 +3100,11 @@ pub fn subject_eta_dx(
     let sigma = &params.sigma.values;
     // Correlated residual (`block_sigma`, #627): σ FD must use the correlation-aware
     // variance / `∂R/∂f` (mirrors `sigma_block`). Diagonal-R only (guarded in `prepare`).
-    let correlated = !model.residual_correlations.is_empty();
+    // Live, not declared (#847): the values fed to `corr_residual_rd_at_sigma`
+    // below come from `params`, so the predicate that gates them must too, or a
+    // hand-built `ModelParameters` could disagree with the model about whether a
+    // correlation exists at all.
+    let correlated = !params.residual_correlations.is_empty();
     let eta_dx_ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
@@ -2962,12 +3119,14 @@ pub fn subject_eta_dx(
                     subject,
                     &eta_dx_ipreds,
                     &sp,
+                    &params.residual_correlations,
                 )),
                 Some(corr_residual_rd_at_sigma(
                     model,
                     subject,
                     &eta_dx_ipreds,
                     &sm,
+                    &params.residual_correlations,
                 )),
             )
         } else {
@@ -3061,6 +3220,29 @@ pub fn subject_eta_dx(
             }
         }
         out[sigma_start + k] = -(&prep.h_inner_inv * mvec) * sigma[k];
+    }
+
+    // ρ coords (#847): `M_ρ = ½ Σⱼ ∂αⱼ/∂ρ · aⱼ`, the σ loop's body with
+    // `(∂R/∂ρ, ∂d/∂ρ)` swapped in. The inner objective is interaction-independent,
+    // so this one Jacobian serves both the FOCE and FOCEI callers — the same
+    // reason the σ columns are shared. Every `sigma_block`-style branch is
+    // inapplicable here (see `rho_block`), so the plain row is the only one.
+    if !params.residual_correlations.is_empty() {
+        let rho_start = rho_packed_start(template);
+        let rho_terms = rho_rd_terms(model, subject, &sens, sigma, &params.residual_correlations);
+        for (k, per_obs) in rho_terms.iter().enumerate() {
+            let mut mvec = DVector::<f64>::zeros(n_eta);
+            for (j, obs) in sens.obs.iter().enumerate() {
+                let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
+                let (dr, dd) = per_obs[j];
+                let dalpha = dalpha_dsigma(r, d, eps, prep.ruv_scale * dr, prep.ruv_scale * dd);
+                for m in 0..n_eta {
+                    mvec[m] += 0.5 * dalpha * obs.df_deta[m];
+                }
+            }
+            out[rho_start + k] =
+                -(&prep.h_inner_inv * mvec) * rho_chain(params.residual_correlations[k].rho);
+        }
     }
 
     Some(out)

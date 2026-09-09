@@ -1,0 +1,91 @@
+# MFL programs fed to Pharmpy's parser, one per line (#1179). `;` separates
+# statements within a program. Blank lines and `#` lines are skipped by
+# dump.py — they are NOT part of the corpus (Pharmpy rejects `#`; that case
+# is written with a literal `\n` escape below).
+#
+# Sections mirror crates/ferx-tools/src/search/mfl_pharmpy_anchor.rs, which
+# names every line where ferx deliberately differs.
+
+# --- the issue example and each feature category -----------------------------
+ABSORPTION([FO,ZO]); PERIPHERALS(0..1); LAGTIME([OFF,ON]); COVARIATE?(@IIV, @CONTINUOUS, [pow,lin]); COVARIATE?(@IIV, @CATEGORICAL, cat)
+ABSORPTION(FO)
+ABSORPTION(*)
+ABSORPTION([INST,FO,ZO,SEQ-ZO-FO,WEIBULL])
+ELIMINATION([FO,ZO,MM,MIX-FO-MM])
+ELIMINATION(*)
+PERIPHERALS(1)
+PERIPHERALS([0,2])
+PERIPHERALS(0..2,MET)
+PERIPHERALS(1,[DRUG,MET])
+PERIPHERALS(1..1)
+PERIPHERALS([2,1,1])
+TRANSITS(N)
+TRANSITS(n)
+TRANSITS(1)
+TRANSITS(0..3)
+TRANSITS([1,3],NODEPOT)
+TRANSITS(2,*)
+TRANSITS(1,DEPOT)
+LAGTIME(ON)
+LAGTIME(on)
+LAGTIME(*)
+COVARIATE(CL,WT,pow)
+COVARIATE([CL,V],[WT,AGE],[exp,pow])
+COVARIATE?([CL,V],[WT,AGE],[exp,pow])
+COVARIATE?(@PK,@CONTINUOUS,*,+)
+COVARIATE?(CL,SEX,cat)
+COVARIATE(CL,WT,pow,+)
+COVARIATE(CL,WT,POW,*)
+COVARIATE?(@IIV,@CATEGORICAL,[cat,cat2])
+COVARIATE(CL,WT,[lin,piece_lin,exp,pow,custom])
+ALLOMETRY(WT,70)
+ALLOMETRY(WT,70.5)
+DIRECTEFFECT([LINEAR,EMAX])
+DIRECTEFFECT(*)
+EFFECTCOMP([LINEAR,EMAX,SIGMOID,STEP,LOGLIN])
+INDIRECTEFFECT(EMAX,PRODUCTION)
+INDIRECTEFFECT(*,*)
+INDIRECTEFFECT(EMAX,*)
+METABOLITE(PSC)
+METABOLITE(*)
+LET(CONTINUOUS,[WT,AGE])
+LET(X,WT)
+LET(X,[A,B]);COVARIATE(@X,WT,pow)
+
+# --- spelling variants ---------------------------------------------------------
+absorption(fo)
+ABSORPTION([FO])
+LAGTIME([ON,ON,OFF])
+COVARIATE(Cl,wt,POW)
+  ABSORPTION( FO ) ;ELIMINATION(FO)
+
+# --- rejected by both ------------------------------------------------------------
+A(FO)
+ABSORPTION(FAST)
+ABSORPTION(FO,ZO)
+ABSORPTION?(FO)
+COVARIATE(CL,WT)
+COVARIATE(CL,WT,pow,lin)
+COVARIATE(CL,WT,*)
+COVARIATE(@PK,@CONTINUOUS,*)
+TRANSITS(N,DEPOT)
+TRANSITS(1.5)
+PERIPHERALS([1,x])
+PERIPHERALS(*)
+ABSORPTION(FO) ELIMINATION(FO)
+ABSORPTION(FO
+
+# --- where ferx deliberately differs (each named in the Rust test) --------------
+PERIPHERALS(2..0)
+PERIPHERALS(0..100)
+ALLOMETRY(WT)
+COVARIATE?(*,*,*)
+COVARIATE?(CL,*,pow)
+COVARIATE?(*,WT,pow)
+ABSORPTION(FO) # c
+ABSORPTION(FO);;\nELIMINATION(FO)
+IIV(@PK,EXP)
+IIV?([CL,V],[EXP,ADD])
+IOV(CL,PROP)
+COVARIANCE(IIV,@PK_IIV)
+COVARIANCE?(IOV,[CL,V])

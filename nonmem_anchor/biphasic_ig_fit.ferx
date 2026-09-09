@@ -6,7 +6,7 @@
 # concentration = central / V via [scaling]. Runs on data/biphasic_ig_oral.csv
 # (every record on CMT 1), the ferx-keyed copy of nonmem_anchor/biphasic_ig_oral.csv.
 #
-#   cargo run --release -- nonmem_anchor/biphasic_ig_fit.ferx \
+#   cargo run --release -p ferx-cli -- nonmem_anchor/biphasic_ig_fit.ferx \
 #     --data data/biphasic_ig_oral.csv
 #
 # The dataset is simulated FROM this biphasic model (same truths), so this is a

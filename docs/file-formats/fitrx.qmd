@@ -1,3 +1,7 @@
+---
+pagetitle: "The .fitrx fit bundle format"
+---
+
 # The `.fitrx` Fit Bundle
 
 A `.fitrx` file is a single, portable, self-describing container for a fit

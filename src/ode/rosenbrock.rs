@@ -463,7 +463,7 @@ fn method_gamma(method: OdeMethod) -> f64 {
         OdeMethod::Rodas5P => RODAS5P.gamma,
         // Spelled out, not a catch-all: a newly added `OdeMethod` must fail to compile
         // here rather than reach this panic from inside a fit's worker thread.
-        other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+        other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto) => {
             unreachable!("{other:?} does not use the Rosenbrock stepper")
         }
     }
@@ -475,7 +475,7 @@ fn method_err_exp(method: OdeMethod) -> f64 {
         OdeMethod::Rosenbrock23 => ROS23_ERR_EXP,
         OdeMethod::Rodas4 => RODAS4.err_exp,
         OdeMethod::Rodas5P => RODAS5P.err_exp,
-        other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+        other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto) => {
             unreachable!("{other:?} does not use the Rosenbrock stepper")
         }
     }
@@ -773,7 +773,7 @@ impl<T: PkNum> RosStepper<T> {
             OdeMethod::Rosenbrock23 => 2,
             OdeMethod::Rodas4 => RODAS4.stages,
             OdeMethod::Rodas5P => RODAS5P.stages,
-            other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+            other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto) => {
                 unreachable!("{other:?} does not use the Rosenbrock stepper")
             }
         };
@@ -824,7 +824,7 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
             OdeMethod::Rosenbrock23 => self.ws.ros23_stages(rhs, u, params, t, dt),
             OdeMethod::Rodas4 => self.ws.rodas_stages(rhs, u, params, t, dt, &RODAS4),
             OdeMethod::Rodas5P => self.ws.rodas_stages(rhs, u, params, t, dt, &RODAS5P),
-            other @ (OdeMethod::Rk45 | OdeMethod::Vern7) => {
+            other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto) => {
                 unreachable!("{other:?} does not use the Rosenbrock stepper")
             }
         }

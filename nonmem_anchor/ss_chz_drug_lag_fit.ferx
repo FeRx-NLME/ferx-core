@@ -1,0 +1,64 @@
+# SS=1 dose x ODE-accumulated cumulative hazard, LAGGED arm (#1220 item 1).
+#
+# `ss_chz_drug_fit.ferx` plus `ALAG1 = TVLAG` with `TVLAG = 24` FIXed, run against
+# `nonmem_anchor/ss_chz_ss2_lag.csv`. The NONMEM twin is
+# `nonmem_anchor/ss_chz_r5_drug_lag.ctl`, which carries **no ALAG at all** — see that
+# file's header for why a shifted train cannot reproduce this, and for the two
+# deliberate holes in the two datasets.
+#
+# `BETA = 0.5`, so the hazard rides the central concentration and has no closed form.
+# That is required here: with `BETA = 0` the hazard is `H0` whatever the lag does, so a
+# const arm is structurally blind to this construction.
+#
+# The lag is a FIXed theta, not a data column, on purpose: `ode_cumhaz_hazard` snapshots
+# the PK parameters at `t = 0`, so a per-dose lag column would be read at its baseline
+# for every dose, and a time-varying one would trip `assert_survival_tv_covariates`.
+#
+# `ALAG1 = 24 = 2 x II`. That keeps the first record's own arrival on the `II` grid, but
+# it also means this fixture cannot tell ferx's phase CLAMP from a WRAP (both give phase
+# 0 at an exact multiple). The clamp convention is anchored by #1121's `ss_lag_ge_ii`
+# (`LG = 15`, `II = 12`); what this fixture anchors is `restore_chz`.
+#
+# ferx time `t` corresponds to NONMEM time `600 + t`.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.5, FIX)
+  theta TVLAG(24.0, FIX)
+
+  # No omega: the NONMEM twin runs `$OMEGA 0 FIX`, so both sides evaluate at eta = 0.
+  sigma PROP_ERR ~ 0.01            # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+  ALAG1 = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[scaling]
+  obs_scale = V                    # states are AMOUNTS; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

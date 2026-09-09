@@ -19,11 +19,29 @@ use crate::types::*;
 use nalgebra::DVector;
 use std::path::Path;
 
+/// Append the SIR kernel's proposal-conditioning notes to a fit's warnings,
+/// skipping any that are already there.
+///
+/// `run_sir` clones its input fit, and that fit may already carry identical
+/// `SIR:` lines — it was produced with `sir = true` (the inline path in
+/// `fit_inner` pushes the same text), or its own `run_sir` output is being piped
+/// back in. Without the dedupe the same line accumulates and is printed once per
+/// pass (#1037).
+fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
+    for w in sir_warnings {
+        let line = format!("SIR: {}", w);
+        if !warnings.contains(&line) {
+            warnings.push(line);
+        }
+    }
+}
+
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
-/// of `fit` with the `sir_*` fields populated. The returned fit's
-/// `warnings` vector is unchanged — SIR-specific diagnostics live on
-/// `sir_ess` (low ESS signals a poorly-matched proposal); the SIR kernel
-/// does not emit structured warnings, so there is nothing to propagate.
+/// of `fit` with the `sir_*` fields populated. Proposal-conditioning
+/// diagnostics (rank deficiency / bound-driven shrinkage, #1021) are appended
+/// to the returned fit's `warnings` as `SIR: …` lines, deduplicated against
+/// what the input fit already carried; `sir_ess` remains the quantitative
+/// signal for a poorly-matched proposal.
 ///
 /// # Notes on integrity
 ///
@@ -49,7 +67,7 @@ use std::path::Path;
 /// block — that name doesn't survive on a `CompiledModel`. When the
 /// caller passes `None` for both `model` and `population`, this function
 /// parses the full model file (including `[fit_options]`) and threads
-/// `iov_column` into `read_nonmem_csv`. When the caller supplies
+/// `iov_column` into the model-routed reader. When the caller supplies
 /// `Some(model)` for an IOV model but leaves `population = None`, there
 /// is no source of `iov_column`, so `run_sir` returns an error rather
 /// than silently dropping occasion parsing. Workaround: pass both
@@ -60,12 +78,28 @@ use std::path::Path;
 ///   `covariance_matrix` (i.e. the original fit ran with `covariance = true`).
 /// - `model`: pre-compiled model. When `None`, re-parsed from `fit.model_path`.
 /// - `population`: dataset. When `None`, re-read from `fit.data_path` (with
-///   the `iov_column` constraint above for IOV models).
+///   the `iov_column` constraint above for IOV models), routed by the model so
+///   a joint model's event rows come back as event records (#1199). A supplied
+///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
 ///   `sir_seed`, `sir_keep_samples`, plus the inner-loop settings
 ///   (`inner_maxiter`, `inner_tol`, `interaction`, `mu_referencing`,
 ///   `verbose`, `cancel`). Other fields (e.g. `method`) are ignored.
 pub fn run_sir(
+    fit: &FitResult,
+    model: Option<&CompiledModel>,
+    population: Option<&Population>,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
+    // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
+    // SIR sample re-solves the inner loop, so without this a caller-supplied `ode_reltol` /
+    // `ode_method` would be ignored and the sampled OFVs would come from a different
+    // integration accuracy than the fit being refined. The scope also puts the sample
+    // fan-out on a pool whose workers carry the same settings.
+    crate::api::with_fit_ode_scope(options, || run_sir_scoped(fit, model, population, options))?
+}
+
+fn run_sir_scoped(
     fit: &FitResult,
     model: Option<&CompiledModel>,
     population: Option<&Population>,
@@ -86,6 +120,9 @@ pub fn run_sir(
     // population re-read below.
     let model_owned: Option<CompiledModel>;
     let mut iov_column_from_parse: Option<String> = None;
+    // `[data]` column renames (#730), as in `run_covariance`: the re-read has to
+    // resolve `TIME = TAFD` the way the original fit did.
+    let mut column_map_from_parse: Vec<(String, String)> = Vec::new();
     let model_ref: &CompiledModel = match model {
         Some(m) => m,
         None => {
@@ -108,6 +145,7 @@ pub fn run_sir(
             }
             let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
             iov_column_from_parse = parsed.fit_options.iov_column.clone();
+            column_map_from_parse = parsed.column_map.clone();
             model_owned = Some(parsed.model);
             model_owned.as_ref().unwrap()
         }
@@ -150,10 +188,11 @@ pub fn run_sir(
                     ));
                 }
             }
-            let p = crate::io::datareader::read_nonmem_csv(
+            let p = crate::api::read_population_routed_by(
+                model_ref,
                 Path::new(path),
-                None,
                 iov_column_from_parse.as_deref(),
+                &column_map_from_parse,
             )?;
             pop_owned = Some(p);
             pop_owned.as_ref().unwrap()
@@ -164,6 +203,12 @@ pub fn run_sir(
     // dose-compartment precondition `fit()` enforces (#375) — a `Result`-returning
     // API must not abort the process from inside the walk. Mirrors `run_covariance`.
     crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+    // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: SIR on
+    // a population read model-blind would resample the Gaussian half of a joint
+    // likelihood. The re-read above is routed; this covers a supplied population.
+    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
+        model_ref, pop_ref, true,
+    ))?;
 
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {
@@ -203,6 +248,7 @@ pub fn run_sir(
 
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
+    push_sir_warnings(&mut out.warnings, &sir.warnings);
     out.sir_ci_theta = Some(sir.ci_theta);
     out.sir_ci_omega = Some(sir.ci_omega);
     out.sir_ci_sigma = Some(sir.ci_sigma);
@@ -215,6 +261,39 @@ pub fn run_sir(
 mod tests {
     use super::*;
     use crate::api::fit_from_files;
+
+    /// #1037: a fit that already carries the same `SIR:` line — because it was
+    /// fitted with `sir = true`, or because its `run_sir` output is being piped
+    /// back in — must not collect a second copy.
+    #[test]
+    fn push_sir_warnings_does_not_duplicate() {
+        let mut warnings = vec![
+            "Covariance step: matrix was not positive definite".to_string(),
+            "SIR: proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
+        ];
+        let sir = vec![
+            "proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
+            "proposal was shrunk in 1 direction(s) [KA +1.00]".to_string(),
+        ];
+        push_sir_warnings(&mut warnings, &sir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[2].starts_with("SIR: proposal was shrunk"),
+            "{warnings:?}"
+        );
+
+        // Idempotent: a second pass over the same kernel output adds nothing.
+        push_sir_warnings(&mut warnings, &sir);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+    }
+
+    /// A clean SIR run leaves the fit's warnings untouched.
+    #[test]
+    fn push_sir_warnings_is_a_no_op_when_the_proposal_was_clean() {
+        let mut warnings = vec!["Minimization terminated".to_string()];
+        push_sir_warnings(&mut warnings, &[]);
+        assert_eq!(warnings, vec!["Minimization terminated".to_string()]);
+    }
 
     // Use the in-tree warfarin example + data. They live at repo paths
     // `examples/warfarin.ferx` and `data/warfarin.csv` (see CLAUDE.md);
@@ -574,6 +653,44 @@ mod tests {
             "ess = {} out of (0, {}]",
             ess,
             opts.sir_samples
+        );
+    }
+
+    /// #1021: the covariance step floors non-identified eigenvalues of the FD
+    /// Hessian before inverting it, so such a direction comes back in
+    /// `covariance_matrix` with a variance of ~1/floor. Sampling that direction
+    /// unshrunk put every SIR draw outside the packed bounds, and SIR failed
+    /// with the uninformative "All SIR samples had invalid weights". The
+    /// proposal is now capped at the bounds: SIR runs, and says so.
+    #[test]
+    fn run_sir_survives_an_explosive_proposal_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        let opts = quick_opts();
+        let Some(mut fit) = fit_with_cov_or_skip(
+            model_path.to_str().unwrap(),
+            data_path.to_str().unwrap(),
+            opts.clone(),
+        ) else {
+            return;
+        };
+
+        // Inflate one free direction to the magnitude an eigenvalue-floored
+        // Hessian produces. Adding to a diagonal keeps the matrix PSD, so this
+        // is a covariance a real fit could hand us — not a malformed input.
+        let mut cov = fit.covariance_matrix.clone().expect("covariance present");
+        cov[(0, 0)] += 1e8;
+        fit.covariance_matrix = Some(cov);
+
+        let out = run_sir(&fit, None, None, &opts)
+            .expect("SIR must survive an eigenvalue-floored proposal direction");
+        let ess = out.sir_ess.expect("sir_ess populated");
+        assert!(ess > 0.0, "ess = {ess}");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("shrunk")),
+            "the shrinkage must be reported to the user: {:?}",
+            out.warnings
         );
     }
 

@@ -1,3 +1,7 @@
+---
+pagetitle: "Adaptive Gaussian Quadrature (AGQ)"
+---
+
 # AGQ — Adaptive Gaussian Quadrature
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -273,8 +277,10 @@ AGQ reuses the FOCE/Laplace machinery almost entirely:
 4. **Objective.** The exact conditional likelihood is evaluated at each node.
 5. **Outer loop.** AGQ has an **analytic outer gradient** (below), so
    `optimizer = auto` resolves to gradient-based **L-BFGS**. The covariance step
-   differences the AGQ objective too, so the reported standard errors belong to
-   the likelihood that was actually optimised.
+   works on the AGQ objective too, so the reported standard errors belong to
+   the likelihood that was actually optimised — see
+   [the analytic covariance](#the-analytic-covariance) for when that is computed
+   analytically rather than by finite differences.
 
 Subjects are evaluated in parallel (rayon); the node sweep is serial within a
 subject. The population sum is reduced in a fixed subject order, so the OFV does
@@ -296,7 +302,7 @@ $$
 $$
 
 so the outer gradient is a **posterior-weighted average of fixed-η scores**. Each
-`∂nll(η_j)/∂θ` is available exactly from the `Dual2` sensitivity provider (the
+`∂nll(η_j)/∂θ` is available analytically from the `Dual2` sensitivity provider (the
 same `∂f/∂θ` FOCE/FOCEI use — it makes no mode assumption, so it evaluates at any
 η). The Ω block is closed-form from the η-prior, the σ block closed-form from the
 variance model.
@@ -443,6 +449,116 @@ trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting
 "converged"). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx
 records in #317. `auto` picks L-BFGS for AGQ precisely to avoid it.
 
+## The analytic covariance
+
+The analytic R-matrix supports three estimation paths:
+
+| Fit | Covariance objective |
+|---|---|
+| `method = foce` | FOCE marginal with residual variance frozen at zero random effects |
+| `method = focei`, `n_agq = 1` | FOCEI marginal |
+| `method = focei`, `n_agq > 1` | FOCEI-anchored quadrature marginal, including movement of the nodes |
+
+Outside the analytic scope, the covariance step uses finite differences of the
+objective function. Under AGQ that is expensive: the stencil needs
+`~2·n_free²` **reconverged population objectives**, and every one of them sweeps the
+whole `n_agq^d` node grid for every subject. Doubling the nodes per dimension
+multiplies the grid size by `2^d`.
+
+For `method = focei` with `n_agq > 1`, ferx now assembles that R-matrix analytically
+instead, in a single pass. The standard errors mean the same thing they did before —
+they describe the quadrature marginal the fit actually minimised, not the FOCEI one.
+
+### Why quadrature support uses the FOCEI anchor
+
+The restriction is structural rather than a staging decision. The quadrature grid is
+scaled by a Hessian anchor, and the two methods anchor differently:
+
+| method | anchor | second derivative needs |
+|---|---|---|
+| `focei`, `n_agq > 1` | Gauss-Newton `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` | **third**-order sensitivities |
+| `laplace`, any `n_agq` | exact `H = ∂²nll/∂b²` | **fourth**-order sensitivities |
+
+`H̃` is built from first derivatives of the prediction, so differentiating it twice in
+the population parameters bottoms out at third-order sensitivities — which ferx already
+computes for the FOCE/FOCEI covariance. The exact conditional Hessian already contains
+`∂²f/∂η²`, so the same operation would need a fourth order that does not exist. So
+`method = laplace` keeps the finite-difference covariance at every node count.
+
+### When it applies
+
+The analytic route is taken when **all** of the following hold; otherwise the fit
+keeps the finite-difference covariance, subject to its numerical convergence and step-size limits.
+
+- `method = focei` with `n_agq > 1`.
+- The model is inside the analytic covariance scope shared with FOCE/FOCEI, with a
+  Gaussian endpoint the closed-form or ODE sensitivity provider reaches. M3/BLOQ censoring is supported;
+  TTE, categorical endpoints, and custom or time-varying residual
+  magnitudes are outside it.
+- Closed-form and ODE IOV are supported, including correlated IOV blocks shared across
+  occasions. The assembly uses the full joint mode and quadrature grid and ties
+  the shared covariance derivatives across occasions. IOV with modeled lag,
+  LTBS, or observation scaling remains outside this covariance scope.
+- The subject's anchor is well conditioned. A flat or unidentifiable random-effect
+  direction is declined rather than reported: the assembly would otherwise invert a
+  near-singular matrix and return standard errors inflated by orders of magnitude.
+
+That last point is worth stating plainly — **this does not make every AGQ fit cheaper**.
+It speeds up the covariance step for Gaussian-endpoint FOCEI-anchored quadrature, which
+is a common and expensive case, but the non-Gaussian endpoints that motivate quadrature
+in the first place keep the existing path.
+
+### Covariance validation
+
+For IOV, `tests/iov_analytic_covariance.rs` compares FOCEI R-matrix standard errors
+at the stored NONMEM 7.6.0 beta 1 `MATRIX=R` estimates for warfarin with two
+occasions. All eight SEs agree within 0.44% (the test allows 1%); OFVs are
+308.83426 in ferx and 308.83047 in NONMEM. The control stream and output are
+stored as `tests/nonmem/warfarin_iov_cov_r.{ctl,ext}`. FOCE and FOCEI IOV Hessians
+are also checked against reconverged analytic gradients, including correlated
+BSV and IOV blocks; AGQ-FOCEI is checked against its reconverged quadrature
+objective. The legacy objective stencil was numerically indefinite at this
+reference point, so it is not used as the SE reference.
+
+For M3, `bloq_m3_analytic_covariance_at_nonmem_minimum` evaluates the analytical
+FOCEI R-matrix at the stored NONMEM 7.5.1 LAPLACE M3 minimum. Fixed-effect SEs
+agree within 0.38%; residual and random-effect variance SEs differ by 5–16%,
+consistent with ferx's documented FOCEI Gauss–Newton versus NONMEM full-Laplace
+curvature difference. The regression allows 1% for fixed effects and 20% for
+variance parameters.
+
+The shared FOCEI covariance machinery is checked against the stored NONMEM 7.5.1
+`MATRIX=R` reference at the same parameter values, using
+`tests/covariance_se_at_nonmem_minimum.rs`. All seven checked standard errors pass
+its 6% acceptance band. This anchors FOCEI; the AGQ Hessian is checked against its
+own quadrature objective:
+
+- **Finite-difference oracles at three and five nodes** — diagonal and correlated Ω,
+  proportional and combined residual errors. The packed Hessian is compared against
+  a reconverged second difference of the AGQ objective in optimizer space. This is the
+  check that matters, because it sees the assembly end to end, including the `√2` node
+  scaling and the softmax-response term.
+- **Reduction to FOCEI at one node** — at `n_agq = 1` the grid collapses onto the mode
+  and its node-curvature term reproduces the FOCEI term; the log-determinant still
+  includes the quadrature proposal jitter. This check
+  *cannot* see a `√2` error (the single node sits at `z = 0`, so the scaling drops out),
+  which is why the multi-node oracle above is the primary evidence rather than a
+  supplement.
+- **Production covariance dispatch** — FOCE, FOCEI, and AGQ-FOCEI standard errors are
+  compared against the finite-difference covariance. The test also asserts that the
+  analytic dispatcher accepts each fixture and rejects exact-anchor Laplace.
+- **Censoring combinations** — FOCE and FOCEI M3 Hessians match reconverged analytic-gradient
+  differences, including two-occasion IOV. AGQ-FOCEI M3 matches a reconverged second
+  difference of its quadrature objective, both with and without IOV.
+- **Anchor identity** — the covariance uses the directly assembled objective anchor,
+  without recovering it by inverting its inverse. A regression checks exact matrix
+  equality and confirms that the old inverse round trip changes the fixture's entries.
+
+The derivative assembly uses finite differences of the second-order sensitivity jet
+for third-order sensitivities. Its node sigma score also centrally differences the
+residual variance at fixed predictions; the variance is quadratic in sigma within this
+scope, so that step has rounding error but no truncation error.
+
 ## Inter-occasion variability (IOV)
 
 AGQ and `laplace` both support `[iov]`. Under IOV the integral is over the
@@ -484,6 +600,46 @@ read, and the error names the occasion count so the cause is obvious.
 - Models outside the `Dual2` provider take a finite-differenced θ/σ score rather than
   an analytic one (see above). Same gradient, no inner re-solve, just a little slower
   per iteration.
+- Mixture models support plain FOCEI, but `focei` with `n_agq > 1` is rejected:
+  the mixture engine does not yet integrate each class by quadrature. It must not
+  silently ignore the node count.
+
+## Method boundaries
+
+`focei` with multiple nodes and `laplace` with multiple nodes are intentional
+quadrature variants. The former uses the Gauss–Newton anchor; the latter uses the
+exact conditional Hessian. A numerical fallback changes how a derivative is
+computed, never which anchor or likelihood is requested.
+Both file-based and Rust API fits reject `n_agq = 0`; zero cannot silently select
+plain FOCEI or one-node Laplace.
+The IOV grid cap inspects every stage in a method chain, including a quadrature
+stage following a non-quadrature estimator.
+
+An explicitly requested terminal `agq_eval_only` stage is a likelihood readout:
+it preserves the preceding estimator's parameters and covariance and updates the
+reported OFV. The reported estimation method remains that preceding estimator.
+
+This applies to standard errors too. The R-matrix, the score matrix used by `s`
+and `rsr`, and SIR all evaluate the selected quadrature objective. The score matrix
+uses subject negative-log-likelihood scores directly; the optimizer doubles these
+for its OFV gradient. A FOCEI eta-response correction must not be
+added to a quadrature score that already includes mode and grid movement.
+
+If a required derivative perturbation cannot produce a finite anchor or grid
+response, only that subject's analytic score is declined first. Its numerical fallback
+reconverges the mode and differences the same quadrature objective; other subjects
+keep their analytic scores. For `s` and `rsr`, a failed inner solve, rejected start,
+or non-finite/penalty objective makes the score unavailable and the covariance step
+reports unavailable standard errors. It never squares an optimizer penalty into S,
+regardless of `max_unconverged_frac`, and uses `cov_inner_tol` for numerical scores.
+Finite-grid posterior-mean scores are
+generally nonzero; the exact-integral Bartlett identity does not remove their
+mode-response contribution.
+
+The analytic R-matrix is assembled in parallel and summed in fixed subject order.
+Zero-weight nodes are skipped before sensitivity evaluation. Grid abscissae are
+materialized only for covariance; objective and gradient sweeps reconstruct their
+indices rather than allocating another coordinate vector per node.
 
 ## References
 

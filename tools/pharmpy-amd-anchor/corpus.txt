@@ -1,0 +1,12 @@
+# AMD-shaped search spaces, one per line (#1184).
+#
+# Pharmpy 2.2.0's MFL grammar has no IIV / IOV / COVARIANCE statements — the
+# variability half of the space is ferx's own (#1183) — so the corpus covers
+# what both sides can express: the structural, allometry and covariate
+# statements that one `[space] mfl` carries for the whole pipeline.
+ABSORPTION([INST,FO]);PERIPHERALS(0..1);LAGTIME([OFF,ON]);ALLOMETRY(WT,70);COVARIATE?(@IIV,@CONTINUOUS,[POW,LIN])
+ABSORPTION([INST,FO]);PERIPHERALS(0..2)
+COVARIATE?(@IIV,@CONTINUOUS,POW);COVARIATE?(CL,SEX,CAT)
+ABSORPTION(FO);LAGTIME([OFF,ON]);COVARIATE(CL,WT,POW)
+PERIPHERALS(0..1);ALLOMETRY(WT,70)
+LET(P,[CL,V]);COVARIATE?(@P,WT,POW)

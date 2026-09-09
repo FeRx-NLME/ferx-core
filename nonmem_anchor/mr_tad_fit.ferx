@@ -1,0 +1,46 @@
+# ferx twin of nonmem_anchor/mr_tad.ctl (#1124).
+#
+# One state, with a built-in `first_order` input-rate forcing — the shape that
+# makes this model eligible for the closed-form modified-release fast path, which
+# is precisely the path that used to drop the `TAD` term from the predictions.
+# NONMEM models the same system with an explicit DEPOT compartment; the forcing
+# delivers `KA*D*exp(-KA*(t-t_dose))` into central, which is that depot's outflow,
+# so the central trajectory — the only thing observed — is identical.
+#
+# `MAXEVAL=0` / `maxiter = 0` on both sides: this anchors the objective at a fixed
+# parameter point, so it compares the two engines' predictions and OFV rather than
+# two optimizer trajectories.
+
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  theta TVKA(0.8, 0.001, 24.0)
+  theta THETA_TAD(0.3, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  KTAD = THETA_TAD
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V) * central * (1.0 + KTAD * TAD)
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  maxiter    = 0
+  covariance = false
+  ode_method = rk45
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+  inner_tol  = 1e-6

@@ -17,10 +17,10 @@ fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
             BinOp::Mul,
             Box::new(Expression::Variable("PROP".to_string())),
         );
-        let prog = compile_ruv_mag_deriv_program(&expr, "PROP", n);
+        let prog = compile_ruv_mag_deriv_program(&expr, Some("PROP"), n);
         let theta = vec![0.5f64; n];
         let grad = prog
-            .theta_grad(&theta, &cov, 0.0)
+            .theta_grad(&theta, &cov, 0.0, f64::NAN)
             .unwrap_or_else(|| panic!("theta_grad must dispatch for n_theta = {n}"));
         assert_eq!(grad.len(), n);
         assert!(
@@ -43,9 +43,9 @@ fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
         BinOp::Mul,
         Box::new(Expression::Variable("PROP".to_string())),
     );
-    let prog = compile_ruv_mag_deriv_program(&expr, "PROP", over);
+    let prog = compile_ruv_mag_deriv_program(&expr, Some("PROP"), over);
     assert!(
-        prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0)
+        prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0, f64::NAN)
             .is_none(),
         "n_theta beyond MAX_RUV_MAG_AXES must decline to FD"
     );
@@ -211,7 +211,7 @@ fn transit_time_desugars_to_ode_equivalent() {
         .absorption_ode_equivalent
         .as_ref()
         .expect("transit + TIME must carry an ODE equivalent")
-        .get_or_build();
+        .built();
     let ode = eq
         .ode_spec
         .as_ref()
@@ -1691,6 +1691,1435 @@ fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
     );
 }
 
+// ── #993: a dose attribute applied by the engine AND read by the model ───────
+//
+// The mirror image of the carve-out above. `F` / `LAGTIME` / `ALAG` (and the
+// compartment-indexed `F{n}` / `ALAG{n}` / `LAGTIME{n}`) are load-bearing while
+// textually absent, so the dead-param census exempts them — but a model that
+// *does* read one on the prediction path gets it applied twice, silently: once by
+// the engine at the dose event, once where it is read. Measured on the engine at
+// exactly `F` on every prediction, and `exp(LAGTIME·ke)` for lag.
+
+/// Build a 1-compartment ODE model whose only individual parameter besides CL/V is
+/// `name`, read in the `[odes]` RHS as the elimination rate constant. This is the
+/// exact shape of the #993 repro: rename `name` and the fit moves by a level block.
+fn dose_attr_rhs_model(name: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {name} = 0.1
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -{name} * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_odes_rhs_is_rejected() {
+    // Every spelling the engine applies to *every* dose: the two bare reserved-slot
+    // names plus the `alag` alias, and the compartment-indexed forms. Each must be
+    // a hard parse error naming the parameter, both readings, and the rename.
+    for (name, noun) in [
+        ("F", "bioavailability"),
+        ("LAGTIME", "absorption lag"),
+        ("ALAG", "absorption lag"),
+        ("F1", "bioavailability"),
+        ("ALAG1", "absorption lag"),
+        ("LAGTIME1", "absorption lag"),
+    ] {
+        let err = expect_parse_err(&dose_attr_rhs_model(name));
+        assert!(
+            err.contains("[odes]:") && err.contains(&format!("`{name}`")),
+            "must name the block and the parameter, got: {err}"
+        );
+        assert!(
+            err.contains(noun),
+            "must say what `{name}` means to the engine ({noun}), got: {err}"
+        );
+        // The remediation is the half a user acts on, and the sentinel
+        // `parse_error_to_diagnostic` keys `E_DOSE_ATTR_DOUBLE_USE` off.
+        assert!(
+            err.contains("reserved dose-attribute name"),
+            "must offer the rename, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn dose_attr_read_in_odes_rhs_is_matched_case_insensitively() {
+    // `build_ode_spec` aliases each parameter's case variants onto one var slot, so
+    // a lower-case `f` in the RHS reads the very same value as `F` and must
+    // diagnose identically. Guards against a check that compares raw spellings.
+    let src = dose_attr_rhs_model("F").replace("-F * central", "-f * central");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("reserved dose-attribute name"),
+        "a lower-case read of `F` is the same double use: {err}"
+    );
+}
+
+/// Build a 1-compartment ODE model that declares dose attribute `name` and reads it
+/// in an `init(...)` seed — never in the RHS. Companion to [`dose_attr_rhs_model`],
+/// which is the rejected shape; this is the accepted one (#1046).
+fn dose_attr_init_model(name: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVA(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {name} = TVA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = {name} * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_odes_init_is_accepted() {
+    // The scope floor of the #993 rule, and the one surface it must NOT claim
+    // (#1046). An `init(...)` seed is not a dose: `OdeSpec::initial_state` writes the
+    // raw expression value into the state vector, and `F`/lag are resolved through
+    // `DoseAttrMap` at dose events only — a path the seed never takes. So
+    // `init(central) = F * 100` (the bioavailable residue of a pre-study 100 mg dose)
+    // applies `F` exactly once, to a quantity the engine never scales.
+    //
+    // Anchored on NONMEM 7.6.0, which agrees: `A_0(1) = F1*100` with `F1 = 0.5` seeds
+    // 50, not 25, and its table is byte-identical to the twin seeding from an ordinary
+    // parameter of the same value (`nonmem_anchor/odes_init_dose_attr_f_{A,B}.ctl`;
+    // same for lag). Rejecting this made a correct model unwritable and advised the
+    // wrong repair — renaming the parameter whose meaning *is* bioavailability.
+    //
+    // Contrast the RHS, which IS a doubling and stays rejected:
+    // `dose_attr_read_in_odes_rhs_is_rejected`.
+    for name in ["F", "LAGTIME", "ALAG", "F1", "ALAG1", "LAGTIME1"] {
+        let src = dose_attr_init_model(name);
+        if let Err(e) = parse_full_model(&src) {
+            panic!("`init(central) = {name} * 100` applies `{name}` once: {e}");
+        }
+    }
+}
+
+#[test]
+fn an_init_read_counts_as_a_use_for_the_never_used_census() {
+    // Companion to the acceptance test above, and deliberately *not* folded into it:
+    // asserting "no never-used warning" for `F`/`LAGTIME`/`F1`/… cannot fail, because
+    // the census exempts every dose-attribute name before it looks at block text
+    // (`RESERVED_PK_SLOTS` for the bare names, `DoseAttr::from_indexed_name` for the
+    // indexed ones). Measured: with the `init(...)` line deleted entirely, all six
+    // still produce zero "never used" warnings.
+    //
+    // So the census claim has to be made with a name the exemption does not cover. An
+    // ordinary parameter read *only* from the init is that name — and it is the shape
+    // that would regress if the seed ever stopped being counted as a use.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVA(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  FSEED = TVA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = FSEED * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let never_used = |s: &str| -> Vec<String> {
+        parse_full_model(s)
+            .expect("parses")
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("never used"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        never_used(src).is_empty(),
+        "`FSEED` is read by the init seed, so it is used: {:?}",
+        never_used(src)
+    );
+    // Non-vacuity: delete the init line and the very same parameter *is* reported —
+    // so the assertion above is a statement about the init read, not about the census
+    // being silent in general.
+    let without = src.replace("  init(central) = FSEED * 100.0\n", "");
+    assert_ne!(without, src, "the init line must actually be removed");
+    assert!(
+        never_used(&without).iter().any(|w| w.contains("`FSEED`")),
+        "with the init read gone `FSEED` must be reported unused: {:?}",
+        never_used(&without)
+    );
+}
+
+#[test]
+fn coded_rate_param_read_in_odes_init_is_not_recorded() {
+    // The `D{n}`/`R{n}` half of #1046, and the reason the fix had to drop the init
+    // walk from `rhs_reads` rather than skip the check: that same set drives
+    // `mark_prediction_path_read`, whose marks `check_modeled_dose_rates` turns into
+    // a data-gated error once a `RATE=-2` dose lands on the compartment. An init
+    // amount consults no dose attribute at all — modeled duration included — so a
+    // `D1` read there must record nothing, or a correct model would be rejected as
+    // soon as its dataset happened to carry a coded RATE.
+    use crate::types::DoseAttr;
+    let parsed = parse_full_model(&dose_attr_init_model("D1")).expect("`D1` in an init parses");
+    assert_eq!(
+        parsed
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        None,
+        "an init-only `D1` read is not a prediction-path read"
+    );
+
+    // Control: the same parameter read in the RHS *is* recorded, so the assertion
+    // above cannot pass for a map that simply never marks anything.
+    let rhs = dose_attr_init_model("D1").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * D1 * central",
+    );
+    assert_eq!(
+        parse_full_model(&rhs)
+            .expect("`D1` in the RHS parses — it is data-gated, not rejected")
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        Some("D1"),
+        "a `D1` read by the [odes] RHS must still be recorded for the data check"
+    );
+}
+
+#[test]
+fn dose_attr_read_in_both_odes_init_and_rhs_is_still_rejected() {
+    // Overshoot guard for #1046. Accepting the init read must not disarm the RHS
+    // walk: a model that seeds from `F` *and* folds `F` into the flux still applies
+    // it twice on the dose-driven term, which is exactly the #993 defect. Pins that
+    // the fix dropped the init walk only.
+    let src = dose_attr_init_model("F").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * F * central",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
+        "the RHS read is still a double use even when an init also reads it: {err}"
+    );
+    // And the message must say *which* read to remove. This is the exact model where
+    // the un-narrowed wording misled: "remove it from [odes]" invites deleting the
+    // `init(...)` line, which is legal (#1046) and does not clear the error. The
+    // sibling data-gated half already says "[odes] RHS or [scaling]"
+    // (`api/validation.rs`), so the two halves of `E_DOSE_ATTR_DOUBLE_USE` agree.
+    assert!(
+        err.contains("read in the [odes] RHS") && err.contains("remove it from the [odes] RHS"),
+        "the remedy must name the RHS, not the whole block: {err}"
+    );
+}
+
+#[test]
+fn out_of_range_indexed_dose_attr_reports_the_compartment_error() {
+    // Scope boundary on the compartment index. `F5` on a one-state model is a
+    // *different* defect, and `dose_attr_map`'s build reports it precisely. This
+    // check runs first, so it must decline out-of-range indices — otherwise the
+    // user is told to rename `F5` when the real problem is that compartment 5 does
+    // not exist.
+    let err = expect_parse_err(&dose_attr_rhs_model("F5"));
+    assert!(
+        err.contains("only 1 compartment"),
+        "the compartment-index error must win over the double-use rename advice: {err}"
+    );
+    assert!(
+        !err.contains("reserved dose-attribute name"),
+        "out-of-range `F5` is not the #993 diagnostic: {err}"
+    );
+}
+
+#[test]
+fn ordinary_names_read_in_odes_rhs_are_accepted() {
+    // The other half of the contract, and the one that would break real models if
+    // the predicate over-matched. `N`/`MTT`/`MAT`/`CV2` hold canonical PK slots but
+    // are only ever read through an explicit `transit(n=…)`/`igd(…)` arg mapping;
+    // `S{n}` is not routed at all; `D{n}`/`R{n}` are dose attributes but inert
+    // unless the *data* codes RATE, so they are not a parse error (see
+    // `tests/modeled_rate.rs` for the data-gated half).
+    for name in [
+        "KA", "Q", "V2", "Q3", "V3", "N", "MTT", "MAT", "CV2", "S1", "S2", "D1", "R1", "KEL", "ZQ",
+    ] {
+        assert!(
+            parse_full_model(&dose_attr_rhs_model(name)).is_ok(),
+            "`{name}` in the [odes] RHS is not a dose-attribute double use and must parse"
+        );
+    }
+}
+
+/// A 1-compartment ODE model with a declarative reactive controller whose
+/// `observe` signal is `signal_expr`. `[adaptive_dosing] observe` is compiled by
+/// the same `build_y_output_fn` a Form-C `y` readout uses, so it reaches
+/// individual parameters — including the reserved dose-attribute names.
+fn adaptive_observe_model(extra_param: &str, signal_expr: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVX(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {extra_param} = TVX
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[adaptive_dosing]
+  observe = {signal_expr}
+  at = [24, 48]
+  start_dose = 100
+  route = bolus(cmt = 1)
+  dose_bounds = [0, 400]
+  when signal < 10 : increase 25%
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_adaptive_observe_is_rejected() {
+    // The controller's signal is a prediction path too, and the worst one to get
+    // wrong: `observe` does not merely report a number, it is what the `when` rules
+    // compare against, so a double-applied `F` biases the titration decision and
+    // every dose the controller then emits.
+    for (name, noun) in [
+        ("F", "bioavailability"),
+        ("LAGTIME", "absorption lag"),
+        ("F1", "bioavailability"),
+    ] {
+        let err = expect_parse_err(&adaptive_observe_model(
+            name,
+            &format!("central / (V * {name})"),
+        ));
+        assert!(
+            err.contains("[adaptive_dosing]:") && err.contains(&format!("`{name}`")),
+            "must name the block and the parameter, got: {err}"
+        );
+        assert!(
+            err.contains(noun) && err.contains("reserved dose-attribute name"),
+            "must say what `{name}` means and offer the rename, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_name_read_in_adaptive_observe_is_accepted() {
+    // Over-match guard: an ordinary parameter in the controller signal is the
+    // normal case and must keep parsing. `D1`/`R1` are dose attributes but inert
+    // until the data codes a RATE, so they are not a parse error either.
+    for name in ["KEL", "ZQ", "D1", "R1"] {
+        let src = adaptive_observe_model(name, &format!("central / (V * {name})"));
+        assert!(
+            parse_full_model(&src).is_ok(),
+            "`{name}` in [adaptive_dosing] observe must parse"
+        );
+    }
+}
+
+#[test]
+fn malformed_adaptive_observe_now_fails_at_parse_time() {
+    // Consequence of the #993 walk, worth pinning because it is a behaviour change:
+    // `parse_adaptive_dosing_block` only stores `observe` as a string (the real
+    // compile happens in `compile_observe`, at simulate time), so this is the FIRST
+    // parse of that expression. A syntactically broken signal now surfaces here
+    // rather than at the first `simulate()` — earlier, and attributed to the block
+    // it came from.
+    let err = expect_parse_err(&adaptive_observe_model("KEL", "central / (V * KEL"));
+    assert!(
+        err.contains("[adaptive_dosing] observe"),
+        "the error must name the block and key it came from, got: {err}"
+    );
+}
+
+#[test]
+fn coded_rate_param_read_in_adaptive_observe_is_recorded() {
+    // The data-gated half of the same path: `R1` in the controller signal is legal
+    // on ordinary data, so nothing is rejected — but the read must be *recorded* so
+    // `check_modeled_dose_rates` can report it once a `RATE=-1` dose lands on it.
+    // Silence here and a diagnostic there is the whole contract.
+    use crate::types::DoseAttr;
+    let parsed = parse_full_model(&adaptive_observe_model("R1", "central / (V * R1)"))
+        .expect("an R1 controller signal parses");
+    assert_eq!(
+        parsed
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Rate, 1),
+        Some("R1"),
+        "an `R1` read by [adaptive_dosing] observe must be recorded for the data check"
+    );
+    // The same model without the read records nothing — otherwise the assertion
+    // above would pass for a map that marks everything.
+    let clean = parse_full_model(&adaptive_observe_model("R1", "central / V"))
+        .expect("the control model parses");
+    assert_eq!(
+        clean
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Rate, 1),
+        None,
+        "an unread `R1` must not be marked"
+    );
+}
+
+#[test]
+fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
+    // Second door into the same panic, found probing the first. `F` here is the `f=`
+    // mapping — so the #735 shadow guard allows it — *and* the `v=` role, so the
+    // generated twin emits `d/dt(central) = … − (CL/F) * central` with
+    // `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. The
+    // twin's own parse rejects that as a #993 double use, which (before #1008 made
+    // the build a parse-time decline) `get_or_build` `.expect()`ed — so a model the
+    // analytical primary accepts crashed the moment a TV-covariate / `TIME` / IOV
+    // subject rerouted to the twin.
+    //
+    // The specific guard is kept even though #1008's attach-site decline would now
+    // catch this generically: it declines *before* reconstructing a twin known to be
+    // unusable, so the model needs no `W_ABSORPTION_TWIN_DECLINED` warning for a case
+    // the desugar can name exactly. (`state_named_parameter_declines_the_absorption_
+    // twin_with_a_warning` covers the generic backstop.)
+    //
+    // The model is pharmacological nonsense (bioavailability used as a volume), but
+    // nonsense must not panic. Declining keeps it closed-form — exactly what it was
+    // before the twin existed.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  N   = TVN
+  MTT = TVMTT
+  F   = inv_logit(THETA_F)
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src).expect("the analytical primary still parses");
+    assert!(
+        parsed.model.absorption_ode_equivalent.is_none(),
+        "a dose-attribute parameter reused as a disposition role must decline the twin, \
+         not build one that panics"
+    );
+    // The desugar names this case, so it declines *before* reconstructing a source —
+    // no generic build-failure warning is raised.
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        "a guard-recognised decline must not fall through to the generic build-failure \
+         warning; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+/// #1008: the third live door into the `.expect()` panic the first two (#1003) armed —
+/// found by probing the class rather than the instances, and the reason the fix is
+/// structural instead of a fourth point guard.
+///
+/// The twin's ODE states are named `central` (and `periph` for 2-cpt). An individual
+/// parameter named `CENTRAL` is meaningless to the analytical primary — which has no state
+/// namespace at all — so nothing rejects it there; the twin then re-emits it into
+/// `[individual_parameters]` beside `states=[central]`, and the twin's own parse rejects the
+/// case-insensitive name collision. None of the three existing guards look at state names,
+/// so this reached `get_or_build` and panicked mid-fit.
+///
+/// Three shapes are covered: a stray parameter that merely *exists* (never referenced by the
+/// `pk()` mapping), one that fills a disposition role, and the 2-cpt `periph` analogue —
+/// whose colliding name set differs because the twin's state list is topology-dependent.
+#[test]
+fn state_named_parameter_declines_the_absorption_twin_with_a_warning() {
+    let stray = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // `v=CENTRAL` — the parameter is load-bearing, so the twin's `d/dt(central)` RHS reads
+    // the very name it declares as a state.
+    let disposition_role = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  CENTRAL = TVV
+  N   = TVN
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=CENTRAL, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // The 2-cpt twin declares a second state, `periph`, so its state namespace — and hence
+    // the set of parameter names that collide — depends on the topology. Cover both.
+    let two_cpt_periph = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV1(50.0, 0.0, 1e15)
+  theta TVQ(10.0, 0.0, 1e15)
+  theta TVV2(80.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1
+  Q   = TVQ
+  PERIPH = TVV2
+  N   = TVN
+  MTT = TVMTT
+
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=PERIPH, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    for (label, src, colliding) in [
+        ("stray", stray, "CENTRAL"),
+        ("disposition role", disposition_role, "CENTRAL"),
+        ("2-cpt periph", two_cpt_periph, "PERIPH"),
+    ] {
+        let parsed = parse_full_model(src)
+            .unwrap_or_else(|e| panic!("the analytical primary ({label}) must still parse: {e}"));
+        assert!(
+            parsed.model.absorption_ode_equivalent.is_none(),
+            "a parameter named after a twin state ({label}) must decline the twin, not build \
+             one that panics"
+        );
+        let warning = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("W_ABSORPTION_TWIN_DECLINED"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the decline ({label}) must be reported; warnings: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        // The twin parser's own message is carried through, so the reason is readable
+        // without a debugger — the specific complaint here is the state-name collision.
+        assert!(
+            warning.contains(colliding) && warning.contains("collides"),
+            "the warning must carry the twin parser's reason (naming `{colliding}`), \
+             got: {warning}"
+        );
+        // …and it must classify to its own code rather than the `general` bucket, so a
+        // consumer can branch on "this model kept no ODE fallback". Asserted here on the
+        // *produced* message, so the code cannot drift away from the text that carries it.
+        assert_eq!(
+            crate::types::classify_warning(warning).category.as_str(),
+            "absorption_twin_declined",
+            "the decline ({label}) must classify to its own warning code"
+        );
+
+        // The load-bearing half of the trade (#1027 review): declining is only safe because a
+        // subject that would have rerouted is *rejected*, not silently served by the closed
+        // form. Reach the guard directly rather than through `fit()` (Tier 1: no convergence
+        // loop) — this is the exact call `fit()` makes at its `check_absorption_closed_form_
+        // support` gate, and the same `Option<String>` `predict()`/`simulate()` panic on.
+        let rejection =
+            crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a declined-twin model ({label}) must reject a TV-covariate subject, \
+                         not silently serve it from the closed form"
+                    )
+                });
+        // …and the rejection must name the real cause. Before #1027 it told the author their
+        // model was "an unrecognised closed form" and pointed at a rewrite they did not need,
+        // while the reason lived in a parse warning `fit()` never reaches on the `Err` path.
+        // Asserted on the *content* (the colliding name) rather than the wrapper wording, so a
+        // reworded clause does not silently pass a rejection that dropped the reason.
+        assert!(
+            rejection.contains(colliding),
+            "the rejection ({label}) must quote the twin's decline reason (naming \
+             `{colliding}`), got: {rejection}"
+        );
+        assert!(
+            !rejection.contains("an unrecognised closed form"),
+            "a recognised closed form whose twin was declined must not be called unrecognised \
+             ({label}), got: {rejection}"
+        );
+
+        // The other two reroute-needing features the twin serves (#719) take their own message
+        // arms, so assert each carries the cause and the reason too — a declined twin loses SS
+        // and infusion exactly like it loses the TV-covariate reroute, and an author who hits
+        // one of those first must not be told the form is unrecognised either.
+        for (feature, marker, population) in [
+            (
+                "steady-state",
+                "steady-state (SS) doses",
+                ss_dose_population(),
+            ),
+            ("infusion", "infusion doses", infusion_population()),
+        ] {
+            let msg = crate::api::check_absorption_closed_form_support(&parsed.model, &population)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a declined-twin model ({label}) must reject a {feature} subject, not \
+                         silently serve it from the closed form"
+                    )
+                });
+            // Pin *which* arm fired: these populations are built by mutating the TV-covariate
+            // one, so without this the assertions below would pass just as happily on the
+            // TV-covariate message and prove nothing about the SS / infusion arms.
+            assert!(
+                msg.contains(marker),
+                "the {feature} subject ({label}) must hit the {feature} arm, got: {msg}"
+            );
+            assert!(
+                msg.contains(colliding) && !msg.contains("an unrecognised closed form"),
+                "the {feature} rejection ({label}) must name the decline cause and quote the \
+                 reason (naming `{colliding}`), got: {msg}"
+            );
+        }
+    }
+}
+
+/// A one-subject population whose subject takes a **steady-state** dose, and one whose subject
+/// takes an **infusion** — the other two features that reroute to the ODE twin (#719) and are
+/// therefore rejected when there is no twin. Each hits its own arm of
+/// `check_absorption_closed_form_support`, so both are exercised alongside the TV-covariate one.
+fn ss_dose_population() -> crate::types::Population {
+    let mut pop = tv_cov_population();
+    let s = &mut pop.subjects[0];
+    s.id = "SS1".to_string();
+    s.obs_covariates = Vec::new(); // drop the TV covariate so the SS arm is what fires
+    s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    pop
+}
+
+fn infusion_population() -> crate::types::Population {
+    let mut pop = tv_cov_population();
+    let s = &mut pop.subjects[0];
+    s.id = "INF1".to_string();
+    s.obs_covariates = Vec::new(); // drop the TV covariate so the infusion arm is what fires
+    s.doses = vec![crate::types::DoseEvent::new(
+        0.0, 100.0, 1, 50.0, false, 0.0,
+    )];
+    pop
+}
+
+/// A one-subject population whose subject carries a time-varying covariate row — the cheapest
+/// thing that makes `Subject::has_tv_covariates()` true, which is what routes a closed-form
+/// absorption subject to its twin (`CompiledModel::effective_for`) and, twin-less, is what
+/// `check_absorption_closed_form_support` rejects on.
+fn tv_cov_population() -> crate::types::Population {
+    crate::types::Population {
+        subjects: vec![crate::types::Subject {
+            id: "TV1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0],
+            obs_cmts: vec![1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![std::collections::HashMap::from([("WT".to_string(), 80.0)])],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// The positive control for the test above: an ordinary transit model — same shape, no
+/// state-named parameter — keeps its twin and is warned about nothing. Without this, the
+/// decline path could pass by declining *everything*.
+#[test]
+fn an_ordinary_transit_model_keeps_its_twin_and_warns_about_nothing() {
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta TVX(1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  CENTRAL_AMT = TVX
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src).expect("an ordinary transit model parses");
+    assert!(
+        parsed
+            .model
+            .absorption_ode_equivalent
+            .as_ref()
+            .is_some_and(|eq| eq.built().ode_spec.is_some()),
+        "an ordinary transit model must keep a working ODE twin; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
+        "nothing to decline here; warnings: {:?}",
+        parsed.model.parse_warnings
+    );
+    // The negative control for the rejection assertion in the test above: a twin-carrying
+    // model must *accept* the very subject a declined one rejects — otherwise that assertion
+    // could pass by rejecting every transit model with a TV covariate.
+    assert_eq!(
+        crate::api::check_absorption_closed_form_support(&parsed.model, &tv_cov_population()),
+        None,
+        "a twin-carrying transit model must reroute a TV-covariate subject, not reject it"
+    );
+}
+
+#[test]
+fn adaptive_observe_does_not_reach_the_absorption_twin() {
+    // Regression guard on the interaction between the #993 `[adaptive_dosing]`
+    // rejection and the absorption ODE twin, found reviewing that commit.
+    //
+    // `absorption_ode_equivalent_source` re-emits the model's blocks into a source
+    // whose `[structural_model]` is `ode(...)`. `[odes]` and `[scaling]` can never
+    // reach a new ODE-only check from there — their presence makes the twin decline
+    // outright — but `[adaptive_dosing]` does not decline it. So an analytical model
+    // that the parser deliberately accepts (the rejection is ODE-scoped, see #1004)
+    // produced a twin that the parser *rejects* — which, before #1008 made the build
+    // a parse-time decline, `get_or_build` turned into a `.expect()` panic mid-fit, on
+    // the plain predict path that reroutes TV-covariate / `TIME` / IOV subjects.
+    //
+    // The block is now dropped from the twin, so the model keeps a working fallback.
+    //
+    // #1004 update: the primary no longer accepts a dose-attribute read in `observe`
+    // — that is now the analytical rejection, asserted below — so no *reachable*
+    // controller carries something the twin's own parse would reject. That makes
+    // "the twin exists, therefore the block was dropped" vacuous: with the drop
+    // removed this test still passed. The second half therefore asserts on the
+    // re-emitted source itself, which holds whatever the controller says.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  F   = inv_logit(THETA_F)
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT, f=F)
+
+[adaptive_dosing]
+  observe = central / (V * F)
+  at = [24, 48]
+  start_dose = 100
+  route = bolus(cmt = 1)
+  dose_bounds = [0, 400]
+  when signal < 10 : increase 25%
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    // Half one: the primary rejects it itself (#1004), rather than accepting it and
+    // handing the twin a source whose own parse fails — which since #1008 costs the
+    // model its fallback silently instead of panicking.
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("[adaptive_dosing]:") && err.contains("remove the `f=F` mapping"),
+        "the primary must reject the dose-attribute observe, got: {err}"
+    );
+
+    // Half two: the block-drop itself, asserted on the reconstructed source rather
+    // than inferred from the twin parsing. "The twin builds, therefore the block
+    // was dropped" only holds while the controller still carries something the ODE
+    // parse rejects — and after #1004 the primary rejects that shape first, so any
+    // controller reaching this point is one the twin's own parse would accept.
+    // Reading the emitted source keeps the guard honest whatever `observe` says.
+    let ok_src = src.replace("observe = central / (V * F)", "observe = central / V");
+    assert_ne!(ok_src, src, "the accepted variant must actually differ");
+    let parsed = parse_full_model(&ok_src).expect("a controller without a dose attribute parses");
+    // The primary keeps its controller — only the twin drops it.
+    assert!(
+        parsed.adaptive_dosing.is_some(),
+        "the primary must still carry the [adaptive_dosing] block"
+    );
+    let eq = parsed
+        .model
+        .absorption_ode_equivalent
+        .as_ref()
+        .expect("a plain transit model carries an ODE twin");
+    // The drop, asserted where it happens. `AbsorptionOdeEquivalent` keeps only the
+    // built model since #1008, so the reconstruction is re-run here rather than read
+    // off the twin — same function, same blocks, and it fails if the block comes back.
+    let extracted = super::extract_blocks(&ok_src).expect("the model file extracts");
+    let twin_src = super::absorption_ode_equivalent_source(&extracted)
+        .expect("a plain transit model reconstructs a twin source");
+    assert!(
+        !twin_src.contains("[adaptive_dosing]"),
+        "the twin source must not re-emit the controller block, got:\n{twin_src}"
+    );
+    let twin = eq.built();
+    assert!(
+        twin.ode_spec.is_some(),
+        "the twin must be a working ODE model"
+    );
+}
+
+#[test]
+fn dose_attr_read_in_scaling_is_rejected() {
+    // The readout is a prediction path too: dividing by `F` applies bioavailability
+    // a second time, measured at exactly `F`. Both readout forms — Form-C `y` and
+    // `obs_scale` — reach the same check.
+    for readout in ["y = central / (V * F)", "obs_scale = V * F"] {
+        let src = format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  {readout}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("[scaling]:") && err.contains("reserved dose-attribute name"),
+            "`{readout}` double-applies F and must be rejected, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn dose_attr_read_only_for_reporting_is_accepted() {
+    // `[derived]` / `[output]` are post-solve reporting, not the prediction path: a
+    // model that tabulates its own bioavailability (and an exposure derived from
+    // it) is correct and must stay silent. Rejecting here would also panic the
+    // absorption ODE twin, which re-emits `[derived]` verbatim into a source it
+    // `.expect()`s to re-parse.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[derived]
+  AUCF = F * 100.0 / CL
+
+[output]
+  F
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let parsed = parse_full_model(src)
+        .expect("reading F only for reporting is not a double use and must parse");
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("computed but never used")),
+        "a reported F is used, not dead: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+/// An analytical model whose `pk(...)` call carries the extra argument `mapping`
+/// (empty for none) and whose `[scaling]`/`[initial_conditions]`/
+/// `[adaptive_dosing]` block is `block`. `decl` is the individual-parameter line
+/// for the parameter under test.
+fn analytical_dose_attr_src(mapping: &str, decl: &str, block: &str) -> String {
+    let args = if mapping.is_empty() {
+        "cl=CL, v=V, ka=KA".to_string()
+    } else {
+        format!("cl=CL, v=V, ka=KA, {mapping}")
+    };
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  {decl}
+
+[structural_model]
+  pk one_cpt_oral({args})
+
+{block}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn analytical_dose_attr_read_in_scaling_is_rejected() {
+    // #1004, the analytical half of #993. `pk(..., f=F)` applies `F` at the dose;
+    // an `obs_scale`/`y` that reads `F` applies it a second time — measured at
+    // exactly `F` on the prediction (`tests/dose_attr_double_use_nonmem_anchor.rs`,
+    // which also pins NONMEM's own ADVAN2 doing the same silently under
+    // `S2 = V/F1`). #1003 left this accepted, arguing the explicit mapping made it
+    // "stated rather than silent"; nothing in the model states the value is applied
+    // twice, which is exactly the silence #993 closed on the ODE engine.
+    //
+    // The readouts deliberately do NOT mention `V`: `obs_scale = V * F` (what this
+    // test pinned before) trips the pre-existing volume double-divide warning in
+    // `build_obs_scale_spec`, which masks how quiet the general case is.
+    for readout in [
+        "obs_scale = 50.0 * F",
+        "obs_scale = 1.0 / F",
+        "y = central * F",
+    ] {
+        let src = analytical_dose_attr_src("f=F", "F  = TVF", &format!("[scaling]\n  {readout}"));
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains("[scaling]:") && err.contains("remove the `f=F` mapping"),
+            "`{readout}` double-applies F and must be rejected, got: {err}"
+        );
+        // The remediation is engine-correct: renaming does nothing here, because
+        // the mapping follows the parameter.
+        assert!(
+            !err.contains("reserved dose-attribute name"),
+            "the analytical wording must not tell the user to rename: {err}"
+        );
+    }
+}
+
+#[test]
+fn analytical_dose_attr_read_through_scaling_intermediate_is_rejected() {
+    // #1030 must not open a hole in #1004: naming the doubled read does not make it
+    // stop happening, so a readout that reaches `F` only through a named
+    // intermediate is rejected exactly as the inline spelling is. This is the
+    // read-scan half of the inlining contract — the scan runs on the expanded AST,
+    // not on the raw line.
+    let src = analytical_dose_attr_src(
+        "f=F",
+        "F  = TVF",
+        "[scaling]\n  SCALE = 50.0 * F\n  obs_scale = SCALE",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[scaling]:") && err.contains("remove the `f=F` mapping"),
+        "a dose attribute reached through an intermediate must still be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn analytical_lag_mapping_read_in_scaling_is_rejected() {
+    // The lag half, and both spellings of the mapping (`lagtime=` and the NONMEM
+    // alias `alag=`, which `PkParams::name_to_index` routes to the same slot). A
+    // readout that multiplies by the lag applies it once as a time shift at the
+    // dose and once as a number here.
+    for mapping in ["lagtime=TLAG", "alag=TLAG"] {
+        let src = analytical_dose_attr_src(
+            mapping,
+            "TLAG = TVLAG",
+            "[scaling]\n  obs_scale = 2.0 * TLAG",
+        );
+        let err = expect_parse_err(&src);
+        // The message must quote the role the model file actually uses: telling an
+        // `alag=` user to remove a `lagtime=` argument names text that is not there.
+        assert!(
+            err.contains("[scaling]:")
+                && err.contains("absorption lag")
+                && err.contains(&format!("remove the `{mapping}` mapping")),
+            "`{mapping}` + a TLAG readout must be rejected and quote its own spelling, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn analytical_dose_attr_read_in_initial_conditions_is_accepted() {
+    // Scope floor, and the one surface the #1004 rule must NOT claim. An analytical
+    // init amount is not a dose: `pk::analytical_init_concentration_g` propagates it
+    // with `F = 1` and no lag ("an initial condition is not an absorbed dose, so
+    // bioavailability does not apply"), so `init(depot) = F * 500` — the
+    // bioavailable residue of a pre-study 500 mg dose — applies `F` exactly once,
+    // to a term the engine never scales. That is a legitimate model.
+    //
+    // Contrast `[scaling]`, which IS a doubling: `obs_scale` multiplies every
+    // prediction, the F-scaled dose contribution included. An init sits beside that
+    // contribution, not on top of it.
+    for block in [
+        "[initial_conditions]\n  init(central) = F * 100.0",
+        "[initial_conditions]\n  init(depot) = F * 500.0",
+    ] {
+        let src = analytical_dose_attr_src("f=F", "F  = TVF", block);
+        assert!(
+            parse_full_model(&src).is_ok(),
+            "an init amount that reads a mapped `F` applies it once, not twice: {block}"
+        );
+    }
+    // Same for lag, whose init impulse is likewise deposited at t=0 unshifted.
+    let lag = analytical_dose_attr_src(
+        "lagtime=TLAG",
+        "TLAG = TVLAG",
+        "[initial_conditions]\n  init(central) = TLAG * 100.0",
+    );
+    assert!(
+        parse_full_model(&lag).is_ok(),
+        "the init impulse carries no lag either"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_read_only_for_reporting_is_accepted() {
+    // The analytical counterpart of `dose_attr_read_only_for_reporting_is_accepted`
+    // (which pins the ODE engine). `[derived]`/`[output]` are post-solve reporting,
+    // not the prediction path, so tabulating a mapped `F` is correct and must stay
+    // silent on the default engine too — this is the scope floor `ferxtranslate`'s
+    // reporting columns sit on.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[derived]
+  AUCF = F * 100.0 / CL
+
+[output]
+  F
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    assert!(
+        parse_full_model(src).is_ok(),
+        "reading a mapped F only for reporting is not a double use"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_remedy_quotes_the_mapping_as_written() {
+    // The remediation clause has to name text the model file actually contains.
+    // `analytical_dose_attr_slot_map` binds through `build_pk_param_fn`'s lowercase
+    // compat lookup as well as an exact match, so `alag=TLAG` legitimately binds a
+    // parameter declared `tlag` — and the message must say `alag=TLAG`, not the
+    // canonical `lagtime=` (an argument the file never wrote) nor `tlag` (the
+    // declaration's casing, which is not what the `pk(...)` call says).
+    let src = analytical_dose_attr_src(
+        "alag=TLAG",
+        "tlag = TVLAG",
+        "[scaling]\n  obs_scale = 2.0 * tlag",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("remove the `alag=TLAG` mapping"),
+        "the message must quote the mapping as written, got: {err}"
+    );
+    assert!(
+        !err.contains("lagtime="),
+        "naming a `lagtime=` argument the file does not contain misdirects: {err}"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
+    // `pk_param_map` is a `HashMap`, and one parameter can fill both dose-attribute
+    // roles. With arbitrary iteration order the surviving slot — and therefore the
+    // noun and the quoted role — differed between parses of the identical source,
+    // and the two halves disagreed with each other ("bioavailability … remove the
+    // `lagtime=X` mapping"). Sorted iteration in `analytical_dose_attr_slot_map`
+    // plus an `attr`-filtered role lookup makes both stable and mutually
+    // consistent. Several parses in one process, because `HashMap`'s ordering is
+    // per-instance.
+    let src = analytical_dose_attr_src(
+        "f=X, lagtime=X",
+        "X  = TVF",
+        "[scaling]\n  obs_scale = 2.0 * X",
+    );
+    let first = expect_parse_err(&src);
+    for _ in 0..16 {
+        assert_eq!(
+            expect_parse_err(&src),
+            first,
+            "the diagnostic must not depend on HashMap iteration order"
+        );
+    }
+    // And the noun must agree with the role the clause tells the user to remove.
+    assert!(
+        first.contains("absorption lag") && first.contains("remove the `lagtime=X` mapping"),
+        "noun and quoted role must describe the same slot, got: {first}"
+    );
+}
+
+#[test]
+fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
+    // `lagtime=` and `alag=` are two spellings of the SAME slot, so a `pk(...)`
+    // call may legally carry both. Two cases, both of which the remediation clause
+    // has to get right on its own — the role lookup cannot just take the first map
+    // entry that routes to the lag slot.
+    //
+    // (a) Two different parameters on the one slot. Whichever is read, the message
+    //     must quote *that* parameter's own spelling.
+    let two = |readout: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  TLAGA = TVLAG
+  TLAGB = TVLAG
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAGA, alag=TLAGB)
+
+[scaling]
+  obs_scale = 2.0 * {readout}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        )
+    };
+    for (readout, want) in [
+        ("TLAGA", "remove the `lagtime=TLAGA` mapping"),
+        ("TLAGB", "remove the `alag=TLAGB` mapping"),
+    ] {
+        let err = expect_parse_err(&two(readout));
+        assert!(
+            err.contains(want),
+            "reading `{readout}` must quote its own mapping, got: {err}"
+        );
+    }
+
+    // (b) One parameter under both spellings. Both `analytical_dose_attr_slot_map`
+    //     and `build_pk_param_fn` iterate ascending and let the last write win, so
+    //     `lagtime=` is the mapping that actually reaches the slot — quoting
+    //     `alag=` would name one whose removal changes nothing.
+    let both = analytical_dose_attr_src(
+        "lagtime=X, alag=X",
+        "X = TVLAG",
+        "[scaling]\n  obs_scale = 2.0 * X",
+    );
+    let err = expect_parse_err(&both);
+    assert!(
+        err.contains("remove the `lagtime=X` mapping"),
+        "must quote the binding mapping, not the shadowed alias, got: {err}"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_read_in_adaptive_observe_is_rejected() {
+    // The controller signal. A dose attribute read here biases every dose the
+    // controller then emits by exactly that attribute.
+    let src = analytical_dose_attr_src(
+        "f=F",
+        "F  = TVF",
+        "[adaptive_dosing]\n  observe = central / (50.0 * F)\n  at = [24, 48]\n  \
+         start_dose = 100\n  route = bolus(cmt = 1)\n  dose_bounds = [0, 400]\n  \
+         when signal < 10 : increase 25%",
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[adaptive_dosing]:") && err.contains("remove the `f=F` mapping"),
+        "an observe signal that reads F double-applies it, got: {err}"
+    );
+}
+
+#[test]
+fn analytical_unmapped_f_named_parameter_is_not_a_double_use() {
+    // Scope floor for #1004. On the analytical engine the *name* is inert — only
+    // the `pk(...)` mapping binds a parameter to the dose route. A model with an
+    // ordinary parameter that happens to be called `F`, not mapped, is correct and
+    // must keep parsing (this is what ferxtranslate's nlmixr2 sources produce: a
+    // plain parameter whose name has dose-attribute shape).
+    let src = analytical_dose_attr_src("", "F  = TVF", "[scaling]\n  obs_scale = 50.0 * F");
+    assert!(
+        parse_full_model(&src).is_ok(),
+        "an unmapped `F` is an ordinary parameter on the analytical engine"
+    );
+
+    // And the mapped-but-unread case: `f=F` with a readout that does not mention
+    // `F` is the ordinary bioavailability model, which must stay silent.
+    let ok = analytical_dose_attr_src("f=F", "F  = TVF", "[scaling]\n  obs_scale = 50.0");
+    assert!(
+        parse_full_model(&ok).is_ok(),
+        "a mapped-but-unread F is the ordinary model"
+    );
+}
+
+#[test]
+fn analytical_dose_attr_mapped_to_another_parameter_only_rejects_that_one() {
+    // The mapping, not the name, is what the check follows: `f=FBIO` makes `FBIO`
+    // the dose attribute even though its name has no dose-attribute shape, while a
+    // separate parameter literally named `F` stays ordinary. Reading `F` is fine;
+    // reading `FBIO` is the double use.
+    let ok = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVF(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  F    = TVF
+  FBIO = TVF
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=FBIO)
+
+[scaling]
+  obs_scale = 50.0 * F
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    assert!(
+        parse_full_model(ok).is_ok(),
+        "the unmapped `F` is ordinary; only the mapped `FBIO` is the dose attribute"
+    );
+    let bad = ok.replace("obs_scale = 50.0 * F\n", "obs_scale = 50.0 * FBIO\n");
+    assert_ne!(bad, ok, "the bad variant must actually differ");
+    let err = expect_parse_err(&bad);
+    assert!(
+        err.contains("`FBIO`") && err.contains("remove the `f=FBIO` mapping"),
+        "reading the mapped `FBIO` is the double use, got: {err}"
+    );
+}
+
+#[test]
+fn transit_twin_with_reserved_f_name_still_builds() {
+    // Regression guard on the absorption ODE twin: any new parse error the twin can
+    // trip costs the model its fallback (and, before #1008, panicked at fit time), so
+    // the twin must keep re-parsing for the shapes the desugar accepts. The twin
+    // re-emits `[individual_parameters]` verbatim and, for an `f=` role whose
+    // parameter does not already self-route, appends an `f = <param>` alias — so
+    // `f` appears as a declaration but never as a read. Cover both: a parameter
+    // literally named `F` (self-routing, no alias) and one named `FBIO` (alias
+    // emitted).
+    for (fname, mapping) in [("F", "f=F"), ("FBIO", "f=FBIO")] {
+        let src = format!(
+            "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVN(3.0, 1.0, 20.0)
+  theta TVMTT(1.5, 0.01, 100.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT
+  {fname}   = inv_logit(THETA_F)
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=N, mtt=MTT, {mapping})
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+        );
+        let parsed = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("transit model with {mapping} must parse: {e}"));
+        // The twin is built during that parse (#1008). Assert it is *present*: a twin
+        // whose source fails to parse is now declined rather than panicking, so
+        // "didn't panic" alone would pass vacuously for a broken reconstruction.
+        let eq = parsed
+            .model
+            .absorption_ode_equivalent
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "transit model with {mapping} must keep its ODE twin; warnings: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        assert!(
+            eq.built().ode_spec.is_some(),
+            "the twin for {mapping} must be a working ODE model"
+        );
+    }
+}
+
 #[test]
 fn test_ode_multiple_dead_params_use_plural_message() {
     // #315: two+ dead ODE params share one warning and use the plural grammar
@@ -2002,6 +3431,26 @@ fn test_parse_inits_from_nca() {
 }
 
 #[test]
+fn test_parse_nn_regularization_lambdas() {
+    // Default: both off (0.0), a strict no-op for existing fits.
+    let d = FitOptions::default();
+    assert_eq!(d.nn_l2_lambda, 0.0);
+    assert_eq!(d.nn_smooth_lambda, 0.0);
+
+    // Settable from the [fit_options] block (same path as ferx_fit settings).
+    let opts =
+        parse_fit_options(&["nn_l2 = 1e-2".to_string(), "nn_smooth = 0.25".to_string()]).unwrap();
+    assert_eq!(opts.nn_l2_lambda, 1e-2);
+    assert_eq!(opts.nn_smooth_lambda, 0.25);
+
+    // Non-negativity guard: negative strengths are rejected.
+    assert!(parse_fit_options(&["nn_l2 = -1.0".to_string()]).is_err());
+    assert!(parse_fit_options(&["nn_smooth = -0.5".to_string()]).is_err());
+    // Non-numeric values are rejected.
+    assert!(parse_fit_options(&["nn_l2 = high".to_string()]).is_err());
+}
+
+#[test]
 fn test_parse_method_chain() {
     let opts = parse_fit_options(&["method = [saem, focei]".to_string()]).unwrap();
     assert_eq!(
@@ -2153,6 +3602,68 @@ fn test_apply_fit_option_known_applies() {
     assert_eq!(opts.saem_omega_burnin, 30);
 }
 
+/// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
+/// so the calibrated constant applies, and rejects anything outside `(0, 1]` —
+/// `1.0` is the documented "off" value and must stay accepted.
+#[test]
+fn test_mstep_damping_round_trips_and_validates() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_mstep_damping, None,
+        "unset must stay None so the MSTEP_SA_MAX_STEP default applies"
+    );
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_damping", "0.01"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(0.01));
+
+    // The `saem_`-prefixed spelling writes the same field.
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_damping", "0.5"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(0.5));
+
+    // 1.0 disables the damping and is in range.
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_damping", "1.0"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_damping, Some(1.0));
+
+    for bad in ["0", "-0.1", "1.5"] {
+        let err = apply_fit_option(&mut opts, "mstep_damping", bad)
+            .expect_err("out-of-range mstep_damping must be rejected");
+        assert!(err.contains("(0, 1]"), "got: {err}");
+        // The offending value is echoed, as the neighbouring range validators do.
+        assert!(err.contains(bad), "value not echoed, got: {err}");
+    }
+    // The error names the spelling the user actually wrote.
+    let err = apply_fit_option(&mut opts, "saem_mstep_damping", "-1")
+        .expect_err("out-of-range saem_mstep_damping must be rejected");
+    assert!(err.contains("`saem_mstep_damping`"), "got: {err}");
+    // A rejected value must not have clobbered the last good one.
+    assert_eq!(opts.saem_mstep_damping, Some(1.0));
+}
+
+/// The key is advertised as SAEM-specific, so using it under FOCEI warns rather
+/// than silently doing nothing.
+#[test]
+fn test_mstep_damping_under_focei_warns() {
+    let opts = parse_fit_options(&[
+        "method = focei".to_string(),
+        "mstep_damping = 0.01".to_string(),
+    ])
+    .unwrap();
+    let warnings = opts.unsupported_keys_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("mstep_damping")),
+        "got: {warnings:?}"
+    );
+}
+
 /// Conditional-distribution keys (#257) round-trip into FitOptions, both the
 /// bare and `saem_`-prefixed spellings of the master switch.
 #[test]
@@ -2251,8 +3762,14 @@ fn test_apply_fit_option_ode_solver_tolerances() {
 fn test_apply_fit_option_ode_method() {
     use crate::ode::OdeMethod;
     let mut opts = FitOptions::default();
-    // The engine default is the explicit stepper — an existing fit is unaffected.
+    // The engine default is the probe (#978): a model that names no stepper gets `auto`, which
+    // keeps the explicit method on everything that is not stability-limited.
+    assert_eq!(opts.ode_method, OdeMethod::Auto);
+
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "rk45"), Ok(true));
     assert_eq!(opts.ode_method, OdeMethod::Rk45);
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "auto"), Ok(true));
+    assert_eq!(opts.ode_method, OdeMethod::Auto);
 
     assert_eq!(
         apply_fit_option(&mut opts, "ode_method", "rodas5p"),
@@ -2279,6 +3796,122 @@ fn test_apply_fit_option_ode_method() {
         OdeMethod::Rodas4,
         "failed apply must not mutate"
     );
+}
+
+/// `ode_stiff_abort_after` (#708 / #1080 Part B): opt-in, disable-able without deleting the
+/// key, and framework-level so it is not reported as ignored.
+#[test]
+fn test_apply_fit_option_ode_stiff_abort_after() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.ode_stiff_abort_after, None, "must be opt-in");
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_stiff_abort_after", "25"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_stiff_abort_after, Some(25));
+
+    // `0` / `off` / `none` turn the budget back off, so a settings list can disable it
+    // without removing the key.
+    for off in ["0", "off", "none", "false"] {
+        opts.ode_stiff_abort_after = Some(25);
+        assert_eq!(
+            apply_fit_option(&mut opts, "ode_stiff_abort_after", off),
+            Ok(true)
+        );
+        assert_eq!(opts.ode_stiff_abort_after, None, "{off}");
+    }
+
+    assert!(apply_fit_option(&mut opts, "ode_stiff_abort_after", "x").is_err());
+}
+
+/// The budget reaches the integrator the same way the tolerances do — through
+/// `sync_ode_solver_opts` at parse time — so `predict()`, which gets no fit options, honours
+/// it too.
+#[test]
+fn test_ode_stiff_abort_after_reaches_ode_spec() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_stiff_abort_after = 40
+"#;
+    let p = parse_full_model(src).unwrap();
+    assert_eq!(
+        p.model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .solver_opts
+            .stiff_abort_after,
+        Some(40)
+    );
+    assert!(!p
+        .fit_options
+        .unsupported_keys_warnings()
+        .iter()
+        .any(|w| w.contains("ode_stiff_abort_after")));
+}
+
+/// `ode_auto_switch` (#1080 Part C): on by default, turn-off-able without deleting the key,
+/// framework-level, and carried onto the solver options the integrator actually reads.
+#[test]
+fn test_apply_fit_option_ode_auto_switch() {
+    let mut opts = FitOptions::default();
+    assert!(opts.ode_auto_switch, "mid-segment switching is the default");
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_auto_switch", "false"),
+        Ok(true)
+    );
+    assert!(!opts.ode_auto_switch);
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_auto_switch", "true"),
+        Ok(true)
+    );
+    assert!(opts.ode_auto_switch);
+    assert!(apply_fit_option(&mut opts, "ode_auto_switch", "sometimes").is_err());
+}
+
+#[test]
+fn test_ode_auto_switch_reaches_ode_spec() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_auto_switch = false
+"#;
+    let p = parse_full_model(src).unwrap();
+    assert!(!p.model.ode_spec.as_ref().unwrap().solver_opts.auto_switch);
+    assert!(!p
+        .fit_options
+        .unsupported_keys_warnings()
+        .iter()
+        .any(|w| w.contains("ode_auto_switch")));
 }
 
 #[test]
@@ -2312,7 +3945,7 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     assert_eq!(s.abstol, 1e-6);
     assert_eq!(s.max_steps, 10_000);
 
-    assert_eq!(s.method, crate::ode::OdeMethod::Rk45);
+    assert_eq!(s.method, crate::ode::OdeMethod::Auto);
 
     // Override via [fit_options].
     let with_opts = format!(
@@ -2802,12 +4435,21 @@ fn test_ode_solver_keys_do_not_warn() {
 #[test]
 fn test_cov_inner_tol_does_not_warn() {
     // `cov_inner_tol` decouples the covariance step's EBE-reconvergence tolerance
-    // from `inner_tol`. The covariance step is method-independent, so the key is
-    // framework-level. Regression: it had a working `apply_fit_option` arm and a
+    // from `inner_tol`. Regression: it had a working `apply_fit_option` arm and a
     // `fit-options.qmd` entry while appearing in *neither* advertised key list, so
     // `unsupported_keys_warnings` reported that a value it had just applied would
-    // be ignored — the same shape as the ODE-solver and checkpoint bugs above.
-    for method in ["focei", "foce", "laplace", "saem", "imp", "gn"] {
+    // be ignored. Every estimator that runs a covariance step advertises the key.
+    for method in [
+        "focei",
+        "foce",
+        "laplace",
+        "saem",
+        "imp",
+        "impmap",
+        "gn",
+        "gn_hybrid",
+        "vi",
+    ] {
         let opts = parse_fit_options(&[
             format!("method = {method}"),
             "cov_inner_tol = 1e-11".to_string(),
@@ -2824,6 +4466,20 @@ fn test_cov_inner_tol_does_not_warn() {
             opts.unsupported_keys_warnings()
         );
     }
+}
+
+#[test]
+fn test_cov_inner_tol_warns_for_bayes() {
+    // Bayes reports posterior credible intervals and explicitly disables the
+    // Hessian covariance step, so this covariance-only tolerance has no effect.
+    let opts = parse_fit_options(&[
+        "method = bayes".to_string(),
+        "cov_inner_tol = 1e-11".to_string(),
+    ])
+    .unwrap();
+    let warnings = opts.unsupported_keys_warnings();
+    assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+    assert!(warnings[0].contains("cov_inner_tol"), "got: {warnings:?}");
 }
 
 /// The reverse of [`every_advertised_fit_option_key_has_an_apply_fit_option_arm`].
@@ -2922,6 +4578,7 @@ fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
         EstimationMethod::Impmap,
         EstimationMethod::Bayes,
         EstimationMethod::Laplace,
+        EstimationMethod::Vi,
     ] {
         advertised.extend(method_specific_keys(m).iter().copied());
     }
@@ -2962,6 +4619,43 @@ fn test_checkpoint_keys_parse_and_do_not_warn() {
             opts.unsupported_keys_warnings()
         );
     }
+}
+
+#[test]
+fn test_nn_regularization_keys_do_not_warn_on_foce_family() {
+    // nn_l2 / nn_smooth are applied by every FOCE-family outer optimizer
+    // (foce, focei, laplace, gn, gn_hybrid — NLopt, built-in BFGS, trust-region
+    // and Gauss–Newton all add the penalty), so they must never be flagged "not
+    // used by method" there. Regression: they were parsed but listed in no
+    // `method_specific_keys` arm, so every regularized fit — including one from
+    // ferx-r's `settings = list(nn_l2 = ...)`, which routes through the same
+    // `apply_fit_option` — reported them as ignored.
+    for method in ["focei", "foce", "laplace", "gn", "gn_hybrid"] {
+        let opts = parse_fit_options(&[
+            format!("method = {method}"),
+            "nn_l2 = 1e-2".to_string(),
+            "nn_smooth = 1e-1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(opts.nn_l2_lambda, 1e-2);
+        assert_eq!(opts.nn_smooth_lambda, 1e-1);
+        assert!(
+            opts.unsupported_keys_warnings().is_empty(),
+            "method={method} spuriously warned on nn_l2/nn_smooth: {:?}",
+            opts.unsupported_keys_warnings()
+        );
+    }
+    // ...and they *are* flagged where nothing applies them, so a user asking
+    // for a regularized SAEM fit hears about it rather than getting an
+    // unregularized one silently.
+    let saem =
+        parse_fit_options(&["method = saem".to_string(), "nn_l2 = 1e-2".to_string()]).unwrap();
+    let w = saem.unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "saem must warn once on nn_l2: {w:?}");
+    assert!(
+        w[0].contains("`nn_l2` is not used by method `SAEM`"),
+        "{w:?}"
+    );
 }
 
 #[test]
@@ -3182,35 +4876,28 @@ fn test_parse_all_example_ferx_files() {
                 continue;
             }
         }
-        // Endpoint-only files (no [structural_model] block) — TTE `[event_model]` or the
-        // #760 `[binary_model]` — require the survival feature to parse (the endpoint
-        // block is unrecognized without it, so the parser demands the Gaussian PK blocks).
-        // Use a line-start check so a comment like "# Note: [structural_model] ..." in an
+        // A file declaring a feature-gated endpoint block — TTE `[event_model]` /
+        // `[binary_model]` (`survival`), or the CTMM `[markov_model]` (`markov`,
+        // which implies `survival`) — cannot parse in a build without that feature:
+        // since #1040 the parser rejects the block outright rather than reading the
+        // file as a Gaussian-only model. Skip those files here; the rejection itself
+        // is pinned by `test_feature_gated_block_rejected_without_its_feature`.
+        // Line-start checks so a comment like "# Note: [structural_model] ..." in an
         // example header does not falsely count as a block.
+        let block_at_line_start = |src: &str, block: &str| {
+            src.lines()
+                .any(|l| l.trim_start().starts_with(&format!("[{block}")))
+        };
         if !cfg!(feature = "survival") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            let has_nongaussian_endpoint =
-                src.contains("[event_model") || src.contains("[binary_model");
-            let has_struct_block = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[structural_model"));
-            if has_nongaussian_endpoint && !has_struct_block {
+            if block_at_line_start(&src, "event_model") || block_at_line_start(&src, "binary_model")
+            {
                 continue;
             }
         }
-        // A `[markov_model]` (CTMM) endpoint-only file needs the `markov` feature
-        // specifically (`markov` implies `survival`, so the `survival`-only build above
-        // does not cover it): without `markov` the block is unrecognized and the parser
-        // demands the Gaussian PK blocks. Skip such a file whenever `markov` is off.
         if !cfg!(feature = "markov") {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
-            let has_markov_endpoint = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[markov_model"));
-            let has_struct_block = src
-                .lines()
-                .any(|l| l.trim_start().starts_with("[structural_model"));
-            if has_markov_endpoint && !has_struct_block {
+            if block_at_line_start(&src, "markov_model") {
                 continue;
             }
         }
@@ -3370,6 +5057,103 @@ const MINIMAL_MODEL: &str = "\
 [error_model]
   DV ~ proportional(PROP_ERR)
 ";
+
+/// `MINIMAL_MODEL` with every `omega` declaration and every `exp(ETA_*)` term
+/// removed — a continuous (residual-error) endpoint with no random effects. This
+/// is the shape #989 unblocked; before it, `parse_full_model` returned
+/// `Err("No omega parameters defined")`.
+const NO_OMEGA_MODEL: &str = "\
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(1.0)
+  sigma PROP_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn test_parse_continuous_model_with_no_omega_declarations() {
+    let parsed = parse_full_model(NO_OMEGA_MODEL)
+        .expect("a continuous model with no random effects must parse (#989)");
+    assert_eq!(parsed.model.n_eta, 0);
+    assert_eq!(parsed.model.default_params.omega.matrix.nrows(), 0);
+    assert!(parsed.model.default_params.omega.eta_names.is_empty());
+    assert!(parsed.model.default_params.omega_fixed.is_empty());
+    // Only Ω went away — the residual error is untouched, and its sigma is still
+    // the thing that defines the likelihood.
+    assert_eq!(parsed.model.default_params.sigma.values.len(), 1);
+    // No IOV was declared, so the kappa matrix must stay absent rather than
+    // becoming a second empty matrix (`omega_iov.is_some()` reads as "IOV active").
+    assert!(parsed.model.default_params.omega_iov.is_none());
+}
+
+#[test]
+fn test_no_omega_model_still_requires_sigma() {
+    // Ω is optional; σ is not. The two capabilities are separate, and the error
+    // must say so — a user who deleted the wrong line needs to see which.
+    let no_sigma = NO_OMEGA_MODEL.replace("  sigma PROP_ERR ~ 0.1\n", "");
+    // `ParsedModel` is not `Debug`, so `expect_err` is unavailable here.
+    let err = match parse_full_model(&no_sigma) {
+        Ok(_) => panic!("a continuous endpoint with no sigma must still be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("sigma"),
+        "the sigma error must name sigma, not Omega: {err}"
+    );
+    assert!(
+        !err.contains("omega parameters"),
+        "must not report this as an Omega problem: {err}"
+    );
+}
+
+#[test]
+fn test_no_omega_model_with_error_model_removed_is_rejected() {
+    let no_error_model =
+        NO_OMEGA_MODEL.replace("[error_model]\n  DV ~ proportional(PROP_ERR)\n", "");
+    let err = match parse_full_model(&no_error_model) {
+        Ok(_) => panic!("a continuous model with no [error_model] must still be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.contains("[error_model]"), "{err}");
+}
+
+#[test]
+fn test_parse_no_bsv_omega_with_kappa_is_iov_only() {
+    // Kappas with no BSV etas: Ω is 0x0 while Ω_IOV is 1x1. This combination was
+    // also blocked by the old rejection (it keys on the BSV eta list), so it needs
+    // its own pin — the IOV matrix must not be collapsed along with Ω.
+    let src = "\
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(1.0)
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(KAPPA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+    let parsed = parse_full_model(src).expect("kappa without BSV omega must parse (#989)");
+    assert_eq!(parsed.model.n_eta, 0);
+    assert_eq!(parsed.model.default_params.omega.matrix.nrows(), 0);
+    let iov = parsed
+        .model
+        .default_params
+        .omega_iov
+        .as_ref()
+        .expect("declaring a kappa must still build an IOV matrix");
+    assert_eq!(iov.matrix.nrows(), 1);
+    assert!((iov.matrix[(0, 0)] - 0.01).abs() < 1e-12);
+}
 
 #[test]
 fn test_data_block_populates_parsed_model_data_path() {
@@ -3652,7 +5436,8 @@ fn test_parse_diagonal_omega() {
         "omega ETA_CL ~ 0.07".to_string(),
         "omega ETA_V  ~ 0.02".to_string(),
     ];
-    let (_, omegas, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, block_omegas, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 2);
     assert_eq!(block_omegas.len(), 0);
     assert_eq!(omegas[0].name, "ETA_CL");
@@ -3662,7 +5447,8 @@ fn test_parse_diagonal_omega() {
 #[test]
 fn test_parse_block_omega() {
     let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string()];
-    let (_, omegas, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, block_omegas, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 0);
     assert_eq!(block_omegas.len(), 1);
     assert_eq!(block_omegas[0].names, vec!["ETA_CL", "ETA_V"]);
@@ -3679,7 +5465,8 @@ fn test_parse_block_omega_multiline() {
         "0.02, 0.04".to_string(),
         "]".to_string(),
     ];
-    let (_, omegas, block_omegas, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, block_omegas, _, _, eta_names, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 0);
     assert_eq!(block_omegas.len(), 1);
     assert_eq!(block_omegas[0].names, vec!["ETA_CL", "ETA_V"]);
@@ -3695,7 +5482,8 @@ fn test_parse_block_omega_multiline_fix() {
         "block_omega (ETA_CL, ETA_V) = [0.09,".to_string(),
         "0.02, 0.04] FIX".to_string(),
     ];
-    let (_, _, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, block_omegas, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas.len(), 1);
     assert!(block_omegas[0].fixed);
 }
@@ -3710,7 +5498,8 @@ fn test_parse_block_omega_multiline_fix_own_line() {
         "]".to_string(),
         "FIX".to_string(),
     ];
-    let (_, _, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, block_omegas, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas.len(), 1);
     assert!(block_omegas[0].fixed);
 }
@@ -3722,7 +5511,8 @@ fn test_parse_block_kappa_multiline() {
         "0.05, 0.01, 0.03".to_string(),
         "]".to_string(),
     ];
-    let (_, _, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, kappas, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(kappas.block.len(), 1);
     assert_eq!(kappas.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
     assert_eq!(kappas.block[0].lower_triangle, vec![0.05, 0.01, 0.03]);
@@ -3738,7 +5528,8 @@ fn test_parse_block_kappa_multiline_fix_own_line() {
         "]".to_string(),
         "FIX".to_string(),
     ];
-    let (_, _, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, kappas, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(kappas.block.len(), 1);
     assert!(kappas.block[0].fixed);
 }
@@ -3748,7 +5539,8 @@ fn test_parse_block_omega_3x3() {
     let lines = vec![
         "block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.01, 0.04, 0.005, 0.002, 0.16]".to_string(),
     ];
-    let (_, _, block_omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, block_omegas, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas[0].names.len(), 3);
     assert_eq!(block_omegas[0].lower_triangle.len(), 6); // 3*(3+1)/2
 }
@@ -3758,7 +5550,7 @@ fn test_parse_block_omega_wrong_count() {
     let lines = vec![
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.02]".to_string(), // needs 3, got 2
     ];
-    let result = parse_parameters(&lines);
+    let result = parse_parameters(&lines, &Default::default());
     assert!(result.is_err());
 }
 
@@ -3768,7 +5560,8 @@ fn test_parse_mixed_diagonal_and_block() {
         "omega ETA_KA ~ 0.40".to_string(),
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
     ];
-    let (_, omegas, block_omegas, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, block_omegas, _, _, eta_names, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 1);
     assert_eq!(block_omegas.len(), 1);
     // Declaration order preserved: ETA_KA first, then block (ETA_CL, ETA_V)
@@ -3781,9 +5574,33 @@ fn test_declaration_order_block_before_diagonal() {
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
         "omega ETA_KA ~ 0.40".to_string(),
     ];
-    let (_, _, _, _, _, eta_names, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, eta_names, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     // block_omega declared first, so ETA_CL, ETA_V come before ETA_KA
     assert_eq!(eta_names, vec!["ETA_CL", "ETA_V", "ETA_KA"]);
+}
+
+/// #989: an empty eta list is a fixed-effects-only (naive-pooled) model, not an
+/// error. This used to return `Err("No omega parameters defined")`, which is what
+/// blocked a continuous model from omitting its `omega` declarations.
+#[test]
+fn test_build_omega_matrix_empty_is_naive_pooled_not_an_error() {
+    let omega = build_omega_matrix(&[], &[], &[])
+        .expect("an empty eta list must yield a 0x0 Omega, not an error");
+    assert_eq!(omega.matrix.nrows(), 0);
+    assert_eq!(omega.matrix.ncols(), 0);
+    assert!(omega.eta_names.is_empty());
+    // The 0x0 matrix must take the diagonal packing path: `omega_packed_len(0, ..)`
+    // is 0 either way, but the flag is what `parameterization.rs` branches on.
+    assert!(omega.diagonal);
+    // `log|Ω| = 0` is what makes the FOCE/FOCEI objective collapse to plain ML —
+    // the marginal loses its `½log|Ω|` penalty rather than picking up a NaN.
+    assert_eq!(omega.log_det, 0.0);
+    assert_eq!(
+        crate::estimation::parameterization::omega_packed_len(0, false),
+        0,
+        "a 0x0 Omega must contribute no packed optimizer coordinates"
+    );
 }
 
 #[test]
@@ -3854,7 +5671,8 @@ fn test_build_omega_matrix_mixed() {
 #[test]
 fn test_parse_theta_fix_without_bounds() {
     let lines = vec!["theta TVCL(0.1, FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
     assert!((thetas[0].init - 0.1).abs() < 1e-12);
@@ -3863,7 +5681,8 @@ fn test_parse_theta_fix_without_bounds() {
 #[test]
 fn test_parse_theta_fix_with_bounds() {
     let lines = vec!["theta TVCL(0.1, 0.01, 1.0, FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(thetas[0].fixed);
     assert!((thetas[0].lower - 0.01).abs() < 1e-12);
     assert!((thetas[0].upper - 1.0).abs() < 1e-12);
@@ -3873,7 +5692,8 @@ fn test_parse_theta_fix_with_bounds() {
 fn test_parse_theta_fix_no_comma_inside_parens() {
     // theta NAME(init FIX) — no comma before FIX
     let lines = vec!["theta TVCL(0.75 FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
     assert!((thetas[0].init - 0.75).abs() < 1e-12);
@@ -3883,7 +5703,8 @@ fn test_parse_theta_fix_no_comma_inside_parens() {
 fn test_parse_theta_fix_after_paren() {
     // theta NAME(init) FIX — FIX outside closing paren
     let lines = vec!["theta TVCL(0.75) FIX".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
     assert!((thetas[0].init - 0.75).abs() < 1e-12);
@@ -3893,7 +5714,8 @@ fn test_parse_theta_fix_after_paren() {
 fn test_parse_theta_fix_after_paren_with_bounds() {
     // theta NAME(init, lower, upper) FIX — bounds + FIX outside paren
     let lines = vec!["theta TVKA(1.0, 0.01, 10.0) FIX".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
     assert!((thetas[0].init - 1.0).abs() < 1e-12);
@@ -3905,7 +5727,8 @@ fn test_parse_theta_fix_after_paren_with_bounds() {
 fn test_parse_theta_lower_bound_only() {
     // theta NAME(init, lower) — upper defaults to 1e9
     let lines = vec!["theta TVCL(1.0, 0.01)".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(!thetas[0].fixed);
     assert!((thetas[0].init - 1.0).abs() < 1e-12);
@@ -3917,7 +5740,8 @@ fn test_parse_theta_lower_bound_only() {
 fn test_parse_theta_lower_bound_fix_inside() {
     // theta NAME(init, lower, FIX) — lower only + FIX inside parens
     let lines = vec!["theta TVCL(1.0, 0.01, FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
     assert!((thetas[0].lower - 0.01).abs() < 1e-12);
@@ -3928,7 +5752,8 @@ fn test_parse_theta_lower_bound_fix_inside() {
 fn test_parse_theta_lower_bound_fix_outside() {
     // theta NAME(init, lower) FIX — lower only + FIX after paren
     let lines = vec!["theta TVCL(1.0, 0.01) FIX".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
     assert!((thetas[0].lower - 0.01).abs() < 1e-12);
@@ -3938,7 +5763,8 @@ fn test_parse_theta_lower_bound_fix_outside() {
 #[test]
 fn test_parse_theta_unfixed_by_default() {
     let lines = vec!["theta TVCL(0.1, 0.01, 1.0)".to_string()];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!thetas[0].fixed);
 }
 
@@ -3952,7 +5778,8 @@ fn test_parse_theta_allows_space_before_paren() {
         "theta TVV  ( 10 )".to_string(),
         "theta TVKA\t(0.5, FIX)".to_string(),
     ];
-    let (thetas, _, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, _, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 3);
     assert_eq!(thetas[0].name, "TVCL");
     assert!((thetas[0].init - 5.0).abs() < 1e-12);
@@ -3968,7 +5795,8 @@ fn test_parse_theta_allows_space_before_paren() {
 #[test]
 fn test_parse_omega_fix() {
     let lines = vec!["omega ETA_CL ~ 0.09 FIX".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(omegas[0].fixed);
 }
 
@@ -3978,7 +5806,8 @@ fn test_omega_unfixed_no_annotation() {
     // group-numbering shift (annotation moved 3→4) didn't regress the
     // common case.
     let lines = vec!["omega ETA_CL ~ 0.09".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!omegas[0].fixed);
     assert!(!omegas[0].init_as_sd);
     assert!((omegas[0].variance - 0.09).abs() < 1e-12);
@@ -3989,7 +5818,8 @@ fn test_omega_double_fix_is_harmless() {
     // `FIX (sd) FIX` — both FIX groups fire; result must still be fixed
     // with SD squaring applied.
     let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd) FIX".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
     assert!(omegas[0].fixed);
@@ -3999,14 +5829,16 @@ fn test_omega_double_fix_is_harmless() {
 #[test]
 fn test_parse_sigma_fix() {
     let lines = vec!["sigma PROP ~ 0.05 FIX".to_string()];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas[0].fixed);
 }
 
 #[test]
 fn test_parse_block_sigma_builds_sigmas_and_correlation() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0]".to_string()];
-    let (_, _, _, sigmas, block_sigmas, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(sigmas.len(), 2);
     assert_eq!(sigmas[0].name, "PROP");
     assert_eq!(sigmas[1].name, "ADD");
@@ -4014,26 +5846,35 @@ fn test_parse_block_sigma_builds_sigmas_and_correlation() {
     assert!((sigmas[1].value - 1.0).abs() < 1e-12);
 
     let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
-    let corrs = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
+    let (corrs, fixed) = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
     assert_eq!(corrs.len(), 1);
     assert_eq!(corrs[0].sigma_i, 1);
     assert_eq!(corrs[0].sigma_j, 0);
     assert!((corrs[0].rho - 0.5).abs() < 1e-12);
+    // #847: a bare `block_sigma` estimates its off-diagonal.
+    assert_eq!(fixed, vec![false]);
 }
 
 #[test]
 fn test_parse_block_sigma_fix_marks_sigmas_fixed() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
-    let (_, _, _, sigmas, block_sigmas, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas.iter().all(|s| s.fixed));
-    assert!(block_sigmas[0].fixed);
+
+    // #847: `FIX` pins the off-diagonal too, which is what distinguishes it from
+    // a bare `block_sigma` (that one estimates ρ, NONMEM `$SIGMA BLOCK(n)`).
+    let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
+    let (corrs, fixed) = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
+    assert_eq!(corrs.len(), 1);
+    assert_eq!(fixed, vec![true]);
 }
 
 #[test]
 fn test_parse_block_sigma_wrong_triangle_count_errs() {
     // (PROP, ADD) needs 3 lower-triangle values; only 2 supplied.
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 1.0]".to_string()];
-    let Err(err) = parse_parameters(&lines) else {
+    let Err(err) = parse_parameters(&lines, &Default::default()) else {
         panic!("expected an error for a short lower triangle");
     };
     assert!(err.contains("lower-triangle"), "got: {err}");
@@ -4042,7 +5883,7 @@ fn test_parse_block_sigma_wrong_triangle_count_errs() {
 #[test]
 fn test_parse_block_sigma_negative_variance_errs() {
     let lines = vec!["block_sigma (PROP, ADD) = [-0.04, 0.10, 1.0]".to_string()];
-    let Err(err) = parse_parameters(&lines) else {
+    let Err(err) = parse_parameters(&lines, &Default::default()) else {
         panic!("expected an error for a negative variance");
     };
     assert!(err.contains("negative initial variance"), "got: {err}");
@@ -4051,7 +5892,7 @@ fn test_parse_block_sigma_negative_variance_errs() {
 #[test]
 fn test_parse_block_sigma_non_finite_covariance_errs() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, inf, 1.0]".to_string()];
-    let Err(err) = parse_parameters(&lines) else {
+    let Err(err) = parse_parameters(&lines, &Default::default()) else {
         panic!("expected an error for a non-finite covariance");
     };
     assert!(err.contains("non-finite"), "got: {err}");
@@ -4063,7 +5904,7 @@ fn test_build_residual_correlations_zero_diagonal_errs() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.0, 0.1, 1.0],
-        fixed: true,
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -4076,11 +5917,28 @@ fn test_build_residual_correlations_invalid_rho_errs() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.04, 0.10, 0.04],
-        fixed: true,
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
     assert!(err.contains("invalid correlation"), "got: {err}");
+}
+
+#[test]
+fn test_build_residual_correlations_unit_rho_errs() {
+    // cov 0.04 with both variances 0.04 implies rho = 1 exactly, which makes
+    // the residual covariance matrix singular: reject it at parse time rather
+    // than let it surface as a NaN/Inf OFV mid-fit.
+    for cov in [0.04_f64, -0.04_f64] {
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, cov, 0.04],
+            fixed: false,
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("|rho| < 1"), "got: {err}");
+    }
 }
 
 #[test]
@@ -4089,7 +5947,7 @@ fn test_build_residual_correlations_unknown_name_errs() {
     let block = BlockSigmaSpec {
         names: vec!["X".to_string(), "Y".to_string()],
         lower_triangle: vec![1.0, 0.5, 1.0],
-        fixed: true,
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -4097,22 +5955,43 @@ fn test_build_residual_correlations_unknown_name_errs() {
 }
 
 #[test]
-fn test_build_residual_correlations_zero_covariance_omitted() {
-    // A zero off-diagonal entry carries no correlation, so no entry is built.
+fn test_build_residual_correlations_zero_covariance_kept_when_estimated() {
+    // #847: a zero off-diagonal on a non-`FIX` block still declares an estimated
+    // correlation. `$SIGMA BLOCK(2)` with a zero covariance init is a routine
+    // NONMEM starting point; dropping it would silently fit a diagonal residual
+    // with no coordinate to move and no diagnostic.
+    let block = BlockSigmaSpec {
+        names: vec!["A".to_string(), "B".to_string()],
+        lower_triangle: vec![0.04, 0.0, 1.0],
+        fixed: false,
+    };
+    let names = vec!["A".to_string(), "B".to_string()];
+    let (corrs, fixed) = build_residual_correlations(&[block], &names).unwrap();
+    assert_eq!(corrs.len(), 1);
+    assert_eq!(corrs[0].rho, 0.0);
+    assert_eq!(fixed, vec![false]);
+}
+
+#[test]
+fn test_build_residual_correlations_zero_covariance_omitted_when_fixed() {
+    // A `FIX`ed zero correlation is the same object as no correlation, so it
+    // still carries nothing — and costs no packed coordinate.
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.04, 0.0, 1.0],
         fixed: true,
     };
     let names = vec!["A".to_string(), "B".to_string()];
-    let corrs = build_residual_correlations(&[block], &names).unwrap();
+    let (corrs, fixed) = build_residual_correlations(&[block], &names).unwrap();
     assert!(corrs.is_empty());
+    assert!(fixed.is_empty());
 }
 
 #[test]
 fn test_parse_block_omega_fix() {
     let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX".to_string()];
-    let (_, _, blocks, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, blocks, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(blocks[0].fixed);
 }
 
@@ -4123,7 +6002,8 @@ fn test_fix_keyword_case_insensitive() {
         "omega ETA ~ 0.05 Fix".to_string(),
         "sigma S ~ 0.02 FIX".to_string(),
     ];
-    let (thetas, omegas, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (thetas, omegas, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(thetas[0].fixed);
     assert!(omegas[0].fixed);
     assert!(sigmas[0].fixed);
@@ -4135,7 +6015,8 @@ fn test_fix_keyword_case_insensitive() {
 fn test_omega_default_is_variance() {
     // No annotation: value is stored verbatim as variance.
     let lines = vec!["omega ETA_CL ~ 0.07".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
     assert!(!omegas[0].init_as_sd);
 }
@@ -4144,7 +6025,8 @@ fn test_omega_default_is_variance() {
 fn test_omega_sd_annotation_squares_value() {
     // `(sd)` → variance is the square of the raw value.
     let lines = vec!["omega ETA_CL ~ 0.265 (sd)".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.265 * 0.265;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
     assert!(omegas[0].init_as_sd);
@@ -4157,7 +6039,8 @@ fn test_omega_variance_annotation_is_noop() {
         "omega ETA_CL ~ 0.07 (variance)".to_string(),
         "omega ETA_V  ~ 0.04 (var)".to_string(),
     ];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
     assert!(!omegas[0].init_as_sd);
     assert!((omegas[1].variance - 0.04).abs() < 1e-12);
@@ -4168,7 +6051,8 @@ fn test_omega_variance_annotation_is_noop() {
 fn test_omega_sd_annotation_with_fix() {
     // `(sd) FIX` — both annotations must be honored together.
     let lines = vec!["omega ETA_CL ~ 0.30 (sd) FIX".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
     assert!(omegas[0].fixed);
@@ -4179,7 +6063,8 @@ fn test_omega_sd_annotation_with_fix() {
 fn test_omega_fix_before_sd_annotation() {
     // `FIX (sd)` — FIX before the scale annotation.
     let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd)".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
     assert!(omegas[0].fixed);
@@ -4190,7 +6075,8 @@ fn test_omega_fix_before_sd_annotation() {
 fn test_omega_fix_before_annotation_no_sd() {
     // `FIX` before a no-op annotation — fixed and variance-scale.
     let lines = vec!["omega ETA_CL ~ 0.09 FIX (variance)".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.09).abs() < 1e-12);
     assert!(omegas[0].fixed);
     assert!(!omegas[0].init_as_sd);
@@ -4200,7 +6086,8 @@ fn test_omega_fix_before_annotation_no_sd() {
 fn test_sigma_fix_before_sd_annotation() {
     // `FIX (sd)` — FIX before the scale annotation for sigma.
     let lines = vec!["sigma PROP ~ 0.30 FIX (sd)".to_string()];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas[0].fixed);
     assert!(sigmas[0].init_as_sd);
     assert!((sigmas[0].value - 0.30).abs() < 1e-12);
@@ -4210,7 +6097,8 @@ fn test_sigma_fix_before_sd_annotation() {
 fn test_sigma_fix_after_sd_annotation() {
     // `(sd) FIX` — existing form still works.
     let lines = vec!["sigma PROP ~ 0.30 (sd) FIX".to_string()];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas[0].fixed);
     assert!(sigmas[0].init_as_sd);
 }
@@ -4220,7 +6108,8 @@ fn test_sigma_unfixed_no_annotation() {
     // Baseline: plain sigma with no FIX and no annotation — confirms the
     // group-numbering shift didn't regress the common case.
     let lines = vec!["sigma PROP ~ 0.04".to_string()];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!sigmas[0].fixed);
     assert!(!sigmas[0].init_as_sd);
     // Stored as SD internally: sqrt(0.04) = 0.2
@@ -4232,7 +6121,8 @@ fn test_sigma_default_is_variance() {
     // Since #56, the default sigma input is variance — the parser sqrt's
     // it into the internal SD representation that the likelihood uses.
     let lines = vec!["sigma PROP ~ 0.04".to_string()];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     // Stored value is SD = sqrt(variance) = sqrt(0.04) = 0.2.
     assert!((sigmas[0].value - 0.2).abs() < 1e-12);
     assert!(!sigmas[0].init_as_sd);
@@ -4242,7 +6132,8 @@ fn test_sigma_default_is_variance() {
 fn test_sigma_sd_annotation_stores_value_as_is() {
     // `(sd)` → the value is already on the SD scale, no transform.
     let lines = vec!["sigma PROP ~ 0.2 (sd)".to_string()];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!((sigmas[0].value - 0.2).abs() < 1e-12);
     assert!(sigmas[0].init_as_sd);
 }
@@ -4255,7 +6146,8 @@ fn test_sigma_default_and_sd_equivalent_initial_value() {
         "sigma A ~ 0.0004".to_string(),    // variance 0.0004
         "sigma B ~ 0.02 (sd)".to_string(), // SD 0.02
     ];
-    let (_, _, _, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!((sigmas[0].value - sigmas[1].value).abs() < 1e-12);
 }
 
@@ -4265,7 +6157,7 @@ fn test_sigma_negative_variance_rejected() {
     // sqrt would yield NaN and silently corrupt the fit. Reject up-front
     // with a clear error.
     let lines = vec!["sigma PROP ~ -0.1".to_string()];
-    let res = parse_parameters(&lines);
+    let res = parse_parameters(&lines, &Default::default());
     match res {
         Err(msg) => assert!(msg.contains("negative initial variance"), "got: {msg}"),
         Ok(_) => panic!("expected error for negative sigma variance"),
@@ -4279,7 +6171,7 @@ fn test_sigma_negative_sd_rejected() {
     // bad input rather than surface it. Reject at parse time, symmetric
     // with the negative-variance case.
     let lines = vec!["sigma PROP ~ -0.5 (sd)".to_string()];
-    let res = parse_parameters(&lines);
+    let res = parse_parameters(&lines, &Default::default());
     match res {
         Err(msg) => assert!(msg.contains("negative initial SD"), "got: {msg}"),
         Ok(_) => panic!("expected error for negative sigma SD"),
@@ -4295,7 +6187,7 @@ fn test_omega_negative_value_rejected() {
         "kappa KAPPA_CL ~ -0.03",
         "kappa KAPPA_CL ~ -0.1 (sd)",
     ] {
-        let res = parse_parameters(&[line.to_string()]);
+        let res = parse_parameters(&[line.to_string()], &Default::default());
         assert!(res.is_err(), "expected negative `{line}` to be rejected");
     }
 }
@@ -4303,7 +6195,8 @@ fn test_omega_negative_value_rejected() {
 #[test]
 fn test_kappa_sd_annotation_squares_value() {
     let lines = vec!["kappa KAPPA_CL ~ 0.25 (sd)".to_string()];
-    let (_, _, _, _, _, _, kappas) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, kappas, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     let k = &kappas.diagonal[0];
     let expected = 0.25 * 0.25;
     assert!((k.variance - expected).abs() < 1e-12);
@@ -4318,7 +6211,8 @@ fn test_sd_annotation_case_insensitive() {
         "omega ETA_B ~ 0.2 (Sd)".to_string(),
         "omega ETA_C ~ 0.3 (sd)".to_string(),
     ];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert!(omegas.iter().all(|o| o.init_as_sd));
 }
 
@@ -4333,7 +6227,8 @@ fn test_unknown_scale_tag_is_ignored_as_trailing_garbage() {
     // behavior; anything else is silently ignored, consistent with the
     // parser's existing FIXED-vs-FIX handling.)
     let lines = vec!["omega ETA_CL ~ 0.07 (foo)".to_string()];
-    let (_, omegas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 1);
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
     assert!(!omegas[0].init_as_sd);
@@ -4388,7 +6283,8 @@ fn test_fix_keyword_rejects_prefix_match() {
         "sigma PROP ~ 0.02 FIXED".to_string(),
         "block_omega (A, B) = [1.0, 0.0, 1.0] FIXED".to_string(),
     ];
-    let (_, omegas, blocks, sigmas, _, _, _) = parse_parameters(&lines).unwrap();
+    let (_, omegas, blocks, sigmas, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     // omega/sigma still parse (trailing `FIXED` is ignored) but must NOT
     // be marked fixed.
     assert!(!omegas[0].fixed);
@@ -4474,8 +6370,8 @@ fn test_ruv_magnitude_time_varying_prop_parses() {
     let theta = vec![0.2, 10.0, 1.5];
     let cov = std::collections::HashMap::new();
     // Before 24 h the multiplier is 1; after, it is RUV_LATE.
-    let m_early = rm.eval_obs(&theta, &cov, 10.0);
-    let m_late = rm.eval_obs(&theta, &cov, 30.0);
+    let m_early = rm.eval_obs(&theta, &cov, 10.0, 10.0);
+    let m_late = rm.eval_obs(&theta, &cov, 30.0, 30.0);
     assert!((m_early[0] - 1.0).abs() < 1e-12);
     assert!((m_early[1] - 1.0).abs() < 1e-12);
     assert!((m_late[0] - 1.5).abs() < 1e-12);
@@ -4665,7 +6561,7 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
     let theta = vec![0.2, 10.0, 1.5];
     let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
     let grad = deriv
-        .theta_grad(&theta, &cov_zero, 10.0)
+        .theta_grad(&theta, &cov_zero, 10.0, 10.0)
         .expect("theta_grad supported");
     assert!(
         grad.iter().all(|g| g.is_finite()),
@@ -4692,10 +6588,10 @@ fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
         BinOp::Mul,
         Box::new(Expression::Covariate("TIME".to_string())),
     );
-    let deriv = compile_ruv_mag_deriv_program(&expr, "UNUSED_SIGMA", 1);
+    let deriv = compile_ruv_mag_deriv_program(&expr, Some("UNUSED_SIGMA"), 1);
     let empty_cov = std::collections::HashMap::new();
     let grad = deriv
-        .theta_grad(&[2.0], &empty_cov, 10.0)
+        .theta_grad(&[2.0], &empty_cov, 10.0, 10.0)
         .expect("theta_grad supported");
     // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
     approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
@@ -4772,9 +6668,12 @@ fn test_ruv_magnitude_rejects_covariate_without_covariates_block() {
 
 #[test]
 fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
-    // Single-endpoint error models use the leading sigma slots
-    // positionally; with block_sigma present, reject a name order that
-    // would silently bind the proportional/additive components backwards.
+    // Single-endpoint error models use the leading sigma slots positionally, so
+    // a name order that would bind the proportional/additive components
+    // backwards is rejected. `block_sigma` declares its entries into the same
+    // flat sigma vector, so it reaches the same rule as plain `sigma` lines —
+    // this was the one case the order was enforced in before #1001 generalised
+    // it to every single-endpoint model.
     let content = r#"
 [parameters]
   theta TVCL(0.2)
@@ -4790,8 +6689,224 @@ fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
   DV ~ combined(PROP_ERR, ADD_ERR)
 "#;
     let err = expect_parse_err(content);
+    // Pin the argument index, not just a name: `PROP_ERR` appears in the
+    // argument-1 message (`named`) *and* in the argument-2 message (`slot`), so
+    // asserting the name alone would still pass if the enumerate loop reported
+    // the wrong argument.
     assert!(
-        err.contains("block_sigma") && err.contains("sigma order"),
+        err.contains("consumed positionally")
+            && err.contains("argument 1 names sigma 'PROP_ERR'")
+            && err.contains("supplies 'ADD_ERR'"),
+        "got: {err}"
+    );
+    // The block_sigma-specific half of the remedy: reordering the names without
+    // permuting the lower triangle parses clean and silently swaps the two
+    // variances, so the message must say so.
+    assert!(err.contains("lower triangle"), "got: {err}");
+}
+
+// ── #1001: single-endpoint sigma names must match declaration order ──────────
+//
+// A single-endpoint `[error_model]` consumes its sigmas positionally from the
+// `[parameters]` declaration order, so the names written in the arguments are
+// only meaningful if they *are* that order. Before #1001 those names were
+// validated (the sigma had to exist) and then discarded, so a model naming them
+// in any other order fitted silently against different sigmas than it reads as
+// describing. These pin the parse-time rejection that replaced the silence.
+
+/// A one-compartment analytical model with the given `[parameters]` sigma
+/// declarations and `[error_model]` statement.
+fn sigma_order_model(sigma_decls: &str, error_stmt: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{sigma_decls}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  {error_stmt}
+"
+    )
+}
+
+#[test]
+fn single_error_model_wrong_sigma_name_errs() {
+    // The #1001 reproducer, in the shape a parse test can hold: before the fix
+    // `proportional(S_SMALL)` bound `S_BIG` because `S_BIG` was declared first.
+    // The objective that misbinding cost is measured — on the anchor dataset,
+    // against NONMEM — in `tests/sigma_order_nonmem_anchor.rs` (103.828964 vs
+    // −6.838931, a 110.67-unit span); this test only pins the rejection, so it
+    // deliberately quotes no number of its own.
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma S_SMALL ~ 0.05 (sd)",
+        "DV ~ proportional(S_SMALL)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("S_SMALL") && err.contains("S_BIG"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_declaration_order_match_parses() {
+    // The control for the test above: the same file with the declarations in
+    // the order the `[error_model]` names them is accepted unchanged.
+    let content = sigma_order_model(
+        "  sigma S_SMALL ~ 0.05 (sd)\n  sigma S_BIG ~ 2.0 (sd)",
+        "DV ~ proportional(S_SMALL)",
+    );
+    parse_full_model(&content).expect("declaration order matches the argument order");
+}
+
+#[test]
+fn single_error_model_combined_transposed_args_err() {
+    // `combined(prop, add)` is positional in both directions: transposing the
+    // two arguments used to be a no-op that silently swapped which sigma played
+    // the proportional role.
+    let content = sigma_order_model(
+        "  sigma ADD_ERR ~ 1.0 (sd)\n  sigma PROP_ERR ~ 0.04 (sd)",
+        "DV ~ combined(PROP_ERR, ADD_ERR)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("PROP_ERR"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_repeated_sigma_arg_errs() {
+    // `combined(S_A, S_A)` parsed and then bound slot 1 to whatever was
+    // declared second — here `S_B`, which the model never names.
+    //
+    // Reported as a repeat, *not* as an order mismatch: duplicate `sigma`
+    // declarations are rejected upstream, so no permutation of `[S_A, S_B]`
+    // puts `S_A` in both slots and transposing two identical arguments is a
+    // no-op. Telling the user to reorder here — and handing a consumer the
+    // reorder-shaped `E_SIGMA_ORDER_MISMATCH` — would prescribe a fix that
+    // cannot work, which is exactly what the count arm below avoids for the
+    // one-sigma spelling of the same defect.
+    let content = sigma_order_model(
+        "  sigma S_A ~ 0.05 (sd)\n  sigma S_B ~ 1.0 (sd)",
+        "DV ~ combined(S_A, S_A)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("argument 2 names sigma 'S_A'")
+            && err.contains("argument 1 already claims")
+            && !err.contains("consumed positionally")
+            && !err.contains("Reorder"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_repeated_sigma_arg_without_a_second_sigma_errs() {
+    // The same repetition with only one sigma declared reaches the same arm and
+    // reports the same defect — one message, one code, for both spellings — and
+    // still carries the counts, which are the actionable part here: there is no
+    // second sigma to name yet.
+    let content = sigma_order_model("  sigma S_A ~ 0.05 (sd)", "DV ~ combined(S_A, S_A)");
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("argument 1 already claims")
+            && err.contains("needs 2, [parameters] declares 1")
+            && !err.contains("consumed positionally"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_trailing_unused_sigma_parses() {
+    // A sigma declared *after* the ones the error model names occupies a slot the
+    // error model never loads, so the order rule does not reach it. It still earns
+    // the pre-existing "not referenced in [error_model]" warning.
+    let content = sigma_order_model(
+        "  sigma PROP_ERR ~ 0.04 (sd)\n  sigma EPSCOV ~ 1.0 (sd)",
+        "DV ~ proportional(PROP_ERR)",
+    );
+    let parsed = parse_full_model(&content).expect("a trailing unused sigma is not an order error");
+    assert!(
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("EPSCOV") && w.contains("not referenced")),
+        "got: {:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+#[test]
+fn single_error_model_frem_shape_parses() {
+    // The real FREM shape, which the test above only approximates: `prepare_frem`
+    // (`src/frem/mod.rs`) copies the base model's sigmas in order and then appends
+    // `sigma EPSCOV`, wiring it up through `[fit_options] frem_sigma` rather than
+    // `[error_model]`. This pins that the *spelling* survives the #1001 order
+    // rule — a trailing sigma consumed by a `[fit_options]` key rather than by
+    // `[error_model]` is still accepted.
+    //
+    // It does NOT pin `generate_frem_model`'s emission order, because it
+    // hand-writes the text rather than generating it. The end-to-end pin is
+    // `frem::tests::test_generate_frem_model_preserves_scaling_block`
+    // (`src/frem/mod.rs`), which runs `generate_frem_model` on a base model with
+    // `sigma PROP_ERR` + `DV ~ proportional(PROP_ERR)` and parses the result: if
+    // EPSCOV were ever emitted before the copied base sigmas, that test — not
+    // this one — is what fails.
+    let content = r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+  sigma EPSCOV ~ 1e-6 FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  frem_sigma = EPSCOV
+";
+    parse_full_model(content).expect("a generated FREM model keeps its trailing covariate sigma");
+}
+
+#[test]
+fn single_error_model_magnitude_expression_respects_declaration_order() {
+    // #484 magnitude expressions inherit the positional binding: the multiplier
+    // is stored per argument slot and applied to that slot's sigma, so an
+    // expression scaling `S_SMALL` in argument 1 was applied to `S_BIG`.
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma S_SMALL ~ 0.05 (sd)",
+        "DV ~ proportional(S_SMALL * 2.0)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("S_SMALL"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_ltbs_respects_declaration_order() {
+    // The LTBS spelling reaches the same `ParsedErrorModel::Single`, so it must
+    // be held to the same rule rather than slipping past on its own regex.
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma ADD_LOG ~ 0.1 (sd)",
+        "log(DV) ~ additive(ADD_LOG)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("ADD_LOG"),
         "got: {err}"
     );
 }
@@ -5586,7 +7701,7 @@ fn test_apply_fit_option_fd_hessian_step_negative_rejected() {
 #[test]
 fn test_parse_kappa_keyword() {
     let lines = vec!["kappa KAPPA_CL ~ 0.01".to_string()];
-    let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(ki.diagonal.len(), 1);
     assert_eq!(ki.diagonal[0].name, "KAPPA_CL");
     assert!((ki.diagonal[0].variance - 0.01).abs() < 1e-12);
@@ -5596,7 +7711,7 @@ fn test_parse_kappa_keyword() {
 #[test]
 fn test_parse_kappa_fix() {
     let lines = vec!["kappa KAPPA_V ~ 0.05 FIX".to_string()];
-    let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert!(ki.diagonal[0].fixed);
 }
 
@@ -5605,7 +7720,7 @@ fn test_kappa_unfixed_no_annotation() {
     // Baseline: plain kappa with no FIX and no annotation — confirms the
     // group-numbering shift didn't regress the common case.
     let lines = vec!["kappa KAPPA_V ~ 0.05".to_string()];
-    let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!ki.diagonal[0].fixed);
     assert!(!ki.diagonal[0].init_as_sd);
     assert!((ki.diagonal[0].variance - 0.05).abs() < 1e-12);
@@ -5615,7 +7730,7 @@ fn test_kappa_unfixed_no_annotation() {
 fn test_kappa_fix_before_sd_annotation() {
     // `FIX (sd)` — FIX before the scale annotation for kappa.
     let lines = vec!["kappa KAPPA_V ~ 0.30 FIX (sd)".to_string()];
-    let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((ki.diagonal[0].variance - expected).abs() < 1e-12);
     assert!(ki.diagonal[0].fixed);
@@ -5630,7 +7745,8 @@ fn test_kappa_appended_after_bsv_etas() {
         "omega ETA_CL ~ 0.09".to_string(),
         "kappa KAPPA_CL ~ 0.01".to_string(),
     ];
-    let (_, _, _, _, _, bsv_etas, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, bsv_etas, ki, _, _, _) =
+        parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(bsv_etas, vec!["ETA_CL"]);
     assert_eq!(ki.diagonal.len(), 1);
     assert_eq!(ki.diagonal[0].name, "KAPPA_CL");
@@ -5760,7 +7876,7 @@ fn test_iov_occasion_parsed_from_fit_options_block() {
 #[test]
 fn test_parse_block_kappa_syntax() {
     let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005]".to_string()];
-    let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(ki.diagonal.len(), 0);
     assert_eq!(ki.block.len(), 1);
     assert_eq!(ki.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
@@ -5772,7 +7888,7 @@ fn test_parse_block_kappa_syntax() {
 #[test]
 fn test_parse_block_kappa_fix() {
     let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005] FIX".to_string()];
-    let (_, _, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert!(ki.block[0].fixed);
 }
 
@@ -5780,7 +7896,7 @@ fn test_parse_block_kappa_fix() {
 fn test_parse_block_kappa_wrong_count_errors() {
     // 2 names → need 3 values, only 2 given
     let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002]".to_string()];
-    assert!(parse_parameters(&lines).is_err());
+    assert!(parse_parameters(&lines, &Default::default()).is_err());
 }
 
 #[test]
@@ -5789,7 +7905,7 @@ fn test_parse_block_kappa_name_overlap_errors() {
         "kappa KAPPA_CL ~ 0.01".to_string(),
         "block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005]".to_string(),
     ];
-    assert!(parse_parameters(&lines).is_err());
+    assert!(parse_parameters(&lines, &Default::default()).is_err());
 }
 
 #[test]
@@ -6413,7 +8529,7 @@ fn test_duplicate_diffeq_in_different_branches_allowed() {
         "}".into(),
     ];
     let state_names = vec!["central".to_string()];
-    let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]);
+    let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[], &[]);
     assert!(
         result.is_ok(),
         "same state in different branches must be allowed"
@@ -6435,6 +8551,7 @@ fn test_ode_rhs_undefined_name_errors() {
         Some("central"),
         &["CL".to_string()],
         &[0],
+        &[],
     );
     let err = match result {
         Err(e) => e,
@@ -6473,6 +8590,7 @@ fn test_ode_rhs_undefined_name_walks_all_nodes() {
         Some("central"),
         &["CL".to_string()],
         &[0],
+        &[],
     );
     let err = match result {
         Err(e) => e,
@@ -6501,6 +8619,7 @@ fn test_ode_rhs_defined_names_ok() {
         Some("central"),
         &["CL".to_string(), "V".to_string()],
         &[0, 1],
+        &[],
     );
     assert!(
         result.is_ok(),
@@ -6516,7 +8635,7 @@ fn test_ode_rhs_macheps_resolves_to_epsilon() {
     // silently read 0.0.
     let ode_lines: Vec<String> = vec!["d/dt(central) = MACHEPS".into()];
     let state_names = vec!["central".to_string()];
-    let spec = match build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]) {
+    let spec = match build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[], &[]) {
         Ok(s) => s,
         Err(e) => panic!("MACHEPS in an ODE RHS must parse, got: {e}"),
     };
@@ -6536,7 +8655,7 @@ fn test_ode_reserved_builtin_name_collision_errors() {
     // builtin name — `MACHEPS` is now reserved alongside TIME/TAFD/TAD.
     let ode_lines: Vec<String> = vec!["d/dt(MACHEPS) = -MACHEPS".into()];
     let state_names = vec!["MACHEPS".to_string()];
-    let result = build_ode_spec(&ode_lines, &state_names, Some("MACHEPS"), &[], &[]);
+    let result = build_ode_spec(&ode_lines, &state_names, Some("MACHEPS"), &[], &[], &[]);
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("a state named MACHEPS must collide with the reserved builtin"),
@@ -7259,10 +9378,12 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -7328,10 +9449,12 @@ fn test_selected_error_obs_keys_dispatch() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -8521,6 +10644,200 @@ fn test_init_macheps_is_case_insensitive() {
 }
 
 #[test]
+fn test_init_time_builtin_rejected() {
+    // #994: a bare `TIME` parses to `Expression::Time`, not to a `Variable`, so
+    // the undefined-name check could not see it and it was silently accepted —
+    // while `TAFD`/`TAD`, its siblings in the same reserved list, were rejected.
+    // Model time at an initial condition is 0 by definition, so the reference
+    // could only ever flatten the expression (`init = TIME * X` → 0).
+    for rhs in ["TIME", "TIME + 50", "time * KIN", "2 * (TIME + KIN)"] {
+        let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("init(response)")
+                && err.contains("time built-in(s): TIME")
+                && err.contains("evaluated at the time origin"),
+            "error should name init(response) and the TIME built-in, got: {err}"
+        );
+        assert!(
+            err.contains("#994"),
+            "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_time_clocks_rejected_in_every_casing() {
+    // Every clock, every spelling, one diagnostic (#994). Before this, the four
+    // names split three ways on representation alone: `TIME`/`time` were
+    // accepted (an `Expression::Time` node the undefined-name walker cannot
+    // see), `Time` was reported as a plain undefined name, and `T`/`TAFD`/`TAD`
+    // were reported as undefined names. The casing asymmetry was the tell that
+    // none of it was a scope decision.
+    //
+    // The assertion is on the *clock* diagnostic specifically, not merely on
+    // "some error": the node guard feeds the same message as the undefined-name
+    // split, so a regression that reported one as the other would otherwise
+    // pass unnoticed.
+    for base in ODE_INIT_REJECTED_BUILTINS {
+        for rhs in [
+            base.to_string(),
+            base.to_lowercase(),
+            // `Tafd` / `Time` / `T` — mixed case, the spelling that used to be
+            // handled differently from the other two.
+            base[..1].to_string() + &base[1..].to_lowercase(),
+        ] {
+            let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+            let err = parse_full_model(&src)
+                .err()
+                .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+            assert!(
+                err.contains("init(response)") && err.contains("time built-in(s)"),
+                "`{rhs}` should get the clock diagnostic, not a bare undefined-name \
+                 error, got: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_init_reports_clock_and_undefined_name_together() {
+    // One parse, both problems (#994 review): an init RHS can carry a clock and
+    // an undefined name at once, and reporting them one per parse costs the user
+    // two round-trips for a single line.
+    let src = turnover_ode_model("  init(response) = TIME + BASE");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("`init(response) = TIME + BASE` must be rejected");
+    assert!(
+        err.contains("time built-in(s): TIME"),
+        "error should name the clock, got: {err}"
+    );
+    assert!(
+        err.contains("undefined name(s): BASE"),
+        "error should name the undefined BASE in the same message, got: {err}"
+    );
+}
+
+#[test]
+fn test_init_undefined_name_message_lists_the_real_scope() {
+    // The diagnostic is the only place the init scope rule is written down
+    // (#994), so it must name every accepted built-in — including `MIXNUM`,
+    // which is in scope and was absent from the message — and say that the time
+    // built-ins are not.
+    let src = turnover_ode_model("  init(response) = BASE");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("undefined name must be rejected");
+    for builtin in ODE_INIT_SCOPE_BUILTINS {
+        assert!(
+            err.contains(builtin),
+            "message should list the accepted built-in {builtin}, got: {err}"
+        );
+    }
+    for rejected in ODE_INIT_REJECTED_BUILTINS {
+        assert!(
+            err.contains(rejected),
+            "message should list the out-of-scope built-in {rejected}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_mixnum_accepted_in_mixture_model() {
+    // The other payload-free built-in node, `Expression::MixNum`, is invisible to
+    // the undefined-name check for the same structural reason `TIME` was — but
+    // unlike `TIME` it does real work at init: it resolves to the subject's class
+    // and discriminates the classes. It stays in scope (#994 comment); the class-1
+    // default gives 100 here.
+    let src = r"
+[parameters]
+  theta TVKIN(10.0, 0.001, 100.0)
+  theta TVKOUT(2.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_KIN ~ 0.09
+  sigma ADD ~ 0.1
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  KIN  = TVKIN * exp(ETA_KIN)
+  KOUT = TVKOUT
+
+[structural_model]
+  ode(obs_cmt=response, states=[response])
+
+[odes]
+  init(response) = MIXNUM * 100
+  d/dt(response) = KIN - KOUT * response
+
+[error_model]
+  DV ~ additive(ADD)
+";
+    let parsed = parse_full_model(src).expect("MIXNUM is in scope in an init expression");
+    let ode = parsed.model.ode_spec.as_ref().expect("ODE spec");
+    assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![100.0]);
+}
+
+#[test]
+fn test_analytical_init_time_builtin_rejected() {
+    // #994: the `[initial_conditions]` surface took the same leak. The baseline
+    // amount is evaluated once per subject at t = 0, so `TIME` reads the
+    // model-time thread-local's 0.0 and the reference contributes nothing.
+    for rhs in ["TIME", "TIME + 50", "time * V"] {
+        let src = analytical_oral_with_init(&format!(
+            "
+[initial_conditions]
+  init(central) = {rhs}
+"
+        ));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(central) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("[initial_conditions] init") && err.contains("`TIME` built-in"),
+            "error should name the block and the TIME built-in, got: {err}"
+        );
+        assert!(
+            err.contains("#994"),
+            "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_analytical_init_clock_names_are_ordinary_covariates() {
+    // The `[odes]`-only built-ins are ordinary covariates everywhere else — the
+    // same deliberate rule `[scaling]` follows so a dataset that really carries a
+    // `TAD` column can use it (#1028, `ODE_ONLY_BUILTINS` in `api::validation`).
+    // `[initial_conditions]` is "everywhere else", so only `TIME` is rejected
+    // there; `T`/`TAFD`/`TAD`/`MACHEPS` parse as covariate leaves and become
+    // required data columns. Pinned because `ODE_INIT_REJECTED_BUILTINS` is
+    // public and a consumer mirroring it on an analytical model would otherwise
+    // reject a legal reference (#994 review).
+    for name in ["T", "TAFD", "TAD", "MACHEPS"] {
+        let src = analytical_oral_with_init(&format!(
+            "
+[initial_conditions]
+  init(central) = {name} * 10
+"
+        ));
+        let model = parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("`init(central) = {name} * 10` must parse: {e}"));
+        assert_eq!(model.analytical_init.len(), 1);
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "`{name}` must be registered as a required data column, got: {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+#[test]
 fn test_diffusion_block_parsed_into_theta() {
     let src = minimal_ode_model_with_diffusion("  central ~ 0.05");
     let parsed = parse_full_model(&src).unwrap();
@@ -8755,14 +11072,16 @@ fn test_covariate_nn_block_without_nn_feature_errors() {
 }
 
 /// Sanity for the named-block parser extension itself (independent of the
-/// NN feature). `[block_type NAME]` should be recognised and parsed.
+/// NN feature). `[block_type NAME]` should be recognised and parsed. Uses a
+/// registry block (`covariate_nn`, which is named-only) rather than an invented
+/// name — since #1040 `extract_blocks` rejects unknown block names.
 #[test]
 fn test_extract_blocks_recognizes_named_block_form() {
     let src = "
 [parameters]
   theta T1(1.0, 0.001, 10.0)
 
-[some_named_block FOO]
+[covariate_nn FOO]
   key = value
 ";
     let extracted = extract_blocks(src).unwrap();
@@ -8771,11 +11090,233 @@ fn test_extract_blocks_recognizes_named_block_form() {
     // Named block captured by type + instance.
     let by_inst = extracted
         .named
-        .get("some_named_block")
+        .get("covariate_nn")
         .expect("named block extracted");
     let lines = by_inst.get("FOO").expect("instance FOO present");
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0], "key = value");
+}
+
+// ─── Closed-world `[block]` names (#1040) ────────────────────────────────────
+
+/// A minimal but complete model, with `{extra}` spliced in after the required
+/// blocks so a test can add one offending header.
+fn model_with_extra_block(extra: &str) -> String {
+    format!(
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+{extra}"
+    )
+}
+
+/// The headline regression: a misspelled optional block used to be dropped on
+/// the floor — `[fit_option]` left the fit running with the default method and
+/// no covariance step while `ferx check` still said `valid: true`.
+#[test]
+fn test_unknown_block_name_is_rejected_with_line_and_valid_set() {
+    let src = model_with_extra_block("[fit_option]\n  method = focei\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(
+        err.starts_with("Unknown block `[fit_option]` (line 16)"),
+        "message should name the block and its header line, got: {err}"
+    );
+    assert!(
+        err.contains("did you mean `[fit_options]`"),
+        "near miss should be suggested, got: {err}"
+    );
+    // The valid set is enumerated, in the `[event_model]: unknown key ...` style.
+    // Assert on names present in every build — the enumeration is filtered by
+    // the features this binary carries (see `known_block_names`).
+    assert!(err.contains("Valid blocks: adaptive_dosing, "), "{err}");
+    assert!(err.contains("fit_options, "), "{err}");
+    assert!(err.contains("structural_model."), "{err}");
+}
+
+/// Every offender is reported in one pass, so a batch of typos does not turn
+/// into a fix-one-reparse loop.
+#[test]
+fn test_unknown_block_names_are_all_reported_together() {
+    let src = model_with_extra_block("[scalings]\n  V = 1.0\n\n[outputs]\n  CL\n");
+    let err = parse_model_string(&src).expect_err("unknown blocks must be an error");
+    assert!(err.contains("`[scalings]`"), "{err}");
+    assert!(err.contains("`[outputs]`"), "{err}");
+    assert!(err.contains("did you mean `[scaling]`"), "{err}");
+    assert!(err.contains("did you mean `[output]`"), "{err}");
+}
+
+/// An invented name with no near miss still errors — just without a hint.
+#[test]
+fn test_unknown_block_without_near_match_has_no_suggestion() {
+    let src = model_with_extra_block("[qqqqqqqq]\n  key = value\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[qqqqqqqq]`"), "{err}");
+    assert!(!err.contains("did you mean"), "{err}");
+}
+
+/// A repeated unknown header is reported once, not once per occurrence.
+#[test]
+fn test_unknown_block_reported_once_per_name() {
+    let src =
+        model_with_extra_block("[fit_option]\n  method = focei\n\n[fit_option]\n  maxiter = 5\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert_eq!(err.matches("`[fit_option]`").count(), 1, "{err}");
+}
+
+/// Block names are case-folded before the lookup, as they always have been —
+/// `[FIT_OPTIONS]` is valid, not unknown.
+#[test]
+fn test_uppercase_block_name_is_not_unknown() {
+    let src = model_with_extra_block("[FIT_OPTIONS]\n  maxiter = 5\n");
+    assert!(parse_model_string(&src).is_ok());
+}
+
+/// An instance name on a block that takes none is the same silent drop by
+/// another route: it lands in the `named` map that nothing reads.
+#[test]
+fn test_instance_name_on_unnamed_only_block_is_rejected() {
+    let src = model_with_extra_block("[fit_options DOSE]\n  maxiter = 5\n");
+    let err = parse_model_string(&src).expect_err("instance name must be an error");
+    assert!(
+        err.contains("`[fit_options DOSE]` (line 16) does not take an instance name"),
+        "{err}"
+    );
+    assert!(err.contains("write `[fit_options]`"), "{err}");
+}
+
+/// The mirror case: `[covariate_nn]` is read only out of the named map, so an
+/// unnamed one was silently ignored.
+#[test]
+fn test_named_only_block_without_instance_name_is_rejected() {
+    let src = model_with_extra_block("[covariate_nn]\n  inputs = [WT]\n");
+    let err = parse_model_string(&src).expect_err("missing instance name must be an error");
+    assert!(
+        err.contains("`[covariate_nn]` (line 16) requires an instance name"),
+        "{err}"
+    );
+    assert!(err.contains("write `[covariate_nn NAME]`"), "{err}");
+}
+
+/// A block whose cargo feature is off is *known* but unusable — reject it
+/// rather than parse the file as if the endpoint were not there.
+#[cfg(not(feature = "survival"))]
+#[test]
+fn test_feature_gated_block_rejected_without_its_feature() {
+    let src = model_with_extra_block("[event_model]\n  family = exponential\n");
+    let err = parse_model_string(&src).expect_err("feature-gated block must be an error");
+    assert!(
+        err.contains(
+            "`[event_model]` (line 16) requires building ferx-core with `--features survival`"
+        ),
+        "{err}"
+    );
+}
+
+/// With the feature on, the same file parses — the gate is the only reason the
+/// block is refused above.
+#[cfg(feature = "survival")]
+#[test]
+fn test_feature_gated_block_accepted_with_its_feature() {
+    let src = model_with_extra_block(
+        "[event_model]\n  cmt = 2\n  family = exponential\n  scale = TVCL\n",
+    );
+    assert!(parse_model_string(&src).is_ok());
+}
+
+#[test]
+fn test_nearest_block_name_thresholds() {
+    // Prefix relationship, either direction.
+    assert_eq!(nearest_block_name("fit_option"), Some("fit_options"));
+    assert_eq!(nearest_block_name("parameters_pk"), Some("parameters"));
+    // Within edit distance 2.
+    assert_eq!(nearest_block_name("odez"), Some("odes"));
+    // Far enough away that a suggestion would be noise.
+    assert_eq!(nearest_block_name("qqqqqqqq"), None);
+}
+
+/// The registry is what the rest of the parser looks up, so nothing may be in
+/// one and not the other. `known_block_names` is also the list `ferx-r` and
+/// `ferxtranslate` are meant to read instead of keeping their own copy.
+#[test]
+fn test_known_block_names_are_sorted_and_unique() {
+    let names = known_block_names();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names, sorted, "BLOCK_REGISTRY must be sorted and unique");
+    assert!(names.contains(&"fit_options"));
+    // Deprecated names are not valid, so they must never be advertised.
+    assert!(!names.contains(&"initial_values"));
+}
+
+/// The advertised list is what *this* binary accepts. A build without a
+/// feature must not name the blocks it would then refuse — a consumer told to
+/// source the list from the engine (`ferx-r`) would otherwise call
+/// `[markov_model]` valid against a core that rejects it.
+#[test]
+fn test_known_block_names_track_the_build_features() {
+    let names = known_block_names();
+    assert_eq!(
+        names.contains(&"event_model"),
+        cfg!(feature = "survival"),
+        "event_model must be advertised iff `survival` is on"
+    );
+    assert_eq!(
+        names.contains(&"markov_model"),
+        cfg!(feature = "markov"),
+        "markov_model must be advertised iff `markov` is on"
+    );
+    // Ungated blocks are there whatever the build.
+    assert!(names.contains(&"parameters") && names.contains(&"odes"));
+    // A registry entry naming a feature this function does not know can only be
+    // a typo in the table; treat it as enabled so the mistake never rejects a
+    // valid model.
+    assert!(block_feature_enabled("not-a-real-feature"));
+}
+
+/// A block that *was* ferx syntax gets its own code and remediation rather
+/// than a bare "unknown block": `initial_values` predates inline inits, the
+/// parser stopped reading it silently, and `nearest_block_name` finds nothing
+/// close enough to suggest (`initial_conditions` is far past edit distance 2),
+/// so the generic path would leave the user with no explanation at all.
+#[test]
+fn test_deprecated_block_is_rejected_with_its_remediation() {
+    assert_eq!(nearest_block_name("initial_values"), None);
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
+    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    assert!(
+        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
+        "{err}"
+    );
+    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
+    assert!(err.contains("delete it"), "{err}");
+    // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
+    assert!(!err.contains("Valid blocks"), "{err}");
+}
+
+/// An unknown header written with an instance name is echoed as written, so
+/// the message can be grepped for in the user's own file — and two instances
+/// of the same unknown type are two findings, not one entry that names only
+/// the first.
+#[test]
+fn test_unknown_named_block_reports_its_instance_name() {
+    let src = model_with_extra_block("[foo BAR]\n  k = 1\n\n[foo BAZ]\n  k = 2\n");
+    let err = parse_model_string(&src).expect_err("unknown block must be an error");
+    assert!(err.contains("`[foo BAR]` (line 16)"), "{err}");
+    assert!(err.contains("`[foo BAZ]` (line 19)"), "{err}");
 }
 
 // ─── [covariate_nn] dot-access + pk_param_fn dispatch (Phase A M1 step 3) ────
@@ -9430,12 +11971,809 @@ fn test_parse_scaling_y_and_obs_scale_mix_rejected_on_analytical() {
 
 #[test]
 fn test_parse_scaling_unknown_key_errors() {
+    // Since #1030 any key other than `obs_scale`/`y` is a *named intermediate*, so
+    // the old blanket "unknown key" rejection is gone. The protection it provided —
+    // catching a misspelt `obs_scale`, which would otherwise silently disable
+    // scaling — is re-established from the other side: an intermediate no entry
+    // reads is rejected, and the error names both readings.
     let src = analytical_model_with_scaling(Some("  foo = 1000\n"));
-    let err = parse_model_string(&src).expect_err("unknown scaling key must be rejected");
+    let err = parse_model_string(&src).expect_err("an unread scaling key must be rejected");
+    assert!(
+        err.contains("foo") && err.contains("never used") && err.contains("misspelled"),
+        "expected unused-intermediate error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_parse_scaling_unknown_key_with_cmt_subscript_errors() {
+    // `[CMT=N]` belongs to `obs_scale`/`y` only — an intermediate takes no
+    // subscript, so this stays an unknown-key error rather than becoming a
+    // legal-but-unread binding (#1030).
+    let src = analytical_model_with_scaling(Some("  foo[CMT=1] = 1000\n"));
+    let err = parse_model_string(&src).expect_err("subscripted unknown key must be rejected");
     assert!(
         err.contains("unknown key") && err.contains("foo"),
         "expected unknown-key error, got: {}",
         err
+    );
+}
+
+// ── [scaling] named intermediates (#1030) ───────────────────────────────────
+
+/// The headline case: a readout written with named intermediates must compile to
+/// the *same* function as the hand-expanded one-liner it replaces. That is the
+/// whole contract — intermediates are inlined into the AST, so nothing downstream
+/// can tell the two apart.
+#[test]
+fn test_scaling_intermediates_match_hand_expanded_readout() {
+    let with_names = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some(
+            "  ACR20    = central / V\n\
+             \x20 ACR20SAT = max(ACR20, 0.01)\n\
+             \x20 y        = log(ACR20SAT / (1 - ACR20SAT))\n",
+        ),
+    );
+    // What the block had to say before #1030: the same sub-expression four times,
+    // guarded with the inline conditional that `max` desugars to.
+    let hand = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some(
+            "  y = log((if (central / V > 0.01) central / V else 0.01) \
+             / (1 - (if (central / V > 0.01) central / V else 0.01)))\n",
+        ),
+    );
+
+    let readout = |src: &str| -> crate::ode::OdeOutputFn {
+        let model = parse_model_string(src).expect("model parses");
+        let ode = model.ode_spec.expect("ODE spec present");
+        match ode.readout {
+            crate::ode::OdeReadout::Single(f) => f,
+            _ => panic!("Form C must set OdeReadout::Single"),
+        }
+    };
+    let f_named = readout(&with_names);
+    let f_hand = readout(&hand);
+
+    let cov = HashMap::new();
+    let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+    pk[0] = 1.0; // CL
+    pk[1] = 50.0; // V
+    pk[2] = 1.0; // KA
+                 // Above the clamp, below it, and far above — `max` uses `>=` where the hand
+                 // form uses `>`, so the two agree everywhere except exactly at the bound.
+    for central in [0.0, 0.05, 20.0, 100.0] {
+        let state = vec![0.0, central];
+        let a = f_named(&state, &pk, &[], &[], &cov);
+        let b = f_hand(&state, &pk, &[], &[], &cov);
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "named-intermediate readout must equal the hand-expanded one at \
+             central={central} (named={a}, hand={b})"
+        );
+    }
+}
+
+/// `min(a, b)` / `max(a, b)` compose into the published `[0.01, 0.99]` clamp, and
+/// the clamp actually bites on both sides.
+#[test]
+fn test_scaling_intermediates_two_sided_clamp() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some(
+            "  RAW = central / V\n\
+             \x20 SAT = min(max(RAW, 0.01), 0.99)\n\
+             \x20 y   = SAT\n",
+        ),
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    let ode = model.ode_spec.expect("ODE spec present");
+    let f = match ode.readout {
+        crate::ode::OdeReadout::Single(f) => f,
+        _ => panic!("Form C must set OdeReadout::Single"),
+    };
+    let cov = HashMap::new();
+    let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+    pk[1] = 100.0; // V — so y = central / 100
+    for (central, want) in [(0.0, 0.01), (5.0, 0.05), (500.0, 0.99)] {
+        let y = f(&vec![0.0, central], &pk, &[], &[], &cov);
+        assert!(
+            (y - want).abs() < 1e-12,
+            "central={central} → expected {want}, got {y}"
+        );
+    }
+}
+
+/// A covariate reachable only through an intermediate is still a required data
+/// column — intermediates participate in the #1028 "defined" set, as the issue
+/// asked, because they are inlined before the covariate scan runs.
+#[test]
+fn test_scaling_intermediate_covariate_is_registered() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  W = sqrt(NARM)\n  y = central / V * W\n"),
+    );
+    let model = parse_model_string(&src).expect("model parses");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "NARM"),
+        "a covariate reached through an intermediate must be a required column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Intermediates work on the `obs_scale` (Form B) half of the block too.
+#[test]
+fn test_scaling_intermediate_in_obs_scale() {
+    let src = analytical_model_with_scaling(Some("  K = MW * 1000\n  obs_scale = K\n"));
+    let model = parse_model_string(&src).expect("model parses");
+    assert!(
+        matches!(
+            model.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        ),
+        "obs_scale built from an intermediate must be a Form B expression scale"
+    );
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "MW"),
+        "obs_scale covariate reached through an intermediate must be registered, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Order is the same rule `[individual_parameters]` already enforces: define
+/// above, use below. That makes a reference cycle unrepresentable rather than a
+/// recursion guard to get right.
+#[test]
+fn test_scaling_intermediate_forward_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  A = B * 2\n  B = 3\n  y = A\n"));
+    let err = parse_model_string(&src).expect_err("forward reference must be rejected");
+    assert!(
+        err.contains("declared on or below"),
+        "expected forward-reference error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_scaling_intermediate_self_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  A = A + 1\n  y = A\n"));
+    let err = parse_model_string(&src).expect_err("self reference must be rejected");
+    assert!(
+        err.contains("declared on or below"),
+        "expected self-reference error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_scaling_intermediate_duplicate_rejected() {
+    let src = analytical_model_with_scaling(Some("  A = 2\n  A = 3\n  y = A\n"));
+    let err = parse_model_string(&src).expect_err("duplicate intermediate must be rejected");
+    assert!(
+        err.contains("duplicate named intermediate"),
+        "expected duplicate error, got: {}",
+        err
+    );
+}
+
+/// A binding named after something already in scope would never be read — the
+/// expression parser binds θ / η / individual parameters / states first — so it is
+/// rejected rather than left silently dead.
+#[test]
+fn test_scaling_intermediate_shadowing_rejected() {
+    for (name, what) in [
+        ("V", "an individual parameter"),
+        ("TVCL", "a theta"),
+        ("ETA_CL", "an eta"),
+    ] {
+        let src = analytical_model_with_scaling(Some(&format!("  {name} = 2\n  y = {name}\n")));
+        let err = parse_model_string(&src)
+            .expect_err("a name already in scope must be rejected as an intermediate");
+        assert!(
+            err.contains(what) && err.contains(name),
+            "expected shadowing error naming {what}, got: {}",
+            err
+        );
+    }
+}
+
+/// The three pre-scans that run *before* `parse_scaling_block` — the #486 direct-θ/η
+/// desugaring and the #650 readout slot allocator — must see through intermediates
+/// too, or a readout that was analytic when written inline would silently drop to
+/// finite-difference sensitivities once it was named.
+#[test]
+fn test_scaling_intermediate_keeps_the_analytic_readout_path() {
+    let model_src = |scaling: &str| {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVBMAX(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BMAX = TVBMAX
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+{scaling}
+"#
+        )
+    };
+    // A non-structural individual parameter (`BMAX`) reached only through an
+    // intermediate still earns a differentiable PK slot; and a bare theta inside an
+    // intermediate is still desugared into a synthetic readout parameter.
+    for scaling in [
+        "  C   = central / V\n  SIG = BMAX * C\n  y   = SIG\n",
+        "  G = TVCL * 2\n  y = central / V + G\n",
+    ] {
+        let model = parse_model_string(&model_src(scaling)).expect("model parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("finite-difference")),
+            "readout `{scaling}` must stay on the analytic path, warnings: {:?}",
+            model.parse_warnings
+        );
+    }
+}
+
+/// `obs_scale` is a subject-static divisor, so a `TIME` reference in it is
+/// rejected (#1028). Routing that reference through an intermediate must not
+/// launder it — the inlining happens before the check.
+#[test]
+fn test_scaling_intermediate_cannot_smuggle_time_into_obs_scale() {
+    let src = analytical_model_with_scaling(Some("  K = 1 + TIME\n  obs_scale = K\n"));
+    let err = parse_model_string(&src).expect_err("TIME in obs_scale must be rejected");
+    assert!(
+        err.contains("subject-static divisor"),
+        "expected the obs_scale TIME rejection, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_scaling_intermediate_reserved_name_rejected() {
+    let src = analytical_model_with_scaling(Some("  TIME = 2\n  y = TIME\n"));
+    let err = parse_model_string(&src).expect_err("`TIME` must be rejected as an intermediate");
+    assert!(
+        err.contains("model-time built-in"),
+        "expected reserved-name error, got: {}",
+        err
+    );
+}
+
+/// `TAD` / `TAFD` / `MACHEPS` are supplied by the evaluator, so a binding under one
+/// of those names is either dead or a silent override. Rejected like `TIME`.
+#[test]
+fn test_scaling_intermediate_eval_builtin_name_rejected() {
+    for name in ["TAD", "TAFD", "MACHEPS"] {
+        let src =
+            analytical_model_with_scaling(Some(&format!("  {name} = 2\n  obs_scale = {name}\n")));
+        let err = parse_model_string(&src)
+            .expect_err("an eval-time built-in must be rejected as an intermediate");
+        assert!(
+            err.contains("eval-time built-in") && err.contains(name),
+            "expected built-in shadowing error for {name}, got: {}",
+            err
+        );
+    }
+}
+
+/// A declared covariate clashes the *other* way round from a θ/η/state: an
+/// unresolved `[scaling]` identifier parses as `Covariate(name)`, which the
+/// substituter does rewrite — so an intermediate named after a data column would
+/// silently shadow it and drop it from the required-column set. Rejected too.
+#[test]
+fn test_scaling_intermediate_covariate_shadowing_rejected() {
+    let src = "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[covariates]
+  WT continuous
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+  WT = 70
+  obs_scale = WT
+";
+    let err = parse_model_string(src)
+        .expect_err("an intermediate named after a declared covariate must be rejected");
+    assert!(
+        err.contains("a declared covariate") && err.contains("WT"),
+        "expected covariate shadowing error, got: {}",
+        err
+    );
+}
+
+/// Define-above-use-below is enforced on both sides: an *entry* may not read an
+/// intermediate declared below it either, even though the substitution itself is
+/// order-independent.
+#[test]
+fn test_scaling_entry_forward_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = FOO * 2\n  FOO = 3\n"));
+    let err = parse_model_string(&src)
+        .expect_err("an entry reading an intermediate declared below it must be rejected");
+    assert!(
+        err.contains("declared on or below this line") && err.contains("FOO"),
+        "expected entry forward-reference error, got: {}",
+        err
+    );
+}
+
+/// The dead-binding guard scans tokens while the substitution walks the AST, so the
+/// two must agree on what counts as a *read*. An identifier followed by `(` parses
+/// as a function call, never a `Variable`/`Covariate` leaf — so the intermediate is
+/// not inlined, and must be reported rather than silently vanishing.
+#[test]
+fn test_scaling_intermediate_in_unreachable_position_is_reported() {
+    let src = analytical_model_with_scaling(Some("  FOO = 2\n  obs_scale = FOO(V)\n"));
+    let err = parse_model_string(&src)
+        .expect_err("an intermediate the substituter cannot reach must be reported unused");
+    assert!(
+        err.contains("is never used") && err.contains("FOO"),
+        "expected unused-intermediate error, got: {}",
+        err
+    );
+}
+
+// ── Two-argument min / max (#1030) ──────────────────────────────────────────
+
+#[test]
+fn test_min_max_two_args_in_individual_parameters() {
+    let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = max(TVCL * WT / 70, 1.0)
+  V  = min(TVV, 20.0)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).unwrap();
+    let theta = vec![2.0, 10.0];
+    let eta = vec![0.0];
+    let mut covs = HashMap::new();
+
+    covs.insert("WT".to_string(), 70.0);
+    let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    assert!(
+        (p.values[0] - 2.0).abs() < 1e-12,
+        "WT=70 → CL = max(2, 1) = 2"
+    );
+    assert!((p.values[1] - 10.0).abs() < 1e-12, "V = min(10, 20) = 10");
+
+    // Below the floor: the clamp bites.
+    covs.insert("WT".to_string(), 7.0);
+    let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    assert!(
+        (p.values[0] - 1.0).abs() < 1e-12,
+        "WT=7 → CL = max(0.2, 1) = 1, got {}",
+        p.values[0]
+    );
+}
+
+/// The arity diagnostic the issue called out: a one-argument `max` used to be
+/// silently the identity, and a stray comma in a one-argument function reported a
+/// missing `)`, sending the reader after a bracket bug that does not exist.
+#[test]
+fn test_min_max_arity_diagnostics() {
+    let one_arg = analytical_model_with_scaling(Some("  y = max(central)\n"));
+    let err = parse_model_string(&one_arg).expect_err("one-argument max must be rejected");
+    assert!(
+        err.contains("two arguments") && err.contains("max(a, b)"),
+        "expected an arity error, got: {}",
+        err
+    );
+
+    let extra_arg = analytical_model_with_scaling(Some("  y = exp(central, 2)\n"));
+    let err = parse_model_string(&extra_arg).expect_err("two-argument exp must be rejected");
+    assert!(
+        err.contains("takes 1 argument") && err.contains("min(a, b)"),
+        "expected an arity error naming the two-argument functions, got: {}",
+        err
+    );
+}
+
+// ── Three-argument clamp (#1092) ────────────────────────────────────────────
+
+/// Parse a single expression with `X` / `Y` bound to variable slots 0 and 1, so
+/// the bytecode and `Dual2` helpers above can drive whatever the parser built.
+fn parse_indexed_expr(src: &str) -> Expression {
+    let toks = tokenize(src).expect("tokenizes");
+    let defined = vec!["X".to_string(), "Y".to_string()];
+    let ctx = ParseCtx::new(&[], &[], &defined);
+    let (mut expr, p) = parse_add_sub(&toks, 0, ctx).expect("parses");
+    assert_eq!(p, toks.len(), "trailing tokens in `{src}`");
+    let var_idx: HashMap<String, usize> = [("X".to_string(), 0), ("Y".to_string(), 1)]
+        .into_iter()
+        .collect();
+    resolve_expr_indices(&mut expr, &var_idx, &HashMap::new());
+    expr
+}
+
+/// `clamp(x, lo, hi)` is defined as the nested form it replaces, so on every
+/// finite `x` the two must agree — including *on* both bounds, where the branch
+/// taken decides which of two equal values is returned. (`NaN` is the one input
+/// where they deliberately part; see
+/// `clamp_propagates_nan_where_nested_pins_to_lo`.)
+#[test]
+fn clamp_matches_nested_min_max_on_every_finite_x() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    let nested = parse_indexed_expr("min(max(X, 0.01), 0.99)");
+    let nn: Vec<Vec<f64>> = Vec::new();
+    for x in [-1.0, 0.0, 0.005, 0.01, 0.5, 0.99, 1.0, 2.0] {
+        let vars = [x, 0.0];
+        let a = eval_expression_indexed(&clamped, &[], &[], &[], &vars, &nn);
+        let b = eval_expression_indexed(&nested, &[], &[], &[], &vars, &nn);
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "clamp != min(max(..)) at x = {x}: {a} vs {b}"
+        );
+        assert_eq!(a, x.clamp(0.01, 0.99), "at x = {x}");
+    }
+}
+
+/// The one input where `clamp` and `min(max(..))` part company, pinned so the
+/// divergence stays a decision rather than an accident. `NaN` fails both
+/// `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and propagates it;
+/// the nested form's `max` sees `x >= lo` false and returns the bound, and the
+/// outer `min` keeps it — so a `NaN` readout comes back silently pinned to `lo`.
+/// Propagating is what we want: a `NaN` reaches the OFV, where it is caught.
+#[test]
+fn clamp_propagates_nan_where_nested_pins_to_lo() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    let nested = parse_indexed_expr("min(max(X, 0.01), 0.99)");
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let vars = [f64::NAN, 0.0];
+    assert!(
+        eval_expression_indexed(&clamped, &[], &[], &[], &vars, &nn).is_nan(),
+        "clamp must propagate a NaN input"
+    );
+    assert_eq!(
+        eval_expression_indexed(&nested, &[], &[], &[], &vars, &nn),
+        0.01,
+        "the nested form pins a NaN to `lo` — the behaviour clamp does not copy"
+    );
+    // The bytecode VM takes the same branches as the AST evaluator.
+    let bc = compile_bytecode(&clamped);
+    let mut stack: Vec<f64> = Vec::new();
+    assert!(
+        eval_bytecode_g::<f64>(&bc, &[], &[], &[], &vars, &nn, &mut stack).is_nan(),
+        "the compiled clamp must propagate a NaN too"
+    );
+}
+
+/// The desugared tree compiles: the bytecode VM and the AST evaluator must agree
+/// bit-for-bit in each of the three regimes and on both bounds.
+#[test]
+fn clamp_bytecode_matches_ast() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    for x in [-1.0, 0.005, 0.01, 0.5, 0.99, 2.0] {
+        bc_vs_ast(clamped.clone(), &[x, 0.0], &[], &[], &[]);
+    }
+    // Variable bounds are ordinary expressions, not literals-only.
+    let var_bound = parse_indexed_expr("clamp(X, Y, 2 * Y)");
+    for x in [-1.0, 0.5, 1.0, 5.0] {
+        bc_vs_ast(var_bound.clone(), &[x, 0.75], &[], &[], &[]);
+    }
+}
+
+/// Derivatives across both bounds: flat (∂/∂x = 0) outside, pass-through
+/// (∂/∂x = 1) inside, and the bound's own derivative when the bound is a
+/// variable. Checked against central FD of the `f64` evaluator, with the probe
+/// steps kept clear of the kinks.
+#[test]
+fn clamp_dual2_matches_fd_in_every_regime() {
+    let expr = parse_indexed_expr("clamp(X, 0.2, 0.8) * Y");
+    for x in [0.05, 0.5, 0.95] {
+        bc_g_dual2_fd(&expr, x, 1.5, 1e-6, 1e-3);
+    }
+    // A variable lower bound: below it, the value *is* `Y`, so the gradient
+    // moves off `X` and onto `Y`.
+    let var_lo = parse_indexed_expr("clamp(X, Y, 0.9)");
+    bc_g_dual2_fd(&var_lo, 0.1, 0.3, 1e-6, 1e-3);
+    bc_g_dual2_fd(&var_lo, 0.5, 0.3, 1e-6, 1e-3);
+}
+
+/// The convention at the bounds themselves, where FD cannot speak: `x <= lo` and
+/// `x >= hi` take the *bound* branch, so the derivative is 0 on both bounds and 1
+/// strictly between them. Pinned so a later `<`/`<=` edit is a test failure.
+#[test]
+fn clamp_derivative_convention_on_the_bounds() {
+    use crate::sens::dual2::Dual2;
+    let bc = compile_bytecode(&parse_indexed_expr("clamp(X, 0.2, 0.8)"));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let grad_at = |x: f64| {
+        let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(0.0, 1)];
+        let mut s: Vec<Dual2<2>> = Vec::new();
+        eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut s).grad[0]
+    };
+    assert_eq!(
+        grad_at(0.2),
+        0.0,
+        "on the lower bound the `lo` branch is taken"
+    );
+    assert_eq!(
+        grad_at(0.8),
+        0.0,
+        "on the upper bound the `hi` branch is taken"
+    );
+    assert_eq!(grad_at(0.5), 1.0, "strictly inside, clamp is the identity");
+    assert_eq!(grad_at(0.1), 0.0, "below the lower bound");
+    assert_eq!(grad_at(0.9), 0.0, "above the upper bound");
+}
+
+/// End to end through a real model: the clamp bites at both bounds and passes
+/// through in between, after index resolution and bytecode compilation.
+#[test]
+fn test_clamp_in_individual_parameters() {
+    let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = clamp(TVCL * WT / 70, 1.0, 3.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).unwrap();
+    let theta = vec![2.0, 10.0];
+    let eta = vec![0.0];
+    let mut covs = HashMap::new();
+
+    let cl_at = |wt: f64, covs: &mut HashMap<String, f64>| {
+        covs.insert("WT".to_string(), wt);
+        (parsed.model.pk_param_fn)(&theta, &eta, covs, 0.0).values[0]
+    };
+    assert!(
+        (cl_at(70.0, &mut covs) - 2.0).abs() < 1e-12,
+        "inside: CL = 2"
+    );
+    assert!((cl_at(7.0, &mut covs) - 1.0).abs() < 1e-12, "floor bites");
+    assert!(
+        (cl_at(700.0, &mut covs) - 3.0).abs() < 1e-12,
+        "ceiling bites"
+    );
+}
+
+/// `clamp` with one, two or four arguments must be a hard error naming the
+/// three-argument form. The one-argument case is the trap the feature invites:
+/// an unknown `name(arg)` used to become `UnaryFn`, which every consumer
+/// evaluates as the identity — a no-op that fits, converges and gives wrong
+/// numbers.
+#[test]
+fn test_clamp_arity_diagnostics() {
+    for bad in [
+        "  y = clamp(central)\n",
+        "  y = clamp(central, 0.1)\n",
+        "  y = clamp(central, 0.1, 0.9, 2)\n",
+    ] {
+        let src = analytical_model_with_scaling(Some(bad));
+        let err = parse_model_string(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`{}` must be rejected", bad.trim()));
+        assert!(
+            err.contains("three arguments") && err.contains("clamp(x, lo, hi)"),
+            "expected a clamp arity error for `{}`, got: {}",
+            bad.trim(),
+            err
+        );
+    }
+
+    // The reverse mistake: a third argument to `min`/`max` points at `clamp`
+    // rather than at a bracket bug.
+    let src = analytical_model_with_scaling(Some("  y = min(central, 0.1, 0.9)\n"));
+    let err = parse_model_string(&src).expect_err("three-argument min must be rejected");
+    assert!(
+        err.contains("clamp(x, lo, hi)"),
+        "expected the three-argument min error to name clamp, got: {}",
+        err
+    );
+}
+
+/// `clamp(x, 0.9, 0.1)` would never return `x` at all — quietly handing back
+/// `0.9` below the crossing and `0.1` above it. With both bounds literal that
+/// can only be a typo, so it is a parse error; bounds that
+/// are not both literals are left to run rather than paying an ordering test on
+/// every evaluation.
+#[test]
+fn test_clamp_rejects_inverted_literal_bounds() {
+    let src = analytical_model_with_scaling(Some("  y = clamp(central, 0.9, 0.1)\n"));
+    let err = parse_model_string(&src).expect_err("inverted literal bounds must be rejected");
+    assert!(
+        err.contains("bounds inverted"),
+        "expected the inverted-bounds error, got: {}",
+        err
+    );
+
+    // Equal bounds are a degenerate but well-defined constant, not an error.
+    let src = analytical_model_with_scaling(Some("  y = clamp(central, 0.5, 0.5)\n"));
+    parse_model_string(&src).expect("equal bounds are legal");
+
+    // A non-literal bound is not checked — no runtime ordering test.
+    let src = analytical_model_with_scaling(Some("  y = clamp(central, V, 0.1)\n"));
+    parse_model_string(&src).expect("non-literal bounds parse");
+}
+
+// ── Operator continuation lines (#1030) ─────────────────────────────────────
+
+#[test]
+fn test_join_continuation_lines() {
+    let join = |lines: &[&str]| -> Vec<String> {
+        super::join_continuation_lines(&lines.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    };
+    // Leading operator continues the previous line...
+    assert_eq!(
+        join(&["A = B", "+ C", "- D", "E = F"]),
+        vec!["A = B + C - D".to_string(), "E = F".to_string()]
+    );
+    // ...as does a trailing one.
+    assert_eq!(
+        join(&["A = B +", "C", "E = F"]),
+        vec!["A = B + C".to_string(), "E = F".to_string()]
+    );
+    // A trailing `=` continues too, so `LEMAX =` on its own line works.
+    assert_eq!(join(&["A =", "B * 2"]), vec!["A = B * 2".to_string()]);
+    // A leading operator on the very first line has nothing to join to; leave it
+    // for the statement parser to reject with its own message.
+    assert_eq!(join(&["+ C"]), vec!["+ C".to_string()]);
+    // Ordinary lines are untouched.
+    assert_eq!(
+        join(&["A = B", "C = D"]),
+        vec!["A = B".to_string(), "C = D".to_string()]
+    );
+}
+
+/// The additive-on-logit covariate model from the issue: one covariate per line,
+/// which used to fail with ``Expected an assignment, … got Plus``.
+#[test]
+fn test_individual_parameters_operator_continuation_lines() {
+    let content = r#"
+[parameters]
+  theta LEMAX0(0.5, -5.0, 5.0)
+  theta OR_ABATA(1.5, 0.1, 10.0)
+  theta OR_ADALI(2.0, 0.1, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_EMAX ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = LEMAX0
+       + log(OR_ABATA) * ABATA
+       + log(OR_ADALI) * ADALI
+       + ETA_EMAX
+  V  = TVV *
+       2.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).expect("continuation lines parse");
+    let theta = vec![0.5, 1.5, 2.0, 10.0];
+    let eta = vec![0.25];
+    let mut covs = HashMap::new();
+    covs.insert("ABATA".to_string(), 1.0);
+    covs.insert("ADALI".to_string(), 0.0);
+    let p = (parsed.model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    let want = 0.5 + 1.5f64.ln() + 0.25;
+    assert!(
+        (p.values[0] - want).abs() < 1e-12,
+        "expected {want}, got {}",
+        p.values[0]
+    );
+    assert!((p.values[1] - 20.0).abs() < 1e-12, "trailing `*` continues");
+}
+
+/// `[scaling]` is scanned line by line rather than through the token stream, so
+/// its continuation support is worth pinning separately.
+#[test]
+fn test_scaling_continuation_lines() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V\n      * 2.0\n"),
+    );
+    let model = parse_model_string(&src).expect("continuation line parses in [scaling]");
+    let ode = model.ode_spec.expect("ODE spec present");
+    let f = match ode.readout {
+        crate::ode::OdeReadout::Single(f) => f,
+        _ => panic!("Form C must set OdeReadout::Single"),
+    };
+    let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+    pk[1] = 50.0;
+    let y = f(&vec![0.0, 100.0], &pk, &[], &[], &HashMap::new());
+    assert!((y - 4.0).abs() < 1e-12, "expected 100/50*2 = 4, got {y}");
+}
+
+/// `[initial_conditions]` is line-oriented too (`init(NAME) = <expr>`, one per
+/// line), so its continuation support is pinned on its own path — and the joined
+/// expression must actually reach the init amount, not just parse.
+#[test]
+fn test_initial_conditions_continuation_lines() {
+    let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+                  + 5.0
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+    let model = parse_model_string(content).expect("continuation line parses in the init block");
+    assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "CONC0"),
+        "the continued line's covariate must still be a required column, got: {:?}",
+        model.referenced_covariates
+    );
+    // CONC0 = 2, V = 10 → 2*10 + 5 = 25. The `+ 5.0` line has to be part of the
+    // expression, not silently dropped.
+    let mut covs = HashMap::new();
+    covs.insert("CONC0".to_string(), 2.0);
+    let theta = vec![1.0, 10.0];
+    let eta = vec![0.0];
+    let pk = (model.pk_param_fn)(&theta, &eta, &covs, 0.0);
+    let amount = (model.analytical_init[0].amount_fn)(&theta, &eta, &covs, &pk);
+    assert!(
+        (amount - 25.0).abs() < 1e-12,
+        "expected 2*10 + 5 = 25, got {amount}"
     );
 }
 
@@ -10142,6 +13480,321 @@ fn test_parse_scaling_per_cmt_accepts_ad() {
         analytical_model_with_scaling(Some("  obs_scale[CMT=1] = 1000\n  obs_scale[CMT=2] = 1\n"));
     let src = base.replace("gradient = fd", "gradient = ad");
     parse_model_string(&src).expect("per-CMT obs_scale + gradient = ad now parses");
+}
+
+// ── [scaling] undefined-identifier guard + TIME built-in (issue #1028) ──
+
+/// Every identifier a `[scaling]` expression cannot bind to a theta / eta /
+/// individual parameter / state is a **covariate**, and therefore a required data
+/// column. The Form C `y` half has registered them since #540; the Form B
+/// `obs_scale` half silently dropped them, so a typo (or a real covariate the data
+/// didn't carry) resolved to the covariate map's `0.0` default and the divisive
+/// scale turned every prediction into the `apply_scaling` NaN path — with nothing
+/// in `referenced_covariates` for `check_covariates` to catch. Registering the name
+/// is what makes `fit()` / `simulate()` / `predict()` refuse the model instead.
+#[test]
+fn scaling_obs_scale_registers_covariate_references() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = V / TOTALLY_UNDEFINED_NAME\n"));
+    let model = parse_model_string(&src).expect("obs_scale expression parses");
+    assert!(
+        model
+            .referenced_covariates
+            .iter()
+            .any(|c| c == "TOTALLY_UNDEFINED_NAME"),
+        "an unbindable `obs_scale` identifier must become a required data column, \
+         got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// The per-CMT `obs_scale[CMT=N]` form registers its covariates too — the
+/// collection sits in `build_obs_scale_spec`, which both key forms route through.
+#[test]
+fn scaling_obs_scale_per_cmt_registers_covariate_references() {
+    let src = analytical_model_with_scaling(Some(
+        "  obs_scale[CMT=1] = SCALE_A\n  obs_scale[CMT=2] = SCALE_B\n",
+    ));
+    let model = parse_model_string(&src).expect("per-CMT obs_scale expression parses");
+    for name in ["SCALE_A", "SCALE_B"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "`{name}` must be registered, got {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+/// A bound name is *not* a covariate: `obs_scale = V` reads the individual
+/// parameter, so nothing is added to the required-column set. Guards the new
+/// collection against over-registering.
+#[test]
+fn scaling_obs_scale_indiv_param_is_not_a_covariate() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = V / 10\n"));
+    let model = parse_model_string(&src).expect("obs_scale expression parses");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "an individual-parameter reference must not register as a data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// `obs_scale` is a subject-static divisor — `apply_scaling` evaluates it once per
+/// subject at t = 0 and divides the whole prediction vector by the result — so a
+/// `TIME` reference in it would always read the t=0 value. Reject it (naming Form C
+/// as the place for a time-dependent readout) rather than serve the silent
+/// collapse. Both spellings of the built-in are caught.
+#[test]
+fn scaling_obs_scale_rejects_the_time_builtin() {
+    for expr in ["TIME", "V * TIME", "T", "V + T"] {
+        let src = analytical_model_with_scaling(Some(&format!("  obs_scale = {expr}\n")));
+        let err =
+            parse_model_string(&src).expect_err("obs_scale referencing TIME must be rejected");
+        assert!(
+            err.contains("subject-static") && err.contains("y = <expr>"),
+            "error for `{expr}` must explain the subject-static divisor and point at \
+             Form C, got: {err}"
+        );
+    }
+}
+
+/// A Form C `y = <expr>` readout may reference `TIME` — it is evaluated per
+/// observation — so the parser must leave it alone and, crucially, must not
+/// register it as a data column.
+#[test]
+fn scaling_y_readout_accepts_the_time_builtin() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * TIME\n"),
+    );
+    let model = parse_model_string(&src).expect("Form C readout may reference TIME");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "`TIME` is a built-in, not a data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Does the model's uniform Form C readout compile to a `PushTime` read? The
+/// direct discriminator for the `[scaling]` time built-in: `referenced_covariates`
+/// alone cannot tell "folded into `TIME`" from "bound to something else", since
+/// both leave it empty.
+fn readout_reads_time(model: &CompiledModel) -> bool {
+    let program = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .or_else(|| {
+            model
+                .analytic_readout
+                .as_ref()
+                .and_then(|a| a.program.as_ref())
+        })
+        .expect("uniform Form C readout carries a program");
+    program.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
+}
+
+/// `T` / `t` is the `[odes]` spelling of the same built-in (reserved there against
+/// every state / indiv-param / intermediate name). `[scaling]` parses with
+/// `fallback_covariate = true`, so before #1028 a bare `T` landed as a covariate —
+/// a required column named `T`, or a silent zero. It now folds into the same
+/// `Expression::Time` node `TIME` produces, so the two blocks agree on the name.
+#[test]
+fn scaling_y_readout_accepts_the_t_time_alias() {
+    for alias in ["T", "t", "TIME", "time"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V * {alias}\n")),
+        );
+        let model =
+            parse_model_string(&src).expect("Form C readout may reference the T time alias");
+        assert!(
+            model.referenced_covariates.is_empty(),
+            "`{alias}` must fold into the TIME built-in, not register as a data \
+             column; got {:?}",
+            model.referenced_covariates
+        );
+        assert!(
+            readout_reads_time(&model),
+            "`{alias}` must compile to the model-time read"
+        );
+    }
+}
+
+/// The `T` fold targets `Covariate` leaves only, so a name the parse *did* bind
+/// keeps winning — an individual parameter named `T` still resolves to itself, and
+/// the readout compiles to a plain variable read rather than a model-time read.
+/// (Unreachable on ODE models, where `[odes]` rejects that name outright.)
+#[test]
+fn scaling_y_readout_t_alias_does_not_shadow_a_bound_name() {
+    let src = analytical_model_with_scaling(Some("  y = central / T\n"))
+        .replace("  V  = TVV\n", "  V  = TVV\n  T  = TVV / 2\n");
+    let model = parse_model_string(&src).expect("indiv param named T parses");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "an individual parameter named `T` must win over the time alias, got {:?}",
+        model.referenced_covariates
+    );
+    assert!(
+        !readout_reads_time(&model),
+        "an individual parameter named `T` must not be folded into the time built-in"
+    );
+}
+
+/// The `T` fold walks the whole expression tree, not just its top-level operands:
+/// `visit_expr_nodes_mut` has to recurse through every node kind that carries a
+/// child. This readout puts a `T` under each one — a compound `if` condition
+/// (`Conditional` over `Condition::And` over `Condition::Compare`) and both of its
+/// arms, a unary function argument (`UnaryFn`), and both sides of a power
+/// (`Power`) — so a missed arm leaves a stray `Covariate("T")` behind and shows up
+/// as a spurious required data column.
+#[test]
+fn scaling_y_readout_folds_the_t_alias_under_every_node_kind() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = if (T > 1 && T < 100) exp(-T) * (T ^ T) else central / V + sqrt(T)\n"),
+    );
+    let model = parse_model_string(&src).expect("nested T references parse");
+    assert!(
+        model.referenced_covariates.is_empty(),
+        "every `T` must fold into the time built-in, whatever node it sits under; \
+         got {:?}",
+        model.referenced_covariates
+    );
+    assert!(
+        readout_reads_time(&model),
+        "the folded readout must compile to the model-time read"
+    );
+}
+
+/// A `[scaling]` `y` covariate has been a required data column since #540, so a
+/// dataset with a real column named `T` and a readout like `y = central/V * T`
+/// worked before #1028 — and the alias fold must not silently repoint it at the
+/// clock. Declaring `T` in `[covariates]` is the explicit escape hatch: the name
+/// then keeps its data-column meaning, exactly as a bound state or individual
+/// parameter does.
+#[test]
+fn scaling_y_readout_t_alias_loses_to_a_declared_covariate() {
+    for alias in ["T", "t"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V * {alias}\n")),
+        ) + &format!("\n[covariates]\n  {alias} continuous\n");
+        let model = parse_model_string(&src).expect("a declared T covariate parses");
+        assert_eq!(
+            model.referenced_covariates,
+            vec![alias.to_string()],
+            "a `[covariates]`-declared `{alias}` must stay a required data column"
+        );
+        assert!(
+            !readout_reads_time(&model),
+            "a declared `{alias}` must not be folded into the model-time built-in"
+        );
+    }
+}
+
+/// The alias collapses `T` and `t` into one built-in, so the declaration that
+/// protects it has to be matched the same way. A case-exact guard let
+/// `[covariates] T` fail to protect a `y = ... t ...` reference — silently folding
+/// it to the clock even though the user took the documented escape hatch — and, in
+/// `obs_scale`, raised the `TIME`-rejection error against a legitimately declared
+/// column. Both spellings of the declaration must cover both spellings of the
+/// reference (#1042 review).
+#[test]
+fn scaling_time_alias_declaration_is_case_insensitive() {
+    for declared in ["T", "t"] {
+        for used in ["T", "t"] {
+            let src = ode_model_with_scaling(
+                "ode(states=[depot, central])",
+                Some(&format!("  y = central / V * {used}\n")),
+            ) + &format!("\n[covariates]\n  {declared} continuous\n");
+            let model = parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("declared `{declared}`, used `{used}`: {e}"));
+            assert_eq!(
+                model.referenced_covariates,
+                vec![used.to_string()],
+                "declared `{declared}` must protect the `{used}` reference"
+            );
+            assert!(
+                !readout_reads_time(&model),
+                "declared `{declared}`, used `{used}`: must not fold to the clock"
+            );
+        }
+    }
+}
+
+/// The same case-insensitivity on the `obs_scale` side, where the mismatch was not
+/// a silent fold but a hard error thrown at a column the model legitimately
+/// declared.
+#[test]
+fn obs_scale_time_rejection_respects_a_case_mismatched_declaration() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  obs_scale = 1000 / t\n  y = central\n"),
+    ) + "\n[covariates]\n  T continuous\n";
+    let model = parse_model_string(&src).expect("a declared `T` column is not the TIME built-in");
+    assert_eq!(model.referenced_covariates, vec!["t".to_string()]);
+}
+
+/// …and when the fold *does* fire (no declaration), it says so. The undeclared
+/// case is the one the parser cannot disambiguate — a dataset column named `T` is
+/// only a warning elsewhere — so the note names both escapes: spell it `TIME`, or
+/// declare the column.
+#[test]
+fn scaling_y_readout_t_alias_fold_warns() {
+    let src = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * T\n"),
+    );
+    let model = parse_model_string(&src).expect("the T alias parses");
+    let note = model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("model-time built-in"))
+        .unwrap_or_else(|| panic!("expected a fold warning, got {:?}", model.parse_warnings));
+    assert!(
+        note.contains("[covariates]"),
+        "warning must name the escape hatch: {note}"
+    );
+
+    // Spelling it `TIME` is unambiguous and must not warn.
+    let src_time = ode_model_with_scaling(
+        "ode(states=[depot, central])",
+        Some("  y = central / V * TIME\n"),
+    );
+    let model_time = parse_model_string(&src_time).expect("TIME parses");
+    assert!(
+        !model_time
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("model-time built-in")),
+        "the unambiguous `TIME` spelling must not warn, got {:?}",
+        model_time.parse_warnings
+    );
+}
+
+/// `[odes]` reserves `TIME`/`T`/`TAFD`/`TAD`/`MACHEPS`, but only `TIME` (and its
+/// `T` alias) is a `[scaling]` built-in. `TAFD`/`TAD`/`MACHEPS` stay **ordinary
+/// covariates** here — documented behaviour (`docs/model-file/scaling.qmd`), so a
+/// dataset that really carries a `TAD` column can use it. This pins that: they
+/// register as required data columns and are not folded into anything.
+#[test]
+fn scaling_odes_only_builtins_stay_covariates() {
+    for builtin in ["TAFD", "TAD", "MACHEPS"] {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some(&format!("  y = central / V + {builtin}\n")),
+        );
+        let model = parse_model_string(&src).expect("an [odes]-only name parses as a covariate");
+        assert_eq!(
+            model.referenced_covariates,
+            vec![builtin.to_string()],
+            "`{builtin}` must register as a required data column in [scaling]"
+        );
+        assert!(
+            !readout_reads_time(&model),
+            "`{builtin}` must not resolve to the model-time built-in"
+        );
+    }
 }
 
 #[test]
@@ -11937,6 +15590,137 @@ fn parse_derived_per_row() {
     }
 }
 
+/// `min`/`max` at a `[derived]` statement's top level used to be read *only* as the
+/// row aggregate, so the two-argument numeric form (#1030) meant one thing nested
+/// (`1 * max(CL, 2)`) and failed outright unnested. A second argument with no
+/// comparison operator cannot be a row filter, so both spellings now agree.
+#[test]
+fn parse_derived_two_arg_max_at_statement_top_level() {
+    let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+    let eval_one = |derived: &str| {
+        let src = minimal_model_with_derived(derived);
+        let parsed = parse_full_model(&src).expect("two-arg max at top level parses");
+        let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind else {
+            panic!("expected PerRow, got the row aggregate");
+        };
+        let ctx = DerivedContext {
+            theta: &theta,
+            eta: &eta,
+            indiv_params: &indiv_params,
+            covariates: &covariates,
+            ipred: 0.0,
+            pred: 0.0,
+            dv: 0.0,
+            time: 1.0,
+            tafd: 1.0,
+            tad: 1.0,
+            prev_derived: &prev_derived,
+            compartments: &[],
+            compartment_names: &[],
+        };
+        eval(&ctx)
+    };
+    // CL = 1: the floor bites at top level exactly as it does nested.
+    assert_eq!(eval_one("X = max(CL, 2.0)"), 2.0);
+    assert_eq!(eval_one("X = 1 * max(CL, 2.0)"), 2.0);
+    assert_eq!(eval_one("X = min(CL, 2.0)"), 1.0);
+    // Still an expression, not a call: trailing operators are honoured.
+    assert_eq!(eval_one("X = max(CL, 2.0) * 3"), 6.0);
+}
+
+/// `clamp` has no row-aggregate spelling, so it is unambiguous in `[derived]`:
+/// it means the same thing at statement top level as it does nested one level
+/// in, and it stays an expression that trailing operators continue.
+#[test]
+fn parse_derived_clamp_is_unambiguous() {
+    let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+    let eval_one = |derived: &str| {
+        let src = minimal_model_with_derived(derived);
+        let parsed = parse_full_model(&src).expect("clamp in [derived] parses");
+        let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind else {
+            panic!("expected PerRow, got the row aggregate");
+        };
+        let ctx = DerivedContext {
+            theta: &theta,
+            eta: &eta,
+            indiv_params: &indiv_params,
+            covariates: &covariates,
+            ipred: 0.0,
+            pred: 0.0,
+            dv: 0.0,
+            time: 1.0,
+            tafd: 1.0,
+            tad: 1.0,
+            prev_derived: &prev_derived,
+            compartments: &[],
+            compartment_names: &[],
+        };
+        eval(&ctx)
+    };
+    // CL = 1, V = 10.
+    assert_eq!(eval_one("X = clamp(CL, 2.0, 5.0)"), 2.0);
+    assert_eq!(eval_one("X = 1 * clamp(CL, 2.0, 5.0)"), 2.0);
+    assert_eq!(eval_one("X = clamp(V, 2.0, 5.0)"), 5.0);
+    assert_eq!(eval_one("X = clamp(V, 2.0, 50.0)"), 10.0);
+    // Still an expression, not a call: trailing operators are honoured.
+    assert_eq!(eval_one("X = clamp(CL, 2.0, 5.0) * 3"), 6.0);
+}
+
+/// A third argument to a statement-top-level `[derived]` aggregate used to be
+/// dropped in silence — `args[2..]` is never read — so `max(IPRED, TIME > 0, Q)`
+/// computed `max(IPRED, TIME > 0)`. Reject it, and name `clamp` for `min`/`max`,
+/// which is what the extra argument usually means (#1092).
+#[test]
+fn parse_derived_aggregate_rejects_a_third_argument() {
+    for (derived, names_clamp) in [
+        ("CMAX = max(IPRED, TIME > 0, 99)", true),
+        ("CMIN = min(IPRED, TIME > 0, 99)", true),
+        ("TP = tmax(IPRED, TIME > 0, 99)", false),
+    ] {
+        let src = minimal_model_with_derived(derived);
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("a third argument must be rejected: `{derived}`"));
+        assert!(
+            err.contains("at most two arguments"),
+            "expected the aggregate arity error for `{derived}`, got: {err}"
+        );
+        assert_eq!(
+            err.contains("clamp(x, lo, hi)"),
+            names_clamp,
+            "only `min`/`max` should point at clamp: `{derived}` gave: {err}"
+        );
+    }
+}
+
+/// A second argument that *is* a comparison keeps meaning the row filter.
+#[test]
+fn parse_derived_aggregate_filter_still_parses() {
+    let src = minimal_model_with_derived("CMAX = max(IPRED, TIME > 0)");
+    let parsed = parse_full_model(&src).expect("aggregate with a row filter parses");
+    assert!(matches!(
+        parsed.model.derived_exprs[0].kind,
+        DerivedKind::Aggregate { .. }
+    ));
+}
+
+/// Trailing tokens after a row aggregate's `)` used to be dropped in silence, so
+/// `max(IPRED) * 2` computed `max(IPRED)`. No aggregate form continues into a
+/// larger expression, so it is now an error rather than a wrong number.
+#[test]
+fn parse_derived_aggregate_rejects_trailing_tokens() {
+    let src = minimal_model_with_derived("CMAX = max(IPRED) * 2");
+    let err = match parse_full_model(&src) {
+        Ok(_) => panic!("trailing tokens after an aggregate must error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("unexpected token(s) after"),
+        "expected the trailing-token error, got: {}",
+        err
+    );
+}
+
 #[test]
 fn parse_derived_sequential_reference() {
     let src = minimal_model_with_derived("KE = CL / V\nT_HALF = 0.693 / KE");
@@ -13242,6 +17026,7 @@ fn cov_static_classifier_helpers_cover_all_arms() {
         ops,
         constants: vec![0.0],
         max_stack: 2,
+        gathers: Vec::new(),
     };
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushEta(0)]), &dv));
     assert!(bytecode_is_dynamic(&bc(vec![Op::PushTheta(0)]), &dv));
@@ -13361,6 +17146,7 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
                 ops: vec![Op::PushVar(1), Op::PushConst(0), Op::Add],
                 constants: vec![1.0],
                 max_stack: 2,
+                gathers: Vec::new(),
             },
         ),
         Statement::AssignBc(
@@ -13369,6 +17155,7 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
                 ops: vec![Op::PushTheta(0)],
                 constants: vec![],
                 max_stack: 1,
+                gathers: Vec::new(),
             },
         ),
     ];
@@ -13385,6 +17172,7 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
                     ops: vec![Op::PushCov(0)],
                     constants: vec![],
                     max_stack: 1,
+                    gathers: Vec::new(),
                 },
             )],
         )],
@@ -13394,6 +17182,7 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
                 ops: vec![Op::PushConst(0)],
                 constants: vec![0.0],
                 max_stack: 1,
+                gathers: Vec::new(),
             },
         )]),
     }];
@@ -13414,6 +17203,7 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
                     ops: vec![Op::PushCov(0)],
                     constants: vec![],
                     max_stack: 1,
+                    gathers: Vec::new(),
                 },
             )],
         )],
@@ -13423,6 +17213,7 @@ fn cov_static_mask_fixpoint_and_dynamic_if_context() {
                 ops: vec![Op::PushConst(0)],
                 constants: vec![1.0],
                 max_stack: 1,
+                gathers: Vec::new(),
             },
         )]),
     }];
@@ -13434,12 +17225,19 @@ fn sim_lines(body: &[&str]) -> Vec<String> {
     body.iter().map(|s| s.to_string()).collect()
 }
 
+/// [`parse_simulation_block`] with no declared covariates — the shape every key
+/// test below wants. The declared-name list only gates `covariate NAME = ...`
+/// (#1083); an empty list means "no `[covariates]` block", which accepts any name.
+fn parse_sim_block(lines: &[String]) -> Result<SimulationSpec, String> {
+    parse_simulation_block(lines, &[])
+}
+
 #[test]
 fn simulation_long_form_keys_apply() {
     // The canonical (and example-file) spellings must actually be honored —
     // the bug was that `n_subjects`/`dose_amt`/`dose_cmt` were silently ignored
     // and fell back to the defaults (10 / 100 / 1).
-    let spec = parse_simulation_block(&sim_lines(&[
+    let spec = parse_sim_block(&sim_lines(&[
         "n_subjects = 7",
         "dose_amt = 50",
         "dose_cmt = 2",
@@ -13459,7 +17257,7 @@ fn simulation_short_form_aliases_apply() {
     // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
     // documented spelling) remain valid aliases for the same fields, and the
     // defaults hold for the keys we omit (seed = 42).
-    let spec = parse_simulation_block(&sim_lines(&[
+    let spec = parse_sim_block(&sim_lines(&[
         "subjects = 3",
         "dose = 25",
         "cmt = 4",
@@ -13476,7 +17274,7 @@ fn simulation_short_form_aliases_apply() {
 fn simulation_unknown_key_errors() {
     // A typo (e.g. `n_subject`) must be a hard error, not a silent default —
     // this is the silent-failure class the fix closes.
-    let err = parse_simulation_block(&sim_lines(&[
+    let err = parse_sim_block(&sim_lines(&[
         "n_subject = 5", // typo: missing the trailing 's'
         "times = [1.0]",
     ]))
@@ -13493,7 +17291,7 @@ fn simulation_unknown_key_errors() {
 fn simulation_malformed_line_errors() {
     // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
     // error rather than being silently skipped into the default.
-    let err = parse_simulation_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
+    let err = parse_sim_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
     assert!(
         err.starts_with("[simulation]:") && err.contains("malformed line"),
         "got: {err}"
@@ -13512,7 +17310,7 @@ fn simulation_bad_value_errors_per_key() {
         ("seed = -1", "seed"),          // seed is u64
         ("times = [1.0, oops]", "times"),
     ] {
-        let err = parse_simulation_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
+        let err = parse_sim_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
         assert!(
             err.starts_with("[simulation]:") && err.contains(key),
             "key `{key}` on `{line}` gave: {err}"
@@ -13522,18 +17320,18 @@ fn simulation_bad_value_errors_per_key() {
 
 #[test]
 fn simulation_requires_times() {
-    let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
+    let err = parse_sim_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
     assert!(err.contains("times"), "got: {err}");
 }
 
 #[test]
 fn simulation_horizon_parses() {
     // `horizon = <t>` is captured as the administrative censoring window (#522).
-    let spec = parse_simulation_block(&sim_lines(&["horizon = 14", "times = [1.0]"]))
-        .expect("horizon parses");
+    let spec =
+        parse_sim_block(&sim_lines(&["horizon = 14", "times = [1.0]"])).expect("horizon parses");
     assert_eq!(spec.horizon, Some(14.0));
     // Absent ⇒ None (the per-record window path).
-    let spec = parse_simulation_block(&sim_lines(&["times = [1.0]"])).expect("no horizon");
+    let spec = parse_sim_block(&sim_lines(&["times = [1.0]"])).expect("no horizon");
     assert_eq!(spec.horizon, None);
 }
 
@@ -13541,7 +17339,7 @@ fn simulation_horizon_parses() {
 fn simulation_horizon_satisfies_observe_requirement() {
     // A TTE-only design has no continuous `times`; a `horizon` alone is enough
     // to make the block valid (the relaxed times-OR-horizon rule).
-    let spec = parse_simulation_block(&sim_lines(&["n_subjects = 5", "horizon = 14"]))
+    let spec = parse_sim_block(&sim_lines(&["n_subjects = 5", "horizon = 14"]))
         .expect("horizon alone is a valid design");
     assert_eq!(spec.horizon, Some(14.0));
     assert!(spec.obs_times.is_empty());
@@ -13555,7 +17353,7 @@ fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
         "horizon = inf",
         "horizon = nan",
     ] {
-        let err = parse_simulation_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
+        let err = parse_sim_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
         assert!(
             err.starts_with("[simulation]:") && err.contains("horizon"),
             "`{bad}` gave: {err}"
@@ -13565,9 +17363,4434 @@ fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
 
 #[test]
 fn simulation_horizon_bad_value_errors() {
-    let err = parse_simulation_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
+    let err = parse_sim_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
     assert!(
         err.starts_with("[simulation]:") && err.contains("horizon"),
         "got: {err}"
     );
+}
+
+// ── [simulation] per-subject covariates (#1083) ──────────────────────────
+//
+// A simulated trial invents arms that are in no dataset, so the covariates its
+// design turns on — an MBMA arm size behind `weight = NARM`, a reported standard
+// error behind `weight = WPSE` — have no row to be read from and must be stated
+// here. Before #1083 `SimulationSpec::covariates` was a field the parser always
+// wrote empty and nothing ever read.
+
+#[test]
+fn simulation_covariate_list_is_read_per_subject() {
+    let spec = parse_sim_block(&sim_lines(&[
+        "n_subjects = 3",
+        "times = [1.0]",
+        "covariate NARM = [400, 200, 50]",
+    ]))
+    .expect("per-subject covariate list parses");
+    assert_eq!(
+        spec.covariates,
+        vec![("NARM".to_string(), vec![400.0, 200.0, 50.0])]
+    );
+}
+
+#[test]
+fn simulation_covariate_scalar_broadcasts_to_every_subject() {
+    let spec = parse_sim_block(&sim_lines(&[
+        "n_subjects = 4",
+        "times = [1.0]",
+        "covariate WT = 70",
+    ]))
+    .expect("scalar covariate parses");
+    assert_eq!(spec.covariates, vec![("WT".to_string(), vec![70.0; 4])]);
+}
+
+#[test]
+fn simulation_covariate_length_is_checked_regardless_of_key_order() {
+    // `n_subjects` deliberately *follows* the covariate line: the length rule runs
+    // after the whole block is read, so the keys stay order-independent like every
+    // other key in this block.
+    let err = parse_sim_block(&sim_lines(&[
+        "covariate NARM = [400, 200]",
+        "n_subjects = 3",
+        "times = [1.0]",
+    ]))
+    .unwrap_err();
+    assert!(
+        err.starts_with("[simulation]:")
+            && err.contains("NARM")
+            && err.contains("2 value(s)")
+            && err.contains("3 subject(s)"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn simulation_covariate_must_be_declared_when_a_covariates_block_exists() {
+    // The `[covariates]` block is authoritative when present, exactly as it is for
+    // the data readers — a name it never declared is a typo, and one that reached
+    // `Subject` silently would be read by nothing.
+    let declared = vec!["NARM".to_string()];
+    let err = parse_simulation_block(
+        &sim_lines(&["n_subjects = 2", "times = [1.0]", "covariate NARN = 100"]),
+        &declared,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("NARN") && err.contains("not declared in [covariates]"),
+        "got: {err}"
+    );
+    // …and the correctly-spelled one is accepted against the same list.
+    parse_simulation_block(
+        &sim_lines(&["n_subjects = 2", "times = [1.0]", "covariate NARM = 100"]),
+        &declared,
+    )
+    .expect("a declared covariate is accepted");
+}
+
+#[test]
+fn simulation_covariate_rejects_duplicates_and_bad_values() {
+    let dup = parse_sim_block(&sim_lines(&[
+        "n_subjects = 2",
+        "times = [1.0]",
+        "covariate NARM = 100",
+        "covariate NARM = 50",
+    ]))
+    .unwrap_err();
+    assert!(dup.contains("declared twice"), "got: {dup}");
+
+    let bad = parse_sim_block(&sim_lines(&[
+        "n_subjects = 1",
+        "times = [1.0]",
+        "covariate NARM = many",
+    ]))
+    .unwrap_err();
+    assert!(
+        bad.starts_with("[simulation]:") && bad.contains("NARM"),
+        "got: {bad}"
+    );
+
+    let nameless = parse_sim_block(&sim_lines(&["times = [1.0]", "covariate = 100"])).unwrap_err();
+    assert!(nameless.contains("needs a name"), "got: {nameless}");
+}
+
+#[test]
+fn simulation_covariate_matches_the_word_not_the_prefix() {
+    // `covariates = ...` must stay an unknown key rather than being read as a
+    // covariate named `s` — the arm is keyed on the word, not on `starts_with`.
+    let err = parse_sim_block(&sim_lines(&["times = [1.0]", "covariates = [1, 2]"])).unwrap_err();
+    assert!(
+        err.contains("unknown key `covariates`"),
+        "a prefix match would have accepted this: {err}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mixture models — `[mixture]` block + reserved `MIXNUM` index (#977, Phase 1)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A valid 2-class mixture model: class-specific CL via a `MIXNUM` branch, a
+/// covariate-dependent mixing logit, and per-class Ω/Σ overrides.
+const MIXTURE_2CLASS: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BWT(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT*WT
+  omega(2) ETA_CL ~ 0.4
+  sigma(2) EPS ~ 0.12
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn mixture_block_parses_into_spec() {
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let spec = model.mixture.as_ref().expect("mixture spec present");
+    assert_eq!(spec.n_classes, 2);
+    assert_eq!(spec.mixing.len(), 1, "K-1 mixing exprs for K=2");
+    assert_eq!(spec.mixing[0].class, 1);
+    assert!(spec.mixing[0].is_logit);
+    assert_eq!(spec.logit_covariates, vec!["WT".to_string()]);
+    assert_eq!(spec.omega_overrides.len(), 1);
+    assert_eq!(spec.omega_overrides[0].class, 2);
+    assert_eq!(spec.omega_overrides[0].name, "ETA_CL");
+    assert!((spec.omega_overrides[0].init - 0.4).abs() < 1e-12);
+    assert_eq!(spec.sigma_overrides.len(), 1);
+    assert_eq!(spec.sigma_overrides[0].class, 2);
+    assert_eq!(spec.sigma_overrides[0].name, "EPS");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Class-aware mu-referencing for MIXNUM-switched typical values (#996)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build a mixture model with `nsub = k` and the given `[individual_parameters]`
+/// body, using thetas TVCL1/TVCL2/TVCL3/TVV/MIXL1/MIXL2 and eta ETA_CL/ETA_V.
+fn mixture_model_with_indiv(n_classes: usize, indiv: &str) -> crate::types::CompiledModel {
+    let mixing: String = (1..n_classes)
+        .map(|c| format!("  logit({c}) = MIXL{c}\n"))
+        .collect();
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVCL3(5.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL1(0.0, -10.0, 10.0)
+  theta MIXL2(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = {n_classes}
+{mixing}
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    );
+    parse_model_string(&src).expect("mixture model parses")
+}
+
+/// Names of the class anchors detected for `eta`, or `None` when the eta has no
+/// class-aware mu-ref.
+fn class_anchors(model: &crate::types::CompiledModel, eta: &str) -> Option<Vec<String>> {
+    model
+        .mixture
+        .as_ref()
+        .expect("mixture spec")
+        .mu_refs
+        .iter()
+        .find(|m| m.eta_name == eta)
+        .map(|m| m.theta_names.clone())
+}
+
+#[test]
+fn class_aware_mu_ref_detects_canonical_two_class_ternary() {
+    // The canonical ferx mixture form: one eta, one theta per class.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+    // The unswitched V carries no eta at all, so no entry.
+    assert_eq!(class_anchors(&model, "ETA_V"), None);
+    // The classical (non-class-aware) map is untouched — a mixture must not
+    // start reporting a single anchor for a class-switched parameter.
+    assert!(!model.mu_refs.contains_key("ETA_CL"));
+}
+
+#[test]
+fn class_aware_mu_ref_detects_three_class_chain() {
+    let model = mixture_model_with_indiv(
+        3,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) \
+             else if (MIXNUM == 2) TVCL2 * exp(ETA_CL) \
+             else TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec![
+            "TVCL1".to_string(),
+            "TVCL2".to_string(),
+            "TVCL3".to_string()
+        ])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_trailing_else_covers_every_unnamed_class() {
+    // K = 3 but only class 1 is named: classes 2 and 3 share the else arm's
+    // theta, which is well-defined (and updates from their pooled members).
+    let model = mixture_model_with_indiv(
+        3,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec![
+            "TVCL1".to_string(),
+            "TVCL2".to_string(),
+            "TVCL2".to_string()
+        ])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_degenerate_same_theta_in_both_arms() {
+    // The degenerate oracle: both classes anchor on the *same* theta, so the
+    // per-class update must collapse to the classical pooled one.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL1 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL1".to_string()])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_accepts_log_sum_form_in_every_arm() {
+    // Pattern 2 (`exp(log(THETA) + ETA)`) is a log mu-ref just like Pattern 1.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) exp(log(TVCL1) + ETA_CL) else exp(log(TVCL2) + ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_differing_eta_per_arm() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_V)\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+    assert_eq!(class_anchors(&model, "ETA_V"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_mixed_log_and_additive_arms() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_all_additive_arms() {
+    // Additive mu-refs are excluded on purpose: the closed-form shift is only
+    // the EM optimum on the log scale.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 + ETA_CL else TVCL2 + ETA_CL\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_non_mixnum_condition() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (TVV > 5) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_out_of_range_class() {
+    // `MIXNUM == 3` is unreachable in a 2-class mixture; reject loudly rather
+    // than silently mapping a dead branch onto a class.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 3) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_rejects_non_mu_ref_arm() {
+    // A class arm with no eta at all is not a mu-ref pattern.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2\n  V = TVV",
+    );
+    assert_eq!(class_anchors(&model, "ETA_CL"), None);
+}
+
+#[test]
+fn class_aware_mu_ref_class_shared_param_stays_in_plain_mu_refs() {
+    // A non-switched typical value in a mixture model is an ordinary mu-ref;
+    // it must keep appearing in `mu_refs` (the estimators broadcast it across
+    // classes themselves).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         V = TVV * exp(ETA_V)",
+    );
+    assert_eq!(class_anchors(&model, "ETA_V"), None);
+    assert_eq!(
+        model.mu_refs.get("ETA_V").map(|m| m.theta_name.as_str()),
+        Some("TVV")
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_failure_is_warned_not_silent() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_V)\n  V = TVV",
+    );
+    assert!(
+        model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied") && w.contains("CL")),
+        "expected a #996 fallback warning, got {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_success_emits_no_warning() {
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "unexpected fallback warning: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_no_warning_for_a_class_switched_value_without_iiv() {
+    // A class-switched typical value the user deliberately gave no IIV is not a
+    // missed mu-ref: there is no eta to anchor, and advising them to add one
+    // would be wrong (#996 review).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = TVCL1 * exp(ETA_CL)\n  V = if (MIXNUM == 1) TVV else TVV * 2.0",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "an eta-free MIXNUM expression must not be flagged: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_no_warning_for_an_intermediate_class_flag() {
+    // Same for an intermediate flag variable that merely reads MIXNUM.
+    let model = mixture_model_with_indiv(
+        2,
+        "  FLAG = if (MIXNUM == 1) 1.0 else 2.0\n  \
+         CL = TVCL1 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied")),
+        "a MIXNUM flag variable must not be flagged: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_still_warns_when_an_eta_bearing_switch_fails_to_match() {
+    // The guard above must not swallow the real case: the expression carries an
+    // eta but is not a mu-ref chain, so the fallback warning still fires.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) + 1.0 else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert!(
+        model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("Class-aware mu-referencing not applied") && w.contains("CL")),
+        "expected the #996 fallback warning, got {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_duplicate_eta_keeps_the_last_like_detect_mu_refs() {
+    // Two class-aware assignments on the same eta: the mixture map must keep the
+    // *last*, matching `detect_mu_refs`' `insert`, so `MixtureSpec::mu_refs` and
+    // `CompiledModel::mu_refs` never name different anchors for one eta
+    // (#996 review).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = if (MIXNUM == 1) TVCL2 * exp(ETA_CL) else TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL2".to_string(), "TVCL3".to_string()]),
+        "the last assignment wins"
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_yields_to_a_later_ordinary_mu_ref_on_the_same_eta() {
+    // An ordinary mu-ref written *after* a class-aware one is what
+    // `detect_mu_refs` keeps, so the mixture spec must drop its entry — otherwise
+    // `get_mixture_mu_ref_pairs` (which prefers the spec) and every
+    // `CompiledModel::mu_refs` consumer would use different anchors for one eta.
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  \
+         CL = TVCL3 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        None,
+        "the later ordinary mu-ref wins, so no class-aware entry survives"
+    );
+    assert_eq!(
+        model.mu_refs.get("ETA_CL").map(|m| m.theta_name.clone()),
+        Some("TVCL3".to_string())
+    );
+}
+
+#[test]
+fn class_aware_mu_ref_survives_an_earlier_ordinary_mu_ref_on_the_same_eta() {
+    // The other order: the class-aware assignment is last, so it is the anchor
+    // both maps agree on (`get_mixture_mu_ref_pairs` prefers the spec).
+    let model = mixture_model_with_indiv(
+        2,
+        "  CL = TVCL3 * exp(ETA_CL)\n  \
+         CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV",
+    );
+    assert_eq!(
+        class_anchors(&model, "ETA_CL"),
+        Some(vec!["TVCL1".to_string(), "TVCL2".to_string()])
+    );
+}
+
+#[test]
+fn non_mixture_model_has_no_spec() {
+    let model = minimal_model_with_indiv("  CL = TVCL * exp(ETA_CL)\n  V = TVV");
+    assert!(model.mixture.is_none());
+}
+
+#[test]
+fn mixnum_resolves_to_class_1_by_default() {
+    // With no mixture-class set (Phase 1), `MIXNUM` reads the class-1 default, so
+    // the typical-value closure evaluates the class-1 branch: CL = TVCL1 = 1.0.
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let theta = &model.default_params.theta;
+    let mut cov = std::collections::HashMap::new();
+    cov.insert("WT".to_string(), 70.0);
+    let tv = model.tv_fn.as_ref().unwrap()(theta, &cov);
+    // indiv_param_names order: CL then V.
+    let cl_idx = model
+        .indiv_param_names
+        .iter()
+        .position(|n| n == "CL")
+        .unwrap();
+    assert!(
+        (tv[cl_idx] - 1.0).abs() < 1e-9,
+        "class-1 branch → CL = TVCL1 = 1.0, got {}",
+        tv[cl_idx]
+    );
+}
+
+#[test]
+fn mixnum_in_non_mixture_model_rejected() {
+    let err = minimal_model_str_result("  CL = if (MIXNUM == 1) TVCL else TVCL\n  V = TVV")
+        .expect_err("MIXNUM without [mixture] must be rejected");
+    assert!(
+        err.contains("MIXNUM") && err.contains("mixture"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mixnum_outside_indiv_params_rejected() {
+    // #980: MIXNUM anywhere in a model with no [mixture] block must be rejected,
+    // not just in [individual_parameters]. The AST guard only scans indiv
+    // statements; a raw-token scan of the other blocks catches this [derived] use.
+    let src = r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+
+[derived]
+  FOO = MIXNUM
+";
+    let err = parse_model_string(src)
+        .expect_err("MIXNUM in [derived] without [mixture] must be rejected");
+    assert!(
+        err.contains("MIXNUM") && err.contains("mixture"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mixing_expression_covariate_registered() {
+    // #980: a covariate used only in the mixing expression (logit) must land in
+    // referenced_covariates so the data reader loads its column — else it silently
+    // reads 0 and the covariate-dependent mixing degrades to intercept-only (the
+    // #765 trap, already fixed for the scaling / error-selector / init blocks).
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "WT"),
+        "mixing-expr covariate WT must be registered, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+#[test]
+fn mixnum_assignment_rejected() {
+    // `MIXNUM = …` in [individual_parameters] of an otherwise-valid mixture model.
+    let src = MIXTURE_2CLASS.replace("  V = TVV", "  V = TVV\n  MIXNUM = 2");
+    let err = parse_model_string(&src).expect_err("assigning MIXNUM must be rejected");
+    assert!(
+        err.contains("MIXNUM") && err.contains("reserved"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn mixture_nsub_below_two_rejected() {
+    let src = MIXTURE_2CLASS.replace("nsub = 2", "nsub = 1");
+    let err = parse_model_string(&src).expect_err("nsub < 2 must be rejected");
+    assert!(err.contains("nsub") && err.contains(">= 2"), "got: {err}");
+}
+
+#[test]
+fn mixture_missing_mixing_expr_rejected() {
+    // Declare 3 classes but only supply logit(1); logit(2) is missing.
+    let src = MIXTURE_2CLASS.replace("nsub = 2", "nsub = 3");
+    let err = parse_model_string(&src).expect_err("missing class-2 mixing expr must be rejected");
+    assert!(err.contains("missing mixing expression"), "got: {err}");
+}
+
+#[test]
+fn mixture_mixing_expr_with_eta_rejected() {
+    let src = MIXTURE_2CLASS.replace("logit(1) = MIXL + BWT*WT", "logit(1) = MIXL + ETA_CL");
+    let err = parse_model_string(&src).expect_err("eta in mixing expr must be rejected");
+    assert!(err.contains("eta"), "got: {err}");
+}
+
+#[test]
+fn mixture_override_unknown_name_rejected() {
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_NOPE ~ 0.4");
+    let err = parse_model_string(&src).expect_err("override of unknown eta must be rejected");
+    assert!(err.contains("ETA_NOPE"), "got: {err}");
+}
+
+#[test]
+fn mixture_override_of_base_class_rejected() {
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(1) ETA_CL ~ 0.4");
+    let err = parse_model_string(&src).expect_err("class-1 override must be rejected");
+    assert!(err.contains("class 1 is the base"), "got: {err}");
+}
+
+#[test]
+fn mixture_mixed_logit_and_prob_forms_rejected() {
+    // K=3 with logit(1) and p(2) — forms must not be mixed.
+    let src = MIXTURE_2CLASS
+        .replace("nsub = 2", "nsub = 3")
+        .replace("logit(1) = MIXL + BWT*WT", "logit(1) = MIXL\n  p(2) = 0.3");
+    let err = parse_model_string(&src).expect_err("mixed forms must be rejected");
+    assert!(err.contains("cannot mix"), "got: {err}");
+}
+
+#[test]
+fn fit_on_mixture_model_rejects_missing_mixture_params() {
+    // Custom init_params with mixture: None (e.g. rebuilt from a FitResult) must
+    // be rejected rather than silently running the single-population objective.
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let pop = crate::types::Population {
+        subjects: vec![],
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut params = model.default_params.clone();
+    params.mixture = None;
+    let opts = crate::types::FitOptions::default();
+    let err = crate::api::fit(&model, &pop, &params, &opts)
+        .expect_err("mixture model with mixture: None params must be rejected");
+    assert!(
+        err.contains("per-class Omega/Sigma") && err.contains("init_params.mixture"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn fit_on_mixture_model_rejects_unsupported_method() {
+    // FOCE/FOCEI, SAEM, Bayes, and IMP objective-evaluation estimate/evaluate a
+    // mixture (#985); the remaining estimators (here Gauss-Newton) must still
+    // error clearly rather than silently ignoring the mixture structure. The
+    // method guard fires before any subject is touched, so an empty population
+    // suffices.
+    let model = parse_model_string(MIXTURE_2CLASS).expect("mixture model parses");
+    let pop = crate::types::Population {
+        subjects: vec![],
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let params = model.default_params.clone();
+    let opts = crate::types::FitOptions {
+        method: crate::types::EstimationMethod::FoceGn,
+        ..crate::types::FitOptions::default()
+    };
+    let err = crate::api::fit(&model, &pop, &params, &opts)
+        .expect_err("Gauss-Newton on a mixture model must be rejected");
+    assert!(
+        err.contains("mixture") && err.contains("FOCE"),
+        "got: {err}"
+    );
+}
+
+/// Helper: parse a full model whose `[individual_parameters]` body is `indiv`,
+/// returning the raw `Result` so rejection tests can inspect the error. Mirrors
+/// [`minimal_model_with_indiv`] but does not unwrap.
+fn minimal_model_str_result(indiv: &str) -> Result<crate::types::CompiledModel, String> {
+    let model_str = format!(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    );
+    parse_model_string(&model_str)
+}
+
+// ── Phase 2: per-class Omega/Sigma numeric params + packing round-trip (#977) ──
+
+/// 2-class, 2-eta model. Class 2 overrides only `omega(2) ETA_CL` and
+/// `sigma(2) EPS` — `ETA_V` is *not* overridden, so it must track the base.
+const MIXTURE_2ETA: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.2
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.4
+  sigma(2) EPS ~ 0.09
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+#[test]
+fn mixture_params_built_from_overrides() {
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let mp = model
+        .default_params
+        .mixture
+        .as_ref()
+        .expect("mixture params");
+    assert_eq!(mp.omega.len(), 2);
+    assert_eq!(mp.sigma.len(), 2);
+    // Class 1 == base.
+    assert!((mp.omega[0].matrix[(0, 0)] - 0.1).abs() < 1e-12);
+    assert!((mp.omega[0].matrix[(1, 1)] - 0.2).abs() < 1e-12);
+    // Class 2: ETA_CL overridden to 0.4, ETA_V tracks base 0.2.
+    assert!((mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-12);
+    assert!((mp.omega[1].matrix[(1, 1)] - 0.2).abs() < 1e-12);
+    // Sigma stored on SD scale: base EPS = sqrt(0.01) = 0.1; class-2 = sqrt(0.09) = 0.3.
+    assert!((mp.sigma[0].values[0] - 0.1).abs() < 1e-12);
+    assert!((mp.sigma[1].values[0] - 0.3).abs() < 1e-12);
+    // Override addresses: class index 1 (0-based), eta/sigma index 0.
+    assert_eq!(mp.omega_override_addr, vec![(1, 0)]);
+    assert_eq!(mp.sigma_override_addr, vec![(1, 0)]);
+    assert_eq!(mp.omega_override_fixed, vec![false]);
+    assert_eq!(mp.sigma_override_fixed, vec![false]);
+}
+
+#[test]
+fn mixture_packed_len_counts_overrides() {
+    use crate::estimation::parameterization::{packed_fixed_mask, packed_len};
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let p = &model.default_params;
+    // 4 theta + 2 omega diag + 1 sigma + 2 mixture overrides = 9.
+    assert_eq!(packed_len(p), 9);
+    assert_eq!(packed_fixed_mask(p).len(), packed_len(p));
+}
+
+#[test]
+fn mixture_pack_unpack_roundtrip() {
+    use crate::estimation::parameterization::{pack_params, unpack_params};
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let p = &model.default_params;
+    let v = pack_params(p);
+    assert_eq!(v.len(), 9);
+    let rt = unpack_params(&v, p);
+    let v2 = pack_params(&rt);
+    assert_eq!(v.len(), v2.len());
+    for (a, b) in v.iter().zip(&v2) {
+        assert!(
+            (a - b).abs() < 1e-12,
+            "pack∘unpack∘pack not identity: {a} vs {b}"
+        );
+    }
+    // Numeric per-class values survive the round trip.
+    let mp = rt.mixture.as_ref().expect("mixture survives unpack");
+    assert!(
+        (mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10,
+        "class-2 ETA_CL override"
+    );
+    assert!(
+        (mp.omega[1].matrix[(1, 1)] - 0.2).abs() < 1e-10,
+        "class-2 ETA_V tracks base"
+    );
+    assert!(
+        (mp.sigma[1].values[0] - 0.3).abs() < 1e-10,
+        "class-2 EPS override"
+    );
+    assert!(
+        (mp.omega[0].matrix[(0, 0)] - 0.1).abs() < 1e-10,
+        "class-1 == base"
+    );
+}
+
+#[test]
+fn mixture_unpack_tracks_perturbed_base() {
+    // Perturbing the *base* ETA_V variance in the packed vector must flow into
+    // class 2 (which does not override ETA_V), while class 2's overridden ETA_CL
+    // stays put. This is the core Phase-2 semantic: non-overridden entries track
+    // the base.
+    use crate::estimation::parameterization::{coordinate_names, pack_params, unpack_params};
+    let model = parse_model_string(MIXTURE_2ETA).expect("parses");
+    let p = &model.default_params;
+    let names = coordinate_names(p);
+    let etav_idx = names
+        .iter()
+        .position(|n| n == "ETA_V")
+        .expect("ETA_V coord");
+    let mut v = pack_params(p);
+    // Base ETA_V is packed as ln(sqrt(var)); set var := 0.5 → chol_diag = sqrt(0.5).
+    v[etav_idx] = 0.5_f64.sqrt().ln();
+    let rt = unpack_params(&v, p);
+    // Base updated.
+    assert!(
+        (rt.omega.matrix[(1, 1)] - 0.5).abs() < 1e-10,
+        "base ETA_V perturbed"
+    );
+    let mp = rt.mixture.as_ref().unwrap();
+    // Class 2 ETA_V tracks the new base; ETA_CL override unchanged.
+    assert!(
+        (mp.omega[1].matrix[(1, 1)] - 0.5).abs() < 1e-10,
+        "class-2 ETA_V tracks base"
+    );
+    assert!(
+        (mp.omega[1].matrix[(0, 0)] - 0.4).abs() < 1e-10,
+        "class-2 ETA_CL override held"
+    );
+}
+
+#[test]
+fn mixture_fixed_override_pinned_in_mask() {
+    use crate::estimation::parameterization::{coordinate_names, packed_fixed_mask};
+    let src = MIXTURE_2ETA.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4 FIX");
+    let model = parse_model_string(&src).expect("parses");
+    let p = &model.default_params;
+    let mp = p.mixture.as_ref().unwrap();
+    assert_eq!(mp.omega_override_fixed, vec![true]);
+    // The FIX flag must land at the override's packed coordinate.
+    let names = coordinate_names(p);
+    let mask = packed_fixed_mask(p);
+    let mix_idx = names
+        .iter()
+        .position(|n| n == "ETA_CL_MIX2")
+        .expect("mixture coord name");
+    assert!(
+        mask[mix_idx],
+        "fixed omega override must be pinned in the mask"
+    );
+}
+
+#[test]
+fn mixture_negative_override_rejected() {
+    let src = MIXTURE_2ETA.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ -0.4");
+    let err = parse_model_string(&src).expect_err("negative override must be rejected");
+    assert!(err.contains("non-negative"), "got: {err}");
+}
+
+#[test]
+fn mixture_duplicate_override_rejected() {
+    let src = MIXTURE_2ETA.replace(
+        "omega(2) ETA_CL ~ 0.4",
+        "omega(2) ETA_CL ~ 0.4\n  omega(2) ETA_CL ~ 0.6",
+    );
+    let err = parse_model_string(&src).expect_err("duplicate override must be rejected");
+    assert!(err.contains("duplicate"), "got: {err}");
+}
+
+#[test]
+fn mixture_block_omega_override_rejected() {
+    // Per-class omega override requires a diagonal base omega.
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  block_omega (ETA_CL, ETA_V) = [0.1, 0.01, 0.2]
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ 0.4
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = 10 * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let err = parse_model_string(src).expect_err("block-omega override must be rejected");
+    assert!(err.contains("diagonal base omega"), "got: {err}");
+}
+
+/// #958 (second reported item): the parse-time error for an unknown `gradient` value
+/// advertised `'ad'`, but no fit accepts it — the Enzyme AD path was retired in #428 and
+/// the engine rejects `gradient = ad` at fit time. So a user who mistyped the option was
+/// pointed at a setting that cannot work. The message now lists only what a fit will take.
+/// `ad` itself still parses, so requesting it deliberately still reaches the engine's
+/// specific "no longer supported, use auto or fd" error rather than a generic one.
+#[test]
+fn unknown_gradient_value_does_not_advertise_the_retired_ad_route() {
+    let err = parse_model_string(
+        "[parameters]\n  theta CL(1.0,0.1,10)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = CL * exp(ETA_CL)\n  V = 10\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n[fit_options]\n  gradient = enzyme\n",
+    )
+    .expect_err("an unknown `gradient` value must be rejected at parse time");
+    assert!(
+        err.contains("expected 'auto' or 'fd'"),
+        "message must list only the values a fit accepts, got: {err}"
+    );
+    assert!(
+        !err.contains("'ad'"),
+        "the retired AD route must not be advertised, got: {err}"
+    );
+
+    // `ad` still parses — the engine, not the parser, owns its retirement message.
+    assert!(
+        parse_model_string(
+            "[parameters]\n  theta CL(1.0,0.1,10)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = CL * exp(ETA_CL)\n  V = 10\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n[fit_options]\n  gradient = ad\n",
+        )
+        .is_ok(),
+        "`gradient = ad` must still parse so the engine can emit its own retirement error"
+    );
+}
+
+// ── Residual weighting: `weight = <expr>` (issue #1029) ──────────────────────
+//
+// The modifier desugars into a #484 per-observation residual magnitude on the
+// *additive* sigma slot: weighting is defined as "divide DV and the prediction
+// by the weight", so the additive loading picks up a level block `W` and the
+// proportional loading is untouched (a common scale factor cancels out of a
+// constant-CV error).
+
+/// Study-as-subject MBMA model: one trial-level mean per row, weighted by its
+/// reported standard error. `error_block` overrides just the `[error_model]`
+/// body so negative tests can vary one line.
+fn weighted_model_str(sigma_block: &str, error_block: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{}
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+
+[covariates]
+  WPSE continuous
+  NARM continuous
+",
+        sigma_block, error_block
+    )
+}
+
+/// Single sigma, so `additive(ADD_ERR)` lands on slot 0. A single-endpoint
+/// `[error_model]` consumes its sigmas positionally from the `[parameters]`
+/// declaration order (#1001), so the fixture has to declare exactly the sigmas
+/// the error block names, in the order it names them.
+const W_SIGMA_ADD: &str = "  sigma ADD_ERR ~ 1.0 (variance) FIX\n";
+/// Proportional first, additive second — `combined`'s argument order.
+const W_SIGMA_COMBINED: &str = "  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 1.0 (variance) FIX\n";
+/// Proportional only, for the `weight =`-on-proportional rejection.
+const W_SIGMA_PROP: &str = "  sigma PROP_ERR ~ 0.04\n";
+
+/// The additive-slot fixture, the shape most of these tests want.
+fn weighted_add_model_str(error_block: &str) -> String {
+    weighted_model_str(W_SIGMA_ADD, error_block)
+}
+
+#[test]
+fn test_weight_modifier_scales_the_additive_slot() {
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+    let rm = model
+        .ruv_magnitude
+        .as_ref()
+        .expect("`weight =` compiles to a residual magnitude");
+    assert!(rm.is_active());
+    assert_eq!(rm.per_sigma.len(), 1);
+    assert!(
+        rm.per_sigma[0].is_some(),
+        "additive slot carries the weight"
+    );
+
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("WPSE".to_string(), 2.5)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
+    assert!((m[0] - 2.5).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_on_combined_leaves_the_proportional_slot_bare() {
+    // `W * (f/W) = f`: a common scale factor cancels out of the proportional
+    // (constant-CV) loading, so only the additive slot may be weighted.
+    let model = parse_model_string(&weighted_model_str(
+        W_SIGMA_COMBINED,
+        "  DV ~ combined(PROP_ERR, ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    assert_eq!(rm.per_sigma.len(), 2);
+    assert!(rm.per_sigma[0].is_none(), "proportional slot stays bare");
+    assert!(
+        rm.per_sigma[1].is_some(),
+        "additive slot carries the weight"
+    );
+
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("WPSE".to_string(), 4.0)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
+    assert!((m[0] - 1.0).abs() < 1e-12, "got {m:?}");
+    assert!((m[1] - 4.0).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_accepts_an_expression_with_its_own_parens() {
+    // The weighted-logit MBMA transform: `weight = 1/sqrt(N)`. The peel must not
+    // stop at the expression's own closing paren.
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = 1.0 / sqrt(NARM)",
+    ))
+    .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 16.0)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
+    assert!((m[0] - 0.25).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_composes_with_a_custom_magnitude() {
+    // `weight =` multiplies whatever magnitude expression the slot already
+    // carries (#484) rather than replacing it.
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR * 3.0) weight = WPSE",
+    ))
+    .unwrap();
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let theta = vec![0.2, 10.0];
+    let cov: std::collections::HashMap<String, f64> =
+        [("WPSE".to_string(), 2.0)].into_iter().collect();
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
+    assert!((m[0] - 6.0).abs() < 1e-12, "got {m:?}");
+}
+
+#[test]
+fn test_weight_modifier_rejected_on_proportional_error() {
+    let err = expect_parse_err(&weighted_model_str(
+        W_SIGMA_PROP,
+        "  DV ~ proportional(PROP_ERR) weight = WPSE",
+    ));
+    assert!(
+        err.contains("no effect on a purely proportional"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_weight_modifier_rejected_with_per_cmt_error_models() {
+    let err = expect_parse_err(&pkpd_model_str(
+        "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD) weight = WT",
+    ));
+    assert!(err.contains("not supported with per-CMT"), "got: {err}");
+}
+
+#[test]
+fn test_weight_modifier_rejected_inside_a_covariate_selected_block() {
+    let err = expect_parse_err(&weighted_add_model_str(
+        "  if (WPSE > 1.0) { DV ~ additive(ADD_ERR) weight = WPSE }\n  else { DV ~ additive(ADD_ERR) }",
+    ));
+    assert!(
+        err.contains("not supported inside a covariate-selected"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_weight_modifier_rejects_an_undeclared_covariate() {
+    // Inherits #484's guard: an undeclared name would silently evaluate to 0
+    // and collapse every observation's weight to zero.
+    let err = expect_parse_err(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = NOTACOV",
+    ));
+    assert!(err.contains("undeclared covariate"), "got: {err}");
+}
+
+#[test]
+fn test_weight_modifier_rejects_an_empty_right_hand_side() {
+    let err = expect_parse_err(&weighted_add_model_str("  DV ~ additive(ADD_ERR) weight ="));
+    assert!(
+        err.contains("no expression on its right-hand side"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_weight_modifier_rejects_eta_dependence() {
+    // A weight is a property of the datum, never of the individual.
+    let err = expect_parse_err(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = exp(ETA_CL)",
+    ));
+    assert!(!err.is_empty(), "an eta-dependent weight must not parse");
+}
+
+#[test]
+fn test_split_weight_modifier_ignores_a_weight_inside_the_sigma_parens() {
+    // A covariate literally named `WEIGHT` inside a magnitude expression is at
+    // paren depth 1 and must not be mistaken for the modifier.
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD * WEIGHT)",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
+    assert_eq!(stmt, "DV ~ additive(ADD * WEIGHT)");
+    assert!(w.is_none());
+}
+
+#[test]
+fn test_split_weight_modifier_ignores_a_comparison() {
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD) weight == 2",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
+    assert_eq!(stmt, "DV ~ additive(ADD) weight == 2");
+    assert!(w.is_none());
+}
+
+#[test]
+fn test_split_weight_modifier_ignores_a_longer_identifier() {
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD) weighted = 2",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
+    assert_eq!(stmt, "DV ~ additive(ADD) weighted = 2");
+    assert!(w.is_none());
+}
+
+#[test]
+fn test_split_weight_modifier_requires_a_statement_before_it() {
+    let err = super::split_weight_modifier(
+        "weight = WPSE",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("must follow a `DV ~ TYPE(...)` statement"),
+        "got: {err}"
+    );
+}
+
+/// A covariate that appears *only* in a `weight =` / magnitude expression is
+/// still model-referenced. Without it in `referenced_covariates`,
+/// `Population::prune_irrelevant_tv_covariates` drops the per-observation
+/// snapshots for a subject whose only time-varying covariate is that one, and
+/// every row is silently scored with the subject's *first* weight — the whole
+/// point of the feature, lost with no diagnostic (#484 / #1029).
+#[test]
+fn test_weight_covariate_is_registered_as_model_referenced() {
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+    assert!(
+        model.referenced_covariates.contains(&"WPSE".to_string()),
+        "got: {:?}",
+        model.referenced_covariates
+    );
+}
+
+#[test]
+fn test_weight_covariate_survives_tv_snapshot_pruning() {
+    use crate::types::{Population, Subject};
+
+    let model = parse_model_string(&weighted_add_model_str(
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ))
+    .unwrap();
+
+    // One subject whose only time-varying column is the weight.
+    let snap = |w: f64| -> std::collections::HashMap<String, f64> {
+        [("WPSE".to_string(), w)].into_iter().collect()
+    };
+    let subject = Subject {
+        id: "1".to_string(),
+        obs_times: vec![1.0, 2.0],
+        observations: vec![9.0, 6.0],
+        obs_cmts: vec![1, 1],
+        cens: vec![0, 0],
+        covariates: snap(0.5),
+        obs_covariates: vec![snap(0.5), snap(1.5)],
+        ..Default::default()
+    };
+    let mut pop = Population {
+        subjects: vec![subject],
+        covariate_names: vec!["WPSE".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+
+    let pruned = pop.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+    assert_eq!(pruned, 0, "the weight covariate is model-referenced");
+    assert_eq!(pop.subjects[0].obs_cov(1).get("WPSE"), Some(&1.5));
+}
+
+/// `weight =` desugars into the sigma argument (`ADD_ERR` becomes
+/// `(ADD_ERR) * (WPSE)`), and #1001's positional sigma-order check reads the
+/// sigma name back *out* of that rewritten argument. The two must not blind each
+/// other: an order mismatch under a weighted model still has to be reported as
+/// an order mismatch, naming the sigma the user wrote, rather than degrading
+/// into "references multiple sigmas" — or, worse, passing.
+#[test]
+fn test_weight_modifier_still_reports_a_sigma_order_mismatch() {
+    let err = expect_parse_err(&weighted_model_str(
+        "  sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 1.0 (variance) FIX\n",
+        "  DV ~ additive(ADD_ERR) weight = WPSE",
+    ));
+    assert!(
+        err.contains("consumed positionally") && err.contains("ADD_ERR"),
+        "got: {err}"
+    );
+}
+
+/// The weight expression itself must not name a sigma — that would make the
+/// desugared argument reference two, which no positional slot can express.
+#[test]
+fn test_weight_modifier_rejects_a_sigma_in_the_weight_expression() {
+    let err = expect_parse_err(&weighted_model_str(
+        "  sigma ADD_ERR ~ 1.0 (variance) FIX\n  sigma PROP_ERR ~ 0.04\n",
+        "  DV ~ additive(ADD_ERR) weight = PROP_ERR",
+    ));
+    assert!(err.contains("multiple sigmas"), "got: {err}");
+}
+
+// ── #1031: sample-size-weighted IOV (`kappa K ~ γ² weight = W`) ─────────────
+//
+// `κ_ik ~ N(0, Ω_IOV / W_ik)` — the between-treatment-arm variability of a
+// longitudinal MBMA, whose arm-level effect scales with the number of subjects
+// behind the arm. The engine applies it by rewriting every reference to the
+// kappa as `K / sqrt(W)`, which is the same distribution and the same model the
+// modifier replaces.
+
+/// One arm-level random effect on CL, weighted by the arm size `NARM`.
+/// `kappa_line` and `extra_block` are varied by the negative tests.
+fn weighted_kappa_model_str(kappa_line: &str, extra_block: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{kappa_line}
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+{extra_block}
+[fit_options]
+  iov_column = OCC
+"
+    )
+}
+
+/// The individual parameter a weighted kappa feeds must come out identical to
+/// the hand-written `KAPPA / sqrt(NARM)` form — that equivalence is the whole
+/// implementation, and it is what lets every estimator downstream stay unaware
+/// of the feature.
+#[test]
+fn test_weighted_kappa_divides_the_kappa_by_sqrt_of_the_weight() {
+    let weighted = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let plain =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    let theta = weighted.default_params.theta.clone();
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 4.0)].into_iter().collect();
+    // Extended η = [ETA_CL, KAPPA_CL]. κ = 0.8 at NARM = 4 must act as κ = 0.4.
+    let got = (weighted.pk_param_fn)(&theta, &[0.1, 0.8], &cov, 0.0);
+    let want = (plain.pk_param_fn)(&theta, &[0.1, 0.4], &cov, 0.0);
+    approx::assert_relative_eq!(got.values[0], want.values[0], max_relative = 1e-12);
+    // ... and it is genuinely scaled, not passed through.
+    let unscaled = (plain.pk_param_fn)(&theta, &[0.1, 0.8], &cov, 0.0);
+    assert!(
+        (got.values[0] - unscaled.values[0]).abs() > 1e-6,
+        "weight had no effect: {got:?} vs {unscaled:?}"
+    );
+}
+
+/// The weight is per *record*, so a covariate that differs between occasions
+/// scales each occasion by its own arm size.
+#[test]
+fn test_weighted_kappa_reads_the_weight_at_the_record() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let theta = model.default_params.theta.clone();
+    let big: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    let small: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 1.0)].into_iter().collect();
+    let cl_big = (model.pk_param_fn)(&theta, &[0.0, 1.0], &big, 0.0).values[0];
+    let cl_small = (model.pk_param_fn)(&theta, &[0.0, 1.0], &small, 0.0).values[0];
+    let tvcl = theta[0];
+    approx::assert_relative_eq!(cl_big, tvcl * (1.0f64 / 10.0).exp(), max_relative = 1e-12);
+    approx::assert_relative_eq!(cl_small, tvcl * 1.0f64.exp(), max_relative = 1e-12);
+}
+
+/// Ω_IOV keeps its declared (unweighted) scale — the γ² a published MBMA
+/// reports. Only the *effect* is divided.
+#[test]
+fn test_weighted_kappa_leaves_omega_iov_on_the_unweighted_scale() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 2.0 (sd) weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let iov = model
+        .default_params
+        .omega_iov
+        .as_ref()
+        .expect("IOV present");
+    approx::assert_relative_eq!(iov.matrix[(0, 0)], 4.0, max_relative = 1e-12);
+}
+
+/// The model carries the weight for reporting: the source text plus an
+/// evaluator, so a fit can print the effective SD `γ/√W` at a typical arm size.
+#[test]
+fn test_weighted_kappa_is_reported_on_the_compiled_model() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    assert!(model.has_weighted_kappa());
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    assert_eq!(w.expr, "NARM");
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 200.0)].into_iter().collect();
+    approx::assert_relative_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        max_relative = 1e-12
+    );
+}
+
+/// An unweighted IOV model must not start carrying weight metadata — the
+/// `kappa_weights` slots exist but stay empty.
+#[test]
+fn test_unweighted_kappa_carries_no_weight() {
+    let model =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    assert!(!model.has_weighted_kappa());
+    assert!(model.kappa_weights.iter().all(|w| w.is_none()));
+}
+
+/// A covariate named only by a weight expression is still model-referenced:
+/// without it in `referenced_covariates` the per-observation snapshots are
+/// pruned and every occasion silently reads the subject's first arm size
+/// (the #484 / #1029 trap).
+#[test]
+fn test_weighted_kappa_registers_its_covariate() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    assert!(
+        model.referenced_covariates.contains(&"NARM".to_string()),
+        "got: {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Weighting a kappa must not cost the *BSV* eta sharing its `exp(...)` its
+/// mu-reference — that would silently drop SAEM/IMP to the general θ step.
+#[test]
+fn test_weighted_kappa_preserves_the_bsv_mu_reference() {
+    let weighted = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let plain =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    let plain_ref = plain.mu_refs.get("ETA_CL").expect("baseline mu-ref");
+    let weighted_ref = weighted
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives the kappa rewrite");
+    assert_eq!(weighted_ref.theta_name, plain_ref.theta_name);
+    assert_eq!(weighted_ref.log_transformed, plain_ref.log_transformed);
+}
+
+#[test]
+fn test_weighted_kappa_rejects_a_random_effect_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = exp(ETA_CL)",
+        "",
+    ));
+    assert!(err.contains("references a random effect"), "got: {err}");
+}
+
+#[test]
+fn test_weighted_kappa_rejects_an_empty_right_hand_side() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight =",
+        "",
+    ));
+    assert!(
+        err.contains("no expression on its right-hand side"),
+        "got: {err}"
+    );
+}
+
+/// A weight on anything but a `kappa` is rejected rather than ignored: the
+/// unanchored declaration regexes would otherwise drop it silently, which is
+/// the failure mode the feature exists to remove.
+#[test]
+fn test_weight_modifier_rejected_on_a_non_kappa_declaration() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09\n  omega ETA_V ~ 0.04 weight = NARM",
+        "",
+    ));
+    assert!(
+        err.contains("only supported on a `kappa NAME ~ VALUE` declaration"),
+        "got: {err}"
+    );
+}
+
+/// A `block_kappa` cannot carry a weight: the divisor would have to apply to
+/// the block's covariances too for the matrix to stay a valid one.
+#[test]
+fn test_weight_modifier_rejected_on_block_kappa() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.01, 0.04] weight = NARM",
+        "",
+    ));
+    assert!(err.contains("`block_kappa` cannot carry one"), "got: {err}");
+}
+
+/// Only `[individual_parameters]` applies the scaling, so a weighted kappa
+/// named anywhere else would read as the *unweighted* κ — a plausible wrong
+/// answer. Reject it instead.
+#[test]
+fn test_weighted_kappa_rejected_outside_individual_parameters() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.contains("references `KAPPA_CL`, a kappa declared with `weight = ...`"),
+        "got: {err}"
+    );
+}
+
+/// The unweighted kappa keeps its freedom to appear elsewhere.
+#[test]
+fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
+    parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ))
+    .expect("an unweighted kappa is unaffected by the #1031 guard");
+}
+
+/// A weighted kappa that no individual parameter references scales nothing —
+/// but the fit still reports `→ SD = γ/√N`, and a covariate named *only* by the
+/// weight never reaches `referenced_covariates`, so the datareader skips the
+/// column and the data check then blames a present column for reading 0.
+#[test]
+fn test_weighted_kappa_must_be_referenced_in_individual_parameters() {
+    let model_str = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "",
+    );
+    let err = expect_parse_err(&model_str);
+    assert!(
+        err.contains("`KAPPA_V`") && err.contains("never referenced in [individual_parameters]"),
+        "got: {err}"
+    );
+}
+
+/// The same guard must not fire on a kappa that *is* referenced, including one
+/// reached only from inside a conditional branch.
+#[test]
+fn test_weighted_kappa_referenced_in_a_branch_is_not_inert() {
+    let model_str = r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  if (NARM > 1) {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    parse_model_string(model_str).expect("a kappa referenced inside a branch is not inert");
+}
+
+/// An *estimated* theta in the weight moves the divisor during the outer
+/// optimisation, so the up-front `E_KAPPA_WEIGHT_NONPOSITIVE` check — evaluated
+/// at the initial θ — certifies nothing: a weight that starts positive and
+/// crosses zero mid-fit divides an individual parameter by zero silently.
+#[test]
+fn test_weighted_kappa_rejects_an_estimated_theta_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = TVCL * NARM",
+        "",
+    ));
+    assert!(
+        err.contains("references estimated theta(s) `TVCL`"),
+        "got: {err}"
+    );
+}
+
+/// A FIXed theta is a known constant, so it is as safe as a covariate column
+/// and stays allowed.
+#[test]
+fn test_weighted_kappa_allows_a_fixed_theta_in_the_weight() {
+    let model_str = weighted_kappa_model_str(
+        "  theta NSCALE(2.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = NSCALE * NARM",
+        "",
+    );
+    let model = parse_model_string(&model_str).expect("a FIXed theta in the weight is allowed");
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    // 2.0 (NSCALE, FIXed) × 100 (NARM) = 200.
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    assert_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        "the fixed theta enters the weight"
+    );
+}
+
+/// The "outside `[individual_parameters]`" error names the block the author
+/// wrote (`event_model armA`), not the bare instance label (`armA`), which on
+/// its own reads as a block name that does not exist. Every *named* block type
+/// is feature-gated, so this is the survival build's case.
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_outside_error_names_the_block_type() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.contains("[event_model armA] references `KAPPA_CL`"),
+        "got: {err}"
+    );
+}
+
+/// Mu-reference detection runs on the *rewritten* statements, so the declared
+/// `weight = W` form and the hand-written `K / sqrt(W)` agree on their mu-refs
+/// exactly as they agree on the objective. Detecting on a pre-rewrite snapshot
+/// registered a kappa mu-ref the rewritten model does not satisfy — which
+/// `method = bayes` then rejects while accepting the hand-written twin.
+#[test]
+fn test_weighted_kappa_mu_refs_match_the_hand_written_form() {
+    let declared = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let hand_written = parse_model_string(
+        &weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")
+            .replace("ETA_CL + KAPPA_CL", "ETA_CL + KAPPA_CL / sqrt(NARM)"),
+    )
+    .unwrap();
+    assert_eq!(
+        declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        hand_written.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "declared and hand-written forms must agree on kappa mu-refs"
+    );
+    assert!(
+        !declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "a weighted kappa is not a bare Eta after the rewrite, so it is not a mu-ref"
+    );
+}
+
+/// The order-dependent case the pre-rewrite snapshot got backwards: in
+/// `TVCL * exp(KAPPA_CL) * exp(ETA_CL)` the left-to-right `or_else` returns the
+/// *kappa* index on the snapshot, losing the BSV eta's mu-ref that survives the
+/// rewrite — and with it SAEM/IMP's closed-form θ step.
+#[test]
+fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
+    let model_str = weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", "").replace(
+        "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        "CL = TVCL * exp(KAPPA_CL) * exp(ETA_CL)",
+    );
+    let model = parse_model_string(&model_str).unwrap();
+    let mu = model
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives a kappa written to its left");
+    assert_eq!(mu.theta_name, "TVCL");
+    assert!(mu.log_transformed);
+}
+
+#[test]
+fn test_split_weight_modifier_peels_a_kappa_declaration() {
+    let (stmt, w) = super::split_weight_modifier(
+        "kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM",
+        "parameters",
+        "a `kappa NAME ~ VALUE` declaration",
+    )
+    .unwrap();
+    assert_eq!(stmt, "kappa KAPPA_EMAX ~ 2.0 (sd)");
+    assert_eq!(w.as_deref(), Some("NARM"));
+}
+
+/// `[covariate_nn]` inputs must count as referenced covariates.
+///
+/// They are named in the block, not in any expression, so no statement walker sees them.
+/// If they are not registered here the model does not treat them as required data
+/// columns, `Population::prune_irrelevant_tv_covariates` discards their trajectories, and
+/// the network silently reads each subject's baseline value for the whole record.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_inputs_are_registered_as_referenced_covariates() {
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [ZCOV, WT]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("DCM fixture parses");
+
+    for name in ["ZCOV", "WT"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "NN input {name} must be a referenced covariate, got {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+/// The regression proper: a network whose input is time-varying must still produce
+/// time-varying predictions **after the fit pipeline has pruned covariates**.
+///
+/// Routing through `prune_irrelevant_tv_covariates` is the whole point. That is the call
+/// `api::fit` makes, and it is where the bug lived: a subject constructed by hand keeps
+/// its `obs_covariates` and predicts correctly whether or not the fix is present, so a
+/// test that skips the prune passes either way and proves nothing. (Verified: without the
+/// fix this test fails only when the prune is included.)
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_reads_time_varying_covariate_values() {
+    use crate::types::{DoseEvent, Subject};
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [ZCOV]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("DCM fixture parses");
+
+    let times = vec![1.0, 4.0, 8.0, 16.0, 24.0];
+    // `obs_covariates` carries the per-observation snapshot the engine reads.
+    let make = |zcov: &[f64]| -> Subject {
+        let per_obs: Vec<HashMap<String, f64>> = zcov
+            .iter()
+            .map(|&z| HashMap::from([("ZCOV".to_string(), z)]))
+            .collect();
+        Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; times.len()],
+            obs_cmts: vec![1; times.len()],
+            covariates: HashMap::from([("ZCOV".to_string(), zcov[0])]),
+            dose_covariates: vec![HashMap::from([("ZCOV".to_string(), zcov[0])])],
+            obs_covariates: per_obs,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; times.len()],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+
+    // Same baseline, but one subject's covariate swings hard after the second sample.
+    let mut pop = crate::types::Population {
+        subjects: vec![
+            make(&[-1.0, -1.0, -1.0, -1.0, -1.0]),
+            make(&[-1.0, -1.0, 1.5, 1.5, 1.5]),
+        ],
+        covariate_names: vec!["ZCOV".to_string()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    assert!(
+        pop.subjects[1].has_tv_covariates(),
+        "fixture must present time-varying covariates before pruning"
+    );
+
+    // The step that broke it: covariates the model does not reference are dropped here.
+    pop.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+
+    let constant = &pop.subjects[0];
+    let varying = &pop.subjects[1];
+    let theta = &model.default_params.theta;
+    let mut scratch = crate::pk::EventPkParams::default();
+    let p_const =
+        crate::pk::compute_predictions_with_tv_into(&model, constant, theta, &[0.0], &mut scratch);
+    let p_vary =
+        crate::pk::compute_predictions_with_tv_into(&model, varying, theta, &[0.0], &mut scratch);
+
+    // The first two samples share a covariate value, so they must agree exactly; the
+    // later ones must not, or the network never saw the change.
+    for j in 0..2 {
+        assert!(
+            (p_const[j] - p_vary[j]).abs() < 1e-12,
+            "obs {j} precedes the covariate change and must be identical"
+        );
+    }
+    let diverged = (2..times.len()).any(|j| (p_const[j] - p_vary[j]).abs() > 1e-9);
+    assert!(
+        diverged,
+        "predictions after the covariate change are identical ({p_const:?} vs {p_vary:?}); \
+         the NN is reading a frozen baseline covariate instead of the trajectory"
+    );
+}
+
+/// A `[covariate_nn]` input that the data does not carry must be a hard error, not a
+/// silent zero.
+///
+/// `NamedMlpMapper::forward_raw` zero-fills any input it cannot find, matching the
+/// expression evaluator's `unwrap_or(0.0)`. On the hot path that is the right shape --
+/// it runs per prediction and must not allocate an error -- but it means a typo'd or
+/// unavailable input degenerates the network to a constant with nothing to show for it.
+/// The guard is `check_covariates` at fit time, which only sees NN inputs because they
+/// are registered as referenced covariates.
+///
+/// `TIME` is the case a user is most likely to reach for, wanting a time-varying
+/// parameter. It is a reserved column rather than a covariate, so it is not in the
+/// covariate map and must be rejected like any other absent input.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_input_missing_from_data_is_rejected() {
+    use crate::types::{DoseEvent, Population, Subject};
+    use std::collections::HashMap;
+
+    let parse = |inputs: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [{inputs}]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    let population = Population {
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::from([("WT".to_string(), 70.0)]),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    // A typo'd covariate name.
+    let diags = crate::api::check_covariates(&parse("ZCOV"), &population);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("ZCOV")),
+        "an NN input absent from the data must be rejected, got {diags:?}"
+    );
+
+    // `TIME` is not a covariate column, so it must be rejected too rather than
+    // silently zero-filling the network's only input.
+    let diags = crate::api::check_covariates(&parse("TIME"), &population);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("TIME")),
+        "`inputs = [TIME]` must be rejected, got {diags:?}"
+    );
+
+    // A present covariate must not be flagged.
+    let diags = crate::api::check_covariates(&parse("WT"), &population);
+    assert!(
+        diags.is_empty(),
+        "a present covariate must pass, got {diags:?}"
+    );
+}
+
+/// `center` / `scale` must reach the network: the forward pass sees `(x - center)/scale`.
+///
+/// Asserted by equivalence rather than by inspecting the mapper's fields — a model
+/// declaring `center`/`scale` must predict identically to one fed the already-normalised
+/// covariate, for the same weights. That pins the transform's direction and its
+/// application point, which reading the stored vectors back would not.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_center_and_scale_normalize_the_inputs() {
+    use std::collections::HashMap;
+
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT]
+{extra}  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    let normalized = build("  center     = [70.0]\n  scale      = [12.0]\n");
+    let raw = build("");
+
+    // Same auto-generated Glorot weights in both (the init is deterministic).
+    let w_norm = &normalized.default_params.theta[2..];
+    let w_raw = &raw.default_params.theta[2..];
+    assert_eq!(
+        w_norm, w_raw,
+        "weight init must be identical across the two fixtures"
+    );
+
+    let nn_norm = &normalized.covariate_nns[0];
+    let nn_raw = &raw.covariate_nns[0];
+
+    // WT = 94 under center 70 / scale 12 is z = 2.0; the un-normalised network must
+    // reproduce it exactly when handed 2.0 directly.
+    let out_norm = nn_norm
+        .mapper
+        .forward_raw(w_norm, &HashMap::from([("WT".to_string(), 94.0)]))
+        .expect("forward");
+    let out_raw = nn_raw
+        .mapper
+        .forward_raw(w_raw, &HashMap::from([("WT".to_string(), 2.0)]))
+        .expect("forward");
+    assert!(
+        (out_norm[0] - out_raw[0]).abs() < 1e-12,
+        "normalised input must equal the pre-normalised one: {out_norm:?} vs {out_raw:?}"
+    );
+
+    // And it must NOT equal the raw network fed the raw value, or nothing happened.
+    let out_unnormalized = nn_raw
+        .mapper
+        .forward_raw(w_raw, &HashMap::from([("WT".to_string(), 94.0)]))
+        .expect("forward");
+    assert!(
+        (out_norm[0] - out_unnormalized[0]).abs() > 1e-9,
+        "declaring center/scale must change the forward pass"
+    );
+}
+
+/// Normalisation is what keeps a `tanh` layer out of saturation.
+///
+/// The motivation for the feature, as a test rather than a claim: at Glorot
+/// initialisation a raw `WT ≈ 70` drives every hidden unit to ±1, so the layer's
+/// derivative collapses and the network is nearly blind to its input. Standardised
+/// inputs leave it responsive. Measured as the spread of the output across the covariate
+/// range — a saturated network barely moves.
+#[cfg(feature = "nn")]
+#[test]
+fn normalization_keeps_the_hidden_layer_responsive() {
+    use std::collections::HashMap;
+
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT]
+{extra}  outputs    = [CL]
+  layers     = [8]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    // Observed weight range, roughly 45-95 kg.
+    let wts = [45.0, 55.0, 65.0, 75.0, 85.0, 95.0];
+    let spread = |model: &crate::types::CompiledModel| -> f64 {
+        let w = &model.default_params.theta[2..];
+        let outs: Vec<f64> = wts
+            .iter()
+            .map(|&x| {
+                model.covariate_nns[0]
+                    .mapper
+                    .forward_raw(w, &HashMap::from([("WT".to_string(), x)]))
+                    .expect("forward")[0]
+            })
+            .collect();
+        outs.iter().cloned().fold(f64::MIN, f64::max)
+            - outs.iter().cloned().fold(f64::MAX, f64::min)
+    };
+
+    let raw_spread = spread(&build(""));
+    let norm_spread = spread(&build("  center     = [70.0]\n  scale      = [15.0]\n"));
+
+    assert!(
+        norm_spread > 10.0 * raw_spread,
+        "standardising the input must leave the network far more responsive across the \
+         covariate range: raw spread {raw_spread:.3e}, normalised {norm_spread:.3e}"
+    );
+}
+
+/// `scale = 0` is a division by zero and must be rejected at parse time, as must a
+/// length that does not match `inputs`.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_rejects_invalid_normalization() {
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT, CRCL]
+{extra}  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = 10.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+    };
+
+    let err = build("  scale      = [12.0, 0.0]\n").expect_err("zero scale must be rejected");
+    assert!(
+        err.contains("scale") && err.contains("CRCL"),
+        "error must name the offending input: {err}"
+    );
+
+    let err = build("  center     = [70.0]\n").expect_err("short center must be rejected");
+    assert!(
+        err.contains("center") && err.contains("2"),
+        "error must report the expected length: {err}"
+    );
+
+    // The identity is always acceptable and matches an undeclared block.
+    build("  center     = [0.0, 0.0]\n  scale      = [1.0, 1.0]\n")
+        .expect("identity normalisation parses");
+}
+
+// ---------------------------------------------------------------------------
+// [covariate_nn] `init`
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nn")]
+fn covariate_nn_init_model_src(init_line: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [4]
+  activation = tanh
+  output = softplus
+{init_line}
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+    )
+}
+
+/// The behaviour `init` exists for: at the model's default parameters the
+/// network emits exactly the declared values, for every subject's covariates.
+///
+/// Checked at two very different covariate vectors, because the whole point of
+/// zeroing the output-layer weight block is that the starting value does not
+/// depend on the inputs. Setting the bias alone would leave a covariate-dependent
+/// `W_L · a_{L-1}` on top, of the same order as the value being set.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_sets_the_starting_outputs_exactly() {
+    use crate::nn::CovariateMapper;
+
+    let model = parse_model_string(&covariate_nn_init_model_src("  init = [1.25, 18.0]\n"))
+        .expect("model with init parses");
+    let theta = model.default_params.theta.clone();
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+
+    for (wt, crcl) in [(70.0, 95.0), (45.0, 150.0)] {
+        let cov = HashMap::from([("WT".to_string(), wt), ("CRCL".to_string(), crcl)]);
+        let out = nn.mapper.forward_raw(w, &cov).expect("forward");
+        assert!(
+            (out[0] - 1.25).abs() < 1e-12,
+            "CL init at WT={wt}: got {}, want 1.25",
+            out[0]
+        );
+        assert!(
+            (out[1] - 18.0).abs() < 1e-12,
+            "V init at WT={wt}: got {}, want 18.0",
+            out[1]
+        );
+    }
+}
+
+/// Without `init` the head starts at `softplus(0) = 0.693` for *every* output —
+/// the behaviour that made a DCM's initial volume 0.69 L. Pinned so the
+/// difference `init` makes is visible in the test suite rather than only in a
+/// changelog entry.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_without_init_starts_every_output_at_softplus_zero() {
+    use crate::nn::CovariateMapper;
+
+    let model = parse_model_string(&covariate_nn_init_model_src("")).expect("model parses");
+    let theta = model.default_params.theta.clone();
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+    let cov = HashMap::from([("WT".to_string(), 70.0), ("CRCL".to_string(), 95.0)]);
+    let out = nn.mapper.forward_raw(w, &cov).expect("forward");
+    // Biases are 0 and W_L is Glorot (not zeroed), so the output is near but not
+    // exactly softplus(0); the point is the *scale* — every output lands around
+    // 0.7 no matter what the parameter means.
+    for &v in &out {
+        assert!(
+            (0.2..2.0).contains(&v),
+            "expected an un-initialised head near softplus(0)=0.693, got {v}"
+        );
+    }
+}
+
+/// `init` must not silently accept a value the head cannot emit — a negative
+/// target under `softplus` would otherwise become a NaN bias and poison every
+/// downstream evaluation.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_rejects_values_outside_the_activation_range() {
+    let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0, -5.0]\n"))
+        .expect_err("a negative softplus target must be rejected");
+    assert!(
+        err.contains("init") && err.contains("softplus"),
+        "error should name the key and the activation: {err}"
+    );
+}
+
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_requires_one_entry_per_output() {
+    let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0]\n"))
+        .expect_err("a short init list must be rejected");
+    assert!(
+        err.contains("one entry per output"),
+        "error should explain the arity: {err}"
+    );
+}
+
+/// `ModelNnGuard::enter_for` must return `None` for a model with no
+/// `[covariate_nn]` blocks — the ambient-outputs slot is left untouched, so the
+/// generic evaluator's `Op::PushNnOutput` arm stays unreachable rather than
+/// reading an empty block.
+///
+/// Deliberately **not** `#[cfg(feature = "nn")]`. There are two `enter_for`
+/// bodies — the real one and a `#[cfg(not(feature = "nn"))]` stub that returns
+/// `None` unconditionally — and only one of them is compiled in any given build.
+/// An ungated test exercises whichever one this build has, so the contract
+/// "a model with no networks declines the guard" is pinned in the base `ci` build
+/// and the `nn` build alike. Gating it would leave the stub untested and let a
+/// future edit give the two bodies different answers.
+#[test]
+fn model_nn_guard_declines_a_model_with_no_networks() {
+    use crate::parser::model_parser::ModelNnGuard;
+    use std::collections::HashMap;
+
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+    let model = parse_model_string(src).expect("plain model parses");
+    // `covariate_nns` is itself an `nn`-gated field, so the premise can only be
+    // stated in the `nn` build. In the base build there is no such field and the
+    // premise holds by construction.
+    #[cfg(feature = "nn")]
+    assert!(
+        model.covariate_nns.is_empty(),
+        "the premise is a model with no networks"
+    );
+
+    let cov = HashMap::from([("WT".to_string(), 72.0)]);
+    let guard = ModelNnGuard::enter_for(&model, &model.default_params.theta, &cov);
+    assert!(
+        guard.is_none(),
+        "a model with no [covariate_nn] blocks must not install a guard"
+    );
+}
+
+// ── #811: compartment-free (`$PRED`-equivalent) structural model ─────────────
+
+/// A compartment-free model: `[structural_model]` holds the equation itself, with
+/// no `pk` / `ode` line anywhere. `equations` is the block body.
+fn algebraic_model_str(equations: &str) -> String {
+    format!(
+        "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVEMAX(5.0, 0.1, 100.0)\n\
+        \x20 theta TVET50(2.0, 0.01, 100.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0   = TVE0 * exp(ETA_E0)\n\
+        \x20 EMAX = TVEMAX\n\
+        \x20 ET50 = TVET50\n\n\
+        [structural_model]\n\
+        {equations}\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n"
+    )
+}
+
+/// The base case: an Emax time-course with no compartments at all parses, and is
+/// recognised as compartment-free — no ODE spec, a Form C readout whose state
+/// layout is empty.
+#[test]
+fn algebraic_structural_model_parses_without_pk_or_ode() {
+    let model = parse_model_string(&algebraic_model_str(
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ))
+    .expect("a compartment-free [structural_model] parses");
+    assert!(
+        model.is_algebraic(),
+        "must be recognised as compartment-free"
+    );
+    assert!(model.ode_spec.is_none(), "no ODE spec");
+    let ar = model
+        .analytic_readout
+        .as_ref()
+        .expect("the equation compiles to a Form C readout");
+    assert!(
+        ar.state_names.is_empty(),
+        "a compartment-free readout reconstructs no amounts, got {:?}",
+        ar.state_names
+    );
+}
+
+/// Named intermediates (#1030) work here for free: the equations are moved into
+/// the Form C pipeline verbatim, so a `y` built from bindings above it compiles to
+/// the same readout as the inlined form.
+#[test]
+fn algebraic_structural_model_accepts_named_intermediates() {
+    let model = parse_model_string(&algebraic_model_str(
+        "  EFF = EMAX * TIME / (ET50 + TIME)\n  y   = E0 - EFF\n",
+    ))
+    .expect("intermediates are usable in a compartment-free model");
+    assert!(model.is_algebraic());
+    assert!(
+        model
+            .analytic_readout
+            .as_ref()
+            .is_some_and(|ar| ar.program.is_some()),
+        "the readout carries a sensitivity program"
+    );
+}
+
+/// The block must produce a prediction. Intermediates alone are not a model, and
+/// the diagnostic says so rather than surfacing the Form C pipeline's downstream
+/// "a binding no entry reads".
+#[test]
+fn algebraic_structural_model_requires_a_y_entry() {
+    let err = expect_parse_err(&algebraic_model_str("  EFF = EMAX * TIME\n"));
+    assert!(
+        err.contains("[structural_model]") && err.contains("`y = <expr>`"),
+        "got: {err}"
+    );
+}
+
+/// `obs_scale` divides a *built-in* prediction; a compartment-free model has none.
+#[test]
+fn algebraic_structural_model_rejects_obs_scale() {
+    let err = expect_parse_err(&algebraic_model_str("  y = E0\n  obs_scale = 1000\n"));
+    assert!(
+        err.contains("obs_scale") && err.contains("compartment-free"),
+        "got: {err}"
+    );
+}
+
+/// A compartment amount cannot be referenced when there are no compartments. The
+/// message names the real problem (no compartment model declared) instead of
+/// falling through to "undefined identifier" or a silent covariate lookup.
+#[test]
+fn algebraic_structural_model_rejects_a_compartment_reference() {
+    for name in ["central", "depot", "peripheral"] {
+        let err = expect_parse_err(&algebraic_model_str(&format!("  y = {name} / E0\n")));
+        assert!(
+            err.contains(name) && err.contains("no compartments"),
+            "for `{name}`, got: {err}"
+        );
+    }
+}
+
+/// The equation lives in `[structural_model]`, so its diagnostics must say so —
+/// the `[scaling]` pipeline that parses it after the desugaring must not leak the
+/// block name the user never wrote.
+#[test]
+fn algebraic_structural_model_diagnostics_name_the_structural_block() {
+    let err = expect_parse_err(&algebraic_model_str("  y = E0\n  y = EMAX\n"));
+    assert!(
+        err.contains("[structural_model]"),
+        "diagnostic must name [structural_model], got: {err}"
+    );
+    assert!(
+        !err.contains("[scaling]"),
+        "diagnostic must not name a block the user never wrote, got: {err}"
+    );
+}
+
+/// A name the model does not define is a **data column** — that is how an MBMA
+/// equation reaches the per-row covariates it regresses on (arm size, dose,
+/// study-level flags). It must land in `referenced_covariates` so the data check
+/// requires it, exactly as in `[scaling]`.
+#[test]
+fn algebraic_structural_model_registers_free_names_as_covariates() {
+    let model = parse_model_string(&algebraic_model_str("  y = E0 + EMAX * DOSE\n"))
+        .expect("an undeclared name in the equation is a data column");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "DOSE"),
+        "`DOSE` must become a required data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// `[scaling]` alongside a compartment-free model would either declare a second
+/// readout or divide the equation's own output.
+#[test]
+fn algebraic_structural_model_rejects_a_scaling_block() {
+    let src = format!(
+        "{}\n[scaling]\n  y = E0\n",
+        algebraic_model_str("  y = E0 - EMAX\n")
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[scaling]") && err.contains("compartment-free"),
+        "got: {err}"
+    );
+}
+
+/// Blocks that only mean something with compartments underneath are rejected by
+/// name, rather than silently ignored (`[odes]` is only read when
+/// `[structural_model]` declares `ode(...)`).
+#[test]
+fn algebraic_structural_model_rejects_compartment_only_blocks() {
+    for (block, body) in [
+        ("odes", "  d/dt(central) = -0.1 * central\n"),
+        ("initial_conditions", "  init(central) = 1.0\n"),
+        ("diffusion", "  central ~ 0.1\n"),
+    ] {
+        let src = format!(
+            "{}\n[{block}]\n{body}",
+            algebraic_model_str("  y = E0 - EMAX\n")
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains(&format!("[{block}]")) && err.contains("compartment-free"),
+            "for [{block}], got: {err}"
+        );
+    }
+}
+
+/// A mistyped disposition used to parse: the `pk` matcher was unanchored, so
+/// `zpk one_cpt_iv(...)` matched `pk one_cpt_iv(...)` inside it and the model
+/// silently became a one-compartment IV fit (#811).
+#[test]
+fn structural_model_rejects_a_mistyped_pk_line() {
+    let err = expect_parse_err(&algebraic_model_str(
+        "  zpk one_cpt_iv(cl=E0, v=EMAX)\n  y = E0\n",
+    ));
+    assert!(
+        err.contains("unrecognized line") && err.contains("zpk"),
+        "got: {err}"
+    );
+}
+
+/// Every line in the block is now classified, so a stray one errors instead of
+/// being dropped — before #811 the scan returned on the first `pk` match and
+/// discarded the rest of the block without a word.
+#[test]
+fn structural_model_rejects_a_stray_line_next_to_a_pk_model() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n  V = TVV\n\
+        \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  this is not a directive\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(err.contains("unrecognized line"), "got: {err}");
+}
+
+/// A readout on top of a compartment model belongs in `[scaling]`; mixing the two
+/// forms in one block is ambiguous about which one is the model.
+#[test]
+fn structural_model_rejects_mixing_a_compartment_model_with_an_equation() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n  V = TVV\n\
+        \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  y = central / V\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("cannot mix") && err.contains("[scaling]"),
+        "got: {err}"
+    );
+}
+
+/// Two dispositions in one block used to be silently resolved as "first one wins".
+#[test]
+fn structural_model_rejects_two_disposition_lines() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n  V = TVV\n\
+        \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  pk one_cpt_oral(cl=CL, v=V, ka=CL)\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(err.contains("more than one structural model"), "got: {err}");
+}
+
+/// An empty `[structural_model]` is a model that predicts nothing. Block
+/// extraction records a block only once it has a content line, so an empty one is
+/// indistinguishable from an absent one and reports as missing — which is the
+/// same instruction to the user. Pinned so the #811 classifier, which has its own
+/// "is empty" arm for a block that reaches it with no classifiable line, cannot
+/// quietly take over this case with a worse message. (A TTE-only model omits the
+/// block entirely, which is a different, valid case.)
+#[test]
+fn structural_model_rejects_an_empty_block() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n\
+        \n[structural_model]\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("Missing [structural_model] block"),
+        "got: {err}"
+    );
+}
+
+/// A compartment-free model lays its parameters out like an ODE model — every
+/// individual parameter gets a slot from the full `MAX_PK_PARAMS` layout — so it
+/// is not bound by the handful of spare slots an analytical Form C readout draws
+/// from. This is what lets an MBMA-style model carry dozens of fixed effects.
+#[test]
+fn algebraic_structural_model_allows_many_readout_parameters() {
+    // Well past the `0..=PK_IDX_MTT` spare region an analytical readout is
+    // confined to (at most 11 slots, and fewer once a closed form takes its own).
+    const N: usize = 40;
+    let mut params = String::new();
+    let mut indiv = String::new();
+    let mut terms: Vec<String> = Vec::new();
+    for i in 0..N {
+        params.push_str(&format!("  theta TV{i}(1.0, 0.01, 100.0)\n"));
+        indiv.push_str(&format!("  P{i} = TV{i}\n"));
+        terms.push(format!("P{i}"));
+    }
+    let src = format!(
+        "[parameters]\n{params}  sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n{indiv}\n\
+        [structural_model]\n  y = {}\n\n\
+        [error_model]\n  DV ~ proportional(PROP)\n",
+        terms.join(" + ")
+    );
+    let model = parse_model_string(&src)
+        .expect("a compartment-free model is not bound by the analytical spare-slot region");
+    assert!(model.is_algebraic());
+}
+
+/// A bare `THETA(i)` / `ETA(k)` in the equation must ride the #486 desugaring:
+/// the parser appends a synthetic individual parameter and rewrites the reference
+/// to it, so the readout stays dual-evaluable and keeps the analytic gradient.
+///
+/// The synthetics are appended on the ODE-layout path (which a compartment-free
+/// model takes), but the *acceptance list* was then overwritten with the analytical
+/// allocator's empty result — so the reference was never rewritten, the readout
+/// reported `dual_evaluable = false`, and the model silently dropped to finite
+/// differences while carrying a warning blaming the readout's shape.
+#[test]
+fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVSLOPE(0.5, -5.0, 5.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0 * exp(ETA_E0)\n\n\
+        [structural_model]\n\
+        \x20 y = E0 + TVSLOPE * TIME + ETA_E0\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n";
+    let model = parse_model_string(src).expect("a bare theta/eta in the equation parses");
+    assert!(model.is_algebraic());
+    let program = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref())
+        .expect("the equation compiles to a readout program");
+    assert!(
+        program.is_dual_evaluable(),
+        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
+         model loses its analytic gradient"
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
+        "no FD-fallback warning should be emitted, got {:?}",
+        model.parse_warnings
+    );
+    assert!(
+        crate::sens::algebraic::supported(&model),
+        "and the analytic walks must actually serve it"
+    );
+    // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
+    // path a compartment-free model takes; a second append from the analytical
+    // allocator would double them and silently consume two PK slots each.
+    let synths: Vec<&String> = model
+        .indiv_param_names
+        .iter()
+        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
+        .collect();
+    assert_eq!(
+        synths.len(),
+        2,
+        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
+    );
+}
+
+/// A compartment name is rejected in the equation because the model has no
+/// compartments — but a parameter the user *declared* with that name is not a
+/// compartment reference at all, and the rejection's own advice ("define it in
+/// [individual_parameters]") is what they already did.
+#[test]
+fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartment() {
+    for name in ["central", "depot", "periph"] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 {name} = TVE0\n\n\
+            [structural_model]\n\
+            \x20 y = {name} * 2\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| {
+            panic!("`{name}` is a declared individual parameter here, not a compartment: {e}")
+        });
+        assert!(model.is_algebraic());
+    }
+}
+
+// ── #1064: θ level blocks ────────────────────────────────────────
+//
+// An unstructured placebo effect in an MBMA model gives every (study ×
+// timepoint) cell its own fixed effect — hundreds of θ. What makes that
+// tractable is that the block is read by a *gather*: one `PkParams` slot, one
+// contiguous θ block, one index per row.
+mod theta_vector_blocks {
+    use super::*;
+
+    /// A one-compartment IV model reading `PLACEBO[PLA_IDX]` into `CL`.
+    fn gather_model(len: usize) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[{len}](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL + PLACEBO[PLA_IDX]
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        )
+    }
+
+    fn cov(name: &str, value: f64) -> HashMap<String, f64> {
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), value);
+        m
+    }
+
+    #[test]
+    fn vector_theta_expands_to_one_named_theta_per_level() {
+        let parsed = parse_full_model(&gather_model(4)).unwrap();
+        assert_eq!(parsed.model.n_theta, 6, "TVCL + 4 levels + TVV");
+        assert_eq!(
+            parsed.model.theta_names,
+            vec![
+                "TVCL".to_string(),
+                "PLACEBO[1]".to_string(),
+                "PLACEBO[2]".to_string(),
+                "PLACEBO[3]".to_string(),
+                "PLACEBO[4]".to_string(),
+                "TVV".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_theta_broadcasts_init_and_bounds_to_every_level() {
+        let parsed = parse_full_model(&gather_model(3)).unwrap();
+        let p = &parsed.model.default_params;
+        for k in 1..=3 {
+            assert_eq!(p.theta[k], 0.5, "init broadcast to level {k}");
+            assert_eq!(p.theta_lower[k], -10.0, "lower broadcast to level {k}");
+            assert_eq!(p.theta_upper[k], 10.0, "upper broadcast to level {k}");
+            assert!(!p.theta_fixed[k]);
+        }
+    }
+
+    #[test]
+    fn vector_theta_broadcasts_fix_to_every_level() {
+        let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[3](0.5, -10.0, 10.0, FIX)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[PLA_IDX]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let parsed = parse_full_model(content).unwrap();
+        assert_eq!(
+            parsed.model.default_params.theta_fixed,
+            vec![false, true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn gather_reads_the_level_the_index_column_selects() {
+        let parsed = parse_full_model(&gather_model(4)).unwrap();
+        // θ = [TVCL, PLACEBO[1..4], TVV]
+        let theta = vec![2.0, 0.1, 0.2, 0.3, 0.4, 10.0];
+        let eta = vec![0.0];
+        for level in 1..=4usize {
+            let p = (parsed.model.pk_param_fn)(&theta, &eta, &cov("PLA_IDX", level as f64), 0.0);
+            let expected = 2.0 + theta[level];
+            assert!(
+                (p.values[0] - expected).abs() < 1e-12,
+                "PLA_IDX={level} → CL={expected}, got {}",
+                p.values[0]
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_index_is_nan_not_a_silent_zero() {
+        // Division by zero already underflows to 0.0 in this evaluator, so a
+        // gather that returned 0.0 for a bad index would be indistinguishable
+        // from a legitimately-estimated level. It must be NaN.
+        let parsed = parse_full_model(&gather_model(4)).unwrap();
+        let theta = vec![2.0, 0.1, 0.2, 0.3, 0.4, 10.0];
+        let eta = vec![0.0];
+        for bad in [0.0, 5.0, -1.0, 2.5] {
+            let p = (parsed.model.pk_param_fn)(&theta, &eta, &cov("PLA_IDX", bad), 0.0);
+            assert!(p.values[0].is_nan(), "PLA_IDX={bad} must give NaN");
+        }
+    }
+
+    #[test]
+    fn literal_index_folds_to_a_plain_theta_read() {
+        let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[4](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[3]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let parsed = parse_full_model(content).unwrap();
+        let theta = vec![2.0, 0.1, 0.2, 0.3, 0.4, 10.0];
+        let p = (parsed.model.pk_param_fn)(&theta, &[0.0], &HashMap::new(), 0.0);
+        assert!((p.values[0] - 2.3).abs() < 1e-12, "PLACEBO[3] = 0.3");
+        // No index column is read, so nothing is recorded for the data check.
+        assert_eq!(parsed.model.theta_blocks().index_columns().count(), 0);
+    }
+
+    #[test]
+    fn out_of_range_literal_index_is_a_parse_error() {
+        for bad in ["0", "5", "1.5"] {
+            let content = format!(
+                r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[4](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[{bad}]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            );
+            let err = parse_full_model(&content).err().unwrap();
+            assert!(
+                err.contains("level index must be an integer in 1..=4"),
+                "index {bad} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_reference_to_an_explicit_vector_is_an_error() {
+        // Without an index there is nothing to gather on; silently treating
+        // `PLACEBO` as a covariate would read 0.0 forever.
+        let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[4](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let err = parse_full_model(content).err().unwrap();
+        assert!(
+            err.contains("is a vector of 4 θ levels"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_length_vector_is_rejected() {
+        let err = parse_full_model(&gather_model(0)).err().unwrap();
+        assert!(err.contains("at least one level"), "got: {err}");
+    }
+
+    #[test]
+    fn gather_index_column_is_recorded_for_the_pre_fit_check() {
+        let parsed = parse_full_model(&gather_model(4)).unwrap();
+        let uses: Vec<_> = parsed.model.theta_blocks().index_columns().collect();
+        assert_eq!(uses, vec![("PLACEBO", "PLA_IDX", 4usize)]);
+    }
+
+    #[test]
+    fn a_gather_occupies_one_pk_param_slot_not_one_per_level() {
+        // The whole point: 800 levels must not need 800 `PkParams` slots.
+        let parsed = parse_full_model(&gather_model(800)).unwrap();
+        assert_eq!(parsed.model.n_theta, 802);
+        assert_eq!(
+            parsed.model.indiv_param_names,
+            vec!["CL".to_string(), "V".to_string()],
+            "the block is a gather — CL and V are still the only individual parameters"
+        );
+    }
+}
+
+// ── #1064: the level-block primitives, branch by branch ────────────────────
+//
+// The declaration surface and the end-to-end binding are covered by
+// `theta_vector_blocks` above and `api::levels`. What is left here are the
+// error and edge branches of the primitives themselves — reachable directly,
+// and several of them not reachable at all through a well-formed model file.
+mod theta_level_primitives {
+    use super::*;
+
+    fn spec(levels: Vec<LevelRule>) -> GatherSpec {
+        GatherSpec {
+            name: "PLACEBO".to_string(),
+            levels,
+        }
+    }
+
+    fn binding(labels: &[&str], groups: &[usize], contrast: LevelContrast) -> LevelBinding {
+        LevelBinding {
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            groups: groups.to_vec(),
+            contrast,
+        }
+    }
+
+    // ── parse_theta_block_spec ──────────────────────────────────────────────
+
+    #[test]
+    fn a_digits_only_bracket_is_a_level_count() {
+        assert_eq!(
+            parse_theta_block_spec("P", " 12 ").unwrap(),
+            ThetaBlockSpec::Count(12)
+        );
+    }
+
+    #[test]
+    fn a_zero_level_count_is_rejected() {
+        let err = parse_theta_block_spec("P", "0").unwrap_err();
+        assert!(err.contains("at least one level"), "{err}");
+    }
+
+    #[test]
+    fn a_level_count_too_large_for_usize_is_rejected_not_wrapped() {
+        // All-digits but unparseable — the branch that would otherwise panic on
+        // `unwrap` or silently wrap.
+        let huge = "9".repeat(40);
+        let err = parse_theta_block_spec("P", &huge).unwrap_err();
+        assert!(err.contains("bad level count"), "{err}");
+    }
+
+    #[test]
+    fn columns_after_the_contrast_modifier_are_rejected() {
+        let err = parse_theta_block_spec("P", "STUDY, contrast = ref, TIME").unwrap_err();
+        assert!(err.contains("must come before `contrast = ...`"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_contrast_modifier_is_rejected() {
+        let err =
+            parse_theta_block_spec("P", "STUDY, contrast = ref, contrast = none").unwrap_err();
+        assert!(err.contains("`contrast` given twice"), "{err}");
+    }
+
+    #[test]
+    fn a_column_name_with_punctuation_is_rejected() {
+        let err = parse_theta_block_spec("P", "STUDY-ARM, TIME").unwrap_err();
+        assert!(err.contains("not a valid data column name"), "{err}");
+    }
+
+    #[test]
+    fn empty_entries_between_commas_are_skipped() {
+        // `[STUDY, , TIME]` is sloppy but unambiguous.
+        assert_eq!(
+            parse_theta_block_spec("P", "STUDY, , TIME").unwrap(),
+            ThetaBlockSpec::Columns {
+                columns: vec!["STUDY".to_string(), "TIME".to_string()],
+                contrast: LevelContrast::Auto,
+            }
+        );
+    }
+
+    #[test]
+    fn every_contrast_spelling_parses() {
+        for (token, expected) in [
+            ("auto", LevelContrast::Auto),
+            ("sum_to_zero", LevelContrast::SumToZero),
+            ("sum_to_zero_within", LevelContrast::SumToZeroWithin),
+            ("sum_to_zero_within_group", LevelContrast::SumToZeroWithin),
+            ("ref", LevelContrast::Ref),
+            ("reference", LevelContrast::Ref),
+            ("first", LevelContrast::Ref),
+            ("none", LevelContrast::Unconstrained),
+            ("unconstrained", LevelContrast::Unconstrained),
+            ("  REF  ", LevelContrast::Ref),
+        ] {
+            let parsed =
+                parse_theta_block_spec("P", &format!("STUDY, contrast = {token}")).unwrap();
+            match parsed {
+                ThetaBlockSpec::Columns { contrast, .. } => {
+                    assert_eq!(contrast, expected, "token {token}")
+                }
+                other => panic!("expected a column block for {token}, got {other:?}"),
+            }
+        }
+    }
+
+    // ── build_level_rules ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_binding_whose_labels_and_groups_disagree_is_rejected() {
+        let b = binding(&["a", "b"], &[0], LevelContrast::SumToZero);
+        let err = build_level_rules("P", &b, 0).unwrap_err();
+        assert!(err.contains("2 labels but 1 group ids"), "{err}");
+    }
+
+    #[test]
+    fn a_binding_with_no_levels_is_rejected() {
+        let b = binding(&[], &[], LevelContrast::SumToZero);
+        let err = build_level_rules("P", &b, 0).unwrap_err();
+        assert!(err.contains("no observed level combinations"), "{err}");
+    }
+
+    #[test]
+    fn a_non_contiguous_contrast_group_is_rejected() {
+        // The `NegSum` range is a single slice, so a group that re-opens after
+        // another would silently sum the wrong levels. The binder orders them
+        // correctly; this is the tripwire for any future caller that does not.
+        let b = binding(&["a", "b", "c"], &[0, 1, 0], LevelContrast::SumToZero);
+        let err = build_level_rules("P", &b, 0).unwrap_err();
+        assert!(err.contains("is not contiguous"), "{err}");
+    }
+
+    #[test]
+    fn unconstrained_bindings_estimate_every_level() {
+        let b = binding(&["a", "b", "c"], &[0, 0, 0], LevelContrast::Unconstrained);
+        let (rules, names) = build_level_rules("P", &b, 5).unwrap();
+        assert_eq!(
+            rules,
+            vec![LevelRule::Free(5), LevelRule::Free(6), LevelRule::Free(7)]
+        );
+        assert_eq!(names, vec!["P[a]", "P[b]", "P[c]"]);
+    }
+
+    #[test]
+    fn a_reference_binding_pins_the_first_level_with_an_empty_negsum() {
+        let b = binding(&["a", "b"], &[0, 0], LevelContrast::Ref);
+        let (rules, names) = build_level_rules("P", &b, 3).unwrap();
+        // An empty `NegSum` range evaluates to 0.0 — that is how a reference
+        // level is encoded, rather than as a special rule variant.
+        assert_eq!(rules[0], LevelRule::NegSum(3, 3));
+        assert_eq!(rules[1], LevelRule::Free(3));
+        assert_eq!(names, vec!["P[b]"]);
+    }
+
+    // ── the gather itself ───────────────────────────────────────────────────
+
+    #[test]
+    fn eval_gather_rejects_every_ill_formed_index() {
+        let s = spec(vec![LevelRule::Free(0), LevelRule::Free(1)]);
+        let theta = [1.0, 2.0];
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            3.0,
+            1.5,
+            -1.0,
+        ] {
+            assert!(
+                eval_gather(&s, &theta, bad).is_nan(),
+                "index {bad} must be NaN, never a silent value"
+            );
+        }
+        assert_eq!(eval_gather(&s, &theta, 1.0), 1.0);
+        assert_eq!(eval_gather(&s, &theta, 2.0), 2.0);
+    }
+
+    #[test]
+    fn eval_gather_rejects_a_rule_pointing_past_the_theta_vector() {
+        // Defensive: a spec built against a longer θ vector than the caller
+        // supplies must not read out of bounds or return a neighbouring value.
+        let s = spec(vec![LevelRule::Free(7)]);
+        assert!(eval_gather(&s, &[1.0], 1.0).is_nan());
+        let s = spec(vec![LevelRule::NegSum(0, 9)]);
+        assert!(eval_gather(&s, &[1.0, 2.0], 1.0).is_nan());
+        let s = spec(vec![LevelRule::NegSum(3, 1)]);
+        assert!(eval_gather(&s, &[1.0, 2.0, 3.0, 4.0], 1.0).is_nan());
+    }
+
+    #[test]
+    fn eval_gather_sums_the_dependent_level() {
+        let s = spec(vec![
+            LevelRule::Free(0),
+            LevelRule::Free(1),
+            LevelRule::NegSum(0, 2),
+        ]);
+        let theta = [0.25, -0.75];
+        assert_eq!(eval_gather(&s, &theta, 3.0), 0.5);
+    }
+
+    #[test]
+    fn the_pknum_gather_matches_the_f64_one_on_every_branch() {
+        // `gather_g` is the copy the analytic-sensitivity path runs. The two
+        // must agree bit for bit or a model's gradient and its prediction come
+        // from different formulas. `f64` is itself a `PkNum`, so this compares
+        // them directly.
+        let cases = vec![
+            spec(vec![LevelRule::Free(0), LevelRule::Free(1)]),
+            spec(vec![LevelRule::Free(0), LevelRule::NegSum(0, 1)]),
+            spec(vec![LevelRule::NegSum(0, 0), LevelRule::Free(0)]),
+            spec(vec![LevelRule::Free(9)]),
+            spec(vec![LevelRule::NegSum(0, 9)]),
+            spec(vec![LevelRule::NegSum(3, 1)]),
+        ];
+        let theta = [0.25, -0.75, 1.5];
+        for s in &cases {
+            for raw in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1.0, 2.0, 3.0, 1.5] {
+                let a = eval_gather(s, &theta, raw);
+                let b = gather_g::<f64>(s, &theta, raw);
+                assert_eq!(
+                    a.is_nan(),
+                    b.is_nan(),
+                    "NaN disagreement on {s:?} at index {raw}"
+                );
+                if !a.is_nan() {
+                    assert_eq!(a, b, "value disagreement on {s:?} at index {raw}");
+                }
+            }
+        }
+    }
+
+    // ── the θ-axis reverse map the differentiator uses ──────────────────────
+
+    #[test]
+    fn axes_for_theta_finds_the_free_and_dependent_levels() {
+        let s = spec(vec![
+            LevelRule::Free(0),
+            LevelRule::Free(1),
+            LevelRule::NegSum(0, 2),
+        ]);
+        // θ_0 is read directly by level 1 and through the contrast by level 3.
+        assert_eq!(s.axes_for_theta(0), (Some(1), Some(3)));
+        assert_eq!(s.axes_for_theta(1), (Some(2), Some(3)));
+        // A θ the block does not touch at all.
+        assert_eq!(s.axes_for_theta(7), (None, None));
+    }
+
+    #[test]
+    fn a_reference_level_contributes_no_dependent_axis() {
+        // Its `NegSum` range is empty, so no θ is read through it.
+        let s = spec(vec![LevelRule::NegSum(0, 0), LevelRule::Free(0)]);
+        assert_eq!(s.axes_for_theta(0), (Some(2), None));
+    }
+}
+
+/// `vi_grad_clip` parses, accepts `0` as "disabled", and rejects a negative threshold.
+///
+/// `0` has to stay legal: it is how a user asks for the unclipped Adam trajectory, which
+/// is the pre-#1097 behaviour and occasionally worth reproducing for comparison. A
+/// negative clip has no meaning — `grad_clip_scale` would treat it as disabled — so it is
+/// rejected at parse time rather than silently reinterpreted.
+#[test]
+fn test_apply_fit_option_vi_grad_clip() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.vi_grad_clip, 1e4, "default clip");
+
+    assert_eq!(apply_fit_option(&mut opts, "vi_grad_clip", "250"), Ok(true));
+    assert_eq!(opts.vi_grad_clip, 250.0);
+
+    // Explicitly disabled.
+    assert_eq!(apply_fit_option(&mut opts, "vi_grad_clip", "0"), Ok(true));
+    assert_eq!(opts.vi_grad_clip, 0.0);
+
+    // Rejected, and a failed apply leaves the previous value alone.
+    assert!(apply_fit_option(&mut opts, "vi_grad_clip", "-1").is_err());
+    assert!(apply_fit_option(&mut opts, "vi_grad_clip", "nope").is_err());
+    assert_eq!(opts.vi_grad_clip, 0.0);
+}
+
+/// Every *reachable* arm of the [`stmts_read_time_builtin`] walk, driven through
+/// the parser.
+///
+/// A wrong `false` from any arm is a **silently dropped term with no
+/// diagnostic** — the exact #1124 failure mode — because `reads_model_time` is
+/// what keeps a non-autonomous RHS off the closed form and off the SS
+/// equilibration. `mr_scope_declines_every_model_time_spelling` exercises two
+/// arms (`Op::PushTime` in a bytecode statement, and `Condition::Compare`); the
+/// rest were reachable only by inspection until this test.
+///
+/// **Where the `Expression::*` arms live.** `resolve_variable_indices` lowers
+/// *every* `Assign` / `AssignIdx` / `DiffEq` / `DiffEqIdx` in a resolved RHS to
+/// `AssignBc` / `DiffEqBc`, so in an `OdeRhsProgram` those four statement arms
+/// are unreachable and a statement's expression is only ever walked as bytecode
+/// (the `Op::PushTime` arm). `expr_reads_time_builtin` is therefore reached
+/// **only through `if` conditions**, which keep their `Condition`/`Expression`
+/// trees. Putting `exp(…TIME…)` in a `d/dt(...)` looks like it covers
+/// `Expression::UnaryFn` and does not — it compiles to bytecode. Every
+/// expression case below is inside a condition for that reason; a first draft of
+/// this test had them in the derivative and the `UnaryFn` mutation survived.
+///
+/// `Expression::ThetaGather` is not covered: it is produced only by a levelled
+/// theta reference (`NAME[idx]`), which has no route into an `[odes]` condition,
+/// so there is no parseable model that reaches that arm here. Its recursion into
+/// `idx` is written for the shared shape of the walk.
+///
+/// Each case is asserted in both directions against a `TIME`-free twin of the
+/// same shape, so an arm that returns a blanket `true` fails just as loudly as
+/// one that returns a blanket `false`.
+#[test]
+fn every_arm_of_the_time_builtin_walk_sees_time() {
+    fn prog_reads_time(rhs: &str) -> bool {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{rhs}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("model must parse: {e}\n{src}"))
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program")
+            .reads_time_builtin()
+    }
+
+    // (arm exercised, RHS that reads TIME, the same RHS with TIME removed)
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "Expression::Time via a plain assignment",
+            "  KE = TIME\n  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*KE)",
+            "  KE = 6.0\n  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*KE)",
+        ),
+        (
+            "Expression::Time directly in the DiffEq",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*TIME)",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*6.0)",
+        ),
+        (
+            "Op::PushTime under a call in a bytecode statement",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*exp(-0.01*TIME)",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*exp(-0.01*6.0)",
+        ),
+        (
+            "Expression::UnaryFn (in a condition)",
+            "  KE = CL/V\n  if (exp(0.1*TIME) > 2.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (exp(0.1*KA) > 2.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Expression::Power, base (in a condition)",
+            "  KE = CL/V\n  if (TIME^2.0 > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA^2.0 > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Expression::Power, exponent (in a condition)",
+            "  KE = CL/V\n  if (2.0^TIME > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (2.0^KA > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Expression::Binary under a UnaryFn (in a condition)",
+            "  KE = CL/V\n  if (log(TIME + 1.0) > 1.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (log(KA + 1.0) > 1.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::Compare",
+            "  KE = CL/V\n  if (TIME > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::And",
+            "  KE = CL/V\n  if (TIME > 6.0 && KA > 0.5) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (CL > 6.0 && KA > 0.5) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::Or",
+            "  KE = CL/V\n  if (KA > 99.0 || TIME > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 99.0 || CL > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::Not",
+            "  KE = CL/V\n  if (!(TIME > 6.0)) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (!(KA > 6.0)) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "statements inside a taken branch body",
+            "  KE = CL/V\n  if (KA > 0.5) { KE = CL/V*(1.0 + 0.01*TIME) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 0.5) { KE = CL/V*(1.0 + 0.01*6.0) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "statements inside an else body",
+            "  KE = CL/V\n  if (KA > 99.0) { KE = 2.0*CL/V } else { KE = CL/V*(1.0 + 0.01*TIME) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 99.0) { KE = 2.0*CL/V } else { KE = CL/V*(1.0 + 0.01*6.0) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+    ];
+
+    for (arm, with_time, without_time) in cases {
+        assert!(
+            prog_reads_time(with_time),
+            "`{arm}`: the walk missed a `TIME` read — this RHS would be admitted as \
+             time-invariant and its term silently dropped (#1124)"
+        );
+        assert!(
+            !prog_reads_time(without_time),
+            "`{arm}`: the walk reported a `TIME` read in an RHS that has none — the \
+             positive case above proves nothing if the arm answers `true` blindly"
+        );
+    }
+}
+
+// ── `present(COV)` — the data-presence predicate (#1111) ────────────────────
+//
+// A missing covariate is `NaN`, and `x/NaN` underflows to `0.0` in this engine
+// rather than blowing up, so a model that reads a covariate which may be
+// missing needs a guard or it silently zeroes a parameter. `COV == COV` says
+// that (NaN compares false against itself) but reads like a typo; `present(COV)`
+// is the same test, spelled. It is the guard `[covariate_model]` generates, so
+// it appears in text users audit against NONMEM.
+
+/// A one-compartment model whose `CL` is guarded by `cond`.
+fn present_model(cond: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * (if ({cond}) (WT / 70) else 1.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[covariates]
+  WT continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    )
+}
+
+/// `CL` at the given `WT`, through the production parameter closure — so this
+/// exercises the compiled bytecode path the fit uses, not just the AST walker.
+fn cl_at(cond: &str, wt: f64) -> f64 {
+    let parsed = parse_full_model(&present_model(cond)).expect("model should parse");
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), wt);
+    (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0]
+}
+
+#[test]
+fn present_is_true_for_a_value_and_false_for_a_missing_one() {
+    // WT = 140 → factor 2; WT missing → the neutral branch, NOT 0.
+    assert_eq!(cl_at("present(WT)", 140.0), 4.0);
+    assert_eq!(cl_at("present(WT)", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_means_exactly_what_the_self_comparison_idiom_meant() {
+    // `present(COV)` replaced `COV == COV` in generated model text, so the two
+    // must agree everywhere — including on infinity, which is a value, not a
+    // gap in the data. (`is_finite` would have differed here.)
+    for wt in [140.0, 0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            cl_at("present(WT)", wt),
+            cl_at("WT == WT", wt),
+            "present(WT) and WT == WT disagree at WT = {wt}"
+        );
+    }
+}
+
+/// `TIME` and the slot-backed spellings are covered by **disjoint** flags, and
+/// only [`OdeRhsProgram::reads_model_time`] sees both. Pinned structurally so a
+/// caller pairing them by hand cannot drift back into #1124's gap.
+///
+/// The fourth column is [`OdeRhsProgram::pk_reads_absolute_time`] (#1139 T3), which is the
+/// same question with `TAD` removed — so the `TAD` row is the one that separates it from
+/// `reads_model_time`, and without that row a gate wired to the wrong one of the two would
+/// pass every case here.
+#[test]
+fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
+    fn flags(term: &str) -> (bool, bool, bool, bool) {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V)*central{term}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        let m = parse_model_string(&src).expect("parse");
+        let p = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        (
+            p.uses_time_vars(),
+            p.reads_time_builtin(),
+            p.reads_model_time(),
+            p.pk_reads_absolute_time(),
+        )
+    }
+
+    // `TIME` sets ONLY the built-in flag; the slot-backed names set ONLY the
+    // broad flag. Neither flag alone covers all four — that disjointness is the
+    // whole reason `reads_model_time` exists.
+    assert_eq!(
+        flags("*(1.0 + 0.01*TIME)"),
+        (false, true, true, true),
+        "TIME"
+    );
+    assert_eq!(flags("*(1.0 + 0.01*T)"), (true, false, true, true), "T");
+    // The lowercase aliases resolve to the same slot (`var_idx` binds `TIME`/`time`/`T`/`t`),
+    // and nothing else pins that — a `T`-only fixture cannot tell the alias set apart.
+    assert_eq!(flags("*(1.0 + 0.01*t)"), (true, false, true, true), "t");
+    assert_eq!(
+        flags("*(1.0 + 0.01*TAFD)"),
+        (true, false, true, true),
+        "TAFD"
+    );
+    // The discriminating row: `TAD` is model time but **not** an absolute clock, so it is
+    // the only spelling on which the two predicates disagree.
+    assert_eq!(
+        flags("*(1.0 + 0.01*TAD)"),
+        (true, false, true, false),
+        "TAD"
+    );
+    // …and mentioning `TAD` must not mask an absolute read sitting beside it: the flags are
+    // a union over the block, not a classification of it.
+    assert_eq!(
+        flags("*(1.0 + 0.01*TAD + 0.01*T)"),
+        (true, false, true, true),
+        "TAD and T together"
+    );
+    assert_eq!(
+        flags(""),
+        (false, false, false, false),
+        "autonomous control"
+    );
+}
+
+/// The two halves of [`OdeRhsProgram::pk_reads_absolute_time`], asserted **separately**.
+///
+/// The union is what any gate asks, but a message has to name the spelling, because the two
+/// fail differently under `SS=1`: `TAFD` reads `NaN` inside the run-in while `T`/`TIME` come
+/// back finite and matching NONMEM. A test that only ever checked the union would pass
+/// against an implementation where one of the two flags is stuck — and against one where
+/// they are swapped.
+///
+/// Both disjuncts of `pk_reads_solver_time` are exercised on purpose: `T` reaches it through
+/// `time_slot`, a bare `TIME` only through `Op::PushTime`, and a `T`-only fixture cannot see
+/// the second (#1124).
+#[test]
+fn the_two_absolute_clock_spellings_are_tracked_separately() {
+    fn split(term: &str) -> (bool, bool) {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V)*central{term}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        let m = parse_model_string(&src).expect("parse");
+        let p = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        assert_eq!(
+            p.pk_reads_absolute_time(),
+            p.pk_reads_tafd() || p.pk_reads_solver_time(),
+            "the union must stay the OR of its halves for `{term}`"
+        );
+        (p.pk_reads_tafd(), p.pk_reads_solver_time())
+    }
+
+    // (tafd, solver_time)
+    assert_eq!(split("*(1.0 + 0.01*TAFD)"), (true, false), "TAFD alone");
+    assert_eq!(split("*(1.0 + 0.01*T)"), (false, true), "T alone");
+    assert_eq!(split("*(1.0 + 0.01*TIME)"), (false, true), "TIME alone");
+    assert_eq!(
+        split("*(1.0 + 0.01*TAFD + 0.01*TIME)"),
+        (true, true),
+        "both spellings"
+    );
+    // `TAD` sets neither, which is what keeps the diagnostic off a model #1139 T2 fixed.
+    assert_eq!(split("*(1.0 + 0.01*TAD)"), (false, false), "TAD alone");
+    assert_eq!(split(""), (false, false), "autonomous control");
+}
+
+/// A joint PK-TTE model, with `{PK}` appended to the central derivative, `{PRE}`
+/// inserted as an `[odes]` intermediate line and `{HAZ}` as the hazard.
+#[cfg(feature = "survival")]
+fn joint_src(pk: &str, pre: &str, haz: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  {pre}
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central{pk}
+[event_model]
+  cmt    = 3
+  hazard = {haz}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"
+    )
+}
+
+/// `(uses_time_vars, reads_time_builtin, reads_model_time, pk_reads_model_time,
+/// pk_reads_absolute_time)`.
+#[cfg(feature = "survival")]
+fn joint_flags(pk: &str, pre: &str, haz: &str) -> (bool, bool, bool, bool, bool) {
+    let m = parse_model_string(&joint_src(pk, pre, haz)).expect("joint model must parse");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    (
+        p.uses_time_vars(),
+        p.reads_time_builtin(),
+        p.reads_model_time(),
+        p.pk_reads_model_time(),
+        p.pk_reads_absolute_time(),
+    )
+}
+
+/// #1166: the injected `d/dt(__chz_<cmt>)` hazard line does not make the **PK
+/// block** non-autonomous, under any spelling of model time.
+///
+/// The three wide flags keep seeing the whole augmented program — the SS gates
+/// need them to, since steady-state equilibration integrates `__chz` too — and
+/// only the fourth narrows. Every row is one variable away from its neighbour.
+#[test]
+#[cfg(feature = "survival")]
+fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
+    const AUTO: &str = "H0 * exp(BETA * (central / V))";
+
+    // Control: nothing anywhere reads time.
+    assert_eq!(
+        joint_flags("", "", AUTO),
+        (false, false, false, false, false),
+        "autonomous hazard, autonomous PK"
+    );
+
+    // The four spellings, in the hazard: wide flags fire, the narrow ones do not.
+    for (term, wide) in [
+        ("TIME", (false, true, true)),
+        ("T", (true, false, true)),
+        ("TAD", (true, false, true)),
+        ("TAFD", (true, false, true)),
+    ] {
+        let haz = format!("H0 * exp(0.05*{term}) * exp(BETA * (central / V))");
+        assert_eq!(
+            joint_flags("", "", &haz),
+            (wide.0, wide.1, wide.2, false, false),
+            "`{term}` in the hazard must leave the PK block autonomous"
+        );
+    }
+
+    // The same term in the PK RHS, with an autonomous hazard: the narrow flag
+    // must stay wide. This is the row that fails if the exclusion is written as
+    // "drop every top-level derivative" rather than "drop the injected ones".
+    assert_eq!(
+        joint_flags("*(1.0 + 0.01*TIME)", "", AUTO),
+        (false, true, true, true, true),
+        "`TIME` in the PK RHS is a genuinely non-autonomous PK block"
+    );
+    // `TAD` in the PK RHS is non-autonomous but **not** an absolute clock — the one row
+    // where the two narrow flags part company, and the reason a diagnostic keyed on the
+    // absolute one stays off a model #1139 T2 already fixed.
+    assert_eq!(
+        joint_flags("*(1.0 + 0.01*TAD)", "", AUTO),
+        (true, false, true, true, false),
+        "`TAD` in the PK RHS likewise"
+    );
+
+    // Documented over-decline: an intermediate that reads time and is consumed
+    // *only* by the hazard is a top-level `AssignBc`, not one of the excluded
+    // derivative lines, so it still reads wide. Conservative in the safe
+    // direction — pinned so a later dataflow cut is a deliberate change.
+    //
+    // `pk_reads_absolute_time` inherits it, and there it is no longer free: #1166's consumer
+    // is a gradient-routing gate, where over-declining costs speed, while #1139 T3's is a
+    // user-facing warning, where it is a false positive on a legitimate joint model.
+    // Accepted rather than narrowed here — the dataflow cut is #1166's deferred change — and
+    // the *consequence* is pinned end-to-end by
+    // `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    assert_eq!(
+        joint_flags(
+            "",
+            "TT = TIME",
+            "H0 * exp(0.05*TT) * exp(BETA * (central / V))"
+        ),
+        (false, true, true, true, true),
+        "a time-reading intermediate used only by the hazard over-declines, by design"
+    );
+}
+
+/// The narrowing is scoped to joint models by construction: with no injected
+/// lines the filter is empty and the new flag *is* the old one. Asserted for
+/// both a time-reading and an autonomous RHS, and in a build without the
+/// `survival` feature this is the only shape that exists.
+#[test]
+fn without_an_event_model_the_narrow_flag_equals_the_wide_one() {
+    fn flags(term: &str) -> (bool, bool, bool) {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -1.0 * depot
+  d/dt(central) =  1.0 * depot - (CL/V) * central{term}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        );
+        let m = parse_model_string(&src).expect("parse");
+        let p = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        (
+            p.reads_model_time(),
+            p.pk_reads_model_time(),
+            p.pk_reads_absolute_time(),
+        )
+    }
+    // `want_absolute` is asserted here rather than derived, because this is the arm of the
+    // `pk_view` selection that a model *with* an `[event_model]` never reaches: with no
+    // injected slots the filter is skipped entirely, so a mutation to it is invisible from
+    // this side and a mutation to the selection is invisible from the other.
+    for (term, want_absolute) in [
+        ("", false),
+        ("*(1.0 + 0.01*TIME)", true),
+        ("*(1.0 + 0.01*TAD)", false),
+    ] {
+        let (wide, narrow, absolute) = flags(term);
+        assert_eq!(
+            wide, narrow,
+            "with no [event_model] the two predicates must agree (term `{term}`)"
+        );
+        assert_eq!(
+            absolute, want_absolute,
+            "pk_reads_absolute_time on `{term}` with no [event_model]"
+        );
+    }
+}
+
+/// The exclusion is keyed on the **slot** the parser injected, never on the name.
+///
+/// Without an `[event_model]` there is no injection and no reserved-name guard, so
+/// `__chz_1` is an ordinary, legal user state — and in a build without the
+/// `survival` feature that is the *only* way the name can occur. A name-prefix
+/// filter would silently drop this user's own derivative from the predicate and
+/// route a genuinely non-autonomous model as if it were time-invariant.
+#[test]
+fn a_user_state_named_like_the_accumulator_is_not_excluded() {
+    let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, __chz_1])
+[odes]
+  d/dt(central) = -(CL/V) * central
+  d/dt(__chz_1) =  0.01 * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+    let m = parse_model_string(src).expect("`__chz_1` is a legal user state with no [event_model]");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        p.reads_model_time() && p.pk_reads_model_time(),
+        "a user's own `__chz_1` derivative reading TIME must still read as non-autonomous"
+    );
+}
+
+/// The same rule where a name filter and a slot filter actually diverge *with*
+/// `survival` on: the parser injects `__chz_3` for the CMT-3 endpoint, and the
+/// collision guard only rejects a user state of **that** name — so a user state
+/// called `__chz_9` is legal, is not injected, and must be walked.
+///
+/// The sibling above cannot catch a name-prefix filter, because with no
+/// `[event_model]` the slot list is empty and the filter never runs at all.
+#[test]
+#[cfg(feature = "survival")]
+fn a_second_chz_named_user_state_is_walked_because_it_was_not_injected() {
+    let src = joint_src("", "", "H0 * exp(BETA * (central / V))")
+        .replace(
+            "  ode(obs_cmt=central, states=[depot, central])",
+            "  ode(obs_cmt=central, states=[depot, central, __chz_9])",
+        )
+        .replace(
+            "  d/dt(depot)   = -KA * depot",
+            "  d/dt(depot)   = -KA * depot\n  d/dt(__chz_9) = 0.01 * TIME",
+        );
+    let m = parse_model_string(&src).expect("`__chz_9` is not the injected accumulator");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        p.pk_reads_model_time(),
+        "a user state whose name merely looks like the accumulator is still a PK \
+         equation — only the injected slot may be excluded"
+    );
+}
+
+/// A Form C `[scaling] y = …` readout that reads `TIME` must **not** widen the
+/// predicate (#1166 §2).
+///
+/// Both engines evaluate the readout under a `ModelTimeGuard`, so a time-reading
+/// readout is already correct on the dense driver; folding
+/// `readout_program.reads_time_builtin()` into this predicate — which
+/// `pk/modified_release.rs` does hand-pair, for a closed-form-only reason — would
+/// decline the shared solve for nothing. Pinned so that folding is a red test
+/// rather than a silent cost.
+#[test]
+#[cfg(feature = "survival")]
+fn a_time_reading_form_c_readout_does_not_widen_the_predicate() {
+    let src = joint_src("", "", "H0 * exp(BETA * (central / V))")
+        .replace(
+            "  ode(obs_cmt=central, states=[depot, central])",
+            "  ode(states=[depot, central])",
+        )
+        .replace(
+            "[event_model]",
+            "[scaling]\n  y = (central / V) * (1.0 + 0.0*TIME)\n\n[event_model]",
+        );
+    let m = parse_model_string(&src).expect("a TIME-reading Form C readout must parse");
+    let spec = m.ode_spec.as_ref().expect("ode spec");
+    // The precondition, asserted rather than assumed: the readout really does read
+    // time. Without this the two assertions below would also hold for a model where
+    // the `[scaling]` substitution silently did nothing.
+    assert!(
+        spec.readout_program
+            .as_ref()
+            .expect("Form C readout")
+            .reads_time_builtin(),
+        "the readout must actually read the TIME built-in"
+    );
+    let prog = spec.rhs_program.as_ref().expect("rhs program");
+    assert!(
+        !prog.reads_model_time(),
+        "the RHS itself is autonomous — only the readout reads time"
+    );
+    assert!(
+        !crate::pk::model_uses_time_anywhere(&m),
+        "a time-reading readout must not route the model off the dense driver"
+    );
+}
+
+/// #1166: `__chz_*` is write-only. The narrow flag is sound only because the
+/// injected line cannot influence the PK dynamics, and that is a property of
+/// every *normal* model rather than a structurally enforced one — the collision
+/// guard rejects a user state of the same name, but a user *reference* to the
+/// accumulator compiled fine. Establish the precondition by rejecting.
+#[test]
+#[cfg(feature = "survival")]
+fn reading_the_hazard_accumulator_is_rejected_everywhere_it_could_feed_back() {
+    let cases = [
+        // From a PK derivative — the read that would actually couple the systems.
+        (
+            joint_src(" + 0.0*__chz_3", "", "H0 * exp(BETA * (central / V))"),
+            "PK derivative",
+        ),
+        // Case-insensitively: the aliases resolve to the same slot.
+        (
+            joint_src(" + 0.0*__CHZ_3", "", "H0 * exp(BETA * (central / V))"),
+            "PK derivative, upper case",
+        ),
+        // From an intermediate.
+        (
+            joint_src("", "Z = __chz_3", "H0 * exp(BETA * (central / V))"),
+            "intermediate",
+        ),
+        // From inside an `if` condition — `stmts_read_slots` recurses into both
+        // the condition and the body, and a gate that only walked bodies would
+        // miss this.
+        (
+            joint_src(
+                "",
+                "if (__chz_3 > 1.0) { Z = 1.0 } else { Z = 2.0 }",
+                "H0 * exp(BETA * (central / V))",
+            ),
+            "if condition",
+        ),
+        // From the hazard itself — a self-exciting hazard is the same coupling.
+        (
+            joint_src("", "", "H0 * exp(BETA * (central / V)) * exp(0.1*__chz_3)"),
+            "hazard expression",
+        ),
+    ];
+    for (src, what) in cases {
+        let err = parse_model_string(&src)
+            .err()
+            .unwrap_or_else(|| panic!("reading __chz_3 from the {what} must be rejected"));
+        assert!(
+            err.contains("__chz") && err.contains("reserved"),
+            "the {what} error must name the accumulator and say it is reserved: {err}"
+        );
+    }
+}
+
+/// `init(__chz_n)` is the same hole through a different door: `parse_init_line`
+/// accepts any declared state, and the accumulator is a declared state by then,
+/// so a user could seed `H(0) ≠ 0` and shift every survival probability.
+#[test]
+#[cfg(feature = "survival")]
+fn seeding_the_hazard_accumulator_with_init_is_rejected() {
+    let src = joint_src("", "init(__chz_3) = 0.5", "H0 * exp(BETA * (central / V))");
+    let err = parse_model_string(&src)
+        .err()
+        .expect("init(__chz_3) must be rejected");
+    assert!(
+        err.contains("init(__chz_3)") && err.contains("H(0) = 0"),
+        "error must name the init and the definition it violates: {err}"
+    );
+}
+
+/// The one read that is **allowed**, pinned as allowed: a `[scaling]` readout
+/// cannot feed back into the dynamics, so `y = __chz_3` is legal — and it
+/// reads the cumulative hazard, which is what makes it worth a test rather than
+/// an accident of where the rejection was placed.
+#[test]
+#[cfg(feature = "survival")]
+fn a_scaling_readout_may_read_the_hazard_accumulator() {
+    let src = joint_src("", "", "H0 * exp(BETA * (central / V))")
+        .replace(
+            "  ode(obs_cmt=central, states=[depot, central])",
+            "  ode(states=[depot, central])",
+        )
+        .replace("[event_model]", "[scaling]\n  y = __chz_3\n\n[event_model]");
+    let m = parse_model_string(&src).expect("a readout reading __chz_3 must parse");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        !p.pk_reads_model_time(),
+        "a readout does not make the PK block non-autonomous"
+    );
+}
+
+/// As [`cl_at`], but with a *constant* then-branch — so a branch taken while
+/// `WT` is missing yields a number rather than propagating the `NaN` the test
+/// is not about.
+fn cl_at_const(cond: &str, wt: f64) -> f64 {
+    let src = present_model(cond).replace("(WT / 70)", "3.0");
+    let parsed = parse_full_model(&src).expect("model should parse");
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), wt);
+    (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0]
+}
+
+#[test]
+fn present_negates_and_combines_like_any_other_condition() {
+    // `!present(...)` selects the other branch …
+    assert_eq!(cl_at_const("!present(WT)", 140.0), 2.0);
+    assert_eq!(cl_at_const("!present(WT)", f64::NAN), 6.0);
+    // … and it composes with `&&`, so a guard can carry a real test alongside
+    // the presence check — and short-circuits, so the comparison against a
+    // missing value never decides the branch on its own.
+    assert_eq!(cl_at_const("present(WT) && WT > 100", 140.0), 6.0);
+    assert_eq!(cl_at_const("present(WT) && WT > 100", 50.0), 2.0);
+    assert_eq!(cl_at_const("present(WT) && WT > 100", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_accepts_an_expression_not_only_a_bare_name() {
+    // The argument is an ordinary expression, so a derived quantity can be
+    // tested for missingness too — `WT * 2` is NaN exactly when `WT` is.
+    assert_eq!(cl_at("present(WT * 2)", 140.0), 4.0);
+    assert_eq!(cl_at("present(WT * 2)", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_is_only_special_in_condition_position() {
+    // A covariate that happens to be named `present` is not shadowed: the
+    // predicate is recognised only as `present(` at the head of a condition.
+    let src = r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * (if (present > 0) 2.0 else 1.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(src).expect("a covariate called `present` still parses");
+    let mut covariates = HashMap::new();
+    covariates.insert("present".to_string(), 1.0);
+    let cl = (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0];
+    assert_eq!(cl, 4.0);
+}
+
+#[test]
+fn an_unclosed_present_is_a_parse_error() {
+    let src = present_model("present(WT").replace("else 1.0)", "else 1.0)");
+    let e = parse_full_model(&src)
+        .map(|_| ())
+        .expect_err("unbalanced `present(` must not parse");
+    assert!(
+        e.to_lowercase().contains("present") || e.contains(')'),
+        "{e}"
+    );
+}
+
+// ── #1182: `power(SIGMA, P)` and the `TAD` magnitude built-in ───────────────
+
+const POWER_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ power(PROP_ERR, RUV_POW)
+"#;
+
+/// `power(σ, P)` is the proportional model plus an exponent program on its
+/// slot: the compiled error model is `Proportional`, the magnitude row carries
+/// `[m, p]`, and `∂p/∂θ` is the unit vector on the exponent θ.
+#[test]
+fn power_form_parses_as_proportional_with_an_exponent_slot() {
+    let model = parse_model_string(POWER_MODEL).unwrap();
+    assert_eq!(model.error_model, ErrorModel::Proportional);
+    assert!(model.has_custom_ruv_magnitude());
+    assert!(model.has_ruv_exponent());
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    let rm = model.ruv_magnitude.as_ref().unwrap();
+    assert!(rm.per_sigma[0].is_none(), "the sigma itself is bare");
+    assert!(rm.per_sigma_exponent[0].is_some());
+    let theta = vec![0.2, 10.0, 1.3];
+    let cov = std::collections::HashMap::new();
+    let row = rm.eval_obs(&theta, &cov, 1.0, 1.0);
+    assert_eq!(row, vec![1.0, 1.3], "multiplier half then exponent half");
+    let grad = rm.eval_obs_theta_grad(&theta, &cov, 1.0, 1.0).unwrap();
+    assert_eq!(grad.len(), 2);
+    assert_eq!(
+        grad[0],
+        vec![0.0; 3],
+        "the bare multiplier has no θ derivative"
+    );
+    assert_eq!(
+        grad[1],
+        vec![0.0, 0.0, 1.0],
+        "∂p/∂θ is the unit vector on RUV_POW"
+    );
+    // The exponent θ is referenced from [error_model], so it is not "unused".
+    assert!(
+        !model.parse_warnings.iter().any(|w| w.contains("RUV_POW")),
+        "{:?}",
+        model.parse_warnings
+    );
+    // The row reaches the variance: σ²·|f|^{2p} at f = 2.
+    let sigma = &model.default_params.sigma.values;
+    let v = model
+        .error_spec
+        .variance_at_scaled(1, 2.0, sigma, &[], &row);
+    approx::assert_relative_eq!(
+        v,
+        sigma[0] * sigma[0] * 2.0f64.powf(2.6),
+        max_relative = 1e-12
+    );
+}
+
+/// An exponent of exactly `1` is the proportional model, on the legacy
+/// arithmetic bit for bit — the search's neutral start must not move the
+/// base fit.
+#[test]
+fn power_form_with_unit_exponent_is_the_proportional_variance_bit_for_bit() {
+    let model = parse_model_string(&POWER_MODEL.replace("RUV_POW(1.3,", "RUV_POW(1.0,")).unwrap();
+    let rm = model.ruv_magnitude.as_ref().unwrap();
+    let theta = vec![0.2, 10.0, 1.0];
+    let row = rm.eval_obs(&theta, &std::collections::HashMap::new(), 1.0, 1.0);
+    assert_eq!(row, vec![1.0, 1.0]);
+    let sigma = &model.default_params.sigma.values;
+    for f in [0.0, 0.37, 2.0, 15.5, -3.0] {
+        assert_eq!(
+            model.error_spec.variance_at_scaled(1, f, sigma, &[], &row),
+            model
+                .error_spec
+                .variance_at_scaled(1, f, sigma, &[], &row[..1]),
+            "f = {f}"
+        );
+        assert_eq!(
+            model.error_spec.dvar_df_scaled(1, f, sigma, &row),
+            model.error_spec.dvar_df_scaled(1, f, sigma, &row[..1]),
+        );
+    }
+}
+
+/// `TAD` inside a magnitude expression is the record's data-derived time after
+/// dose, in both the runtime closure and the `Dual1` θ-program.
+#[test]
+fn magnitude_expression_reads_tad() {
+    let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_TV(1.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0))
+"#;
+    let model = parse_model_string(content).unwrap();
+    let rm = model.ruv_magnitude.as_ref().unwrap();
+    assert!(!rm.has_exponent());
+    let theta = vec![0.2, 10.0, 1.5];
+    let cov = std::collections::HashMap::new();
+    // TIME is 100 on both records; only TAD tells them apart.
+    assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 5.0), vec![1.5]);
+    assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 20.0), vec![1.0]);
+    let early = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 5.0).unwrap();
+    let late = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 20.0).unwrap();
+    assert_eq!(early[0], vec![0.0, 0.0, 1.0]);
+    assert_eq!(late[0], vec![0.0, 0.0, 0.0]);
+}
+
+/// `Subject::time_after_dose` is the data TAD with Pharmpy's `get_doseid`
+/// grouping: an observation at exactly a non-SS dose's time belongs to the
+/// previous dose (`dose@0, dose@24, obs@24` → `24`, not `0`), steady-state
+/// aware, and a pre-dose observation is Pharmpy's dose group `0` — its
+/// offset from the subject's first pre-dose record, `0` for a lone baseline
+/// sample. The sdtab fallback `time_after_dose_at_or_before` keeps NONMEM's
+/// record-order `0` on the same-time row and `NaN` before the first dose.
+/// Regression for the review of #1182: with `<=` the trough at the dosing
+/// time read `0`, shifting `ruvsearch`'s TAD quantiles away from Pharmpy's;
+/// and for the review of #1273: the pre-dose row read `NaN`, which failed
+/// `fit()` at `check_residual_magnitude` for any dataset with a baseline
+/// sample and put those rows in the late group of a time-varying candidate.
+#[test]
+fn subject_time_after_dose_is_the_data_tad() {
+    use crate::types::{DoseEvent, Subject};
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![-1.0, 0.0, 2.0, 23.9, 24.0, 30.0],
+        ..Default::default()
+    };
+    let tad: Vec<f64> = (0..6).map(|j| subject.time_after_dose(j)).collect();
+    assert_eq!(
+        tad,
+        [0.0, 0.0, 2.0, 23.9, 24.0, 6.0],
+        "Pharmpy grouping: the lone pre-dose sample is group 0 at offset 0; \
+         obs@24 belongs to dose@0; obs@0 keeps the first dose"
+    );
+    let nonmem: Vec<f64> = (0..6)
+        .map(|j| subject.time_after_dose_at_or_before(j))
+        .collect();
+    assert!(
+        nonmem[0].is_nan(),
+        "sdtab fallback: NaN before the first dose"
+    );
+    assert_eq!(
+        nonmem[1..],
+        [0.0, 2.0, 23.9, 0.0, 6.0],
+        "sdtab fallback: the dose at 24 is the most recent dose"
+    );
+    // The two conventions differ on exactly the same-time row (the pre-dose
+    // row is NaN on one side, so it is compared separately above).
+    let differing: Vec<usize> = (1..6).filter(|&j| tad[j] != nonmem[j]).collect();
+    assert_eq!(differing, [4]);
+
+    // Pharmpy's group-0 cumsum: several pre-dose records read their offset
+    // from the first of them, whichever record kind that is (an `EVID=2` row
+    // here), and a record *at* the first dose's time is that dose's, not
+    // group 0's.
+    let run_in = Subject {
+        id: "4".into(),
+        doses: vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)],
+        pk_only_times: vec![-3.0],
+        obs_times: vec![-2.0, 0.0, 10.0, 12.0],
+        ..Default::default()
+    };
+    let tad: Vec<f64> = (0..4).map(|j| run_in.time_after_dose(j)).collect();
+    assert_eq!(tad, [1.0, 3.0, 0.0, 2.0]);
+    // A subject with no dose at all is one group-0 run: time since its first
+    // record, never NaN.
+    let undosed = Subject {
+        id: "5".into(),
+        obs_times: vec![0.0, 4.0, 9.0],
+        ..Default::default()
+    };
+    let tad: Vec<f64> = (0..3).map(|j| undosed.time_after_dose(j)).collect();
+    assert_eq!(tad, [0.0, 4.0, 9.0]);
+    assert!(
+        undosed.time_after_dose(3).is_nan(),
+        "out of range stays NaN"
+    );
+
+    let ss = Subject {
+        id: "2".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+        obs_times: vec![0.0, 26.0],
+        ..Default::default()
+    };
+    assert_eq!(
+        ss.time_after_dose(0),
+        0.0,
+        "an observation at an SS dose's time stays with that dose (no swap)"
+    );
+    assert_eq!(
+        ss.time_after_dose(1),
+        2.0,
+        "SS with II=12: last implied dose at 24"
+    );
+    // An SS dose at the observation's time counts under Pharmpy's rule even
+    // when a non-SS dose precedes it.
+    let ss_later = Subject {
+        id: "3".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(48.0, 100.0, 1, 0.0, true, 12.0),
+        ],
+        obs_times: vec![48.0],
+        ..Default::default()
+    };
+    assert_eq!(ss_later.time_after_dose(0), 0.0);
+}
+
+/// `TAD` inside an `[error_model]` expression is the engine-computed time
+/// after dose and resolves before the covariate map is consulted, so a
+/// declared covariate of that name would be read by every other block and
+/// silently shadowed here. Refused at parse time (review of #1273).
+#[test]
+fn error_model_tad_builtin_refuses_a_declared_tad_covariate() {
+    let with_cov = POWER_MODEL.replace(
+        "  DV ~ power(PROP_ERR, RUV_POW)\n",
+        "  DV ~ power(PROP_ERR * (if (TAD < 12.0) 1.5 else 1.0), RUV_POW)\n[covariates]\n  \
+         TAD continuous\n",
+    );
+    let err = expect_parse_err(&with_cov);
+    assert!(
+        err.contains("references `TAD`") && err.contains("covariate named `TAD`"),
+        "got: {err}"
+    );
+    // The lower-case spelling resolves to the same built-in, and a covariate
+    // of either case is the same clash.
+    let lower = with_cov.replace("(TAD < 12.0)", "(tad < 12.0)");
+    assert!(expect_parse_err(&lower).contains("references `TAD`"));
+    // A `TAD` covariate that the error model does not read is fine, and so
+    // is the built-in without the covariate.
+    let unread = POWER_MODEL.replace(
+        "  DV ~ power(PROP_ERR, RUV_POW)\n",
+        "  DV ~ power(PROP_ERR, RUV_POW)\n[covariates]\n  TAD continuous\n",
+    );
+    parse_model_string(&unread).expect("a TAD covariate the error model never reads");
+    let builtin = POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR * (if (TAD < 12.0) 1.5 else 1.0), RUV_POW)",
+    );
+    parse_model_string(&builtin).expect("the built-in without a covariate");
+}
+
+/// `RuvMagnitude::uses_tad` records whether any expression reads the `TAD`
+/// built-in, so `ruv_obs_mult` runs the per-observation dose scan only for
+/// a model that can see the result (review of #1273).
+#[test]
+fn ruv_magnitude_records_whether_it_reads_tad() {
+    let without = parse_model_string(POWER_MODEL).unwrap();
+    assert!(!without.ruv_magnitude.as_ref().unwrap().uses_tad);
+    for spelling in ["TAD", "tad"] {
+        let with = parse_model_string(&POWER_MODEL.replace(
+            "power(PROP_ERR, RUV_POW)",
+            &format!("power(PROP_ERR * (if ({spelling} < 12.0) 1.5 else 1.0), RUV_POW)"),
+        ))
+        .unwrap();
+        assert!(with.ruv_magnitude.as_ref().unwrap().uses_tad, "{spelling}");
+    }
+    // The exponent is an expression too.
+    let in_exponent = parse_model_string(&POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR, RUV_POW + 0.01 * TAD)",
+    ))
+    .unwrap();
+    assert!(in_exponent.ruv_magnitude.as_ref().unwrap().uses_tad);
+}
+
+#[test]
+fn power_form_rejects_the_wrong_argument_count() {
+    let err = expect_parse_err(&POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR)"));
+    assert!(err.contains("power(SIGMA, EXPONENT)"), "got: {err}");
+    let err = expect_parse_err(
+        &POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR, RUV_POW, TVV)"),
+    );
+    assert!(err.contains("3 argument(s)"), "got: {err}");
+}
+
+#[test]
+fn power_form_rejects_a_sigma_in_the_exponent() {
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR, RUV_POW * PROP_ERR)",
+    ));
+    assert!(err.contains("references sigma `PROP_ERR`"), "got: {err}");
+}
+
+#[test]
+fn power_form_rejects_an_eta_in_the_exponent() {
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR, RUV_POW * exp(ETA_CL))",
+    ));
+    assert!(
+        err.contains("power exponent may not depend on a random effect"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn power_form_rejects_the_forms_it_cannot_combine_with() {
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "DV ~ power(PROP_ERR, RUV_POW)",
+        "log(DV) ~ power(PROP_ERR, RUV_POW)",
+    ));
+    assert!(
+        err.contains("log-transform-both-sides supports only additive"),
+        "got: {err}"
+    );
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "DV ~ power(PROP_ERR, RUV_POW)",
+        "DV ~ power(PROP_ERR, RUV_POW) weight = TVV",
+    ));
+    assert!(
+        err.contains("`weight = …` has no effect on a `power(...)`"),
+        "got: {err}"
+    );
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "DV ~ power(PROP_ERR, RUV_POW)",
+        "if (TVV > 1.0) { DV ~ power(PROP_ERR, RUV_POW) } else { DV ~ proportional(PROP_ERR) }",
+    ));
+    assert!(
+        err.contains("not supported inside a covariate-selected"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn power_form_rejects_per_cmt() {
+    let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  CMT=1: DV ~ power(PROP_ERR, RUV_POW)
+"#;
+    let err = expect_parse_err(content);
+    assert!(err.contains("not supported with per-CMT"), "got: {err}");
 }

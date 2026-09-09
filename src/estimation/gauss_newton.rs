@@ -19,10 +19,34 @@ use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{chol_log_det, compute_r_tilde};
-use crate::stats::residual_error::compute_r_diag;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
+
+/// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends
+/// unconverged on a fixed-effects-only model (`n_eta = 0`).
+///
+/// States the *outcome* only. The remedy ("prefer `gn_hybrid` or `focei`, or improve
+/// the `sigma` start") belongs to `W_GN_NO_RANDOM_EFFECTS`, which `check_model_options`
+/// raises for the same configuration and `fit_inner` surfaces alongside this one —
+/// repeating it here made a single `gn` run at `n_eta = 0` give the same advice twice.
+/// Inside `fit()` the two always travel together: this warning needs `n_eta = 0` and a
+/// non-hybrid, non-polished `gn` stage, which is precisely when the check raises
+/// `W_GN_NO_RANDOM_EFFECTS`. A caller reaching `run_foce_gn` directly, bypassing
+/// `check_model_options`, sees the outcome without the remedy.
+///
+/// Named rather than inlined because the exemption has two halves. `gn_hybrid` is
+/// handled here (`options.method` is `FoceGnHybrid` during its GN phase), but a
+/// hand-written `methods = [gn, focei]` chain — the same polish, spelled out — is
+/// invisible from inside this function: `api::fit` rewrites `stage_opts.method` to
+/// the stage's method and blanks `stage_opts.methods`, so the chain is gone by the
+/// time `run_foce_gn` sees its options. `fit_inner` therefore drops this exact
+/// string from a GN stage that is not the last estimating stage; see
+/// `api::postfit::keep_gn_zero_eta_warning`.
+pub(crate) const GN_ZERO_ETA_NONCONVERGENCE_WARNING: &str =
+    "Gauss-Newton did not converge on a model with no random effects \
+     (n_eta = 0). BHHH curvature is unreliable far from the optimum in \
+     this regime, so the result may be badly wrong, not just imprecise.";
 
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
@@ -56,6 +80,12 @@ pub fn run_foce_gn(
     };
 
     let mut warnings = Vec::new();
+
+    // Covariate-NN (DCM) regularizer. No-op when both λ are 0. GN minimises the
+    // penalized objective (`ofv`), with ∇P in the gradient and the penalty's
+    // curvature in the BHHH system; `ofv_clean` — the −2LL at the same point —
+    // is what the trace, checkpoint, verbose lines and the reported OFV carry.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
 
     // BHHH Information-matrix approximation degrades as the censoring fraction
     // grows — each censored row contributes less Fisher information than its
@@ -97,7 +127,7 @@ pub fn run_foce_gn(
         options.inner_restarts,
     );
 
-    let mut ofv = 2.0
+    let mut ofv_clean = 2.0
         * pop_nll(
             model,
             population,
@@ -107,9 +137,10 @@ pub fn run_foce_gn(
             &kappas,
             options.interaction,
         );
+    let mut ofv = ofv_clean + nn_reg.penalty_value(&params.theta);
 
     if verbose {
-        eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv);
+        eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv_clean);
     }
 
     let mut converged = false;
@@ -136,6 +167,15 @@ pub fn run_foce_gn(
             &bounds,
             options,
         );
+        // Covariate-NN penalty: ∇P into the gradient, its curvature (exact 2λ
+        // on the L2 weight diagonal, Gauss–Newton `2λ·Σ ∂C/∂w ∂C/∂wᵀ` for the
+        // smoothness term) into the BHHH system, so the quadratic model
+        // predicts the penalized objective it is stepping on.
+        if nn_reg.is_active() {
+            let theta_x = unpack_params(&x, init_params).theta;
+            nn_reg.add_packed_gradient(&theta_x, grad.as_mut_slice());
+            nn_reg.add_packed_hessian(&theta_x, &mut |i, j, v| h_bhhh[(i, j)] += v);
+        }
 
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
         // their diagonal to 1. The clamp at step-application keeps x[i] at its
@@ -240,7 +280,7 @@ pub fn run_foce_gn(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
         );
-        let ofv_try = 2.0
+        let ofv_try_clean = 2.0
             * pop_nll(
                 model,
                 population,
@@ -250,6 +290,7 @@ pub fn run_foce_gn(
                 &kap_try,
                 options.interaction,
             );
+        let ofv_try = ofv_try_clean + nn_reg.penalty_value(&params_try.theta);
 
         // TR ratio: actual OFV decrease vs quadratic model decrease.
         // rho < 0 or non-finite OFV → reject.
@@ -278,7 +319,7 @@ pub fn run_foce_gn(
                     iter,
                     gn_method,
                     gn_phase,
-                    ofv,
+                    ofv_clean,
                     Some(grad_norm_trace),
                     radius_before,
                     0.0,
@@ -311,8 +352,9 @@ pub fn run_foce_gn(
         let rel_change = ofv_change / ofv.abs().max(1.0);
 
         x = x_try;
-        let prev_ofv = ofv;
+        let prev_ofv_clean = ofv_clean;
         ofv = ofv_try;
+        ofv_clean = ofv_try_clean;
         eta_hats = eta_try;
         h_matrices = h_try;
         kappas = kap_try;
@@ -330,10 +372,10 @@ pub fn run_foce_gn(
                 iter,
                 gn_method,
                 gn_phase,
-                ofv,
+                ofv_clean,
                 Some(grad_norm_trace),
                 trust_radius,
-                ofv - prev_ofv,
+                ofv_clean - prev_ofv_clean,
                 true,
                 None,
                 None,
@@ -345,13 +387,13 @@ pub fn run_foce_gn(
         // Checkpoint (#755): persist the accepted point periodically. `x` is
         // already the packed vector, so this is alloc-free until a write is due.
         if crate::io::checkpoint::is_due() {
-            crate::io::checkpoint::maybe_write(iter, ofv, &x);
+            crate::io::checkpoint::maybe_write(iter, ofv_clean, &x);
         }
 
         if verbose {
             eprintln!(
                 "  GN iter {:>3}: OFV = {:.6}  (delta={:.2e}, radius={:.4})",
-                iter, ofv, ofv_change, trust_radius
+                iter, ofv_clean, ofv_change, trust_radius
             );
         }
 
@@ -367,6 +409,20 @@ pub fn run_foce_gn(
 
     if !converged {
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
+        // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
+        // predicts a badly wrong answer — there is no inner EBE loop to absorb
+        // a poor start, so the BHHH step can collapse orders of magnitude above
+        // the optimum (8940 OFV units off on the `one_cpt_iv_pooled` anchor).
+        // `gn_hybrid` is exempt: its FOCEI polish re-optimises from here and
+        // recovers the optimum. A hand-written `methods = [gn, focei]` chain
+        // earns the same exemption, but this function cannot see it — `api::fit`
+        // blanks `stage_opts.methods` per stage — so that case is suppressed by
+        // name in `fit_inner` via [`GN_ZERO_ETA_NONCONVERGENCE_WARNING`].
+        // `ferx check` flags the same combination up front as
+        // W_GN_NO_RANDOM_EFFECTS (`check_model_options`).
+        if model.n_eta == 0 && !matches!(options.method, EstimationMethod::FoceGnHybrid) {
+            warnings.push(GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string());
+        }
     }
 
     // Recompute gradient at the final accepted x so the stored value is always
@@ -382,17 +438,25 @@ pub fn run_foce_gn(
         &bounds,
         options,
     );
-    let mut final_gradient: Option<Vec<f64>> = Some(grad_final.as_slice().to_vec());
+    let gn_params = unpack_params(&x, init_params);
+    // `final_gradient` is the gradient of the objective GN minimised, i.e.
+    // penalized under covariate-NN regularization (see `FitResult::final_gradient`).
+    let mut grad_final = grad_final.as_slice().to_vec();
+    nn_reg.add_packed_gradient(&gn_params.theta, &mut grad_final);
+    let mut final_gradient: Option<Vec<f64>> = Some(grad_final);
 
+    // Penalized: this is what the FOCEI polish below is ranked against.
     let gn_ofv = ofv;
+    let gn_ofv_clean = ofv_clean;
     let do_polish = matches!(options.method, EstimationMethod::FoceGnHybrid);
 
     // ---- Optional hybrid: polish with FOCEI from GN result ----
     if do_polish && verbose {
-        eprintln!("GN phase done (OFV={:.4}). Polishing with FOCEI...", ofv);
+        eprintln!(
+            "GN phase done (OFV={:.4}). Polishing with FOCEI...",
+            gn_ofv_clean
+        );
     }
-
-    let gn_params = unpack_params(&x, init_params);
 
     if !do_polish {
         // Pure GN — skip FOCEI polish, go directly to covariance step
@@ -416,12 +480,12 @@ pub fn run_foce_gn(
         warnings.extend(cov_warnings);
 
         if verbose {
-            eprintln!("FOCE-GN completed. Final OFV = {:.4}", ofv);
+            eprintln!("FOCE-GN completed. Final OFV = {:.4}", gn_ofv_clean);
         }
 
         return OuterResult {
             params: gn_params,
-            ofv,
+            ofv: gn_ofv_clean,
             converged,
             n_iterations: maxiter,
             eta_hats,
@@ -445,6 +509,9 @@ pub fn run_foce_gn(
             // the exact factor `L`; reused by `run_covariance` for a bit-for-bit
             // covariance instead of re-decomposing `omega` (#816 follow-up).
             packed_estimate: Some(x.clone()),
+            left_init: None,
+            mixture_posteriors: None,
+            vi: None,
         };
     }
 
@@ -474,11 +541,17 @@ pub fn run_foce_gn(
     let final_h_mats;
     let final_kappas;
 
-    if polish_result.ofv < gn_ofv {
+    // Rank the two phases on the objective both of them minimised. The polish
+    // reports the clean −2LL, so under covariate-NN regularization its penalty
+    // is added back before the compare — comparing clean against clean would
+    // throw the regularized polish away whenever the penalty bit (a penalized
+    // optimum's clean OFV is ≥ the unregularized GN optimum's by construction).
+    let polish_penalized = polish_result.ofv + nn_reg.penalty_value(&polish_result.params.theta);
+    if polish_penalized < gn_ofv {
         if verbose {
             eprintln!(
                 "  FOCEI polish improved OFV: {:.4} -> {:.4}",
-                gn_ofv, polish_result.ofv
+                gn_ofv_clean, polish_result.ofv
             );
         }
         final_ofv = polish_result.ofv;
@@ -492,7 +565,7 @@ pub fn run_foce_gn(
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
         }
-        final_ofv = gn_ofv;
+        final_ofv = gn_ofv_clean;
         final_params = gn_params;
         final_etas = eta_hats;
         final_h_mats = h_matrices;
@@ -554,6 +627,9 @@ pub fn run_foce_gn(
         // Exact packed vector this stage's covariance step used (see above);
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
+        left_init: None,
+        mixture_posteriors: None,
+        vi: None,
     }
 }
 
@@ -650,47 +726,6 @@ fn fwd_solve(chol_l: &DMatrix<f64>, rhs: &[f64]) -> Vec<f64> {
     w
 }
 
-/// d(r_j)/d(log sigma_k) for each observation, at the prediction point used
-/// to evaluate r_diag (f0 for standard, ipreds for interaction).
-fn dr_diag_d_log_sigma(
-    error_model: ErrorModel,
-    r_diag: &[f64],
-    pred_point: &[f64], // f0 or ipreds depending on path
-    sigma_values: &[f64],
-    sigma_k: usize,
-) -> Vec<f64> {
-    r_diag
-        .iter()
-        .zip(pred_point.iter())
-        .map(|(&r_j, &f_j)| match error_model {
-            ErrorModel::Additive => {
-                if sigma_k == 0 {
-                    2.0 * sigma_values[0] * sigma_values[0]
-                } else {
-                    0.0
-                }
-            }
-            ErrorModel::Proportional => {
-                if sigma_k == 0 {
-                    2.0 * r_j
-                } else {
-                    0.0
-                }
-            }
-            ErrorModel::Combined => {
-                if sigma_k == 0 {
-                    // d(sigma_prop^2 * f^2)/d(log sigma_prop) = 2 * sigma_prop^2 * f^2
-                    let sp2 = sigma_values[0] * sigma_values[0];
-                    2.0 * sp2 * f_j * f_j
-                } else {
-                    // sigma_k == 1: d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
-                    2.0 * sigma_values[1] * sigma_values[1]
-                }
-            }
-        })
-        .collect()
-}
-
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
 ///
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
@@ -767,11 +802,19 @@ fn subject_nll_pop_grad_analytical(
         Vec::new()
     };
     let r_pred_point: &[f64] = if use_pop_var { &pop_preds } else { &f0 };
-    let r_diag = compute_r_diag(
+    // #484/#1029: the per-observation magnitude rides the sigma loadings, so the
+    // Sheiner–Beal `R̃` is built from the same variance the FOCE marginal scores.
+    // A θ-*dependent* magnitude is routed to the FD fallback by the caller (this
+    // chain rule has no direct `∂R/∂θ` term), so what reaches here is θ-free.
+    let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+    let obs_keys = model.error_spec.obs_keys(subject);
+    let obs_keys: &[usize] = obs_keys.as_ref();
+    let r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
         &model.error_spec,
         r_pred_point,
-        model.error_spec.obs_keys(subject).as_ref(),
+        obs_keys,
         &params.sigma.values,
+        ruv_mult.as_deref(),
     );
 
     let r_tilde = compute_r_tilde(h_matrix, &params.omega.matrix, &r_diag);
@@ -857,24 +900,29 @@ fn subject_nll_pop_grad_analytical(
         let d_var_pred: &[f64] = if use_pop_var { &d_pop_preds } else { &d_ipreds };
 
         // d(f0) = d(ipreds); d(v) = -d(f0)
-        // For sigma-dependent r: d(r_j)/d(x[k]) via chain rule through r at r_pred_point
-        let dr: Vec<f64> = r_diag
+        // For sigma-dependent r: d(r_j)/d(x[k]) = ∂V/∂f · ∂f/∂x[k], the slope
+        // taken at r_pred_point through `residual_error`'s own `∂V/∂f` — the
+        // same magnitude-scaled, exponent-aware (#1182) dispatch the Laplace
+        // path and every other estimator use, so there is no second copy of
+        // the variance formula here to drift (a hand-rolled `2·σ²·f²·m²` did,
+        // silently, under a `power(...)` loading).
+        let dr: Vec<f64> = r_pred_point
             .iter()
-            .zip(r_pred_point.iter().zip(d_var_pred.iter()))
-            .map(|(&r_j, (&pred_j, &dp_j))| match model.error_model {
-                ErrorModel::Additive => 0.0,
-                ErrorModel::Proportional => {
-                    // r_j = sigma^2 * pred^2 => dr/d(pred) = 2*sigma^2*pred = 2*r_j/pred
-                    if pred_j.abs() > 1e-15 {
-                        2.0 * r_j / pred_j * dp_j
-                    } else {
-                        0.0
-                    }
-                }
-                ErrorModel::Combined => {
-                    let sp2 = params.sigma.values[0] * params.sigma.values[0];
-                    2.0 * sp2 * pred_j * dp_j
-                }
+            .zip(d_var_pred.iter())
+            .enumerate()
+            .map(|(j, (&pred_j, &dp_j))| {
+                let dvdf = match ruv_mult.as_deref() {
+                    Some(m) => model.error_spec.dvar_df_scaled(
+                        obs_keys[j],
+                        pred_j,
+                        &params.sigma.values,
+                        &m[j],
+                    ),
+                    None => model
+                        .error_spec
+                        .dvar_df(obs_keys[j], pred_j, &params.sigma.values),
+                };
+                dvdf * dp_j
             })
             .collect();
 
@@ -979,13 +1027,26 @@ fn subject_nll_pop_grad_analytical(
         if fixed_mask[k] {
             continue;
         }
-        let dr_k = dr_diag_d_log_sigma(
-            model.error_model,
-            &r_diag,
-            r_pred_point,
-            &params.sigma.values,
-            ks,
-        );
+        // ∂r_j/∂log σ_ks at r_pred_point, from the one owner of that formula
+        // (`ErrorSpec::dvar_dlogsigma{,_scaled}`): a sigma the statement does
+        // not load (#1001's inert trailing sigma) reads `0`, and a `power(...)`
+        // slot's `|f|^{2p}` loading is carried (#1182).
+        let dr_k: Vec<f64> = r_pred_point
+            .iter()
+            .enumerate()
+            .map(|(j, &f_j)| match ruv_mult.as_deref() {
+                Some(m) => model.error_spec.dvar_dlogsigma_scaled(
+                    obs_keys[j],
+                    ks,
+                    f_j,
+                    &params.sigma.values,
+                    &m[j],
+                ),
+                None => model
+                    .error_spec
+                    .dvar_dlogsigma(obs_keys[j], ks, f_j, &params.sigma.values),
+            })
+            .collect();
         let g: f64 = dr_k
             .iter()
             .zip(rinv_diag.iter().zip(solved_a.iter()))
@@ -1142,17 +1203,31 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let err: Vec<f64> = (0..n_obs)
         .map(|j| subject.observations[j] - ipreds[j])
         .collect();
+    // #484/#1029: per-observation residual-magnitude multiplier. The caller
+    // routes a *θ-dependent* magnitude to the FD fallback (there is no direct
+    // `∂V/∂θ` channel in this assembly), so what reaches here is θ-free — a
+    // per-observation constant, for which `R`, `∂R/∂f`, `∂²R/∂f²` and
+    // `∂R/∂log σ` in their `_scaled` forms make the whole gradient exact again.
+    let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+    let mult_row = |j: usize| ruv_mult.as_ref().map(|m| m[j].as_slice());
     let r_diag: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.variance_at(err_keys[j], ipreds[j], sigma_values))
+        .map(|j| match mult_row(j) {
+            Some(m) => error_spec.variance_at_scaled(err_keys[j], ipreds[j], sigma_values, &[], m),
+            None => error_spec.variance_at(err_keys[j], ipreds[j], sigma_values),
+        })
         .collect();
     if r_diag.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
         return None;
     }
     let d_vec: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.dvar_df(err_keys[j], ipreds[j], sigma_values))
+        .map(|j| match mult_row(j) {
+            Some(m) => error_spec.dvar_df_scaled(err_keys[j], ipreds[j], sigma_values, m),
+            None => error_spec.dvar_df(err_keys[j], ipreds[j], sigma_values),
+        })
         .collect();
-    // ∂²R/∂f² per observation. f-independent for additive/proportional/combined
-    // (0 for additive, 2·σ_prop² otherwise), but the *per-CMT* value can differ
+    // ∂²R/∂f² per observation. Constant for additive/proportional/combined
+    // (0 for additive, 2·σ_prop² otherwise) except where the variance floor
+    // clamps it to 0 (#958), but the *per-CMT* value can differ
     // across observations: e.g. an Emax PK/PD model with proportional error on
     // PK (CMT=2) and additive on PD (CMT=3) needs `d2 = 2·σ_prop²` at PK obs
     // and `d2 = 0` at PD obs. Dispatch through `error_spec.d2var_df2` so the
@@ -1160,7 +1235,10 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     // the cmt argument and returns the scalar value uniformly. The β_j chain
     // at line ~1095 then reads `d2_vec[j]` per obs.
     let d2_vec: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.d2var_df2(err_keys[j], sigma_values))
+        .map(|j| match mult_row(j) {
+            Some(m) => error_spec.d2var_df2_scaled(err_keys[j], ipreds[j], sigma_values, m),
+            None => error_spec.d2var_df2(err_keys[j], ipreds[j], sigma_values),
+        })
         .collect();
 
     // Conditional Hessian H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.
@@ -1378,8 +1456,8 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     //   ∂R/∂log σ_s, ∂d/∂log σ_s per obs (from `dvar_dlogsigma` and the
     //   error-model dispatch — `dvar_dlogsigma` is already the right hook
     //   for ∂R/∂log σ; ∂d/∂log σ for the proportional component is 2·d
-    //   (combined or proportional), and 0 for additive — see the analytical
-    //   SB path's `dr_diag_d_log_sigma` for the matching idiom).
+    //   (combined or proportional), and 0 for additive — the analytical
+    //   SB path takes the same `dvar_dlogsigma{,_scaled}` per observation).
     //
     // Resolve SigmaType through `error_spec` (the same dispatcher every other
     // variance call uses), not `model.error_model`, so this stays internally
@@ -1392,7 +1470,16 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             continue;
         }
         let dr_per_obs: Vec<f64> = (0..n_obs)
-            .map(|j| error_spec.dvar_dlogsigma(err_keys[j], ks, ipreds[j], sigma_values))
+            .map(|j| match mult_row(j) {
+                // #484/#1029: slot `ks`'s loading carries the magnitude, so its
+                // `log σ` derivative scales by `m_ks²` — the same pairing
+                // `r_diag`/`d_vec`/`d2_vec` take above. `dd = d·dd_factor` needs
+                // no separate treatment: `d_vec` is already the scaled slope.
+                Some(m) => {
+                    error_spec.dvar_dlogsigma_scaled(err_keys[j], ks, ipreds[j], sigma_values, m)
+                }
+                None => error_spec.dvar_dlogsigma(err_keys[j], ks, ipreds[j], sigma_values),
+            })
             .collect();
         // ∂d/∂log σ_s. For proportional and combined, d = 2·σ_prop²·f, so
         // ∂d/∂log σ_prop = 2·d and ∂d/∂log σ_add = 0. For additive d = 0
@@ -1627,8 +1714,23 @@ pub(crate) fn subject_nll_pop_grad(
     // residual-eta c̃ column that `foce_subject_nll_interaction` now adds. Fall
     // back to central FD over `subject_nll_at` (which holds the correct scaled
     // marginal) so the gradient stays consistent with the objective.
+    // #484/#1029: both closed forms take the θ axis as a forward FD on the
+    // *predictions* alone. A θ-free magnitude (every `weight = <covariate>`
+    // model) is a per-observation constant, so scaling R / ∂R∂f / ∂R∂logσ keeps
+    // them exact. A θ-*dependent* magnitude adds a direct `∂R/∂θ` channel that
+    // neither chain rule carries — and it enters `log|H̃|` as well as the data
+    // term — so route those subjects to the FD fallback below, which differences
+    // `subject_nll_at` and is magnitude-aware end to end.
+    // A θ-*free* `power(...)` exponent (#1182) needs no such routing: both
+    // closed forms take `R`, `∂R/∂f` and `∂R/∂log σ` from `residual_error`'s
+    // `_scaled` dispatch, which carries the `|f|^{2p}` loading. An exponent
+    // that names a θ is θ-dependent like any other magnitude and goes to FD.
+    let no_theta_dep_magnitude = !model.has_theta_dependent_ruv_magnitude();
     let no_ruv_eta = model.residual_error_eta.is_none();
-    let common_ok = !matches!(model.bloq_method, BloqMethod::M3) && kappas.is_empty() && no_ruv_eta;
+    let common_ok = !matches!(model.bloq_method, BloqMethod::M3)
+        && kappas.is_empty()
+        && no_ruv_eta
+        && no_theta_dep_magnitude;
     let sb_ok =
         common_ok && model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_));
     let laplace_ok = common_ok;
@@ -1923,7 +2025,10 @@ fn subject_nll_at(
         eta_hat,
         h_matrix,
         &params.omega,
+        // `block_sigma` + Gauss-Newton is rejected up front
+        // (`E_BLOCK_SIGMA_METHOD_UNSUPPORTED`), so these are always empty (#847).
         &params.sigma.values,
+        &params.residual_correlations,
         options.interaction,
     )
 }
@@ -1942,6 +2047,8 @@ mod tests {
     fn make_model() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             theta_lower: vec![0.1, 5.0],
@@ -1956,8 +2063,10 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         CompiledModel {
+            covariate_model: None,
             name: "gn_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -1984,6 +2093,7 @@ mod tests {
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
@@ -2002,6 +2112,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
@@ -2017,6 +2128,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 
@@ -2035,10 +2147,12 @@ mod tests {
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 obs_l2: Vec::new(),
                 dose_occasions: vec![1],
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             })
@@ -2050,6 +2164,53 @@ mod tests {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
+        }
+    }
+
+    /// A sigma declared past the ones the `[error_model]` names is inert — #1001
+    /// documents it that way and accepts the spelling (FREM's trailing `EPSCOV`
+    /// is the shipped example). The Sheiner–Beal σ-gradient once had its own
+    /// `∂R/∂log σ` whose `Combined` arm used a bare `else` for `sigma_k != 0`,
+    /// so the trailing sigma was handed the *additive* sigma's derivative
+    /// instead of zero, and `subject_nll_pop_grad` (also the `s`/`rsr` score
+    /// cross-product in `covariance.rs`) carried a spurious row for a
+    /// parameter that does not enter `R`. That path now reads
+    /// `ErrorSpec::dvar_dlogsigma`, the one owner of the formula; pin that it
+    /// returns zero for the unloaded slot on every single-endpoint error model.
+    #[test]
+    fn combined_ignores_sigmas_past_its_own_slots() {
+        let pred = [2.0_f64, 4.0];
+        let sigmas = [0.2_f64, 0.1, 1.0]; // prop, add, trailing/unreferenced
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+
+        // Slot 0 and slot 1 keep their derivatives.
+        let d0: Vec<f64> = pred
+            .iter()
+            .map(|&f| spec.dvar_dlogsigma(0, 0, f, &sigmas))
+            .collect();
+        assert!((d0[0] - 2.0 * 0.04 * 4.0).abs() < 1e-12, "{d0:?}");
+        let d1: Vec<f64> = pred
+            .iter()
+            .map(|&f| spec.dvar_dlogsigma(0, 1, f, &sigmas))
+            .collect();
+        assert!(d1.iter().all(|v| (v - 2.0 * 0.01).abs() < 1e-12), "{d1:?}");
+
+        // Slot 2 is not loaded by a `combined` error model, so ∂R/∂log σ₂ ≡ 0.
+        let d2: Vec<f64> = pred
+            .iter()
+            .map(|&f| spec.dvar_dlogsigma(0, 2, f, &sigmas))
+            .collect();
+        assert!(d2.iter().all(|v| *v == 0.0), "{d2:?}");
+
+        // The other two error models load one sigma; a second one is inert
+        // for them too, so the three arms cannot drift apart.
+        for em in [ErrorModel::Additive, ErrorModel::Proportional] {
+            let spec = ErrorSpec::Single(em);
+            let d: Vec<f64> = pred
+                .iter()
+                .map(|&f| spec.dvar_dlogsigma(0, 1, f, &sigmas))
+                .collect();
+            assert!(d.iter().all(|v| *v == 0.0), "{em:?}: {d:?}");
         }
     }
 
@@ -2949,6 +3110,8 @@ mod tests {
             OmegaMatrix::from_matrix(omega_matrix, vec!["ETA_CL".into(), "ETA_V".into()], false);
 
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             theta_lower: vec![0.1, 5.0],
@@ -2963,8 +3126,10 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         };
         let model = CompiledModel {
+            covariate_model: None,
             name: "gn_block_omega_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -2991,6 +3156,7 @@ mod tests {
             omega_init_as_sd: vec![false, false],
             sigma_init_as_sd: vec![false],
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
@@ -3009,6 +3175,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
@@ -3024,6 +3191,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         };
 
         let template = &model.default_params;
@@ -3236,6 +3404,8 @@ mod tests {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             theta_lower: vec![0.01, 1.0],
@@ -3250,8 +3420,10 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            mixture: None,
         };
         CompiledModel {
+            covariate_model: None,
             name: "iov_gn_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -3279,6 +3451,7 @@ mod tests {
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],
             kappa_init_as_sd: vec![false],
+            kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
@@ -3297,6 +3470,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
@@ -3312,6 +3486,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 
@@ -3329,10 +3504,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3576,5 +3753,275 @@ mod tests {
         }
         assert!(checked, "expected at least one GN trace row");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── #484/#1029: the residual magnitude reaches the Gauss-Newton gradient ──
+    //
+    // `subject_nll_at` is the shared magnitude-aware FOCE/FOCEI marginal, so
+    // checking GN's `(nll, grad)` against it and its central difference is both
+    // the cross-estimator likelihood-agreement check and the gradient gate — for
+    // the analytic closed forms (θ-free magnitude) and for the FD fallback a
+    // θ-dependent one is routed to.
+
+    fn weighted_gn_model(error_block: &str, extra_theta: &str) -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(1.0, 0.1, 10.0)\n  theta TVV(10.0, 1.0, 100.0)\n{extra_theta}  \
+             omega ETA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.10 (sd)\n  sigma ADD_ERR ~ 0.50 \
+             (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = \
+             TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             {error_block}\n[covariates]\n  WPSE continuous\n"
+        ))
+        .expect("weighted GN model parses")
+    }
+
+    fn weighted_gn_population() -> Population {
+        let snap =
+            |w: f64| -> HashMap<String, f64> { [("WPSE".to_string(), w)].into_iter().collect() };
+        Population {
+            subjects: vec![Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 4.0, 8.0],
+                observations: vec![8.0, 6.0, 4.0],
+                obs_cmts: vec![1; 3],
+                cens: vec![0; 3],
+                covariates: snap(0.5),
+                obs_covariates: vec![snap(0.5), snap(0.9), snap(1.4)],
+                ..Default::default()
+            }],
+            covariate_names: vec!["WPSE".to_string()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// `subject_nll_pop_grad` vs central FD of `subject_nll_at`, for whichever
+    /// path (analytic Laplace / analytic Sheiner–Beal / FD fallback) the
+    /// dispatcher picks for this model.
+    fn check_gn_grad_matches_fd(model: &CompiledModel, interaction: bool) {
+        let population = weighted_gn_population();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+
+        let eta_hat = DVector::from_vec(vec![0.05]);
+        // Non-zero η-Jacobian so the log|H̃| / c̃ terms — which read R and ∂R/∂f,
+        // both magnitude-scaled — actually contribute.
+        let h_matrix = DMatrix::from_column_slice(3, 1, &[-0.4, -0.3, -0.15]);
+        let mut options = FitOptions::default();
+        options.interaction = interaction;
+
+        let (nll, grad) = subject_nll_pop_grad(
+            &x,
+            template,
+            model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
+        );
+        let nll_ref = subject_nll_at(
+            model,
+            &population,
+            0,
+            &unpack_params(&x, template),
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &options,
+        );
+        assert!(
+            (nll - nll_ref).abs() < 1e-9,
+            "GN NLL disagrees with the shared magnitude-aware marginal: {nll} vs {nll_ref}"
+        );
+
+        let eps = 1e-5;
+        for j in 0..x.len() {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let two_h = xp[j] - xm[j];
+            let nll_p = subject_nll_at(
+                model,
+                &population,
+                0,
+                &unpack_params(&xp, template),
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let nll_m = subject_nll_at(
+                model,
+                &population,
+                0,
+                &unpack_params(&xm, template),
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &options,
+            );
+            let fd = (nll_p - nll_m) / two_h;
+            let rel = (grad[j] - fd).abs() / fd.abs().max(1e-6);
+            assert!(
+                rel < 2e-3,
+                "weighted GN grad[{j}] (interaction={interaction}): analytic={:.6e}, \
+                 fd={:.6e}, rel={:.2e}",
+                grad[j],
+                fd,
+                rel
+            );
+        }
+    }
+
+    /// Magnitudes on **both** slots: `weight =` scales the additive loading and
+    /// an explicit #484 expression scales the proportional one. The second is
+    /// what makes `∂R/∂f` and `∂²R/∂f²` magnitude-sensitive — with a weight
+    /// alone, `m_prop ≡ 1` and the `_scaled` slopes coincide with the bare ones,
+    /// so the test would not see them.
+    const GN_BOTH_SLOTS: &str =
+        "DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE";
+
+    #[test]
+    fn weighted_error_gn_laplace_grad_matches_fd() {
+        let model = weighted_gn_model(GN_BOTH_SLOTS, "");
+        assert!(model.has_custom_ruv_magnitude());
+        assert!(!model.has_theta_dependent_ruv_magnitude());
+        check_gn_grad_matches_fd(&model, true);
+    }
+
+    #[test]
+    fn weighted_error_gn_sheiner_beal_grad_matches_fd() {
+        let model = weighted_gn_model(GN_BOTH_SLOTS, "");
+        check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// A θ-dependent magnitude has a direct `∂R/∂θ` channel neither closed form
+    /// carries, so the dispatcher must route it to the FD fallback — which
+    /// differences the magnitude-aware marginal and is therefore still exact.
+    #[test]
+    fn theta_dependent_magnitude_gn_grad_matches_fd_via_fallback() {
+        let model = weighted_gn_model(
+            "DV ~ combined(PROP_ERR, ADD_ERR * (1.0 + RUV_W * WPSE))",
+            "  theta RUV_W(0.30, 0.01, 5.0)\n",
+        );
+        assert!(model.has_theta_dependent_ruv_magnitude());
+        check_gn_grad_matches_fd(&model, true);
+        check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// A θ-free `power(σ, P)` loading (#1182) stays on the closed forms — both
+    /// the Laplace and the Sheiner–Beal gradient take `R`, `∂R/∂f` and
+    /// `∂R/∂log σ` from `residual_error`'s exponent-aware `_scaled` dispatch.
+    /// Regression for the review of #1273: the SB path once built `∂R/∂log σ`
+    /// and `∂R/∂f` from a hand-rolled `σ²·f²·m²`, which a `|f|^{2p}` loading
+    /// does not satisfy, and the dispatcher papered over it by routing every
+    /// exponent to FD through a gate no test could see. One test per leg so
+    /// each closed form is observed on its own; the mutation results are on
+    /// each.
+    fn power_exponent_gn_model() -> CompiledModel {
+        let model = weighted_gn_model("DV ~ power(PROP_ERR * (1.0 + 0.5 * WPSE), 1.5)", "");
+        assert!(model.has_ruv_exponent());
+        assert!(
+            !model.has_theta_dependent_ruv_magnitude(),
+            "a literal exponent must not route to the FD fallback"
+        );
+        model
+    }
+
+    /// Mutation checks, run by hand: dropping the exponent arm of
+    /// `dvar_dlogsigma_scaled` fails this leg at `grad[3]` (σ), rel 8.3e-1;
+    /// dropping it from `dvar_df_scaled` fails at `grad[0]` (θ), rel 6.1e-1.
+    #[test]
+    fn power_exponent_gn_laplace_grad_matches_fd() {
+        check_gn_grad_matches_fd(&power_exponent_gn_model(), true);
+    }
+
+    /// Mutation checks, run by hand: dropping the exponent arm of
+    /// `dvar_dlogsigma_scaled` fails this leg at `grad[3]` (σ), rel 8.4e-1;
+    /// dropping it from `dvar_df_scaled` fails at `grad[0]` (θ), rel 6.1e-1.
+    #[test]
+    fn power_exponent_gn_sheiner_beal_grad_matches_fd() {
+        check_gn_grad_matches_fd(&power_exponent_gn_model(), false);
+    }
+
+    /// A `power(σ, θ)` exponent is a θ-dependent magnitude: the direct `∂R/∂θ`
+    /// channel routes it to the FD fallback, which differences the
+    /// exponent-aware marginal and is therefore still exact.
+    #[test]
+    fn theta_exponent_gn_grad_matches_fd_via_fallback() {
+        let model = weighted_gn_model(
+            "DV ~ power(PROP_ERR, RUV_POW)",
+            "  theta RUV_POW(1.3, 0.01, 10.0)\n",
+        );
+        assert!(model.has_ruv_exponent());
+        assert!(model.has_theta_dependent_ruv_magnitude());
+        check_gn_grad_matches_fd(&model, true);
+        check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// #1006: an unconverged pure-GN run on a fixed-effects-only model must
+    /// carry the targeted post-fit warning, while `gn_hybrid` (whose FOCEI
+    /// polish recovers the optimum) and a mixed-effects `gn` run must not.
+    #[test]
+    fn gn_unconverged_at_zero_eta_pushes_targeted_warning() {
+        use std::path::Path;
+        let is_targeted = |w: &String| w.contains("no random effects");
+
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/one_cpt_iv_pooled.ferx",
+        ))
+        .expect("pooled model parses");
+        assert_eq!(model.n_eta, 0, "fixture must be fixed-effects-only");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("one_cpt_iv data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            // Forces non-convergence structurally: the only normal convergence
+            // branch is `rel_change < 1e-6 && iter > 3`, so a 2-iteration budget
+            // cannot converge from any start. This pins the *gate* on the
+            // warning (n_eta = 0, not gn_hybrid, not converged), not the BHHH
+            // collapse itself — that is anchored in docs/estimation/gauss-newton.qmd.
+            outer_maxiter: 2,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(!res.converged, "a 2-iteration GN budget cannot converge");
+        assert!(
+            res.warnings.iter().any(is_targeted),
+            "targeted #1006 warning missing: {:?}",
+            res.warnings
+        );
+
+        // gn_hybrid control: identical unconverged GN phase, but the FOCEI
+        // polish makes the targeted warning inapplicable.
+        let hybrid_opts = FitOptions {
+            method: EstimationMethod::FoceGnHybrid,
+            ..opts.clone()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &hybrid_opts);
+        assert!(
+            !res.warnings.iter().any(is_targeted),
+            "gn_hybrid must not carry the #1006 warning: {:?}",
+            res.warnings
+        );
+
+        // Mixed-effects control: same tiny budget, but the inner EBE loop makes
+        // the targeted warning inapplicable at n_eta > 0.
+        let mixed = make_model();
+        let mixed_pop = make_population();
+        let res = run_foce_gn(&mixed, &mixed_pop, &mixed.default_params, &opts);
+        assert!(
+            !res.warnings.iter().any(is_targeted),
+            "mixed-effects gn must not carry the #1006 warning: {:?}",
+            res.warnings
+        );
     }
 }

@@ -4,7 +4,8 @@
 //!
 //! - `manifest.json`     — format version, ferx version, timestamp, entry index
 //! - `fit.json`          — scalars / vectors / matrices on `FitResult`
-//! - `ebes.csv`          — per-subject EBEs (`ID, eta_1..eta_n, ofv_contribution, n_obs`)
+//! - `ebes.csv`          — per-subject EBEs (`ID, eta_1..eta_n, ofv_contribution, n_obs`;
+//!                          a mixture fit appends `MIXEST, PMIX_1..K`)
 //! - `ebes_kappa.csv`    — per-(subject, occasion) kappa EBEs (only when `n_kappa > 0`)
 //! - `conddist.csv`      — per-subject conditional η mean/SD/mode (only when `conddist = true`, SAEM-only)
 //! - `predictions.csv`   — per-observation predictions joined with TIME/DV
@@ -129,6 +130,10 @@ struct FitWire {
     cov_eigenvalues: Option<Vec<f64>>,
     #[serde(with = "crate::io::serde_nan::opt")]
     cov_condition_number: Option<f64>,
+    // Absent on bundles saved before #1177; loaders default to an all-zero
+    // tally, for which `bic()` reports NaN rather than a wrong penalty.
+    #[serde(default)]
+    bic_inputs: BicInputs,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -156,6 +161,17 @@ struct FitWire {
     theta_init: Vec<f64>,
     #[serde(default)]
     omega_init: Option<MatrixWire>,
+    // Absent on bundles saved before #1177 recorded the optimizer's own
+    // init-escape verdict; `stalled_at_init` then falls back to comparing
+    // estimates against `theta_init` & co.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left_init: Option<bool>,
+    // The packed Ω / κ layout (#1177); absent on older bundles, which then
+    // read their covariance matrix as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omega_is_diagonal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kappa_is_diagonal: Option<bool>,
     #[serde(default)]
     sigma_init: Vec<f64>,
     #[serde(default)]
@@ -234,6 +250,18 @@ struct SigmaWire {
     /// for backward compatibility with .fitrx files from before issue #5.
     #[serde(default)]
     init_as_sd: Vec<bool>,
+    /// `block_sigma` correlations. Absent in bundles written before issue #1100
+    /// and omitted for the common diagonal-sigma case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    residual_correlations: Vec<crate::types::ResidualCorrelation>,
+    /// FIX flags parallel to `residual_correlations` (#847). Absent in bundles
+    /// written before the off-diagonal became estimable, where every correlation
+    /// was fixed by construction — hence the `true` fill on load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    residual_correlation_fixed: Vec<bool>,
+    /// Standard errors for the estimated correlations, natural ρ scale (#847).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    se_residual_correlations: Option<Vec<f64>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -264,6 +292,13 @@ struct IovWire {
     /// .fitrx files from before issue #5.
     #[serde(default)]
     kappa_init_as_sd: Vec<bool>,
+    /// Per-kappa `weight = <expr>` source text and the median arm weight it
+    /// evaluated to (#1031). Both empty for a model with no weighted kappa, and
+    /// defaulted so a bundle written before #1031 still reads.
+    #[serde(default)]
+    kappa_weights: Vec<Option<String>>,
+    #[serde(default)]
+    kappa_weight_typical: Vec<Option<f64>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -375,6 +410,7 @@ str_enum_map!(EstimationMethod, "method", method_to_str(EstimationMethod), metho
     Bayes => "bayes",
     // `agq` was removed (#251); it was unreleased, so no persisted bundle carries it.
     Laplace => "laplace",
+    Vi => "vi",
 });
 
 str_enum_map!(ErrorModel, "error_model", error_model_to_str(ErrorModel), error_model_from_str, {
@@ -593,6 +629,9 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .map(|t| sigma_type_to_str(*t).into())
                 .collect(),
             init_as_sd: r.sigma_init_as_sd.clone(),
+            residual_correlations: r.residual_correlations.clone(),
+            residual_correlation_fixed: r.residual_correlation_fixed.clone(),
+            se_residual_correlations: r.se_residual_correlations.clone(),
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
@@ -601,6 +640,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         covariance_matrix: r.covariance_matrix.as_ref().map(MatrixWire::from),
         cov_eigenvalues: r.cov_eigenvalues.clone(),
         cov_condition_number: r.cov_condition_number,
+        bic_inputs: r.bic_inputs,
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -622,6 +662,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             omega_iov: MatrixWire::from(m),
             omega_iov_param_corr: r.omega_iov_param_corr.as_ref().map(MatrixWire::from),
             kappa_init_as_sd: r.kappa_init_as_sd.clone(),
+            kappa_weights: r.kappa_weights.clone(),
+            kappa_weight_typical: r.kappa_weight_typical.clone(),
         }),
         eta_param_info: r
             .eta_param_info
@@ -643,6 +685,9 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         model_text: r.model_text.clone(),
         theta_init: r.theta_init.clone(),
         omega_init: Some(MatrixWire::from(&r.omega_init)),
+        left_init: r.left_init,
+        omega_is_diagonal: r.omega_is_diagonal,
+        kappa_is_diagonal: r.kappa_is_diagonal,
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
@@ -677,6 +722,21 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         header.push_str(name);
     }
     header.push_str(",ofv_contribution,n_obs");
+    // Mixture (#983): a mixture fit carries per-subject `MIXEST` (most-probable
+    // class) and `PMIX_1..K` (posterior class weights). Append them after the
+    // fixed base columns so a non-mixture bundle is byte-identical to before and
+    // the reader can pick them up by header name. `K` comes from the first
+    // subject that has posteriors (all subjects of a mixture fit have them).
+    let mix_k = r
+        .subjects
+        .iter()
+        .find_map(|s| s.pmix.as_ref().map(|p| p.len()));
+    if let Some(k) = mix_k {
+        header.push_str(",MIXEST");
+        for j in 1..=k {
+            header.push_str(&format!(",PMIX_{j}"));
+        }
+    }
     writeln!(w, "{}", header)?;
     for s in &r.subjects {
         let mut row = csv_escape(&s.id);
@@ -688,6 +748,23 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         row.push_str(&fmt_f64(s.ofv_contribution));
         row.push(',');
         row.push_str(&s.n_obs.to_string());
+        if let Some(k) = mix_k {
+            // MIXEST is 1-based; write 0 for a subject that somehow lacks it so
+            // the column count stays rectangular (should not happen — posteriors
+            // are set together for every subject of a mixture fit).
+            row.push(',');
+            row.push_str(&s.mixest.unwrap_or(0).to_string());
+            for j in 0..k {
+                row.push(',');
+                let p = s
+                    .pmix
+                    .as_ref()
+                    .and_then(|v| v.get(j))
+                    .copied()
+                    .unwrap_or(0.0);
+                row.push_str(&fmt_f64(p));
+            }
+        }
         writeln!(w, "{}", row)?;
     }
     Ok(())
@@ -904,16 +981,20 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         std::fs::write(tmp.path(), &data_csv_bytes)?;
         // data.csv is bundled with its original headers, so honour the model's
         // `[data]` column mapping (#730) when re-reading — otherwise a fit that
-        // mapped e.g. `DV = CONC` cannot round-trip through load_fit. Parse the
-        // bundled model source for the map; fall back to no mapping if it can't
-        // be parsed (leave the read to fail with its own diagnostic).
-        let column_map = crate::parser::model_parser::parse_full_model(&model_source)
-            .map(|m| m.column_map)
-            .unwrap_or_default();
-        Some(
-            crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &column_map)
-                .map_err(FitrxError::Corrupt)?,
-        )
+        // mapped e.g. `DV = CONC` cannot round-trip through load_fit — and route
+        // the model's non-Gaussian endpoints (#1199): a joint PK-TTE bundle read
+        // model-blind came back with *no* event records, and `fit()` now rejects
+        // such a population outright (`E_ENDPOINT_UNROUTED`). Parse the bundled
+        // model source for both; fall back to the plain mapped read only if it
+        // can't be parsed (leave the read to fail with its own diagnostic).
+        let population = match crate::parser::model_parser::parse_full_model(&model_source) {
+            Ok(m) => {
+                crate::api::read_population_routed_by(&m.model, tmp.path(), None, &m.column_map)
+            }
+            Err(_) => crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &[]),
+        }
+        .map_err(FitrxError::Corrupt)?;
+        Some(population)
     } else {
         None
     };
@@ -972,6 +1053,25 @@ fn read_json<T: serde::de::DeserializeOwned, R: Read + std::io::Seek>(
     Ok(serde_json::from_slice(&buf)?)
 }
 
+/// Column indices of the `PMIX_{k}` headers, ordered by class number `k` rather
+/// than raw header position (#984 review). ferx writes `PMIX_1..K` in order, but a
+/// CSV tool that reordered columns (e.g. alphabetically — `PMIX_10` before
+/// `PMIX_2`) would otherwise silently swap class probabilities on restore, since
+/// the restored `pmix` vector is indexed by class. A non-numeric suffix sorts last
+/// deterministically.
+fn pmix_column_order(header_names: &[&str]) -> Vec<usize> {
+    let mut named: Vec<(usize, usize)> = header_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            c.strip_prefix("PMIX_")
+                .map(|suf| (suf.parse::<usize>().unwrap_or(usize::MAX), i))
+        })
+        .collect();
+    named.sort_by_key(|&(cls, _)| cls);
+    named.into_iter().map(|(_, i)| i).collect()
+}
+
 fn parse_subjects(
     ebes_csv: &str,
     preds_csv: &str,
@@ -983,26 +1083,37 @@ fn parse_subjects(
     let header = lines
         .next()
         .ok_or_else(|| FitrxError::Corrupt("ebes.csv: empty".into()))?;
-    let expected_cols = 1 + n_eta + 2;
-    let header_cols = header.split(',').count();
-    if header_cols != expected_cols {
+    // The base columns (ID, eta_1..n, ofv_contribution, n_obs) are fixed at the
+    // front; a mixture bundle appends MIXEST + PMIX_1..K after them (#983). So the
+    // base count is a *minimum*, and the optional mixture columns are located by
+    // header name rather than position.
+    let base_cols = 1 + n_eta + 2;
+    let header_names: Vec<&str> = header.split(',').collect();
+    let header_cols = header_names.len();
+    if header_cols < base_cols {
         return Err(FitrxError::Corrupt(format!(
-            "ebes.csv header has {} columns, expected {}",
-            header_cols, expected_cols
+            "ebes.csv header has {} columns, expected at least {}",
+            header_cols, base_cols
         )));
     }
+    // Optional mixture columns (#983): MIXEST + PMIX_1..K, by header name.
+    let mixest_idx = header_names.iter().position(|&c| c == "MIXEST");
+    // Restore PMIX columns in class-number order, not raw header order (#984
+    // review): the restored `pmix` vector is indexed by class, so a CSV tool that
+    // reordered columns would otherwise silently swap class probabilities.
+    let pmix_idxs = pmix_column_order(&header_names);
     let mut subjects: Vec<SubjectResult> = Vec::new();
     for (i, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let fields = parse_csv_row(line);
-        if fields.len() != expected_cols {
+        if fields.len() != header_cols {
             return Err(FitrxError::Corrupt(format!(
                 "ebes.csv row {} has {} fields, expected {}",
                 i + 1,
                 fields.len(),
-                expected_cols
+                header_cols
             )));
         }
         let id = fields[0].clone();
@@ -1018,6 +1129,20 @@ fn parse_subjects(
         let n_obs = fields[2 + n_eta]
             .parse::<usize>()
             .map_err(|_| FitrxError::Corrupt(format!("ebes.csv: bad n_obs in row {}", i + 1)))?;
+        // Mixture posteriors (#983): restore MIXEST + PMIX_1..K when the bundle
+        // carries them. A `MIXEST` of 0 is the sentinel for "no class" → None.
+        let mixest = mixest_idx.and_then(|mi| fields[mi].parse::<usize>().ok().filter(|&m| m != 0));
+        let pmix = if pmix_idxs.is_empty() {
+            None
+        } else {
+            let mut v = Vec::with_capacity(pmix_idxs.len());
+            for &pi in &pmix_idxs {
+                v.push(fields[pi].parse::<f64>().map_err(|_| {
+                    FitrxError::Corrupt(format!("ebes.csv: bad PMIX in row {}", i + 1))
+                })?);
+            }
+            Some(v)
+        };
         subjects.push(SubjectResult {
             id,
             eta,
@@ -1030,6 +1155,10 @@ fn parse_subjects(
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
+            // Mixture posteriors round-trip through ebes.csv's optional
+            // MIXEST/PMIX_* columns (#983); None for a non-mixture bundle.
+            pmix,
+            mixest,
             extra_columns: vec![],
             per_obs_tad: vec![],
             compartment_states: vec![],
@@ -1524,6 +1653,60 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             n_sigma
         ));
     }
+    let mut seen_corr_pairs = std::collections::HashSet::new();
+    for corr in &w.sigma.residual_correlations {
+        if corr.sigma_i >= n_sigma || corr.sigma_j >= n_sigma {
+            return bail(format!(
+                "sigma residual correlation index ({}, {}) is out of bounds for {} sigmas",
+                corr.sigma_i, corr.sigma_j, n_sigma
+            ));
+        }
+        // `|rho| == 1` is rejected alongside `> 1`: a perfectly correlated pair
+        // makes the subject-level `R` exactly singular, which would otherwise
+        // surface as a NaN/Inf OFV on the next evaluation rather than as a
+        // load-time error.
+        if corr.sigma_i == corr.sigma_j || !corr.rho.is_finite() || corr.rho.abs() >= 1.0 {
+            return bail(format!(
+                "invalid sigma residual correlation ({}, {}, rho={})",
+                corr.sigma_i, corr.sigma_j, corr.rho
+            ));
+        }
+        // A repeated (i, j) pair would double-count the cross term in
+        // `cross_observation_covariance` and emit duplicate YAML keys.
+        let pair = (
+            corr.sigma_i.min(corr.sigma_j),
+            corr.sigma_i.max(corr.sigma_j),
+        );
+        if !seen_corr_pairs.insert(pair) {
+            return bail(format!(
+                "duplicate sigma residual correlation for pair ({}, {})",
+                pair.0, pair.1
+            ));
+        }
+    }
+    // #847 companions to `residual_correlations`: both are optional (a pre-#847
+    // bundle carries neither), but a present one must be parallel — a truncated
+    // FIX vector would silently report an estimated correlation as free, and a
+    // truncated SE vector would mis-align the SE with the pair it belongs to.
+    let n_corr = w.sigma.residual_correlations.len();
+    if !w.sigma.residual_correlation_fixed.is_empty()
+        && w.sigma.residual_correlation_fixed.len() != n_corr
+    {
+        return bail(format!(
+            "sigma.residual_correlation_fixed ({}) does not match sigma.residual_correlations ({})",
+            w.sigma.residual_correlation_fixed.len(),
+            n_corr
+        ));
+    }
+    if let Some(se) = &w.sigma.se_residual_correlations {
+        if se.len() != n_corr {
+            return bail(format!(
+                "sigma.se_residual_correlations ({}) does not match sigma.residual_correlations ({})",
+                se.len(),
+                n_corr
+            ));
+        }
+    }
     // IOV init_as_sd: same backward-compat rule as omega/sigma. Only validate
     // when an `iov` section is present (otherwise there's no n_kappa to match
     // against).
@@ -1597,6 +1780,8 @@ fn wire_to_fit_result(
         kappa_names,
         kappa_fixed,
         kappa_init_as_sd,
+        kappa_weights,
+        kappa_weight_typical,
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
@@ -1618,6 +1803,8 @@ fn wire_to_fit_result(
                 iov.kappa_names,
                 iov.kappa_fixed,
                 init_as_sd,
+                iov.kappa_weights,
+                iov.kappa_weight_typical,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
                 iov.shrinkage_kappa_by_occ,
@@ -1628,6 +1815,8 @@ fn wire_to_fit_result(
         }
         None => (
             None,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1667,8 +1856,19 @@ fn wire_to_fit_result(
         std::mem::take(&mut w.sigma.init_as_sd)
     };
 
+    // A bundle written before #847 has correlations but no FIX vector: back then
+    // every `block_sigma` off-diagonal was held fixed, so that is what it meant.
+    let residual_correlation_fixed_resolved = if w.sigma.residual_correlations.is_empty() {
+        Vec::new()
+    } else if w.sigma.residual_correlation_fixed.is_empty() {
+        vec![true; w.sigma.residual_correlations.len()]
+    } else {
+        std::mem::take(&mut w.sigma.residual_correlation_fixed)
+    };
+
     Ok(FitResult {
         restored_from_checkpoint: true,
+        covariate_relations: Vec::new(),
         method,
         method_chain,
         method_wall_times_secs: w.method_wall_times_secs,
@@ -1683,11 +1883,14 @@ fn wire_to_fit_result(
         omega,
         sigma: w.sigma.estimates,
         sigma_names: w.sigma.names,
+        residual_correlations: w.sigma.residual_correlations,
+        residual_correlation_fixed: residual_correlation_fixed_resolved,
         error_model: error_model_from_str(&w.error_model)?,
         covariance_matrix,
         se_theta: w.theta.se,
         se_omega: w.omega.se,
         se_sigma: w.sigma.se,
+        se_residual_correlations: w.sigma.se_residual_correlations,
         theta_fixed: w.theta.fixed,
         omega_fixed: w.omega.fixed,
         sigma_fixed: w.sigma.fixed,
@@ -1715,10 +1918,15 @@ fn wire_to_fit_result(
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
+        // .fitrx v1 does not serialise the variational posteriors; re-run
+        // `method = vi` if the consumer needs them.
+        vi: None,
         omega_iov,
         kappa_names,
         kappa_fixed,
         kappa_init_as_sd,
+        kappa_weights,
+        kappa_weight_typical,
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
@@ -1753,6 +1961,7 @@ fn wire_to_fit_result(
         sigma_types,
         cov_eigenvalues: w.cov_eigenvalues,
         cov_condition_number: w.cov_condition_number,
+        bic_inputs: w.bic_inputs,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -1788,6 +1997,9 @@ fn wire_to_fit_result(
         // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
         // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
         packed_estimate: None,
+        left_init: w.left_init,
+        omega_is_diagonal: w.omega_is_diagonal,
+        kappa_is_diagonal: w.kappa_is_diagonal,
     })
 }
 
@@ -1828,26 +2040,34 @@ mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
 
-    fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResult {
-        SubjectResult {
-            id: id.into(),
-            eta: DVector::from_vec((0..n_eta).map(|k| 0.1 * (k as f64 + 1.0)).collect()),
-            ipred: (0..n_obs).map(|j| 1.0 + j as f64).collect(),
-            pred: (0..n_obs).map(|j| 1.5 + j as f64).collect(),
-            iwres: (0..n_obs).map(|j| 0.01 * j as f64).collect(),
-            cwres: (0..n_obs).map(|j| -0.02 * j as f64).collect(),
-            npde: vec![],
-            npd: vec![],
-            ofv_contribution: 12.34,
-            cens: vec![0; n_obs],
-            n_obs,
-            extra_columns: vec![],
-            per_obs_tad: vec![],
-            compartment_states: vec![],
-            #[cfg(feature = "survival")]
-            discrete_rows: Vec::new(),
-        }
+    #[test]
+    fn pmix_column_order_sorts_by_class_number() {
+        // #984 review: restore PMIX by class number, not header position — so an
+        // alphabetically-reordered header (PMIX_10 before PMIX_2, K ≥ 10) maps each
+        // column to the right class instead of silently swapping probabilities.
+        // In-order header → identity mapping onto the PMIX columns.
+        let h = [
+            "ID", "eta_1", "ofv", "n_obs", "MIXEST", "PMIX_1", "PMIX_2", "PMIX_3",
+        ];
+        assert_eq!(pmix_column_order(&h), vec![5, 6, 7]);
+
+        // Alphabetically reordered (PMIX_1, PMIX_10, PMIX_11, PMIX_2, ...) must be
+        // re-sorted to class order 1,2,...,10,11 → the column *positions* follow.
+        let h2 = [
+            "ID", "PMIX_1", "PMIX_10", "PMIX_11", "PMIX_2", "PMIX_3", "PMIX_4", "PMIX_5", "PMIX_6",
+            "PMIX_7", "PMIX_8", "PMIX_9",
+        ];
+        // class 1..9 sit at positions 1,4,5,6,7,8,9,10,11; class 10,11 at 2,3.
+        assert_eq!(
+            pmix_column_order(&h2),
+            vec![1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3]
+        );
+
+        // No PMIX columns → empty.
+        assert!(pmix_column_order(&["ID", "eta_1", "ofv", "n_obs"]).is_empty());
     }
+
+    use crate::types::test_helpers::dummy_subject;
 
     fn dummy_population(ids: &[&str], n_obs_each: usize) -> Population {
         let mut subjects = Vec::new();
@@ -1865,10 +2085,12 @@ mod tests {
                 pk_only_times: vec![],
                 pk_only_covariates: vec![],
                 reset_times: vec![],
+                reset_covariates: Vec::new(),
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 obs_l2: Vec::new(),
                 dose_occasions: vec![],
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             });
@@ -1883,136 +2105,7 @@ mod tests {
         }
     }
 
-    fn minimal_fit_result() -> FitResult {
-        let n_eta = 2;
-        FitResult {
-            restored_from_checkpoint: false,
-            method: EstimationMethod::FoceI,
-            method_chain: vec![EstimationMethod::FoceI],
-            method_wall_times_secs: vec![1.234],
-            covariance_wall_time_secs: 0.0,
-            converged: true,
-            ofv: 100.0,
-            aic: 110.0,
-            bic: 115.0,
-            theta: vec![1.0, 2.0, 0.5],
-            theta_names: vec!["CL".into(), "V".into(), "KA".into()],
-            eta_names: vec!["eta_CL".into(), "eta_V".into()],
-            omega: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
-            sigma: vec![0.05],
-            sigma_names: vec!["prop".into()],
-            error_model: ErrorModel::Proportional,
-            covariance_matrix: Some(DMatrix::<f64>::identity(3, 3)),
-            se_theta: Some(vec![0.01, 0.02, 0.005]),
-            se_omega: Some(vec![0.01, 0.02]),
-            se_sigma: Some(vec![0.001]),
-            theta_fixed: vec![false, false, false],
-            omega_fixed: vec![false, false],
-            sigma_fixed: vec![false],
-            omega_init_as_sd: vec![false, false],
-            sigma_init_as_sd: vec![false],
-            subjects: vec![dummy_subject("S1", n_eta, 3), dummy_subject("S2", n_eta, 2)],
-            n_obs: 5,
-            n_subjects: 2,
-            n_parameters: 6,
-            n_iterations: 10,
-            interaction: true,
-            warnings: vec!["watch out".into()],
-            warnings_structured: vec![crate::types::classify_warning("watch out")],
-            sir_ci_theta: None,
-            sir_ci_omega: None,
-            sir_ci_sigma: None,
-            sir_ess: None,
-            sir_resamples_packed: None,
-            importance_sampling: None,
-            impmap_trace: None,
-            bayes: None,
-            omega_iov: None,
-            kappa_names: vec![],
-            kappa_fixed: vec![],
-            kappa_init_as_sd: vec![],
-            se_kappa: None,
-            shrinkage_kappa: vec![],
-            shrinkage_kappa_by_occ: vec![],
-            ebe_kappas: vec![],
-            saem_mu_ref_m_step_evals_saved: None,
-            saem_n_subjects_hmc: None,
-            gradient_method_inner: "analytic (Dual2)".into(),
-            gradient_method_outer: "finite differences".into(),
-            uses_ode_solver: false,
-            uses_sde: false,
-            n_threads_used: 4,
-            nlopt_missing_algorithms: vec![],
-            covariance_n_evals_estimated: None,
-            trace_path: None,
-            ebe_convergence_warnings: 0,
-            max_unconverged_subjects: 0,
-            total_ebe_fallbacks: 0,
-            covariance_status: CovarianceStatus::Computed,
-            shrinkage_eta: vec![0.1, 0.15],
-            cond_dist: None,
-            shrinkage_eps: 0.05,
-            iwres_lag1_r: 0.12,
-            dw_statistic: 1.75,
-            wall_time_secs: 1.234,
-            model_name: "test_model".into(),
-            ferx_version: "0.1.0".into(),
-            environment: crate::environment::detect(),
-            eta_param_info: vec![
-                EtaParamInfo {
-                    eta_name: "eta_CL".into(),
-                    param_type: EtaParamType::LogNormal,
-                    linked_theta: Some("CL".into()),
-                    individual_param_name: "CL".into(),
-                },
-                EtaParamInfo {
-                    eta_name: "eta_V".into(),
-                    param_type: EtaParamType::LogNormal,
-                    linked_theta: Some("V".into()),
-                    individual_param_name: "V".into(),
-                },
-            ],
-            theta_transform: vec![
-                ThetaTransform::Log,
-                ThetaTransform::Log,
-                ThetaTransform::Log,
-            ],
-            sigma_types: vec![SigmaType::Proportional],
-            cov_eigenvalues: Some(vec![1.0, 0.5, 0.2]),
-            cov_condition_number: Some(5.0),
-            eta_log_transformed: vec![true, true],
-            omega_param_corr: None,
-            omega_iov_param_corr: None,
-            model_path: None,
-            data_path: None,
-            model_hash: None,
-            data_hash: None,
-            model_text: None,
-            theta_init: vec![1.0, 2.0, 0.5],
-            omega_init: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
-            sigma_init: vec![0.05],
-            obs_time_range: Some((0.25, 24.0)),
-            final_gradient: None,
-            optimizer: "slsqp".to_string(),
-            n_starts: 1,
-            multi_start_seed: None,
-            saem_seed: None,
-            sir_seed: None,
-            imp_seed: None,
-            npde_seed: None,
-            bloq_method: "drop".to_string(),
-            outer_maxiter: 300,
-            outer_gtol: 1e-4,
-            inits_from_nca: None,
-            covariate_names: vec!["WT".into(), "AGE".into()],
-            input_columns: vec![],
-            #[cfg(feature = "nn")]
-            neural_networks: Vec::new(),
-            covariate_table: None,
-            exclusions: None,
-            packed_estimate: None,
-        }
-    }
+    use crate::types::test_helpers::minimal_fit_result;
 
     #[test]
     fn json_result_has_versioned_schema_and_round_trips() {
@@ -2032,11 +2125,116 @@ mod tests {
         assert_eq!(v1["omega"]["cols"], 2);
         assert_eq!(v1["omega"]["data"], serde_json::json!([0.1, 0.0, 0.0, 0.2]));
         assert_eq!(v1["subjects"][0]["eta"].as_array().unwrap().len(), 2);
+        assert!(
+            v1.get("residual_correlations").is_none(),
+            "diagonal-sigma JSON must remain byte-compatible"
+        );
 
         // Round-trip: unknown `schema_version` is ignored on the way back in.
         let back: FitResult = serde_json::from_value(v1.clone()).unwrap();
         let v2 = back.to_json_value();
         assert_eq!(v1, v2, "JSON round-trip is not idempotent (lossy field?)");
+    }
+
+    #[test]
+    fn json_result_includes_residual_correlations() {
+        let mut fit = minimal_fit_result();
+        fit.sigma.push(1.0);
+        fit.sigma_names.push("add".into());
+        fit.sigma_fixed.push(false);
+        fit.sigma_types.push(SigmaType::Additive);
+        fit.sigma_init_as_sd.push(false);
+        fit.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+
+        let value = fit.to_json_value();
+        assert_eq!(
+            value["residual_correlations"],
+            serde_json::json!([{"sigma_i": 1, "sigma_j": 0, "rho": 0.5}])
+        );
+        let restored: FitResult = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.residual_correlations, fit.residual_correlations);
+    }
+
+    #[test]
+    fn fitrx_rejects_invalid_residual_correlations() {
+        let mut fit = minimal_fit_result();
+        fit.sigma.push(1.0);
+        fit.sigma_names.push("add".into());
+        fit.sigma_fixed.push(false);
+        fit.sigma_types.push(SigmaType::Additive);
+        fit.sigma_init_as_sd.push(false);
+        let mut wire = build_fit_wire(&fit);
+
+        for invalid in [
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 2,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 0,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 1.5,
+            },
+            // |rho| == 1 is singular, not merely extreme: reject it too.
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 1.0,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: -1.0,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: f64::NAN,
+            },
+        ] {
+            wire.sigma.residual_correlations = vec![invalid];
+            assert!(
+                validate_parallel_lengths(&wire).is_err(),
+                "accepted invalid correlation: {invalid:?}"
+            );
+        }
+
+        // The same (i, j) pair twice would double-count the cross term.
+        wire.sigma.residual_correlations = vec![
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: 0.25,
+            },
+        ];
+        let err = validate_parallel_lengths(&wire).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate sigma residual correlation"),
+            "got: {err}"
+        );
+
+        // A well-formed single pair still loads.
+        wire.sigma.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        assert!(validate_parallel_lengths(&wire).is_ok());
     }
 
     #[test]
@@ -2131,6 +2329,81 @@ mod tests {
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
     }
 
+    #[test]
+    fn roundtrip_preserves_residual_correlations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block-sigma.fitrx");
+        let mut r = minimal_fit_result();
+        r.sigma = vec![0.2, 1.0];
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![true, true];
+        r.sigma_init_as_sd = vec![false, false];
+        r.sigma_types = vec![SigmaType::Proportional, SigmaType::Additive];
+        r.sigma_init = r.sigma.clone();
+        r.se_sigma = None;
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.residual_correlations, r.residual_correlations);
+    }
+
+    #[test]
+    fn roundtrip_mixture_pmix_mixest() {
+        // #983: a mixture fit's per-subject MIXEST + PMIX_1..K survive the .fitrx
+        // checkpoint via ebes.csv's optional trailing columns. Before, load_fit
+        // hard-coded them to None, so a restored mixture fit emitted no
+        // MIXEST/PMIX_* sdtab columns.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mix.fitrx");
+        let mut r = minimal_fit_result();
+        for (i, s) in r.subjects.iter_mut().enumerate() {
+            let p0 = 0.2 + 0.3 * i as f64; // 0.2, 0.5 → distinct per subject
+            s.pmix = Some(vec![p0, 1.0 - p0]);
+            s.mixest = Some(if p0 >= 0.5 { 1 } else { 2 });
+        }
+        let expected: Vec<(Option<usize>, Vec<f64>)> = r
+            .subjects
+            .iter()
+            .map(|s| (s.mixest, s.pmix.clone().unwrap()))
+            .collect();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "m\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.subjects.len(), expected.len());
+        for (s, (mixest, pmix)) in loaded.fit.subjects.iter().zip(&expected) {
+            assert_eq!(s.mixest, *mixest, "MIXEST for {}", s.id);
+            let got = s.pmix.as_ref().expect("PMIX restored");
+            assert_eq!(got.len(), pmix.len());
+            for (a, b) in got.iter().zip(pmix) {
+                assert!((a - b).abs() < 1e-9, "PMIX {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_non_mixture_has_no_pmix() {
+        // A non-mixture bundle carries no MIXEST/PMIX columns and restores to
+        // None — the appended columns are strictly opt-in (#983).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "m\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        for s in &loaded.fit.subjects {
+            assert!(s.pmix.is_none(), "no PMIX for a non-mixture fit");
+            assert!(s.mixest.is_none(), "no MIXEST for a non-mixture fit");
+        }
+    }
+
     /// The `restored_from_checkpoint` flag is set by `load_fit` and only by `load_fit`.
     /// This is the *wiring* test: a live fit carries `false`, a saved-then-loaded fit
     /// carries `true`. Without it, the flag could silently fail to be set (wrong literal,
@@ -2217,6 +2490,115 @@ mod tests {
         assert!(!pop.covariate_names.contains(&"CONC".to_string()));
     }
 
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_bundled_data_routes_the_model_endpoints() {
+        // #1199: a joint PK-TTE bundle re-read through the model-blind reader came
+        // back with *no* event records (and its event rows as Gaussian CMT-3
+        // observations), so anything fed the reloaded population re-fit or
+        // predicted the Gaussian half only. `load_fit` now routes by the bundled
+        // model. The reference is the routed reader on the same file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("joint.fitrx");
+        let model_source = std::fs::read_to_string("examples/pktte_joint.ferx").unwrap();
+        let data_csv = PathBuf::from("data/pktte_joint.csv");
+
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(
+            &r,
+            &p,
+            &model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(data_csv),
+            },
+        )
+        .unwrap();
+
+        let loaded = load_fit(&path).expect("load_fit reads the bundled joint data.csv");
+        let pop = loaded.population.expect("data.csv was bundled");
+        let events: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
+        let gaussian_on_3: usize = pop
+            .subjects
+            .iter()
+            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
+            .sum();
+
+        let m = crate::parser::model_parser::parse_full_model(&model_source)
+            .unwrap()
+            .model;
+        let (want, _) = crate::api::read_population_for(
+            &m,
+            &None,
+            "data/pktte_joint.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let want_events: usize = want.subjects.iter().map(|s| s.obs_records.len()).sum();
+        assert!(want_events > 0, "the fixture carries event rows");
+        assert_eq!(
+            events, want_events,
+            "reloaded population must carry every event record"
+        );
+        assert_eq!(
+            gaussian_on_3, 0,
+            "…and none of them as a Gaussian CMT-3 row"
+        );
+    }
+
+    /// The discrete arm of the same reload: a `[binary_model]` bundle comes back
+    /// with its rows as `DiscreteState` records, none in the Gaussian grid.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_bundled_data_routes_a_binary_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.fitrx");
+        let model_source = std::fs::read_to_string("examples/binary_logistic.ferx").unwrap();
+        let data = "data/binary_logistic.csv";
+
+        save_fit(
+            &minimal_fit_result(),
+            &dummy_population(&["S1", "S2"], 3),
+            &model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(PathBuf::from(data)),
+            },
+        )
+        .unwrap();
+
+        let pop = load_fit(&path)
+            .expect("load_fit reads the bundled binary data.csv")
+            .population
+            .expect("data.csv was bundled");
+        let records: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
+        let gaussian_on_3: usize = pop
+            .subjects
+            .iter()
+            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
+            .sum();
+
+        let m = crate::parser::model_parser::parse_full_model(&model_source)
+            .unwrap()
+            .model;
+        let (want, _) =
+            crate::api::read_population_for(&m, &None, data, None, None, None, &[]).unwrap();
+        let want_records: usize = want.subjects.iter().map(|s| s.obs_records.len()).sum();
+        assert!(want_records > 0, "the fixture carries binary rows");
+        assert_eq!(
+            records, want_records,
+            "reloaded population must carry every record"
+        );
+        assert_eq!(
+            gaussian_on_3, 0,
+            "…and none of them as a Gaussian CMT-3 row"
+        );
+    }
+
     #[test]
     fn roundtrip_preserves_npde_npd() {
         // When the fit ran with npde_nsim > 0, the predictions.csv carries NPDE/NPD
@@ -2278,6 +2660,71 @@ mod tests {
         assert_eq!(load_fit(&none).unwrap().fit.npde_seed, None);
     }
 
+    /// The tally behind the BIC variants and the optimizer's init-escape
+    /// verdict (#1177) round-trip. `minimal_fit_result` carries the *default*
+    /// tally, which is indistinguishable from a dropped field, so this uses a
+    /// non-default one — the mutation `bic_inputs: Default::default()` in
+    /// `build_fit_wire` is unobservable otherwise.
+    #[test]
+    fn bic_inputs_and_left_init_round_trip_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run1.fitrx");
+        let mut r = minimal_fit_result();
+        r.bic_inputs = crate::types::BicInputs {
+            n_obs: 155,
+            theta_random: 2,
+            theta_fixed: 1,
+            omega: 2,
+            kappa: 0,
+            sigma: 1,
+            sigma_random: false,
+        };
+        r.left_init = Some(false);
+        r.omega_is_diagonal = Some(false);
+        r.kappa_is_diagonal = Some(true);
+        assert_ne!(r.bic_inputs, crate::types::BicInputs::default());
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let l = load_fit(&path).unwrap().fit;
+        assert_eq!(l.bic_inputs, r.bic_inputs);
+        assert_eq!(l.left_init, Some(false));
+        assert_eq!(l.omega_is_diagonal, Some(false));
+        assert_eq!(l.kappa_is_diagonal, Some(true));
+        // And the loaded bundle ranks: the tally partitions `n_parameters`.
+        assert!(
+            crate::model_selection::bic(&l, crate::model_selection::BicType::Mixed).is_finite()
+        );
+    }
+
+    /// A bundle saved before #1177 has neither key: the tally defaults to all
+    /// zero, for which `bic()` reports NaN rather than a wrong penalty, and the
+    /// stall predicate falls back to comparing against the initial estimates.
+    #[test]
+    fn fit_wire_missing_bic_inputs_and_left_init_default() {
+        let r = minimal_fit_result();
+        let wire = build_fit_wire(&r);
+        let mut value = serde_json::to_value(&wire).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        assert!(obj.remove("bic_inputs").is_some());
+        // `left_init` is skipped when `None`; simulate an explicit old bundle
+        // by making sure it is absent either way.
+        obj.remove("left_init");
+        obj.remove("omega_is_diagonal");
+        obj.remove("kappa_is_diagonal");
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert_eq!(reloaded.bic_inputs, crate::types::BicInputs::default());
+        assert_eq!(reloaded.left_init, None);
+        assert_eq!(reloaded.omega_is_diagonal, None);
+        assert_eq!(reloaded.kappa_is_diagonal, None);
+
+        let mut old = r.clone();
+        old.bic_inputs = reloaded.bic_inputs;
+        old.left_init = reloaded.left_init;
+        assert!(old.n_parameters > 0);
+        assert!(crate::model_selection::bic(&old, crate::model_selection::BicType::Mixed).is_nan());
+    }
+
     #[test]
     fn fit_wire_missing_environment_defaults_to_none() {
         // Simulates a `.fitrx` bundle saved before #704 added `environment` to
@@ -2330,6 +2777,27 @@ mod tests {
         assert_eq!(loaded.fit.ebe_kappas[0].len(), 2);
         assert!((loaded.fit.ebe_kappas[0][0][0] - 0.01).abs() < 1e-9);
         assert_eq!(loaded.fit.ebe_kappas[1].len(), 1);
+    }
+
+    /// A weighted kappa (#1031) carries its declaration and the arm size it was
+    /// read against into the bundle, so a reloaded fit still reports the
+    /// effective SD rather than a bare gamma^2.
+    #[test]
+    fn roundtrip_with_a_weighted_kappa() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weighted_kappa.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[4.0]));
+        r.kappa_names = vec!["KAPPA_EMAX".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        r.kappa_weights = vec![Some("NARM".into())];
+        r.kappa_weight_typical = vec![Some(200.0)];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.kappa_weights, vec![Some("NARM".to_string())]);
+        assert_eq!(loaded.fit.kappa_weight_typical, vec![Some(200.0)]);
     }
 
     #[test]

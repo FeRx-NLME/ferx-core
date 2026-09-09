@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -39,7 +38,7 @@ use std::time::Instant;
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
-/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 ///
 /// **Gaussian rows only.** Non-Gaussian endpoints keep their own entry points, because
@@ -57,6 +56,20 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
+    // Every identifier the parser could not bind resolves as a covariate, and a
+    // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
+    // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
+    // and `simulate()` already refuse this; match them here.
+    assert_covariates_present(model, population);
+    // A population read by the model-blind `read_nonmem_csv` carries a declared
+    // endpoint's rows as Gaussian observations, and this function would return a
+    // *concentration* for the event row (#1199). `fit()` Err's on the same signature.
+    assert_endpoint_routing(model, population);
+    // …and that no `[covariate_model]` relation is still waiting on the
+    // data-derived statistics that build it (#1111): an unresolved relation
+    // simply is not in the compiled expression, and a dropped covariate effect
+    // is invisible in a prediction.
+    crate::api::validation::assert_covariate_model_bound(model);
     // …and that every dose names a compartment the analytical engine can route
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).
@@ -145,6 +158,11 @@ pub fn predict_categorical(
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
     assert_survival_tv_covariates(model, population);
+    // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
+    // `obs_records`, so a population read model-blind — its binary rows in the
+    // Gaussian grid — would come back empty, indistinguishable from a model with no
+    // binary endpoint.
+    assert_endpoint_routing(model, population);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
     for subject in &population.subjects {
@@ -180,7 +198,7 @@ pub struct SurvivalPredictionResult {
     pub survival_all: f64,
     /// Median survival time T₅₀ (where S(T₅₀) = 0.5); analytic closed form.
     pub median_survival: f64,
-    /// Mean survival time E[T] = ∫₀^∞ S(t) dt; analytic for Exponential,
+    /// Mean survival time `E[T]` = ∫₀^∞ S(t) dt; analytic for Exponential,
     /// numerical midpoint rule (2 000 steps) for Weibull and Gompertz.
     pub mean_survival: f64,
 }
@@ -216,7 +234,7 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// multiple TTE CMTs (competing risks) it also reports, per CMT, the
 /// cause-specific cumulative incidence `F(t)` and the all-cause survival
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
-/// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see [`cif_curves`]).
+/// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see `cif_curves`).
 ///
 /// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
 /// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,

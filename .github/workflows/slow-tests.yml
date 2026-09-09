@@ -13,21 +13,54 @@ on:
   push:
     branches: [main]
     paths:
-      # Re-run when something touches the code that the heavy fits exercise.
-      # `src/ode/solver.rs` is in the list because the EKF in `src/ode/ekf.rs`
-      # uses `solve_ode` from it — a change to the integrator otherwise
-      # wouldn't trigger this workflow until the next scheduled run.
-      - 'src/api.rs'
-      - 'src/estimation/**'
-      - 'src/ode/ekf.rs'
-      - 'src/ode/predictions.rs'
-      - 'src/ode/solver.rs'
-      # The parser compiles every model the heavy fits run, so a change to model
-      # compilation (e.g. the structural-param binding in #261) can shift a fit's
-      # objective or break it outright — including the NONMEM-anchored slow test
-      # in tests/structural_param_nonmem.rs.
-      - 'src/parser/**'
-      - 'src/stats/likelihood.rs'
+      # One rule, no per-module judgement: re-run when a push to `main` touches the code
+      # compiled into this job's test binaries, the data those tests read, or the
+      # definition of the job itself.
+      #
+      # It is deliberately NOT a curated list of "modules that can move a fit". That list
+      # existed and it rotted: `src/api.rs` was named here, the file became `src/api/`, and
+      # the glob went dead — silently, for months, because a stale glob and a live one look
+      # identical in review (#949). Enumerating by module also makes every new module a
+      # silent omission until someone remembers; that is how `src/pk`, `src/survival`,
+      # `examples/` and `nonmem_anchor/` all ended up uncovered.
+      #
+      # Measured over the last 400 first-parent commits on `main`: the original 7-entry
+      # filter fired on 292, a per-module list on 359, and this one on 363. So curating
+      # bought 4 skipped runs in 400 (1% — one of them a `Cargo.lock` bump that should run
+      # anyway) while silently missing 67. That is the trade, and it is not close.
+      #
+      # `tools/**` (#1157). Two reasons, and the first is the substantive one: `tools/`
+      # holds inputs the gated fits are tied to — `tools/vi-emvi-comparison/*.ferx` are the
+      # harness models the VI/EMVI anchors mirror, and `make-wide-residual-data.sh`
+      # generates the dataset `tests/nonmem/warfarin_10pct.ctl` is built from, so editing
+      # either can move a nightly anchor with nothing under `src/` or `tests/` changed.
+      # Second, `tests/preflight_owns_the_fast_gates.rs` names `tools/preflight.sh` in its
+      # assertions, which is enough for the harvest below to derive `tools` as an input
+      # root — so the guard test requires this entry either way.
+      #
+      # Measured before adding it, the same way the numbers above were: over the last 400
+      # first-parent commits on `main`, 3 touch `tools/` and **0** would newly fire this
+      # workflow — all three also touched `src/` or `tests/`. Read that as an upper bound on
+      # what it cost *then*, not as a forecast: #1157 makes `tools/preflight.sh` the place
+      # new gates are added, so tools-only commits should get MORE common, not less. The
+      # measurement says the entry was free to add; the reasons above are why it stays.
+      #
+      # `tests/slow_test_path_filter.rs` pins this list in both directions: every input the
+      # suite reads must be matched here, and every entry here must match a tracked file.
+      # The input roots it checks against are derived from the tree and from the fixture
+      # paths the tests themselves open — so a new module or fixture directory fails that
+      # test until it is added below, rather than going quietly uncovered.
+      - '.github/workflows/slow-tests.yml'  # the feature set / cargo command this job runs
+      - 'Cargo.lock'                        # a nlopt/nalgebra/rand bump moves fit numbers and RNG streams
+      - 'Cargo.toml'                        # the `ci-test` profile + the `slow-tests` / `survival` features
+      - 'crates/**'                         # the workspace members — the job runs `--workspace`
+      - '!crates/docs-lint/**'              # ...except the one the command --excludes; see the run: step
+      - 'data/**'                           # fixture CSVs the fits read by literal path
+      - 'examples/**'                       # `.ferx` models the anchors load (e.g. the adaptive vanco suite)
+      - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
+      - 'src/**'                            # everything linked into the fits
+      - 'tests/**'                          # the gated fits themselves + the shared tests/common harness
+      - 'tools/**'                          # scripts CI itself executes (preflight, the API baseline)
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,9 +69,20 @@ env:
 
 jobs:
   slow-tests:
-    name: Slow regression tests
+    name: Slow regression tests (${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      # A failing leg must NOT cancel the other -- see the `fail-fast` note below.
+      fail-fast: false
+      matrix:
+        include:
+          - leg: core
+            cache: ci-slow
+            features: ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests
+          - leg: nn
+            cache: ci-slow-nn
+            features: ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
@@ -46,7 +90,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-slow
+          shared-key: ${{ matrix.cache }}
       - name: cargo test (ci-test profile + slow-tests)
         # `--profile ci-test` (defined in Cargo.toml) keeps release-level
         # optimisation so the heavy fits run fast, but drops fat LTO — the
@@ -65,4 +109,59 @@ jobs:
         # (`tests/tte_convergence.rs`, gated on BOTH `survival` and `slow-tests`)
         # actually execute here — the ci.yml `survival` job runs the TTE *smoke*
         # tests but not the slow convergence/SSE fits.
-        run: cargo test --no-default-features --features ci,survival,slow-tests --profile ci-test --no-fail-fast
+        #
+        # `--workspace` with PACKAGE-QUALIFIED features (#1114): without
+        # `--workspace` this builds the root `ferx-core` package only, so a
+        # Tier-3 test in `crates/ferx-tools/tests/` stays `#[ignore]`d in every
+        # job that exists and never runs anywhere. The features have to be
+        # qualified because `ci`/`survival` are not features of the members and
+        # `slow-tests` is declared by both `ferx-core` and `ferx-tools` — an
+        # unqualified name would resolve to the root package's and leave the
+        # member's gate closed.
+        #
+        # `--exclude docs-lint`: that crate is a structural linter over `docs/**` with its
+        # own seconds-long CI job, and it depends on nothing. Running it here would put
+        # `docs/**` among this job's inputs, so a docs typo would trigger the two-hour fit
+        # suite — and it would couple the linter to the `ferx-core` compile path, which is
+        # exactly what keeping it dependency-free was for (#969). The guard reads this
+        # `--exclude` list, so adding or dropping one moves the path filter with it.
+        #
+        # `ferx-core/nn` is the second matrix leg, not part of the base list. #1215 added it
+        # to the single job that existed then, which switched on `tests/vi_dcm_omega_recovery.rs`
+        # (`#![cfg(feature = "nn")]`, 5 DCM VI/FOCEI fits) in CI for the first time. Those fits
+        # consumed the whole 120-minute budget, so the ~165 binaries ordered after them never
+        # ran -- five nightlies in a row covered less than they appeared to, and the NN fits are
+        # still gated on BOTH `nn` and `slow-tests`, so dropping the leg entirely would leave
+        # them running in no job at all (the per-PR job that passes `nn` has no `slow-tests`,
+        # by design). Separate legs keep both properties: the NN fits run, and an over-budget
+        # NN fit costs its own leg and nothing else.
+        #
+        # `fail-fast: false` above is load-bearing, not stylistic. A matrix leg failing cancels
+        # its siblings by default, which would put the base leg right back to being killed by
+        # the NN leg -- the bug this split exists to fix.
+        #
+        # `timeout` is what makes an overrun visible. A job killed by `timeout-minutes` is
+        # reported by GitHub as **`cancelled`, not `failure`** -- it does not read as a red test,
+        # which is why the five timed-out nightlies looked like infra blips. Exceeding the inner
+        # budget exits 124 and fails the step loudly instead.
+        #
+        # 100m is derived, not picked: the suite ran in 43m on a fast runner, and the measured
+        # spread across `ubuntu-latest` draws is 1.7x (same commit, same features -- see #1239),
+        # giving ~74m worst case. 100m leaves headroom over that while staying clear of the 120m
+        # job ceiling, which must also absorb checkout, toolchain install and cache restore.
+        #
+        # KNOWN: the `nn` leg is expected to stay RED until #1239 sizes those fits -- it was
+        # unfinished after 13 minutes at ~7 cores locally, and this runner gives it 2 cores with
+        # `RAYON_NUM_THREADS: 1`. That is deliberate: a red leg is the honest signal, and it no
+        # longer costs the base leg. If it is still red long enough to become background noise,
+        # fix #1239 rather than muting it here.
+        run: |
+          timeout --signal=INT --kill-after=2m 100m \
+            cargo test --workspace --exclude docs-lint --no-default-features \
+              --features ${{ matrix.features }} \
+              --profile ci-test --no-fail-fast \
+            || { code=$?; \
+                 if [ "$code" -eq 124 ]; then \
+                   echo "::error::slow-tests (${{ matrix.leg }}) exceeded its 100m budget - a test is hanging or the suite outgrew the runner; see FeRx-NLME/ferx-core#1239"; \
+                 fi; \
+                 exit "$code"; }

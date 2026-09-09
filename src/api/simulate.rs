@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -39,7 +38,7 @@ use std::time::Instant;
 /// Simulate observations from a model with given parameters (random seed).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
-/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 pub fn simulate(
     model: &CompiledModel,
@@ -289,6 +288,31 @@ pub(crate) fn validate_tte_simulatable(
     Ok(())
 }
 
+/// Reject a `params` value that cannot drive an IOV (`kappa`) simulation.
+///
+/// An IOV model draws one κ ~ N(0, Ω_IOV) per occasion, so `params.omega_iov` must
+/// be present whenever `model.n_kappa > 0`. The parser guarantees that for
+/// `CompiledModel::default_params`, but a caller that *rebuilds* `ModelParameters`
+/// from a fit — e.g. the R `ferx_simulate(..., fit = f)` bridge (#1019) — can drop
+/// the IOV block and reach the emitter with `None`. That is a caller bug rather than
+/// a user-fixable model error, but it must be reported, not panicked across an FFI
+/// boundary. Silently substituting the model's *initial* Ω_IOV is not an option: it
+/// would under- or over-disperse every simulated occasion with no diagnostic.
+pub(crate) fn validate_iov_simulatable(
+    model: &CompiledModel,
+    params: &ModelParameters,
+) -> Result<(), String> {
+    if model.n_kappa > 0 && params.omega_iov.is_none() {
+        return Err(format!(
+            "model declares {} kappa (IOV) but the supplied parameters carry no omega_iov; \
+             simulation draws one kappa vector per occasion from it. Rebuild the parameters \
+             with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
+            model.n_kappa
+        ));
+    }
+    Ok(())
+}
+
 /// Simulate observations under `opts`, returning only the observation rows.
 ///
 /// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
@@ -314,8 +338,10 @@ pub fn simulate_with_options(
 /// fitted (posthoc) etas are computed once from `params` + the observed
 /// `population`.
 ///
-/// Returns `Err` if matching is requested but the population is empty or any
-/// subject has no observations.
+/// Returns `Err` if matching is requested but the population is empty, or any
+/// subject has no observations or carries a non-finite DV (a `DV = .` design
+/// template read by [`crate::api::read_population_for_simulation`] is a
+/// simulation input; there is nothing to compute a posthoc eta from).
 ///
 /// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
 /// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
@@ -343,11 +369,21 @@ pub fn simulate_with_options_diag(
     #[cfg(feature = "survival")]
     validate_tte_simulatable(model, population, opts.horizon)?;
 
+    // An IOV model needs the fitted Ω_IOV in `params` (#1019). Report a missing one
+    // as a clean Err here; the Vec-returning entry points enforce the same contract
+    // as a panic at the chokepoint below, since they cannot signal.
+    validate_iov_simulatable(model, params)?;
+
     // Parity with `fit()`: a referenced covariate absent from the data would
     // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
     // would route every row to branch 0, applying the wrong residual variance
-    // with no diagnostic). Reject it here the same way `fit()` does (#658).
-    first_error(&check_covariates(model, population))?;
+    // with no diagnostic), a blank arm-size cell would collapse a weighted κ
+    // (#1031), and a blank standard-error cell would collapse a `weight = <expr>`
+    // residual magnitude (#1029). One shared list so no simulate entry point can
+    // carry a different subset than the others (#658 / #1083). Only the fatal
+    // half; the within-occasion variation warning belongs to `fit()`'s warning
+    // list.
+    first_error(&check_simulation_data(model, population))?;
 
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
@@ -442,6 +478,26 @@ pub fn simulate_with_options_diag(
         return Err(format!(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
+            s.id
+        ));
+    }
+    // A `DV = .` design template read by `read_population_for_simulation` (#957)
+    // has rows but NaN observations, so the emptiness check above no longer
+    // catches it. Its posthoc EBE would be optimized against a NaN objective —
+    // either tripping the non-finite-eta guard below with a misleading "did not
+    // converge", or (if the inner optimizer hands back its finite starting eta)
+    // matching every subject on all-zero etas and returning an arbitrary
+    // assignment. Reject it here with the real cause.
+    if let Some(s) = population
+        .subjects
+        .iter()
+        .find(|s| s.observations.iter().any(|v| !v.is_finite()))
+    {
+        return Err(format!(
+            "propensity-score matching requires finite observations for every subject \
+             (to compute posthoc etas); subject '{}' has non-finite DV values. A `DV = .` \
+             design template carries NaN placeholders — match against the observed dataset \
+             instead",
             s.id
         ));
     }
@@ -559,10 +615,10 @@ fn emit_subject_rows<R: rand::Rng>(
     // Non-IOV models keep the TV-covariate-aware fast-path dispatcher unchanged
     // and draw no extra randoms, so their output is byte-identical.
     let ipreds = if model.n_kappa > 0 {
-        let omega_iov = params
-            .omega_iov
-            .as_ref()
-            .expect("omega_iov is present whenever the model declares kappa (n_kappa > 0)");
+        let omega_iov = params.omega_iov.as_ref().expect(
+            "omega_iov is present whenever the model declares kappa (n_kappa > 0) — \
+                 guaranteed by `validate_iov_simulatable` at every simulate entry point (#1019)",
+        );
         // One κ vector per occasion group, in `iov_occasion_groups` order — the
         // exact order `predict_iov` indexes its `kappas` argument by. Empty when
         // the subject carries no occasion labels, in which case `predict_iov`
@@ -609,11 +665,27 @@ fn emit_subject_rows<R: rand::Rng>(
     // `block_sigma` + M3 model is rejected at fit by `check_model_options`
     // regardless, so the two paths can only differ on an unfitted fixed model.)
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !model.residual_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
+    // The **live** correlations (#847). `params` is the fitted (or drawn) vector,
+    // so reading `model.residual_correlations` here would draw residuals at the
+    // declared rho while using the fitted sigmas — exactly the mismatch that
+    // would make a VPC of an estimated `block_sigma` fail to reproduce it.
+    // Prefer the parameter vector's correlations, falling back to the model's
+    // declaration when a caller supplied a `ModelParameters` without them (a
+    // hand-built one, or an artifact predating the field). Dropping a declared
+    // `block_sigma` silently — independent draws for a model that asks for
+    // correlated ones — is the worse of the two failures.
+    let draw_correlations: &[crate::types::ResidualCorrelation] =
+        if params.residual_correlations.is_empty() {
+            &model.residual_correlations
+        } else {
+            &params.residual_correlations
+        };
+    if !draw_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
         emit_correlated_residual_rows(
             model,
             subject,
             params,
+            draw_correlations,
             &ipreds,
             ruv_scale,
             ruv_mult.as_deref(),
@@ -697,10 +769,13 @@ fn emit_subject_rows<R: rand::Rng>(
 /// draw instead of a Cholesky panic. Subjects whose R is diagonal (no paired
 /// rows) take a cheap per-row draw and skip the factorization entirely.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
+    /* live correlations, resolved by the caller */
+    correlations: &[crate::types::ResidualCorrelation],
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
@@ -721,7 +796,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.occasions,
             &subject.obs_l2,
             &params.sigma.values,
-            &model.residual_correlations,
+            correlations,
             mult,
         ),
         None => compute_r_matrix_with_correlations(
@@ -733,7 +808,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.occasions,
             &subject.obs_l2,
             &params.sigma.values,
-            &model.residual_correlations,
+            correlations,
         ),
     };
     if ruv_scale != 1.0 {
@@ -840,6 +915,31 @@ fn simulate_inner_with_draw<R: rand::Rng>(
         panic!("{e}");
     }
 
+    // Same split for the IOV precondition (#1019): `simulate_with_options*` already
+    // returned a clean Err; the Vec-returning `simulate` / `simulate_with_seed` and the
+    // uncertainty path funnel through here, where the only way to enforce the contract
+    // is to fail loud rather than emit rows with no inter-occasion variability.
+    if let Err(e) = validate_iov_simulatable(model, params) {
+        panic!("{e}");
+    }
+
+    // Same split again for the model-vs-population checks (#1083). The
+    // `Result`-returning entry points above have already run this list and
+    // returned a clean `Err`; `simulate` / `simulate_with_seed` funnel through
+    // here and cannot signal, and the failures this catches are silent by
+    // construction — a weight that underflows to zero produces finite, plottable
+    // rows with the variability quietly removed.
+    //
+    // Redundant on those `Result` paths, and `simulate_with_uncertainty` reaches
+    // here once per draw, so the walk repeats. It is affordable because both
+    // expensive halves are gated on the model actually declaring a weight
+    // (`has_weighted_kappa` / `has_custom_ruv_magnitude`), which is false for
+    // every model that does not use one; and where it is true, the pass is linear
+    // in the observations the draw is about to simulate anyway.
+    if let Err(e) = first_error(&check_simulation_data(model, population)) {
+        panic!("{e}");
+    }
+
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
@@ -910,11 +1010,19 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 }
 
 /// Options controlling `simulate_with_uncertainty()`.
-#[derive(Debug, Clone)]
+///
+/// Derives `Default` so an out-of-crate caller (the R wrapper) can build one
+/// with `..Default::default()` and stay source-compatible when a field is
+/// added here (#529). Note that the two counts default to `0`, which draws
+/// nothing and returns an empty row set — a caller spreading the default is
+/// expected to set both explicitly.
+#[derive(Debug, Clone, Default)]
 pub struct SimulateUncertaintyOptions {
     /// Number of parameter sets to draw from the uncertainty distribution.
+    /// Defaults to `0`; set it explicitly when spreading `Default::default()`.
     pub n_uncertainty_draws: usize,
     /// Number of eta/eps replicates simulated *per* parameter draw.
+    /// Defaults to `0`; set it explicitly when spreading `Default::default()`.
     pub n_sim_per_draw: usize,
     /// How to draw the parameter sets — asymptotic MVN or SIR resamples.
     pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
@@ -948,8 +1056,10 @@ pub fn simulate_with_uncertainty(
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
-    // would otherwise route every row to branch 0). See #658.
-    first_error(&check_covariates(model, population))?;
+    // would otherwise route every row to branch 0). See #658 — and, for a weighted
+    // κ or a weighted residual, a non-positive weight before it collapses to zero
+    // (#1031 / #1029 / #1083).
+    first_error(&check_simulation_data(model, population))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),

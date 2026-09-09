@@ -21,6 +21,7 @@ use std::collections::HashMap;
 /// Caller supplies `derived_exprs`.
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        covariate_model: None,
         name: "test_session".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Additive,
@@ -37,6 +38,8 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         indiv_param_names: Vec::new(),
         indiv_param_partials: IndivParamPartials::empty(),
         default_params: ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: Vec::new(),
             theta_names: Vec::new(),
             theta_lower: Vec::new(),
@@ -51,10 +54,12 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         },
         omega_init_as_sd: Vec::new(),
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: Some(Box::new(|_t, _c| vec![])),
@@ -73,6 +78,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -88,6 +94,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -113,10 +120,12 @@ fn two_session_subject() -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: vec![5.0], // boundary at shifted t=5
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -136,6 +145,8 @@ fn sr_for(n_obs: usize) -> SubjectResult {
         ofv_contribution: 0.0,
         cens: vec![0; n_obs],
         n_obs,
+        pmix: None,
+        mixest: None,
         extra_columns: Vec::new(),
         per_obs_tad: Vec::new(),
         compartment_states: Vec::new(),
@@ -170,7 +181,7 @@ fn derived_per_row_time_is_raw_clock() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(6)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     let expected = vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0];
     for (j, (&got, &exp)) in col.iter().zip(expected.iter()).enumerate() {
@@ -215,7 +226,7 @@ fn derived_aggregate_tmax_returns_raw_time() {
     // ipred peak is at j=4 (shifted t=6, raw t=1) which should give tmax=1.
     sr.ipred = vec![1.0, 2.0, 1.5, 0.5, 3.0, 1.0];
     let mut subjects_results = vec![sr];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // All entries should be 1.0 (raw time of peak at j=4).
     for &v in col {
@@ -259,7 +270,7 @@ fn derived_integral_obs_per_session_explicit_window() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(6)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // Expected AUC = 8.0 for every row in each session.
     for (j, &v) in col.iter().enumerate() {
@@ -310,7 +321,7 @@ fn derived_integral_periodic_uses_raw_clock() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(6)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // All obs land in the raw-clock window [0,5); all three per-session
     // points contribute → AUC=8.0 for every row.
@@ -354,10 +365,12 @@ fn derived_integral_single_session_unchanged() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 3],
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -370,7 +383,7 @@ fn derived_integral_single_session_unchanged() {
         warnings: Vec::new(),
     };
     let mut subjects_results = vec![sr_for(3)];
-    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
+    compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results, None);
     let col = &subjects_results[0].extra_columns[0].1;
     // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
     for &v in col {

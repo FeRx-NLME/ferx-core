@@ -55,9 +55,15 @@ const SS_ORAL_MODEL: &str = r#"
 "#;
 
 #[test]
+// Re-enabled (#960): the analytic-gradient NLopt L-BFGS first-step overshoot
+// that left this SS-oral fit stuck (quit at eval 5, warm/cold EBE gap 83→121) is
+// fixed by the first-step gradient cap (`cap_scaled_gradient` on the opening
+// L-BFGS eval), so it converges. This one needed only the convergence half
+// (mode 1) — no covariance step — so it re-greens independent of the analytic
+// Hessian. Back on the standard slow-tests gate.
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
+    ignore = "slow full-fit smoke test (#960): opt in with --features slow-tests"
 )]
 fn fit_runs_on_ss_oral_dataset() {
     let parsed = parse_full_model(SS_ORAL_MODEL).expect("SS model parses");

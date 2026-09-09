@@ -1,3 +1,15 @@
+mod allometry_cmd;
+mod amd_cmd;
+mod bootstrap_cmd;
+mod bootstrap_progress;
+mod covsearch_cmd;
+mod gam_cmd;
+mod globalsearch_cmd;
+mod iivsearch_cmd;
+mod iovsearch_cmd;
+mod modelsearch_cmd;
+mod ruvsearch_cmd;
+
 use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
@@ -9,6 +21,26 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
        ferx summary <run.fitrx> [<run2.fitrx> ...]
+       ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N]
+                      [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
+       ferx gam      <model.ferx>  --data <data.csv> [--csv gam.csv] [--threads N]
+                                                         (see `ferx gam --help`)
+       ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx covsearch --help`)
+       ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70]
+                                                         (see `ferx allometry --help`)
+       ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx modelsearch --help`)
+       ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx ruvsearch --help`)
+       ferx iivsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx iivsearch --help`)
+       ferx iovsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx iovsearch --help`)
+       ferx amd       <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx amd --help`)
+       ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx globalsearch --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -30,6 +62,9 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
 --inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,
                overriding the model file. METHOD is nca, nca_sweep (default),
                or nca_ebe; a bare --inits-from-nca means nca_sweep.
+
+--gam          run GAM covariate pre-screening after fitting and write
+               {model}-gam.csv  (same as `ferx gam` but in one step)
 
 --clean        ignore any resume checkpoint ({model}.tmp) and start fresh.
                By default a run periodically checkpoints and, if interrupted,
@@ -89,6 +124,51 @@ fn main() {
     // basic run info to stdout. Dispatch before the fit/simulate path.
     if args.get(1).map(String::as_str) == Some("summary") {
         std::process::exit(run_summary(&args));
+    }
+
+    // `ferx bootstrap ...` (#1140) is the first `ferx-tools` subcommand: many
+    // fits over resampled data. Dispatched here for the same reason as the two
+    // above — the fit/simulate path below is untouched, and a plain
+    // `ferx model.ferx` still means what it always did.
+    if args.get(1).map(String::as_str) == Some("bootstrap") {
+        std::process::exit(bootstrap_cmd::run(&args));
+    }
+
+    if args.get(1).map(String::as_str) == Some("gam") {
+        std::process::exit(gam_cmd::run(&args));
+    }
+
+    // `ferx covsearch` / `ferx allometry` (#1180): the first model-space
+    // search tools, driven by a `.ferxsearch` file (or, for allometry, a
+    // model file plus flags).
+    if args.get(1).map(String::as_str) == Some("covsearch") {
+        std::process::exit(covsearch_cmd::run(&args));
+    }
+    if args.get(1).map(String::as_str) == Some("allometry") {
+        std::process::exit(allometry_cmd::run(&args));
+    }
+    // `ferx modelsearch` (#1181): structural PK search over the `pk` templates.
+    if args.get(1).map(String::as_str) == Some("modelsearch") {
+        std::process::exit(modelsearch_cmd::run(&args));
+    }
+    // `ferx ruvsearch` (#1182): residual-error model search.
+    if args.get(1).map(String::as_str) == Some("ruvsearch") {
+        std::process::exit(ruvsearch_cmd::run(&args));
+    }
+    // `ferx iivsearch` / `ferx iovsearch` (#1183): variability-structure search.
+    if args.get(1).map(String::as_str) == Some("iivsearch") {
+        std::process::exit(iivsearch_cmd::run(&args));
+    }
+    if args.get(1).map(String::as_str) == Some("iovsearch") {
+        std::process::exit(iovsearch_cmd::run(&args));
+    }
+    // `ferx amd` (#1184): the whole pipeline, one tool after another.
+    if args.get(1).map(String::as_str) == Some("amd") {
+        std::process::exit(amd_cmd::run(&args));
+    }
+    // `ferx globalsearch` (#1185): GA / exhaustive over one grid, penalized fitness.
+    if args.get(1).map(String::as_str) == Some("globalsearch") {
+        std::process::exit(globalsearch_cmd::run(&args));
     }
 
     if args.len() < 2 {
@@ -199,7 +279,7 @@ fn main() {
             }
 
             // SAEM conditional-distribution outputs (only when the pass ran).
-            for msg in ferx_core::io::output::write_conddist_outputs(&fit_result, &model_name) {
+            for msg in ferx_core::io::output::write_conddist_outputs(&fit_result, model_name) {
                 eprintln!("{}", msg);
             }
 
@@ -247,6 +327,14 @@ fn main() {
                 ) {
                     Ok(()) => eprintln!("Fit bundle written to {}", out),
                     Err(e) => eprintln!("Warning: failed to write fit bundle: {}", e),
+                }
+            }
+
+            // --gam: run GAM covariate pre-screening after fitting and write CSV.
+            if args.iter().any(|a| a == "--gam") {
+                match gam_cmd::run_after_fit(&fit_result, &population, model_name) {
+                    Ok(path) => eprintln!("GAM results written to {path}"),
+                    Err(e) => eprintln!("Warning: failed to write GAM results: {e}"),
                 }
             }
 
@@ -451,6 +539,16 @@ fn print_check_human(report: &ferx_core::CheckReport) {
         if let Some(s) = &d.suggestion {
             println!("    help: {}", s);
         }
+    }
+    // #1111: a `[covariate_model]` block is sugar over `[individual_parameters]`,
+    // so show what it built. Without this the modeller cannot check the
+    // generated expression against a NONMEM control stream.
+    if !report.desugared_individual_parameters.is_empty() {
+        println!("\n[individual_parameters] as built from [covariate_model]:");
+        for line in &report.desugared_individual_parameters {
+            println!("  {}", line.trim());
+        }
+        println!();
     }
     if report.valid {
         println!(
@@ -786,8 +884,13 @@ mod tests {
     // the coverage and pins the documented exit-code contract: 0 = valid,
     // 1 = errors found, 2 = usage / bad arguments.
 
-    const VALID_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/one_cpt_iv.ferx");
-    const VALID_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/one_cpt_iv.csv");
+    // `CARGO_MANIFEST_DIR` is `crates/ferx-cli`, so the repo-root fixtures
+    // (`examples/`, `data/`) are two levels up (#1114).
+    const VALID_MODEL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/one_cpt_iv.ferx"
+    );
+    const VALID_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/one_cpt_iv.csv");
 
     #[test]
     fn run_check_usage_errors_return_2() {
@@ -854,7 +957,8 @@ mod tests {
 
     // ── run_summary: in-process coverage of the `summary` subcommand ──────────
 
-    const WARFARIN_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/warfarin.ferx");
+    const WARFARIN_MODEL: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/warfarin.ferx");
 
     #[test]
     fn run_summary_usage_errors_return_2() {

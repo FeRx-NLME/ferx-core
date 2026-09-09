@@ -1,16 +1,78 @@
+# The repo root is BOTH the `ferx-core` package and the workspace root. That is
+# deliberate and load-bearing: `ferx-r/src/rust/.cargo/config.toml` patches
+# `ferx-core = { path = "../../../ferx-core" }` — the repo root — so moving the
+# package under `crates/` would break every local ferx-r build, and break it
+# *silently* (the patch stops applying and ferx-r quietly builds `main` instead
+# of your branch). See #1114.
+#
+# Boundary rule: `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
+# many fits, resampling, model-space search. Statistical kernels stay in core;
+# orchestration of repeated fits lives in tools. `ferx-core` never depends on
+# either member (A1); the public-API baseline in `api/ferx-core-public-api.txt`
+# is what keeps the boundary honest (A2).
+[workspace]
+# `crates/docs-lint` is dev tooling, not part of the boundary above: it is a
+# member so it gets rustfmt / clippy / `cargo test`, it depends on nothing (not
+# even `ferx-core`), and nothing depends on it. See #1163.
+members = ["crates/ferx-tools", "crates/ferx-cli", "crates/docs-lint"]
+# Required to PRESERVE existing behaviour, not to change it: a standalone
+# edition-2021 package gets resolver v2 implicitly, but inside a workspace the
+# root package's edition no longer implies it — cargo would warn and fall back
+# to v1, quietly changing how dev-/build-dependency features unify into the
+# `ferx-core` build. Naming v2 keeps `ferx-core` resolving exactly as it did
+# before the split.
+resolver = "2"
+
 [package]
 name = "ferx-core"
-version = "0.2.0"
+version = "0.3.1"
 edition = "2021"
 description = "Nonlinear Mixed Effects modeling engine with FOCE/FOCEI estimation"
 license = "MIT"
-authors = ["Ron Keizer", "Teun Post"]
+authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "pharmacokinetics", "foce", "ode"]
+categories = ["science", "mathematics", "simulation"]
 readme = "README.md"
-
-[[bin]]
-name = "ferx"
-path = "src/bin/run_model.rs"
+# `data/mbma_naproxen.csv` is CC BY-NC 4.0, not MIT (see the root LICENSE and
+# data/mbma_naproxen.LICENSE). It is a slow-test fixture, so excluding it keeps
+# the crate published to crates.io free of any CC BY-NC file. The glob also takes
+# its README and licence companions, which are MIT / Creative Commons' own text
+# respectively — they are dropped because they are meaningless without the data,
+# not because of their licence. The slow test that reads the fixture is covered
+# by the blanket `tests/*` exclusion below.
+#
+# The glob deliberately has no `.` after `mbma_naproxen`: `data/mbma_naproxen.*`
+# matched the csv/LICENSE/README but not `data/mbma_naproxen_source.py` (#1170).
+# `examples/mbma_naproxen.ferx` is listed separately for the same reason the
+# slow test is: without the excluded csv it is an example that cannot run.
+#
+# `api/` is the CI-enforced public-API baseline (#1114) — a 388 KB rustdoc-derived
+# snapshot that is repo infrastructure, not crate content, so it is kept out of
+# the published tarball too.
+exclude = [
+  "data/mbma_naproxen*",
+  "examples/mbma_naproxen.ferx",
+  "api/*",
+  # Repo infrastructure, not crate content. None of it is needed to build or
+  # document the crate, and together it is roughly 7.5 MB of a 19.6 MB tarball.
+  # `nonmem_anchor/` goes with `tests/`: it is the NONMEM reference output the
+  # anchor tests read, and nothing outside `tests/` opens it (the mentions in
+  # `src/` are prose in doc comments). Consumers who want to run the test suite
+  # clone the repo; the published crate exists to be built against.
+  "tests/*",
+  "nonmem_anchor/*",
+  "docs/*",
+  "plans/*",
+  "tools/*",
+  ".github/*",
+  ".githooks/*",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "SDLC.md",
+  "VI_VALIDATION.md",
+  "codecov.yml",
+]
 
 [features]
 default = []
@@ -44,7 +106,11 @@ slow-tests = []
 nalgebra = "0.35"
 csv = "1.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: without it `serde_json` parses floats to within 1 ULP
+# rather than exactly, so a `.fitrx` bundle — or any JSON a checkpoint or cache
+# reads back — can return an estimate one bit from the one that was written.
+# Every consumer here is numeric output that is meant to reload as itself.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 rayon = "1.10"
 rand = "0.10"
@@ -71,3 +137,57 @@ lto = "fat"
 [profile.ci-test]
 inherits = "release"
 lto = false
+
+# Used by the per-PR `ci.yml` jobs only. `ci-test` sets `lto = false`, which in
+# Cargo means "no *cross-crate* LTO" but still leaves rustc's *local* ThinLTO
+# across the crate's codegen units on — and that local ThinLTO is ~77% of the
+# lib's LLVM time (measured 2026-08-15, #969/#971). `lto = "off"` disables it,
+# cutting the lib compile ~31% (~404s → ~277s locally). The trade is that the
+# population fits run ~20–40% slower without it — which is why this profile is
+# for the per-PR jobs (compile-bound, fits are fast Tier-1/2) and NOT for the
+# heavy Tier-3 fits: `slow-tests.yml` and the nightly full-coverage job stay on
+# `ci-test` so their 5–60 min fits keep the ThinLTO speedup. See #969.
+[profile.ci-fast]
+inherits = "ci-test"
+lto = "off"
+
+
+# Used by the two per-PR *coverage* jobs only (`Tests + coverage (core)` and
+# `Tests + coverage (TTE/CTMM endpoints)`). Everything `ci-fast` gives them, plus
+# the `debug_assert!` guards actually live. This is #1248, and it subsumes #344.
+#
+# WHY A PROFILE RATHER THAN A FLIPPED `ci-fast`. `ci-fast` is not CI-only despite
+# its name — `tools/vi-nuts-anchor/run.sh` and `tools/vi-emvi-comparison/run.sh`
+# build `target/ci-fast/ferx` with it to produce NUMERICAL anchors. Flipping it
+# would put the guards (and the `#[cfg(debug_assertions)]` MR ODE-twin verifier in
+# `pk/modified_release.rs`) into those runs, which is not what a maintainer timing
+# an anchor asked for. A separate profile keeps that surface untouched.
+#
+# NAME COLLISION, deliberate and harmless: `coverage-pr`'s `rust-cache` entry is
+# also called `ci-cov`. Different namespaces (a cargo profile vs a cache key) for
+# the same pair of jobs; neither reads the other.
+#
+# It costs no extra compile in CI. Both coverage jobs already carry coverage
+# `RUSTFLAGS` and their own `rust-cache` keys (`ci-cov`, `ci-cov-endpoints`), so
+# their artifacts were never shared with any other job; this renames the profile
+# they build under rather than adding a build. Measured locally (15 cores, stable,
+# `--features ci`), clean lib rebuild: `ci-fast` 92 s / 98 s vs `ci-cov` 93 s / 87 s
+# — the within-profile spread exceeds the between-profile difference.
+#
+# `debug-assertions` — measured `--workspace --tests`: 133 s off, 133 s on; `--lib`
+# 5.76 s → 6.45 s. Free, because these profiles are release-optimised. Do NOT read
+# the 577 s figure in `pk/modified_release.rs` as the cost of turning its verifier
+# on: that was measured on the unoptimised `dev` profile, where the fits are two
+# orders slower.
+#
+# `overflow-checks` — NOT inherited from `debug-assertions`. Cargo defaults it per
+# profile (true for `dev`, false for `release`), so a `release`-derived profile that
+# sets only `debug-assertions = true` still compiles with `-C overflow-checks=off`
+# (verified via `cargo build -v`). It is set explicitly here because it is the one
+# thing the retired `Tests (debug-assertions)` job had that the coverage jobs did
+# not, and folding it in is what let that job go. Measured cost: `--workspace
+# --tests` 133 s → 147 s, 5732 passed / 0 failed.
+[profile.ci-cov]
+inherits = "ci-fast"
+debug-assertions = true
+overflow-checks = true

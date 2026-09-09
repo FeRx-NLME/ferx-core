@@ -1,0 +1,36 @@
+# ferx twin of `kappa_weight_anchor.ctl` (#1031).
+#
+# Same data, same 1-cpt oral structure, same FOCE objective. The one difference
+# is the declaration: NONMEM has to write the sample-size scaling into $PK by
+# hand (`KAPPA/SQRT(NARM)`), while ferx declares it on the kappa itself. The two
+# must land on the same objective and the same estimates — that equality is what
+# this anchor pins.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01 weight = NARM
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  method     = foce
+  iov_column = OCC
+  covariance = false

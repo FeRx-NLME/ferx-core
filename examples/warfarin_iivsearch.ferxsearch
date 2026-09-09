@@ -1,0 +1,35 @@
+# Variability-structure search over examples/warfarin.ferx (#1183).
+#
+#   ferx iivsearch examples/warfarin_iivsearch.ferxsearch
+#
+# The space names the η to search and the correlations to try. CL keeps its
+# η in every candidate (a plain IIV, Pharmpy's forced feature); V and KA are
+# searched (IIV?); any block among the three may be tried (COVARIANCE?).
+# Every parameter named must be written as `P = TVP * exp(ETA_P)`, which
+# warfarin.ferx is. See docs/tools/iivsearch.qmd.
+
+base = "warfarin.ferx"
+data = "../data/warfarin.csv"
+
+[space]
+mfl = """
+IIV(CL, EXP); IIV?([V,KA], EXP)
+COVARIANCE?(IIV, [CL,V,KA])
+"""
+
+[iivsearch]
+algorithm             = "top_down_exhaustive"   # or "bottom_up_stepwise", "simultaneous_stepwise", "skip"
+correlation_algorithm = "top_down_exhaustive"   # or "skip"
+block_retries         = 2                       # extra starts per η beyond two in a block
+
+[rank]
+type = "bic"                 # the BIC(iiv): OFV + n_omega * ln(n_subjects)
+
+[strictness]
+require_converged  = true
+reject_on_boundary = true
+
+[run]
+threads   = 4
+retries   = 2
+cache_dir = ".ferx-iivsearch"

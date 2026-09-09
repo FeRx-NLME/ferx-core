@@ -1,3 +1,8 @@
+---
+pagetitle: "NLME estimation methods in ferx"
+description: "Compare FOCE, FOCEI, SAEM, Gauss-Newton, importance sampling, SIR, and Bayesian estimation methods for population PK/PD models in ferx."
+---
+
 # Estimation Methods
 
 ferx-core separates two orthogonal choices: the **statistical method** (how random effects are handled) and the **outer optimizer** (the algorithm that minimises the population objective).
@@ -23,6 +28,15 @@ These chain after a primary method via `methods = [...]` and refine the result r
 - **Importance Sampling (IMP), evaluation-only** (`method = [..., imp]` with `imp_eval_only = true`) — a Monte-Carlo marginal likelihood estimate (`−2 log L`) more accurate than the Laplace approximation, for model comparison when the FOCE OFV may be biased (sparse data, complex random-effect structure). This is the post-estimation *scoring* use of [IMP](importance-sampling.qmd); without `imp_eval_only` the same `imp` token *estimates* instead (see Statistical methods above).
 
 - **[SIR](sir.qmd)** — Sampling Importance Resampling. Provides non-parametric 95% CIs for all parameters, more robust than the asymptotic covariance matrix. Appended automatically when `sir = true` in `[fit_options]`.
+
+## Parameterization
+
+All of these methods optimize the same **[packed parameter
+vector](parameterization.qmd)** — theta on the log (or identity) scale, Omega
+by its Cholesky factor, sigma on the log scale, in one flat vector. That page
+documents the layout, the bounds, how FIX is enforced, and where the packed
+space shows up in output (the covariance matrix, SIR resamples, uncertainty
+draws).
 
 ## Outer optimizers
 

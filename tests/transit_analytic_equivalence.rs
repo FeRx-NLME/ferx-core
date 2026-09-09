@@ -1717,7 +1717,8 @@ LAGTIME = TVF\n\n\
 /// held by `v=V`) is not a reserved-name shadow, so the shadow guard passes it — but the
 /// generated twin's `ode_param_slots` rejects the duplicate V slot. Before the collision guard
 /// the twin was built (`is_some`) and `predict`/`fit`/`simulate` PANICKED in
-/// `get_or_build().expect(...)`. It must now decline the twin (`is_none`).
+/// `get_or_build().expect(...)`. It must decline the twin (`is_none`) — named by this guard,
+/// so it never reaches #1008's generic build-failure decline.
 #[test]
 fn transit_flipflop_f_param_named_disposition_slot_declines_twin() {
     // Flip-flop: ke = CL/V = 2.0/4.0 = 0.5 ≥ KTR = (3+1)/20 = 0.2.

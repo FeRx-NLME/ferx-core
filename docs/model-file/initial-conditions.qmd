@@ -1,3 +1,7 @@
+---
+pagetitle: "ODE initial conditions"
+---
+
 # Initial Conditions
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -34,7 +38,12 @@ Each line is `init(NAME) = <expr>`, where:
   thetas, etas, covariates, and individual parameters declared in
   `[individual_parameters]` — exactly the symbols a Form-B `[scaling]`
   expression sees. So `init(central) = CONC0 * V` reads the data column `CONC0`
-  and the per-subject `V`.
+  and the per-subject `V`. Unlike `[scaling]`, that includes a parameter the
+  `pk(...)` call maps as a dose attribute (`f=`, `lagtime=`/`alag=`): an initial
+  condition is **not** an absorbed dose, so the engine deposits the amount with
+  `F = 1` and no lag. `init(depot) = F * 500` — the bioavailable residue of a
+  pre-study 500 mg dose — therefore applies `F` exactly once and is accepted
+  ([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)).
 
 ::: {.callout-important}
 A covariate named in the init expression is a **required data column**, matched
@@ -88,15 +97,37 @@ above — numerically equivalent, and still allocation-free.
 - **Central or depot only.** A peripheral-compartment initial amount needs the
   cross-compartment impulse response, which the analytical closed forms do not
   expose. Use an ODE model for that.
+- **No `TIME` in the init expression.** The baseline amount is evaluated once
+  per subject at the time origin, so `TIME` would read exactly `0` and the
+  reference could only flatten the expression — `init(central) = TIME + 50` was
+  bit-identical to `init(central) = 50`. The parser rejects it (issue #994).
+  Note that `T` / `TAFD` / `TAD` / `MACHEPS` are **not** built-ins on this
+  surface: outside `[odes]` they are ordinary covariates, so they are accepted
+  here and become required data columns, exactly as in `[scaling]`. See
+  [What an `init(...)` expression may reference](ode-models.qmd#init-scope) for
+  the two surfaces side by side.
 - **No `KAPPA_*` (IOV) in the init expression.** The baseline amount is a single
   t = 0 quantity evaluated with the between-subject η only, so a per-occasion
   kappa reference would silently see `kappa = 0`. The parser rejects it (the same
   guard as a Form C ODE readout, issue #107); reference the occasion-dependent
   structural parameter (e.g. `CL`) instead. The baseline's *decay* over time does
   use each observation's occasion-specific PK parameters on the IOV path.
-- **System resets wipe the baseline.** A reset record (NONMEM `EVID = 3/4`) zeros
-  every compartment, including the residual init baseline; nothing re-deposits
-  it. Observations at or after a reset therefore carry no baseline contribution.
+- **System resets: `[odes]` re-deposits the baseline, `[initial_conditions]` does not.**
+  A reset record (NONMEM `EVID = 3/4`) discards every compartment amount, including the
+  residual baseline. What happens next differs by engine, and only one of the two matches
+  NONMEM today:
+  - On an **`[odes]`** model the reset re-applies `init(state) = <expr>`, evaluated at the
+    **reset row's own data items** — `$PK` runs at that row, so a covariate-driven baseline
+    restarts on that row's values, not the preceding record's and not the following one's
+    (#1133). With an `iov_column` this covers the row's `OCC` too: a reset that opens a new
+    occasion re-seeds under that occasion's κ. Anchored against NONMEM 7.6.0 in
+    `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl` — including a reset that is the
+    subject's first event (H), a reset with a separate dose row at the same time (G), and the
+    occasion question in isolation (J).
+  - On an **analytical** model with `[initial_conditions]` nothing re-deposits the
+    baseline, so observations at or after the first reset carry no baseline contribution.
+    NONMEM re-applies `A_0` there too, so this is a known divergence (#1135) — use an
+    `[odes]` model if you need a baseline that survives a reset.
 - **Steady-state doses warn.** A steady-state dose (`SS = 1`) already
   pre-equilibrates an infinite dose history, so superposing an init baseline
   double-counts the starting amount. The combination raises
@@ -118,7 +149,8 @@ above — numerically equivalent, and still allocation-free.
   `[odes]` models the same applies when the baseline is combined with a finite
   infusion, an estimated lagtime, a built-in input-rate forcing, steady-state
   dosing, a modeled-duration/rate dose, or an EVID 3/4 reset (production re-applies
-  `init` at each reset, and the sensitivity walk re-seeds it there).
+  `init` at each reset from that reset row's own snapshot, and the sensitivity walk
+  re-seeds it from the same one — #1133).
 
 ## NONMEM comparison
 

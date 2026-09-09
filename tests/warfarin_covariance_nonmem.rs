@@ -226,9 +226,15 @@ fn assert_covariance_se_matches_nonmem(method: EstimationMethod, interaction: bo
 }
 
 #[test]
+// Re-enabled (#960): mode 1 fixed by the L-BFGS first-step overshoot cap
+// (`cap_scaled_gradient` now fires on the opening L-BFGS gradient eval), so the
+// `Auto` default converges warfarin FOCEI to the true optimum instead of staying
+// at init; mode 2 (the FD-of-OFV knife-edge, SE(TVCL) 0.0071↔121 on a ~3e-5 θ
+// shift) is cured by the analytic covariance Hessian (#436, default-on), which
+// has no FD step to condition. Back on the standard slow-tests gate.
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored covariance SE cross-check (#209/#196/#129): opt in with --features slow-tests"
+    ignore = "slow + NONMEM-anchored covariance SE cross-check (#209/#196/#129/#960): opt in with --features slow-tests"
 )]
 fn covariance_se_matches_nonmem() {
     assert_covariance_se_matches_nonmem(EstimationMethod::FoceI, true);

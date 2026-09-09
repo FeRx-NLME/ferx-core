@@ -1,3 +1,7 @@
+---
+pagetitle: "Simulation API"
+---
+
 # Simulation
 
 ## `simulate()`
@@ -23,8 +27,10 @@ pub fn simulate(
 
 **Example:**
 ```rust
+use ferx_core::api::read_population_for;
+
 let model = parse_model_file(Path::new("model.ferx"))?;
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+let (population, _) = read_population_for(&model, &None, "data.csv", None, None, None, &[])?;
 
 // Simulate 1000 replicates
 let sims = simulate(&model, &population, &model.default_params, 1000);
@@ -34,6 +40,60 @@ for sim in &sims[..5] {
              sim.sim, sim.id, sim.time, sim.ipred, sim.dv_sim);
 }
 ```
+
+## `read_population_for_simulation()`
+
+Read a NONMEM-format CSV that will be **simulated from** rather than fitted.
+
+```rust
+pub fn read_population_for_simulation(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String>
+```
+
+Identical to `read_population_for()` — the reader every fitting entry point uses
+— except in how it reads a **missing `DV`** on a scored row (`EVID=0`,
+`MDV=0`). For a fit, a missing `DV` means "no observation here", so the row is
+skipped and counted for the `W_MISSING_DV` warning. For a simulation the `DV` is
+the *output*, so the same row is a **design point**: a sampling time whose value
+has not been generated yet.
+
+That makes the natural design template simulate as written:
+
+```csv
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,0.25,.,0,.,1,0
+1,1,.,0,.,1,0
+1,4,.,0,.,1,0
+```
+
+```rust
+let (population, _covariates) =
+    read_population_for_simulation(&model, &None, "design.csv", None, None, None, &[])?;
+let sims = simulate(&model, &population, &model.default_params, 1000);
+```
+
+Read with `read_population_for()` the same file yields zero simulated rows. Rows
+marked `MDV=1` are excluded on both paths. Retained rows are reported once as a
+`W_DESIGN_DV` warning on the returned population, so a simulation run off an
+*observed* dataset makes visible that it kept rows a fit of the same data would
+have skipped.
+
+The retained rows carry a placeholder `DV` (`NaN`, or the endpoint's first
+declared state code for an integer-coded endpoint) that the simulated value
+replaces, so the returned population is **for simulation only** — do not pass it
+to `fit()`. That is enforced, not merely advised: a population carrying
+non-finite observations is rejected by `fit()` (and reported by `ferx check`) as
+`E_NONFINITE_DV`, and propensity-score-matched simulation
+(`SimulateOptions::match_method`) rejects it too, since a design template has
+nothing to compute posthoc etas from.
 
 ## `simulate_with_seed()`
 
@@ -290,9 +350,10 @@ parameter draws:
 1. **Outer loop** — for each of `n_uncertainty_draws`, draw a population
    parameter set $(\theta_k, \Omega_k, \Sigma_k)$ from the uncertainty
    distribution.
-   - **Asymptotic**: $x_k = \hat{x} + L_\text{cov} z$ in packed log-space
-     (theta, Cholesky-omega, sigma share one packed vector), then unpack —
-     theta, Omega, and Sigma are perturbed coherently from a single MVN draw.
+   - **Asymptotic**: $x_k = \hat{x} + L_\text{cov} z$ in
+     [packed log-space](../estimation/parameterization.qmd) (theta,
+     Cholesky-omega, sigma share one packed vector), then unpack — theta,
+     Omega, and Sigma are perturbed coherently from a single MVN draw.
    - **SIR**: pick a parameter vector at random from
      `FitResult.sir_resamples_packed` (the resampled pool retained from the
      SIR step).
@@ -309,3 +370,55 @@ The resulting `SimulationResult` rows are tagged with both `draw` and `sim`
 so downstream code can compute either marginal bands (over all draws and
 sims) or hierarchical bands (e.g. median across sims within each draw, then
 percentiles across draws).
+
+## What the uncertainty distribution is {#uncertainty-distribution}
+
+**There is no inverse-Wishart draw here.** Ω uncertainty is *not* sampled
+from a conjugate matrix distribution; the inverse-Wishart in ferx belongs to
+the [Bayesian MCMC estimator](../estimation/bayes.qmd), which is a separate
+code path (`estimation/bayes.rs`) and is not used by
+`simulate_with_uncertainty()`.
+
+What actually happens, for `UncertaintyMethod::Asymptotic`:
+
+- The proposal is a plain multivariate normal, and it lives in the
+  [**packed parameter space**](../estimation/parameterization.qmd) — theta
+  (log), the Omega Cholesky factor (log-diagonal), and sigma (log) in one
+  vector. `FitResult.covariance_matrix` is the inverse FD Hessian of the OFV
+  *in that same space*, so it is the natural — and the only dimensionally
+  consistent — place to draw. Its off-diagonal blocks are what makes each
+  draw's θ, Ω and Σ move together instead of independently.
+- Because the Omega segment is $\log L_{ii}$, the implied marginal on an
+  Omega diagonal is roughly **log-normal on the standard-deviation scale**,
+  and every draw yields a positive-definite Ω by construction — no rejection
+  of non-PD matrices needed. Off-diagonal Cholesky entries are drawn on the
+  identity scale.
+- If `covariance_matrix` is not positive-definite, it is symmetrised and
+  eigenvalue-floored before the Cholesky (`regularised_cholesky`). A draw
+  from the regularised factor is slightly wider than the raw covariance in
+  the corrected directions.
+- **FIX'd parameters carry no uncertainty**: any packed index flagged FIX is
+  reset to its fitted value on every draw, so a FIX'd theta, omega, sigma or
+  kappa is identical across all draws. (`compute_bounds()` pins fixed indices
+  with `lower == upper`, so an unpinned continuous draw would otherwise be
+  rejected for every model with a FIX.)
+- A draw that lands outside the packed bounds, or that unpacks to a
+  non-positive theta / sigma / Omega diagonal, is discarded and redrawn, up
+  to `10 × n_uncertainty_draws` attempts in total; exhausting that budget is
+  an `Err`, and usually means an ill-conditioned covariance matrix or an
+  estimate sitting on a bound.
+- If a *valid* draw then fails during simulation (e.g. the drawn parameters
+  make the ODE solver fail), that single draw is skipped with a
+  `uncertainty draw k skipped — …` warning rather than aborting the whole
+  run, so the returned set may contain fewer than `n_uncertainty_draws`
+  distinct draws.
+
+`UncertaintyMethod::Sir` makes none of these distributional assumptions: it
+resamples whole parameter vectors from the SIR pool, so its shape is whatever
+the [SIR](../estimation/sir.qmd) step found. Prefer it when the asymptotic
+normal approximation is suspect (parameters near a bound, a banana-shaped
+likelihood) — at the cost of running SIR with `sir_keep_samples = true` at
+fit time.
+
+Bootstrap (subject resampling + refit) is not implemented; the
+`UncertaintyMethod` enum is deliberately open for it.

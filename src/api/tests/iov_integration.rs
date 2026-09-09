@@ -1,5 +1,6 @@
 use super::fit;
 use super::simulate_with_seed;
+use super::{simulate_with_options, SimOutcome};
 use crate::types::*;
 
 use std::collections::HashMap;
@@ -9,6 +10,8 @@ fn make_iov_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -23,8 +26,10 @@ fn make_iov_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "iov_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -53,6 +58,7 @@ fn make_iov_model() -> CompiledModel {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -71,6 +77,7 @@ fn make_iov_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -86,6 +93,7 @@ fn make_iov_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -121,10 +129,12 @@ fn make_iov_population() -> Population {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: occasions.clone(),
             obs_l2: Vec::new(),
             dose_occasions: dose_occ.clone(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -910,13 +920,18 @@ fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         .iter()
         .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-    // FOCE, FOCEI, SAEM, IMP, AGQ, and Laplace are all accepted (no method diagnostic).
+    // FOCE, FOCEI, SAEM, IMP, AGQ, Laplace, and VI are all accepted (no method
+    // diagnostic). VI belongs here because its data term is `obs_nll_subject_grad`,
+    // whose non-IOV path routes a dense `R` through the same full-FD fallback the
+    // others use; only the closed-form σ maximizer is unavailable there, and that
+    // falls back to Adam with a recorded reason rather than failing the fit.
     for method in [
         EstimationMethod::Foce,
         EstimationMethod::FoceI,
         EstimationMethod::Saem,
         EstimationMethod::Imp,
         EstimationMethod::Laplace,
+        EstimationMethod::Vi,
     ] {
         let opts = fast_opts(method, Optimizer::Bobyqa, false);
         assert!(
@@ -1051,10 +1066,12 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1079,6 +1096,242 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("SAEM fit with cross-endpoint block_sigma should succeed");
     assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
+}
+
+/// A VI block that a later *estimating* stage has overtaken says so; one followed only by
+/// an evaluator does not.
+///
+/// `FitResult.vi` survives the rest of a chain on purpose — `methods = [vi, laplace]` with
+/// `agq_eval_only` is the recommended way to turn VI's lower bound into a real `−2 log L`,
+/// and the variational covariance is the only per-subject covariance in the result. But on
+/// `methods = [vi, focei]` the reported θ/Ω/σ and subject diagnostics come from FOCEI while
+/// every number under `vi` still describes VI's parameter point. That is worth reporting,
+/// not worth reporting *silently*.
+#[test]
+fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
+    use crate::parser::model_parser::parse_model_string;
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("1-cpt IV fixture parses");
+
+    let mut subjects = Vec::new();
+    for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
+        subjects.push(Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: obs,
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 2],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        });
+    }
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    let base = |methods: Vec<EstimationMethod>| {
+        let mut o = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
+        o.methods = methods;
+        o.outer_maxiter = 2;
+        o.vi_iters = 5;
+        o.vi_mc_samples = 2;
+        o
+    };
+
+    // VI alone: nothing supersedes it.
+    let solo = fit(&model, &population, &model.default_params, &base(vec![]))
+        .expect("VI-only fit succeeds");
+    assert_eq!(solo.vi.as_ref().expect("VI block").superseded_by, None);
+
+    // A trailing evaluator reads the fit out without moving it, so the VI block still
+    // describes the reported parameters.
+    let mut eval_opts = base(vec![EstimationMethod::Vi, EstimationMethod::Laplace]);
+    eval_opts.agq_eval_only = true;
+    let evaluated = fit(&model, &population, &model.default_params, &eval_opts)
+        .expect("vi + agq_eval_only laplace fit succeeds");
+    assert_eq!(
+        evaluated.vi.as_ref().expect("VI block").superseded_by,
+        None,
+        "an evaluation-only stage must not count as superseding VI"
+    );
+
+    // A later estimating stage does move the parameters, and is named.
+    let chained = fit(
+        &model,
+        &population,
+        &model.default_params,
+        &base(vec![EstimationMethod::Vi, EstimationMethod::FoceI]),
+    )
+    .expect("vi + focei fit succeeds");
+    assert_eq!(
+        chained
+            .vi
+            .as_ref()
+            .expect("VI block")
+            .superseded_by
+            .as_deref(),
+        Some("FOCEI")
+    );
+    assert!(
+        chained
+            .warnings
+            .iter()
+            .any(|w| w.contains("still describes the parameter point VI ended on")),
+        "the staleness must be stated in prose too, got {:?}",
+        chained.warnings
+    );
+}
+
+/// VI must accept a correlated `$SIGMA` block too, and fall back to Adam on `σ` rather
+/// than failing.
+///
+/// Its data term is `obs_nll_subject_grad`, whose non-IOV path routes a dense `R` through
+/// the same full-FD fallback FOCE and SAEM use, so the objective and its θ/σ gradient are
+/// correct here. What a dense `R` does remove is the *closed-form* `σ` maximizer — `σ` is
+/// no longer inside a scalar variance with a stationary point — and `closed_form_sigma_support`
+/// declines it with a reason and steps `σ` by Adam instead. The option docs promise exactly
+/// that fallback, so rejecting the configuration at check time contradicted them.
+#[test]
+fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
+    use crate::parser::model_parser::parse_model_string;
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+    )
+    .expect("cross-endpoint block_sigma ODE model parses");
+
+    // Check time first: this is the guard the docs contradicted.
+    let check_opts = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
+    assert!(
+        !super::check_model_options(&model, &check_opts)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"),
+        "block_sigma + vi must not be rejected at check time"
+    );
+
+    let mut subjects = Vec::new();
+    for (id, dose_amt, obs) in [
+        ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+        ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+    ] {
+        subjects.push(Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0, 2.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: obs,
+            obs_cmts: vec![1, 2, 1, 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 4],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        });
+    }
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    let mut opts = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
+    opts.vi_iters = 5;
+    opts.vi_mc_samples = 2;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("VI fit with cross-endpoint block_sigma should succeed");
+    let vi = result.vi.as_ref().expect("VI block present");
+    assert!(
+        vi.neg_two_elbo.is_finite(),
+        "dense-R data term must produce a finite -2*ELBO"
+    );
+    // And the promised fallback actually fired, with its reason recorded.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("vi_sigma_update") && w.contains("Adam")),
+        "expected the closed-form sigma fallback warning, got {:?}",
+        result.warnings
+    );
 }
 
 // Importance sampling must accept a correlated $SIGMA block: the weights use
@@ -1140,10 +1393,12 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1227,10 +1482,12 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1322,10 +1579,12 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1418,10 +1677,12 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1524,11 +1785,17 @@ fn test_simulate_zero_rho_matches_diagonal_draw_path() {
 #[test]
 fn test_simulate_singular_rho_one_does_not_panic() {
     let (mut model, population) = block_sigma_selected_model_and_population();
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
+    let singular = vec![crate::types::ResidualCorrelation {
         sigma_i: 0,
         sigma_j: 1,
         rho: 1.0,
     }];
+    // `simulate` draws from the **parameter vector's** correlations since #847
+    // (so a VPC of an estimated `block_sigma` reproduces the fitted rho), so the
+    // singular value has to be set there; the model copy is kept in step because
+    // the two must agree for every other consumer.
+    model.residual_correlations = singular.clone();
+    model.default_params.residual_correlations = singular;
 
     let n_sim = 20_000;
     let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 11);
@@ -1582,6 +1849,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &model,
         subject,
         &model.default_params,
+        &model.default_params.residual_correlations,
         &ipreds,
         2.0, // ruv_scale != 1.0
         Some(&mult),
@@ -1765,10 +2033,12 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 5],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1805,4 +2075,93 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
             "predictions must be finite"
         );
     }
+}
+
+// ── #1019: simulating an IOV model from caller-rebuilt parameters ────────
+//
+// The R bridge rebuilds `ModelParameters` from a fit object; before #1019 it
+// dropped `omega_iov`, and the per-occasion κ draw in `emit_subject_rows`
+// unwrapped that `None` — a panic across the FFI boundary that took the R
+// session's error handling with it. The contract is now enforced at every
+// simulate entry point: a clean `Err` where one can be returned, a loud panic
+// on the Vec-returning chokepoint.
+
+/// `params` with the IOV block stripped — exactly what a fit-rebuilt
+/// `ModelParameters` looked like before the fix.
+fn iov_params_without_omega_iov(model: &CompiledModel) -> ModelParameters {
+    let mut params = model.default_params.clone();
+    params.omega_iov = None;
+    params
+}
+
+#[test]
+fn test_simulate_with_options_errs_when_omega_iov_missing() {
+    let model = make_iov_model();
+    let population = make_iov_population();
+    let params = iov_params_without_omega_iov(&model);
+
+    let err = simulate_with_options(
+        &model,
+        &population,
+        &params,
+        2,
+        &crate::SimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        },
+    )
+    .expect_err("an IOV model with no omega_iov must not simulate");
+    assert!(
+        err.contains("omega_iov") && err.contains("kappa"),
+        "error must name the missing IOV covariance; got: {err}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "carry no omega_iov")]
+fn test_simulate_with_seed_panics_when_omega_iov_missing() {
+    let model = make_iov_model();
+    let population = make_iov_population();
+    let params = iov_params_without_omega_iov(&model);
+    // No Err channel on this entry point: fail loud rather than emit rows with
+    // zero inter-occasion variability.
+    let _ = simulate_with_seed(&model, &population, &params, 1, 1);
+}
+
+#[test]
+fn test_simulate_from_fitted_params_carries_omega_iov() {
+    let model = make_iov_model();
+    let population = make_iov_population();
+    let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    let fit_result = fit(&model, &population, &model.default_params.clone(), &opts)
+        .expect("IOV fit must succeed");
+
+    // The supported way to rebuild parameters from a fit — the fix the R bridge
+    // mirrors. It must carry the IOV covariance through, and simulate cleanly.
+    let params =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit_result, &model);
+    assert!(
+        params.omega_iov.is_some(),
+        "fitted_params_from_result must thread omega_iov through for a kappa model"
+    );
+
+    let results = simulate_with_options(
+        &model,
+        &population,
+        &params,
+        2,
+        &crate::SimulateOptions {
+            seed: Some(7),
+            ..Default::default()
+        },
+    )
+    .expect("simulating from fitted params must succeed");
+    assert_eq!(
+        results.len(),
+        2 * population.subjects.len() * population.subjects[0].obs_times.len()
+    );
+    assert!(results.iter().all(|r| {
+        r.ipred.is_finite()
+            && matches!(&r.outcome, SimOutcome::Continuous { value } if value.is_finite())
+    }));
 }

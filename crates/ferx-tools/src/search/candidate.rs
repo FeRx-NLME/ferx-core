@@ -1,0 +1,500 @@
+//! What a search hands the runner, and what it gets back (#1178).
+//!
+//! A [`Candidate`] is a rendered model plus its provenance: the id the search
+//! knows it by, the parent it was derived from, and the [`FeatureVector`]
+//! describing *what makes it different* — the row a report shows next to its
+//! criterion. A [`CandidateResult`] is the same identity carried back with the
+//! fit, the [`StrictnessVerdict`] and the ranking criterion attached.
+
+use std::collections::BTreeMap;
+
+use ferx_core::{bic, BicType, FitResult, StrictnessVerdict};
+use serde::{Deserialize, Serialize};
+
+use ferx_core::edit::ModelText;
+
+use super::penalty::Penalties;
+
+/// The search-space coordinates of one candidate: `ABSORPTION = FO`,
+/// `CL-WT = pow`, `PERIPHERALS = 1`, …
+///
+/// The runner never interprets these — it stores them, journals them and puts
+/// them in the per-candidate table. They exist so a report can say *which*
+/// model won rather than only which id, and so a resumed run's table still
+/// describes its rows. Ordering is by key (a `BTreeMap`), so two vectors with
+/// the same entries render identically whatever order they were built in.
+///
+/// It is deliberately **not** the candidate's identity: two different feature
+/// vectors can render to the same model text, and it is the canonical hash of
+/// that text that decides whether a fit is reused (see
+/// [`ModelText::canonical_hash`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FeatureVector {
+    entries: BTreeMap<String, String>,
+}
+
+impl FeatureVector {
+    /// An empty vector — a base model with nothing to say about itself.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builder form of [`set`](Self::set), for `FeatureVector::new().with(…).with(…)`.
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.set(key, value);
+        self
+    }
+
+    /// Set one feature, returning the value it replaced.
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
+        self.entries.insert(key.into(), value.into())
+    }
+
+    /// The value of one feature, if present.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    /// Every `(key, value)` in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The one-cell rendering for the per-candidate table: `k=v` pairs joined
+    /// by `;`, in key order.
+    ///
+    /// Display only — the journal round-trips the vector through serde, which
+    /// has no separator to collide with, so nothing has to parse this back.
+    pub fn render(&self) -> String {
+        self.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+}
+
+impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for FeatureVector {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        Self {
+            entries: iter
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        }
+    }
+}
+
+/// One model a search wants fitted.
+///
+/// No `Eq`: [`cost`](Self::cost) is an `f64` scheduling hint, and "the same
+/// cost" is not a question anything asks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    /// How the search refers to this candidate. Must be unique within one
+    /// [`run`](super::Runner::run) — the results are keyed by it and the table
+    /// is written under it.
+    pub id: String,
+    /// The candidate's model source, as produced by the `ferx-core::edit`
+    /// layer.
+    pub model: ModelText,
+    /// The candidate this one was derived from, for a step-history report.
+    /// `None` for the base model or for an exhaustively enumerated candidate.
+    pub parent: Option<String>,
+    /// What distinguishes it — see [`FeatureVector`].
+    pub features: FeatureVector,
+    /// This candidate's own start count, a **floor** under
+    /// [`RunOptions::n_starts`] when set. A search that knows one candidate
+    /// is harder to fit than its siblings — a full omega block over three or
+    /// more η (#1183), a Michaelis-Menten elimination (#1257), both in
+    /// `docs/examples/multistart.qmd` — asks for more starts here rather than
+    /// paying for them on every candidate of the run.
+    ///
+    /// A floor rather than a replacement, because it says *this candidate
+    /// needs at least this many*: a run the user configured with more
+    /// `retries` than a tool's own guess must not have them taken away by it.
+    pub n_starts: Option<usize>,
+    /// What this candidate is expected to cost relative to the others in the
+    /// same run, for the thread plan. `1.0` is the run's ordinary candidate.
+    ///
+    /// The runner's split between concurrent fits and threads *per* fit is
+    /// one number for a whole batch ([`ferx_core::PoolPlan::from_budget`]), which is the
+    /// right split only when the candidates cost about the same. They do not
+    /// once a search mixes analytic templates with `[odes]` ones: a
+    /// Michaelis-Menten candidate integrates numerically where its
+    /// first-order sibling has a closed form, at one to two orders of
+    /// magnitude more per fit (#1257). Scheduled together, the expensive one
+    /// finishes long after the pool has emptied, holding the run open on a
+    /// single thread while the rest of the machine idles.
+    ///
+    /// So candidates of **equal cost are planned together**, heaviest group
+    /// first, each group getting the whole thread budget for its own split —
+    /// a handful of ODE candidates run few-at-a-time with many subject
+    /// threads each, and the analytic ones then run wide. A run whose
+    /// candidates all carry the default cost is one group and is planned
+    /// exactly as before.
+    ///
+    /// It is a *hint*, not a measurement: it only has to be right about which
+    /// candidates are the long poles. The report's per-candidate `seconds` is
+    /// the measurement.
+    pub cost: f64,
+}
+
+impl Candidate {
+    /// A candidate with no parent and no features.
+    pub fn new(id: impl Into<String>, model: ModelText) -> Self {
+        Self {
+            id: id.into(),
+            model,
+            parent: None,
+            features: FeatureVector::new(),
+            n_starts: None,
+            cost: 1.0,
+        }
+    }
+
+    /// Builder: fit this candidate with at least `n` starts — see
+    /// [`n_starts`](Self::n_starts). Clamped to at least 1 when applied.
+    pub fn starts(mut self, n: usize) -> Self {
+        self.n_starts = Some(n);
+        self
+    }
+
+    /// Builder: what this candidate costs relative to the run's ordinary one
+    /// — see [`cost`](Self::cost). A non-finite or non-positive value is
+    /// ignored, since it would make the grouping meaningless rather than
+    /// merely wrong.
+    pub fn cost(mut self, cost: f64) -> Self {
+        if cost.is_finite() && cost > 0.0 {
+            self.cost = cost;
+        }
+        self
+    }
+
+    /// Builder: record the candidate this one was derived from.
+    pub fn parent(mut self, parent: impl Into<String>) -> Self {
+        self.parent = Some(parent.into());
+        self
+    }
+
+    /// Builder: attach the search-space coordinates.
+    pub fn features(mut self, features: FeatureVector) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// The candidate's identity: hex [`ModelText::canonical_hash`], with the
+    /// per-candidate [`n_starts`](Self::n_starts) folded in when it is set.
+    ///
+    /// This — not the id, not the features — is the dedup and cache key, so a
+    /// model reached twice by two different step orders is fitted once.
+    ///
+    /// The start count belongs in it because the key has to cover everything
+    /// that changes the *result*, and the extra starts exist precisely to
+    /// reach a different optimum: without it, two candidates carrying the
+    /// same text but different start counts would deduplicate to the cheaper
+    /// fit, and a resume after raising `block_retries` would reuse a
+    /// journalled fit that never took the extra starts —
+    /// [`SearchManifest`](super::SearchManifest) compares only the *run-wide*
+    /// count, so nothing else would notice. A candidate with no override
+    /// hashes exactly as before, so an existing journal still resumes.
+    pub fn hash(&self) -> String {
+        let base = hex(&self.model.canonical_hash());
+        match self.n_starts {
+            None => base,
+            Some(n) => ferx_core::io::hash::sha256_bytes(format!("{base}\nstarts={n}").as_bytes()),
+        }
+    }
+}
+
+/// Lower-case hex of a 32-byte digest.
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// What a candidate is ranked on.
+///
+/// The BIC variants are `ferx_core::bic`, i.e. Pharmpy's four
+/// `calculate_bic` conventions; see [`BicType`]. Every variant is
+/// **lower-is-better**, which is what lets a search compare them without
+/// knowing which one it was configured with.
+///
+/// Not `Eq`: [`Penalized`](Self::Penalized) carries its schedule, which is
+/// `f64`s.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Criterion {
+    /// The objective function value itself. Only comparable between nested
+    /// models with the same parameter count, so a search using it supplies its
+    /// own likelihood-ratio cutoff.
+    Ofv,
+    /// `FitResult::aic`.
+    Aic,
+    /// `ferx_core::bic(result, kind)`.
+    Bic(BicType),
+    /// pyDarwin's penalized fitness: `OFV` plus a charge per estimated
+    /// parameter and per failure — see [`Penalties`] (#1185).
+    Penalized(Penalties),
+}
+
+impl Default for Criterion {
+    /// The mixed BIC — Pharmpy's default and the one its structural and IIV
+    /// searches rank on.
+    fn default() -> Self {
+        Criterion::Bic(BicType::Mixed)
+    }
+}
+
+impl Criterion {
+    /// Evaluate the criterion on a finished fit.
+    pub fn of(&self, result: &FitResult) -> f64 {
+        match self {
+            Criterion::Ofv => result.ofv,
+            Criterion::Aic => result.aic,
+            Criterion::Bic(kind) => bic(result, *kind),
+            Criterion::Penalized(p) => p.score(result),
+        }
+    }
+
+    /// A short stable label for the table header.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Criterion::Ofv => "ofv",
+            Criterion::Aic => "aic",
+            Criterion::Bic(BicType::Mixed) => "bic_mixed",
+            Criterion::Bic(BicType::Iiv) => "bic_iiv",
+            Criterion::Bic(BicType::Random) => "bic_random",
+            Criterion::Bic(BicType::Fixed) => "bic_fixed",
+            Criterion::Penalized(_) => "penalized",
+        }
+    }
+
+    /// What the run manifest records, so a resume under a different
+    /// criterion is refused: the [`label`](Self::label), plus the whole
+    /// schedule for a penalized criterion — two penalized runs with
+    /// different charges score the same fit differently, and the label
+    /// alone would let one reuse the other's rows.
+    pub fn manifest_key(&self) -> String {
+        match self {
+            Criterion::Penalized(p) => format!("{}{}", self.label(), penalty_key(p)),
+            other => other.label().to_string(),
+        }
+    }
+
+    /// The penalty schedule, for a search that charges the two
+    /// search-level penalties (non-influential genes, crashes) itself.
+    /// `None` for every other criterion.
+    pub fn penalties(&self) -> Option<Penalties> {
+        match self {
+            Criterion::Penalized(p) => Some(*p),
+            _ => None,
+        }
+    }
+}
+
+/// `{theta=10,omega=10,…}` — every field of the schedule, in order, in
+/// Rust's shortest round-trippable float spelling so the key is stable.
+fn penalty_key(p: &Penalties) -> String {
+    format!(
+        "{{theta={},omega={},sigma={},convergence={},covariance={},correlation={},\
+         max_correlation={},condition_number={},max_condition_number={},non_influential={},\
+         crash={},gate={}}}",
+        p.theta,
+        p.omega,
+        p.sigma,
+        p.convergence,
+        p.covariance,
+        p.correlation,
+        p.max_correlation,
+        p.condition_number,
+        p.max_condition_number,
+        p.non_influential,
+        p.crash,
+        p.gate
+    )
+}
+
+/// How the candidates in one [`run`](super::Runner::run) are fitted and judged.
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// What [`CandidateResult::criterion`] holds.
+    pub criterion: Criterion,
+    /// The gate a fit must pass before its criterion is trusted. A candidate
+    /// that fails is **kept**, with its reasons — see
+    /// [`CandidateResult::verdict`].
+    pub strictness: ferx_core::Strictness,
+    /// `FitOptions::n_starts` for every candidate — the *retries* of the epic's
+    /// search configuration, applied before the strictness gate. Clamped to at
+    /// least 1.
+    ///
+    /// The default is 3, not 1: under automation an init stall (#751) or an
+    /// inner-EBE mode (#864, #891) is a model-selection error, not a slow fit.
+    pub n_starts: usize,
+    /// Reuse the candidates already in the cache directory's journal instead of
+    /// refitting them. Ignored when the runner has no cache directory.
+    pub resume: bool,
+    /// Fit settings for every candidate, replacing the ones in its own
+    /// `[fit_options]` block.
+    ///
+    /// `None` — the default — lets each candidate carry its own settings, which
+    /// is what a search over models edited from one base file wants: the base
+    /// file's estimation method, tolerances and covariance step come along with
+    /// the edit. `Some` is for a caller that needs one configuration across a
+    /// space whose members disagree, or a cheaper one than the base file's.
+    ///
+    /// Either way the runner still applies its own overrides on top —
+    /// [`quiet`](ferx_core::FitOptions::quiet), the [`PoolPlan`](ferx_core::PoolPlan)
+    /// thread pin, `n_starts` and the cancellation flag — so those four are not
+    /// settable here.
+    pub fit_options: Option<ferx_core::FitOptions>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            criterion: Criterion::default(),
+            strictness: ferx_core::Strictness::default(),
+            n_starts: 3,
+            resume: false,
+            fit_options: None,
+        }
+    }
+}
+
+/// Why a candidate produced no fit, and whether a later run should try again.
+///
+/// The flag is not cosmetic: a journalled outcome is what every subsequent
+/// `resume: true` run believes without rechecking, and the two failures that
+/// arrive here are not the same statement. A model that does not compile will
+/// not compile on the next machine either — remembering that saves the parse
+/// and, more importantly, keeps the candidate in the report. A fit that died
+/// because `install_on_fit_pool` could not build a pool (`api/pool.rs`) says
+/// nothing about the model at all, and writing *that* down as final would let
+/// one bad minute mark a fittable model dead for the rest of the search's life.
+///
+/// From inside the runner the two are one `String`, which is why the
+/// classification is made where the failure is raised rather than recovered
+/// from the message afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateError {
+    /// What went wrong, as shown in the report.
+    pub message: String,
+    /// `true` when the failure describes the run rather than the candidate, so
+    /// a resumed run should fit it again instead of trusting the row.
+    pub retryable: bool,
+}
+
+impl CandidateError {
+    /// A failure that is a property of the candidate itself — a model that does
+    /// not compile, or does not bind against this run's data. Deterministic, so
+    /// a resume reuses it.
+    pub fn model(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// A failure raised by the run rather than by the candidate. A resume
+    /// refits it.
+    ///
+    /// This is the default for anything `fit()` itself returns. Note that the
+    /// *expected* bad outcome of a search candidate — a fit that finishes but
+    /// does not converge — is not an error at all: it comes back `Ok` and is
+    /// judged by [`check_strictness`](ferx_core::check_strictness), so it is
+    /// journalled and reused like any other result. An `Err` out of `fit()` is
+    /// the pathological case, and refitting it is cheap because it is rare.
+    pub fn environment(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+}
+
+impl std::fmt::Display for CandidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// One candidate's outcome.
+///
+/// A candidate that failed its strictness gate, failed to compile or failed to
+/// fit is still here, with the reason — nothing is dropped silently, because a
+/// candidate missing from a search report is indistinguishable from one that
+/// was never generated.
+#[derive(Debug, Clone)]
+pub struct CandidateResult {
+    /// The [`Candidate::id`] this result belongs to.
+    pub id: String,
+    /// [`Candidate::hash`] — the cache key the fit was stored under.
+    pub hash: String,
+    /// [`Candidate::parent`], carried through.
+    pub parent: Option<String>,
+    /// [`Candidate::features`], carried through.
+    pub features: FeatureVector,
+    /// The fit, when this run performed it.
+    ///
+    /// `None` in three cases, told apart by the other fields: the fit failed
+    /// (`error` is set), the candidate duplicated one that *was* fitted
+    /// (`duplicate_of` is set), or the outcome was read back from a journal
+    /// whose cached fit is absent or unreadable (`reused`).
+    pub fit: Option<FitResult>,
+    /// The objective function value, mirroring [`FitResult::ofv`] whenever
+    /// [`fit`](Self::fit) is present.
+    ///
+    /// Kept beside the fit rather than read out of it because the fit is the
+    /// part a resume can lose: `fits/<hash>.json` is a cache, and a candidate
+    /// whose cached fit is missing or corrupt still has its OFV in the journal
+    /// row. Reading the table's `ofv` column off `fit` alone would blank it for
+    /// exactly the degraded resume the journal is designed to survive.
+    /// `None` when there is no fit at all.
+    pub ofv: Option<f64>,
+    /// Whether the fit converged, mirroring [`FitResult::converged`] — and kept
+    /// beside it for the same reason as [`ofv`](Self::ofv). `None` when there
+    /// is no fit at all, which is not the same statement as `Some(false)`.
+    pub converged: Option<bool>,
+    /// Every gate the fit failed, and every gate that could not be evaluated.
+    /// A compile or fit failure yields a verdict with one failure naming it.
+    pub verdict: StrictnessVerdict,
+    /// [`RunOptions::criterion`] evaluated on the fit; `NaN` when there is no
+    /// fit to evaluate it on.
+    pub criterion: f64,
+    /// Wall-clock seconds the fit took; `0.0` for a reused or duplicate result.
+    pub seconds: f64,
+    /// Why there is no fit, when that is the reason — and whether a resumed run
+    /// will take the candidate's word for it. See [`CandidateError`].
+    pub error: Option<CandidateError>,
+    /// Set when this candidate rendered to the same canonical text as an
+    /// earlier one in the same run: the named id is the one that was fitted,
+    /// and this result carries its criterion and verdict.
+    pub duplicate_of: Option<String>,
+    /// Set when the outcome came from the journal rather than from a fit in
+    /// this run.
+    pub reused: bool,
+}
+
+impl CandidateResult {
+    /// `true` when the fit exists and passed every enabled gate — the
+    /// precondition for ranking on [`criterion`](Self::criterion).
+    pub fn eligible(&self) -> bool {
+        self.error.is_none() && self.verdict.passed && self.criterion.is_finite()
+    }
+}
+
+#[cfg(test)]
+#[path = "candidate_tests.rs"]
+mod tests;

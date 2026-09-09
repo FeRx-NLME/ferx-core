@@ -1,3 +1,7 @@
+---
+pagetitle: "Multi-start NLME fitting example"
+---
+
 # Multi-Start: Michaelis-Menten Elimination
 
 Michaelis-Menten (saturable) elimination is the canonical example of a local-minimum problem in NLME modelling. The Vmax/Km pair is only weakly identifiable from sparse PK data: many (Vmax, Km) combinations produce similar predicted concentrations, so the OFV surface contains a narrow ridge. A single-start FOCEI run is sensitive to the initial values — starting far from the true optimum, the optimizer often settles on an inflated Vmax/Km pair with a higher OFV than the true optimum.
@@ -25,10 +29,10 @@ With `n_starts = 8` and `start_sigma = 0.5`:
 
 ```bash
 # Simulate data first
-cargo run --release -- examples/mm_multistart.ferx --simulate
+cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --simulate
 
 # Fit with multi-start
-cargo run --release -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
+cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
 ```
 
 ## When to use multi-start

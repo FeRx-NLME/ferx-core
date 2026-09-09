@@ -7,13 +7,18 @@
 #   project/floor        -> per-PR 90% gap shown to the author (informational)
 #   project/floor_weekly -> 90% floor ENFORCED on the weekly main run (goes red
 #                           below 90%); never evaluated on PRs, so it blocks no one
-# Slow-tests NEVER run on PRs. Per-PR uploads = `fast` (--features ci) + `survival`
-# (--features ci,survival) + `markov` (--features ci,markov); nightly upload = `slow`
-# flag (--features ci,slow-tests). carryforward lets the nightly `slow` data augment
-# the project number on PRs without re-running it. The `survival` and `markov` flags
-# exist because that feature-gated code is compiled OUT of the `fast`/`slow` FD builds
-# — Codecov merges the flags in so those lines are counted where they're actually
-# exercised (#293).
+# Slow-tests NEVER run on PRs. Per-PR uploads = `fast` (--features ci, from
+# `Tests + coverage (core)`) + `survival`, `markov` AND `nn`, which are ALL uploaded
+# from the single `Tests + coverage (TTE/CTMM endpoints)` job (--features
+# ci,markov,nn, and `markov = ["survival"]` so that build is a strict superset of a
+# survival-only one); nightly upload = `slow` flag (--features ci,slow-tests).
+# carryforward lets the nightly `slow` data augment the project number on PRs without
+# re-running it. The `survival`, `markov` and `nn` flags exist because that
+# feature-gated code is compiled OUT of the `fast`/`slow` FD builds — Codecov merges
+# the flags in so those lines are counted where they're actually exercised (#293).
+# All three flags are kept as distinct names (rather than collapsed into one) so the
+# patch status can require each family independently and so a future split of the
+# jobs needs no config change.
 
 coverage:
   range: 85..95
@@ -37,6 +42,7 @@ coverage:
           - slow
           - survival
           - markov
+          - nn
       # The explicit 90% gap, shown on every PR so the author sees how far
       # under the floor they are — informational, so it challenges without
       # gatekeeping.
@@ -49,6 +55,7 @@ coverage:
           - slow
           - survival
           - markov
+          - nn
       # The teeth: ENFORCED on the weekly full-coverage run on `main` only, so
       # the project status genuinely goes RED there while we're below 90%.
       # Never evaluated on PRs (branches: main), so it blocks no one. No later
@@ -65,26 +72,47 @@ coverage:
           - slow
           - survival
           - markov
+          - nn
     patch:
       default:
         target: 90% # new/changed lines must be tested
         threshold: 0%
         # Patch is a pull-request concept — grade changed lines only on PRs.
-        # On a push to `main` the `fast` flag is absent (its job is PR-only), so
-        # patch falls back to `survival` alone and mis-grades the merge commit's
-        # diff against a stale base: a false red on `main` that blocks nothing.
-        # `only_pulls` confines the status to PR comparisons. (#300)
+        # It previously mis-graded merge commits on `main` (a false red that
+        # blocks nothing); `only_pulls` confines the status to PR comparisons.
+        # (#300)
         only_pulls: true
-        # `fast`, `survival`, and `markov` are the FRESH per-PR coverage sources,
-        # so they grade the changed lines. `survival` and `markov` are each
-        # required here: their feature-gated code is compiled out of the `fast`
-        # build, so without the flag a survival- or markov-only PR's own new lines
-        # would read as uncovered and fail this gate at 0%. `slow` stays excluded —
-        # it's carryforward (stale for brand-new code).
+        # `fast`, `survival`, `markov`, and `nn` are the FRESH per-PR coverage
+        # sources, so they grade the changed lines. `survival`, `markov` and `nn`
+        # are each required here: their feature-gated code is compiled out of the
+        # `fast` build, so without the flag a survival-, markov- or nn-only PR's own
+        # new lines would read as uncovered and fail this gate at 0%. `slow` stays
+        # excluded — it's carryforward (stale for brand-new code).
         flags:
           - fast
           - survival
           - markov
+          - nn
+
+# Workspace components (#1114). Flags stay as they are — the members are measured
+# by the SAME `--workspace` instrumented run as `ferx-core`, so they ride the
+# `fast` flag and need no flag of their own. Components are the path-based view
+# on top: they let the split be read per layer (is the CLI covered? are the
+# tools?) without changing what any status gates on.
+component_management:
+  individual_components:
+    - component_id: ferx_core
+      name: ferx-core (engine)
+      paths:
+        - src/**
+    - component_id: ferx_tools
+      name: ferx-tools (multi-fit tooling)
+      paths:
+        - crates/ferx-tools/**
+    - component_id: ferx_cli
+      name: ferx-cli (ferx binary)
+      paths:
+        - crates/ferx-cli/**
 
 flag_management:
   default_rules:
@@ -95,13 +123,19 @@ flag_management:
     - name: slow
       carryforward: true
     - name: survival
-      # The `survival` job runs on PRs, main pushes, AND the weekly schedule, so it
-      # normally uploads fresh. carryforward is a safety net: the flag still
-      # contributes on any run where that job didn't upload (fresh data overrides).
+      # `Tests + coverage (TTE/CTMM endpoints)` runs on PRs, main pushes, AND the
+      # weekly schedule, so this flag normally uploads fresh. carryforward is a
+      # safety net: it still contributes on any run where that job didn't upload
+      # (fresh data overrides).
       carryforward: true
     - name: markov
-      # Same as survival: the `markov` job runs on PRs and main pushes and normally
-      # uploads fresh; carryforward is the safety net for any run where it didn't.
+      # Same job, same upload, same rationale as `survival` above.
+      carryforward: true
+    - name: nn
+      # Same job, same upload, same rationale as `survival` above. Covers the
+      # `[covariate_nn]` / DCM surface (`src/nn`, the θ-gradient module, and the
+      # `nn`-gated branches of the parser, sens provider and io/output), which is
+      # compiled out of every non-`nn` build.
       carryforward: true
 
 comment:
@@ -109,20 +143,32 @@ comment:
   require_changes: true
 
 # Ignore policy: scope by what the code IS, never by how red it is.
-#   tests/**, build.rs        -> don't measure coverage OF test/build code.
+#   tests/**, crates/*/tests/**, build.rs
+#                             -> don't measure coverage OF test/build code.
+#       The member entry is separate because `tests/**` is root-anchored and
+#       does not reach `crates/ferx-cli/tests/` after the #1114 move.
 #   src/bin/generate_data.rs  -> maintainer tool that writes example-data
 #       fixtures; not library, not the user-facing CLI. Guarded at the right
 #       altitude by the e2e smoke test in tests/cli_binaries.rs. Ignorable on
 #       its role (would be even at 100%), not to pad the number.
 #
 # Deliberately NOT ignored:
-#   src/bin/run_model.rs      -> the `ferx` CLI (arg parsing, dispatch, error
+#   crates/ferx-cli/**        -> the `ferx` CLI (arg parsing, dispatch, error
 #       exits) is user-facing logic -> refactored into a lib run() and
-#       unit-tested, not excluded (#286).
+#       unit-tested, not excluded (#286). It lived at `src/bin/run_model.rs`
+#       until #1114 moved the binary into its own workspace package; the
+#       `--workspace` coverage run keeps it measured across that move.
 #
 ignore:
   - "tests/**"
+  - "crates/*/tests/**"
   - "**/build.rs"
   - "src/bin/generate_data.rs"
   - "src/bin/pktte_sim_anchor.rs"
   - "src/bin/rtte_sim_anchor.rs"
+  # Maintainer timing harness; real fits and numerical comparisons run manually
+  # on both revisions, outside the PR coverage job.
+  - "examples/pool_benchmark.rs"
+  - "examples/focei_pipeline_benchmark.rs"
+  - "examples/focei_profile.rs"
+  - "tools/profiling_alloc.rs"

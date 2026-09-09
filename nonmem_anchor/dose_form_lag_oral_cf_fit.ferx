@@ -1,0 +1,44 @@
+# Closed-form twin of `dose_form_lag_oral_fit.ferx` (#1121).
+#
+# Identical model — same thetas, same omegas, same sigma, same covariate
+# relations, same ALAG1 — expressed as an analytical `one_cpt_oral` instead of
+# an `[odes]` depot -> central pair. The two are the same system, so on the same
+# dataset they must produce the same objective to solver tolerance.
+#
+# That equivalence is what makes this file an anchor rather than a duplicate.
+# The `[odes]` model is externally anchored to NONMEM 7.6.0 (ADVAN13 TOL=9,
+# `results/dose_form_lag_ss.lst`), so agreement between the two ferx engines
+# transfers that anchor to the closed-form event-driven walk — which has its own
+# SS + lagtime handling (`pk/event_driven.rs`) that no NONMEM run covers
+# directly.
+#
+# Note there is deliberately no `[scaling]` block: the closed form returns a
+# concentration already, where the ODE model reads out an amount and divides by
+# V via `obs_scale`.
+
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta WTEXP_CL(0.75, 0.01, 2.0)
+  theta WTEXP_KA(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.0025
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP_CL * exp(ETA_CL)
+  V     = TVV * exp(ETA_V)
+  KA    = TVKA * (WT/70)^WTEXP_KA
+  LAG   = TVP * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAG)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
