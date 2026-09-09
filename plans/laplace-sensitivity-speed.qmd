@@ -341,17 +341,35 @@ scale-response FD term for `∂/∂(ruv_scale)` — caught by the FD-parity test
 initial implementation missed it), and correlated residuals (`block_sigma`, both the
 `corr_residual_rd_at_sigma` σ-direct swap and a new packed-coordinate segment for the ρ
 off-diagonal, chained through `rho_chain`'s Fisher-z factor via `rho_rd_terms`'s closed form —
-no FD needed there, unlike the σ/magnitude channels). What remains:
+no FD needed there, unlike the σ/magnitude channels), and **IOV** — a sibling
+`subject_htilde_dx_iov` (not a branch of the non-IOV function, matching the codebase's own
+`*_iov` convention throughout `sens_outer_gradient.rs`): the packed layout is
+`[θ, Ω_bsv, σ, Ω_iov]` (σ sits between the two Ω segments), the sensitivity provider is
+`subject_sensitivities_iov`, and a BSV or IOV Ω coordinate's `dΩ⁻¹/dx` reads the *joint*
+Cholesky factor (`block_chol_full`) — an IOV entry moves `K` replicated diagonal blocks of
+`Σ_b` at once, so its derivative sums `K` such contributions. `agq.rs`'s `analytic_grid_
+response` already passed `stack.omega_joint_inv` (never reduced) and already dispatched
+`db_dx` through `subject_eta_dx_iov` when `stack.is_iov()`, so the only caller-side change was
+adding a third `HessianAnchor::GaussNewton if stack.is_iov()` match arm. Validated both at the
+isolated-function level (`focei_htilde_dx::tests::htilde_derivative_matches_fd_under_iov`,
+mutation-tested: dropping the `K`-sum kills it hard) and end-to-end through the real
+`agq_population_gradient` against FD of the actual IOV population objective
+(`tests/agq.rs::iov_gauss_newton_anchored_gradient_matches_fd`) — the earlier build-cost
+caution about `MAX_ODE_IOV_AXES` turned out not to apply here: `subject_sensitivities_iov`/
+`subject_eta_dx_iov` are already instantiated in the binary (they back the existing
+`subject_packed_gradient_iov`), so adding call sites doesn't re-expand any axis
+monomorphization. What remains:
 
-- **IOV / mixture** — declined for both modules. This is a different shape of gap from the
-  others: `packed_len` already has dedicated `n_iov`/`n_mixture` terms this module's layout
-  guard doesn't decode, `omega_inv` changes meaning entirely (bare η block → joint
-  `Ω_bsv ⊕ K·Ω_iov`), the Ω-coordinate branch's `dΩ⁻¹/dx` derivation needs the stacked-layout
-  version, and the caller (`agq.rs`) would need to switch to `subject_sensitivities_iov`/
-  `subject_eta_dx_iov` too — not a self-contained change to this module alone. ODE-IOV also
-  measurably dominates the debug build (67% at `MAX_ODE_IOV_AXES=96`,
-  `ode-iov-axes-dominates-build` note), so this is deliberately left as its own PR rather than
-  folded in here.
+- **Mixture** — declined for both modules (a mixture's subpopulation overrides are a
+  different packed segment again, not the stacked-prior story IOV is).
+- **`laplace_h_deriv` + IOV** — not attempted in this round. The covariance provider does
+  reach IOV (`subject_sensitivities_cov_iov`) except when combined with `has_lagtime()`, so
+  it is reachable in principle, but needs the same `[θ, Ω_bsv, σ, Ω_iov]` layout and joint-`Ω⁻¹`
+  treatment `subject_htilde_dx_iov` just built, applied to the third-order (not second-order)
+  case — left for a follow-up given `laplace`'s route is opt-in with no proven speed win
+  regardless.
+- **`block_sigma` + IOV** — unreachable through either module today (`score_core`'s own scope
+  keeps the two mutually exclusive in practice), so not attempted.
 - A repository-required NONMEM comparison would be owed only if either route becomes the
   route a user-visible numerical result depends on differently than before — it does not
   currently, since both are pinned to the pre-existing gradient.

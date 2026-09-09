@@ -79,8 +79,12 @@
 //! magnitude, correlated residuals (`block_sigma`, see above), LTBS, `ExpressionScale`, FREM,
 //! closed-form **and ODE** — minus one structural exclusion this assembly does not (yet) build:
 //!
-//! * **IOV / mixture** — the packed-layout decode below assumes exactly
-//!   `[θ…, Ω lower-tri…, σ…]`.
+//! * **mixture** — a mixture's subpopulation overrides are a different packed segment
+//!   again, not decoded here.
+//!
+//! **IOV** has its own sibling, [`subject_htilde_dx_iov`] — the packed layout, the joint
+//! `Ω⁻¹`, and the sensitivity provider all change under IOV, so it is not a branch of this
+//! function.
 //!
 //! Anything outside returns `None` and the caller keeps the finite-difference grid response.
 
@@ -89,7 +93,9 @@
 use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::agq::analytic_score_supported;
-use crate::estimation::parameterization::{lower_tri_entries, packed_len, rho_chain};
+use crate::estimation::parameterization::{
+    block_chol_full, lower_tri_entries, packed_len, rho_chain,
+};
 use crate::estimation::sens_outer_gradient::{
     corr_residual_rd_at_sigma, rho_rd_terms, score_core, sigma_fd_step, theta_dx_chain,
 };
@@ -119,6 +125,18 @@ fn dp_dv(r: f64, d: f64, rv: f64, dv: f64) -> f64 {
 #[inline]
 fn dg_dv(r: f64, d: f64, rv: f64, dv: f64) -> f64 {
     (dv * r - d * rv) / (r * r)
+}
+
+/// `dΩ⁻¹/dL_{row,col}` for a Cholesky factor `L` of `Ω`: `-(u pᵀ + p uᵀ)`, `u = Ω⁻¹[:,row]`,
+/// `p = Ω⁻¹·L[:,col]`. The same formula [`subject_htilde_dx`]'s non-IOV Ω-coordinate branch
+/// uses inline; factored out for [`subject_htilde_dx_iov`], which needs it summed over `K`
+/// replica positions for an IOV Ω entry (one entry of `L_iov` moves `K` diagonal blocks of the
+/// joint `Σ_b` at once).
+#[inline]
+fn omega_inv_deriv(omega_inv: &DMatrix<f64>, u: &DVector<f64>, v: &DVector<f64>) -> DMatrix<f64> {
+    let p = omega_inv * v;
+    let up = u * p.transpose();
+    -(&up + up.transpose())
 }
 
 /// The total derivative `dH̃/dx_k` of the Gauss-Newton Hessian, one `d × d` matrix per
@@ -512,11 +530,363 @@ pub(crate) fn subject_htilde_dx(
     Some(out)
 }
 
+/// The stacked-system twin of [`subject_htilde_dx`] for IOV models.
+///
+/// The IOV FOCEI marginal is exactly the ordinary FOCEI Laplace objective over the augmented
+/// system `b = [η, κ₁..κ_K]`, prior `Σ_b = Ω_bsv ⊕ K·Ω_iov`
+/// (`sens_outer_gradient::subject_theta_gradient_iov`'s own doc) — so [`score_core`] and the
+/// per-observation `p`/`β` machinery this module already builds on need only `n_eta → n_st`
+/// (the stacked dimension) and the joint `Ω⁻¹` to keep working; no residual-chain math is new.
+/// What is genuinely new: the packed layout is `[θ, Ω_bsv lower-tri, σ, Ω_iov lower-tri]`
+/// (σ sits BETWEEN the two Ω segments, not after both — mirrors `subject_eta_dx_iov`'s own
+/// `sigma_start`/`iov_start`), the sensitivity provider is
+/// [`crate::sens::provider::subject_sensitivities_iov`], and a BSV or IOV Ω coordinate's
+/// `dΩ⁻¹/dx` reads a column of the *joint* Cholesky factor
+/// ([`crate::estimation::parameterization::block_chol_full`]) rather than the bare block's —
+/// an IOV entry moves `K` replicated diagonal blocks of `Σ_b` at once, so its `dΩ⁻¹/dx` sums
+/// `K` such contributions ([`omega_inv_deriv`]).
+///
+/// `omega_inv` must be the joint `Σ_b⁻¹` (`Stack::omega_joint_inv` — the caller passes this
+/// unconditionally, IOV or not, never reduced to the bare η block); `b_hat`/`db_dx` the
+/// stacked mode and its response
+/// ([`crate::estimation::sens_outer_gradient::subject_eta_dx_iov`]).
+///
+/// # Scope
+///
+/// Mirrors [`subject_htilde_dx`]'s scope for everything that carries over unchanged (M3-BLOQ
+/// including its σ-direct derivative, custom/TV σ magnitude, `iiv_on_ruv` including combined
+/// with M3-BLOQ, LTBS, `ExpressionScale`, FREM), minus:
+///
+/// * **mixture** — a mixture's subpopulation overrides are a different packed segment again,
+///   not the stacked-prior story IOV is; kept as its own decline;
+/// * **correlated residuals (`block_sigma`)** — mutually exclusive with IOV in `score_core`'s
+///   own scope already, so declined here too rather than building dead code for an
+///   unreachable combination.
+pub(crate) fn subject_htilde_dx_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    omega_inv: &DMatrix<f64>,
+    x: &[f64],
+    b_hat: &[f64],
+    db_dx: &[DVector<f64>],
+) -> Option<Vec<DMatrix<f64>>> {
+    let n_theta = params.theta.len();
+    let n_sigma = params.sigma.values.len();
+    let n_eta_bsv = model.n_eta;
+    let n_iov = model.n_kappa;
+    if n_eta_bsv == 0 || n_iov == 0 {
+        return None;
+    }
+    let k_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    let n_st = n_eta_bsv + k_occ * n_iov;
+    let omega_iov = params.omega_iov.as_ref()?;
+
+    let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
+    let iov_entries = lower_tri_entries(n_iov, omega_iov.diagonal);
+    let omega_start = n_theta;
+    let sigma_start = omega_start + bsv_entries.len();
+    let iov_start = sigma_start + n_sigma;
+    let expected_len = iov_start + iov_entries.len();
+
+    if packed_len(template) != expected_len
+        || x.len() != expected_len
+        || db_dx.len() != x.len()
+        || b_hat.len() != n_st
+        || template.mixture.is_some()
+        || !params.residual_correlations.is_empty()
+        || !analytic_score_supported(model)
+    {
+        return None;
+    }
+
+    let sens =
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b_hat)?;
+    let n_obs = subject.observations.len();
+    if n_obs == 0 || sens.obs.len() != n_obs {
+        return None;
+    }
+    let core = score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        n_st,
+        omega_inv,
+        b_hat,
+        model.residual_error_eta,
+    )?;
+
+    let sigma = &params.sigma.values;
+    let err_keys = model.error_spec.obs_keys(subject);
+    let frem_r_base = build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma);
+    let d2_row: Vec<f64> = if core.ruv.is_some() {
+        sens.obs
+            .iter()
+            .enumerate()
+            .map(|(j, o)| {
+                let cmt = err_keys[j];
+                let mult_row: Option<&[f64]> = core
+                    .mult
+                    .as_ref()
+                    .and_then(|m| m.get(j))
+                    .map(|v| v.as_slice());
+                let (_, _, d2) = residual_rd2(&model.error_spec, cmt, o.f, sigma, mult_row);
+                d2 * core.ruv_scale
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut sigma_row_derivs: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
+    let mut sigma_row_derivs_g: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
+    let mut sigma_row_derivs_cz: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
+    let mut sigma_row_derivs_cm: Vec<Vec<f64>> = vec![vec![0.0; n_obs]; n_sigma];
+    for s in 0..n_sigma {
+        let h = sigma_fd_step(sigma[s]);
+        let mut sp = sigma.to_vec();
+        sp[s] += h;
+        let mut sm = sigma.to_vec();
+        sm[s] -= h;
+        let frem_override_p =
+            build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sp);
+        let frem_override_m =
+            build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, &sm);
+        for (j, o) in sens.obs.iter().enumerate() {
+            let cmt = err_keys[j];
+            let et = &core.et[j];
+            if et.censored {
+                let y = subject.observations[j];
+                let f = o.f;
+                let kern_at = |sa: &[f64]| -> (f64, f64, f64) {
+                    let r = model.error_spec.variance_at(cmt, f, sa) * core.ruv_scale;
+                    let d = model.error_spec.dvar_df(cmt, f, sa) * core.ruv_scale;
+                    let d2 = model.error_spec.d2var_df2(cmt, f, sa) * core.ruv_scale;
+                    let (_g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, et.cens_sign);
+                    (g2, cz, cm)
+                };
+                let (g2p, czp, cmp) = kern_at(&sp);
+                let (g2m, czm, cmm) = kern_at(&sm);
+                sigma_row_derivs[s][j] = (g2p - g2m) / (2.0 * h);
+                if core.ruv.is_some() {
+                    sigma_row_derivs_cz[s][j] = (czp - czm) / (2.0 * h);
+                    sigma_row_derivs_cm[s][j] = (cmp - cmm) / (2.0 * h);
+                }
+                continue;
+            }
+            let frem_p = frem_override_p
+                .as_ref()
+                .and_then(|ov| ov.get(j))
+                .and_then(|v| *v);
+            let frem_m = frem_override_m
+                .as_ref()
+                .and_then(|ov| ov.get(j))
+                .and_then(|v| *v);
+            let (r_sig, d_sig) = if let (Some(vp), Some(vm)) = (frem_p, frem_m) {
+                ((vp - vm) / (2.0 * h), 0.0)
+            } else {
+                let mult_row: Option<&[f64]> = core
+                    .mult
+                    .as_ref()
+                    .and_then(|m| m.get(j))
+                    .map(|v| v.as_slice());
+                let (vp, dp) = residual_rd(&model.error_spec, cmt, o.f, &sp, mult_row);
+                let (vm, dm) = residual_rd(&model.error_spec, cmt, o.f, &sm, mult_row);
+                let scale = core.ruv_scale;
+                (scale * (vp - vm) / (2.0 * h), scale * (dp - dm) / (2.0 * h))
+            };
+            sigma_row_derivs[s][j] = dp_dv(et.r, et.d, r_sig, d_sig);
+            if core.ruv.is_some() {
+                sigma_row_derivs_g[s][j] = dg_dv(et.r, et.d, r_sig, d_sig);
+            }
+        }
+    }
+
+    let l_bsv = &params.omega.chol;
+    let l_iov = &omega_iov.chol;
+    let l_full = block_chol_full(l_bsv, l_iov, k_occ, n_eta_bsv, n_iov);
+
+    let mut out: Vec<DMatrix<f64>> = Vec::with_capacity(x.len());
+    let mut psi = vec![0.0f64; n_st];
+    for kx in 0..x.len() {
+        let mut dh = DMatrix::<f64>::zeros(n_st, n_st);
+        let (mut theta_idx, mut dtheta) = (usize::MAX, 0.0f64);
+        let (mut sigma_idx, mut dsigma) = (usize::MAX, 0.0f64);
+
+        if kx < n_theta {
+            theta_idx = kx;
+            dtheta = theta_dx_chain(template, &params.theta, kx);
+        } else if kx < omega_start + bsv_entries.len() {
+            let (row, col) = bsv_entries[kx - omega_start];
+            let chain = if row == col { l_bsv[(row, row)] } else { 1.0 };
+            let v = l_full.column(col).into_owned();
+            let u: DVector<f64> = omega_inv.column(row).into_owned();
+            dh = omega_inv_deriv(omega_inv, &u, &v) * chain;
+        } else if kx < iov_start {
+            sigma_idx = kx - sigma_start;
+            dsigma = sigma[sigma_idx];
+        } else {
+            let (i, j) = iov_entries[kx - iov_start];
+            let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
+            let mut acc = DMatrix::<f64>::zeros(n_st, n_st);
+            for occ in 0..k_occ {
+                let row = n_eta_bsv + occ * n_iov + i;
+                let col = n_eta_bsv + occ * n_iov + j;
+                let v = l_full.column(col).into_owned();
+                let u: DVector<f64> = omega_inv.column(row).into_owned();
+                acc += omega_inv_deriv(omega_inv, &u, &v);
+            }
+            dh = acc * chain;
+        }
+
+        let bk = &db_dx[kx];
+        for (j, o) in sens.obs.iter().enumerate() {
+            let a = o.df_deta.as_slice();
+            let big_a = o.d2f_deta2.as_slice();
+            let et = &core.et[j];
+            let p = et.p;
+
+            let mut phi = 0.0;
+            for r in 0..n_st {
+                phi += a[r] * bk[r];
+            }
+            if theta_idx < n_theta {
+                phi += o.df_dtheta[theta_idx] * dtheta;
+            }
+            for i in 0..n_st {
+                let mut v = 0.0;
+                for r in 0..n_st {
+                    v += big_a[i * n_st + r] * bk[r];
+                }
+                if theta_idx < n_theta {
+                    v += o.d2f_deta_dtheta[i * n_theta + theta_idx] * dtheta;
+                }
+                psi[i] = v;
+            }
+
+            let mut dp = et.beta * phi;
+            if theta_idx < n_theta && !et.dr_dtheta.is_empty() {
+                let (rv, dv) = (et.dr_dtheta[theta_idx], et.dd_dtheta[theta_idx]);
+                if rv != 0.0 || dv != 0.0 {
+                    dp += dp_dv(et.r, et.d, rv, dv) * dtheta;
+                }
+            }
+            if sigma_idx < n_sigma {
+                dp += sigma_row_derivs[sigma_idx][j] * dsigma;
+            }
+
+            let mut censored_ruv_scale_response: Option<(f64, f64)> = None;
+            if let Some(rr) = core.ruv {
+                let frem_var = frem_r_base
+                    .as_ref()
+                    .and_then(|ov| ov.get(j))
+                    .and_then(|v| *v);
+                if frem_var.is_none() {
+                    if et.censored {
+                        let s = core.ruv_scale;
+                        let hs = 1e-6 * s.max(1.0);
+                        let y = subject.observations[j];
+                        let f = o.f;
+                        let at = |scale: f64| -> (f64, f64, f64) {
+                            let ratio = scale / s;
+                            let (_g1, g2, cz, cm) = m3_censored_outer(
+                                y,
+                                f,
+                                et.r * ratio,
+                                et.d * ratio,
+                                d2_row[j] * ratio,
+                                et.cens_sign,
+                            );
+                            (g2, cz, cm)
+                        };
+                        let (g2p, czp, cmp) = at(s + hs);
+                        let (g2m, czm, cmm) = at(s - hs);
+                        let ds_dx = 2.0 * s * bk[rr];
+                        let dg2_ds = (g2p - g2m) / (2.0 * hs);
+                        let dcz_ds = (czp - czm) / (2.0 * hs);
+                        let dcm_ds = (cmp - cmm) / (2.0 * hs);
+                        dp += dg2_ds * ds_dx;
+                        censored_ruv_scale_response = Some((dcz_ds * ds_dx, dcm_ds * ds_dx));
+                    } else {
+                        dp += -2.0 * bk[rr] / et.r;
+                    }
+                }
+            }
+
+            for i in 0..n_st {
+                for m in 0..n_st {
+                    dh[(i, m)] += dp * a[i] * a[m] + p * (psi[i] * a[m] + a[i] * psi[m]);
+                }
+            }
+
+            if let Some(rr) = core.ruv {
+                let frem_var = frem_r_base
+                    .as_ref()
+                    .and_then(|ov| ov.get(j))
+                    .and_then(|v| *v);
+                if frem_var.is_none() {
+                    if et.censored {
+                        let mut dcz = core.cens_dcz_df[j] * phi;
+                        let mut dcm = core.cens_dcm_df[j] * phi;
+                        if sigma_idx < n_sigma {
+                            dcz += sigma_row_derivs_cz[sigma_idx][j] * dsigma;
+                            dcm += sigma_row_derivs_cm[sigma_idx][j] * dsigma;
+                        }
+                        if let Some((dcz_s, dcm_s)) = censored_ruv_scale_response {
+                            dcz += dcz_s;
+                            dcm += dcm_s;
+                        }
+                        dh[(rr, rr)] += dcz;
+                        for l in 0..n_st {
+                            if l == rr {
+                                continue;
+                            }
+                            let contrib = dcm * a[l] + et.ruv_cm * psi[l];
+                            dh[(rr, l)] += contrib;
+                            dh[(l, rr)] += contrib;
+                        }
+                    } else {
+                        let (r, d) = (et.r, et.d);
+                        let mut dg = dg_dv(r, d, d, d2_row[j]) * phi;
+                        if theta_idx < n_theta && !et.dr_dtheta.is_empty() {
+                            let (rv, dv) = (et.dr_dtheta[theta_idx], et.dd_dtheta[theta_idx]);
+                            if rv != 0.0 || dv != 0.0 {
+                                dg += dg_dv(r, d, rv, dv) * dtheta;
+                            }
+                        }
+                        if sigma_idx < n_sigma {
+                            dg += sigma_row_derivs_g[sigma_idx][j] * dsigma;
+                        }
+                        let g = d / r;
+                        for l in 0..n_st {
+                            if l == rr {
+                                continue;
+                            }
+                            let contrib = dg * a[l] + g * psi[l];
+                            dh[(rr, l)] += contrib;
+                            dh[(l, rr)] += contrib;
+                        }
+                    }
+                }
+            }
+        }
+
+        if dh.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let sym = 0.5 * (&dh + dh.transpose());
+        out.push(sym);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{pack_params, unpack_params};
-    use crate::estimation::sens_outer_gradient::subject_eta_dx;
+    use crate::estimation::sens_outer_gradient::{subject_eta_dx, subject_eta_dx_iov};
     use crate::parser::model_parser::parse_model_string;
     use crate::types::DoseEvent;
     use std::collections::HashMap;
@@ -849,5 +1219,162 @@ mod tests {
             &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
         );
         assert_matches_fd(&model, &subject, &template, &[0.05, -0.03], 1e-5);
+    }
+
+    fn iov_fixture_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let obs_times = vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0];
+        let occasions = vec![1u32, 1, 1, 2, 2, 2];
+        let n = obs_times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let preds = crate::pk::predict_iov(
+            model,
+            &subject,
+            theta,
+            &[0.12, -0.08, 0.2],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        subject
+    }
+
+    /// Joint `Σ_b⁻¹` the caller (`agq.rs`'s `Stack::omega_joint_inv`) would build: block
+    /// diagonal `Ω_bsv ⊕ K·Ω_iov`.
+    fn iov_joint_omega_inv(params: &ModelParameters, k: usize) -> DMatrix<f64> {
+        let omega_iov = params.omega_iov.as_ref().expect("IOV params");
+        let block = crate::stats::likelihood::build_block_diag_omega(
+            &params.omega.matrix,
+            &omega_iov.matrix,
+            k,
+        );
+        block.cholesky().expect("PD joint omega").inverse()
+    }
+
+    /// IOV twin of `htilde_at`: `H̃(x)` built from the stacked provider, at the joint
+    /// dimension/prior — exactly the function `subject_htilde_dx_iov` claims to
+    /// differentiate.
+    fn htilde_at_iov(
+        model: &CompiledModel,
+        subject: &Subject,
+        template: &ModelParameters,
+        x: &[f64],
+        b: &[f64],
+        k: usize,
+    ) -> DMatrix<f64> {
+        let params = unpack_params(x, template);
+        let omega_inv = iov_joint_omega_inv(&params, k);
+        let sens =
+            crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
+                .expect("iov sens");
+        score_core(
+            model,
+            subject,
+            &params,
+            &sens,
+            b.len(),
+            &omega_inv,
+            b,
+            model.residual_error_eta,
+        )
+        .expect("score_core")
+        .htilde
+    }
+
+    fn assert_matches_fd_iov(
+        model: &CompiledModel,
+        subject: &Subject,
+        template: &ModelParameters,
+        b_hat: &[f64],
+        k: usize,
+        tol: f64,
+    ) {
+        let x = pack_params(template);
+        let params = unpack_params(&x, template);
+        let omega_inv = iov_joint_omega_inv(&params, k);
+        let db_dx = subject_eta_dx_iov(model, subject, template, &x, b_hat).expect("eta_dx_iov");
+
+        let analytic = subject_htilde_dx_iov(
+            model, subject, &params, template, &omega_inv, &x, b_hat, &db_dx,
+        )
+        .expect("in scope");
+
+        let n_st = b_hat.len();
+        for kx in 0..x.len() {
+            let step = 1e-5 * (1.0 + x[kx].abs());
+            let mut xp = x.clone();
+            xp[kx] += step;
+            let mut xm = x.clone();
+            xm[kx] -= step;
+            let bp: Vec<f64> = (0..n_st).map(|i| b_hat[i] + step * db_dx[kx][i]).collect();
+            let bm: Vec<f64> = (0..n_st).map(|i| b_hat[i] - step * db_dx[kx][i]).collect();
+            let fd = (htilde_at_iov(model, subject, template, &xp, &bp, k)
+                - htilde_at_iov(model, subject, template, &xm, &bm, k))
+                / (2.0 * step);
+            let scale = fd.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            for i in 0..n_st {
+                for m in 0..n_st {
+                    assert!(
+                        (analytic[kx][(i, m)] - fd[(i, m)]).abs() / scale < tol,
+                        "coord {kx} entry ({i},{m}): analytic {} vs FD {} (scale {scale})",
+                        analytic[kx][(i, m)],
+                        fd[(i, m)]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn htilde_derivative_matches_fd_under_iov() {
+        const IOV_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(IOV_MODEL).expect("parse");
+        let theta = [0.22, 11.0, 1.4];
+        let subject = iov_fixture_subject(&model, &theta);
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        // n_st = n_eta_bsv(3) + k(2 occasions) * n_iov(1) = 5.
+        let b_hat = [0.05, -0.03, 0.08, 0.02, -0.015];
+        assert_matches_fd_iov(&model, &subject, &template, &b_hat, 2, 1e-5);
     }
 }

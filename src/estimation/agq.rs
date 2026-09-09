@@ -1545,8 +1545,12 @@ fn fd_grid_response(
 /// crossing or a non-PD `S`), is too ill-conditioned for `S⁻¹` to be contracted against its
 /// own derivative, or the model is outside the scope of the per-anchor `dH/dx` provider this
 /// dispatches to: [`crate::estimation::laplace_h_deriv::subject_h_inner_dx`] for
-/// [`HessianAnchor::Exact`], [`crate::estimation::focei_htilde_dx::subject_htilde_dx`] for
-/// [`HessianAnchor::GaussNewton`].
+/// [`HessianAnchor::Exact`], and — for [`HessianAnchor::GaussNewton`] —
+/// [`crate::estimation::focei_htilde_dx::subject_htilde_dx_iov`] under IOV
+/// (`stack.is_iov()`) or [`crate::estimation::focei_htilde_dx::subject_htilde_dx`] otherwise.
+/// `stack.omega_joint_inv` is passed to both `GaussNewton` arms unconditionally — it is
+/// already the joint matrix under IOV and the bare block otherwise, so neither callee ever
+/// receives a reduced view of it.
 #[allow(clippy::too_many_arguments)]
 fn analytic_grid_response(
     anchor: HessianAnchor,
@@ -1591,6 +1595,18 @@ fn analytic_grid_response(
             b_hat,
             db_dx,
         )?,
+        HessianAnchor::GaussNewton if stack.is_iov() => {
+            crate::estimation::focei_htilde_dx::subject_htilde_dx_iov(
+                model,
+                subject,
+                params,
+                template,
+                &stack.omega_joint_inv,
+                x,
+                b_hat,
+                db_dx,
+            )?
+        }
         HessianAnchor::GaussNewton => crate::estimation::focei_htilde_dx::subject_htilde_dx(
             model,
             subject,
