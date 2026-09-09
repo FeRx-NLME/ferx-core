@@ -117,6 +117,48 @@ The remediation there is the data scale rather than the model — rescale DV, or
 use a proportional or log-transformed error model — and the warning message says
 so when the hit is a Sigma.
 
+### The same box, on the way in
+
+`parameter_at_runaway_guard` is about where a fit *ended*. The box also applies
+before the first objective evaluation: `clamp_to_bounds()` moves the packed
+**start** inside it, and until #1251 that happened in silence. A
+`theta TVCL(0.05, 0.1, 10.0)` fits from `0.1` — a factor of two from what was
+written — and reports nothing.
+
+The start is now compared against the same box, by the same walk, with two
+verdicts split on *whose* bound it is:
+
+- **Outside a bound you declared** — a `theta` below its own lower or above its
+  own upper — is an error, `E_THETA_INIT_OUTSIDE_BOUNDS`, refused before any
+  fitting. NM-TRAN refuses the identical stream too (error 24).
+- **Outside one of the internal guards above** — the `1e-10` / `1e9` Theta caps,
+  the Omega rails, the Sigma rails — is a `W_INIT_OUTSIDE_BOUNDS` warning
+  carrying the `init_outside_bounds` category. It is a warning because these
+  recover: `omega ETA_CL ~ 1e8` on `examples/warfarin.ferx` packs to $+9.21$
+  against the $+6$ rail, starts from a variance of $1.6\times10^5$, and still
+  reaches the base optimum under all eight optimizer × method combinations. The
+  Omega **lower** rail is the exception and is an error
+  (`E_OMEGA_INIT_AT_RAIL`), because there the fit is genuinely trapped.
+
+Three things the comparison deliberately does not do:
+
+- A start sitting **exactly on** a bound is left alone. There `clamp_to_bounds`
+  is a no-op, so nothing is silently moved and the premise does not apply. (This
+  is a deliberate divergence from NM-TRAN, which also rejects equality, with
+  errors 627 and 628.)
+- A **FIX'd** coordinate is never reported, and needs no special case: its bounds
+  are pinned to its own packed value, so it cannot be strictly outside them.
+- An **evaluation-only** run (`maxiter = 0`) is exempt, exactly as for
+  `E_OMEGA_INIT_AT_RAIL`. It clamps too; it just does not hold the clamped value
+  through a search, and that stickiness is what the check is about.
+
+The comparison is against the **packed** start, which is not quite the same as
+"your initial estimates are inside your own bounds". `pack_params()` clamps
+before any box exists: a residual correlation is squeezed into
+$\pm\texttt{RHO\_Z\_BOUND}$ by `pack_rho`, and Theta / Omega diagonals / Sigma
+are floored at `1e-10`. Values moved by *those* clamps compare equal to their
+(identically floored) bounds and are invisible here.
+
 ## Where the packed space surfaces
 
 It is not purely internal; it shows up in several user-visible places.

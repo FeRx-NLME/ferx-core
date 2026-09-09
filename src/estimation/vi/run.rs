@@ -4,7 +4,8 @@
 //!
 //! 1. Evaluate `−ELBO` and its gradients ([`population_neg_elbo`]).
 //! 2. Adam-step the packed population vector `x` and every subject's `φᵢ`, then
-//!    project `x` back into the declared parameter box ([`compute_bounds`]).
+//!    project `x` back into the declared parameter box
+//!    ([`compute_bounds`](crate::estimation::parameterization::compute_bounds)).
 //! 3. Replace `Ω` with its closed-form maximizer (unless `vi_omega_update = adam`).
 //! 4. Once inside the averaging window, fold `x` and `{φᵢ}` into a Polyak mean.
 //!

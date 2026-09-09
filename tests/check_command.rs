@@ -1073,3 +1073,160 @@ fn an_eval_only_fit_reports_the_rail_not_the_declared_zero() {
     let _ = std::fs::remove_file(&model_path);
     let _ = std::fs::remove_file(&fixed_path);
 }
+
+// ── #1251: a start strictly outside its own box ────────────────────────────
+
+/// `rail_model_src` with the `theta TVCL` line substituted instead of the omega.
+fn box_model_src(theta_line: &str) -> String {
+    format!(
+        "[parameters]\n\
+         \x20 {theta_line}\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.5, 0.01, 50.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n\
+         \n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV\n\
+         \x20 KA = TVKA\n\
+         \n\
+         [structural_model]\n\
+         \x20 pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         \n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// T11 (#1251). `ferx check` with **no `--data`** reports a θ whose start is
+/// outside its own declared range, and `fit()` refuses it with the identical
+/// string — the predicate is a property of the initial parameters alone, so it
+/// cannot become data-dependent without this failing.
+#[test]
+fn theta_start_outside_its_declared_range_is_reported_by_check_and_refused_by_fit() {
+    let src = box_model_src("theta TVCL(0.05, 0.1, 10.0)");
+    let model_path = temp_model("box_theta_below", &src);
+
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    assert!(!report.valid, "{:?}", report.diagnostics);
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS")
+        .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
+    assert_eq!(d.block.as_deref(), Some("parameters"));
+    assert_eq!(d.line, Some(1));
+    assert!(d.message.contains("TVCL"), "{}", d.message);
+    assert!(d.suggestion.is_some());
+    let json = serde_json::to_string(&report).expect("report serialises");
+    assert!(json.contains("E_THETA_INIT_OUTSIDE_BOUNDS"), "{json}");
+
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("a start outside its own declared range must be refused");
+    assert_eq!(d.message, err, "check and fit must agree byte for byte");
+
+    // The differential half: the same declaration with the start moved inside
+    // its range is silent, so the two assertions above cannot be passing on a
+    // blanket rejection of this model shape.
+    let ok_path = temp_model(
+        "box_theta_inside",
+        &box_model_src("theta TVCL(0.2, 0.1, 10.0)"),
+    );
+    let ok_report = validate_model_file(ok_path.to_str().unwrap(), None);
+    assert!(
+        !ok_report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
+        "{:?}",
+        ok_report.diagnostics
+    );
+
+    let _ = std::fs::remove_file(&model_path);
+    let _ = std::fs::remove_file(&ok_path);
+}
+
+/// The warning half reaches **both** channels (#1251, and the #1033 shape).
+///
+/// `first_error` discards warnings and `accumulated_warnings` is declared ~50
+/// lines after the check runs, so the check has to be evaluated once into a
+/// local and fed to both. Get that wrong and `ferx check` reports every one of
+/// these while `fit()` drops them silently — which is exactly what this asserts
+/// against, by requiring the same message from both sides.
+///
+/// Tier 2: one outer iteration, so the run returns immediately. It must be at
+/// least one — an eval-only run is exempt from the check by design.
+#[test]
+fn a_start_past_the_hidden_theta_cap_warns_from_both_check_and_fit() {
+    let src = box_model_src("theta TVCL(1e11, 0.001, 1e12)");
+    let model_path = temp_model("box_theta_cap", &src);
+
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "W_INIT_OUTSIDE_BOUNDS")
+        .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
+    // A warning, so the model still validates.
+    assert!(report.valid, "{:?}", report.diagnostics);
+
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let res = fit(&model, &pop, &model.default_params, &opts)
+        .expect("a hidden-cap start is a warning, not a refusal");
+
+    assert!(
+        res.warnings.iter().any(|w| *w == d.message),
+        "the same message must reach `FitResult.warnings`; got {:?}",
+        res.warnings
+    );
+    // …and it is typed as a *start*-side finding, not as a boundary estimate:
+    // `estimate_near_boundary` reads that category and drives bootstrap's
+    // default-on replicate filter (and `Strictness::reject_on_boundary`, and
+    // ferx-r's `check_strictness`).
+    //
+    // Asserted as "no `boundary_estimate` entry carries this token", not as
+    // `!estimate_near_boundary(&res)`: this fixture starts CL at 1e9, which is
+    // nonsense on warfarin data, so the fit legitimately ends with **TVV**
+    // pinned at its declared lower bound of 0.1 and `estimate_near_boundary`
+    // true for a reason that has nothing to do with the start-side check.
+    // (TVCL itself routes to `parameter_at_runaway_guard`, which is the
+    // pre-existing hidden-cap behaviour working as designed.) The property this
+    // test owns is the *discriminator*; `types_tests.rs` pins the classifier
+    // itself, fixture-free.
+    let entry = res
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains("W_INIT_OUTSIDE_BOUNDS"))
+        .expect("structured entry present");
+    assert_eq!(entry.category.as_str(), "init_outside_bounds");
+    assert!(
+        !res.warnings_structured
+            .iter()
+            .any(|w| w.category.as_str() == "boundary_estimate"
+                && w.message.contains("W_INIT_OUTSIDE_BOUNDS")),
+        "a clamped *start* must not be filed as a boundary estimate; entries: {:#?}",
+        res.warnings_structured
+            .iter()
+            .map(|w| (w.category.as_str(), &w.message))
+            .collect::<Vec<_>>()
+    );
+    // The cap is quoted as the number the box actually used. `ln(1e9).exp()` is
+    // `9.999999999999993e8`, which is what this message printed before
+    // `theta_internal_cap` existed.
+    assert!(
+        entry.message.contains("cap of 1e9"),
+        "the message must quote the literal cap: {}",
+        entry.message
+    );
+
+    let _ = std::fs::remove_file(&model_path);
+}

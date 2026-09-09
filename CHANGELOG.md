@@ -93,6 +93,20 @@ section of the SDLC for the versioning policy).
   refits nothing. `models.csv`, `generations.csv`, `final.ferx` and every candidate under
   `models/` are written; `docs/tools/global-search.qmd` says when a global search beats the
   stepwise tools and when it does not.
+- **An initial estimate that lies outside its own optimizer bounds is no longer
+  clamped in silence (#1251).** A `theta` whose start is *strictly* outside the
+  range it declares is now refused before any fitting
+  (`E_THETA_INIT_OUTSIDE_BOUNDS`) — until now `theta TVCL(0.05, 0.1, 10.0)` quietly
+  fitted from `0.1`, a factor of two, on every run; NM-TRAN refuses the same stream
+  outright (error 24). A start outside one of ferx's *internal* rails instead — the
+  hidden `1e9` theta cap, the `omega` `±6` / off-diagonal `±10` guards, the `sigma`
+  `[-8, 5]` guard — is a `W_INIT_OUTSIDE_BOUNDS` warning, carrying the new
+  `init_outside_bounds` warning category. Both are reported by `ferx check` without
+  a `--data` file, and both share `E_OMEGA_INIT_AT_RAIL`'s `maxiter = 0` exemption.
+  A start sitting *exactly* on a bound is left alone: there the clamp is a no-op, so
+  nothing is moved. The new category is deliberately distinct from
+  `boundary_estimate`, which is about where a fit *ended* and which drives
+  `bootstrap`'s replicate filter and `reject_on_boundary`.
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences

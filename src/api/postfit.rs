@@ -1111,6 +1111,7 @@ pub(crate) fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&
 /// Free (non-fixed) theta estimates pinned to an optimizer bound, as
 /// `(name, estimate, effective_bound, side)` per hit.
 fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
+    use crate::estimation::parameterization::theta_guard_is_internal;
     let mut hits = Vec::new();
     for i in 0..params.theta.len() {
         if params.theta_fixed.get(i).copied().unwrap_or(false) {
@@ -1146,20 +1147,6 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
         }
     }
     hits
-}
-
-/// Whether a THETA bound reported by `compute_bounds` is an implementation cap
-/// rather than the user's effective declared limit.
-fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
-    use crate::estimation::parameterization::theta_packs_log;
-    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
-    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
-    theta_packs_log(lower)
-        && match side {
-            "lower" => lower <= 1e-10,
-            "upper" => upper >= 1e9,
-            _ => false,
-        }
 }
 
 /// A free parameter coordinate pinned to one of the internal packed-space
@@ -1237,6 +1224,7 @@ pub(crate) fn packed_guard_side(
 /// hidden 1e-10 / 1e9 cap for the declared range; every later coordinate is an
 /// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
 fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
+    use crate::estimation::parameterization::theta_guard_is_internal;
     use crate::estimation::parameterization::{
         coordinate_kinds, coordinate_names, coordinate_values, pack_with_bounds, PackedStart,
     };

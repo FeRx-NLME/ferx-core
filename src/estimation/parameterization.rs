@@ -30,6 +30,59 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 
+/// Smallest THETA value the log packing represents: `pack_params` floors at it
+/// and `compute_bounds` floors the declared *lower* bound at it, so a
+/// declaration reaching below it arrives at the optimizer as this number.
+pub(crate) const THETA_PACK_FLOOR: f64 = 1e-10;
+
+/// Largest THETA value the log packing represents: `compute_bounds` ceilings
+/// the declared *upper* bound at it. Same story as [`THETA_PACK_FLOOR`] at the
+/// other end.
+///
+/// Both are spelled once here because three places read them — the packer, the
+/// box, and [`theta_guard_is_internal`], which exists to say "this bound is
+/// ours, not the user's" — and a diagnostic that quotes the cap has to quote the
+/// number the box actually used. Writing `ln(1e9).exp()` instead prints
+/// `9.999999999999993e8`.
+pub(crate) const THETA_PACK_CEIL: f64 = 1e9;
+
+/// Whether the THETA bound [`compute_bounds`] reports for coordinate `i` is one
+/// of ferx's own implementation caps rather than the user's effective declared
+/// limit. `side` is `"lower"` or `"upper"`.
+///
+/// Only the log-packed branch has caps: it floors the declared lower at `1e-10`
+/// and ceilings the declared upper at `1e9`, so a declaration reaching past
+/// either arrives at the packer as ferx's number, not the user's. The identity
+/// branch (`theta_lower < 0`) passes both bounds through untouched and is
+/// therefore never internal.
+///
+/// The distinction decides *whose* fault a bound hit is, and both box
+/// predicates need it — the post-fit runaway guard (`api::postfit`), which
+/// routes an internal-cap hit away from the "relax your bound" advice, and the
+/// start-side `check_packed_start_in_box` (`api::validation`), where a start
+/// outside a *declared* bound is an error and one outside a hidden cap is a
+/// warning. It lives here, with the caps it describes.
+pub(crate) fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
+    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
+    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
+    theta_packs_log(lower)
+        && match side {
+            "lower" => lower <= THETA_PACK_FLOOR,
+            "upper" => upper >= THETA_PACK_CEIL,
+            _ => false,
+        }
+}
+
+/// The cap [`theta_guard_is_internal`] found on `side`, on the natural scale —
+/// the number to quote in a diagnostic. Never `exp()` of the packed bound: that
+/// round-trip turns `1e9` into `9.999999999999993e8`.
+pub(crate) fn theta_internal_cap(side: BoxSide) -> f64 {
+    match side {
+        BoxSide::Below => THETA_PACK_FLOOR,
+        BoxSide::Above => THETA_PACK_CEIL,
+    }
+}
+
 /// Unconstrained-space bound for a Fisher-z (`atanh ρ`) residual-correlation
 /// coordinate (#847). `tanh(3) ≈ 0.995_05`, so `1 − ρ² ≥ 9.9e-3`.
 ///
@@ -93,7 +146,7 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     // can be expressed at all).
     for (i, &th) in params.theta.iter().enumerate() {
         if theta_packs_log(params.theta_lower[i]) {
-            v.push(th.max(1e-10).ln());
+            v.push(th.max(THETA_PACK_FLOOR).ln());
         } else {
             v.push(th);
         }
@@ -624,6 +677,113 @@ pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
     }
 }
 
+/// Which side of its own box a packed start fell off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoxSide {
+    /// `packed < lower`.
+    Below,
+    /// `packed > upper`.
+    Above,
+}
+
+impl BoxSide {
+    /// The `"lower"` / `"upper"` token the bound-side helpers spell, notably
+    /// [`theta_guard_is_internal`].
+    pub(crate) fn bound_name(self) -> &'static str {
+        match self {
+            BoxSide::Below => "lower",
+            BoxSide::Above => "upper",
+        }
+    }
+
+    /// The word for a message: which way the start lies from its bound.
+    pub(crate) fn direction(self) -> &'static str {
+        match self {
+            BoxSide::Below => "below",
+            BoxSide::Above => "above",
+        }
+    }
+}
+
+/// A packed coordinate whose start lies **strictly** outside its own box.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutOfBox {
+    /// Index into the packed vector.
+    pub(crate) index: usize,
+    /// What kind of quantity the coordinate holds — which decides how to read
+    /// `packed` and `bound` back onto a reporting scale.
+    pub(crate) kind: PackedCoordKind,
+    /// The packed start.
+    pub(crate) packed: f64,
+    /// The bound it fell outside, in the same packed space.
+    pub(crate) bound: f64,
+    pub(crate) side: BoxSide,
+}
+
+/// Every packed coordinate whose start is **strictly** outside its own box —
+/// the coordinates `clamp_to_bounds` will silently move before the first
+/// objective evaluation (#1251).
+///
+/// Strict, not `<=`/`>=`, and that is the whole of it: at `packed == bound` the
+/// clamp is a **no-op**, so nothing is moved and there is nothing to report.
+/// (NM-TRAN disagrees and rejects `init == bound` too, with errors 627/628; the
+/// two live fixtures in this repo with that shape — `theta TVF(1.0, 0.01, 1.0)`
+/// and `theta TVLAG(0.0, 0.0, 12.0)` — are both idiomatic, and an inclusive
+/// rule would reject both to catch nothing.)
+///
+/// **There is deliberately no `fixed` consult.** [`pack_with_bounds`] pins a
+/// FIX-ed coordinate to `lower == upper == packed[i]` *from this same packed
+/// vector*, so a strict inequality is structurally false for it. A mask test
+/// here would be a second gate rejecting exactly what the first one already
+/// rejects — the shape that cannot fail and cannot be mutation-tested.
+///
+/// Two things it cannot see, both because [`pack_params`] clamps *before* any
+/// box exists:
+///
+/// * **ρ**: [`pack_rho`] clamps into `±RHO_Z_BOUND` and `compute_bounds` pushes
+///   `±RHO_Z_BOUND` — the same constant — so a ρ slot is never outside.
+/// * **the `1e-10` value floor** on θ / Ω diagonals / Σ / mixture overrides: the
+///   bound is floored identically, so a floored start compares equal. That also
+///   makes a `NaN` θ invisible, since `f64::max` discards `NaN` and
+///   `NaN.max(1e-10)` is `1e-10`.
+pub(crate) fn coordinates_outside_bounds<'a>(
+    start: &'a PackedStart,
+    kinds: &'a [PackedCoordKind],
+) -> impl Iterator<Item = OutOfBox> + 'a {
+    (0..start.packed.len()).filter_map(move |index| {
+        // A coordinate any one of the parallel vectors is too short to describe
+        // cannot be judged. `ModelParameters` is public and every producer in
+        // the crate keeps these in lockstep, so this only guards a hand-built
+        // one against a panic.
+        let (&packed, &lower, &upper, &kind) = (
+            start.packed.get(index)?,
+            start.bounds.lower.get(index)?,
+            start.bounds.upper.get(index)?,
+            kinds.get(index)?,
+        );
+        // A degenerate or non-finite box cannot place anything. The packed
+        // value itself is left to speak: `±inf` really is outside, and `NaN`
+        // compares false either way.
+        if !lower.is_finite() || !upper.is_finite() || lower > upper {
+            return None;
+        }
+        let (bound, side) = if packed < lower {
+            (lower, BoxSide::Below)
+        } else if packed > upper {
+            (upper, BoxSide::Above)
+        } else {
+            return None;
+        };
+        Some(OutOfBox {
+            index,
+            kind,
+            packed,
+            bound,
+            side,
+        })
+    })
+}
+
 /// Compute box constraints for the packed parameter vector.
 ///
 /// Parameters marked FIX are given `lower == upper == packed_value`, which
@@ -631,8 +791,9 @@ pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
 /// the hand-rolled BFGS, and the Gauss-Newton clamp on proposed steps).
 ///
 /// A caller that also needs the packed vector or the FIX mask — which is every
-/// production caller — should use [`pack_with_bounds`] and take `.bounds` from
-/// it rather than pairing this with a second [`pack_params`] walk (#1252).
+/// production caller — should use `pack_with_bounds` and take `.bounds` from it
+/// rather than pairing this with a second [`pack_params`] walk (#1252).
+/// (`pack_with_bounds` is crate-internal, so it is not a link here.)
 pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     pack_with_bounds(template).bounds
 }
@@ -653,8 +814,8 @@ fn unpinned_bounds(template: &ModelParameters) -> PackedBounds {
     // (log when sign-constrained, identity otherwise).
     for i in 0..n_theta {
         if theta_packs_log(template.theta_lower[i]) {
-            lower.push(template.theta_lower[i].max(1e-10).ln());
-            upper.push(template.theta_upper[i].min(1e9).ln());
+            lower.push(template.theta_lower[i].max(THETA_PACK_FLOOR).ln());
+            upper.push(template.theta_upper[i].min(THETA_PACK_CEIL).ln());
         } else {
             lower.push(template.theta_lower[i]);
             upper.push(template.theta_upper[i]);

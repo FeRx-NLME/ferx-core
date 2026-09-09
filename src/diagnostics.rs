@@ -42,6 +42,8 @@
 //! | `E_OPTIMIZER_AGQ`         | `optimizer = trust_region` used with a quadrature stage (`laplace`, or `focei` with `n_agq > 1`) |
 //! | `E_SIGMA_ORDER_MISMATCH`  | a single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order |
 //! | `E_OMEGA_INIT_AT_RAIL`    | a **free** `omega` / `kappa` / `[mixture] omega(k)` variance whose initial value packs onto the optimizer's `-6` lower rail (variance ≤ 6.1e-6, `~ 0.0` included) — clamped there and not estimable; `FIX` it or start it higher (#1229) |
+//! | `E_THETA_INIT_OUTSIDE_BOUNDS` | a `theta` whose initial value is strictly outside its **own declared** range — clamped onto the bound and fitted from there; NM-TRAN refuses the identical stream (error 24) (#1251) |
+//! | `W_INIT_OUTSIDE_BOUNDS`   | an initial estimate strictly outside one of ferx's **internal** rails (the hidden `1e9` θ cap, the Ω `±6` / off-diagonal `±10` guards, the Σ `[-8, 5]` guard) — clamped there before the first objective evaluation (#1251) |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_STEADY_STATE_ABSOLUTE_TIME` | SS=1 dose on an `[odes]` PK block reading an absolute clock (`TAFD`, or `T` / `TIME`) — the run-in expands the train on a cycle-local clock, so there is no periodic limit to converge to: `TAFD` reads `NaN`, `T` / `TIME` return NONMEM's value (#1139) |
