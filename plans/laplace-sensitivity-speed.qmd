@@ -301,9 +301,9 @@ Hessian and therefore never needs third order at all: `H̃ = Ω⁻¹ + Σⱼ p�
 call-count-vs-per-call-cost ambiguity to measure.
 
 Scope is close to `analytic_score_supported` (M3-BLOQ base value, custom/TV σ magnitude,
-LTBS, `ExpressionScale`, FREM, closed-form **and ODE**), narrowed by three structural
-exclusions (IOV/mixture layout, `iiv_on_ruv`'s dedicated residual-η rows, correlated
-`block_sigma`) plus one found by testing: M3-censored rows get a correct *base* `H̃` from
+LTBS, `ExpressionScale`, FREM, closed-form **and ODE**), narrowed by two remaining structural
+exclusions (mixture layout, `iiv_on_ruv`'s dedicated residual-η rows) plus one found by
+testing: M3-censored rows get a correct *base* `H̃` from
 `score_core` already, but this module's σ/magnitude direct-derivative formula (`dp_dv`)
 assumes the quantified functional form of `p` and is wrong for a censored row's `p = g2` —
 declined rather than silently wrong. Two bugs caught by the FD-parity tests before landing:
