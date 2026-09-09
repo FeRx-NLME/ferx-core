@@ -10320,6 +10320,114 @@ mod break_collision_1186 {
         }
     }
 
+    /// **#1234 — each of the four engines records its own abandoned walk.**
+    ///
+    /// The test above pins the *outcome* (non-finite predictions) across all four at once;
+    /// this pins the *diagnostic*, per engine, in its own `SolverStatsScope`. Per engine
+    /// because each has its own guard and its own return, so a shared assertion would be
+    /// satisfied by any one of them — and the failure message has to name which recorder
+    /// stopped recording, or the mutation cannot be attributed (CLAUDE.md: mutate each side
+    /// of a twin separately).
+    ///
+    /// The straddle is the second half of each arm: the same engine on the same fixture with
+    /// a finite lag must record nothing and must actually integrate. Without it a recorder
+    /// that fired unconditionally would pass.
+    ///
+    /// Mutation (run): revert any one engine's `abandon_non_finite_timeline` to the bare
+    /// `timeline_has_non_finite` → that engine's arm fires by name and the other three stay
+    /// green.
+    #[test]
+    fn every_dense_engine_records_its_own_abandoned_walk() {
+        let ode = spec();
+        let obs = vec![8.2001, 12.0];
+        let bad = pk(f64::NAN, 0.3);
+        let good = pk(7.9, 0.3);
+        let s = make_subject(doses(8.2), obs.clone());
+        let mk = |v: &[f64]| PkParams {
+            values: v.try_into().unwrap(),
+        };
+
+        // One closure per engine, so each recorder is exercised alone. `stats_in_scope`
+        // returns what the thread-local sink saw while exactly that engine ran.
+        let stats_in_scope = |f: &dyn Fn(&[f64]) -> Vec<f64>, pkv: &[f64]| {
+            let scope = crate::ode::solver::SolverStatsScope::enter();
+            let out = f(pkv);
+            (scope.collected(), out)
+        };
+        let dense = |pkv: &[f64]| ode_predictions(&ode, pkv, &[], &[], &s);
+        let with_states = |pkv: &[f64]| {
+            ode_predictions_with_states(&ode, pkv, &[], &[], &s)
+                .1
+                .iter()
+                .map(|u| u[1])
+                .collect::<Vec<f64>>()
+        };
+        let dense_states = |pkv: &[f64]| {
+            ode_dense_solve_states(&ode, pkv, &[], &[], &s, &obs)
+                .iter()
+                .map(|u| u[1])
+                .collect::<Vec<f64>>()
+        };
+        let event_driven = |pkv: &[f64]| {
+            let pk_d: Vec<PkParams> = s.doses.iter().map(|_| mk(pkv)).collect();
+            let pk_o: Vec<PkParams> = s.obs_times.iter().map(|_| mk(pkv)).collect();
+            ode_predictions_event_driven(&ode, &s, &[], &[], &pk_d, &pk_o, &[], &[])
+        };
+        // Aliased rather than written inline: the bare `&dyn Fn(&[f64]) -> Vec<f64>` array type
+        // trips `clippy::type_complexity`.
+        type EngineFn<'a> = &'a dyn Fn(&[f64]) -> Vec<f64>;
+        let engines: [(&str, EngineFn); 4] = [
+            (ENGINES[0], &dense),
+            (ENGINES[1], &with_states),
+            (ENGINES[2], &dense_states),
+            (ENGINES[3], &event_driven),
+        ];
+
+        for (name, f) in engines {
+            let (stats, out) = stats_in_scope(f, &bad);
+            // `.all()` is vacuously true on an empty `out`, and an abandoned walk returning
+            // nothing at all is a plausible future state — so the length comes first.
+            assert_eq!(
+                out.len(),
+                obs.len(),
+                "[{name}] the engine must return one value per observation: {out:?}"
+            );
+            assert!(
+                out.iter().all(|g| !g.is_finite()),
+                "[{name}] the fixture must actually be abandoned, got {out:?}"
+            );
+            assert_eq!(
+                stats.abandoned_non_finite_timeline, 1,
+                "[{name}] this engine's guard must record the abandoned walk: {stats:?}"
+            );
+            assert_eq!(
+                stats.attempted_steps, 0,
+                "[{name}] nothing was integrated, so the step counters must stay zero — that \
+                 is why the abandoned counter has to exist: {stats:?}"
+            );
+
+            let (clean, out) = stats_in_scope(f, &good);
+            assert_eq!(
+                out.len(),
+                obs.len(),
+                "[{name}] the control must return one value per observation: {out:?}"
+            );
+            assert!(
+                out.iter().all(|g| g.is_finite()),
+                "[{name}] the control fixture must actually integrate, got {out:?}"
+            );
+            assert_eq!(
+                clean.abandoned_non_finite_timeline, 0,
+                "[{name}] a finite lag is not an abandoned walk: {clean:?}"
+            );
+            assert!(
+                clean.attempted_steps > 0,
+                "[{name}] the control must actually integrate, or it separates nothing: \
+                 {clean:?}"
+            );
+        }
+    }
+
     /// A long timeline through every ODE engine, with a non-finite lag.
     ///
     /// Two distinct traps live here. `partial_cmp(..).unwrap()` — what these builders
@@ -10395,12 +10503,54 @@ mod break_collision_1186 {
         ] {
             let pkv = pk(route_lag, alag1);
             let s = make_subject(doses(8.2), obs.clone());
+            // In a scope so the #1234 recorder on this engine is observable: this is the
+            // event-time search, reached in production only from `simulate()`'s latent-event
+            // draw, and nothing else in the suite can see its counter.
+            let scope = crate::ode::solver::SolverStatsScope::enter();
             let got = ode_solve_until_chz_threshold(&ode, &pkv, &s, 1, 0.5, 24.0);
+            let stats = scope.collected();
             assert!(
                 matches!(got, ThresholdOutcome::SolveFailed(_)),
                 "[{label}] a non-finite timeline must be a typed SolveFailed, got {got:?}"
             );
+            // Mutation: revert this engine's `abandon_non_finite_timeline` to the bare
+            // predicate → this fires and the `SolveFailed` assert above stays green, which
+            // is the point: the typed failure and the counter are separate obligations.
+            assert_eq!(
+                stats.abandoned_non_finite_timeline, 1,
+                "[{label}] the CHZ event-time search must record its abandoned walk: {stats:?}"
+            );
         }
+
+        // The straddle, on the engine's own control: a finite timeline must solve and record
+        // nothing. Without it a recorder that fired on every call would pass above.
+        let s = make_subject(doses(8.2), obs.clone());
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let got = ode_solve_until_chz_threshold(&ode, &pk(7.9, 0.3), &s, 1, 0.5, 24.0);
+        let clean = scope.collected();
+        assert!(
+            !matches!(got, ThresholdOutcome::SolveFailed(_)),
+            "the control must actually solve, got {got:?}"
+        );
+        assert_eq!(
+            clean.abandoned_non_finite_timeline, 0,
+            "a finite timeline is not an abandoned walk: {clean:?}"
+        );
+        // No `attempted_steps > 0` here, and the reason is a property of *this* engine worth
+        // recording: the threshold search runs on `solver::solve_ode_until_threshold`, its own
+        // driver, which does not go through `integrate_resolved_g`'s `STATS_SINK` tee — so its
+        // step counters never reach the scope and read `0` on a solve that worked (measured).
+        // The proof that the control actually ran is therefore the outcome asserted above, not
+        // the counters. It also means that on this one engine the step counters cannot serve as
+        // the "abandoned vs nothing to integrate" discriminator the way they do everywhere
+        // else; the new counter is the only thing that separates them here.
+        assert_eq!(
+            clean.attempted_steps, 0,
+            "this engine's own driver does not tee into the stats sink, so its step counters \
+             stay zero even on a solve that worked. If this is now non-zero the tee has been \
+             widened and the comment above (and the control's proof of life) needs revisiting: \
+             {clean:?}"
+        );
     }
 
     /// The control for the test above: the *same* engine on the *same* fixture with a
@@ -11921,4 +12071,265 @@ fn ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice() {
             "segment {m}: anchor {with_empty}, expected the pulse at {seg_start}"
         );
     }
+}
+
+// ── #1234: every engine that abandons an unorderable timeline must say so ────────────
+//
+// The counter (`OdeSolverStats::abandoned_non_finite_timeline`) is only worth having if
+// *every* abandoning walk bumps it: a walk that returns `NaN` predictions while leaving the
+// whole stats block at zero is indistinguishable from a subject there was nothing to
+// integrate for, which is the reading #1234 exists to remove. The four dense / event-driven
+// engines are covered next to their own guards in `break_collision_1186`; the two adaptive
+// walks are here, where the driver and its frozen replay are already driven directly.
+
+/// The **reactive driver**'s guard (`ode_predictions_adaptive_impl`) records too.
+///
+/// Its own site, and reachable from nowhere else in the test suite: the driver runs only
+/// under `simulate()`, which opens no `SolverStatsScope`, so nothing in the fit-level sweep
+/// can observe it. Driving it here in an explicit scope is what makes the recorder
+/// mutation-visible at all.
+///
+/// The straddle is the second half: the *same* driver on the *same* fixture with a finite
+/// dose time must record nothing, so this cannot pass on a counter that fires on every run.
+///
+/// Mutation: delete the record at `ode_predictions_adaptive_impl`'s guard (route it through
+/// the bare `timeline_has_non_finite` again) → the abandoned arm reads 0 and the first
+/// assert fires naming the driver; no other test in the tree moves.
+#[test]
+fn the_adaptive_driver_records_an_abandoned_walk() {
+    let ode = one_cpt_ode_spec();
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk_one(1.0, 10.0)],
+        obs: vec![pk_one(1.0, 10.0); 2],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+        actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+        rule: None,
+    };
+    let run_at = |dose_time: f64, decide: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision| {
+        let base = make_subject(
+            vec![DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 4.0],
+        );
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let out = ode_predictions_adaptive_impl(
+            &ode,
+            &event_pk.obs[0].values,
+            Some(&event_pk),
+            None,
+            None,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            decide,
+            100,
+            None,
+        );
+        (scope.collected(), out)
+    };
+
+    let (stats, out) = run_at(f64::NAN, &mut decide);
+    let err = out.expect_err("a NaN dose time must be the driver's typed error");
+    assert!(
+        err.contains("cannot be ordered"),
+        "the driver must reject it for the timeline, not for something else: {err}"
+    );
+    assert_eq!(
+        stats.abandoned_non_finite_timeline, 1,
+        "the adaptive driver must record its abandoned walk — its guard is its own site and \
+         no other test drives it: {stats:?}"
+    );
+    assert_eq!(
+        stats.attempted_steps, 0,
+        "adaptive driver: nothing was integrated, so the step counters must stay zero: \
+         {stats:?}"
+    );
+
+    // The straddle: same engine, same fixture, orderable timeline.
+    let (clean, out) = run_at(0.0, &mut decide);
+    out.expect("the control fixture must actually run");
+    assert_eq!(
+        clean.abandoned_non_finite_timeline, 0,
+        "a finite dose time is not an abandoned walk: {clean:?}"
+    );
+    assert!(
+        clean.attempted_steps > 0,
+        "the control must actually integrate, or it does not separate anything: {clean:?}"
+    );
+}
+
+/// The **frozen-schedule replay verifier**'s guard (`adaptive_frozen_replay_tv`) records too.
+///
+/// A separate site from the driver's, in a separate function, returning a NaN-prefilled
+/// `Vec<f64>` rather than an `Err` — and the replay is only ever reached from
+/// `verify_adaptive_frozen_replay`, i.e. under `simulate()` in a debug build. Nothing else in
+/// the suite can see this recorder.
+///
+/// Mutation: delete the record at `adaptive_frozen_replay_tv`'s guard → the first assert
+/// fires naming the replay; `the_adaptive_driver_records_an_abandoned_walk` stays green.
+#[test]
+fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
+    let ode = one_cpt_ode_spec();
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk_one(1.0, 10.0)],
+        obs: vec![pk_one(1.0, 10.0); 2],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let replay_at = |dose_time: f64| {
+        let subject = make_subject(
+            vec![DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 4.0],
+        );
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let preds =
+            adaptive_frozen_replay_tv(&ode, &event_pk, None, None, &[], &[], &subject, &[1.0], &[]);
+        (scope.collected(), preds)
+    };
+
+    let (stats, preds) = replay_at(f64::NAN);
+    // Length first: `.all()` on an empty `preds` asserts nothing.
+    assert_eq!(
+        preds.len(),
+        2,
+        "the replay must return both observations: {preds:?}"
+    );
+    assert!(
+        preds.iter().all(|p| p.is_nan()),
+        "the replay must come back NaN-prefilled on an unorderable timeline, got {preds:?}"
+    );
+    assert_eq!(
+        stats.abandoned_non_finite_timeline, 1,
+        "the frozen replay must record its abandoned walk — its own guard, its own return: \
+         {stats:?}"
+    );
+    assert_eq!(
+        stats.attempted_steps, 0,
+        "frozen replay: nothing was integrated, so the step counters must stay zero: {stats:?}"
+    );
+
+    let (clean, preds) = replay_at(0.0);
+    assert_eq!(
+        preds.len(),
+        2,
+        "the control must return both observations: {preds:?}"
+    );
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "the control fixture must actually integrate, got {preds:?}"
+    );
+    assert_eq!(
+        clean.abandoned_non_finite_timeline, 0,
+        "a finite dose time is not an abandoned walk: {clean:?}"
+    );
+    assert!(
+        clean.attempted_steps > 0,
+        "the control must actually integrate, or it does not separate anything: {clean:?}"
+    );
+}
+
+/// **The pairing is structural, not conventional (#1234 §5).**
+///
+/// `timeline_has_non_finite` / `times_have_non_finite` decide *whether* a walk is abandoned;
+/// [`abandon_non_finite_timeline`](crate::ode::predictions::abandon_non_finite_timeline) also
+/// *records* it. Nothing in the type system stops a ninth guard from taking the bare
+/// predicate — it would compile, run, and silently put the diagnostic back to `0/0/0` for
+/// that walk, which is exactly the defect the counter exists to remove. Per-site tests cannot
+/// close that: they can only cover sites that already exist.
+///
+/// So the call sites are pinned. The bare predicates may be called from **two** places, and
+/// this lists both rather than allowing a directory:
+///
+/// * `src/ode/predictions.rs` — twice, and both inside the shared helpers themselves
+///   (`timeline_has_non_finite`'s one-line body, and `abandon_non_finite_timeline`'s test).
+///   A third would be a guard that bypassed the recorder.
+/// * `src/sens/ode_provider.rs` — twice, the two analytic-sensitivity walks, which carry the
+///   same predicate and deliberately do **not** record: their sweep is collected in a
+///   separate scope from which `fit_inner` copies one unrelated field, so an event deposited
+///   there would be discarded or fire a prediction-shaped warning clause. Documented at both
+///   guards and on the counter's own field doc.
+///
+/// Exact counts, not a floor: a removed allowance has to be re-stated here too, so the
+/// exclusion cannot quietly widen or vanish.
+///
+/// Mutation (run): revert any one of the eight engine guards to
+/// `timeline_has_non_finite(&break_times)` → `src/ode/predictions.rs` reads 3 and this fires
+/// naming the file. Adding a bare call in a new file fires with that file named.
+#[test]
+fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable directory") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&root.join("src"), &mut files);
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "the scan found only {} files under src/ — it is measuring the walk, not the code",
+        files.len()
+    );
+
+    let mut seen_name: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut calls: BTreeMap<String, usize> = BTreeMap::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("readable source");
+        let rel = file
+            .strip_prefix(&root)
+            .expect("under the manifest dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        for line in text.lines() {
+            // Comments are where these names legitimately appear everywhere — the guards'
+            // own prose, the mutation notes, the field doc. Only code counts.
+            let code = line.split("//").next().unwrap_or("");
+            for name in ["timeline_has_non_finite", "times_have_non_finite"] {
+                // `fn <name>(` is the definition, not a call.
+                let defined = code.contains(&format!("fn {name}("));
+                if code.contains(&format!("{name}(")) && !defined {
+                    *seen_name.entry(name).or_default() += 1;
+                    *calls.entry(rel.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    // Non-degeneracy: a rename that made the scan match nothing would otherwise pass.
+    assert_eq!(
+        seen_name.len(),
+        2,
+        "both predicate names must still be called somewhere, or this test is scanning for \
+         strings that no longer exist: {seen_name:?}"
+    );
+
+    let expected: BTreeMap<String, usize> = [
+        ("src/ode/predictions.rs".to_string(), 2),
+        ("src/sens/ode_provider.rs".to_string(), 2),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        calls, expected,
+        "the bare non-finite-timeline predicates are called somewhere new. An engine guard \
+         must go through `abandon_non_finite_timeline`, which records the abandoned walk as \
+         well as detecting it — a bare call compiles and runs but leaves the #1234 counter at \
+         zero for that walk, which is indistinguishable from a subject there was nothing to \
+         integrate for. If the new call really is a non-recording site (the two `sens/` \
+         gradient walks are), add it here with the reason."
+    );
 }

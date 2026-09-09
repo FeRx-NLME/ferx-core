@@ -642,6 +642,51 @@ pub struct OdeSolverStats {
     /// Of [`unfinished_segments`](Self::unfinished_segments), the attempts discarded by the
     /// `auto` escalation guard before it re-solved the segment explicitly.
     pub discarded_unfinished_segments: usize,
+    /// Engine walks abandoned **before integrating** because their timeline could not be
+    /// ordered — a `NaN`/`inf` dose time, lagtime, route lag or infusion duration
+    /// (`ode::predictions::timeline_has_non_finite`, #1189).
+    ///
+    /// The odd one out, and deliberately: every other counter here reports work that *happened*,
+    /// so an abandoned walk leaves all of them at zero. That reading is not distinguishable from
+    /// a subject there was nothing to integrate for — measured on one model in a
+    /// `SolverStatsScope`, a normal subject read `attempted/accepted/rejected = 7/7/0` while a
+    /// non-finite timeline, a subject with no records, and a subject with a single observation at
+    /// `t = 0` all read `0/0/0`, returning `[NaN, NaN, NaN, NaN]`, `[]` and `[0.0]` respectively
+    /// (#1234). This counter is what separates the first of those three from the other two.
+    ///
+    /// Counted **once per abandoned walk**, not per subject and not per segment — the honest
+    /// count of trajectories that were never integrated. A post-fit sweep drives more than one
+    /// engine over the same subject, so one bad subject contributes more than one: measured at
+    /// **3** on a plain two-subject FOCEI fit (`ode_predictions` twice,
+    /// `ode_predictions_with_states` once). Zero on every well-formed fit, so any non-zero value
+    /// means some subject's predictions are `NaN` by construction.
+    ///
+    /// Recorded on all eight `f64` engine sites, through
+    /// `ode::predictions::abandon_non_finite_timeline` — the predicate and this counter are one
+    /// call, so a ninth guard cannot be written that detects an unorderable timeline without
+    /// reporting it (pinned by
+    /// `the_bare_timeline_predicates_are_not_called_outside_this_guard`). The eight are the four
+    /// dense / event-driven prediction walks, the adaptive driver and its frozen replay, the EKF
+    /// walk, and `ode_solve_until_chz_threshold`'s event-time solve.
+    ///
+    /// **Three of the eight cannot fire in production today, and that is scope, not an
+    /// oversight.** Outside tests, `SolverStatsScope::enter` appears in exactly two places in
+    /// the tree, both in `api::fit`; `simulate.rs`, `predict.rs` and `sim/adaptive.rs` open
+    /// none. So the adaptive driver, its frozen replay and the CHZ event-time solve — reached
+    /// only under `simulate()` — record into an inactive sink and contribute nothing to any
+    /// warning. They carry the recorder so that wiring a scope onto those paths is a one-line
+    /// change rather than a re-audit, and each is exercised in an explicit scope by its own
+    /// test. Nor is the CHZ one "the one silent hole" it was described as before this
+    /// correction: its sole production caller (`survival::draw_ode_tte_latent`) `panic!`s on
+    /// `SolveFailed`, which is the loudest outcome of the eight.
+    ///
+    /// The two analytic-sensitivity walks (`sens::ode_provider`) carry the same predicate and
+    /// deliberately do **not** bump this: their sweep is collected in its own scope from which
+    /// `fit_inner` copies exactly one field
+    /// ([`auto_stiff_rejected_jets`](Self::auto_stiff_rejected_jets)), so a gradient-solve event
+    /// deposited here would either be discarded or — if that copy were widened — fire a warning
+    /// clause about predictions.
+    pub abandoned_non_finite_timeline: usize,
 }
 
 impl OdeSolverStats {
@@ -682,6 +727,7 @@ impl OdeSolverStats {
             stiff_aborted_segments,
             discarded_clamped_steps,
             discarded_unfinished_segments,
+            abandoned_non_finite_timeline,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -697,6 +743,7 @@ impl OdeSolverStats {
         self.stiff_aborted_segments += stiff_aborted_segments;
         self.discarded_clamped_steps += discarded_clamped_steps;
         self.discarded_unfinished_segments += discarded_unfinished_segments;
+        self.abandoned_non_finite_timeline += abandoned_non_finite_timeline;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -1788,6 +1835,41 @@ fn record_to_stats_sink(stats: &OdeSolverStats) {
             c.set(Some(acc));
         }
     });
+}
+
+/// Note that a prediction walk was abandoned before integrating, because its timeline could
+/// not be ordered ([`OdeSolverStats::abandoned_non_finite_timeline`], #1234).
+///
+/// Reached through [`crate::ode::predictions::abandon_non_finite_timeline`], never called
+/// directly by a guard — the predicate and this record are one call so a ninth guard cannot be
+/// written without the counter.
+///
+/// **Both channels, because the guard sits before the only place that normally tees them.**
+/// A walk's counters leave by two routes: the thread-local [`SolverStatsScope`], which is how
+/// production collects (`api::fit`), and the caller's own `stats` out-parameter, which is how
+/// [`crate::ode::ode_predictions_with_solver_stats`] — the one public getter for an
+/// `OdeSolverStats` — collects. The ordinary route into both is the tee inside
+/// [`integrate_resolved_g`], and this event is precisely the one where no integration is ever
+/// reached: the guard returns before a driver is called. Recording into the sink alone left
+/// the public getter reporting `0` for an abandoned walk, which is the exact conflation this
+/// counter exists to remove, on the surface #1234 reported it against.
+///
+/// Off the diagnostic path this is one `Cell` read, taken only inside a guard that has already
+/// fired on a subject whose predictions are `NaN` regardless.
+#[inline]
+pub(crate) fn record_abandoned_non_finite_timeline(stats: Option<&mut OdeSolverStats>) {
+    // One `OdeSolverStats` through the two ordinary merge paths, rather than a second
+    // hand-written `STATS_SINK` read-modify-write next to `record_to_stats_sink`'s: this is
+    // also what makes `merge`'s `abandoned_non_finite_timeline` line reachable, since nothing
+    // else ever produces a non-scope `OdeSolverStats` carrying the field.
+    let one = OdeSolverStats {
+        abandoned_non_finite_timeline: 1,
+        ..Default::default()
+    };
+    record_to_stats_sink(&one);
+    if let Some(s) = stats {
+        s.merge(&one);
+    }
 }
 
 /// [`integrate_resolved_g_inner`] with the thread-local [`SolverStatsScope`] tee.

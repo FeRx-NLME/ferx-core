@@ -262,7 +262,7 @@ pub fn solve_ekf(
     // `ode::predictions::timeline_has_non_finite`. `results` is prefilled with the
     // caller's default point, so overwrite it with NaN ipreds rather than returning a
     // finite-looking filter pass built on a timeline that could not be ordered.
-    if crate::ode::predictions::timeline_has_non_finite(&break_times) {
+    if crate::ode::predictions::abandon_non_finite_timeline(break_times.iter().copied(), None) {
         // `fill`, not a per-field loop: one spelling of the struct, so a field added to
         // `EkfObsPoint` cannot be left at its default here while the others go NaN.
         results.fill(EkfObsPoint {
@@ -1407,6 +1407,10 @@ mod tests {
              detecting a non-total comparator, or this cannot fail"
         );
         let pk = make_pk(1.0, 10.0);
+        // Inside a `SolverStatsScope` so the #1234 counter is observable: this walk's
+        // recorder is its own site, and no other test in the tree can see it (the fit-level
+        // sweep never drives the EKF). Without the scope the call is unchanged.
+        let scope = crate::ode::solver::SolverStatsScope::enter();
         let got = solve_ekf(
             &one_cpt_rhs,
             1,
@@ -1420,10 +1424,24 @@ mod tests {
             &vec![1.0; obs_times.len()],
             OdeSolverOptions::default(),
         );
+        let stats = scope.collected();
         assert!(
             got.iter().all(|p| !p.ipred.is_finite()),
             "a non-finite timeline must give non-finite EKF ipreds, not a finite pass \
              with the bad dose silently dropped"
+        );
+        // Mutation: delete `ekf.rs`'s `abandon_non_finite_timeline` record (or route it
+        // through the bare predicate again) → this fires naming the EKF walk, and no other
+        // test in the tree moves.
+        assert_eq!(
+            stats.abandoned_non_finite_timeline, 1,
+            "the EKF walk must record its abandoned walk too — it has its own guard and its \
+             own return, and nothing else drives it: {stats:?}"
+        );
+        assert_eq!(
+            stats.attempted_steps, 0,
+            "EKF walk: nothing was integrated, so the step counters must stay zero — that is \
+             why the abandoned counter has to exist: {stats:?}"
         );
     }
 

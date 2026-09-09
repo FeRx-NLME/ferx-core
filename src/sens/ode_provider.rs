@@ -4955,10 +4955,21 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // `ode::predictions::timeline_has_non_finite`. This walk dispatches typed events by
     // index and so never re-applies a dose, but a `NaN`/`inf` time sorts to the end and
     // its event is simply never reached: with a `+inf` lagtime both doses go unapplied
-    // and the walk returns a *finite, drug-free* gradient. NaN jets instead, so the
+    // and the walk returns a *finite, drug-free* gradient. A non-finite fill instead, so the
     // caller sees a diverged subject rather than a plausible wrong one. This is the
     // event-driven twin of the same guard in `integrate_g`; an estimated lagtime routes
     // here, not there, so the two must both carry it.
+    //
+    // Same fill, same caveat as that twin (#1234): `T::from_f64` lifts a *constant*, so this
+    // delivers a NaN **value** with jets of `0.0` and `jets_finite() == true` — not the "NaN
+    // jets" the comment here used to promise. Masked by any `/V`-style readout, which multiplies
+    // `NaN` into the jets afterwards. Repairing it is a behaviour change tracked separately; see
+    // `integrate_g` for the measured numbers.
+    //
+    // This walk has no `Option` to decline through — its return type is a bare `Vec<Vec<T>>`,
+    // with no `None` channel at all — which is why `Some(non-finite)` rather than `None` is the
+    // convention on the static side too. Collapsing that one to `None` would create an asymmetry
+    // this one cannot match.
     if crate::ode::predictions::times_have_non_finite(tl.iter().map(|e| e.0)) {
         for row in states.iter_mut() {
             for x in row.iter_mut() {
@@ -6686,10 +6697,45 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     break_times.sort_by(|a, b| a.total_cmp(b));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     // A non-finite break time makes the subject non-finite (#1189) — see
-    // `ode::predictions::timeline_has_non_finite`. NaN *jets*, not just NaN values: the
-    // whole walk is unreachable, so neither the value nor its `∂/∂η` is defined, and the
-    // caller already tolerates a diverged walk. Without this the NaN-lagged dose is
-    // simply never applied and the gradient comes back finite and wrong.
+    // `ode::predictions::timeline_has_non_finite`. Without this the NaN-lagged dose is simply
+    // never applied and the gradient comes back finite and wrong.
+    //
+    // **What this fill actually delivers is a NaN *value* with jets of `0.0`** — not the "NaN
+    // jets" this comment claimed until #1234. `T::from_f64` lifts a *constant*, so on a dual the
+    // value is `NaN` while the gradient is `[0.0; N]` and `PkNum::jets_finite()` returns `true`.
+    // Measured through the provider on a bare-state readout (`ode(obs_cmt=central)`, no
+    // `[scaling]`): `ObsGrad { f: NaN, df_deta: [0.0] }`.
+    //
+    // It went unnoticed because the *readout* masks it, not because it does not happen. With
+    // `[scaling] y = central / V` and η on `V`, `d(central/V)` folds `NaN · dV` in and the jets
+    // become `NaN` by arithmetic downstream of this fill — measured `[NaN, NaN]` on the same
+    // fixture — so every scaled model agreed with the old comment.
+    //
+    // **Not repaired here, deliberately.** Filling real NaN jets instead is a behaviour change,
+    // not a documentation fix: measured on a 2-subject FOCEI fit with one NaN-dose-time subject,
+    // it moves the reported `ofv` from `NaN` to `2e20` (the outer objective's non-finite
+    // sentinel, `2 · 1e20`), the outer iteration count from 4 to 12, `converged` from `true` to
+    // `false`, and the *healthy* subject's η̂ from 1.000846558216595 to 0.8822190053957163. That
+    // belongs in its own change with its own validation — see the #1234 follow-up. `f` is `NaN`
+    // either way, so no caller reading the value is affected today; what a caller reading the
+    // *jets* gets is a zero gradient on a subject that is diverged.
+    //
+    // **`Some`, not `None`, and the discriminator matters.** This function's two failure exits
+    // answer different questions, and swapping them loses information the caller acts on:
+    //
+    // * `Some` with a non-finite fill — *the analytic walk ran and the subject is diverged.*
+    //   Nothing is wrong with the analytic machinery; the timeline itself is unorderable, so FD
+    //   would produce exactly the same `NaN` from exactly the same broken model, one solve per
+    //   perturbation more expensively.
+    // * `None` (the `recorded` check at the end of this function) — *the analytic walk declines
+    //   to answer.* An observation was never captured, so the state it would report is the
+    //   zero-initialised placeholder, and FD really can do better.
+    //
+    // `None` is also not available as a common spelling: `integrate_tvcov_g`, the event-driven
+    // twin an estimated lagtime routes to, returns a bare `Vec<Vec<T>>` with no `None` channel
+    // at all and NaN-fills this identical condition. `Some(non-finite)` is therefore already the
+    // cross-walk convention, and collapsing this exit to `None` would *create* the asymmetry
+    // rather than remove it.
     if crate::ode::predictions::timeline_has_non_finite(&break_times) {
         for row in states.iter_mut() {
             for x in row.iter_mut() {
@@ -7003,6 +7049,25 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // solver dropped/realigned — would keep its zero-initialised state and feed a
     // silent `f = 0`, `∂f = 0` into the gradient. Decline so the caller falls back
     // to FD for this subject rather than return a wrong `Some`.
+    //
+    // The only `None` this function itself returns, and deliberately (#1234) — the two `None`s
+    // further up are exits from the `zero_windows` `filter_map` closure, not from here. It says
+    // "this walk cannot answer", which is a statement about the analytic machinery and is
+    // actionable: FD will capture the observation this walk lost. The non-finite-timeline guard
+    // above says something else — "the walk ran and the subject is diverged" — which FD cannot
+    // improve on, so it returns `Some` carrying a `NaN` value (with, today, jets of `0.0`; see
+    // that guard). Swapping either exit for the other turns an actionable fallback into a silent
+    // one, or spends N+1 solves reproducing a `NaN` the model guarantees.
+    //
+    // Worth knowing before relying on this arm: it appears to be **unreachable from
+    // `ode_subject_sensitivities` today**. Nine shapes aimed at it — an observation below the
+    // timeline floor, an all-negative grid, observations `5e-13` after the integration start and
+    // after a dose, duplicate and `1e-16`-apart times, a single observation at `t = 0`,
+    // observations entirely before the first dose, and no doses at all — every one comes back
+    // `Some`. `subject_integration_start` (#573) is why the example above no longer reaches it:
+    // a negative observation time now *becomes* the first break rather than falling below it.
+    // A defensive backstop, then, not a live path — but leave it, since the `saveat` realignment
+    // half of the comment above is not covered by that argument.
     if recorded.iter().any(|&r| !r) {
         return None;
     }

@@ -1860,9 +1860,11 @@ pub(crate) fn sweep_sensitivity_solver_stats(
 /// Two severities, because the two things being reported are not the same kind of event:
 ///
 /// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, its explicit
-///   fallback also failed, a segment ended before its requested horizon, or a segment was cut
-///   short by `ode_stiff_abort_after`. Each means part of some subject's trajectory was
-///   freeze-padded or re-solved, i.e. the integration was not clean.
+///   fallback also failed, a segment ended before its requested horizon, a segment was cut
+///   short by `ode_stiff_abort_after`, or a walk was abandoned before integrating because its
+///   timeline could not be ordered (#1234). Each means part of some subject's trajectory was
+///   freeze-padded, re-solved, or — in the last case — never produced at all, i.e. the
+///   integration was not clean.
 /// * **Info** — `auto` escalated and everything worked. Routine on a stiff model (the TMDD
 ///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
 ///   the user never asked for and could not otherwise see.
@@ -1919,6 +1921,15 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // *steps*, so it cannot collide with a segment count the same way; its own segment-level
     // overlap is described in the wording below.)
     let unfinished_other = unfinished_kept.saturating_sub(aborted);
+    // Walks abandoned before a driver was ever called, because the timeline could not be
+    // ordered (#1189, counted since #1234). Disjoint from every counter above by construction:
+    // those all describe a segment that *started*, and here none did — which is exactly why it
+    // needs its own clause. Without it this is the one damaged outcome that leaves the whole
+    // stats block at zero and so reads identical to a subject there was nothing to integrate
+    // for. It is not part of the `unfinished_kept` roll-up either — an abandoned walk has no
+    // segments at all, so folding it in would report it as a segment that started and stopped,
+    // which is a different (and less alarming) failure than the one that happened.
+    let abandoned = stats.abandoned_non_finite_timeline;
     let escalated = stats.auto_stiff_segments;
     // Segments whose stepper changed part-way through (#1080 Part C). Reported as a clause on
     // the escalation note rather than as a warning of its own: a mid-segment switch is `auto`
@@ -1947,12 +1958,17 @@ pub(crate) fn ode_solver_diagnostics_warning(
     } else {
         String::new()
     };
-    let unclean = clamped > 0
+    // Split in two (#1234 review §2). Every counter but `abandoned` describes an integration
+    // that *ran* and came back inaccurate; `abandoned` describes one that never started. The
+    // difference decides both the lead-in verb and whether the solver-knob advice applies, so
+    // the two cannot share one flag.
+    let unclean_integration = clamped > 0
         || rejected > 0
         || rejected_jets > 0
         || fallback_failed > 0
         || unfinished_kept > 0
         || aborted > 0;
+    let unclean = unclean_integration || abandoned > 0;
     if !unclean && escalated == 0 {
         return None;
     }
@@ -1976,6 +1992,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "discarded_unfinished_segments": stats.discarded_unfinished_segments,
         "kept_unfinished_segments": unfinished_kept,
         "stiff_aborted_segments": aborted,
+        "abandoned_non_finite_timeline": abandoned,
     }));
 
     if !unclean {
@@ -1999,6 +2016,22 @@ pub(crate) fn ode_solver_diagnostics_warning(
     }
 
     let mut parts: Vec<String> = Vec::new();
+    // First, because it is the only clause here that reports predictions which are `NaN` rather
+    // than merely inaccurate: every other outcome returns a finite trajectory that was
+    // freeze-padded or re-solved, and this one returns no trajectory at all.
+    if abandoned > 0 {
+        parts.push(format!(
+            "{abandoned} solver walk(s) were abandoned before integrating because the \
+             subject's timeline could not be ordered — a NaN or infinite dose time, lagtime, \
+             route lag, or infusion duration at the final estimates — so those subjects' \
+             predictions are NaN by construction, and they contributed nothing to any other \
+             counter in this payload because nothing was integrated for them. This counts \
+             walks, not subjects: one subject reaches more than one engine in this pass (its \
+             predictions and its [odes] state readout are separate walks), so it contributes \
+             more than one. Check the dose records and any exponential covariate model on ALAG \
+             / F / D / R for a value that overflows at typical covariates"
+        ));
+    }
     if clamped > 0 {
         parts.push(format!(
             "{clamped} step(s) clamped at the minimum step size — the local-error test failed \
@@ -2073,12 +2106,37 @@ pub(crate) fn ode_solver_diagnostics_warning(
         ));
     }
 
+    // The lead-in has to survive the abandoned-only case: "did not integrate cleanly"
+    // understates a walk that never integrated at all and whose predictions are every one
+    // `NaN`.
+    let lead = if unclean_integration {
+        "did not integrate cleanly"
+    } else {
+        "did not produce a usable integration"
+    };
+    // #1234 review §2: the solver-knob advice is about an integration that ran badly, and
+    // saying it unconditionally contradicted this PR's own `docs/model-file/ode-models.qmd`
+    // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
+    // sentence of the message and the only one naming concrete knobs. So it is attached to
+    // the counters it is true of, and an abandoned walk gets the advice that applies to it.
+    let solver_knob_advice = if unclean_integration {
+        " For the segments that did integrate, consider a different ode_method, a looser \
+         ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
+         dynamics."
+    } else {
+        ""
+    };
+    let abandoned_advice = if abandoned > 0 {
+        " The abandoned walk(s) are not an ode_method or tolerance problem — nothing was \
+         integrated for them, so no solver setting changes the outcome; fix the record or \
+         the parameter that produces the non-finite time."
+    } else {
+        ""
+    };
     let msg = format!(
-        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver did not integrate cleanly at the final \
-         estimates (ode_method = {method}): {body}. Counters are from the post-fit prediction \
-         pass over all subjects; consider a different ode_method, a looser ode_reltol / \
-         ode_abstol, or checking the parameter estimates that produce these dynamics.\
-         {switched_warn_clause}",
+        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver {lead} at the final estimates \
+         (ode_method = {method}): {body}. Counters are from the post-fit prediction pass over \
+         all subjects.{solver_knob_advice}{abandoned_advice}{switched_warn_clause}",
         method = options.ode_method.as_str(),
         body = parts.join("; "),
     );

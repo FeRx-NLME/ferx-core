@@ -203,6 +203,22 @@ section of the SDLC for the versioning policy).
   added parameter; `examples/two_cpt_oral_covmodel.ferx` goes from OFV -1026.35 at its
   initial estimates to -1195.30, and `examples/two_cpt_oral_cov.ferx` from -1168.48 to
   -1199.33 (NONMEM FOCEI: -1199.43).
+- A subject whose timeline cannot be ordered — a `NaN` or infinite dose time, lagtime, route
+  lag or infusion duration — is now **reported** instead of being silently indistinguishable
+  from a subject with nothing to integrate (#1234). The prediction engines abandon such a walk
+  before calling the solver, which left every counter in the `ode_solver` diagnostic at zero:
+  measured on one model, a non-finite timeline, a subject with no records, and a subject with a
+  single observation at `t = 0` all read `attempted/accepted/rejected = 0/0/0` while returning
+  `[NaN, …]`, `[]` and `[0.0]` respectively. A new `abandoned_non_finite_timeline` counter on
+  `OdeSolverStats` separates the first from the other two, and a fit that hits it now emits an
+  `ode_solver` **Warning** naming the count and what to check, where before it returned
+  `ofv = NaN` with no warning mentioning the subject, the timeline or `NaN`. The counter reports
+  *walks*, not subjects (a subject whose predictions and `[odes]` state readout are both
+  requested contributes more than one), and it rides in the warning's `details` payload.
+  `ode_predictions_with_solver_stats` reports it too. The `ode_solver` message no longer ends
+  by recommending a different `ode_method` or looser tolerances when the only thing that went
+  wrong is an abandoned walk: nothing was integrated, so no solver setting changes the
+  outcome, and the message now says that instead.
 - Deeply saturated, over-capacity steady-state input-rate models no longer let
   Anderson acceleration report a huge spurious periodic state when integration
   error hides the positive per-cycle surplus (#867, PR #955).
