@@ -687,7 +687,9 @@ fn a_point_rendering_to_a_model_already_fitted_is_a_duplicate_across_batches() {
         by_genome: HashMap::new(),
         by_hash: HashMap::new(),
         rows: Vec::new(),
-        store: HashMap::new(),
+        models: HashMap::new(),
+        fits: HashMap::new(),
+        best_fitness: f64::INFINITY,
         notes: Vec::new(),
         next_id: 0,
         cancelled: false,
@@ -714,6 +716,14 @@ fn a_point_rendering_to_a_model_already_fitted_is_a_duplicate_across_batches() {
         ga::Oracle::evaluate(&mut evaluator, "generation-2", &[vec![0, 0], vec![0, 0]]).unwrap();
     assert_eq!(third[0], third[1]);
     assert_eq!(script.candidates_in("generation-2").len(), 1);
+    // Fits are kept only while they can still win: the INST fit (criterion
+    // 490, the best) stays; the FO point at the fallback 1000 was dropped
+    // the moment its batch closed. Three models evaluated, one fit resident.
+    assert_eq!(evaluator.best_fitness, 490.0);
+    assert_eq!(evaluator.fits.len(), 1);
+    assert_eq!(evaluator.models.len(), 3);
+    let (criterion, fit) = evaluator.fits.values().next().unwrap();
+    assert_eq!((*criterion, fit.ofv), (490.0, 490.0));
 }
 
 #[test]
@@ -937,40 +947,6 @@ fn a_forced_effect_on_a_parameter_the_structure_removed_makes_the_point_unbuilda
 }
 
 #[test]
-fn a_selected_cross_batch_duplicate_takes_its_representatives_fit() {
-    // The store holds `(text, None)` for a cross-batch duplicate; when it
-    // wins, the fit is its representative's.
-    let text = ModelText::parse(BASE).unwrap();
-    let fit = crate::search::test_support::converged_fit(123.0);
-    let mut store: HashMap<String, (ModelText, Option<ferx_core::FitResult>)> = HashMap::new();
-    store.insert("run1".into(), (text.clone(), Some(fit)));
-    store.insert("run3".into(), (text.clone(), None));
-    let (model, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
-    assert_eq!(model.render(), text.render());
-    assert_eq!(fit.map(|f| f.ofv), Some(123.0));
-    // A representative without a fit (a resumed row whose cache is gone)
-    // still yields the duplicate's text, and no fit.
-    let mut store: HashMap<String, (ModelText, Option<ferx_core::FitResult>)> = HashMap::new();
-    store.insert("run1".into(), (text.clone(), None));
-    store.insert("run3".into(), (text.clone(), None));
-    let (_, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
-    assert!(fit.is_none());
-    // A winner missing from the store altogether falls back to its
-    // representative's pair, or to nothing.
-    let mut store: HashMap<String, (ModelText, Option<ferx_core::FitResult>)> = HashMap::new();
-    store.insert(
-        "run1".into(),
-        (
-            text.clone(),
-            Some(crate::search::test_support::converged_fit(7.0)),
-        ),
-    );
-    let (_, fit) = final_model_and_fit("run3", Some("run1"), &mut store).unwrap();
-    assert_eq!(fit.map(|f| f.ofv), Some(7.0));
-    assert!(final_model_and_fit("run9", None, &mut store).is_none());
-}
-
-#[test]
 fn a_run_whose_winner_is_a_cross_batch_duplicate_hands_back_the_fit() {
     // The review's case (PR #1299): on INST/FO × KA-WT the two INST genomes
     // render to one model; when the dead-gene one is fitted first and the
@@ -1035,5 +1011,165 @@ fn a_run_whose_winner_is_a_cross_batch_duplicate_hands_back_the_fit() {
         reached,
         "no seed produced a run whose winner is a cross-batch duplicate; the fixture cannot \
          see the defect it exists to catch"
+    );
+}
+
+// ── second review pass on PR #1299 ──────────────────────────────────────────
+
+#[test]
+fn a_pair_that_is_both_forced_and_searched_is_refused_at_build() {
+    let text = ModelText::parse(BASE).unwrap();
+    let e = Space::build(
+        text,
+        None,
+        &[],
+        &[
+            effect("CL", "WT", CovariateEffect::Pow, false),
+            effect("CL", "WT", CovariateEffect::Exp, true),
+            effect("V", "WT", CovariateEffect::Pow, true),
+        ],
+        &[],
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(e.contains("`CL-WT` is both forced"), "{e}");
+}
+
+#[test]
+fn a_covariate_edit_the_layer_refuses_costs_one_point_not_the_run() {
+    // A base that already declares `CL ~ WT`, handed to `build` as if it
+    // did not: every genome with a CL-WT allele asks the edit layer to add
+    // a second line for the pair, which it refuses. That is a crash-valued
+    // row for the point, and the search still returns with every other
+    // fit and its files.
+    let base = format!("{BASE}\n[covariate_model]\n  CL ~ WT power\n");
+    let text = ModelText::parse(&base).unwrap();
+    let space = Space::build(
+        text,
+        None,
+        &[],
+        &[
+            effect("CL", "WT", CovariateEffect::Exp, true),
+            effect("V", "WT", CovariateEffect::Pow, true),
+        ],
+        &[],
+        Vec::new(),
+    )
+    .unwrap();
+    let script = ScriptedFitter::new(key, &[("input", 500.0), ("V-WT=power", 480.0)]);
+    let result = run(&script, space, &options(Algorithm::Exhaustive));
+    assert_eq!(result.rows.len(), 5);
+    let refused: Vec<&ModelRow> = result
+        .rows
+        .iter()
+        .filter(|r| r.description.contains("CL-WT=exponential"))
+        .collect();
+    assert_eq!(refused.len(), 2);
+    for r in refused {
+        let e = r.error.as_ref().expect("a refused point");
+        assert!(e.message.contains("already declares"), "{}", e.message);
+        assert_eq!(r.fitness, Penalties::default().crash);
+        assert!(r.rank.is_none());
+    }
+    assert_eq!(script.candidates_in("candidates").len(), 2);
+    assert_eq!(
+        result.row(&result.final_id).unwrap().description,
+        "CL-WT=none;V-WT=power"
+    );
+}
+
+#[test]
+fn a_runner_warning_that_recurs_per_batch_is_one_note() {
+    let space = space("PERIPHERALS(0..2)");
+    let mut script = ScriptedFitter::new(key, &[("input", 500.0)]);
+    script.warnings = vec!["no search directory found under `nope` to reuse fits from".into()];
+    let options = GlobalsearchOptions {
+        ga: GaOptions {
+            population_size: 2,
+            generations: 3,
+            elites: 1,
+            seed: 2,
+            ..GaOptions::default()
+        },
+        ..options(Algorithm::Ga)
+    };
+    let result = run(&script, space, &options);
+    assert!(script.dirs().len() >= 3, "{:?}", script.dirs());
+    assert_eq!(
+        result
+            .notes
+            .iter()
+            .filter(|n| n.contains("no search directory"))
+            .count(),
+        1,
+        "{:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn a_cutoff_keeps_the_input_unless_a_candidate_beats_it_by_that_much() {
+    let table = [
+        ("input", 500.0),
+        ("P0", 500.0),
+        ("P1", 497.0),
+        ("P2", 496.0),
+    ];
+    let with = |cutoff: Option<f64>| GlobalsearchOptions {
+        cutoff,
+        ..options(Algorithm::Exhaustive)
+    };
+    // The best candidate is 4 better than the input: a cutoff of 5 keeps
+    // the input, a cutoff of 4 selects it.
+    let result = run(
+        &ScriptedFitter::new(key, &table),
+        space("PERIPHERALS(0..2)"),
+        &with(Some(5.0)),
+    );
+    assert_eq!(result.final_id, "input");
+    assert!(result.row("input").unwrap().selected);
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.contains("beat the input by [rank] cutoff = 5")),
+        "{:?}",
+        result.notes
+    );
+    assert_eq!(result.final_fit.as_ref().map(|f| f.ofv), Some(500.0));
+    let result = run(
+        &ScriptedFitter::new(key, &table),
+        space("PERIPHERALS(0..2)"),
+        &with(Some(4.0)),
+    );
+    assert_eq!(
+        result.row(&result.final_id).unwrap().description,
+        "PERIPHERALS=2"
+    );
+    // The input failing the gate: the cutoff has no reference, the best
+    // candidate is selected and the notes say why.
+    let mut script = ScriptedFitter::new(key, &table);
+    script.failing = vec!["input".into()];
+    let result = run(&script, space("PERIPHERALS(0..2)"), &with(Some(50.0)));
+    assert_eq!(
+        result.row(&result.final_id).unwrap().description,
+        "PERIPHERALS=2"
+    );
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.contains("cutoff cannot be applied")),
+        "{:?}",
+        result.notes
+    );
+    // And the option is validated.
+    let e = with(Some(-1.0)).validate().unwrap_err();
+    assert!(e.contains("[rank] cutoff = -1"), "{e}");
+    let cfg =
+        load("base = \"m.ferx\"\n[space]\nmfl = \"PERIPHERALS(0..1)\"\n[rank]\ncutoff = 3.84\n");
+    assert_eq!(
+        GlobalsearchOptions::from_config(&cfg).unwrap().cutoff,
+        Some(3.84)
     );
 }

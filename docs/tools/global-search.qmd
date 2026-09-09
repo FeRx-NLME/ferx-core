@@ -71,6 +71,7 @@ cache_dir = "warfarin-globalsearch"
 | `max_models` | 500 | `exhaustive` refuses a grid larger than this, naming the size; the GA has no cap |
 | `[globalsearch.ga]` | | the GA's knobs, [below](#the-genetic-algorithm) |
 | `[rank] type` | `penalized` | any of the [rank types](search.qmd#ranking-strictness-and-run-settings) |
+| `[rank] cutoff` | none | a candidate is selected only when its fitness beats the **input's** by at least this much; the input is the final model otherwise (and, when the input fails the gate, the cutoff cannot be applied and the notes say so) |
 | `[rank.penalties]` | pyDarwin's | the [penalty schedule](#penalized-fitness), under any rank type |
 
 ## The grid
@@ -86,7 +87,10 @@ without the `?` is forced onto every candidate and is not an axis — and a
 structural allele that removes its parameter (`COVARIATE(KA, WT, pow)` on
 an `ABSORPTION(INST)` candidate) leaves no model that carries it, so that
 point is refused rather than fitted without the relation; a pair the base
-model already declares is kept as written and noted.
+model already declares is kept as written and noted, and a pair that is
+both forced and searched (`COVARIATE(CL, WT, pow)` beside
+`COVARIATE?(CL, WT, [exp,lin])`) is refused when the file is loaded, since
+the forced line already occupies it.
 
 Decoding a genome is the same edit the stepwise tools make. The structural
 alleles become one `pk` template swap from the input model through

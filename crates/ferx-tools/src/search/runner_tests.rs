@@ -1654,3 +1654,27 @@ fn a_model_failure_row_is_reused_only_under_the_same_scoring_and_the_own_journal
     assert_eq!(report.reused, 1);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
+
+#[test]
+fn a_pre_run_cancel_keeps_what_the_reuse_directories_said() {
+    let empty = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("c0", "[parameters]\ntheta CL = 1\n")];
+    let flag = CancelFlag::new();
+    flag.cancel();
+    let report = Runner::new()
+        .cancel(flag)
+        .reuse_from(empty.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            panic!("nothing may be fitted after a pre-run cancel");
+        })
+        .expect("run");
+    assert!(report.cancelled);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no search directory found")),
+        "{:?}",
+        report.warnings
+    );
+}

@@ -30,7 +30,7 @@ COVARIATE?(@IIV, @CONTINUOUS, [pow,lin])
 """
 
 [globalsearch]
-algorithm    = "ga"                   # or "exhaustive" (raise max_models to 324)
+algorithm    = "ga"                   # or "exhaustive" (324 points, under the 500 cap)
 iiv_strategy = "absorption_delay"     # eta on a new lag time only
 
 [globalsearch.ga]

@@ -301,7 +301,9 @@ impl Runner {
                 fitted: 0,
                 reused: 0,
                 deduped: 0,
-                warnings: Vec::new(),
+                // What `load_foreign` just said about the reuse directories
+                // is still true of a run that stops here.
+                warnings,
             });
         }
 

@@ -48,7 +48,7 @@ use crate::search::fitter::{RunnerFitter, StepFitter};
 use crate::search::seed::seed_from;
 use crate::search::{
     BaseModel, Candidate, CandidateError, CandidateResult, Criterion, Feature, FeatureVector, Mfl,
-    ModelContext, Penalties, PkTemplate, RankType, RunReport, SearchConfig, Statement,
+    ModelContext, Penalties, PkTemplate, RankType, SearchConfig, Statement,
 };
 
 pub mod ga;
@@ -98,6 +98,11 @@ pub struct GlobalsearchOptions {
     /// `[rank.penalties]`: the schedule behind a `penalized` criterion, and
     /// the three search-level charges under any criterion.
     pub penalties: Penalties,
+    /// `[rank] cutoff`: the margin, on the fitness scale, by which a
+    /// candidate must beat the **input** to be selected; the input is the
+    /// final model otherwise. `None` — the default — selects the best
+    /// eligible candidate outright.
+    pub cutoff: Option<f64>,
 }
 
 impl Default for GlobalsearchOptions {
@@ -109,6 +114,7 @@ impl Default for GlobalsearchOptions {
             ga: GaOptions::default(),
             rank: RankType::Penalized,
             penalties: Penalties::default(),
+            cutoff: None,
         }
     }
 }
@@ -154,6 +160,7 @@ impl GlobalsearchOptions {
             // as a BIC.
             rank: config.rank.kind.unwrap_or(RankType::Penalized),
             penalties: config.rank.penalties(),
+            cutoff: config.rank.cutoff,
         };
         options.validate()?;
         Ok(options)
@@ -170,6 +177,14 @@ impl GlobalsearchOptions {
         }
         if self.max_models == 0 {
             return Err("[globalsearch] max_models must be at least 1".into());
+        }
+        if let Some(c) = self.cutoff {
+            if !(c.is_finite() && c >= 0.0) {
+                return Err(format!(
+                    "[rank] cutoff = {c}: must be a finite, non-negative improvement on the \
+                     criterion's own scale"
+                ));
+            }
         }
         self.ga.validate()?;
         self.penalties.validate()?;
@@ -401,6 +416,20 @@ impl Space {
                 }),
             }
         }
+        for f in &forced {
+            let pair = f.pair_key();
+            if axes
+                .iter()
+                .any(|a| matches!(a, Axis::Covariate { pair: p, .. } if *p == pair))
+            {
+                return Err(format!(
+                    "globalsearch: `{pair}` is both forced (COVARIATE) and searched \
+                     (COVARIATE?). A forced relation occupies the pair's [covariate_model] \
+                     line, so an optional form on the same pair could never be written; \
+                     drop one of the two statements"
+                ));
+            }
+        }
         if axes.is_empty() {
             return Err(
                 "globalsearch: the space has no axis to search — every COVARIATE? pair is \
@@ -468,6 +497,10 @@ pub struct ModelRow {
     /// The batch that produced it: `input`, `candidates` (exhaustive),
     /// `generation-{g}`, `downhill-{g}-{k}-{round}`.
     pub step: String,
+    /// The canonical hash of the model this row was scored on — its
+    /// representative's for a duplicate; empty for a point that was never
+    /// built.
+    pub hash: String,
     /// The grid point; `None` for the input.
     pub genome: Option<Genome>,
     /// The genome as labels, `ABSORPTION=FO;CL-WT=power`.
@@ -644,7 +677,19 @@ struct Evaluator<'a> {
     by_genome: HashMap<Genome, usize>,
     by_hash: HashMap<String, usize>,
     rows: Vec<ModelRow>,
-    store: HashMap<String, (ModelText, Option<FitResult>)>,
+    /// Every model's text, by id, for `models/<id>.ferx`.
+    models: HashMap<String, ModelText>,
+    /// The fits that can still win, by canonical hash, each with the
+    /// criterion of the fit. A row's fitness is its hash's criterion plus
+    /// a non-negative charge, and the winner is the lowest-fitness eligible
+    /// row, so a hash whose criterion is above the best fitness any
+    /// eligible row has reached can never yield the winner — its fit is
+    /// dropped after the batch. What stays resident is the best fit and
+    /// any within the non-influential tie-break of it, not one `FitResult`
+    /// per model evaluated.
+    fits: HashMap<String, (f64, FitResult)>,
+    /// The lowest fitness of any eligible candidate row so far.
+    best_fitness: f64,
     notes: Vec<String>,
     next_id: usize,
     cancelled: bool,
@@ -749,11 +794,29 @@ impl<'a> Evaluator<'a> {
         let parameters = parameter_names_of(&model);
         let mut effects = Vec::new();
         let mut non_influential = 0usize;
+        // An edit the layer refuses — a relation the model already declares,
+        // say — is a property of this point: a crash-valued row, not a
+        // search that returns `Err` after hours of fitting with nothing
+        // written. The structural edit above is treated the same way.
+        macro_rules! refused {
+            ($why:expr) => {
+                return Ok(Decoded {
+                    model,
+                    structure,
+                    effects,
+                    features,
+                    non_influential,
+                    cost,
+                    starts,
+                    problem: Some($why),
+                })
+            };
+        }
         for effect in &space.forced {
             if parameters.contains(&effect.parameter) {
-                model
-                    .apply(ModelEdit::AddCovariateRelation(effect.relation()))
-                    .map_err(|e| format!("forcing {}: {e}", effect.label()))?;
+                if let Err(e) = model.apply(ModelEdit::AddCovariateRelation(effect.relation())) {
+                    refused!(format!("forcing {}: {e}", effect.label()));
+                }
                 effects.push(effect.clone());
             } else {
                 // A `COVARIATE(...)` without the `?` is part of every model
@@ -788,9 +851,9 @@ impl<'a> Evaluator<'a> {
             }
             let effect = &forms[*allele - 1];
             if parameters.contains(&effect.parameter) {
-                model
-                    .apply(ModelEdit::AddCovariateRelation(effect.relation()))
-                    .map_err(|e| format!("adding {}: {e}", effect.label()))?;
+                if let Err(e) = model.apply(ModelEdit::AddCovariateRelation(effect.relation())) {
+                    refused!(format!("adding {}: {e}", effect.label()));
+                }
                 features.set(pair.clone(), effect.form_label());
                 effects.push(effect.clone());
             } else {
@@ -854,6 +917,7 @@ impl<'a> Evaluator<'a> {
             id: result.id.clone(),
             parent: result.parent.clone(),
             step: step.to_string(),
+            hash: result.hash.clone(),
             description: genome
                 .as_ref()
                 .map(|g| self.space.describe(g))
@@ -878,18 +942,26 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// The fit behind a result: its own, or its representative's.
-    fn fit_behind(&self, result: &CandidateResult, report: &RunReport) -> Option<FitResult> {
-        if let Some(fit) = &result.fit {
-            return Some(fit.clone());
+    /// Record an eligible candidate row's fitness, and its fit when it has
+    /// one of its own (a duplicate shares its representative's, already
+    /// recorded under the same hash).
+    fn keep(&mut self, row: &ModelRow, fit: Option<&FitResult>) {
+        if !row.eligible() {
+            return;
         }
-        let rep = result.duplicate_of.as_ref()?;
-        report
-            .results
-            .iter()
-            .find(|r| r.id == *rep)
-            .and_then(|r| r.fit.clone())
-            .or_else(|| self.store.get(rep).and_then(|(_, f)| f.clone()))
+        if row.fitness < self.best_fitness {
+            self.best_fitness = row.fitness;
+        }
+        if let Some(fit) = fit {
+            self.fits
+                .insert(row.hash.clone(), (row.criterion, fit.clone()));
+        }
+    }
+
+    /// Drop every fit that can no longer win — see [`Self::fits`].
+    fn prune(&mut self) {
+        let best = self.best_fitness;
+        self.fits.retain(|_, (criterion, _)| *criterion <= best);
     }
 }
 
@@ -936,6 +1008,7 @@ impl ga::Oracle for Evaluator<'_> {
                         id: id.clone(),
                         parent: Some(INPUT_ID.to_string()),
                         step: what.to_string(),
+                        hash: String::new(),
                         description: self.space.describe(genome),
                         genome: Some(genome.clone()),
                         structure: decoded.structure,
@@ -986,6 +1059,7 @@ impl ga::Oracle for Evaluator<'_> {
                         id: id.clone(),
                         parent: Some(INPUT_ID.to_string()),
                         step: what.to_string(),
+                        hash: source.hash.clone(),
                         description: self.space.describe(genome),
                         genome: Some(genome.clone()),
                         structure: decoded.structure,
@@ -1031,7 +1105,12 @@ impl ga::Oracle for Evaluator<'_> {
                 candidates: submitted.len(),
             });
             let report = self.fitter.fit_step(what, &submitted)?;
-            self.notes.extend(report.warnings.iter().cloned());
+            // Deduplicated: a warning that recurs per batch — a mistyped
+            // `reuse_from` directory, say — is one note, not one per
+            // generation and downhill round.
+            for w in &report.warnings {
+                self.note(w.clone());
+            }
             Some(report)
         };
         let mut best: Option<(String, f64)> = None;
@@ -1039,8 +1118,9 @@ impl ga::Oracle for Evaluator<'_> {
             match entry {
                 Entry::Ready { row, store } => {
                     if let Some((id, text)) = store {
-                        self.store.insert(id, (text, None));
+                        self.models.insert(id, text);
                     }
+                    self.keep(&row, None);
                     self.by_genome
                         .insert(row.genome.clone().expect("a grid row"), self.rows.len());
                     self.rows.push(row);
@@ -1061,9 +1141,8 @@ impl ga::Oracle for Evaluator<'_> {
                     if row.eligible() && best.as_ref().is_none_or(|(_, f)| row.fitness < *f) {
                         best = Some((row.id.clone(), row.fitness));
                     }
-                    let fit = self.fit_behind(result, report);
-                    self.store
-                        .insert(row.id.clone(), (candidate.model.clone(), fit));
+                    self.keep(&row, result.fit.as_ref());
+                    self.models.insert(row.id.clone(), candidate.model.clone());
                     if result.duplicate_of.is_none() {
                         self.by_hash.insert(candidate.hash(), self.rows.len());
                     }
@@ -1072,6 +1151,7 @@ impl ga::Oracle for Evaluator<'_> {
                 }
             }
         }
+        self.prune();
         if let Some(report) = report {
             if report.cancelled {
                 self.cancelled = true;
@@ -1170,7 +1250,9 @@ pub(crate) fn search(
         by_genome: HashMap::new(),
         by_hash: HashMap::new(),
         rows: Vec::new(),
-        store: HashMap::new(),
+        models: HashMap::new(),
+        fits: HashMap::new(),
+        best_fitness: f64::INFINITY,
         notes,
         next_id: 0,
         cancelled: report.cancelled,
@@ -1197,8 +1279,8 @@ pub(crate) fn search(
         ));
     }
     evaluator
-        .store
-        .insert(INPUT_ID.to_string(), (space.input_model.clone(), input_fit));
+        .models
+        .insert(INPUT_ID.to_string(), space.input_model.clone());
     evaluator.rows.push(input_row);
 
     // ── the grid ─────────────────────────────────────────────────────────
@@ -1226,7 +1308,8 @@ pub(crate) fn search(
     // ── ranking and selection ────────────────────────────────────────────
     let Evaluator {
         mut rows,
-        mut store,
+        models,
+        mut fits,
         mut notes,
         cancelled,
         ..
@@ -1236,27 +1319,51 @@ pub(crate) fn search(
     for (rank, i) in order.iter().enumerate() {
         rows[*i].rank = Some(rank + 1);
     }
-    // The input is ranked for reference but never selected: it is not a
-    // point of the grid the file describes (its own grid point, when it has
-    // one, is a candidate of its own, seeded from it).
+    // The input is ranked for reference but never selected on its own
+    // merits: it is not a point of the grid the file describes (its own
+    // grid point, when it has one, is a candidate of its own, seeded from
+    // it). It is the final model when nothing else can be — no eligible
+    // candidate, or none that clears `[rank] cutoff` over it.
+    let input_fitness = rows[0].eligible().then_some(rows[0].fitness);
+    let selectable = |r: &ModelRow| match (options.cutoff, input_fitness) {
+        (Some(c), Some(input)) => input - r.fitness >= c,
+        _ => true,
+    };
     let winner = order
         .iter()
         .copied()
-        .find(|i| rows[*i].id != INPUT_ID)
+        .find(|i| rows[*i].id != INPUT_ID && selectable(&rows[*i]))
         .unwrap_or(0);
     rows[winner].selected = true;
     let final_id = rows[winner].id.clone();
     let final_fitness = rows[winner].fitness;
-    if rows[winner].id == INPUT_ID {
-        notes.push("no candidate passed the strictness gate; the final model is the input".into());
+    if winner == 0 {
+        notes.push(if order.iter().any(|i| rows[*i].id != INPUT_ID) {
+            format!(
+                "no candidate beat the input by [rank] cutoff = {}; the final model is \
+                     the input",
+                options.cutoff.unwrap_or(0.0)
+            )
+        } else {
+            "no candidate passed the strictness gate; the final model is the input".into()
+        });
+    } else if options.cutoff.is_some() && input_fitness.is_none() {
+        notes.push(
+            "the input model fails the strictness gate, so [rank] cutoff cannot be applied; \
+             the best eligible candidate is selected"
+                .into(),
+        );
     }
-    let models: BTreeMap<String, ModelText> = store
-        .iter()
-        .map(|(id, (text, _))| (id.clone(), text.clone()))
-        .collect();
-    let (final_model, final_fit) =
-        final_model_and_fit(&final_id, rows[winner].duplicate_of.as_deref(), &mut store)
-            .unwrap_or_else(|| (space.input_model.clone(), None));
+    let final_model = models
+        .get(&final_id)
+        .cloned()
+        .unwrap_or_else(|| space.input_model.clone());
+    let final_fit = if winner == 0 {
+        input_fit
+    } else {
+        fits.remove(&rows[winner].hash).map(|(_, f)| f)
+    };
+    let models: BTreeMap<String, ModelText> = models.into_iter().collect();
     if final_fit.is_none() {
         notes.push(format!(
             "{final_id}: the fit is not in the journal cache, so final-fit.yaml cannot be \
@@ -1279,28 +1386,6 @@ pub(crate) fn search(
         notes,
         cancelled,
     })
-}
-
-/// The selected model's text and fit out of the store.
-///
-/// A duplicate's text is its own (it was decoded), but its fit is its
-/// representative's: a cross-batch duplicate is stored as `(text, None)`,
-/// so when the store has no fit under the winner's own id the
-/// representative's is taken. Without that fallback a winning duplicate
-/// wrote a `final.ferx` at its starting values and no `final-fit.yaml`
-/// while the fit sat one row over.
-fn final_model_and_fit(
-    final_id: &str,
-    duplicate_of: Option<&str>,
-    store: &mut HashMap<String, (ModelText, Option<FitResult>)>,
-) -> Option<(ModelText, Option<FitResult>)> {
-    let rep: Option<(ModelText, Option<FitResult>)> =
-        duplicate_of.and_then(|rep| store.get(rep).cloned());
-    match store.remove(final_id) {
-        Some((text, Some(fit))) => Some((text, Some(fit))),
-        Some((text, None)) => Some((text, rep.and_then(|(_, f)| f))),
-        None => rep,
-    }
 }
 
 /// Where a search run's files go by default: `<config stem>-globalsearch`

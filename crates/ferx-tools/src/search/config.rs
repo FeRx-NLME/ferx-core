@@ -182,19 +182,10 @@ impl RankType {
         }
     }
 
-    /// The runner criterion this ranks on, a `penalized` type at pyDarwin's
-    /// default schedule. A tool holding the file's `[rank.penalties]` uses
-    /// [`criterion_with`](Self::criterion_with) — or [`RankConfig::criterion`]
-    /// — so the file's charges are the ones applied.
-    ///
-    /// `Result` for the tools that validate a rank type they cannot honour
-    /// and report it as a load error; every variant currently maps.
-    pub fn criterion(&self) -> Result<Criterion, String> {
-        Ok(self.criterion_with(Penalties::default()))
-    }
-
     /// The runner criterion, with `penalties` behind a `penalized` type
-    /// (ignored by every other type).
+    /// (ignored by every other type). There is deliberately no
+    /// schedule-less form: a caller that has a rank type has the file it
+    /// came from, and [`RankConfig::criterion`] reads the schedule off it.
     pub fn criterion_with(&self, penalties: Penalties) -> Criterion {
         match self {
             RankType::Ofv => Criterion::Ofv,
