@@ -2408,10 +2408,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
         }
         // The penalized objective the optimizer actually minimized (and judged
-        // convergence on) — equal to `elbo_trace` unless covariate-NN regularization is
-        // active. Emitted only when it differs, so an unregularized fit's YAML is
-        // unchanged.
-        if v.objective_trace != v.elbo_trace {
+        // convergence on). Empty is the "identical to elbo_trace" sentinel (an
+        // unregularized fit, or a result written before this field existed), so emit
+        // only when it is non-empty — never a `objective_trace:` header over an empty
+        // list, which would serialize as a YAML null block. An unregularized fit's YAML
+        // is therefore unchanged.
+        if !v.objective_trace.is_empty() {
             writeln!(f, "  objective_trace:").map_err(|e| e.to_string())?;
             for t in &v.objective_trace {
                 writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
@@ -4153,6 +4155,101 @@ mod tests {
         assert!(
             !out.contains("eta_posterior"),
             "only a VI fit has a variational posterior to report; got:\n{out}"
+        );
+    }
+
+    /// A minimal VI `FitResult` with `objective_trace` under the caller's control, for
+    /// the empty-sentinel emission tests below.
+    fn vi_result_with_objective_trace(objective_trace: Vec<f64>) -> FitResult {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.eta_names = vec!["ETA_CL".into()];
+        r.subjects = vec![sdtab_subject_result("subj-A", 1)];
+        r.vi = Some(ViResult {
+            neg_two_elbo: -1.0,
+            data_term: -2.0,
+            kl_term: 0.5,
+            n_iterations: 2,
+            converged: true,
+            family: "full_rank".into(),
+            n_mc_samples: 8,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 0,
+            elbo_trace: vec![2.0, 1.0],
+            objective_trace,
+            eta_means: vec![vec![0.0]],
+            eta_covs: vec![vec![vec![0.01]]],
+            kappa_means: vec![Vec::new()],
+            n_fd_subjects: 0,
+            elbo_tightness_ratio: 1.0,
+            superseded_by: None,
+        });
+        r
+    }
+
+    fn write_to_string(r: &FitResult) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml writes");
+        std::fs::read_to_string(&path).expect("yaml read")
+    }
+
+    /// The empty `objective_trace` is the "identical to `elbo_trace`" sentinel — an
+    /// unregularized fit, or a result written before the field existed (#1305). It must
+    /// never be emitted as a bare `objective_trace:` header, which YAML reads back as a
+    /// null scalar rather than an empty sequence (the same trap #1111 hit with an empty
+    /// `thetas:` list). A populated trace, by contrast, must be emitted so a consumer can
+    /// read the penalized objective convergence was judged on.
+    #[test]
+    fn empty_objective_trace_is_omitted_and_a_populated_one_is_emitted() {
+        // Empty sentinel → no block at all, but the clean bound it points at is present.
+        let yaml = write_to_string(&vi_result_with_objective_trace(Vec::new()));
+        assert!(
+            !yaml.contains("objective_trace"),
+            "an empty objective_trace must not emit a header (a YAML null block); got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("  elbo_trace:"),
+            "the clean bound the sentinel falls back to must still be emitted; got:\n{yaml}"
+        );
+
+        // Non-empty (regularization active) → emitted as a real sequence.
+        let yaml = write_to_string(&vi_result_with_objective_trace(vec![3.0, 2.0]));
+        assert!(
+            yaml.contains("  objective_trace:\n    - 3.000000\n    - 2.000000"),
+            "a populated objective_trace must be emitted as a sequence; got:\n{yaml}"
+        );
+    }
+
+    /// A `ViResult` serialized before #1305 has no `objective_trace` key. `#[serde(default)]`
+    /// must deserialize it to the empty sentinel (never fail), so a consumer falls back to
+    /// `elbo_trace` — the invariant the field's docs promise. Pinned by serializing a current
+    /// result, deleting the key, and round-tripping.
+    #[test]
+    fn legacy_vi_result_without_objective_trace_deserializes_to_empty_sentinel() {
+        let FitResult { vi, .. } = vi_result_with_objective_trace(vec![3.0, 2.0]);
+        let vi = vi.expect("vi result present");
+
+        let mut json = serde_json::to_value(&vi).expect("serialize");
+        json.as_object_mut()
+            .expect("ViResult serializes to a JSON object")
+            .remove("objective_trace")
+            .expect("the current struct still carries the field before we drop it");
+        assert!(
+            json.get("objective_trace").is_none(),
+            "the key must be gone, to model a pre-#1305 document"
+        );
+
+        let back: ViResult = serde_json::from_value(json).expect("legacy result must deserialize");
+        assert!(
+            back.objective_trace.is_empty(),
+            "a missing objective_trace must default to the empty sentinel, not fail; got {} entries",
+            back.objective_trace.len()
+        );
+        assert_eq!(
+            back.elbo_trace, vi.elbo_trace,
+            "the rest of the result must survive the legacy round-trip"
         );
     }
 

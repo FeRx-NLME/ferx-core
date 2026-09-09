@@ -1004,6 +1004,24 @@ pub fn run_vi(
         || param_settled
         || trace_has_settled(&obj_trace, settle_window(n_iters_run), CONVERGENCE_REL_TOL);
 
+    // Which trace the convergence checks below actually inspected, for the diagnostics
+    // to name. It is `obj_trace` throughout; under regularization that is the penalized
+    // objective (reported as `vi.objective_trace`), which drifts apart from the clean
+    // `vi.elbo_trace` — so a warning that told the user to inspect the ELBO would point
+    // at a trace that does not support the verdict. Unregularized, the two coincide and
+    // `vi.objective_trace` is not emitted, so name `vi.elbo_trace`.
+    let reg_active = nn_reg.is_active();
+    let judged_trace_name = if reg_active {
+        "vi.objective_trace"
+    } else {
+        "vi.elbo_trace"
+    };
+    let judged_trace_noun = if reg_active {
+        "the penalized objective trace"
+    } else {
+        "the ELBO trace"
+    };
+
     // A stop the noise floor caused rather than the optimum. `trace_has_settled` asks
     // whether the remaining drift is distinguishable from Monte-Carlo noise; at a low
     // `vi_mc_samples` the answer turns "no" while the objective is still falling, and the
@@ -1018,10 +1036,10 @@ pub fn run_vi(
         noise_floor_stop = true;
         warnings.push(format!(
             "VI: the objective stopped because its drift fell below the Monte-Carlo noise \
-             floor at vi_mc_samples = {}, not because it reached the optimum — the ELBO trace \
-             is still falling systematically. Reported converged: false. Raise vi_mc_samples \
-             (32 recovers the FOCEI/AGQ reference on warfarin, where the default 8 leaves sigma \
-             34% high and the OFV 11.3 units short), or lower vi_lr.",
+             floor at vi_mc_samples = {}, not because it reached the optimum — {judged_trace_noun} \
+             ({judged_trace_name}) is still falling systematically. Reported converged: false. \
+             Raise vi_mc_samples (32 recovers the FOCEI/AGQ reference on warfarin, where the \
+             default 8 leaves sigma 34% high and the OFV 11.3 units short), or lower vi_lr.",
             options.vi_mc_samples
         ));
     }
@@ -1050,7 +1068,7 @@ pub fn run_vi(
     if needs_iteration_budget_warning(converged, noise_floor_stop, bad_basin_stop) {
         warnings.push(format!(
             "VI: neither the objective nor the parameter estimates had settled after \
-             {n_iters_run} iterations (see vi.elbo_trace). Increase vi_iters, or lower \
+             {n_iters_run} iterations (see {judged_trace_name}). Increase vi_iters, or lower \
              vi_lr if the trace is oscillating."
         ));
     }
@@ -1147,7 +1165,16 @@ pub fn run_vi(
         .to_string(),
         n_kl_fallback_subjects,
         elbo_trace: trace,
-        objective_trace: obj_trace,
+        // Empty is the canonical "identical to elbo_trace" sentinel (see
+        // `ViResult::objective_trace`): an unregularized fit descends the clean bound
+        // itself, so `obj_trace == trace` and we store nothing rather than a duplicate.
+        // Populated only when the regularizer is active and the penalized objective is
+        // the trace convergence was actually judged on.
+        objective_trace: if nn_reg.is_active() {
+            obj_trace
+        } else {
+            Vec::new()
+        },
         eta_means,
         eta_covs,
         kappa_means,

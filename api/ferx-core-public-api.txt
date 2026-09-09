@@ -3262,7 +3262,7 @@ pub fn ferx_core::parser::model_parser::ThetaBlocks::is_empty(&self) -> bool
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_blocks(&self) -> &[ferx_core::parser::model_parser::LevelBlockDecl]
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_count(&self, name: &str) -> core::option::Option<usize>
 pub fn ferx_core::parser::model_parser::ThetaBlocks::unbound_level_blocks(&self) -> &[alloc::string::String]
-pub struct ferx_core::types::ViResult
+#[non_exhaustive] pub struct ferx_core::types::ViResult
 pub ferx_core::types::ViResult::converged: bool
 pub ferx_core::types::ViResult::data_term: f64
 pub ferx_core::types::ViResult::elbo_tightness_ratio: f64
@@ -4739,7 +4739,7 @@ pub fn ferx_core::parser::model_parser::ThetaBlocks::is_empty(&self) -> bool
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_blocks(&self) -> &[ferx_core::parser::model_parser::LevelBlockDecl]
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_count(&self, name: &str) -> core::option::Option<usize>
 pub fn ferx_core::parser::model_parser::ThetaBlocks::unbound_level_blocks(&self) -> &[alloc::string::String]
-pub struct ferx_core::ViResult
+#[non_exhaustive] pub struct ferx_core::ViResult
 pub ferx_core::ViResult::converged: bool
 pub ferx_core::ViResult::data_term: f64
 pub ferx_core::ViResult::elbo_tightness_ratio: f64

@@ -30,8 +30,15 @@ section of the SDLC for the versioning policy).
   split FOCE uses when it reports the clean OFV). This is what lets a regularized VI DCM
   settle and early-stop instead of burning the full `vi_iters` ceiling — judging on the
   clean bound would run to the ceiling as the two quantities drift apart. The penalized
-  objective is exposed as the new `vi.objective_trace` (equal to `elbo_trace` when no
-  regularization is active) (#1305).
+  objective is exposed as the new `vi.objective_trace`, populated only when regularization
+  is active — an empty/omitted trace is the sentinel for "identical to `elbo_trace`", so an
+  unregularized fit's result and YAML are unchanged. **Breaking for struct-literal
+  construction**: `ViResult` gained the `objective_trace` field and is now
+  `#[non_exhaustive]`, so downstream Rust code can no longer build or exhaustively match it
+  with a struct literal (its fields stay public to read, which is all the R wrapper and the
+  YAML/`FitResult` consumers do); making it `#[non_exhaustive]` keeps the next field
+  addition non-breaking. This is the breaking change that takes the workspace to `0.4.0`.
+  No effect on `.ferx` models, the CLI, or reading a fit result (#1305).
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences

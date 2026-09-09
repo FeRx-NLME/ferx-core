@@ -1707,17 +1707,27 @@ fn vi_objective_trace_is_the_penalized_objective() {
 }
 
 /// With no covariate-NN regularization the penalty is `0.0`, so the objective the
-/// convergence tests read is byte-for-byte the reported clean `−2·ELBO` bound — the
-/// guarantee that unregularized fits are entirely unaffected by this feature.
+/// convergence tests descend is byte-for-byte the clean `−2·ELBO` bound. Rather than
+/// store a duplicate of `elbo_trace`, that case is reported as an *empty*
+/// `objective_trace` — the sentinel for "identical to `elbo_trace`" (see
+/// `ViResult::objective_trace`). This is the guarantee that unregularized fits are
+/// entirely unaffected by this feature, and that a consumer can fall back to
+/// `elbo_trace` on an empty trace.
 #[cfg(feature = "nn")]
 #[test]
-fn vi_objective_trace_equals_the_clean_trace_when_unregularized() {
+fn vi_objective_trace_is_empty_sentinel_when_unregularized() {
     let (model, population, params) = dcm_fixture();
     // opts(5) leaves nn_l2 / nn_smooth at their 0.0 default.
     let out = run_vi(&model, &population, &params, &opts(5)).expect("VI runs");
     let vi = out.vi.as_ref().expect("vi result present");
-    assert_eq!(
-        vi.objective_trace, vi.elbo_trace,
-        "unregularized: the convergence trace must be the clean bound, byte for byte"
+    assert!(
+        vi.objective_trace.is_empty(),
+        "unregularized: objective_trace must be the empty \"same as elbo_trace\" sentinel, \
+         not a stored duplicate (got {} entries)",
+        vi.objective_trace.len()
+    );
+    assert!(
+        !vi.elbo_trace.is_empty(),
+        "the clean bound the sentinel points at must itself be present"
     );
 }
