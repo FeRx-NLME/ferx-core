@@ -31,7 +31,7 @@ section of the SDLC for the versioning policy).
   settle and early-stop instead of burning the full `vi_iters` ceiling — judging on the
   clean bound would run to the ceiling as the two quantities drift apart. The penalized
   objective is exposed as the new `vi.objective_trace` (equal to `elbo_trace` when no
-  regularization is active).
+  regularization is active) (#1305).
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences
