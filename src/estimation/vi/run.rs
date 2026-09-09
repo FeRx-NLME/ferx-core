@@ -31,6 +31,7 @@
 use nalgebra::DVector;
 
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::nn_reg::NnRegularizer;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params,
@@ -149,6 +150,31 @@ fn max_relative_change(a: &[f64], b: &[f64]) -> f64 {
 /// separately.
 fn estimates_have_settled(x: &[f64], prev_x: &[f64], phi: &[f64], prev_phi: &[f64]) -> bool {
     max_relative_change(x, prev_x).max(max_relative_change(phi, prev_phi)) < PARAM_SETTLE_REL_TOL
+}
+
+/// Fold the covariate-NN (DCM) penalty gradient into the packed `−ELBO` gradient.
+///
+/// `grad_x` is `∂(−ELBO)/∂x` on the 1× (`−ELBO`) scale; [`NnRegularizer`] defines its
+/// penalty on the `−2LL` scale — the FOCE-family optimizers minimize `2·nll + penalty` —
+/// so the penalty gradient enters at **½**. That factor is what makes a given `nn_l2` /
+/// `nn_smooth` mean the *same thing* under VI as under FOCEI, rather than differing by 2×.
+///
+/// The penalty reads the weights straight out of `x`: NN weights are identity-packed (the
+/// parser gives them `theta_lower = −∞`), so a packed coordinate *is* the natural weight
+/// and `add_packed_gradient` writes to the matching packed index. `scratch` is a reusable
+/// buffer the size of `x` (or empty when the regularizer is inactive). Returns the penalty
+/// value; a strict no-op leaving `grad_x` untouched when the regularizer is inactive, so an
+/// unregularized fit is byte-identical.
+fn fold_nn_penalty(reg: &NnRegularizer, x: &[f64], grad_x: &mut [f64], scratch: &mut [f64]) -> f64 {
+    if !reg.is_active() {
+        return 0.0;
+    }
+    scratch.iter_mut().for_each(|g| *g = 0.0);
+    let penalty = reg.penalty_and_gradient(x, scratch);
+    for (g, s) in grad_x.iter_mut().zip(scratch.iter()) {
+        *g += 0.5 * s;
+    }
+    penalty
 }
 
 /// Whether the parameter-stability criterion means anything for this model.
@@ -652,10 +678,37 @@ pub fn run_vi(
                 .to_string(),
         );
     }
+    // Two traces, one per iteration. `trace` is the clean, reported `−2·ELBO` bound
+    // (`elbo_trace` on the result); `obj_trace` is the quantity the optimizer actually
+    // descends, `−2·ELBO + penalty`, and is what every convergence/early-stop predicate
+    // reads. They are identical when the regularizer is inactive, so an unregularized fit
+    // sees byte-identical convergence behaviour and reports the same trace.
     let mut trace: Vec<f64> = Vec::with_capacity(n_iters);
+    let mut obj_trace: Vec<f64> = Vec::with_capacity(n_iters);
     let mut n_fd_subjects = 0usize;
     let mut n_kl_fallback_subjects = 0usize;
     let verbose = options.verbose;
+
+    // Covariate-NN (DCM) regularization: the same `nn_l2` / `nn_smooth` penalty the
+    // FOCE-family outer optimizers apply, now applied to VI's Adam-stepped objective.
+    // Built once and shared across every iteration, exactly as `outer_optimizer` builds
+    // it. Inactive (a strict no-op that leaves both traces and every gradient
+    // byte-identical) unless a λ is positive and the model has a `[covariate_nn]` block.
+    //
+    // Why it matters here beyond the statistics: an unregularized DCM has exact
+    // permutation / layer-scale weight symmetries, so `x` drifts along those ridges
+    // forever and the parameter criterion cannot settle — the run always burns the full
+    // `vi_iters` ceiling. A positive `nn_l2` pins the ridge and the penalized objective
+    // (`obj_trace`) reaches a genuine minimum, so `trace_has_settled` fires the early
+    // stop. It is the *objective* criterion on the penalized trace — not
+    // `estimates_have_settled` — that does this: the weights `x` settle, but the
+    // per-subject variational parameters `φ` need not reach the parameter tolerance on
+    // weakly-identified DCM data, so the parameter criterion alone would keep resetting.
+    let nn_reg = NnRegularizer::build(model, population, options);
+    // Scratch for the penalty gradient, sized to the packed vector so an NN weight's
+    // (identity-packed) theta coordinate is the same index in both. Only allocated when
+    // the regularizer is active.
+    let mut grad_pen = vec![0.0; if nn_reg.is_active() { x.len() } else { 0 }];
 
     for iter in 0..n_iters {
         let eval = population_neg_elbo(
@@ -683,6 +736,17 @@ pub fn run_vi(
         }
 
         let mut grad_x = eval.grad_x.clone();
+        // Fold the covariate-NN (DCM) penalty gradient into `grad_x` before any other
+        // treatment of it, and record the penalty on the objective trace. `trace` (above)
+        // deliberately stays the clean `−2·ELBO` bound the result reports; `obj_trace` is
+        // the penalized objective the optimizer actually descends, on the same `−2·ELBO`
+        // scale — the penalty value is already `−2LL`-scaled (the ½ inside `fold_nn_penalty`
+        // is only because `grad_x` is on the 1× `−ELBO` scale), so it adds directly with no
+        // factor. Convergence is judged on `obj_trace`; the clean bound is only reported —
+        // the same split FOCE uses when it reports the clean OFV while converging on the
+        // penalized one. Inactive ⇒ penalty is `0.0` ⇒ `obj_trace == trace`.
+        let penalty = fold_nn_penalty(&nn_reg, &x, &mut grad_x, &mut grad_pen);
+        obj_trace.push(2.0 * eval.neg_elbo + penalty);
         zero_fixed_coords(&mut grad_x, init_params, &layout);
         if options.vi_omega_update == ViOmegaUpdate::ClosedForm {
             // Ω is set analytically below; stepping it here as well would apply the
@@ -781,7 +845,11 @@ pub fn run_vi(
 
         if settled_at.is_none() && iter < avg_start && (iter + 1) % CONVERGENCE_CHECK_INTERVAL == 0
         {
-            if trace_has_settled(&trace, settle_window(trace.len()), CONVERGENCE_REL_TOL) {
+            if trace_has_settled(
+                &obj_trace,
+                settle_window(obj_trace.len()),
+                CONVERGENCE_REL_TOL,
+            ) {
                 consecutive_settled += 1;
             } else {
                 // Must be *consecutive*: one settled window followed by a moving one
@@ -934,7 +1002,25 @@ pub fn run_vi(
     // 25 000 long would make `trace_has_settled` return `false` for every early stop.
     let mut converged = settled_at.is_some()
         || param_settled
-        || trace_has_settled(&trace, settle_window(n_iters_run), CONVERGENCE_REL_TOL);
+        || trace_has_settled(&obj_trace, settle_window(n_iters_run), CONVERGENCE_REL_TOL);
+
+    // Which trace the convergence checks below actually inspected, for the diagnostics
+    // to name. It is `obj_trace` throughout; under regularization that is the penalized
+    // objective (reported as `vi.objective_trace`), which drifts apart from the clean
+    // `vi.elbo_trace` — so a warning that told the user to inspect the ELBO would point
+    // at a trace that does not support the verdict. Unregularized, the two coincide and
+    // `vi.objective_trace` is not emitted, so name `vi.elbo_trace`.
+    let reg_active = nn_reg.is_active();
+    let judged_trace_name = if reg_active {
+        "vi.objective_trace"
+    } else {
+        "vi.elbo_trace"
+    };
+    let judged_trace_noun = if reg_active {
+        "the penalized objective trace"
+    } else {
+        "the ELBO trace"
+    };
 
     // A stop the noise floor caused rather than the optimum. `trace_has_settled` asks
     // whether the remaining drift is distinguishable from Monte-Carlo noise; at a low
@@ -945,15 +1031,15 @@ pub fn run_vi(
     // irrelevant. A warning either way — the numbers are not wrong, they are unfinished —
     // but `converged` must not say otherwise.
     let mut noise_floor_stop = false;
-    if converged && !param_settled && trace_still_drifting(&trace, settle_window(n_iters_run)) {
+    if converged && !param_settled && trace_still_drifting(&obj_trace, settle_window(n_iters_run)) {
         converged = false;
         noise_floor_stop = true;
         warnings.push(format!(
             "VI: the objective stopped because its drift fell below the Monte-Carlo noise \
-             floor at vi_mc_samples = {}, not because it reached the optimum — the ELBO trace \
-             is still falling systematically. Reported converged: false. Raise vi_mc_samples \
-             (32 recovers the FOCEI/AGQ reference on warfarin, where the default 8 leaves sigma \
-             34% high and the OFV 11.3 units short), or lower vi_lr.",
+             floor at vi_mc_samples = {}, not because it reached the optimum — {judged_trace_noun} \
+             ({judged_trace_name}) is still falling systematically. Reported converged: false. \
+             Raise vi_mc_samples (32 recovers the FOCEI/AGQ reference on warfarin, where the \
+             default 8 leaves sigma 34% high and the OFV 11.3 units short), or lower vi_lr.",
             options.vi_mc_samples
         ));
     }
@@ -982,7 +1068,7 @@ pub fn run_vi(
     if needs_iteration_budget_warning(converged, noise_floor_stop, bad_basin_stop) {
         warnings.push(format!(
             "VI: neither the objective nor the parameter estimates had settled after \
-             {n_iters_run} iterations (see vi.elbo_trace). Increase vi_iters, or lower \
+             {n_iters_run} iterations (see {judged_trace_name}). Increase vi_iters, or lower \
              vi_lr if the trace is oscillating."
         ));
     }
@@ -1079,6 +1165,16 @@ pub fn run_vi(
         .to_string(),
         n_kl_fallback_subjects,
         elbo_trace: trace,
+        // Empty is the canonical "identical to elbo_trace" sentinel (see
+        // `ViResult::objective_trace`): an unregularized fit descends the clean bound
+        // itself, so `obj_trace == trace` and we store nothing rather than a duplicate.
+        // Populated only when the regularizer is active and the penalized objective is
+        // the trace convergence was actually judged on.
+        objective_trace: if nn_reg.is_active() {
+            obj_trace
+        } else {
+            Vec::new()
+        },
         eta_means,
         eta_covs,
         kappa_means,

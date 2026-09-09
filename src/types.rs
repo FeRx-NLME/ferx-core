@@ -5166,6 +5166,7 @@ pub struct PosteriorSummary {
 /// without the model fitting any better. Use [`FitOptions::vi_final_ofv`], or a
 /// `methods = vi, imp` chain, to obtain a genuine marginal likelihood.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[non_exhaustive]
 pub struct ViResult {
     /// `−2 × ELBO` at the reported (Polyak-averaged) estimate. Scaled by `−2` so
     /// it moves in the same direction as an OFV; see the type docs for why it is
@@ -5180,8 +5181,14 @@ pub struct ViResult {
     /// the `vi_iters` ceiling. Always equal to `elbo_trace.len()`.
     pub n_iterations: usize,
     /// Whether the objective had settled by the end of the run, judged on a
-    /// **moving average** of the ELBO rather than a single-iteration change (the
-    /// objective is a Monte-Carlo estimate, so per-iteration deltas are noise).
+    /// **moving average** rather than a single-iteration change (the objective is a
+    /// Monte-Carlo estimate, so per-iteration deltas are noise). The trace it is
+    /// judged on is the one the optimizer actually descended: the clean `−2·ELBO`
+    /// ([`elbo_trace`](Self::elbo_trace)) for an unregularized fit, and the penalized
+    /// [`objective_trace`](Self::objective_trace) when covariate-NN regularization
+    /// (`nn_l2` / `nn_smooth`) is active — where the clean bound can keep drifting
+    /// after the penalized objective has settled, so judging on the ELBO would report
+    /// a converged DCM as unconverged.
     ///
     /// This is the same predicate that stops the run, so `false` means the fit reached
     /// the `vi_iters` ceiling while still moving — a result to re-run, not to report.
@@ -5198,6 +5205,26 @@ pub struct ViResult {
     pub n_kl_fallback_subjects: usize,
     /// Per-iteration `−2 × ELBO`, for convergence plots.
     pub elbo_trace: Vec<f64>,
+    /// Per-iteration value of the objective the optimizer actually minimized:
+    /// `−2 × ELBO + covariate-NN penalty` (the `nn_l2` / `nn_smooth` penalty on the
+    /// same `−2LL` scale). This — not [`elbo_trace`](Self::elbo_trace) — is what the
+    /// convergence and early-stopping tests read, because a regularized fit descends
+    /// the penalized objective while [`elbo_trace`](Self::elbo_trace) reports only the
+    /// clean bound; judging convergence on the bound would let a DCM run to the
+    /// `vi_iters` ceiling as the two quantities drift apart.
+    ///
+    /// **Empty means "identical to [`elbo_trace`](Self::elbo_trace)".** An
+    /// unregularized fit descends the clean bound itself, so its penalized objective
+    /// equals `elbo_trace` element for element; rather than store a duplicate, that
+    /// case is encoded as an empty vector, which is also what a result serialized
+    /// before this field existed deserializes to (`#[serde(default)]`). So a consumer
+    /// reads `objective_trace` when it is non-empty and falls back to `elbo_trace`
+    /// otherwise — the YAML writer omits the field entirely in the empty case rather
+    /// than emitting a null block. A non-empty `objective_trace` appears only when
+    /// covariate-NN regularization (`nn_l2` / `nn_smooth` with a `[covariate_nn]`
+    /// block) makes it genuinely differ from the clean bound.
+    #[serde(default)]
+    pub objective_trace: Vec<f64>,
     /// Per-subject variational posterior means — VI's analogue of the EBEs, and
     /// what is reported as `eta_hat`.
     pub eta_means: Vec<Vec<f64>>,

@@ -368,9 +368,14 @@ analytic gradients (no autodiff — the smoothness term reuses the MLP's
 analytic Jacobian) and, where the optimizer uses one, the penalty's
 curvature in the Hessian. They apply across the **FOCE-family** methods
 — `foce`, `focei`, `laplace` (every outer optimizer: NLopt, built-in
-BFGS, trust-region) and `gn` / `gn_hybrid`. SAEM, IMP/IMPMAP, Bayes and
-VI do not apply them; setting either key with one of those as the final
-stage produces a warning and an unregularized fit.
+BFGS, trust-region) and `gn` / `gn_hybrid` — and under **`vi`**, which
+folds the same penalty gradient into its Adam step on the same scale, so
+a given `nn_l2` matches its FOCEI meaning. Under `vi` the penalty also
+breaks the network's permutation/scale weight symmetry, so a regularized
+DCM settles and early-stops instead of running the full `vi_iters`
+ceiling an unregularized one would. SAEM, IMP/IMPMAP and Bayes do not
+apply them; setting either key with one of those as the final stage
+produces a warning and an unregularized fit.
 
 The **reported** `fit$ofv` (and hence AIC/BIC) is the **unpenalized**
 −2·log-likelihood, so a regularized DCM stays directly comparable to an

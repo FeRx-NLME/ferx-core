@@ -20,6 +20,25 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
+  same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
+  `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
+  no longer warns that it is). The penalty enters VI's objective on the same scale as
+  FOCEI, so a given `nn_l2` means the same thing under both. Convergence and early
+  stopping are judged on the **penalized** objective the optimizer actually descends,
+  while the reported `vi.elbo_trace` and OFV stay the clean, penalty-free bound (the
+  split FOCE uses when it reports the clean OFV). This is what lets a regularized VI DCM
+  settle and early-stop instead of burning the full `vi_iters` ceiling — judging on the
+  clean bound would run to the ceiling as the two quantities drift apart. The penalized
+  objective is exposed as the new `vi.objective_trace`, populated only when regularization
+  is active — an empty/omitted trace is the sentinel for "identical to `elbo_trace`", so an
+  unregularized fit's result and YAML are unchanged. **Breaking for struct-literal
+  construction**: `ViResult` gained the `objective_trace` field and is now
+  `#[non_exhaustive]`, so downstream Rust code can no longer build or exhaustively match it
+  with a struct literal (its fields stay public to read, which is all the R wrapper and the
+  YAML/`FitResult` consumers do); making it `#[non_exhaustive]` keeps the next field
+  addition non-breaking. This is the breaking change that takes the workspace to `0.4.0`.
+  No effect on `.ferx` models, the CLI, or reading a fit result (#1305).
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences

@@ -1426,3 +1426,308 @@ fn vi_grad_clip_reaches_the_adam_config() {
         1.0
     );
 }
+
+// ---------------------------------------------------------------------------
+// Covariate-NN (DCM) regularization
+// ---------------------------------------------------------------------------
+
+/// A 1-cpt oral DCM: a `[covariate_nn]` maps (WT, CRCL) → (CL, V), with two
+/// standalone etas and proportional error. The returned params seat the network
+/// at physiologically sane, **non-zero** weights (CL ≈ 1, V ≈ 20, everything
+/// else jittered off any symmetric point) — the parser's default biases give
+/// `softplus(0) = 0.69` for every output, which is both a bad start and a
+/// near-degenerate weight vector the L2 penalty would have almost nothing to
+/// pull on.
+#[cfg(feature = "nn")]
+fn dcm_fixture() -> (CompiledModel, Population, ModelParameters) {
+    let src = r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [3]
+  activation = tanh
+  output = softplus
+  center = [70, 90]
+  scale  = [15, 30]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+    let model = crate::parser::model_parser::parse_model_string(src).expect("DCM fixture parses");
+    let mut params = model.default_params.clone();
+    for nn in &model.covariate_nns {
+        let off = nn.weights_offset;
+        let n_w = nn.mapper.mlp().n_weights();
+        for j in 0..n_w {
+            params.theta[off + j] += 0.05 * ((j as f64 + 1.0) * 0.7).sin();
+        }
+        // softplus(z) ≈ z in the linear regime, so the output bias ≈ the value.
+        for (k, target) in [0.55f64, 20.0].iter().enumerate() {
+            params.theta[off + nn.mapper.mlp().output_bias_index(k)] = *target;
+        }
+    }
+
+    let subj = |id: &str, wt: f64, crcl: f64| {
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), wt);
+        cov.insert("CRCL".to_string(), crcl);
+        Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0, 12.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![7.5, 6.0, 3.8, 2.1],
+            obs_cmts: vec![1, 1, 1, 1],
+            covariates: cov,
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 4],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+    let population = Population {
+        subjects: vec![
+            subj("1", 72.0, 95.0),
+            subj("2", 60.0, 80.0),
+            subj("3", 85.0, 110.0),
+        ],
+        covariate_names: vec!["WT".into(), "CRCL".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    (model, population, params)
+}
+
+/// The packed indices of every NN weight coordinate.
+#[cfg(feature = "nn")]
+fn nn_weight_indices(model: &CompiledModel) -> Vec<usize> {
+    model
+        .covariate_nns
+        .iter()
+        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.mapper.mlp().n_weights())
+        .collect()
+}
+
+/// `fold_nn_penalty` adds **exactly half** the penalty gradient, and only at the
+/// NN-weight coordinates. The ½ is the scale reconciliation between VI's 1×
+/// `−ELBO` gradient and the regularizer's `−2LL`-scale penalty (`2·nll + penalty`,
+/// as FOCE applies it); a change to the factor, the sign, or the index mapping
+/// reddens this. The base gradient is deliberately non-zero so a dropped fold
+/// cannot hide behind zeros, and non-weight coordinates are pinned to prove the
+/// penalty touches nothing else.
+#[cfg(feature = "nn")]
+#[test]
+fn fold_nn_penalty_adds_half_the_penalty_gradient_only_at_weight_coords() {
+    let (model, population, params) = dcm_fixture();
+    let x = pack_params(&params);
+    let n = x.len();
+
+    let o = FitOptions {
+        nn_l2_lambda: 0.3,
+        nn_smooth_lambda: 0.2,
+        ..Default::default()
+    };
+    let reg = NnRegularizer::build(&model, &population, &o);
+    assert!(
+        reg.is_active(),
+        "positive λ + a [covariate_nn] block is active"
+    );
+
+    // Independent reference for the penalty gradient and value.
+    let mut pen_grad = vec![0.0; n];
+    let pen_val = reg.penalty_and_gradient(&x, &mut pen_grad);
+    assert!(
+        pen_val > 0.0,
+        "the probe must have non-zero weights, else the penalty is a no-op and proves nothing"
+    );
+
+    let weights: std::collections::HashSet<usize> = nn_weight_indices(&model).into_iter().collect();
+    // The penalty gradient must be zero *off* the weight block — the fold relies on it.
+    for (i, &g) in pen_grad.iter().enumerate() {
+        if !weights.contains(&i) {
+            assert_eq!(g, 0.0, "penalty gradient leaked onto non-weight coord {i}");
+        }
+    }
+
+    let base: Vec<f64> = (0..n).map(|i| 0.1 * (i as f64 + 1.0)).collect();
+    let mut grad = base.clone();
+    let mut scratch = vec![0.0; n];
+    let got_val = fold_nn_penalty(&reg, &x, &mut grad, &mut scratch);
+
+    assert_eq!(
+        got_val, pen_val,
+        "returned penalty value must match the reference"
+    );
+    for i in 0..n {
+        let expected = base[i] + 0.5 * pen_grad[i];
+        assert!(
+            (grad[i] - expected).abs() < 1e-12,
+            "coord {i}: got {}, expected {expected}",
+            grad[i]
+        );
+        if !weights.contains(&i) {
+            assert_eq!(grad[i], base[i], "non-weight coord {i} must be untouched");
+        }
+    }
+}
+
+/// The inactive regularizer (λ = 0) is a strict no-op: it returns `0.0` and
+/// leaves the gradient byte-identical, which is what keeps an unregularized VI
+/// fit's trace and every step exactly as it was before this feature.
+#[cfg(feature = "nn")]
+#[test]
+fn fold_nn_penalty_is_a_strict_noop_when_inactive() {
+    let (model, population, params) = dcm_fixture();
+    let x = pack_params(&params);
+    let reg = NnRegularizer::build(&model, &population, &FitOptions::default());
+    assert!(!reg.is_active(), "λ = 0 must be inactive");
+
+    let base: Vec<f64> = (0..x.len()).map(|i| 0.1 * (i as f64 + 1.0)).collect();
+    let mut grad = base.clone();
+    // An empty scratch is fine: the inactive path returns before touching it.
+    let val = fold_nn_penalty(&reg, &x, &mut grad, &mut []);
+    assert_eq!(val, 0.0);
+    assert_eq!(grad, base, "inactive fold must not move the gradient");
+}
+
+/// End-to-end proof that `run_vi` actually applies the penalty (not just that the
+/// helper is correct): a large `nn_l2` drives the network weights toward zero, so
+/// the fitted weight-block norm is strictly below the unregularized run's from the
+/// same start and seed. This is the side of the twin that dies if the
+/// `fold_nn_penalty` call is deleted from the loop; the sign matters too — a
+/// wrong sign would *grow* the norm.
+#[cfg(feature = "nn")]
+#[test]
+fn vi_nn_l2_shrinks_the_network_weights() {
+    let (model, population, params) = dcm_fixture();
+    let weights = nn_weight_indices(&model);
+    let norm = |p: &ModelParameters| -> f64 {
+        weights
+            .iter()
+            .map(|&i| p.theta[i] * p.theta[i])
+            .sum::<f64>()
+            .sqrt()
+    };
+    let start = norm(&params);
+    assert!(start > 0.0, "the probe weights must start non-zero");
+
+    let unreg = run_vi(&model, &population, &params, &opts(60)).expect("unregularized VI runs");
+
+    let mut reg_opts = opts(60);
+    // Large enough that the L2 gradient (`2·λ·w`) dominates the sign of every weight
+    // coordinate, so Adam steps each one toward zero every iteration.
+    reg_opts.nn_l2_lambda = 50.0;
+    let reg = run_vi(&model, &population, &params, &reg_opts).expect("regularized VI runs");
+
+    let (u, r) = (norm(&unreg.params), norm(&reg.params));
+    assert!(
+        r < u,
+        "regularized weight norm ({r:.4}) must fall below the unregularized norm ({u:.4}); \
+         start was {start:.4}"
+    );
+    assert!(
+        r < start,
+        "regularization must pull the weight norm below its start ({start:.4})"
+    );
+}
+
+/// `objective_trace` is the penalized objective the optimizer descends and the
+/// convergence tests read — `−2·ELBO + penalty` on the −2LL scale. The first entry is
+/// evaluated at the known starting point, so its gap above the clean `elbo_trace` must
+/// equal the penalty at that point *exactly*: this pins the scale (a direct add, no ½ —
+/// the ½ in `fold_nn_penalty` only reconciles `grad_x`'s 1× scale) and that convergence
+/// is judged on the penalized quantity, not the reported bound. Without this split a
+/// regularized DCM runs to the `vi_iters` ceiling because the two quantities drift apart.
+#[cfg(feature = "nn")]
+#[test]
+fn vi_objective_trace_is_the_penalized_objective() {
+    let (model, population, params) = dcm_fixture();
+    let mut x0 = pack_params(&params);
+    clamp_to_bounds(&mut x0, &compute_bounds(&params));
+
+    let o = FitOptions {
+        nn_l2_lambda: 1e-2,
+        nn_smooth_lambda: 5e-2,
+        ..opts(5)
+    };
+    let out = run_vi(&model, &population, &params, &o).expect("regularized VI runs");
+    let vi = out.vi.as_ref().expect("vi result present");
+
+    assert_eq!(
+        vi.objective_trace.len(),
+        vi.elbo_trace.len(),
+        "the two traces are pushed once per iteration, so they must have equal length"
+    );
+
+    let reg = NnRegularizer::build(&model, &population, &o);
+    let penalty0 = reg.penalty_value(&x0);
+    assert!(
+        penalty0 > 0.0,
+        "the probe weights must make the penalty live"
+    );
+    let gap0 = vi.objective_trace[0] - vi.elbo_trace[0];
+    assert!(
+        (gap0 - penalty0).abs() < 1e-9,
+        "iter-0 penalized−clean gap ({gap0}) must equal the penalty at the start ({penalty0})"
+    );
+
+    // The penalty is non-negative, and strictly positive while weights are non-zero, so
+    // the objective the stopping predicate reads sits above the reported bound throughout.
+    for (obj, elbo) in vi.objective_trace.iter().zip(vi.elbo_trace.iter()) {
+        assert!(
+            obj > elbo,
+            "objective ({obj}) must exceed the clean bound ({elbo})"
+        );
+    }
+}
+
+/// With no covariate-NN regularization the penalty is `0.0`, so the objective the
+/// convergence tests descend is byte-for-byte the clean `−2·ELBO` bound. Rather than
+/// store a duplicate of `elbo_trace`, that case is reported as an *empty*
+/// `objective_trace` — the sentinel for "identical to `elbo_trace`" (see
+/// `ViResult::objective_trace`). This is the guarantee that unregularized fits are
+/// entirely unaffected by this feature, and that a consumer can fall back to
+/// `elbo_trace` on an empty trace.
+#[cfg(feature = "nn")]
+#[test]
+fn vi_objective_trace_is_empty_sentinel_when_unregularized() {
+    let (model, population, params) = dcm_fixture();
+    // opts(5) leaves nn_l2 / nn_smooth at their 0.0 default.
+    let out = run_vi(&model, &population, &params, &opts(5)).expect("VI runs");
+    let vi = out.vi.as_ref().expect("vi result present");
+    assert!(
+        vi.objective_trace.is_empty(),
+        "unregularized: objective_trace must be the empty \"same as elbo_trace\" sentinel, \
+         not a stored duplicate (got {} entries)",
+        vi.objective_trace.len()
+    );
+    assert!(
+        !vi.elbo_trace.is_empty(),
+        "the clean bound the sentinel points at must itself be present"
+    );
+}
