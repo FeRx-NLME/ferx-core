@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
+  same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
+  `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
+  no longer warns that it is). The penalty enters VI's objective on the same scale as
+  FOCEI, so a given `nn_l2` means the same thing under both. Convergence and early
+  stopping are judged on the **penalized** objective the optimizer actually descends,
+  while the reported `vi.elbo_trace` and OFV stay the clean, penalty-free bound (the
+  split FOCE uses when it reports the clean OFV). This is what lets a regularized VI DCM
+  settle and early-stop instead of burning the full `vi_iters` ceiling — judging on the
+  clean bound would run to the ceiling as the two quantities drift apart. The penalized
+  objective is exposed as the new `vi.objective_trace` (equal to `elbo_trace` when no
+  regularization is active).
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences

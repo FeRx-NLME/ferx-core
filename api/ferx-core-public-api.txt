@@ -3278,6 +3278,7 @@ pub ferx_core::types::ViResult::n_iterations: usize
 pub ferx_core::types::ViResult::n_kl_fallback_subjects: usize
 pub ferx_core::types::ViResult::n_mc_samples: usize
 pub ferx_core::types::ViResult::neg_two_elbo: f64
+pub ferx_core::types::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::types::ViResult::superseded_by: core::option::Option<alloc::string::String>
 pub struct ferx_core::types::WarningEntry
 pub ferx_core::types::WarningEntry::category: ferx_core::WarningCode
@@ -4754,6 +4755,7 @@ pub ferx_core::ViResult::n_iterations: usize
 pub ferx_core::ViResult::n_kl_fallback_subjects: usize
 pub ferx_core::ViResult::n_mc_samples: usize
 pub ferx_core::ViResult::neg_two_elbo: f64
+pub ferx_core::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::ViResult::superseded_by: core::option::Option<alloc::string::String>
 pub struct ferx_core::WarningEntry
 pub ferx_core::WarningEntry::category: ferx_core::WarningCode

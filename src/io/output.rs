@@ -2407,6 +2407,16 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         for t in &v.elbo_trace {
             writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
         }
+        // The penalized objective the optimizer actually minimized (and judged
+        // convergence on) — equal to `elbo_trace` unless covariate-NN regularization is
+        // active. Emitted only when it differs, so an unregularized fit's YAML is
+        // unchanged.
+        if v.objective_trace != v.elbo_trace {
+            writeln!(f, "  objective_trace:").map_err(|e| e.to_string())?;
+            for t in &v.objective_trace {
+                writeln!(f, "    - {:.6}", t).map_err(|e| e.to_string())?;
+            }
+        }
 
         // Per-subject variational posterior. This is the object VI produces that no other
         // method here does — FOCE and Laplace need a Hessian for the covariance — so it is
@@ -4022,6 +4032,7 @@ mod tests {
             kl: "analytic".into(),
             n_kl_fallback_subjects: 0,
             elbo_trace: vec![1.0, 0.5],
+            objective_trace: vec![1.0, 0.5],
             eta_means: vec![vec![0.25, -0.5], vec![-0.125, 0.75]],
             // Deliberately non-diagonal: a diagonal-only emission would pass a
             // weaker test and would discard what a full-rank family is for.
@@ -4093,6 +4104,7 @@ mod tests {
             kl: "analytic".into(),
             n_kl_fallback_subjects: 0,
             elbo_trace: vec![1.0],
+            objective_trace: vec![1.0],
             eta_means: ids.iter().map(|_| vec![0.0]).collect(),
             eta_covs: ids.iter().map(|_| vec![vec![0.01]]).collect(),
             kappa_means: ids.iter().map(|_| Vec::new()).collect(),

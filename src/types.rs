@@ -5198,6 +5198,20 @@ pub struct ViResult {
     pub n_kl_fallback_subjects: usize,
     /// Per-iteration `−2 × ELBO`, for convergence plots.
     pub elbo_trace: Vec<f64>,
+    /// Per-iteration value of the objective the optimizer actually minimized:
+    /// `−2 × ELBO + covariate-NN penalty` (the `nn_l2` / `nn_smooth` penalty on the
+    /// same `−2LL` scale). This — not [`elbo_trace`](Self::elbo_trace) — is what the
+    /// convergence and early-stopping tests read, because a regularized fit descends
+    /// the penalized objective while [`elbo_trace`](Self::elbo_trace) reports only the
+    /// clean bound; judging convergence on the bound would let a DCM run to the
+    /// `vi_iters` ceiling as the two quantities drift apart. Identical to
+    /// [`elbo_trace`](Self::elbo_trace), element for element, whenever no covariate-NN
+    /// regularization is active (`nn_l2 = nn_smooth = 0`, or no `[covariate_nn]` block).
+    ///
+    /// `#[serde(default)]` so a result serialized before this field existed still
+    /// deserializes (with an empty trace).
+    #[serde(default)]
+    pub objective_trace: Vec<f64>,
     /// Per-subject variational posterior means — VI's analogue of the EBEs, and
     /// what is reported as `eta_hat`.
     pub eta_means: Vec<Vec<f64>>,
