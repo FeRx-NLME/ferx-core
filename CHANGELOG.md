@@ -20,6 +20,7 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+
 - **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles
   its `½·log|H̃|` grid-response gradient term analytically instead of rebuilding the anchor at
   `x ± h` for every free population parameter.** `H̃` is bilinear in first-order prediction
@@ -39,6 +40,8 @@ section of the SDLC for the versioning policy).
   anchor gained the same analytic route for closed-form and **ODE** models (opt-in via
   `FERX_AGQ_GRID_RESPONSE=analytic` — no repeatable wall-clock win was measured there, so it
   is not the default; its value is an exact, FD-noise-free gradient) (#251).
+
+- **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
 
 ### Added
 - **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or

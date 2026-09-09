@@ -3190,26 +3190,27 @@ fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subject) -> bool 
     modeled_doses_resolvable(model, subject)
 }
 
-/// True when this subject combines a **steady-state dose with a lagtime** on the event walk,
-/// which the dual walk does not serve yet (#486).
+/// True when this subject combines a **steady-state infusion with a lagtime** on the event walk.
 ///
-/// Production loads a lagged SS dose's periodic trough at the dose **record** and lets the
-/// walk carry it to the lagged arrival (#1121, `EventKind::DoseRecord` in
-/// `pk::event_driven`); `event_driven_sens_with_doses_g` has no dual twin of that seed — it
-/// still equilibrates at the arrival, with no pre-arrival state at all. So the dual walk
-/// disagrees with production in **value**, not merely in derivative, and this stays a hard
-/// decline to FD rather than an approximation.
+/// Production loads a lagged SS dose's periodic state at the dose **record** and lets the walk
+/// carry it to the lagged arrival (#1121, `EventKind::DoseRecord` in
+/// `pk::event_driven`). The dual walk now mirrors that seed for boluses. An infusion also has
+/// a previous-cycle residual rate window after the record; until that forcing is dualized, it
+/// remains a hard decline to FD rather than an approximation.
 ///
-/// Before #1121 the same decline was justified by a different construct: production patched
-/// the pre-arrival *predictions* after the walk rather than seeding its state. That overlay is
-/// gone, and with it the reason the gate was worded around a post-hoc pass — but the gap it
-/// stood for is the same one, so the gate is unchanged. Giving `propagate_g` a `K_SS_SEED`
-/// analogue would let it be lifted; that is tracked separately, not smuggled in here.
-///
-/// (The CF *static* superposition path does serve SS × lagtime, via `lagged_elapsed`'s
-/// pre-arrival wrap — only the walk is affected.)
+/// This gate is consulted from the four **walk** entry points only, so widening it leaves the
+/// CF *static* superposition path alone — that path reaches SS × lagtime without passing here.
+/// Do not read that as the static path being correct. `lagged_elapsed` still implements the
+/// pre-#1121 semantics on both sides of the arrival: it *wraps* the pre-arrival phase where
+/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
+/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and it always takes the collapsed
+/// `C_ss(t − t_eff)` where production splits into tail + arrival once
+/// `!crate::dosing::ss_arrival_is_trough`. Both divergences are confined to `ALAG > II`, where
+/// `subject_sensitivities` returns `Some` on predictions measured up to ~19 % from
+/// production's. Pre-existing, and untouched by #1311, which changes the walk alone; it needs
+/// its own fix and its own anchor.
 fn ss_lagtime_walk_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
-    model.has_lagtime() && subject.doses.iter().any(|d| d.ss)
+    model.has_lagtime() && subject.doses.iter().any(|d| d.ss && d.is_infusion())
 }
 
 /// Per-dose lagtime **values** for the event schedule (`τ_k = t_k + ALAG`), read from each
