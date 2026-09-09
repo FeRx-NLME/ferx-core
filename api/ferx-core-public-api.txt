@@ -1576,6 +1576,7 @@ impl<const N: usize> core::ops::arith::Sub for ferx_core::sens::dual1::Dual1<N>
 pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
 pub fn ferx_core::sens::dual1::Dual1<N>::sub(self, rhs: Self) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
+pub const ferx_core::sens::dual1::Dual1<N>::N_AXES: usize
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
@@ -1637,6 +1638,7 @@ impl<const NA: usize, const N: usize> core::ops::arith::Sub for ferx_core::sens:
 pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sub(self, rhs: Self) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::N_AXES: usize
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
@@ -1657,6 +1659,7 @@ pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(
 pub mod ferx_core::sens::jet
 pub mod ferx_core::sens::num
 pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self>
+pub const ferx_core::sens::num::PkNum::N_AXES: usize
 pub const ferx_core::sens::num::PkNum::SECOND_ORDER: bool
 pub fn ferx_core::sens::num::PkNum::abs(self) -> Self
 pub fn ferx_core::sens::num::PkNum::acos(self) -> Self
@@ -1674,6 +1677,7 @@ pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
 pub fn ferx_core::sens::num::PkNum::val(self) -> f64
 pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
 impl ferx_core::sens::num::PkNum for f64
+pub const f64::N_AXES: usize
 pub const f64::SECOND_ORDER: bool
 pub fn f64::abs(self) -> Self
 pub fn f64::acos(self) -> Self
@@ -1691,6 +1695,7 @@ pub fn f64::sqrt(self) -> Self
 pub fn f64::val(self) -> f64
 pub fn f64::var(x: f64, _dim: usize) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
+pub const ferx_core::sens::dual1::Dual1<N>::N_AXES: usize
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
@@ -1708,6 +1713,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::val(self) -> f64
 pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::N_AXES: usize
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self

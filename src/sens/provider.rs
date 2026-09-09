@@ -122,6 +122,53 @@ pub(crate) fn obs_sens_from_dual2<const M: usize>(
     }
 }
 
+/// Column-chunked twin of [`obs_sens_from_dual2`]: the jet's θ axes are `theta_cols`
+/// (axis `c` ↔ `θ_{theta_cols[c]}`) and η sits on `theta_cols.len()..M`. Writes this
+/// chunk's θ columns into `into` when an earlier chunk built the observation (its η
+/// blocks are already there and identical — forward-mode axes never interact), else
+/// builds the observation afresh, η blocks included. With `theta_cols == 0..n_theta` the
+/// result is `obs_sens_from_dual2` entry for entry (#1300).
+pub(crate) fn obs_sens_scatter_cols<const M: usize>(
+    fd: &Dual2<M>,
+    theta_cols: &[usize],
+    n_theta: usize,
+    n_eta: usize,
+    into: Option<ObsSens>,
+) -> ObsSens {
+    let nc = theta_cols.len();
+    debug_assert_eq!(M, nc + n_eta);
+    let g = &fd.grad;
+    let h = &fd.hess;
+    let mut o = match into {
+        Some(o) => o,
+        None => {
+            let mut df_deta = vec![0.0; n_eta];
+            let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+            for k in 0..n_eta {
+                df_deta[k] = g[nc + k];
+                for l in 0..n_eta {
+                    d2f_deta2[k * n_eta + l] = h[nc + k][nc + l];
+                }
+            }
+            ObsSens {
+                f: fd.value,
+                df_deta,
+                d2f_deta2,
+                df_dtheta: vec![0.0; n_theta],
+                d2f_deta_dtheta: vec![0.0; n_eta * n_theta],
+                ..Default::default()
+            }
+        }
+    };
+    for (c, &m) in theta_cols.iter().enumerate() {
+        o.df_dtheta[m] = g[c];
+        for k in 0..n_eta {
+            o.d2f_deta_dtheta[k * n_theta + m] = h[nc + k][c];
+        }
+    }
+    o
+}
+
 /// Shared accessor letting the constant-`ScalarScale` divide run once over both the
 /// outer full-jet ([`ObsSens`]) and the inner η-grad ([`ObsGrad`]) observation types.
 /// `for_each_scaled_axis` visits every derivative the scale multiplies by `1/k`, in the
@@ -856,12 +903,17 @@ macro_rules! const_dispatch {
     };
 }
 
-/// Maximum `(θ, η)` axis count (`n_theta + n_eta`) for the TV-cov event-driven dual
-/// walk. The outer `run_obs_tvcov` (`m_dim`) and inner `run_obs_grad_tvcov` (`n_eta
-/// ≤ m_dim`) dispatch tables both enumerate `1..=MAX_TVCOV_AXES`, and
-/// `tvcov_analytical_supported` bounds the model here, so both resolve and the
-/// inner/outer analytic scope stays matched (#449 re-review #2).
-/// Raised 16 → 24 alongside `MAX_ODE_AXES` (#486).
+/// Maximum dual width for the TV-cov event-driven dual walk. The outer `run_obs_tvcov`
+/// (`m_dim`) and inner `run_obs_grad_tvcov` (`n_eta ≤ m_dim`) dispatch tables both
+/// enumerate `1..=MAX_TVCOV_AXES`, and `tvcov_analytical_supported` bounds the model
+/// here, so both resolve and the inner/outer analytic scope stays matched (#449
+/// re-review #2). Raised 16 → 24 alongside `MAX_ODE_AXES` (#486).
+///
+/// What is bounded is the **program's** width, `tvcov_program_axes` — the declared θ, the
+/// η, and one axis per `[covariate_nn]` output — not `model.n_theta + n_eta`. The outer
+/// walk seeds its θ columns in chunks of `MAX_TVCOV_AXES - n_eta` (one chunk for any
+/// non-NN model this admits), so a DCM's dozens of generated weight thetas cost extra
+/// chunks rather than the analytic route (#1300).
 ///
 /// **Must not exceed `MAX_ODE_AXES`** (static assert below). The *inner* TV-cov walk
 /// (`run_obs_grad_tvcov`) obtains its `∂p/∂η` from `param_derivatives_at_cov`, whose dispatch
@@ -882,18 +934,20 @@ const _: () = assert!(
     "MAX_TVCOV_AXES exceeds MAX_ODE_AXES: the TV-cov walk would admit a model whose inner      `param_derivatives_at_cov` dispatch declines, splitting inner/outer analytic scope"
 );
 
-// Five `disp!(1..=24)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
+// Seven `disp!(1..=24)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
 // `lognormal_param_derivatives`, `subject_sensitivities_iov`,
-// `subject_eta_grad_iov_analytical`, `subject_sensitivities_tvcov`, and
-// `subject_eta_grad_tvcov`. Keep all five in lockstep with the const — bumping it without
-// widening every arm would let an in-scope wider model hit `_ => None` and silently fall
-// back to FD. The mirror of the `MAX_ODE_AXES` tripwire in `ode_provider.rs` (#466 review
-// round 4 #12).
+// `subject_eta_grad_iov_analytical`, `subject_sensitivities_tvcov`,
+// `subject_eta_grad_tvcov`, and the two `[covariate_nn]` per-event builders
+// `nn_param_derivatives_at_cov` / `nn_param_eta_derivatives_at_cov` (#1300). Keep all
+// seven in lockstep with the const — bumping it without widening every arm would let an
+// in-scope wider model hit `_ => None` and silently fall back to FD. The mirror of the
+// `MAX_ODE_AXES` tripwire in `ode_provider.rs` (#466 review round 4 #12).
 const _: () = assert!(
     MAX_TVCOV_AXES == 24,
     "MAX_TVCOV_AXES changed: widen the disp!(1..=24) tables in lognormal_param_derivatives, \
      subject_sensitivities_iov, subject_eta_grad_iov_analytical, subject_sensitivities_tvcov, \
-     and subject_eta_grad_tvcov to match, then update this assert"
+     subject_eta_grad_tvcov, nn_param_derivatives_at_cov and nn_param_eta_derivatives_at_cov \
+     to match, then update this assert"
 );
 
 /// Whether the model's output scaling is one the provider differentiates exactly:
@@ -2712,10 +2766,25 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if !init_supported(model) {
         return false;
     }
-    // Bound total axes to the dual-walk dispatch cap so the outer (`m_dim`) and inner
-    // (`n_eta`) TV-cov tables both resolve — matched analytic scope, no fixed-EBE FD
-    // inner split (#449 re-review #2).
-    if model.n_theta + model.n_eta > MAX_TVCOV_AXES {
+    // Bound the *program's* axes to the dual-walk dispatch cap so the outer (`m_dim`) and
+    // inner (`n_eta`) TV-cov tables both resolve — matched analytic scope, no fixed-EBE FD
+    // inner split (#449 re-review #2). For a `[covariate_nn]` model the bound is on the
+    // axes the walk actually seeds — the user-declared θ, η, and one axis per network
+    // output — not on `model.n_theta`, which counts every generated weight (#1300): the
+    // weights reach the PK parameters only through the network output, so their columns
+    // are chained in after the program walk (`nn_param_derivatives_at_cov`) and the outer
+    // walk seeds them in column chunks of `MAX_TVCOV_AXES - n_eta`
+    // (`subject_sensitivities_tvcov`). The chunking needs at least one θ column per
+    // chunk, hence `n_eta < MAX_TVCOV_AXES` whenever there is a θ column at all.
+    if tvcov_program_axes(model) > MAX_TVCOV_AXES
+        || (model.n_theta > 0 && model.n_eta >= MAX_TVCOV_AXES)
+    {
+        return false;
+    }
+    // A model that reads a generated weight θ *directly* (`… + B_TYPICAL_PK_2_1`) breaks
+    // the output-channel factorization the weight chain relies on; the parser records it
+    // and the model routes to FD, loudly (same predicate `nn_theta_gradient` uses).
+    if nn_weight_theta_count(model) > 0 && !nn_output_chain_supported(model) {
         return false;
     }
     // Output scaling: `None` / constant `ScalarScale` (a uniform per-jet divisor), or an
@@ -2744,11 +2813,282 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
             prog_covers_required_pk_slots(model, prog)
-                && prog.n_theta_axis() == model.n_theta
+                // The program's θ axes are the user-declared thetas; generated
+                // `[covariate_nn]` weights are not referenceable by name, so for a DCM this
+                // is `model.n_theta` minus the weight block (`n_program_theta`).
+                && prog.n_theta_axis() == n_program_theta(model)
                 && prog.n_eta_axis() == model.n_eta
         }
         None => false,
     }
+}
+
+/// Number of auto-generated `[covariate_nn]` weight thetas on the model — `0` without a
+/// network (and always `0` without the `nn` feature, where the field does not exist).
+#[cfg(feature = "nn")]
+pub(crate) fn nn_weight_theta_count(model: &CompiledModel) -> usize {
+    model
+        .covariate_nns
+        .iter()
+        .map(|nn| nn.mapper.mlp().n_weights())
+        .sum()
+}
+
+#[cfg(not(feature = "nn"))]
+pub(crate) fn nn_weight_theta_count(_model: &CompiledModel) -> usize {
+    0
+}
+
+/// Total `[covariate_nn]` output count across every network, in the flat order
+/// `ModelNnAxisGuard` seeds them (`covariate_nns` order, each network's outputs in
+/// declaration order). `0` without a network.
+#[cfg(feature = "nn")]
+fn nn_output_count(model: &CompiledModel) -> usize {
+    model
+        .covariate_nns
+        .iter()
+        .map(|nn| nn.mapper.mlp().n_outputs())
+        .sum()
+}
+
+#[cfg(not(feature = "nn"))]
+fn nn_output_count(_model: &CompiledModel) -> usize {
+    0
+}
+
+/// The θ count the compiled `[individual_parameters]` program can seed: every declared
+/// theta, i.e. `model.n_theta` less the generated `[covariate_nn]` weight block.
+pub(crate) fn n_program_theta(model: &CompiledModel) -> usize {
+    model.n_theta - nn_weight_theta_count(model)
+}
+
+/// Dual width of one TV-cov program evaluation: the declared θ, the η, and — for a
+/// `[covariate_nn]` model — one axis per network output (`ModelNnAxisGuard`), so the
+/// program walk yields `∂p/∂z` alongside `∂p/∂(θ,η)`. This, not `model.n_theta + n_eta`,
+/// is what the `1..=MAX_TVCOV_AXES` dispatch must accommodate (#1300).
+fn tvcov_program_axes(model: &CompiledModel) -> usize {
+    n_program_theta(model) + model.n_eta + nn_output_count(model)
+}
+
+/// Whether every `[covariate_nn]` weight reaches the likelihood through its network's
+/// output alone — the invariant behind chaining `∂p/∂w = ∂p/∂z · ∂z/∂w`. The parser
+/// records a direct read of a generated weight θ under
+/// `NN_WEIGHT_DIRECT_REFERENCE_MARKER`; such a model declines to FD here exactly as
+/// `nn_theta_gradient::NnGradPlan::build` does.
+fn nn_output_chain_supported(model: &CompiledModel) -> bool {
+    !model
+        .parse_warnings
+        .iter()
+        .any(|w| w.contains(crate::parser::model_parser::NN_WEIGHT_DIRECT_REFERENCE_MARKER))
+}
+
+/// Per-event `∂p/∂(θ,η)` (+ second order) for the **outer** TV-cov walk at a covariate
+/// snapshot, over the model's full θ width (`model.n_theta` columns).
+///
+/// A model with no network is the former `param_derivatives_at_cov` call, unchanged. A
+/// `[covariate_nn]` model routes to [`nn_param_derivatives_at_cov`], which seeds the
+/// declared θ, η and the network outputs, then chains the weight columns in. `None`
+/// only on a dispatch miss, which `tvcov_analytical_supported` rules out.
+fn tvcov_param_derivs_at(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<crate::sens::ode_provider::ParamDerivs> {
+    if nn_weight_theta_count(model) > 0 {
+        return nn_param_derivatives_at_cov(model, prog, cov, theta, eta);
+    }
+    crate::sens::ode_provider::param_derivatives_at_cov(prog, model, cov, theta, eta)
+}
+
+/// Per-event `∂p/∂η` for the **inner** (η-only) TV-cov walk at a covariate snapshot.
+///
+/// A model with no network is the former `param_derivatives_at_cov` call (full `Dual2`
+/// jet; the inner reads only `dp_deta`), unchanged. A `[covariate_nn]` model evaluates
+/// the program over `Dual1<n_eta>` with the network outputs lifted as constants
+/// (`ModelNnGuard`, exact for `∂/∂η`) — the same route the IOV η-only walk takes
+/// (`iov_eta_only_derivs_dyn`). **Only `dp_deta` is populated** on that arm; the θ and
+/// second-order blocks are left empty rather than zero-filled, so a consumer that reads
+/// them indexes out of bounds instead of silently taking a zero derivative.
+fn tvcov_eta_derivs_at(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<crate::sens::ode_provider::ParamDerivs> {
+    if nn_weight_theta_count(model) > 0 {
+        return nn_param_eta_derivatives_at_cov(model, prog, cov, theta, eta);
+    }
+    crate::sens::ode_provider::param_derivatives_at_cov(prog, model, cov, theta, eta)
+}
+
+/// `ParamDerivs` for a `[covariate_nn]` model at one covariate snapshot, over the model's
+/// full θ width — the per-event derivative source of the outer TV-cov walk (#1300).
+///
+/// The program is evaluated over `Dual2<M>`, `M = n_base + n_eta + n_z`, with the
+/// declared θ on `0..n_base`, η on `n_base..n_base + n_eta`, and each network output
+/// `z` on its own axis after that (`ModelNnAxisGuard`), the outputs' values coming
+/// from a forward pass at this snapshot (`ModelNnGuard`). The θ columns of the result
+/// are then:
+///
+/// * declared θ: read straight off the θ axes;
+/// * weight `w_j` of a network: `∂p/∂w_j = Σ_k ∂p/∂z_k · ∂z_k/∂w_j`, and likewise
+///   `∂²p/∂η∂w_j = Σ_k ∂²p/∂η∂z_k · ∂z_k/∂w_j`, with `∂z/∂w` the network's exact
+///   backprop Jacobian at this snapshot ([`NamedMlpMapper::jacobian_raw`]) — the
+///   *activated* output's Jacobian, since that is what the program reads. `z` does not
+///   depend on η, so no further term appears in the mixed block.
+///
+/// This is the exact, per-event form of the factorization
+/// [`crate::estimation::nn_theta_gradient`] applies with a bias finite difference; here
+/// each event's own `z` is in hand, which is precisely the time-varying-input case that
+/// module documents as out of its scope. `None` only when the width misses the dispatch
+/// table, which `tvcov_analytical_supported` excludes up front.
+///
+/// [`NamedMlpMapper::jacobian_raw`]: crate::nn::NamedMlpMapper::jacobian_raw
+#[cfg(feature = "nn")]
+fn nn_param_derivatives_at_cov(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<crate::sens::ode_provider::ParamDerivs> {
+    use crate::parser::model_parser::{ModelNnAxisGuard, ModelNnGuard};
+    let n_base = prog.n_theta_axis();
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+    let z_base = n_base + n_eta;
+    let m_dim = z_base + nn_output_count(model);
+    // Per network: `(weights_offset, ∂a/∂w)` at this snapshot, in `covariate_nns` order —
+    // the same order the evaluator numbers the output axes.
+    let jacs: Vec<(usize, nalgebra::DMatrix<f64>)> = model
+        .covariate_nns
+        .iter()
+        .map(|nn| {
+            let n_w = nn.mapper.mlp().n_weights();
+            let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
+            let j = nn.mapper.jacobian_raw(w, cov).expect(
+                "NN jacobian_raw failed in nn_param_derivatives_at_cov: this indicates a \
+                 wiring bug (wrong weight slice or input/layer count), not a recoverable \
+                 condition",
+            );
+            (nn.weights_offset, j)
+        })
+        .collect();
+    let _nn = ModelNnGuard::enter_for(model, theta, cov);
+    let _axes = ModelNnAxisGuard::enter(z_base);
+    const_dispatch!(
+        m_dim;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| {
+            let p = prog.eval_param_duals::<M>(theta, eta, cov);
+            let ni = p.len();
+            let mut dp_deta = vec![vec![0.0; n_eta]; ni];
+            let mut dp_dtheta = vec![vec![0.0; n_theta]; ni];
+            let mut d2p_deta2 = vec![vec![vec![0.0; n_eta]; n_eta]; ni];
+            let mut d2p_detadtheta = vec![vec![vec![0.0; n_theta]; n_eta]; ni];
+            for i in 0..ni {
+                let g = &p[i].grad;
+                let h = &p[i].hess;
+                for m in 0..n_base {
+                    dp_dtheta[i][m] = g[m];
+                }
+                for k in 0..n_eta {
+                    dp_deta[i][k] = g[n_base + k];
+                    for l in 0..n_eta {
+                        d2p_deta2[i][k][l] = h[n_base + k][n_base + l];
+                    }
+                    for m in 0..n_base {
+                        d2p_detadtheta[i][k][m] = h[n_base + k][m];
+                    }
+                }
+                // Weight columns by the chain rule through this snapshot's outputs.
+                let mut z0 = z_base;
+                for (w_off, jz) in &jacs {
+                    let (n_out, n_w) = jz.shape();
+                    for j in 0..n_w {
+                        let col = w_off + j;
+                        let mut d = 0.0;
+                        for kz in 0..n_out {
+                            d += g[z0 + kz] * jz[(kz, j)];
+                        }
+                        dp_dtheta[i][col] = d;
+                        for k in 0..n_eta {
+                            let mut dd = 0.0;
+                            for kz in 0..n_out {
+                                dd += h[n_base + k][z0 + kz] * jz[(kz, j)];
+                            }
+                            d2p_detadtheta[i][k][col] = dd;
+                        }
+                    }
+                    z0 += n_out;
+                }
+            }
+            Some(crate::sens::ode_provider::ParamDerivs {
+                dp_deta,
+                dp_dtheta,
+                d2p_deta2,
+                d2p_detadtheta,
+            })
+        }
+    )
+}
+
+#[cfg(not(feature = "nn"))]
+fn nn_param_derivatives_at_cov(
+    _model: &CompiledModel,
+    _prog: &crate::parser::model_parser::IndivParamProgram,
+    _cov: &std::collections::HashMap<String, f64>,
+    _theta: &[f64],
+    _eta: &[f64],
+) -> Option<crate::sens::ode_provider::ParamDerivs> {
+    None
+}
+
+/// η-only `ParamDerivs` for a `[covariate_nn]` model at one covariate snapshot: the
+/// program over `Dual1<n_eta>` with the network outputs lifted as constants
+/// (`ModelNnGuard`), exact because a network never reads η. Only `dp_deta` is filled;
+/// see [`tvcov_eta_derivs_at`] for why the other blocks stay empty.
+#[cfg(feature = "nn")]
+fn nn_param_eta_derivatives_at_cov(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<crate::sens::ode_provider::ParamDerivs> {
+    let n_eta = model.n_eta;
+    let _nn = crate::parser::model_parser::ModelNnGuard::enter_for(model, theta, cov);
+    const_dispatch!(
+        n_eta;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |N| {
+            let p = prog.eval_param_eta_grad::<N>(theta, eta, cov);
+            let ni = p.len();
+            let dp_deta: Vec<Vec<f64>> = (0..ni)
+                .map(|i| (0..n_eta).map(|k| p[i].grad[k]).collect())
+                .collect();
+            Some(crate::sens::ode_provider::ParamDerivs {
+                dp_deta,
+                dp_dtheta: vec![Vec::new(); ni],
+                d2p_deta2: vec![Vec::new(); ni],
+                d2p_detadtheta: vec![Vec::new(); ni],
+            })
+        }
+    )
+}
+
+#[cfg(not(feature = "nn"))]
+fn nn_param_eta_derivatives_at_cov(
+    _model: &CompiledModel,
+    _prog: &crate::parser::model_parser::IndivParamProgram,
+    _cov: &std::collections::HashMap<String, f64>,
+    _theta: &[f64],
+    _eta: &[f64],
+) -> Option<crate::sens::ode_provider::ParamDerivs> {
+    None
 }
 
 /// Clamp a **dual** modeled `D`/`R` to its domain floor, keeping the jet in the
@@ -3136,7 +3476,6 @@ pub fn subject_sensitivities_tvcov(
 
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
-    let m_dim = n_theta + n_eta;
 
     let prog = model
         .indiv_param_partials
@@ -3144,7 +3483,7 @@ pub fn subject_sensitivities_tvcov(
         .as_ref()
         .expect("tvcov_analytical_supported guarantees the program");
     let slots = prog.pk_slots_ref();
-    // PK slot → differentiated-row index of `pd_from_program` (for seeding the
+    // PK slot → differentiated-row index of the per-event `ParamDerivs` (for seeding the
     // dual axis). `pd` rows follow `pk_slots()` order, so row `i` ↔ slot `slots[i]`.
     let slot_row = seed_dim_from_slots(slots);
 
@@ -3154,13 +3493,59 @@ pub fn subject_sensitivities_tvcov(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let mut sens = const_dispatch!(
-        m_dim;
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
-        |M| run_obs_tvcov::<M>(
-            model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, readout,
-        )
-    )?;
+
+    // Per-event program derivatives `∂p/∂(θ, η)` (+ second order) over the model's **full**
+    // θ width, evaluated once per event and shared by every θ-column chunk below and by
+    // the modeled-dose / readout slot duals inside the walk. A `TIME`-built-in structural
+    // parameter resolves `Op::PushTime` from the model-time thread-local, so each snapshot
+    // is evaluated under its own event time (#486 / #610). A `[covariate_nn]` model gets
+    // its weight columns chained in here (`nn_param_derivatives_at_cov`, #1300); a
+    // dispatch miss — excluded by the gate — is the only `None`.
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let pd_at = |time: f64,
+                 cov: &std::collections::HashMap<String, f64>|
+     -> Option<crate::sens::ode_provider::ParamDerivs> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
+        tvcov_param_derivs_at(model, prog, cov, theta, eta)
+    };
+    let pd_dose: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.doses.len())
+        .map(|k| pd_at(subject.doses[k].time, subject.dose_cov(k)))
+        .collect::<Option<Vec<_>>>()?;
+    let pd_obs: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.obs_times.len())
+        .map(|j| pd_at(subject.obs_times[j], subject.obs_cov(j)))
+        .collect::<Option<Vec<_>>>()?;
+    let pd_pk_only: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.pk_only_times.len())
+        .map(|m| pd_at(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .collect::<Option<Vec<_>>>()?;
+
+    // The θ columns are seeded in chunks of at most `MAX_TVCOV_AXES - n_eta`, each chunk
+    // walked with the η axes alongside so the mixed `∂²f/∂η∂θ` block comes out of the same
+    // jet. A model whose program fits the cap in one piece — every non-NN model the gate
+    // admits — is exactly one chunk of width `n_theta + n_eta`, the former single dispatch;
+    // a `[covariate_nn]` model's weight columns (typically dozens) are what spill into
+    // further chunks (#1300). Forward-mode axes never interact, so each chunk's η blocks
+    // are bit-identical and the first chunk's are kept.
+    let all_cols: Vec<usize> = (0..n_theta).collect();
+    let chunk_len = MAX_TVCOV_AXES.saturating_sub(n_eta).max(1);
+    let chunks: Vec<&[usize]> = if all_cols.is_empty() {
+        vec![&all_cols[..]]
+    } else {
+        all_cols.chunks(chunk_len).collect()
+    };
+    let mut acc: Option<SubjectSens> = None;
+    for cols in chunks {
+        let m_dim = cols.len() + n_eta;
+        let into = acc.take();
+        acc = Some(const_dispatch!(
+            m_dim;
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+            |M| run_obs_tvcov::<M>(
+                model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, cols,
+                &pd_dose, &pd_obs, &pd_pk_only, readout, into,
+            )
+        )?);
+    }
+    let mut sens = acc?;
 
     // Analytic `[initial_conditions]` impulse (#486): layer `A₀·kernel(t, pk)` and its exact
     // `(θ,η)` jet onto every pre-reset observation BEFORE scaling — the same insertion order as
@@ -3189,12 +3574,15 @@ pub fn subject_sensitivities_tvcov(
     Some(sens)
 }
 
-/// The dual-width-`M` inner of [`subject_sensitivities_tvcov`] (`M = n_theta +
-/// n_eta`). For each event, evaluates the individual-parameter program's
-/// `∂p/∂(θ, η)` at that event's covariate snapshot, seeds the PK-param duals on the
-/// `(θ, η)` axes (`θ_m → m`, `η_k → n_theta + k`), runs the event-driven
-/// sensitivity walk over `Dual2<M>`, and reads `∂conc/∂(θ, η)` straight off into
-/// the standard `(n_eta, n_theta)` [`SubjectSens`].
+/// The dual-width-`M` inner of [`subject_sensitivities_tvcov`] for one **θ-column
+/// chunk** (`M = theta_cols.len() + n_eta`). For each event, takes the pre-evaluated
+/// program derivatives `∂p/∂(θ, η)` at that event's covariate snapshot (`pd_dose` /
+/// `pd_obs` / `pd_pk_only`, full θ width), seeds the PK-param duals on the chunk's axes
+/// (`θ_{theta_cols[c]} → c`, `η_k → theta_cols.len() + k`), runs the event-driven
+/// sensitivity walk over `Dual2<M>`, and scatters `∂conc/∂(θ_chunk, η)` into the standard
+/// `(n_eta, n_theta)` [`SubjectSens`] — into `into` when an earlier chunk built it (only
+/// this chunk's θ columns are written; the η blocks are identical across chunks), else
+/// into a fresh one. A single chunk covering `0..n_theta` is the pre-#1300 walk verbatim.
 #[allow(clippy::too_many_arguments)]
 fn run_obs_tvcov<const M: usize>(
     model: &CompiledModel,
@@ -3205,59 +3593,39 @@ fn run_obs_tvcov<const M: usize>(
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
     n_theta: usize,
+    theta_cols: &[usize],
+    pd_dose: &[crate::sens::ode_provider::ParamDerivs],
+    pd_obs: &[crate::sens::ode_provider::ParamDerivs],
+    pd_pk_only: &[crate::sens::ode_provider::ParamDerivs],
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    into: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::ode_provider::pd_from_program;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+
+    debug_assert_eq!(M, theta_cols.len() + n_eta);
 
     // PK slot order the program differentiates (for seeding the modeled `D`/`R`
     // slot dual via `pk_slot_dual_outer`, #486).
     let slots = prog.pk_slots_ref();
 
-    // Build the per-event PK-param duals at a covariate snapshot: evaluate the
-    // program's `∂p/∂(θ, η)` (+ 2nd order) at `cov`, then seed each differentiated
-    // PK slot on its `(θ, η)` dual axis (`θ_m → m`, `η_k → n_theta + k`); constants
-    // otherwise. The θ-θ Hessian block is unused downstream (left zero), mirroring
-    // the IOV / scale seeders.
-    // A `TIME`-built-in structural parameter resolves `Op::PushTime` from the
-    // model-time thread-local, which `pd_from_program`'s `Dual2` walk reads. Seed
-    // it with the per-event time (gated on `uses_time`, exactly like the f64
-    // `pk_param_fn` closure) so each event's PK-param duals — value AND derivatives
-    // — are evaluated at that event's `TIME` (#486 / #610).
+    // Build the per-event PK-param duals at a covariate snapshot from that event's
+    // pre-evaluated `∂p/∂(θ, η)` (+ 2nd order): seed each differentiated PK slot on the
+    // chunk's `(θ, η)` dual axes (`θ_{theta_cols[c]} → c`, `η_k → n_cols + k`); constants
+    // otherwise. The θ-θ Hessian block is unused downstream (left zero), mirroring the
+    // IOV / scale seeders.
+    // A `TIME`-built-in structural parameter resolves `Op::PushTime` from the model-time
+    // thread-local; the f64 `pk_param_fn` value here is evaluated under the per-event
+    // time exactly as the derivatives were (#486 / #610).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    let mk = |time: f64, cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
+    let mk = |pd: &crate::sens::ode_provider::ParamDerivs,
+              time: f64,
+              cov: &std::collections::HashMap<String, f64>|
+     -> PkDual<Dual2<M>> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
         let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
-            let mut grad = [0.0; M];
-            let mut hess = [[0.0; M]; M];
-            for m in 0..n_theta.min(M) {
-                grad[m] = pd.dp_dtheta[i][m];
-            }
-            for k in 0..n_eta {
-                if n_theta + k < M {
-                    grad[n_theta + k] = pd.dp_deta[i][k];
-                }
-                for l in 0..n_eta {
-                    if n_theta + k < M && n_theta + l < M {
-                        hess[n_theta + k][n_theta + l] = pd.d2p_deta2[i][k][l];
-                    }
-                }
-                for m in 0..n_theta {
-                    if n_theta + k < M && m < M {
-                        let v = pd.d2p_detadtheta[i][k][m];
-                        hess[n_theta + k][m] = v;
-                        hess[m][n_theta + k] = v;
-                    }
-                }
-            }
-            Dual2 {
-                value: val,
-                grad,
-                hess,
-            }
+            pd_row_dual2_cols::<M>(pd, i, val, theta_cols, n_eta)
         };
         let dv = |slot: usize, val: f64| -> Dual2<M> {
             match slot_row[slot] {
@@ -3281,13 +3649,19 @@ fn run_obs_tvcov<const M: usize>(
     // covariate snapshot (the `*_cov` accessors fall back to the static map when a
     // particular event carries no snapshot).
     let pk_at_dose: Vec<PkDual<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
+        .map(|k| mk(&pd_dose[k], subject.doses[k].time, subject.dose_cov(k)))
         .collect();
     let pk_at_obs: Vec<PkDual<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| mk(subject.obs_times[j], subject.obs_cov(j)))
+        .map(|j| mk(&pd_obs[j], subject.obs_times[j], subject.obs_cov(j)))
         .collect();
     let pk_at_pk_only: Vec<PkDual<Dual2<M>>> = (0..subject.pk_only_times.len())
-        .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
+        .map(|m| {
+            mk(
+                &pd_pk_only[m],
+                subject.pk_only_times[m],
+                subject.pk_only_cov(m),
+            )
+        })
         .collect();
 
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
@@ -3318,17 +3692,15 @@ fn run_obs_tvcov<const M: usize>(
         return None;
     }
     let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    // Reads the dose's already-computed `∂p/∂(θ,η)` — no program re-evaluation (the
+    // inner walk hoisted its twin first, #822 follow-up; the outer followed in #1300).
     let slot_dual = |k: usize, slot: usize| -> Dual2<M> {
-        let cov = subject.dose_cov(k);
-        let _guard =
-            crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
-        let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-        pk_slot_dual_outer::<M>(
+        pk_slot_dual_outer_cols::<M>(
             slot,
             dose_pk[k].values.get(slot).copied().unwrap_or(0.0),
-            &pd,
+            &pd_dose[k],
             slots,
-            n_theta,
+            theta_cols,
             n_eta,
         )
     };
@@ -3379,16 +3751,15 @@ fn run_obs_tvcov<const M: usize>(
                 let t = subject.obs_times[j];
                 let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, t);
                 let pk = (model.pk_param_fn)(theta, eta, cov, t);
-                let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
                 let extras = ro_slots
                     .iter()
                     .map(|&s| {
-                        let d = pk_slot_dual_outer::<M>(
+                        let d = pk_slot_dual_outer_cols::<M>(
                             s,
                             pk.values.get(s).copied().unwrap_or(0.0),
-                            &pd,
+                            &pd_obs[j],
                             slots,
-                            n_theta,
+                            theta_cols,
                             n_eta,
                         );
                         (s, d)
@@ -3404,6 +3775,9 @@ fn run_obs_tvcov<const M: usize>(
     let mut ro_vars: Vec<Dual2<M>> = Vec::new();
     let mut ro_stack: Vec<Dual2<M>> = Vec::new();
 
+    // An earlier chunk's `SubjectSens`, whose θ columns this chunk extends.
+    let mut prev: Vec<ObsSens> = into.map(|s| s.obs).unwrap_or_default();
+    debug_assert!(prev.is_empty() || prev.len() == conc.len());
     let mut obs_out = Vec::with_capacity(conc.len());
     for (j, c) in conc.iter().enumerate() {
         // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
@@ -3466,7 +3840,14 @@ fn run_obs_tvcov<const M: usize>(
         } else {
             c_clamped
         };
-        obs_out.push(obs_sens_from_dual2::<M>(&c, n_theta, n_eta));
+        let into_j = if prev.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut prev[j]))
+        };
+        obs_out.push(obs_sens_scatter_cols::<M>(
+            &c, theta_cols, n_theta, n_eta, into_j,
+        ));
     }
     Some(SubjectSens { obs: obs_out })
 }
@@ -3591,7 +3972,6 @@ fn run_obs_grad_tvcov<const N: usize>(
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::ode_provider::param_derivatives_at_cov;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` clamps below are
@@ -3621,11 +4001,16 @@ fn run_obs_grad_tvcov<const N: usize>(
     // modeled-dose slot dual and the readout's high slots); both were unreachable only by
     // coincidence, and a `MAX_TVCOV_AXES > MAX_ODE_AXES` cap divergence would have made them a
     // silently-wrong gradient rather than an FD fallback (#822 follow-up).
+    //
+    // A `[covariate_nn]` model takes the η-only builder (`tvcov_eta_derivs_at`): the program
+    // over `Dual1<n_eta>` with the network outputs lifted as constants, which is exact for
+    // `∂/∂η` and needs no weight axis at all (#1300). Only its `dp_deta` is populated, and
+    // `dp_deta` is all this walk reads.
     let pd_at = |time: f64,
                  cov: &std::collections::HashMap<String, f64>|
      -> Option<crate::sens::ode_provider::ParamDerivs> {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        param_derivatives_at_cov(prog, model, cov, theta, eta)
+        tvcov_eta_derivs_at(model, prog, cov, theta, eta)
     };
     let pd_dose: Vec<crate::sens::ode_provider::ParamDerivs> = (0..subject.doses.len())
         .map(|k| pd_at(subject.doses[k].time, subject.dose_cov(k)))
@@ -4919,6 +5304,56 @@ fn pk_slot_dual_outer<const M: usize>(
             }
             Dual2 { value, grad, hess }
         }
+        None => Dual2::constant(value),
+    }
+}
+
+/// `Dual2<M>` for row `i` of a full-width `pd`, seeded on a **θ-column chunk**:
+/// `θ_{theta_cols[c]} → c`, `η_k → theta_cols.len() + k` (`M = theta_cols.len() + n_eta`),
+/// with the η-η and η-θ second-order blocks; the θ-θ block is unused downstream and left
+/// zero. The one seeder behind the TV-cov outer walk's per-event `PkDual`s and its
+/// modeled-dose / readout slot duals (`pk_slot_dual_outer_cols`) — with
+/// `theta_cols == 0..n_theta` it is [`pk_slot_dual_outer`]'s body entry for entry (#1300).
+#[inline]
+fn pd_row_dual2_cols<const M: usize>(
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    i: usize,
+    value: f64,
+    theta_cols: &[usize],
+    n_eta: usize,
+) -> Dual2<M> {
+    let nc = theta_cols.len();
+    debug_assert_eq!(M, nc + n_eta);
+    let mut grad = [0.0; M];
+    let mut hess = [[0.0; M]; M];
+    for (c, &m) in theta_cols.iter().enumerate() {
+        grad[c] = pd.dp_dtheta[i][m];
+    }
+    for k in 0..n_eta {
+        grad[nc + k] = pd.dp_deta[i][k];
+        for l in 0..n_eta {
+            hess[nc + k][nc + l] = pd.d2p_deta2[i][k][l];
+        }
+        for (c, &m) in theta_cols.iter().enumerate() {
+            let v = pd.d2p_detadtheta[i][k][m];
+            hess[nc + k][c] = v;
+            hess[c][nc + k] = v;
+        }
+    }
+    Dual2 { value, grad, hess }
+}
+
+/// Column-chunked twin of [`pk_slot_dual_outer`] (see [`pd_row_dual2_cols`]).
+fn pk_slot_dual_outer_cols<const M: usize>(
+    slot: usize,
+    value: f64,
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    slots: &[usize],
+    theta_cols: &[usize],
+    n_eta: usize,
+) -> Dual2<M> {
+    match slots.iter().position(|&x| x == slot) {
+        Some(j) => pd_row_dual2_cols::<M>(pd, j, value, theta_cols, n_eta),
         None => Dual2::constant(value),
     }
 }
@@ -6265,3 +6700,7 @@ fn scatter_compact<const M: usize, const N: usize>(
 #[cfg(test)]
 #[path = "provider_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "provider_nn_tests.rs"]
+mod nn_tests;

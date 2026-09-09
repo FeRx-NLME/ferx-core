@@ -1031,6 +1031,25 @@ impl NamedMlpMapper {
         self.mlp.jacobian_preactivation(&x, weights)
     }
 
+    /// Post-activation Jacobian `∂a_L/∂weights` (`n_outputs × n_weights`) at this
+    /// covariate snapshot, with the same zero-fill input construction as
+    /// [`forward_raw`](Self::forward_raw) — the output-side twin of
+    /// [`jacobian_preactivation_raw`](Self::jacobian_preactivation_raw).
+    ///
+    /// The `[individual_parameters]` program reads the *activated* output (`a_L`, what
+    /// `Op::PushNnOutput` pushes), so a chain rule that seeds the program on those
+    /// outputs (`ModelNnAxisGuard`) needs `∂a_L/∂w`, activation derivative included.
+    /// The pre-activation variant exists for the bias finite-difference identity, which
+    /// is a different chain and would need dividing back through `f'(z)`.
+    pub(crate) fn jacobian_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Result<DMatrix<f64>, NnError> {
+        let x = self.build_input_vec_zero_fill(covariates);
+        self.mlp.jacobian(&x, weights)
+    }
+
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
     /// out with `MissingCovariate` if any input name is absent.
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {

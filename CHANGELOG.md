@@ -530,6 +530,7 @@ section of the SDLC for the versioning policy).
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
 ### Performance
+- **`[covariate_nn]` models with a time-varying network input are analytic on both FOCE/FOCEI loops.** The event-driven sensitivity walk no longer counts the generated weight thetas against its dual-width cap: it seeds the declared thetas, etas and one axis per network output, chains the weight columns in per event through the network's backprop Jacobian, and walks the theta columns in chunks. Subjects that used to fall back to reconverged finite differences (~300× per objective evaluation on the vancomycin DCM) now take the exact gradient; models without a network are numerically unchanged (#1300).
 - Generic analytical FOCEI gradients with exactly four or six differentiated PK
   parameters, one or two of them IIV-bearing, now omit the unused Hessian block
   among IIV-free parameters (#829).

@@ -24,6 +24,12 @@ pub trait PkNum:
     /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
     /// skip building a Hessian it would discard (e.g. `tvcov_init_state` on the inner walk).
     const SECOND_ORDER: bool;
+    /// Number of first-order dual axes the type carries — the largest `dim + 1` that
+    /// [`var`](Self::var) accepts. `0` for `f64` and the zero-width `Dual2<0>` value
+    /// passes, which carry no jet at all. Lets an evaluator that seeds an axis chosen at
+    /// runtime (`Op::PushNnOutput` under a `ModelNnAxisGuard`) tell a jet-free value pass
+    /// apart from a genuine out-of-range seed.
+    const N_AXES: usize;
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -77,6 +83,7 @@ pub trait PkNum:
 
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
+    const N_AXES: usize = 0;
     #[inline]
     fn from_f64(x: f64) -> Self {
         x
@@ -149,9 +156,10 @@ impl PkNum for f64 {
 /// NaN-flooring body. The scalar `f64` impl stays hand-written (its bodies are
 /// inline formulas, not delegation).
 macro_rules! impl_pknum_delegate {
-    ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
+    ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr, axes = $ax:ident) => {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
+            const N_AXES: usize = $ax;
             #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)
@@ -225,8 +233,8 @@ macro_rules! impl_pknum_delegate {
     };
 }
 
-impl_pknum_delegate!(Dual1<const N: usize>, second_order = false);
-impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true);
+impl_pknum_delegate!(Dual1<const N: usize>, second_order = false, axes = N);
+impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true, axes = N);
 
 #[cfg(test)]
 mod tests {

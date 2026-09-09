@@ -3143,7 +3143,12 @@ fn provider_1cpt_reset_midinfusion_matches_production() {
 /// for an LTBS model the production predictor returns `ln(f)`, and the provider
 /// applies the matching `g = ln(f)` jet transform, so the same FD check covers
 /// the log-scale value, gradient, and Hessian.
-fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+pub(super) fn check_full_provider_vs_fd(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) {
     check_full_provider_vs_fd_with_step(model, subject, theta, eta, 1e-4);
 }
 

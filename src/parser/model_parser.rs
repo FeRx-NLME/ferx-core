@@ -16558,12 +16558,59 @@ thread_local! {
 ///
 /// # What it is *not* for
 ///
-/// The outputs are lifted as **constants** on every dual axis. That is exact for
-/// `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a way to
-/// get `∂/∂θ` for NN weights — those derivatives are zero under this guard, which
-/// is why only η-gradient paths may use it. `∂NLL/∂w` comes from
-/// [`crate::estimation::nn_theta_gradient`] instead.
+/// On its own, the outputs are lifted as **constants** on every dual axis. That is
+/// exact for `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a
+/// way to get `∂/∂θ` for NN weights — those derivatives are zero under this guard
+/// alone, which is why only η-gradient paths may use it bare. The θ-chain for the
+/// weights comes from one of two places: the fixed-η estimators use
+/// [`crate::estimation::nn_theta_gradient`]; the FOCE/FOCEI event-driven walk pairs this
+/// guard with a [`ModelNnAxisGuard`], which seeds each output on a dual axis of its own
+/// so `∂p/∂z` falls out of the program walk and is chained to the weights through the
+/// network's backprop Jacobian (#1300).
 pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
+
+thread_local! {
+    /// First dual axis of the `[covariate_nn]` output block for the generic evaluator,
+    /// or `None` (the default) to lift outputs as constants. See [`ModelNnAxisGuard`].
+    static MODEL_NN_AXIS_BASE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Current `[covariate_nn]` output axis base, `None` unless a [`ModelNnAxisGuard`] is live.
+#[inline]
+fn current_nn_axis_base() -> Option<usize> {
+    MODEL_NN_AXIS_BASE.with(std::cell::Cell::get)
+}
+
+/// RAII guard that makes the generic evaluator seed every `[covariate_nn]` output as an
+/// **independent dual variable**: output `flat` (networks in `covariate_nns` order, each
+/// network's outputs in declaration order) lands on axis `base + flat`. Pair it with a
+/// [`ModelNnGuard`] supplying the outputs' values at the same covariate snapshot.
+///
+/// This is how the FOCE/FOCEI TV-cov walk gets an exact `∂p/∂z` (and the mixed
+/// `∂²p/∂η∂z`) from one `Dual2` program evaluation, to be chained to the weight thetas
+/// with the network's backprop Jacobian — the per-event, exact form of the
+/// factorization [`crate::estimation::nn_theta_gradient`] uses with a bias finite
+/// difference (#1300). The caller owns the axis budget: every `base + flat` must be
+/// below the dual width `M` it dispatched on, or `T::var` indexes past the jet.
+#[cfg(feature = "nn")]
+pub(crate) struct ModelNnAxisGuard(Option<usize>);
+
+#[cfg(feature = "nn")]
+impl ModelNnAxisGuard {
+    /// Seed NN outputs on axes `base..base + n_outputs_total` for the current thread,
+    /// restoring the previous setting on drop.
+    pub(crate) fn enter(base: usize) -> Self {
+        let prev = MODEL_NN_AXIS_BASE.with(|cell| cell.replace(Some(base)));
+        ModelNnAxisGuard(prev)
+    }
+}
+
+#[cfg(feature = "nn")]
+impl Drop for ModelNnAxisGuard {
+    fn drop(&mut self) {
+        MODEL_NN_AXIS_BASE.with(|cell| cell.set(self.0));
+    }
+}
 
 impl ModelNnGuard {
     /// Install `outputs` for the current thread, restoring the previous value on drop.
@@ -19170,7 +19217,35 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                         );
                         0.0
                     });
-                push!(k(v));
+                // A live [`ModelNnAxisGuard`] seeds every network output on its own dual
+                // axis (`base + flat output index`), so `∂p/∂z` comes out of the same walk
+                // that yields `∂p/∂(θ,η)`; without one the output is a constant, as it
+                // always was (exact for `∂/∂η` — see `ModelNnGuard`).
+                match current_nn_axis_base() {
+                    // A jet-free instantiation (`f64`, or the `Dual2<0>` value pass the
+                    // cov-static fold runs) has no axis to seed; the value is all it carries.
+                    Some(base) if T::N_AXES > 0 => {
+                        let flat: usize = nn_outputs
+                            .iter()
+                            .take(nn_i as usize)
+                            .map(Vec::len)
+                            .sum::<usize>()
+                            + out_i as usize;
+                        // An axis past the jet is a wiring bug in the caller's width budget
+                        // (`nn_param_derivatives_at_cov`), never a runtime condition; fail
+                        // loudly rather than silently lift the output to a constant, which
+                        // would report a zero `∂/∂z` as analytic.
+                        assert!(
+                            base + flat < T::N_AXES,
+                            "Op::PushNnOutput axis {} exceeds the dual width {} (nn_idx={nn_i}, \
+                             output_idx={out_i}, axis base {base})",
+                            base + flat,
+                            T::N_AXES
+                        );
+                        push!(T::var(v, base + flat));
+                    }
+                    _ => push!(k(v)),
+                }
             }
             // The level index is integer-valued data, so its jet is empty and
             // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
@@ -20377,11 +20452,18 @@ impl IndivParamProgram {
         covariates: &HashMap<String, f64>,
     ) -> Vec<crate::sens::dual2::Dual2<M>> {
         use crate::sens::dual2::Dual2;
+        // Only the program's own θ axes (`0..n_theta`, the user-declared thetas) are
+        // seeded. A `theta` slice longer than that carries generated `[covariate_nn]`
+        // weights, which reach the program through `Op::PushNnOutput` and never through
+        // `PushTheta`; seeding them here would put them on the axes `η` and the NN-output
+        // block occupy (`n_theta + k`, see `ModelNnAxisGuard`). For a program whose θ
+        // axis count equals the model's — every non-NN caller — this is the former
+        // `m < M` bound exactly.
         let theta_d: Vec<Dual2<M>> = theta
             .iter()
             .enumerate()
             .map(|(m, &v)| {
-                if m < M {
+                if m < self.n_theta && m < M {
                     Dual2::var(v, m)
                 } else {
                     Dual2::constant(v)
