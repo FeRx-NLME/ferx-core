@@ -303,7 +303,30 @@ Two consequences worth knowing:
   to the per-`θ` loop — correct, just slower. Covariates that vary but
   do *not* feed the network are unaffected.
 
-`method = focei` uses a different gradient path and is unchanged.
+`method = focei` (and `foce`) takes a different route: the analytic
+sensitivity provider. There the weights were never a problem for a
+network fed **static** covariates — the closed-form path never seeds
+a dual axis per weight. A network fed a **time-varying** covariate
+routes its subjects to the event-driven walk instead, and until
+#1300 that walk bounded its dual width on the model's *total* theta
+count, weights included, so any DCM beyond a toy sent every such
+subject to reconverged finite differences on both loops: on the
+vancomycin example below, ~5–10 s per objective evaluation against
+18 ms for the analytical covariate twin.
+
+The walk now seeds only what the `[individual_parameters]` program
+can reference — the declared thetas, the etas, and one axis per
+network output — and chains the weight columns in per event with the
+same factorization as above, exactly: each event's $z^{(e)}$ is
+available inside the walk, so $\partial p / \partial z^{(e)}$ comes
+out of the same dual evaluation and $\partial z^{(e)} / \partial w$
+is backpropagation at that event's covariates. The weight columns are
+then walked in chunks that fit the dual dispatch table. A time-varying
+NN input therefore stays analytic on both loops under FOCE/FOCEI;
+the `gradient:` line reports it, and the FD-fallback warning is the
+thing to check if a fit is unexpectedly slow. A model that reads a
+generated weight parameter directly (`… + B_TYPICAL_PK_2_1`) still
+routes to FD, as it does for the fixed-η estimators.
 
 ## Regularization (`nn_l2`, `nn_smooth`)
 
