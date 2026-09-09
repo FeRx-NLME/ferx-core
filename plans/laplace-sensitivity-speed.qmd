@@ -333,25 +333,25 @@ near an ODE-tolerance-limited anchor.
 
 ### Left for a follow-up
 
-Both `focei_htilde_dx` and `laplace_h_deriv` now cover ODE, M3-BLOQ (base and, for
-`focei_htilde_dx`, the σ-direct derivative), custom/TV σ magnitude (`focei_htilde_dx` only —
-`laplace_h_deriv` is bounded by the covariance provider's own magnitude exclusion, not a gap
-in this module), and `iiv_on_ruv` (`focei_htilde_dx` only, minus the one still-declined
-combination below). What remains:
+Both `focei_htilde_dx` and `laplace_h_deriv` now cover ODE and M3-BLOQ (base and, for
+`focei_htilde_dx`, the σ-direct derivative). `focei_htilde_dx` additionally covers custom/TV σ
+magnitude, `iiv_on_ruv` **including combined with an M3-censored row** (the `ruv_cz`/`ruv_cm`
+chain, reusing `ScoreCore::cens_dcz_df`/`cens_dcm_df` for the structural half and a new
+scale-response FD term for `∂/∂(ruv_scale)` — caught by the FD-parity test itself, since the
+initial implementation missed it), and correlated residuals (`block_sigma`, both the
+`corr_residual_rd_at_sigma` σ-direct swap and a new packed-coordinate segment for the ρ
+off-diagonal, chained through `rho_chain`'s Fisher-z factor via `rho_rd_terms`'s closed form —
+no FD needed there, unlike the σ/magnitude channels). What remains:
 
-- **IOV / mixture** — declined for both modules (dimension-layout complexity: the packed
-  coordinate decode assumes `[θ…, Ω lower-tri…, σ…]`, and a stacked `[η, κ]` layout needs its
-  own decode plus the joint `Ω⁻¹`, which `laplace_h_deriv`'s covariance provider
-  (`subject_sensitivities_cov_iov`) already reaches but this module does not yet consume).
-- **`iiv_on_ruv` combined with an M3-censored row** (`focei_htilde_dx` only) — the residual-eta
-  row/col becomes the `ruv_cz`/`ruv_cm` chain instead of `(g, 2.0)`, a chain this module does
-  not build; declined rather than silently applying the wrong formula.
-- **Correlated residuals (`block_sigma`)** — declined for both; the σ-direction `∂R/∂σ` needs
-  the correlation-aware variance (`corr_residual_diag`/`corr_residual_rd_at_sigma`), not the
-  plain scalar one either module differences.
-- `laplace_h_deriv` still declines custom/TV σ magnitude and `iiv_on_ruv` outright — both are
-  excluded one level up, by `subject_sensitivities_cov`'s own gate, not by a restriction this
-  module owns; extending either means extending the covariance provider first.
+- **IOV / mixture** — declined for both modules. This is a different shape of gap from the
+  others: `packed_len` already has dedicated `n_iov`/`n_mixture` terms this module's layout
+  guard doesn't decode, `omega_inv` changes meaning entirely (bare η block → joint
+  `Ω_bsv ⊕ K·Ω_iov`), the Ω-coordinate branch's `dΩ⁻¹/dx` derivation needs the stacked-layout
+  version, and the caller (`agq.rs`) would need to switch to `subject_sensitivities_iov`/
+  `subject_eta_dx_iov` too — not a self-contained change to this module alone. ODE-IOV also
+  measurably dominates the debug build (67% at `MAX_ODE_IOV_AXES=96`,
+  `ode-iov-axes-dominates-build` note), so this is deliberately left as its own PR rather than
+  folded in here.
 - A repository-required NONMEM comparison would be owed only if either route becomes the
   route a user-visible numerical result depends on differently than before — it does not
   currently, since both are pinned to the pre-existing gradient.

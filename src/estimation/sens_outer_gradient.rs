@@ -540,7 +540,7 @@ fn corr_residual_diag(
 /// σ-block's central FD (`d2` is not needed there). Diagonals of the same builders
 /// as [`corr_residual_diag`]; the diagonal guard is already applied there so this
 /// reads the diagonal directly.
-fn corr_residual_rd_at_sigma(
+pub(crate) fn corr_residual_rd_at_sigma(
     model: &CompiledModel,
     subject: &Subject,
     ipreds: &[f64],
@@ -1743,7 +1743,7 @@ fn sigma_block(
 /// `prepare_stacked` bail to FD through `corr_residual_diag` when any off-diagonal
 /// survives, so ρ can only reach here through the within-observation `combined`
 /// cross term.
-fn rho_rd_terms(
+pub(crate) fn rho_rd_terms(
     model: &CompiledModel,
     subject: &Subject,
     sens: &SubjectSens,
