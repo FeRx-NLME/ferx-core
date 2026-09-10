@@ -1,6 +1,18 @@
 use super::*;
 use std::collections::HashMap;
 
+#[test]
+fn shi_inner_gradient_uses_noise_aware_stencil() {
+    let obj = |x: &[f64]| x[0].powi(3);
+    let config = InnerFdConfig {
+        method: InnerFdMethod::Shi,
+        objective_noise_abs: Some(1e-8),
+        prediction_noise_abs: Some(1e-8),
+    };
+    let gradient = gradient_fd_config(&obj, &[2.0], 1, config);
+    assert!((gradient[0] - 12.0).abs() < 1e-3);
+}
+
 /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
 /// data term and no PK provider — the inner objective is `½(η'Ω⁻¹η + log|Ω|) + D_ctmm(η)`.
 #[cfg(feature = "markov")]
@@ -1256,7 +1268,19 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
     let eta = [0.1, -0.05, 2.5];
 
     let mut scratch = pk::EventPkParams::default();
-    let jac = compute_jacobian_fd(&model, &subject, &theta, &eta, &mut scratch, None);
+    let jac = compute_jacobian_fd_config(
+        &model,
+        &subject,
+        &theta,
+        &eta,
+        &mut scratch,
+        None,
+        InnerFdConfig {
+            method: InnerFdMethod::Shi,
+            objective_noise_abs: Some(1e-8),
+            prediction_noise_abs: Some(1e-8),
+        },
+    );
 
     // Row 2 (FREM obs) must be exactly [0, 0, 1]
     assert_eq!(jac[(2, 0)], 0.0, "FREM row: ∂Y/∂η_CL must be exactly 0");
