@@ -121,6 +121,12 @@ its own — `CL-WT-linear-add`, competing with `CL-WT-linear` for the one
 which Pharmpy's is not, so a space that asks for `+` carries a note saying the
 equations will not reproduce Pharmpy's.
 
+A search candidate never names its θ, so it takes the form's defaults — and
+under `+` those are
+[scale-free](../model-file/covariate-model.qmd#additive-defaults) rather than
+PsN's spread-derived bounds, which would otherwise cap the added term at about
+±1 absolute unit and make the candidate's ΔOFV under-report the effect.
+
 ## Convergence is shown next to ΔOFV, never omitted
 
 Under automation, a fit that stalled at its initial estimates (#751) or

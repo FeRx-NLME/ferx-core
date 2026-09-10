@@ -27,8 +27,14 @@ section of the SDLC for the versioning policy).
   one carries, so θ = 0, a covariate at its centre and a missing covariate all mean "no
   effect" (the missing-value guard is `else 0.0` under `+`, `else 1.0` under `*`).
   Multiplicative and additive relations may be mixed on one parameter, and an additive
-  relation carries no top-level-product requirement. Mu-referencing switches off for a
-  parameter with an additive relation — the typical value is a sum — and the parser warns.
+  relation carries no top-level-product requirement. Its default θ bounds are scale-free
+  (`±1e6`) rather than PsN's `[1/(c−max), 1/(c−min)]`, which encode the positivity of a
+  factor the additive form does not have, and a centre outside the observed covariate range
+  is legal under `+` for the same reason. Mu-referencing switches off for a parameter with an
+  additive relation — the typical value is a sum — and the parser warns, for the methods that
+  read mu-references (SAEM / IMP / IMPMAP / BAYES). The relation table on `FitResult` and in
+  `{model}-fit.yaml` gains an `op` field, so a caller reading the model back can tell the two
+  spellings apart.
   This is the last MFL operator: `COVARIATE(..., +)` is no longer a search coverage gap, and
   `ferx covsearch` explores `CL-WT-linear-add` as a candidate of its own. **Note:** Pharmpy
   reuses the multiplicative template under `+`, so a model translated from Pharmpy will not

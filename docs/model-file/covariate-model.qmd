@@ -168,7 +168,8 @@ Every `scm` state is expressible:
 | 5 `power` | `(COV/median)**THETA(1)` | `power(center = median)` |
 | arbitrary `[code]` | NONMEM verbatim | `expr("…")` |
 
-The **default inits and bounds are PsN's, verbatim**:
+The **default inits and bounds are PsN's, verbatim** — for a multiplicative
+(`*`) relation:
 
 | form | init | lower | upper |
 |---|---|---|---|
@@ -182,7 +183,8 @@ The linear bounds are not cosmetic: `θ ∈ [1/(c−max), 1/(c−min)]` is exact
 keeps `1 + θ·(COV − c)` positive over the observed covariate range.
 
 Those bounds only exist, and only come back ordered, when the centre lies
-**strictly inside** the observed range, so the linear family requires it:
+**strictly inside** the observed range, so the *multiplicative* linear family
+requires it:
 
 - a covariate that does not vary around its centre makes both bounds infinite;
 - a centre *outside* the range makes both the same sign, which would emit
@@ -191,6 +193,40 @@ Those bounds only exist, and only come back ordered, when the centre lies
 Both are rejected with a message rather than given a θ the optimiser cannot
 move. State the θ yourself (`=> NAME(init, lower, upper)`) if you really want a
 centre outside the data.
+
+### Additive defaults are scale-free {#additive-defaults}
+
+Every bound above exists to keep a *factor* positive — `1 + θ·(COV − c) > 0`,
+`1 + θ_k > 0`. An additive (`+`) relation has no factor: its θ is a shift in the
+parameter's own units, and the block does not know that parameter's scale. So
+the additive defaults drop the data-derived bounds entirely:
+
+| form | init | lower | upper |
+|---|---|---|---|
+| `linear`, `hockey` | `0.001` | `−1e6` | `1e6` |
+| `linear_relative` | `0.001·c` | `−1e6` | `1e6` |
+| `categorical` | `−0.001` | `−1e6` | `1e6` |
+| `exponential`, `power` | `0.001` | `−100` | `1e6` |
+
+Reusing PsN's bounds here would cap the whole added term at roughly ±1 absolute
+unit over the covariate's range. On `WT ∈ [45, 93.7]` centred at 70 that is
+`θ ∈ [−0.042, 0.040]` — tighter than the `0.05` this page uses as an
+illustration — so a slope of that size would be estimated *at* its bound, and a
+covariate search would under-detect the effect with no warning.
+
+The centre rule relaxes with the bounds: under `+` a centre outside the observed
+range is fine (`linear(center = 0) +` is just the uncentred slope `θ·COV`). A
+covariate that is **constant** in the data is still rejected when the centre is
+symbolic, since `θ·(c₀ − c)` is then a constant shift confounded with the
+parameter's typical value.
+
+Bound an additive θ yourself once you know the parameter's scale — a clearance
+term is worth a very different bound from a lag-time one:
+
+```
+[covariate_model]
+  CL ~ CRCL linear(center = 100) + => THETA_CL_CRCL(0.02, -1, 1)
+```
 
 Two forms **divide** by the centre, so it also has to be usable as a divisor —
 this engine underflows `x/0` to `0` rather than raising, so an unusable centre
@@ -265,6 +301,7 @@ covariate_model:
   - parameter: "CL"
     covariate: "WT"
     form: "power"
+    op: "*"
     center: 70.2  # resolved from median
     thetas:
       - name: "THETA_CL_WT"
@@ -273,23 +310,35 @@ covariate_model:
   - parameter: "CL"
     covariate: "SEX"
     form: "categorical"
+    op: "*"
     center: 0  # resolved from mode
     thetas:
       - name: "THETA_CL_SEX_1"
         estimate: 0.184220
         se: 0.061400
         level: 1          # which level this contrast belongs to
+  - parameter: "CL"
+    covariate: "CRCL"
+    form: "linear"
+    op: "+"           # a term added to CL, not a factor on it
+    center: 100
+    thetas:
+      - name: "THETA_CL_CRCL"
+        estimate: 0.021044
+        se: 0.004310
   - parameter: "V"
     covariate: "WT"
     form: "expr"
+    op: "*"
     expression: "1 + 0.1 * WT"   # the hand-written factor, verbatim
     thetas: []                   # `none` and `expr` generate no θ
 ```
 
-The table is meant to be read by a program: a categorical θ names its `level`,
-an `expr` relation carries the `expression` that actually ran, and a relation
-with no θ emits an empty *sequence* (`thetas: []`), never a bare key — so
-`thetas` always deserializes as a list.
+The table is meant to be read by a program: `op` says how the effect combined
+(without it the two spellings of a `linear` relation echo identically), a
+categorical θ names its `level`, an `expr` relation carries the `expression`
+that actually ran, and a relation with no θ emits an empty *sequence*
+(`thetas: []`), never a bare key — so `thetas` always deserializes as a list.
 
 A symbolic statistic can only be resolved once a dataset has been seen. Fits
 launched from a data file (`ferx <model> --data …`, `fit_from_files`, `ferx

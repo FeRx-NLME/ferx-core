@@ -1772,6 +1772,12 @@ impl CovariateSummary {
     }
 }
 
+/// `serde(default)` for [`CovariateRelationEstimate::op`]: a relation echoed
+/// before #1313 carried no operator and was necessarily multiplicative.
+fn multiply_label() -> String {
+    CovariateOp::Multiply.label().to_string()
+}
+
 /// One relation echoed on [`FitResult`], with the estimate and SE of each θ it
 /// generated — the table a covariate search reads back after a fit.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1780,13 +1786,22 @@ pub struct CovariateRelationEstimate {
     pub covariate: String,
     /// [`CovariateForm::label`] of the relation's form.
     pub form: String,
+    /// [`CovariateOp::label`] of how the effect combined: `"*"` or `"+"`.
+    ///
+    /// Without it `CL ~ WT linear` and `CL ~ WT linear +` echo identically,
+    /// and a caller reading this table back reports an additive relation as
+    /// multiplicative — the same reason [`CovariateRelation::op`] exists, one
+    /// layer out. `#[serde(default)]` so a `{model}-fit.yaml` written before
+    /// #1313 still deserializes, as `"*"`.
+    #[serde(default = "multiply_label")]
+    pub op: String,
     /// `center`/`breakpoint`/`ref` as written (`"median"`, `"70"`).
     pub center_source: Option<String>,
     /// …and the value it resolved to.
     pub center: Option<f64>,
     /// The body of an `expr("...")` relation — the expression that actually
-    /// multiplied into the parameter. `None` for every other form, whose
-    /// factor is determined by `form` + `center` + `thetas`. Without it `form:
+    /// combined into the parameter. `None` for every other form, whose effect
+    /// is determined by `form` + `op` + `center` + `thetas`. Without it `form:
     /// "expr"` says a hand-written factor ran but not which one, which is not
     /// enough for a caller to reproduce or report the model.
     pub expression: Option<String>,

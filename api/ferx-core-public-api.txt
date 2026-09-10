@@ -2654,6 +2654,7 @@ pub ferx_core::types::CovariateRelationEstimate::center_source: core::option::Op
 pub ferx_core::types::CovariateRelationEstimate::covariate: alloc::string::String
 pub ferx_core::types::CovariateRelationEstimate::expression: core::option::Option<alloc::string::String>
 pub ferx_core::types::CovariateRelationEstimate::form: alloc::string::String
+pub ferx_core::types::CovariateRelationEstimate::op: alloc::string::String
 pub ferx_core::types::CovariateRelationEstimate::parameter: alloc::string::String
 pub ferx_core::types::CovariateRelationEstimate::thetas: alloc::vec::Vec<ferx_core::CovariateThetaEstimate>
 pub struct ferx_core::types::CovariateRow
@@ -3991,6 +3992,7 @@ pub ferx_core::CovariateRelationEstimate::center_source: core::option::Option<al
 pub ferx_core::CovariateRelationEstimate::covariate: alloc::string::String
 pub ferx_core::CovariateRelationEstimate::expression: core::option::Option<alloc::string::String>
 pub ferx_core::CovariateRelationEstimate::form: alloc::string::String
+pub ferx_core::CovariateRelationEstimate::op: alloc::string::String
 pub ferx_core::CovariateRelationEstimate::parameter: alloc::string::String
 pub ferx_core::CovariateRelationEstimate::thetas: alloc::vec::Vec<ferx_core::CovariateThetaEstimate>
 pub struct ferx_core::CovariateRow

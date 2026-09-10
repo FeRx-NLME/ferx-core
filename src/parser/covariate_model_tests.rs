@@ -36,6 +36,15 @@ fn model_with(covariates: &str, covariate_model: &str) -> String {
     )
 }
 
+/// [`model_with`] plus a `[fit_options] method`, for the warnings that are
+/// scoped to the methods that actually read `mu_refs`.
+fn model_with_method(covariates: &str, covariate_model: &str, method: &str) -> String {
+    format!(
+        "{}\n[fit_options]\n\x20 method = {method}\n",
+        model_with(covariates, covariate_model)
+    )
+}
+
 fn spec(covariates: &str, covariate_model: &str) -> CovariateModelSpec {
     parse_full_model(&model_with(covariates, covariate_model))
         .expect("model should parse")
@@ -1007,9 +1016,10 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
     // differ in exactly one character — the trailing `+` — so they sit on
     // opposite sides of `detect_mu_refs`' predicate, and a change that made the
     // detector match a sum (or stopped it matching a product) reddens this.
-    let mul = parse_full_model(&model_with(
+    let mul = parse_full_model(&model_with_method(
         "  WT continuous",
         "  CL ~ WT linear(center = 70) => THETA_CL_WT(0.02, -1, 1)",
+        "saem",
     ))
     .expect("model should parse");
     assert!(
@@ -1026,9 +1036,10 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
         mul.model.parse_warnings
     );
 
-    let add = parse_full_model(&model_with(
+    let add = parse_full_model(&model_with_method(
         "  WT continuous",
         "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+        "saem",
     ))
     .expect("model should parse");
     assert!(
@@ -1050,9 +1061,12 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
 fn a_parameter_with_no_eta_gets_no_mu_reference_warning() {
     // The warning names a performance cliff that only exists for an η the
     // M-step would otherwise shift; `V = TVV` carries none.
-    let parsed = parse_full_model(&model_with(
+    // Under `saem`, so the warning is suppressed by the missing η and not by
+    // the method gate — with `focei` here the assertion could not fail.
+    let parsed = parse_full_model(&model_with_method(
         "  WT continuous",
         "  V ~ WT linear(center = 70) + => THETA_V_WT(0.02, -1, 1)",
+        "saem",
     ))
     .expect("model should parse");
     assert!(
@@ -1064,6 +1078,54 @@ fn a_parameter_with_no_eta_gets_no_mu_reference_warning() {
         "{:?}",
         parsed.model.parse_warnings
     );
+}
+
+/// The mu-referencing warning describes the SAEM/IMP M-step, so it must not
+/// fire for a method that never reads `mu_refs` (#1316 review).
+///
+/// Its own last sentence says FOCE/FOCEI are unaffected, yet it was pushed
+/// unconditionally at parse time — a paragraph on every FOCEI fit about a path
+/// that run does not take. A differential pair on the *method*, with the
+/// additive relation held fixed, so it straddles the gate that was added.
+#[test]
+fn the_mu_reference_warning_is_scoped_to_the_methods_that_read_mu_refs() {
+    let relation = "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)";
+    let fired = |method: &str| {
+        let parsed = parse_full_model(&model_with_method("  WT continuous", relation, method))
+            .expect("model should parse");
+        // The classification itself is method-independent — only the warning is
+        // scoped — so a gate that silently disabled the detection would not
+        // pass here either.
+        assert!(
+            !parsed.model.mu_refs.contains_key("ETA_CL"),
+            "the sum is not a mu-ref shape under {method}: {:?}",
+            parsed.model.mu_refs
+        );
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("additive (`+`) [covariate_model]"))
+            .cloned()
+    };
+
+    let saem = fired("saem").expect("SAEM uses the mu-ref M-step, so the cliff is real");
+    assert!(
+        saem.contains("SAEM"),
+        "the warning names the method: {saem}"
+    );
+    for method in ["imp", "impmap", "bayes"] {
+        assert!(
+            fired(method).is_some(),
+            "{method} reads mu_refs and must be warned"
+        );
+    }
+    for method in ["focei", "foce", "laplace"] {
+        assert!(
+            fired(method).is_none(),
+            "{method} never reads mu_refs, so the warning is noise"
+        );
+    }
 }
 
 #[test]

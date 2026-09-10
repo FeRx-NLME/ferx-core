@@ -3817,6 +3817,27 @@ pub fn parse_full_model_with(
         // expression; #619 was the effect being dropped), but it is a
         // performance cliff a user should not have to infer from a slow fit.
         // Only a parameter that actually carries an eta is worth naming.
+        //
+        // And only for a method that *reads* `mu_refs` at all: the warning's own
+        // last sentence says FOCE/FOCEI are unaffected, so emitting it on a
+        // FOCEI fit is a paragraph about a path that run never takes. The
+        // consumers are the EM / importance-sampling / Bayes family (grep
+        // `mu_refs` under `src/estimation/`: saem, importance_sampling, impmap,
+        // bayes — `parameterization` serves those).
+        //
+        // This reads the method the *model file* states, which is the only one a
+        // parse-time warning can see: a caller that parses a FOCEI file and then
+        // overrides `FitOptions::method` to `saem` in code gets no warning. The
+        // model file is the spelling this block exists to warn about, and the
+        // detection itself (`mu_refs`, `has_conditional_eta_params`) is not
+        // gated — only the message is.
+        let method_uses_mu_refs = matches!(
+            fit_options.method,
+            EstimationMethod::Saem
+                | EstimationMethod::Imp
+                | EstimationMethod::Impmap
+                | EstimationMethod::Bayes
+        );
         let additive_params: Vec<String> = match &model.covariate_model {
             Some(spec) => {
                 let mut out: Vec<String> = Vec::new();
@@ -3837,13 +3858,15 @@ pub fn parse_full_model_with(
             }
             None => Vec::new(),
         };
-        if !additive_params.is_empty() {
+        if method_uses_mu_refs && !additive_params.is_empty() {
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for parameter(s) with an additive (`+`) \
                  [covariate_model] relation: {}. The typical value is a sum, so it is not \
-                 log-linear in one theta and SAEM/IMP use the numerical M-step for these etas; \
-                 FOCE/FOCEI are unaffected. Use a multiplicative relation to keep mu-referencing.",
-                additive_params.join(", ")
+                 log-linear in one theta and {} uses the numerical M-step for these etas. \
+                 Use a multiplicative relation to keep mu-referencing (FOCE/FOCEI do not use \
+                 it and are unaffected).",
+                additive_params.join(", "),
+                fit_options.method.label(),
             ));
         }
     }

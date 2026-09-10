@@ -764,6 +764,14 @@ fn build_thetas(
     let mut out = match rel.form {
         CovariateForm::Categorical => {
             let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
+            // PsN's `(-1, 5)` is a *multiplicative* bound: the factor is
+            // `1 + θ_k`, so `θ_k > -1` is exactly what keeps it positive. An
+            // additive `θ_k` is a shift in the parameter's own units and carries
+            // no such constraint — see [`ADDITIVE_THETA_BOUNDS`].
+            let (lower, upper) = match rel.op {
+                CovariateOp::Multiply => (-1.0, 5.0),
+                CovariateOp::Add => ADDITIVE_THETA_BOUNDS,
+            };
             non_reference_levels(rel, decl, summary)?
                 .into_iter()
                 .map(|level| CovariateTheta {
@@ -771,8 +779,8 @@ fn build_thetas(
                     // about it, so the parameterization has no preferred sign.
                     name: format!("{base}_{}", level_suffix(level)),
                     init: -0.001,
-                    lower: -1.0,
-                    upper: 5.0,
+                    lower,
+                    upper,
                     fixed: false,
                     level: Some(level),
                 })
@@ -787,10 +795,16 @@ fn build_thetas(
             level: None,
         }],
         CovariateForm::Linear | CovariateForm::LinearRelative | CovariateForm::Hockey => {
-            let Some(summary) = summary else {
-                return Ok(Vec::new());
-            };
-            linear_family_thetas(rel, summary, center)?
+            if rel.op == CovariateOp::Add {
+                // The additive defaults are scale-free, so unlike the
+                // multiplicative ones they do not wait on a dataset.
+                additive_linear_family_thetas(rel, summary, center)?
+            } else {
+                let Some(summary) = summary else {
+                    return Ok(Vec::new());
+                };
+                linear_family_thetas(rel, summary, center)?
+            }
         }
         CovariateForm::None | CovariateForm::Expr(_) => Vec::new(),
     };
@@ -798,13 +812,114 @@ fn build_thetas(
     Ok(out)
 }
 
-/// PsN's default init/bounds for the linear family.
+/// Default bounds for an **additive** covariate θ.
+///
+/// Every data-derived bound in this file exists to keep a *multiplicative*
+/// factor positive — `1 + θ·(COV − c) > 0` for the linear family, `1 + θ_k > 0`
+/// for `categorical`. Under `+` there is no factor: the θ is a shift in the
+/// parameter's own units, and this function does not know that parameter's
+/// scale. Reusing the PsN bounds there caps the whole additive term at roughly
+/// ±1 *absolute* unit over the covariate's range — on `WT ∈ [45, 93.7]` centred
+/// at 70 that is `θ ∈ [−0.042, 0.040]`, tighter than the slopes this feature's
+/// own docs (0.05) and NONMEM anchor (0.04) use, so a covsearch candidate would
+/// be estimated against a pinned bound and its ΔOFV would under-detect the
+/// effect with no warning.
+///
+/// So the additive default is effectively unbounded and the null stays at `0`.
+/// A real bound, when the parameter's scale is known, is stated per relation
+/// with `=> NAME(init, lower, upper)`.
+const ADDITIVE_THETA_BOUNDS: (f64, f64) = (-1e6, 1e6);
+
+/// Init/bounds for the linear family under `+`.
+///
+/// The multiplicative twin ([`linear_family_thetas`]) derives both bounds *and*
+/// its init from the covariate's spread, because both encode the positivity of
+/// `1 + θ·(COV − c)`. None of that survives the drop of the leading `1`, so the
+/// only thing the data is still consulted for here is the degenerate case: a
+/// constant covariate makes `θ·(c₀ − c)` a constant shift, confounded with the
+/// typical value, and no bound can make it identifiable.
+///
+/// That last check is best-effort, and the asymmetry with the multiplicative
+/// path is worth stating: there, the *bounds* need the spread, so the relation
+/// is unresolved until a dataset arrives and a constant covariate is always
+/// caught. Here nothing else needs data, so an additive relation with a
+/// **literal** centre is fully built at parse time and is never handed a
+/// summary. Making it wait for data anyway would be a false requirement — the
+/// defaults below do not depend on the dataset — so the check fires only for a
+/// symbolic centre (`center = median`, …).
+///
+/// The init is `0.001` in the *absolute* slope, scaled for `linear_relative`
+/// exactly as the multiplicative path scales it, so the two spellings still
+/// start the optimiser at the same covariate effect.
+fn additive_linear_family_thetas(
+    rel: &CovariateRelation,
+    summary: Option<&CovariateSummary>,
+    center: f64,
+) -> Result<Vec<CovariateTheta>, String> {
+    if let Some(summary) = summary {
+        if summary.min == summary.max {
+            return Err(format!(
+                "[covariate_model]: `{} ~ {} {} +` has nothing to estimate — `{}` is constant \
+                 ({}) in the data, so the added term `θ·({} − {center})` is a constant shift, \
+                 confounded with the typical value of `{}`. Drop the relation, or supply data \
+                 where the covariate varies.",
+                rel.parameter,
+                rel.covariate,
+                rel.form.label(),
+                rel.covariate,
+                summary.min,
+                rel.covariate,
+                rel.parameter,
+            ));
+        }
+    }
+    let scale = if matches!(rel.form, CovariateForm::LinearRelative) {
+        center
+    } else {
+        1.0
+    };
+    let (lower, upper) = ADDITIVE_THETA_BOUNDS;
+    let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
+    Ok(match rel.form {
+        CovariateForm::Hockey => vec![
+            CovariateTheta {
+                name: format!("{base}_LO"),
+                init: 0.001,
+                lower,
+                upper,
+                fixed: false,
+                level: None,
+            },
+            CovariateTheta {
+                name: format!("{base}_HI"),
+                init: 0.001,
+                lower,
+                upper,
+                fixed: false,
+                level: None,
+            },
+        ],
+        _ => vec![CovariateTheta {
+            name: base,
+            init: scale * 0.001,
+            lower,
+            upper,
+            fixed: false,
+            level: None,
+        }],
+    })
+}
+
+/// PsN's default init/bounds for the linear family under `*`.
 ///
 /// The bounds are not cosmetic: `θ ∈ [1/(med−max), 1/(med−min)]` is exactly
 /// what keeps `1 + θ·(COV − med)` positive over the observed covariate range,
 /// which is why they are adopted verbatim rather than re-invented. A constant
 /// covariate makes both bounds infinite, so it is rejected here instead of
 /// producing a θ the optimiser cannot move.
+///
+/// Multiplicative only — every sentence above is about that leading `1`. The
+/// additive path is [`additive_linear_family_thetas`].
 fn linear_family_thetas(
     rel: &CovariateRelation,
     summary: &CovariateSummary,
@@ -823,7 +938,8 @@ fn linear_family_thetas(
              the observed range of `{}`, which spans [{}, {}] in the data — the PsN default \
              bounds 1/(centre − min) and 1/(centre − max) are only ordered (and only keep the \
              covariate factor positive) there. State the θ explicitly with \
-             `=> NAME(init, lower, upper)`, or drop the relation.",
+             `=> NAME(init, lower, upper)`, make the relation additive (`+`, which has no \
+             factor to keep positive and so no such requirement), or drop it.",
             rel.parameter,
             rel.covariate,
             rel.form.label(),
