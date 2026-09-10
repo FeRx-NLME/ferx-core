@@ -109,15 +109,16 @@ inits and bounds verbatim:
 | `COVARIATE?(CL, WT, exp)` | `CL ~ WT exponential(center = median)` |
 | `COVARIATE?(CL, WT, piece_lin)` | `CL ~ WT hockey(breakpoint = median)` |
 | `COVARIATE?(CL, SEX, cat)` | `CL ~ SEX categorical(ref = mode)` |
+| `COVARIATE?(CL, SEX, cat2)` | `CL ~ SEX categorical2(ref = mode)` |
 | `COVARIATE?(CL, WT, lin, +)` | `CL ~ WT linear(center = median) +` |
 
-`cat2` and `custom` have no block spelling and are refused by the
+`custom` has no block spelling and is refused by the
 [coverage check](search.qmd#coverage) when the file is loaded.
 
 The `+` operator is expressible, and a candidate under it is a candidate of
 its own — `CL-WT-linear-add`, competing with `CL-WT-linear` for the one
 `[covariate_model]` line the pair is allowed. ferx's additive effect is
-[null at θ = 0](../model-file/covariate-model.qmd#multiplicative-and-additive-effects),
+[null at the form's own null](../model-file/covariate-model.qmd#multiplicative-and-additive-effects),
 which Pharmpy's is not, so a space that asks for `+` carries a note saying the
 equations will not reproduce Pharmpy's.
 

@@ -2235,13 +2235,17 @@ fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec
             Diagnostic::error(
                 "E_COV_LEVEL_UNKNOWN",
                 format!(
-                    "[covariate_model]: `{} ~ {} categorical(...)` declares levels {declared:?} \
+                    "[covariate_model]: `{} ~ {} {}(...)` declares levels {declared:?} \
                      (reference {reference}), but `{}` also takes {unknown:?} in the data. An \
                      undeclared value takes the same factor as the reference level, so the fit \
                      would silently model it as reference. List every level \
                      (`{} categorical(levels = [...])`), use `levels = auto` to read them off \
                      the data, or filter the rows out.",
-                    rel.parameter, rel.covariate, rel.covariate, rel.covariate
+                    rel.parameter,
+                    rel.covariate,
+                    rel.form.label(),
+                    rel.covariate,
+                    rel.covariate
                 ),
             )
             .with_block("covariate_model"),

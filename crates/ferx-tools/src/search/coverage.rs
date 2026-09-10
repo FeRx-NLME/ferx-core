@@ -179,27 +179,21 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
         Feature::Lagtime(_) => {}
         Feature::Covariate { effects, .. } => {
             // The covariate wildcard is Pharmpy's four continuous forms, not
-            // the full enum — `cat2` and `custom` have to be asked for by name.
+            // the full enum — `cat`, `cat2` and `custom` have to be asked for
+            // by name.
             let effects = match effects {
                 Modes::Wildcard => CovariateEffect::CONTINUOUS.to_vec(),
                 Modes::List(list) => list.clone(),
             };
             for e in effects {
-                match e {
-                    CovariateEffect::Cat2 => gap(
-                        gaps,
-                        "COVARIATE(..., cat2)".into(),
-                        "`[covariate_model]` has one categorical form, `categorical(ref = …)` \
-                         (MFL `cat`); there is no `cat2` spelling",
-                    ),
-                    CovariateEffect::Custom => gap(
+                if matches!(e, CovariateEffect::Custom) {
+                    gap(
                         gaps,
                         "COVARIATE(..., custom)".into(),
                         "a search cannot invent an expression; write the relation with the \
                          `expr(...)` escape hatch in the base model's `[covariate_model]` \
                          instead",
-                    ),
-                    _ => {}
+                    );
                 }
             }
             // The `+` operator is covered as of #1313 — the block spells it as

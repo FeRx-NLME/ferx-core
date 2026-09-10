@@ -145,6 +145,159 @@ fn categorical_contrasts_every_non_reference_level() {
 }
 
 #[test]
+fn categorical2_is_the_factor_itself_not_an_offset() {
+    // #1312: Pharmpy MFL's `cat2`. Same θ count and the same reference branch
+    // as `categorical`; the non-reference branch is `θ_k`, not `1 + θ_k`.
+    let s = spec(
+        "  SEX categorical(levels = [0, 1, 2])",
+        "  CL ~ SEX categorical2(ref = 0)",
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else \
+         if (SEX == 2) THETA_CL_SEX_2 else 1) else 1.0) * exp(ETA_CL)"
+    );
+    // The θ names and level suffixes are the `categorical` scheme unchanged —
+    // only the shape moved.
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1, 2])",
+        "  CL ~ SEX categorical(ref = 0)",
+    );
+    let names = |s: &CovariateModelSpec| -> Vec<String> {
+        s.relations[0]
+            .thetas
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    };
+    assert_eq!(names(&s), names(&cat));
+    assert_eq!(
+        s.relations[0]
+            .thetas
+            .iter()
+            .map(|t| t.level)
+            .collect::<Vec<_>>(),
+        vec![Some(1.0), Some(2.0)]
+    );
+}
+
+#[test]
+fn categorical2_takes_its_own_init_and_bounds_not_categoricals() {
+    // The null moves from θ = 0 to θ = 1, so inheriting `categorical`'s
+    // defaults would start the relation at a *factor* of −0.001. The bounds
+    // are the image of (−1, 5) under θ₂ = 1 + θ₁, which is also Pharmpy's
+    // `cat2` pair verbatim; the init is the image of ferx's own −0.001, so
+    // the two forms start at the identical model.
+    let s = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0)",
+    );
+    assert_eq!(
+        s.generated_thetas,
+        vec!["  theta THETA_CL_SEX_1(0.999, 0, 6)"]
+    );
+    // Explicitly *not* the `categorical` defaults — a fallthrough to that arm
+    // would emit these instead.
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0)",
+    );
+    assert_eq!(
+        cat.generated_thetas,
+        vec!["  theta THETA_CL_SEX_1(-0.001, -1, 5)"]
+    );
+    assert_ne!(s.generated_thetas, cat.generated_thetas);
+}
+
+#[test]
+fn categorical2_answers_to_ref_and_to_the_categorical_kind_check() {
+    // `ref`, not `center` — the same keyword `categorical` takes.
+    let e = err(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(center = 0)",
+    );
+    assert!(e.contains("centres on `ref`"), "{e}");
+
+    // A continuous column refuses it, and names the form that was written.
+    let e = err("  WT continuous", "  CL ~ WT categorical2(ref = 0)");
+    assert!(e.contains("`categorical2(...)` on `WT`"), "{e}");
+
+    // And a categorical column accepts it where a continuous form is refused.
+    let e = err(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX power(center = 0)",
+    );
+    assert!(e.contains("continuous form"), "{e}");
+}
+
+#[test]
+fn categorical2_needs_levels_and_reports_its_own_name() {
+    let e = err("  SEX categorical", "  CL ~ SEX categorical2(ref = 0)");
+    assert!(
+        e.contains("`categorical2(...)` on `SEX` needs its levels"),
+        "{e}"
+    );
+
+    let e = err(
+        "  SEX categorical(levels = [1])",
+        "  CL ~ SEX categorical2(ref = 1)",
+    );
+    assert!(e.contains("`CL ~ SEX categorical2(...)`"), "{e}");
+    assert!(e.contains("nothing to estimate"), "{e}");
+}
+
+#[test]
+fn categorical2_and_categorical_agree_at_the_matching_theta() {
+    // The reparameterization identity θ₂ = 1 + θ₁ read off the generated text:
+    // substituting the same numbers gives the same factor at every level. Here
+    // θ₁ = 0.25 and θ₂ = 1.25 are both fixed, so the two lines are two
+    // spellings of the same model.
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) => T(0.25, -1, 5)",
+    );
+    let cat2 = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0) => T(1.25, 0, 6)",
+    );
+    assert_eq!(
+        cl_line(&cat),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + T else 1) else 1.0) * exp(ETA_CL)"
+    );
+    assert_eq!(
+        cl_line(&cat2),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) T else 1) else 1.0) * exp(ETA_CL)"
+    );
+    // 1 + 0.25 == 1.25: the non-reference factor is the same number, and the
+    // reference branch is `1` in both.
+    assert_eq!(
+        cat.relations[0].thetas[0].init + 1.0,
+        cat2.relations[0].thetas[0].init
+    );
+}
+
+#[test]
+fn fix_on_categorical2_pins_the_factor_not_the_offset() {
+    // `fix = v` pins every θ at `v` for both forms, but the *null* differs:
+    // `fix = 1` is "no effect" for `categorical2` where `fix = 0` is for
+    // `categorical`. Nothing in the block reinterprets the number, and this
+    // pins that it does not.
+    let s = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0, fix = 1)",
+    );
+    assert_eq!(
+        s.generated_thetas,
+        vec!["  theta THETA_CL_SEX_1(1, 0, 6) FIX"]
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else 1) else 1.0) \
+         * exp(ETA_CL)"
+    );
+}
+
+#[test]
 fn none_declares_no_theta_and_leaves_the_expression_alone() {
     // A search writes `none` to record "tested, rejected"; the generated model
     // must round-trip through the parser unchanged.
@@ -633,6 +786,73 @@ fn a_relation_that_states_no_form_lists_the_forms() {
     assert!(e.contains("linear_relative"), "{e}");
 }
 
+/// Both "expected one of …" diagnostics must offer **every** form the parser
+/// accepts, and the list must stay complete when a variant is added.
+///
+/// This is the regression #1312 left behind on its first pass: `categorical2`
+/// went into the unknown-form message and into `did_you_mean`, but not into the
+/// missing-form message, which kept listing eight forms. The old test asserted
+/// only that `linear_relative` appeared, so it stayed green while the feature
+/// was invisible to anyone who left the form off.
+///
+/// The guard has two halves, and it needs both. `FORM_SPELLINGS` is now the
+/// single list the diagnostics render, so the first half — every spelling is
+/// offered by both messages — could not fail on its own today. The second half
+/// is what makes the pair non-redundant: every `CovariateForm` variant's label
+/// must *be* in that list, driven by an exhaustive `match`, so a new variant is
+/// a compile error here until it is listed and a test failure until the
+/// diagnostics print it.
+#[test]
+fn every_form_the_parser_accepts_is_offered_by_both_diagnostics() {
+    let missing_form = err("  WT continuous", "  CL ~ WT");
+    let unknown_form = err("  WT continuous", "  CL ~ WT nonsense");
+    for spelling in FORM_SPELLINGS {
+        assert!(
+            missing_form.contains(spelling),
+            "the missing-form message omits `{spelling}`: {missing_form}"
+        );
+        assert!(
+            unknown_form.contains(spelling),
+            "the unknown-form message omits `{spelling}`: {unknown_form}"
+        );
+    }
+
+    // …and the list covers the enum. The `match` is exhaustive on purpose: a
+    // new variant does not compile until it is named here.
+    let every_variant = [
+        CovariateForm::None,
+        CovariateForm::Linear,
+        CovariateForm::LinearRelative,
+        CovariateForm::Exponential,
+        CovariateForm::Power,
+        CovariateForm::Hockey,
+        CovariateForm::Categorical,
+        CovariateForm::Categorical2,
+        CovariateForm::Expr("(WT/70)^0.75".into()),
+    ];
+    for form in &every_variant {
+        // The exhaustive arm that forces a new variant into `every_variant`.
+        match form {
+            CovariateForm::None
+            | CovariateForm::Linear
+            | CovariateForm::LinearRelative
+            | CovariateForm::Exponential
+            | CovariateForm::Power
+            | CovariateForm::Hockey
+            | CovariateForm::Categorical
+            | CovariateForm::Categorical2
+            | CovariateForm::Expr(_) => {}
+        }
+        assert!(
+            FORM_SPELLINGS.contains(&form.label()),
+            "`{}` is a form of the enum but not of FORM_SPELLINGS, so no diagnostic \
+             offers it",
+            form.label()
+        );
+    }
+    assert_eq!(every_variant.len(), FORM_SPELLINGS.len());
+}
+
 #[test]
 fn two_relations_generating_the_same_theta_name_is_an_error() {
     // Each relation owns its θ; sharing one would couple two lines and defeat
@@ -822,6 +1042,83 @@ fn an_additive_categorical_contributes_zero_at_the_reference_level() {
         "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + THETA_CL_SEX_1 else 1) else 1.0) \
          * exp(ETA_CL)"
     );
+}
+
+#[test]
+fn an_additive_categorical2_subtracts_its_own_null_not_a_shared_zero() {
+    // #1312 met #1313: `categorical2` reads its θ as the factor itself against
+    // a reference of `1`, so the additive template subtracts *that* null —
+    // `θ_k - 1` — where `categorical`, whose branch is `1 + θ_k`, subtracts the
+    // `1` it carries and lands on a bare `θ_k`. A regression that shares one
+    // null across the forms writes the same text for both and turns `cat +`
+    // and `cat2 +` into duplicate search candidates.
+    let cat2 = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0) +",
+    );
+    assert_eq!(
+        cl_line(&cat2),
+        "CL = TVCL * exp(ETA_CL) + \
+         (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 - 1 else 0) else 0.0)"
+    );
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) +",
+    );
+    assert_ne!(
+        cl_line(&cat2),
+        cl_line(&cat),
+        "the two additive categorical forms must not desugar to the same text"
+    );
+
+    // …and `θ_cat2 = 1 + θ_cat` stays an exact reparameterization under `+`,
+    // asserted on numbers: the same subject, the same level, one θ apart.
+    let tvcl = 4.0;
+    let text2 = model_with(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0) +",
+    );
+    let text1 = model_with(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) +",
+    );
+    let v2 = pk_values(
+        &text2,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)],
+        &[("SEX", 1.0)],
+    );
+    let v1 = pk_values(
+        &text1,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 0.3)],
+        &[("SEX", 1.0)],
+    );
+    assert!(
+        (v2[0] - v1[0]).abs() < 1e-12,
+        "θ_cat2 = 1 + θ_cat must give the same CL: {} vs {}",
+        v2[0],
+        v1[0]
+    );
+    // The effect is live at that level — without this the two agree because
+    // both contributed nothing.
+    assert!(
+        (v2[0] - (tvcl + 0.3)).abs() < 1e-12,
+        "expected TVCL + (θ_cat2 - 1), got {}",
+        v2[0]
+    );
+    // `categorical2`'s null moves with the form: θ = 1, not θ = 0, is "no
+    // effect" — and the reference level contributes nothing either way.
+    let null = pk_values(
+        &text2,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.0)],
+        &[("SEX", 1.0)],
+    );
+    assert_eq!(null[0], tvcl, "θ_cat2 = 1 adds nothing");
+    let reference = pk_values(
+        &text2,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)],
+        &[("SEX", 0.0)],
+    );
+    assert_eq!(reference[0], tvcl, "the reference level adds nothing");
 }
 
 #[test]
