@@ -325,6 +325,11 @@ struct SaemState {
     /// SA sufficient statistic for Omega_iov: running average of (1/N_occ) Σᵢ Σₖ κᵢₖκᵢₖᵀ.
     /// Zero-sized when `n_kappa == 0`.
     s2_iov: DMatrix<f64>,
+    /// SA sufficient statistic for an eligible scalar residual variance: the
+    /// running residual sum of squares, with proportional residuals divided by
+    /// the squared individual prediction. `None` for the general numerical
+    /// residual M-step.
+    residual_sse: Option<f64>,
     /// Current theta
     theta: Vec<f64>,
     /// Current omega matrix
@@ -333,6 +338,149 @@ struct SaemState {
     omega_iov_mat: DMatrix<f64>,
     /// Current sigma values
     sigma_vals: Vec<f64>,
+}
+
+/// Simple Gaussian residual channel whose complete-data σ M-step has a scalar
+/// sufficient statistic. The eligibility gate below intentionally admits only
+/// the legacy `ErrorSpec::Single` forms: per-endpoint, selected, correlated,
+/// combined, transformed, and magnitude-scaled error models need their own
+/// derivation rather than an approximation that silently changes their target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScalarResidualModel {
+    Additive,
+    Proportional,
+}
+
+/// Whether every free structural θ is moved by the log-mu-referenced M-step.
+/// That update re-centres its paired η by the same realised shift, leaving the
+/// latent individual parameters (and hence this residual statistic) unchanged.
+/// A free numerical θ could change predictions between samples, so it stays on
+/// the joint NLopt θ/σ path.
+fn only_mu_referenced_free_thetas(
+    n_theta: usize,
+    theta_fixed: &[bool],
+    mu_ref_pairs: &[(usize, usize)],
+) -> bool {
+    (0..n_theta).all(|i| {
+        theta_fixed.get(i).copied().unwrap_or(false)
+            || mu_ref_pairs.iter().any(|&(theta_idx, _)| theta_idx == i)
+    })
+}
+
+/// Return the exact scalar residual-statistic M-step only for the deliberately
+/// narrow models whose Gaussian complete-data likelihood is
+/// `n_obs * log(σ) + RSS / (2σ²)`, up to constants. Unsupported shapes retain
+/// the established numerical M-step.
+fn scalar_residual_mstep_model(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    n_kappa: usize,
+    is_mixture: bool,
+    use_closed_form_mstep: bool,
+    mu_ref_pairs: &[(usize, usize)],
+) -> Option<ScalarResidualModel> {
+    let scalar_model = match &model.error_spec {
+        ErrorSpec::Single(ErrorModel::Additive) => ScalarResidualModel::Additive,
+        ErrorSpec::Single(ErrorModel::Proportional) => ScalarResidualModel::Proportional,
+        _ => return None,
+    };
+
+    let one_free_sigma = init_params.sigma.values.len() == 1
+        && !init_params.sigma_fixed.first().copied().unwrap_or(false);
+    let stable_latent_predictions = only_mu_referenced_free_thetas(
+        init_params.theta.len(),
+        &init_params.theta_fixed,
+        mu_ref_pairs,
+    ) && (use_closed_form_mstep
+        || init_params.theta_fixed.iter().all(|&fixed| fixed));
+    let plain_gaussian_rows = population.subjects.iter().all(|subject| {
+        !subject.has_censored_observation()
+            && subject.obs_records.is_empty()
+            && !subject.observations.is_empty()
+    });
+
+    if one_free_sigma
+        && stable_latent_predictions
+        && plain_gaussian_rows
+        && !is_mixture
+        && n_kappa == 0
+        && model.residual_error_eta.is_none()
+        && model.residual_correlations.is_empty()
+        && model.frem_config.is_none()
+        && !model.has_custom_ruv_magnitude()
+        && !model.log_transform
+    {
+        Some(scalar_model)
+    } else {
+        None
+    }
+}
+
+/// Sum the scalar residual sufficient statistic at the retained individual
+/// samples. A proportional prediction at (or too near) zero has no valid
+/// `r² / f²` statistic, so callers fall back to the general M-step instead of
+/// introducing an arbitrary denominator floor.
+fn scalar_residual_sse(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    etas: &[Vec<f64>],
+    residual_model: ScalarResidualModel,
+) -> Option<(f64, usize)> {
+    use rayon::prelude::*;
+
+    let per_subject: Vec<Option<(f64, usize)>> = population
+        .subjects
+        .par_iter()
+        .zip(etas.par_iter())
+        .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+            let predictions =
+                crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, scratch);
+            if predictions.len() != subject.observations.len() {
+                return None;
+            }
+            let mut sse = 0.0;
+            for (&y, &f) in subject.observations.iter().zip(predictions.iter()) {
+                if !(y.is_finite() && f.is_finite()) {
+                    return None;
+                }
+                let residual = y - f;
+                let term = match residual_model {
+                    ScalarResidualModel::Additive => residual * residual,
+                    ScalarResidualModel::Proportional => {
+                        if f.abs() <= f64::MIN_POSITIVE {
+                            return None;
+                        }
+                        residual * residual / (f * f)
+                    }
+                };
+                if !term.is_finite() {
+                    return None;
+                }
+                sse += term;
+            }
+            Some((sse, subject.observations.len()))
+        })
+        .collect();
+
+    // Preserve thread-count reproducibility: Rayon may schedule subjects in a
+    // different partition, but the collected vector remains input ordered.
+    per_subject
+        .into_iter()
+        .try_fold((0.0, 0_usize), |(sum, n), item| {
+            item.map(|(subject_sse, subject_n)| (sum + subject_sse, n + subject_n))
+        })
+}
+
+/// Robbins-Monro update of a scalar residual sum of squares. The first retained
+/// sample initializes the statistic; exploration's γ = 1 then has the usual
+/// overwrite semantics without needing a synthetic RSS at the initial ETAs.
+fn update_scalar_residual_sse(statistic: &mut Option<f64>, sample_sse: f64, gamma: f64) {
+    match statistic {
+        Some(current) => *current += gamma * (sample_sse - *current),
+        None => *statistic = Some(sample_sse),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,6 +2028,7 @@ pub fn run_saem(
         steps_since_adapt: 0,
         s2,
         s2_iov: s2_iov_init,
+        residual_sse: None,
         theta: theta_cur,
         omega_mat: omega_cur,
         omega_iov_mat: omega_iov_init,
@@ -2067,6 +2216,19 @@ pub fn run_saem(
         } else {
             !mu_ref_pairs.is_empty()
         };
+
+    // A scalar residual statistic is exact for this narrow subset of models.
+    // Every excluded shape stays on the established joint numerical θ/σ M-step;
+    // importantly, this is not a user-facing approximation switch.
+    let scalar_residual_model = scalar_residual_mstep_model(
+        model,
+        population,
+        init_params,
+        n_kappa,
+        saem_mix.is_some(),
+        use_closed_form_mstep,
+        &mu_ref_pairs,
+    );
 
     // STRONG advisory: an estimated θ with **no associated ETA** is not
     // mu-referenced, so it never receives the γ-damped closed-form
@@ -2873,8 +3035,9 @@ pub fn run_saem(
             None
         };
         if run_mstep {
-            let mstep_maxiter = if k <= k1 { 3 } else { 5 }; // more precise in convergence phase
-
+            // Use a few more iterations after exploration, when the M-step is
+            // expected to settle rather than find its basin.
+            let mstep_maxiter = if k <= k1 { 3 } else { 5 };
             if use_closed_form_mstep && saem_mix.is_none() {
                 // Closed-form EM M-step for log-mu-referenced thetas.
                 //
@@ -2923,31 +3086,37 @@ pub fn run_saem(
                 // gradient request, capped at `mstep_maxiter` requests. FIXed
                 // thetas are not pinned by the closed form (NLopt sees them as
                 // FIXed via the regular bounds path) so they aren't counted.
-                mstep_grad_step_evals_saved += 2 * mstep_maxiter as u64 * n_pinned;
+                if scalar_residual_model.is_none() {
+                    mstep_grad_step_evals_saved += 2 * mstep_maxiter as u64 * n_pinned;
+                }
 
-                // NLopt for non-mu-ref thetas (pinned) and sigma.
-                let (theta_new, sigma_new) = theta_sigma_mstep_light(
-                    model,
-                    population,
-                    &state.etas,
-                    kappas_for_mstep,
-                    &log_theta,
-                    &log_sigma,
-                    &temp_theta_lower,
-                    &temp_theta_upper,
-                    &log_sigma_lower,
-                    &log_sigma_upper,
-                    n_theta,
-                    n_sigma,
-                    mstep_maxiter,
-                    options.scale_params,
-                    &theta_packs_log_mask,
-                    // Closed-form branch is never taken for a mixture (disabled
-                    // above), so no class guard is needed here.
-                    None,
-                );
-                damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                // NLopt for any non-mu-ref theta and the general residual
+                // channel. The scalar statistic gate has no free numerical θ
+                // or σ dimension left for this solve.
+                if scalar_residual_model.is_none() {
+                    let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                        model,
+                        population,
+                        &state.etas,
+                        kappas_for_mstep,
+                        &log_theta,
+                        &log_sigma,
+                        &temp_theta_lower,
+                        &temp_theta_upper,
+                        &log_sigma_lower,
+                        &log_sigma_upper,
+                        n_theta,
+                        n_sigma,
+                        mstep_maxiter,
+                        options.scale_params,
+                        &theta_packs_log_mask,
+                        // Closed-form branch is never taken for a mixture (disabled
+                        // above), so no class guard is needed here.
+                        None,
+                    );
+                    damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                    damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                }
             } else if use_closed_form_mstep {
                 // ---- Closed-form EM M-step under a mixture (#996) ----
                 //
@@ -3050,29 +3219,60 @@ pub fn run_saem(
                 // be class-aware mu-referenced): full NLopt M-step for all thetas
                 // + sigma. For a mixture, `mstep_classes` guards each subject so
                 // class-switched thetas are estimated per class (#985).
-                let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                if scalar_residual_model.is_none() {
+                    let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                        model,
+                        population,
+                        &state.etas,
+                        kappas_for_mstep,
+                        &log_theta,
+                        &log_sigma,
+                        &log_theta_lower,
+                        &log_theta_upper,
+                        &log_sigma_lower,
+                        &log_sigma_upper,
+                        n_theta,
+                        n_sigma,
+                        mstep_maxiter,
+                        options.scale_params,
+                        &theta_packs_log_mask,
+                        saem_mix.as_ref().map(|m| MixMstep {
+                            classes: m.classes.as_slice(),
+                            class_sigma_over: &mix_sigma_over,
+                        }),
+                    );
+                    damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                    damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                }
+            }
+
+            if let Some(residual_model) = scalar_residual_model {
+                // The only θ updates this gate permits are FIXed or
+                // log-mu-referenced shifts paired with eta re-centering, so the
+                // current latent individual predictions remain the complete-data
+                // samples to average. A runtime prediction failure keeps the
+                // last valid σ rather than fabricating a statistic.
+                let theta_for_stat: Vec<f64> = (0..n_theta)
+                    .map(|i| unpack_theta(i, log_theta[i]))
+                    .collect();
+                if let Some((sample_sse, n_obs)) = scalar_residual_sse(
                     model,
                     population,
+                    &theta_for_stat,
                     &state.etas,
-                    kappas_for_mstep,
-                    &log_theta,
-                    &log_sigma,
-                    &log_theta_lower,
-                    &log_theta_upper,
-                    &log_sigma_lower,
-                    &log_sigma_upper,
-                    n_theta,
-                    n_sigma,
-                    mstep_maxiter,
-                    options.scale_params,
-                    &theta_packs_log_mask,
-                    saem_mix.as_ref().map(|m| MixMstep {
-                        classes: m.classes.as_slice(),
-                        class_sigma_over: &mix_sigma_over,
-                    }),
-                );
-                damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                    residual_model,
+                ) {
+                    if n_obs > 0 {
+                        update_scalar_residual_sse(&mut state.residual_sse, sample_sse, gamma);
+                        if let Some(sse) = state.residual_sse {
+                            let sigma = (sse / n_obs as f64).sqrt();
+                            if sigma.is_finite() && sigma > 0.0 {
+                                log_sigma[0] =
+                                    sigma.ln().clamp(log_sigma_lower[0], log_sigma_upper[0]);
+                            }
+                        }
+                    }
+                }
             }
 
             // #895: clamp any RUV-scaled residual σ that the M-step pushed past its
@@ -4296,6 +4496,88 @@ mod tests {
             "MSTEP_NLOPT_ALGORITHM changed — see comment above this test \
              for the Emax-Hill identifiability rationale before adjusting."
         );
+    }
+
+    #[test]
+    fn scalar_residual_statistic_uses_the_averaged_rss_not_the_latest_draw() {
+        // Fixture from the saemix 3.5 investigation: prior RSS = 2, retained
+        // RSS = 18, gamma = 1/2, and two observations. The statistic is 10,
+        // so the M-step SD is sqrt(5); a latest-draw update would be 3 instead.
+        let mut statistic = None;
+        update_scalar_residual_sse(&mut statistic, 2.0, 1.0);
+        update_scalar_residual_sse(&mut statistic, 18.0, 0.5);
+        let sse = statistic.expect("first retained draw initializes the statistic");
+        assert!((sse - 10.0).abs() < 1e-12);
+        assert!(((sse / 2.0).sqrt() - 5.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scalar_residual_mstep_gate_accepts_only_stable_simple_models() {
+        let model = noeta_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(2);
+        let mut params = model.default_params.clone();
+        params.sigma_fixed[0] = false;
+        let pairs = get_mu_ref_pairs(&model);
+
+        assert_eq!(
+            scalar_residual_mstep_model(&model, &pop, &params, 0, false, true, &pairs),
+            Some(ScalarResidualModel::Proportional),
+        );
+
+        // A free fixed-effect-only theta changes predictions in the numerical
+        // M-step, so an RSS accumulated in its old coordinate system is not a
+        // valid sufficient statistic.
+        let unanchored = noeta_model("TVV");
+        let mut unanchored_params = unanchored.default_params.clone();
+        unanchored_params.sigma_fixed[0] = false;
+        let unanchored_pairs = get_mu_ref_pairs(&unanchored);
+        assert_eq!(
+            scalar_residual_mstep_model(
+                &unanchored,
+                &pop,
+                &unanchored_params,
+                0,
+                false,
+                true,
+                &unanchored_pairs,
+            ),
+            None,
+        );
+
+        // FIXed residual SDs are preserved exactly rather than re-estimated.
+        params.sigma_fixed[0] = true;
+        assert_eq!(
+            scalar_residual_mstep_model(&model, &pop, &params, 0, false, true, &pairs),
+            None,
+        );
+    }
+
+    #[test]
+    fn scalar_residual_sse_is_finite_for_additive_and_proportional_samples() {
+        let model = noeta_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(2);
+        let etas = vec![vec![0.0; model.n_eta]; pop.subjects.len()];
+        let additive = scalar_residual_sse(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &etas,
+            ScalarResidualModel::Additive,
+        )
+        .expect("finite additive statistic");
+        let proportional = scalar_residual_sse(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &etas,
+            ScalarResidualModel::Proportional,
+        )
+        .expect("finite proportional statistic");
+        assert_eq!(additive.1, 16);
+        assert_eq!(proportional.1, additive.1);
+        assert!(additive.0.is_finite() && additive.0 > 0.0);
+        assert!(proportional.0.is_finite() && proportional.0 > 0.0);
+        assert_ne!(additive.0, proportional.0);
     }
 
     /// `combined_additive_sigma_at_floor` flags only a free additive component
