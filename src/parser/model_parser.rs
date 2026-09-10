@@ -7697,6 +7697,36 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             })?;
         }
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
+        "outer_fd_method" => {
+            opts.outer_fd_method = match value.to_ascii_lowercase().as_str() {
+                "fixed" => crate::types::OuterFdMethod::Fixed,
+                "shi" => crate::types::OuterFdMethod::Shi,
+                "gill" => crate::types::OuterFdMethod::Gill,
+                other => return Err(format!("fit option `outer_fd_method`: unknown value `{other}` — expected fixed/shi/gill")),
+            };
+        }
+        "outer_fd_noise_abs" => {
+            opts.outer_fd_noise_abs = Some(parse_pos_finite("outer_fd_noise_abs")?)
+        }
+        "inner_fd_method" => {
+            opts.inner_fd_method = match value.to_ascii_lowercase().as_str() {
+                "fixed" => crate::types::InnerFdMethod::Fixed,
+                "shi" => crate::types::InnerFdMethod::Shi,
+                other => {
+                    return Err(format!(
+                    "fit option `inner_fd_method`: unknown value `{other}` — expected fixed/shi"
+                ))
+                }
+            };
+        }
+        "inner_fd_objective_noise_abs" => {
+            opts.inner_fd_objective_noise_abs =
+                Some(parse_pos_finite("inner_fd_objective_noise_abs")?)
+        }
+        "inner_fd_prediction_noise_abs" => {
+            opts.inner_fd_prediction_noise_abs =
+                Some(parse_pos_finite("inner_fd_prediction_noise_abs")?)
+        }
         "analytic_cov_hessian" => opts.analytic_cov_hessian = parse_bool("analytic_cov_hessian")?,
         "covariance_fallback" => {
             opts.covariance_fallback = match value.to_lowercase().as_str() {

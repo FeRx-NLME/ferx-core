@@ -5343,6 +5343,28 @@ pub enum CovarianceMethod {
     Sandwich,
 }
 
+/// Interval policy for numerical outer gradients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OuterFdMethod {
+    /// Historical bounded centred difference with a prescribed interval.
+    #[default]
+    Fixed,
+    /// Shi--Xie--Xuan--Nocedal noise-aware centred interval search.
+    Shi,
+    /// Experimental Gill-style curvature-balanced forward interval.
+    Gill,
+}
+
+/// Interval policy for numerical inner derivatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InnerFdMethod {
+    /// Historical prescribed finite-difference intervals.
+    #[default]
+    Fixed,
+    /// Shi--Xie--Xuan--Nocedal bounded centred interval search.
+    Shi,
+}
+
 /// Severity level for a structured warning entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum WarningSeverity {
@@ -6503,6 +6525,18 @@ pub struct FitOptions {
     /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
     pub ode_auto_switch: bool,
     pub run_covariance_step: bool,
+    /// Interval policy for scalar packed-space outer finite-difference gradients.
+    /// `Fixed` preserves the historical `1e-4 * (1 + |x|)` centred stencil.
+    pub outer_fd_method: OuterFdMethod,
+    /// Absolute function-evaluation noise bound for adaptive outer FD methods.
+    /// Required when [`Self::outer_fd_method`] is `Shi` or `Gill`.
+    pub outer_fd_noise_abs: Option<f64>,
+    /// Interval policy for inner scalar posterior gradients and prediction Jacobians.
+    pub inner_fd_method: InnerFdMethod,
+    /// Absolute noise bound for inner scalar posterior-objective differences.
+    pub inner_fd_objective_noise_abs: Option<f64>,
+    /// Absolute noise bound for inner prediction-Jacobian differences.
+    pub inner_fd_prediction_noise_abs: Option<f64>,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
@@ -7192,6 +7226,11 @@ impl Default for FitOptions {
             ode_stiff_abort_after: None,
             ode_auto_switch: true,
             run_covariance_step: true,
+            outer_fd_method: OuterFdMethod::Fixed,
+            outer_fd_noise_abs: None,
+            inner_fd_method: InnerFdMethod::Fixed,
+            inner_fd_objective_noise_abs: None,
+            inner_fd_prediction_noise_abs: None,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
@@ -8105,6 +8144,11 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance_fallback",
         "analytic_cov_hessian",
         "fd_hessian_step",
+        "outer_fd_method",
+        "outer_fd_noise_abs",
+        "inner_fd_method",
+        "inner_fd_objective_noise_abs",
+        "inner_fd_prediction_noise_abs",
         "verbose",
         "sir",
         "sir_samples",

@@ -3602,6 +3602,54 @@ fn test_apply_fit_option_known_applies() {
     assert_eq!(opts.saem_omega_burnin, 30);
 }
 
+#[test]
+fn test_apply_fit_option_outer_fd_policy_and_noise() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.outer_fd_method, OuterFdMethod::Fixed);
+    assert_eq!(opts.outer_fd_noise_abs, None);
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "outer_fd_method", "shi"),
+        Ok(true)
+    );
+    assert_eq!(opts.outer_fd_method, OuterFdMethod::Shi);
+    assert_eq!(
+        apply_fit_option(&mut opts, "outer_fd_noise_abs", "2e-5"),
+        Ok(true)
+    );
+    assert_eq!(opts.outer_fd_noise_abs, Some(2e-5));
+    assert_eq!(
+        apply_fit_option(&mut opts, "outer_fd_method", "gill"),
+        Ok(true)
+    );
+    assert_eq!(opts.outer_fd_method, OuterFdMethod::Gill);
+
+    assert!(apply_fit_option(&mut opts, "outer_fd_method", "bad").is_err());
+    assert!(apply_fit_option(&mut opts, "outer_fd_noise_abs", "0").is_err());
+}
+
+#[test]
+fn test_apply_fit_option_inner_fd_policy_and_noise() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        apply_fit_option(&mut opts, "inner_fd_method", "shi"),
+        Ok(true)
+    );
+    assert_eq!(opts.inner_fd_method, InnerFdMethod::Shi);
+    assert_eq!(
+        apply_fit_option(&mut opts, "inner_fd_objective_noise_abs", "1e-7"),
+        Ok(true)
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "inner_fd_prediction_noise_abs", "1e-9"),
+        Ok(true)
+    );
+    assert_eq!(opts.inner_fd_objective_noise_abs, Some(1e-7));
+    assert_eq!(opts.inner_fd_prediction_noise_abs, Some(1e-9));
+    assert!(apply_fit_option(&mut opts, "inner_fd_method", "gill").is_err());
+    assert!(apply_fit_option(&mut opts, "inner_fd_prediction_noise_abs", "0").is_err());
+}
+
 /// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
 /// so the calibrated constant applies, and rejects anything outside `(0, 1]` —
 /// `1.0` is the documented "off" value and must stay accepted.

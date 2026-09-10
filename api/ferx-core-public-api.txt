@@ -2306,6 +2306,9 @@ pub ferx_core::types::HessianAnchor::GaussNewton
 pub enum ferx_core::types::InfusionDef
 pub ferx_core::types::InfusionDef::DurationDefined
 pub ferx_core::types::InfusionDef::RateDefined
+pub enum ferx_core::types::InnerFdMethod
+pub ferx_core::types::InnerFdMethod::Fixed
+pub ferx_core::types::InnerFdMethod::Shi
 pub enum ferx_core::types::InnerOptimizer
 pub ferx_core::types::InnerOptimizer::Auto
 pub ferx_core::types::InnerOptimizer::Bfgs
@@ -2360,6 +2363,10 @@ pub ferx_core::types::Optimizer::TrustRegion
 impl ferx_core::Optimizer
 pub fn ferx_core::Optimizer::label(self) -> &'static str
 pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel, interaction: bool) -> ferx_core::Optimizer
+pub enum ferx_core::types::OuterFdMethod
+pub ferx_core::types::OuterFdMethod::Fixed
+pub ferx_core::types::OuterFdMethod::Gill
+pub ferx_core::types::OuterFdMethod::Shi
 pub enum ferx_core::types::ParameterScaling
 pub ferx_core::types::ParameterScaling::Abs
 pub ferx_core::types::ParameterScaling::Auto
@@ -2810,6 +2817,9 @@ pub ferx_core::types::FitOptions::impmap_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::impmap_sobol: bool
 pub ferx_core::types::FitOptions::impmap_trace: bool
 pub ferx_core::types::FitOptions::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::types::FitOptions::inner_fd_method: ferx_core::InnerFdMethod
+pub ferx_core::types::FitOptions::inner_fd_objective_noise_abs: core::option::Option<f64>
+pub ferx_core::types::FitOptions::inner_fd_prediction_noise_abs: core::option::Option<f64>
 pub ferx_core::types::FitOptions::inner_maxiter: usize
 pub ferx_core::types::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::types::FitOptions::inner_restarts: usize
@@ -2840,6 +2850,8 @@ pub ferx_core::types::FitOptions::ode_reltol: f64
 pub ferx_core::types::FitOptions::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::types::FitOptions::optimizer: ferx_core::Optimizer
 pub ferx_core::types::FitOptions::optimizer_trace: bool
+pub ferx_core::types::FitOptions::outer_fd_method: ferx_core::OuterFdMethod
+pub ferx_core::types::FitOptions::outer_fd_noise_abs: core::option::Option<f64>
 pub ferx_core::types::FitOptions::outer_ftol: core::option::Option<f64>
 pub ferx_core::types::FitOptions::outer_gtol: f64
 pub ferx_core::types::FitOptions::outer_maxiter: usize
@@ -3547,6 +3559,9 @@ pub ferx_core::HessianAnchor::GaussNewton
 pub enum ferx_core::InfusionDef
 pub ferx_core::InfusionDef::DurationDefined
 pub ferx_core::InfusionDef::RateDefined
+pub enum ferx_core::InnerFdMethod
+pub ferx_core::InnerFdMethod::Fixed
+pub ferx_core::InnerFdMethod::Shi
 pub enum ferx_core::InnerOptimizer
 pub ferx_core::InnerOptimizer::Auto
 pub ferx_core::InnerOptimizer::Bfgs
@@ -3612,6 +3627,10 @@ pub ferx_core::Optimizer::TrustRegion
 impl ferx_core::Optimizer
 pub fn ferx_core::Optimizer::label(self) -> &'static str
 pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel, interaction: bool) -> ferx_core::Optimizer
+pub enum ferx_core::OuterFdMethod
+pub ferx_core::OuterFdMethod::Fixed
+pub ferx_core::OuterFdMethod::Gill
+pub ferx_core::OuterFdMethod::Shi
 pub enum ferx_core::ParameterScaling
 pub ferx_core::ParameterScaling::Abs
 pub ferx_core::ParameterScaling::Auto
@@ -4185,6 +4204,9 @@ pub ferx_core::FitOptions::impmap_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::impmap_sobol: bool
 pub ferx_core::FitOptions::impmap_trace: bool
 pub ferx_core::FitOptions::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::FitOptions::inner_fd_method: ferx_core::InnerFdMethod
+pub ferx_core::FitOptions::inner_fd_objective_noise_abs: core::option::Option<f64>
+pub ferx_core::FitOptions::inner_fd_prediction_noise_abs: core::option::Option<f64>
 pub ferx_core::FitOptions::inner_maxiter: usize
 pub ferx_core::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::FitOptions::inner_restarts: usize
@@ -4215,6 +4237,8 @@ pub ferx_core::FitOptions::ode_reltol: f64
 pub ferx_core::FitOptions::ode_stiff_abort_after: core::option::Option<u32>
 pub ferx_core::FitOptions::optimizer: ferx_core::Optimizer
 pub ferx_core::FitOptions::optimizer_trace: bool
+pub ferx_core::FitOptions::outer_fd_method: ferx_core::OuterFdMethod
+pub ferx_core::FitOptions::outer_fd_noise_abs: core::option::Option<f64>
 pub ferx_core::FitOptions::outer_ftol: core::option::Option<f64>
 pub ferx_core::FitOptions::outer_gtol: f64
 pub ferx_core::FitOptions::outer_maxiter: usize

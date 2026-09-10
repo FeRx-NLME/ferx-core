@@ -5,6 +5,7 @@ pub mod agq;
 pub(crate) mod agq_cov_hessian;
 pub mod bayes;
 pub(crate) mod covariance;
+pub(crate) mod finite_difference;
 pub(crate) mod fixed_eta_gradient;
 pub(crate) mod focei_htilde_dx;
 pub mod gauss_newton;

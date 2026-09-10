@@ -1,5 +1,6 @@
+use crate::estimation::finite_difference::{adaptive_first_derivative, AxisBounds};
 use crate::estimation::inner_optimizer::{
-    find_ebe, run_inner_loop_warm, run_inner_loop_warm_map, InnerLoopStats,
+    find_ebe, run_inner_loop_warm, run_inner_loop_warm_map, InnerFdConfig, InnerLoopStats,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_iov};
@@ -876,6 +877,7 @@ fn run_inner_loop_and_nll(
         mu_k,
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
+        InnerFdConfig::from_options(options),
         |subject, ebe| {
             subject_nll(
                 model,
@@ -2945,10 +2947,9 @@ fn reconverged_fd_gradient(
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
 
-    // OFV at a packed point, re-solving the inner loop (warm-started). Matches
-    // the objective closure's definition: 2·pop_nll, guarded to 1e20 on
-    // non-finite or excess EBE non-convergence.
-    let eval = |xv: &[f64]| -> f64 {
+    // OFV at a packed point, re-solving the inner loop (warm-started). A
+    // rejected EBE solve is an invalid FD probe, never a smooth 1e20 value.
+    let eval = |xv: &[f64]| -> Option<f64> {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
@@ -2966,14 +2967,14 @@ fn reconverged_fd_gradient(
         if !raw.is_finite()
             || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
         {
-            1e20
+            None
         } else {
-            raw
+            Some(raw)
         }
     };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/`is_finite`-drop convention can't drift (#466 review round 4 #8).
-    central_diff_packed(x, &fixed, bounds, eval)
+    central_diff_packed(x, &fixed, bounds, options, eval)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -2983,7 +2984,8 @@ fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
     bounds: &PackedBounds,
-    eval: impl Fn(&[f64]) -> f64,
+    options: &FitOptions,
+    eval: impl Fn(&[f64]) -> Option<f64>,
 ) -> Vec<f64> {
     let n = x.len();
     let eps = 1e-4;
@@ -2994,6 +2996,32 @@ fn central_diff_packed(
             continue;
         }
         let h = eps * (1.0 + x[k].abs());
+        if options.outer_fd_method != OuterFdMethod::Fixed {
+            let noise = match options.outer_fd_noise_abs {
+                Some(noise) => noise,
+                None => continue,
+            };
+            let derivative = adaptive_first_derivative(
+                options.outer_fd_method,
+                x[k],
+                h,
+                AxisBounds {
+                    lower: bounds.lower[k],
+                    upper: bounds.upper[k],
+                },
+                noise,
+                |coordinate| {
+                    xw[k] = coordinate;
+                    let value = eval(&xw);
+                    xw[k] = x[k];
+                    value
+                },
+            );
+            if let Some(d) = derivative {
+                grad[k] = d;
+            }
+            continue;
+        }
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
         let denom = xp - xm;
@@ -3005,9 +3033,11 @@ fn central_diff_packed(
         xw[k] = xm;
         let fm = eval(&xw);
         xw[k] = x[k];
-        let d = (fp - fm) / denom;
-        if d.is_finite() {
-            grad[k] = d;
+        if let (Some(fp), Some(fm)) = (fp, fm) {
+            let d = (fp - fm) / denom;
+            if d.is_finite() {
+                grad[k] = d;
+            }
         }
     }
     grad
@@ -3036,9 +3066,9 @@ fn subject_reconverged_fd_gradient(
     let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
-    // difference drops to zero for that coordinate.
-    let eval = |xv: &[f64]| -> f64 {
+    // (`foce_subject_nll`, summed by `pop_nll`); a non-finite result makes the
+    // stencil invalid rather than contributing a fabricated derivative.
+    let eval = |xv: &[f64]| -> Option<f64> {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe(
@@ -3051,7 +3081,7 @@ fn subject_reconverged_fd_gradient(
             Some(&mu_k),
             0,
         );
-        crate::stats::likelihood::foce_subject_nll(
+        let value = crate::stats::likelihood::foce_subject_nll(
             model,
             subject,
             &params.theta,
@@ -3061,9 +3091,10 @@ fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             &params.residual_correlations,
             options.interaction,
-        )
+        );
+        value.is_finite().then_some(value)
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    central_diff_packed(x, &fixed, bounds, options, eval)
 }
 
 /// Per-subject reconverged-FD packed gradient for an **IOV** subject — the IOV analogue of
@@ -3081,7 +3112,7 @@ fn subject_reconverged_fd_gradient_iov(
     options: &FitOptions,
 ) -> Vec<f64> {
     let fixed = packed_fixed_mask(init_params);
-    let eval = |xv: &[f64]| -> f64 {
+    let eval = |xv: &[f64]| -> Option<f64> {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe(
@@ -3094,7 +3125,7 @@ fn subject_reconverged_fd_gradient_iov(
             Some(&mu_k),
             0,
         );
-        crate::stats::likelihood::foce_subject_nll_iov(
+        let value = crate::stats::likelihood::foce_subject_nll_iov(
             model,
             subject,
             &params.theta,
@@ -3108,9 +3139,10 @@ fn subject_reconverged_fd_gradient_iov(
                 .omega_iov
                 .as_ref()
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
-        )
+        );
+        value.is_finite().then_some(value)
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    central_diff_packed(x, &fixed, bounds, options, eval)
 }
 
 /// Non-IOV population gradient assembled **per subject**: the exact analytic
