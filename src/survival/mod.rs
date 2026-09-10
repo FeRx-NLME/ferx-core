@@ -735,7 +735,8 @@ pub(crate) fn ode_cumhaz_hazard(
     let mut du = vec![0.0; ode.n_states];
     for (i, &t) in times.iter().enumerate() {
         cum[i] = states[i][chz_state];
-        (ode.rhs)(&states[i], &pk.values, t, &mut du);
+        let rhs_params = crate::ode::predictions::rhs_ext_params_at(ode, subject, &pk.values, t);
+        (ode.rhs)(&states[i], &rhs_params, t, &mut du);
         haz[i] = du[chz_state];
     }
     (cum, haz)

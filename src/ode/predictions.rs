@@ -2598,6 +2598,27 @@ fn subject_dose_attrs(
     (dose_lagtimes, dose_f_bio)
 }
 
+/// Build the extended parameter slice required for a standalone RHS read at `t`.
+///
+/// Integrating prediction paths keep this slice live and update its TAD anchor at
+/// each segment boundary. Readout-only callers (the TTE hazard derivative) do not
+/// own that walk, so they must derive both anchors from the same dose-time helpers
+/// instead of passing a bare [`PkParams::values`](crate::types::PkParams::values)
+/// array to the RHS (#1261).
+#[cfg(feature = "survival")]
+#[inline]
+pub(crate) fn rhs_ext_params_at(
+    ode: &OdeSpec,
+    subject: &Subject,
+    pk_params_flat: &[f64],
+    t: f64,
+) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
+    let (dose_lagtimes, _) = subject_dose_attrs(subject, ode, pk_params_flat);
+    let mut ext_params = seed_ext_params(pk_params_flat, earliest_dose_time(&subject.doses));
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor_for(&subject.doses, &dose_lagtimes, t);
+    ext_params
+}
+
 /// Earliest dose record time, or `+∞` when there are no doses.
 ///
 /// Takes the dose list rather than the `Subject` so the EKF

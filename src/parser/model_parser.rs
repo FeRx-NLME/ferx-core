@@ -11879,6 +11879,19 @@ fn build_ode_spec(
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+            // The RHS always reserves two trailing slots for dose-time anchors:
+            // TAFD at MAX_PK_PARAMS and TAD at MAX_PK_PARAMS + 1. Passing a bare
+            // PkParams::values array (which ends at MAX_PK_PARAMS) turns either
+            // read into NaN and lets that non-finite value surface much later as a
+            // misleading likelihood sentinel. Keep the interface slice-based, but
+            // make every missing extended-parameter injection fail immediately in
+            // debug/test builds (#1266).
+            debug_assert!(
+                params.len() >= crate::types::MAX_PK_PARAMS + 2,
+                "ODE RHS: params.len() = {} < extended parameter length {} (TAFD/TAD slots)",
+                params.len(),
+                crate::types::MAX_PK_PARAMS + 2,
+            );
             // The integrator always passes a `u` whose length matches the
             // declared state count. The old closure index-panicked on
             // `u[i]` if that contract ever broke; preserve that signal here

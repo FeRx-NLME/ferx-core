@@ -221,6 +221,9 @@ pub(crate) struct JointPkTteSolve {
     chz_states: Vec<Vec<f64>>,
     /// PK-parameter snapshot used for the solve — reused to evaluate `h = dCHZ/dt`.
     pk_values: Vec<f64>,
+    /// Extended parameter snapshots aligned to `times`, including the dose-time anchors
+    /// the RHS reads when evaluating `h = dCHZ/dt` (#1261).
+    rhs_params: Vec<[f64; crate::types::MAX_PK_PARAMS + 2]>,
 }
 
 /// Build the shared joint PK-TTE solve, but only when it is provably equivalent to
@@ -317,6 +320,10 @@ fn try_joint_pktte_shared_solve(
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let (mut preds, chz_states) =
         crate::ode::ode_predictions_and_chz(ode, &pk.values, theta, eta, subject, &times);
+    let rhs_params = times
+        .iter()
+        .map(|&t| crate::ode::predictions::rhs_ext_params_at(ode, subject, &pk.values, t))
+        .collect();
     // Apply exactly the post-processing the standalone no-TV ODE prediction path does
     // (compute_predictions_with_tv_into_with_schedule): init impulse, [scaling], LTBS.
     // No-op for Form-C / no-init / linear-scale models; FREM is excluded by the guard.
@@ -329,6 +336,7 @@ fn try_joint_pktte_shared_solve(
         times,
         chz_states,
         pk_values: pk.values.to_vec(),
+        rhs_params,
     })
 }
 
@@ -357,7 +365,7 @@ fn tte_ode_nll_from_shared(
             continue;
         }
         cum[i] = st[chz_state];
-        (ode.rhs)(st, &share.pk_values, t, &mut du);
+        (ode.rhs)(st, &share.rhs_params[i], t, &mut du);
         haz[i] = du[chz_state];
     }
     let tol = crate::survival::MonoTol::from_solver(&ode.effective_solver_opts());
@@ -4160,6 +4168,100 @@ mod tests {
     /// `t_last ≥ subject_integration_start` and so routes the pre-start read through the
     /// engines' pre-first-break **fill** rather than through the `k = 0` boundary visit
     /// that covers a degenerate every-time-before-the-dose timeline (#1218).
+    /// #1261: a TTE hazard readout must receive the dose-time anchors the ODE
+    /// integration used. A bare `PkParams::values` slice made TAD NaN, which the
+    /// scorer converted into its finite 1e20 rejection sentinel.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_hazard_readout_uses_the_current_tad_anchor() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        let model = parse_model_string(
+            r"
+[parameters]
+theta TVCL(1.0, 0.01, 100.0)
+theta TVV(10.0, 0.1, 500.0)
+theta TVH0(0.1, 0.001, 10.0)
+theta TVKT(0.01, 0.0001, 1.0)
+sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+CL = TVCL
+V = TVV
+H0 = TVH0
+KT = TVKT
+[structural_model]
+ode(obs_cmt=central, states=[central])
+[odes]
+d/dt(central) = -CL / V * central
+[event_model]
+cmt = 3
+hazard = H0 * (1.0 + KT * TAD)
+[error_model]
+DV ~ proportional(PROP_ERR)
+",
+        )
+        .expect("TAD-reading ODE hazard must parse");
+        let (chz_state, hazard) = match model.endpoints.get(&3) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => (*chz_state, h),
+            _ => panic!("expected ODE-accumulated endpoint"),
+        };
+        let mut subject = make_simple_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.obs_times = vec![30.0];
+        subject.observations = vec![0.0];
+        subject.obs_cmts = vec![1];
+        subject.cens = vec![0];
+        subject.occasions = vec![1];
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 30.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        let p = &model.default_params;
+        let eta = [];
+        let nll = tte_endpoint_nll(
+            &model,
+            &subject,
+            hazard,
+            crate::types::TteRecurrence::Single,
+            &subject.obs_records,
+            &p.theta,
+            &eta,
+        );
+
+        // H(30) = .1 * [integral_0^12(1 + .01t) + integral_12^30(1 + .01(t - 12))] = 3.234.
+        // h(30) = .1 * (1 + .01 * 18) = .118. Two doses prevent TAD and TAFD aliasing.
+        // The 1e10 guard is ten orders below the old 2e20 sentinel and nine orders above
+        // this roughly 5.37 objective, so it rejects the masked NaN without overfitting
+        // to solver-level round-off.
+        let expected = 3.234_f64 - 0.118_f64.ln();
+        assert_relative_eq!(nll, expected, epsilon = 2e-4);
+        assert!(
+            nll < 1e10,
+            "the old NaN path returns the finite 1e20 sentinel, not an infinite NLL; got {nll}"
+        );
+
+        let (cum, haz) = crate::survival::ode_cumhaz_hazard(
+            &model,
+            &subject,
+            chz_state,
+            &p.theta,
+            &eta,
+            &[30.0],
+        );
+        assert_relative_eq!(cum[0], 3.234, epsilon = 2e-4);
+        assert_relative_eq!(haz[0], 0.118, epsilon = 2e-6);
+    }
+
+    /// Construct a subject with a positive pre-start TTE time and later PK observations.
     #[cfg(feature = "survival")]
     fn late_start_joint_subject(records: Vec<ObsRecord>) -> Subject {
         let mut subject = make_simple_subject();
@@ -4339,7 +4441,7 @@ mod tests {
             }
             // `H` and `h` read exactly as `tte_ode_nll_from_shared` reads them.
             let mut du = vec![0.0; ode.n_states];
-            (ode.rhs)(st, &share.pk_values, t_pre, &mut du);
+            (ode.rhs)(st, &share.rhs_params[i], t_pre, &mut du);
             let (share_cum, share_haz) = (st[chz_state], du[chz_state]);
 
             // Engine 2 — the dedicated two-solve arm.
