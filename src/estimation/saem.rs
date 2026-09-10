@@ -3266,7 +3266,7 @@ pub fn run_saem(
                         update_scalar_residual_sse(&mut state.residual_sse, sample_sse, gamma);
                         if let Some(sse) = state.residual_sse {
                             let sigma = (sse / n_obs as f64).sqrt();
-                            if sigma.is_finite() && sigma > 0.0 {
+                            if sigma.is_finite() {
                                 log_sigma[0] =
                                     sigma.ln().clamp(log_sigma_lower[0], log_sigma_upper[0]);
                             }
@@ -4578,6 +4578,62 @@ mod tests {
         assert!(additive.0.is_finite() && additive.0 > 0.0);
         assert!(proportional.0.is_finite() && proportional.0 > 0.0);
         assert_ne!(additive.0, proportional.0);
+    }
+
+    #[test]
+    fn scalar_residual_exact_fit_updates_sigma_to_lower_bound() {
+        use std::io::Write as _;
+
+        const ZERO_FIT_MODEL: &str = r#"
+[parameters]
+TVCL(1.0, 0.1, 100.0) FIX
+TVV(10.0, 0.1, 1000.0) FIX
+sigma EPS ~ 0.04
+
+[individual_parameters]
+CL = TVCL
+V = TVV
+
+[structural_model]
+pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+DV ~ additive(EPS)
+"#;
+
+        let model = crate::parser::model_parser::parse_model_string(ZERO_FIT_MODEL).unwrap();
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
+        csv.push_str("1,1,0,0,0,1\n");
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+
+        let etas = vec![vec![]];
+        let (sample_sse, n_obs) = scalar_residual_sse(
+            &model,
+            &pop,
+            &model.default_params.theta,
+            &etas,
+            ScalarResidualModel::Additive,
+        )
+        .expect("exact-fit fixture should produce scalar SSE");
+        assert_eq!(sample_sse, 0.0);
+        assert_eq!(n_obs, 1);
+
+        let mut statistic = None;
+        update_scalar_residual_sse(&mut statistic, sample_sse, 1.0);
+        let mut log_sigma = vec![0.0];
+        let log_sigma_lower = vec![(-8.0_f64)];
+        let log_sigma_upper = vec![1.0];
+
+        if let Some(sse) = statistic {
+            let sigma = (sse / n_obs as f64).sqrt();
+            if sigma.is_finite() {
+                log_sigma[0] = sigma.ln().clamp(log_sigma_lower[0], log_sigma_upper[0]);
+            }
+        }
+        assert_eq!(log_sigma[0], log_sigma_lower[0]);
     }
 
     /// `combined_additive_sigma_at_floor` flags only a free additive component
