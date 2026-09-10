@@ -419,7 +419,7 @@ SIR provides non-parametric parameter uncertainty estimates as an optional post-
 
 ### When the covariance step fails
 
-The standard SIR path draws from the inverted FD Hessian, so it needs a
+The standard SIR path draws from the inverted covariance Hessian, so it needs a
 successful covariance step. When that step fails because the Hessian is not
 positive definite, `sir = true` **automatically falls back** to the same
 `|eigenvalue|`-rectified proposal that `covariance_fallback = sir` uses, and

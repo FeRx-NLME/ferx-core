@@ -122,7 +122,7 @@ so when the hit is a Sigma.
 It is not purely internal; it shows up in several user-visible places.
 
 - **Covariance matrix.** `FitResult.covariance_matrix` — and the
-  `covariance_matrix:` block in the fit YAML — is the inverse FD Hessian of
+  `covariance_matrix:` block in the fit YAML — is the inverse covariance Hessian of
   the OFV **with respect to the packed vector**, not with respect to
   $(\theta, \Omega, \Sigma)$. Its `parameters:` list names the packed
   coordinates: `log_chol_<eta>` for an Omega diagonal, `chol_<i>_<j>` for an

@@ -105,7 +105,7 @@ Two things can go wrong with the free block itself:
   positive definite, and warns that those parameter combinations are held at
   their ML values rather than explored.
 - A **non-identified direction** comes back from the covariance step with an
-  enormous variance: the FD Hessian's near-zero eigenvalues are floored before
+  enormous variance: the covariance Hessian's near-zero eigenvalues are floored before
   inversion, so the inverse carries variances around `1 / floor` — thousands of
   standard deviations in packed (log) space. Drawing from that proposal
   unshrunk places every single sample outside the parameter bounds. SIR now caps
