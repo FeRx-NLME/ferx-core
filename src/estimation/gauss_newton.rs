@@ -144,6 +144,8 @@ pub fn run_foce_gn(
     }
 
     let mut converged = false;
+    // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
+    let mut best = crate::estimation::outer_optimizer::BestPoint::new();
 
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -384,10 +386,16 @@ pub fn run_foce_gn(
             );
         }
 
-        // Checkpoint (#755): persist the accepted point periodically. `x` is
+        // Checkpoint (#755): persist the best accepted point periodically. `x` is
         // already the packed vector, so this is alloc-free until a write is due.
+        // A trust-region step is only accepted at `rho >= 0.25`, i.e. on a real
+        // reduction in `ofv`, so the incumbent is normally this iteration's
+        // point; tracking it explicitly still matters when the penalized `ofv`
+        // ranked here and the clean OFV written diverge under NN regularization,
+        // and keeps every driver on one rule (#1317).
+        best.observe(iter, &x, ofv, ofv_clean);
         if crate::io::checkpoint::is_due() {
-            crate::io::checkpoint::maybe_write(iter, ofv_clean, &x);
+            best.write_checkpoint(|best_x| best_x.to_vec());
         }
 
         if verbose {

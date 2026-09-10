@@ -3309,3 +3309,145 @@ fn covariate_model_leaves_its_initial_estimates_1290() {
         result.ofv,
     );
 }
+
+// ─── BestPoint: checkpoint the best point, not the current eval (#1317) ──────
+
+/// Absolute temp path unique to this process + tag (no working-dir pollution).
+fn best_point_tmp_path(tag: &str) -> String {
+    format!("/tmp/ferx_bestpoint_{}_{}.tmp", tag, std::process::id())
+}
+
+/// Arm a checkpoint sink with a zero-second interval, so every write is due.
+/// The sink is a thread-local and each `#[test]` owns its thread, so these
+/// tests do not interfere with each other.
+fn arm_checkpoint_sink(path: &str) {
+    crate::io::checkpoint::remove(path);
+    crate::io::checkpoint::init(
+        path.to_string(),
+        "test".to_string(),
+        None,
+        None,
+        vec!["focei".to_string()],
+        vec!["c0".to_string()],
+        0,
+    );
+}
+
+/// The #1317 regression in the shape the issue reports it: the optimizer
+/// evaluates 100, then 50, then an L-BFGS line-search probe at 1e6, and the
+/// checkpoint write lands on the probe. The `.tmp` must hold the 50 point — the
+/// pre-fix code wrote the probe, putting an OFV five orders of magnitude off
+/// into a file that a resume, a scorer or a progress monitor reads as "where the
+/// fit is".
+#[test]
+fn checkpoint_holds_the_best_point_not_the_line_search_probe() {
+    let path = best_point_tmp_path("probe");
+    arm_checkpoint_sink(&path);
+
+    let mut best = BestPoint::new();
+    for (iter, x, ofv) in [(1usize, 1.0, 100.0), (2, 2.0, 50.0), (3, 3.0, 1.0e6)] {
+        best.observe(iter, &[x], ofv, ofv);
+    }
+    assert!(crate::io::checkpoint::is_due(), "interval 0 → always due");
+    best.write_checkpoint(|x| x.to_vec());
+
+    let cp = crate::io::checkpoint::load(&path).expect("a due write produces a file");
+    assert_eq!(
+        cp.packed,
+        vec![2.0],
+        "checkpoint must hold the best point, not eval 3's probe"
+    );
+    assert_eq!(
+        cp.ofv, 50.0,
+        "and the OFV at that point, not the probe's 1e6"
+    );
+    assert_eq!(cp.iter, 2, "iter is the eval at which the best was seen");
+
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+}
+
+/// Ranking is on `ofv` — the objective the optimizer minimises, penalized under
+/// NN regularization — while the checkpoint reports `ofv_clean`. A point that
+/// fits the data better but carries a worse penalty must not displace the
+/// incumbent, or a heavier-λ optimum could lose to a start that merely overfits.
+#[test]
+fn best_point_ranks_on_the_penalized_objective_and_reports_the_clean_one() {
+    let mut best = BestPoint::new();
+    assert!(best.observe(1, &[1.0], 10.0, 100.0));
+    assert!(
+        !best.observe(2, &[2.0], 20.0, 1.0),
+        "a lower clean OFV must not win on a worse penalized objective"
+    );
+    let b = best.get().expect("an eval was observed");
+    assert_eq!(b.x, vec![1.0]);
+    assert_eq!(
+        b.ofv_clean, 100.0,
+        "the clean OFV travels with its own point"
+    );
+    assert_eq!(best.ofv(), 10.0, "ranking exposes the penalized objective");
+}
+
+/// NaN handling in both directions. `5.0 < NaN` and `NaN < 5.0` are both false,
+/// so a naive `<` leaves a NaN first eval as a permanent incumbent — which is
+/// also what the #59 restore would then land on.
+#[test]
+fn best_point_swaps_a_nan_incumbent_out_but_never_back_in() {
+    let mut best = BestPoint::new();
+    assert_eq!(best.ofv(), f64::INFINITY, "an empty tracker ranks as +inf");
+    assert!(best.get().is_none());
+    assert!(
+        best.observe(1, &[1.0], f64::NAN, f64::NAN),
+        "the first eval is always kept"
+    );
+    assert!(
+        best.observe(2, &[2.0], 5.0, 5.0),
+        "a finite eval must displace a NaN incumbent"
+    );
+    assert!(
+        !best.observe(3, &[3.0], f64::NAN, f64::NAN),
+        "a NaN eval must never displace a finite incumbent"
+    );
+    assert_eq!(best.get().expect("finite incumbent").x, vec![2.0]);
+}
+
+/// The NLopt driver tracks *scaled* `xs`, but a checkpoint stores the packed
+/// (log-theta / Cholesky-omega / log-sigma) vector that `unpack_params` reads on
+/// resume. `write_checkpoint` maps through the caller's unscale, so a driver
+/// working in scaled space cannot silently persist scaled coordinates.
+#[test]
+fn checkpoint_write_maps_the_tracked_point_into_packed_space() {
+    let path = best_point_tmp_path("scale");
+    arm_checkpoint_sink(&path);
+
+    let scale = [10.0, 0.5];
+    let mut best = BestPoint::new();
+    best.observe(7, &[0.3, 4.0], 1.0, 2.0);
+    best.write_checkpoint(|xs| xs.iter().zip(scale).map(|(v, s)| v * s).collect());
+
+    let cp = crate::io::checkpoint::load(&path).expect("a due write produces a file");
+    assert_eq!(cp.packed, vec![3.0, 2.0], "packed = xs · scale");
+    assert_eq!(cp.iter, 7);
+
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+}
+
+/// Nothing observed yet → nothing to record. Reachable when the write interval
+/// elapses before the first eval of a stage completes; writing a fabricated
+/// point there would be worse than leaving the previous stage's checkpoint in
+/// place.
+#[test]
+fn write_checkpoint_is_a_noop_before_the_first_eval() {
+    let path = best_point_tmp_path("empty");
+    arm_checkpoint_sink(&path);
+
+    BestPoint::new().write_checkpoint(|x| x.to_vec());
+    assert!(
+        crate::io::checkpoint::load(&path).is_none(),
+        "an empty tracker must not write"
+    );
+
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+}

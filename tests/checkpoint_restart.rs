@@ -293,3 +293,42 @@ fn saem_fit_checkpoints_and_cleans_up() {
     );
     checkpoint::remove(&path);
 }
+
+/// #1317 guard: the outer drivers must checkpoint through
+/// `BestPoint::write_checkpoint`, never at the eval that happens to be current
+/// when the interval elapses. The unit tests around `BestPoint` pin the
+/// tracker's behaviour but cannot see the call sites, so reverting one driver to
+/// a direct `maybe_write` of its current point — the exact defect #1317 reports,
+/// an L-BFGS line-search probe recorded as the fit's position — leaves them all
+/// green. Counting the direct callers per file is what dies on that edit.
+///
+/// The permitted direct callers are `BestPoint::write_checkpoint` itself and
+/// SAEM, whose current iterate *is* the state being checkpointed (there is no
+/// "probe" to confuse it with: the stochastic approximation has no line search).
+#[test]
+fn optimizer_loops_checkpoint_through_the_best_point_tracker() {
+    for (file, allowed, why) in [
+        (
+            "src/estimation/outer_optimizer.rs",
+            1usize,
+            "only BestPoint::write_checkpoint may call maybe_write",
+        ),
+        (
+            "src/estimation/gauss_newton.rs",
+            0,
+            "GN must checkpoint via BestPoint::write_checkpoint",
+        ),
+        (
+            "src/estimation/saem.rs",
+            1,
+            "SAEM's current iterate is its state, so it writes directly",
+        ),
+    ] {
+        let src = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        let n = src.matches("maybe_write(").count();
+        assert_eq!(
+            n, allowed,
+            "{file}: {n} direct `maybe_write(` call(s), expected {allowed} — {why}"
+        );
+    }
+}
