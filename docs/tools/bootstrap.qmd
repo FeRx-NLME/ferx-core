@@ -400,7 +400,7 @@ defeats the point of writing it.
 |---|---|---|
 | `--samples N`        | 200 | number of bootstrap datasets |
 | `--seed N`           | 1   | master seed |
-| `--threads N`        | all cores | replicates fitted concurrently (each fit uses one thread) |
+| `--threads N`        | all cores | replicates fitted concurrently (each fit uses one thread); an exact ceiling, so peak memory is `N` fits' worth |
 | `--sample-size M`    | dataset size | subjects per replicate, or a per-stratum map |
 | `--stratify-on COL`  | —   | resample within strata from a dataset column |
 | `--directory DIR`    | `{model}-bootstrap` | where the CSVs go |

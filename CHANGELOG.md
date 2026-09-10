@@ -23,7 +23,26 @@ section of the SDLC for the versioning policy).
 
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
+### Fixed
+
+- **A `threads` budget is now a real ceiling on how many fits run at once in
+  `bootstrap`, `modelsearch`, `covsearch`, `iivsearch`, `ruvsearch` and
+  `globalsearch`.** Each replicate or candidate runs its own `fit()` on a nested
+  thread pool, and a worker blocked on that nesting kept taking more work, so a
+  run asked for 4 concurrent fits could hold far more — and that many fits' worth
+  of peak memory. The requested width is now enforced exactly. Runs that were
+  already inside their budget are unaffected; heavily oversubscribed ones should
+  see lower peak memory and steadier per-fit timing rather than higher throughput
+  (#1329).
+
 ### Performance
+
+- **The post-fit per-subject diagnostics pass (IPRED / PRED / IWRES / CWRES,
+  per-subject OFV) and the post-fit analytic-sensitivity sweep now run in
+  parallel over subjects** on the pool the fit already uses, instead of one
+  subject at a time. Output is unchanged bit-for-bit and the ODE-solver
+  diagnostic counters are unchanged; the gain is on the final pass of a fit with
+  many subjects, and is largest on ODE models (#1329).
 
 - **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles
   its `½·log|H̃|` grid-response gradient term analytically instead of rebuilding the anchor at

@@ -229,7 +229,9 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &kappas,
         true,
         None,
-    );
+        false,
+    )
+    .0;
     assert_eq!(results.len(), 1);
     let sdtab_ipred = &results[0].ipred;
     assert_eq!(sdtab_ipred.len(), 3);
@@ -357,7 +359,9 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         &kappas,
         false,
         None,
-    );
+        false,
+    )
+    .0;
 
     let f = ipred[0];
     let expected_v = (f * 0.2).powi(2) + 1.0 + 2.0 * f * 0.5 * 0.2;

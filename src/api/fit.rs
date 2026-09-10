@@ -1894,14 +1894,18 @@ fn fit_inner(
         .as_ref()
         .map(|mp| mp.mixest.clone());
     //
-    // ODE models run this pass inside a solver-statistics scope (#1080 Part B): it is the one
+    // ODE models run this pass under solver-statistics collection (#1080 Part B): it is the one
     // production sweep that integrates every subject at the final estimates through the
     // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
     // decisions can be observed without threading a stats sink through every predictor. Costs
     // one thread-local read per segment on the ODE path and nothing at all elsewhere.
-    let solver_stats_scope =
-        integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter);
-    let mut subjects = compute_subject_results(
+    //
+    // The scope used to be opened *here*, around the call. It is now opened per subject inside
+    // it and the counters come back as a return value, because the pass is parallel over
+    // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
+    // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
+    let ode_model = integrates_odes(model);
+    let (mut subjects, mut ode_solver_stats) = compute_subject_results(
         model,
         population,
         &result.params,
@@ -1910,32 +1914,29 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
         mixest_classes.as_deref(),
+        ode_model,
     );
-    let mut ode_solver_stats = solver_stats_scope
-        .map(|scope| scope.collected())
-        .unwrap_or_default();
     // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
     // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
     // sensitivity solve per subject is what makes that clause reportable: the solve the fit's
     // gradient ran throughout, run once more at the estimates the fit reports. No-ops for
     // every model not on the analytic ODE sensitivity path, and for every FD fit.
     //
-    // It gets its **own** scope, and exactly one field crosses back. Sharing the prediction
+    // It gets its **own** scopes, and exactly one field crosses back. Sharing the prediction
     // pass's scope would double every step, clamp and escalation count across two different
     // solves — and worse, a `min_dt` clamp that happened only in the gradient solve would
     // fire the warning's clamp clause, which tells the user their *predictions* were
     // freeze-padded. Only `auto_stiff_rejected_jets` describes something the prediction pass
     // structurally cannot observe, so only it is carried over.
-    if integrates_odes(model) {
-        let sens_scope = crate::ode::solver::SolverStatsScope::enter();
-        sweep_sensitivity_solver_stats(
+    if ode_model {
+        ode_solver_stats.auto_stiff_rejected_jets = sweep_sensitivity_solver_stats(
             model,
             population,
             &result.params,
             &result.eta_hats,
             mixest_classes.as_deref(),
-        );
-        ode_solver_stats.auto_stiff_rejected_jets = sens_scope.collected().auto_stiff_rejected_jets;
+        )
+        .auto_stiff_rejected_jets;
     }
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto

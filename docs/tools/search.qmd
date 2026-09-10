@@ -287,7 +287,10 @@ not a slow fit, so every candidate gets `retries` starts first, then the gate,
 then ranking.
 
 `[run]` carries `threads` (the candidate pool; each fit's own pool is pinned
-underneath it so the machine is not oversubscribed), `retries` (perturbed
+underneath it so the machine is not oversubscribed — and since #1329 the
+candidate count is an exact ceiling rather than an average, so `threads = 8`
+never holds more than eight live fits and never more than eight fits' worth of
+memory), `retries` (perturbed
 starts per candidate on top of the fit from the exact initials — Pharmpy's
 meaning, so `n_starts = retries + 1`; default 2, i.e. three starts; `0` is a
 single fit), `cache_dir` (the journal a `resume = true` run picks up from,
