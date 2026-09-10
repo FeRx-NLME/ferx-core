@@ -22,10 +22,12 @@ section of the SDLC for the versioning policy).
 ### Changed
 
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
+- **Calling a function ferx does not have is now a parse error naming the call and listing what is available, instead of silently evaluating as the identity.** `CL = TVCL * tanh(ETA_CL)` used to parse, pass `ferx check`, fit and converge while computing `TVCL * ETA_CL`. This applies to every block that parses expressions (`[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, `[error_model]` magnitudes) and to conditions. Model files that relied on the no-op were already computing something other than what they read as, so the new errors are all true positives. Names remain case-insensitive, so `EXP(...)` / `LOG(...)` are unaffected; `present(x)` in value position now points at condition position (#1332).
 
 ### Fixed
 
 - Fixed ODE-accumulated survival hazards that read `TAD`, which could reject valid multi-dose subjects with a misleading finite objective (#1261).
+- `floor(x)`, `ceil(x)` and `round(x)` now differentiate to `0` rather than to `x`'s own derivative. An `[individual_parameters]` or `[odes]` expression that rounds — a dose-band lookup, an occasion index derived from `TIME` — was feeding a wrong analytic gradient to the estimator while its value path was correct (#1332).
 
 ### Performance
 

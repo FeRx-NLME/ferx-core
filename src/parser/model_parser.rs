@@ -16102,6 +16102,58 @@ fn build_pk_param_fn(
 // `types.rs`). They remain unexported from the crate root — external users
 // can't construct or pattern-match them.
 
+/// Every function name `Expression::UnaryFn` may carry (#1332).
+///
+/// `parse_atom` rejects any other `name(...)` in expression position, so this
+/// list is the *complete* domain of the `UnaryFn` dispatch in the three
+/// consumers that give the node meaning — `eval_expr`, `compile_expr_into` and
+/// `differentiate_with_chain`. Each of those ends its match on
+/// `unreachable!(UNARY_FN_ARM_MISSING)` rather than on the identity
+/// fallthrough it used to carry: an unrecognised name used to be silently the
+/// identity, so `CL = TVCL * tanh(ETA_CL)` parsed, fitted, converged and
+/// computed `TVCL * ETA_CL` with no warning anywhere.
+///
+/// The list and the three matches are pinned against each other by
+/// `every_supported_unary_fn_has_an_arm_in_all_three_consumers`, so adding a
+/// name here without an arm in all three is a red test rather than a
+/// production panic. `Expression` is `pub(crate)` and the parser is its only
+/// constructor, which is what makes the `unreachable!` sound.
+///
+/// `min`/`max`/`clamp` are absent on purpose: they take 2/3 arguments and
+/// `parse_atom` desugars them to `Expression::Conditional`, so they never
+/// reach `UnaryFn`. `present(x)` is a *condition*, parsed by `parse_cond_atom`.
+pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
+    "exp",
+    "log",
+    "ln",
+    "sqrt",
+    "abs",
+    "floor",
+    "ceil",
+    "round",
+    "logit",
+    "inv_logit",
+    "expit",
+];
+
+/// Panic message for the (parser-guaranteed unreachable) tail of each
+/// `UnaryFn` match. Named so all three consumers report the same failure.
+const UNARY_FN_ARM_MISSING: &str =
+    "UnaryFn carries a name outside SUPPORTED_UNARY_FNS — parse_atom is the only \
+     constructor and rejects unknown names (#1332); a name added to the whitelist \
+     needs an arm in eval_expr, compile_expr_into and differentiate_with_chain";
+
+/// The human-facing catalogue of callable names, used by the parse-time
+/// rejection. Kept next to `SUPPORTED_UNARY_FNS` so a new builtin is one edit
+/// away from being advertised, and includes the multi-argument forms the
+/// parser desugars plus the conditions-only `present`.
+fn supported_function_list() -> String {
+    format!(
+        "{}, min(a, b), max(a, b), clamp(x, lo, hi), present(x) (conditions only)",
+        SUPPORTED_UNARY_FNS.join(", ")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Expression {
     Literal(f64),
@@ -18463,7 +18515,8 @@ fn eval_expr<E: EvalEnv>(
                     let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                     (clamped / (1.0 - clamped)).ln()
                 }
-                _ => v,
+                // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
+                _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
         }
         Expression::Power(base, exp) => {
@@ -18901,9 +18954,8 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         Expression::UnaryFn(name, arg) => {
             compile_expr_into(bc, arg);
             // Names matched here mirror `eval_expression_indexed`'s UnaryFn
-            // dispatch. Anything else becomes a no-op (the slow path returns
-            // the argument unchanged); preserve that with `Op::Abs` of `Abs`
-            // we can't — fall through to push the value as-is.
+            // dispatch, and the match is total over `SUPPORTED_UNARY_FNS`
+            // because `parse_atom` admits nothing else (#1332).
             match name.as_str() {
                 "exp" => bc.ops.push(Op::Exp),
                 "log" | "ln" => bc.ops.push(Op::Ln),
@@ -18914,7 +18966,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
-                _ => { /* unknown function → leave the argument on the stack */ }
+                _ => unreachable!("{UNARY_FN_ARM_MISSING} (compile_expr_into, `{name}`)"),
             }
         }
         Expression::Conditional(cond, t_expr, e_expr) => {
@@ -21220,7 +21272,8 @@ fn resolve_condition_indices(
 //   UnaryFn("abs", a)      : if a ≥ 0 then a' else −a' (boundary undefined)
 //   UnaryFn("inv_logit"|"expit", a) : inv_logit(a) · (1 − inv_logit(a)) · a'
 //   UnaryFn("logit", a)    : a' / (a · (1 − a))
-//   UnaryFn(unknown, a)    : a' (mirrors the slow path's identity fallthrough)
+//   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
+//                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
 //                            both constant-base and constant-exponent cases)
 //   Conditional(c, t, e)   : Conditional(c, t', e')   (boundary discontinuity
@@ -21431,13 +21484,18 @@ fn differentiate_with_chain(
                     let denom = mul((**arg).clone(), one_minus_a);
                     div(da, denom)
                 }
-                _ => {
-                    // Unknown name — the slow path returns the argument
-                    // unchanged, so the derivative is its argument's
-                    // derivative. (See `eval_expression_indexed`'s
-                    // `_ => v` fallthrough.)
-                    da
+                "floor" | "ceil" | "round" => {
+                    // Piecewise constant: 0 almost everywhere, undefined on the
+                    // integer boundaries (the same convention `BinOp::Mod` takes
+                    // just above). These three had arms in `eval_expr` and in the
+                    // bytecode compiler but none here, so they landed on the
+                    // identity fallthrough and differentiated as `a'` — a value
+                    // path that rounds against an analytic gradient that does not
+                    // (#1332).
+                    Expression::Literal(0.0)
                 }
+                // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
+                _ => unreachable!("{UNARY_FN_ARM_MISSING} (differentiate_with_chain, `{name}`)"),
             }
         }
         Expression::Power(b, e) => {
@@ -22467,6 +22525,27 @@ fn parse_atom(
                     // numbers (#1092). Reject it by name.
                     return Err(format!(
                         "`{func_name}` takes exactly three arguments: `clamp(x, lo, hi)`."
+                    ));
+                }
+                // Any name reaching here is a one-argument call. Reject it unless
+                // it is a builtin the three `UnaryFn` consumers actually implement
+                // (#1332): an unrecognised name used to become `UnaryFn(name, arg)`,
+                // which every consumer evaluated as the identity, so
+                // `CL = TVCL * tanh(ETA_CL)` parsed, fitted, converged and computed
+                // `TVCL * ETA_CL`. The check lives here — the single site that builds
+                // the node — so it covers every block whose expressions go through
+                // `parse_atom`, not one block's path.
+                if !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
+                    if func_name == "present" {
+                        return Err(format!(
+                            "`present(...)` is a condition, not a value — write it as a test, \
+                             e.g. `if (present(WT)) ... else ...`, rather than in `{name}(...)` \
+                             value position."
+                        ));
+                    }
+                    return Err(format!(
+                        "unknown function `{name}`. Supported: {}",
+                        supported_function_list()
                     ));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
