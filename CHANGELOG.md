@@ -25,6 +25,19 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **`focei` with `n_agq > 1` now contracts the analytic grid-response gradient term once per
+  subject instead of once per population parameter.** The node gradients, weights and node
+  positions do not depend on which parameter is being differentiated, so both node sums hoist
+  out of the coordinate loop, taking the contraction from `O(p·Q·d²)` to `O(Q·d² + p·d²)` for
+  `p` free parameters, `Q = n_agq^d` nodes and `d` random effects. The one-node grid
+  additionally skips the node-displacement term and the five `d×d` matrix products behind it
+  outright, since its nodes sit at `z = 0` — that arm is reached by the opt-in
+  `FERX_AGQ_GRID_RESPONSE=analytic` route for `laplace`, not by any default configuration.
+  **No wall-clock figure is claimed**: this reduces the contraction around the `Q`
+  node-gradient evaluations, not their number, and those dominate on ODE models. Gradients
+  move only by floating-point reassociation — measured worst relative change `1.7e-15`, a few
+  ULP — so converged estimates and OFVs may shift within the convergence tolerance (#1333).
+
 - **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles
   its `½·log|H̃|` grid-response gradient term analytically instead of rebuilding the anchor at
   `x ± h` for every free population parameter.** `H̃` is bilinear in first-order prediction
