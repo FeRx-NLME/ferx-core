@@ -10462,3 +10462,536 @@ fn a_diverged_subject_answers_some_rather_than_declining_to_fd() {
          mislabels an unorderable timeline as an analytic-scope gap"
     );
 }
+
+// ── `CMT=0` on an *infusion*: no rate channel, on either side of the walk (#1077) ──
+//
+// `CMT=0` is the default dose *bolus* compartment; a zero-order input has no default
+// target, so `check_dose_compartments` rejects such a row on both engines
+// (`E_DOSE_CMT_NOT_INFUSABLE`) and neither predictor delivers it. That makes these
+// fixtures hand-built by necessity — the point is precisely what the walk does when
+// validation has not run, because whatever it does must match `active_infusions`.
+//
+// The two tests split by which walk they reach, and they are not interchangeable: the
+// static walk has no infusion rate-off saltation at all (its only moving boundary is a
+// zero-order window end), so the defect below is reachable only from the event-driven
+// one, and a lagtime is what routes a subject there.
+
+/// **Regression for #1077's surviving half.** A lagged `CMT=0` infusion delivers nothing
+/// — the segment forcing and the rate-on saltation both skip it — but the rate-*off*
+/// saltation at `K_INF_END` had no compartment test, so it injected the boundary term for
+/// a rate that was never turned on. Measured before the fix, on exactly this fixture:
+/// `f ≡ 0` at every observation on *both* engines while the walk reported
+/// `∂f/∂η_LAG = +1.8878965164038346` at `t = 4`, `+1.2133620764183783` at `t = 8` and
+/// `+0.7798348668467985` at `t = 12`, against a central-FD reference of exactly `0.0`.
+/// An undosed subject handing FOCEI a finite lagtime gradient is infinite relative error,
+/// not a tolerance question — hence the exact-zero assertions.
+///
+/// Non-degeneracy, all four teeth, because "everything is zero" is the easiest assertion
+/// in the world to pass vacuously:
+///   1. the fixture must reach the **event-driven** walk, the only one with this site;
+///   2. observations must straddle the bioavailable window end (`lag + AMT/RATE`), or
+///      `K_INF_END` is processed with nothing downstream of it to record the injected jet
+///      and the mutation is unreachable;
+///   3. the `CMT=1` twin must be live *on the η_LAG axis specifically* — a twin that is
+///      merely non-zero would still pass if the lagtime axis were dead, which is the one
+///      axis this defect moves;
+///   4. `f` itself must be exactly zero, so a predicate that starts delivering `CMT=0`
+///      infusions again (rather than one that merely stops injecting) also fails here.
+#[test]
+fn ode_provider_cmt_zero_lagged_infusion_injects_no_rate_boundary() {
+    let model = parse_model_string(ONECPT_IV_LAG_INF_ODE).expect("parse lag+inf ODE");
+    let times = [1.0, 2.0, 4.0, 8.0, 12.0];
+    let theta = vec![1.0, 10.0, 0.5];
+    let eta = vec![0.1, 0.05];
+    const ETA_LAG: usize = 1;
+
+    let mk = |cmt: usize| {
+        let mut s = bolus_subject(&times);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, cmt, 40.0, false, 0.0)];
+        s
+    };
+    let s0 = mk(0);
+    let s1 = mk(1);
+
+    // (1) The event-driven walk owns `K_INF_END`; the static walk has no infusion
+    // rate-off saltation, so a static fixture cannot observe this at all.
+    assert!(
+        ode_tvcov_supported(&model, &s0),
+        "fixture must reach the event-driven walk, where the rate-off saltation lives"
+    );
+
+    // (2) The window end must fall strictly inside the observation range, with samples on
+    // both sides: `K_INF_END` is where the jet is injected, and only an observation
+    // *after* it can record one.
+    let window_end = theta[2] * f64::exp(eta[ETA_LAG]) + 100.0 / 40.0;
+    assert!(
+        times.iter().any(|&t| t < window_end) && times.iter().any(|&t| t > window_end),
+        "observations must straddle the window end {window_end}, else `K_INF_END` has \
+         nothing downstream to record its injection"
+    );
+
+    let a = ode_subject_sensitivities(&model, &s0, &theta, &eta).expect("supported");
+    let b = ode_subject_sensitivities(&model, &s1, &theta, &eta).expect("supported");
+    let p0 = compute_predictions_with_tv(&model, &s0, &theta, &eta);
+    assert_eq!(a.obs.len(), times.len());
+
+    // (3) The `CMT=1` twin is live on the η_LAG axis — the one this defect moves. Without
+    // this the whole test passes on a fixture where nothing depends on the lagtime.
+    let twin_lag_grad = b
+        .obs
+        .iter()
+        .map(|o| o.df_deta[ETA_LAG].abs())
+        .fold(0.0_f64, |acc, g| {
+            assert!(
+                g.is_finite(),
+                "CMT=1 twin produced a non-finite η_LAG gradient"
+            );
+            acc.max(g)
+        });
+    assert!(
+        twin_lag_grad > 1.0,
+        "CMT=1 twin's |∂f/∂η_LAG| peaks at {twin_lag_grad}, too small for the CMT=0 arm's \
+         zero to mean anything"
+    );
+
+    for (j, o) in a.obs.iter().enumerate() {
+        // (4) Nothing is delivered, on either engine: no drug ever enters the system.
+        assert_eq!(o.f, 0.0, "obs {j}: CMT=0 infusion must deliver nothing");
+        assert_eq!(
+            p0[j], 0.0,
+            "obs {j}: production must agree it delivers nothing"
+        );
+        // The gradient of the identically-zero function is identically zero. This is the
+        // assertion the defect failed, at `+1.89` on the η_LAG axis.
+        for (k, g) in o.df_deta.iter().enumerate() {
+            assert_eq!(
+                *g, 0.0,
+                "obs {j} (t = {}): ∂f/∂η[{k}] = {g} on a subject that receives no drug — a \
+                 rate boundary was injected for a rate the walk never turned on (#1077)",
+                times[j]
+            );
+        }
+        for (m, g) in o.df_dtheta.iter().enumerate() {
+            assert_eq!(
+                *g, 0.0,
+                "obs {j} (t = {}): ∂f/∂θ[{m}] = {g} on a subject that receives no drug",
+                times[j]
+            );
+        }
+    }
+}
+
+/// The static-walk arm: no saltation site there, so what is under test is the segment
+/// **forcing** filter — the walk must integrate the same trajectory `active_infusions`
+/// does. Both drop a `CMT=0` infusion since #1196 step 3 (before it the value path
+/// delivered one and this walk did not, which is the *value* divergence #1077 was filed
+/// for). The `CMT=1` twin is asserted non-trivial so "they agree on zero" is not the
+/// whole content of the test.
+#[test]
+fn ode_provider_cmt_zero_infusion_static_walk_agrees_with_production() {
+    let model = parse_model_string(TWOCPT_ODE).expect("parse");
+    let times = [1.0, 3.0, 5.0, 6.0, 9.0, 24.0];
+    let theta = vec![4.0, 12.0, 2.0, 25.0];
+    let eta = vec![0.12, -0.08];
+
+    let mk = |cmt: usize| {
+        let mut s = bolus_subject(&times);
+        // amt=1000, rate=200 → a 5 h window, so the last four observations sit past its
+        // end and the first inside it.
+        s.doses = vec![DoseEvent::new(0.0, 1000.0, cmt, 200.0, false, 0.0)];
+        s
+    };
+    let s0 = mk(0);
+    let s1 = mk(1);
+
+    // Dispatch: the *static* walk, asserted both ways so a future routing change that
+    // silently moves this fixture to the event-driven walk fails here rather than
+    // quietly re-testing the other test's ground.
+    assert!(
+        !ode_tvcov_supported(&model, &s0) && ode_subject_supported(&model, &s0),
+        "fixture must reach the static walk"
+    );
+
+    let a = ode_subject_sensitivities(&model, &s0, &theta, &eta).expect("supported");
+    let p0 = compute_predictions_with_tv(&model, &s0, &theta, &eta);
+    let p1 = compute_predictions_with_tv(&model, &s1, &theta, &eta);
+    assert_eq!(a.obs.len(), times.len());
+
+    // The `CMT=1` twin is a real curve (peak 30.48 at t=5 on these parameters), so the
+    // zeros below are a statement about `CMT=0`, not about the fixture.
+    assert!(
+        p1.iter().all(|v| v.is_finite()) && p1.iter().any(|&v| v > 1.0),
+        "CMT=1 twin must be a non-trivial curve, got {p1:?}"
+    );
+
+    for (j, o) in a.obs.iter().enumerate() {
+        assert_eq!(o.f, p0[j], "obs {j}: static walk and production must agree");
+        assert_eq!(o.f, 0.0, "obs {j}: CMT=0 infusion must deliver nothing");
+        for (k, g) in o.df_deta.iter().enumerate() {
+            assert_eq!(*g, 0.0, "obs {j}: ∂f/∂η[{k}] = {g} on an undosed subject");
+        }
+    }
+}
+
+/// The **general** (two-sided) arm of the same boundary. The fixture above has flat
+/// covariates, so `pk_snapshot_equal` holds at `K_INF_END` and the walk takes the
+/// closed-form `inject_rate_saltation` fast path — which never calls `boundary_velocity`,
+/// leaving that site's own compartment test unexercised. A time-varying `WT` makes the
+/// pre/post snapshots differ, routing the same boundary through
+/// `general_rate_off_saltation` and its two `boundary_velocity` evaluations.
+///
+/// Two sites, two branches, one predicate: without this test, reverting the guard in
+/// `boundary_velocity` leaves the whole suite green (the fast path supplies the answer),
+/// which is the "a fast path can make the mutation unreachable" trap.
+#[test]
+fn ode_provider_cmt_zero_lagged_infusion_injects_no_rate_boundary_under_tv_covariates() {
+    let model = parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse lag+inf TV ODE");
+    let times = [2.0, 6.0, 9.0, 12.0, 20.0];
+    let theta = vec![1.0, 10.0, 8.0, 0.75];
+    let eta = vec![0.1, 0.05];
+    const ETA_LAG: usize = 1;
+
+    // WT differs at every record, so no two consecutive snapshots are equal and the
+    // rate-off boundary cannot take the `pk_snapshot_equal` fast path. Off the reference
+    // weight (70) throughout, so `WTEXP`'s own jet is live rather than identically zero.
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mk = |cmt: usize| {
+        let mut s = bolus_subject(&times);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, cmt, 40.0, false, 0.0)];
+        s.covariates = wt(62.0);
+        s.dose_covariates = vec![wt(62.0)];
+        s.obs_covariates = vec![wt(64.0), wt(68.0), wt(75.0), wt(82.0), wt(90.0)];
+        s
+    };
+    let s0 = mk(0);
+    let s1 = mk(1);
+
+    assert!(
+        s0.has_tv_covariates() && ode_tvcov_supported(&model, &s0),
+        "fixture must carry TV covariates and reach the event-driven walk"
+    );
+
+    // The window `[lag, lag + AMT/RATE]` must open and close strictly inside the
+    // observation range, with samples on both sides of the close.
+    let lag = theta[2] * f64::exp(eta[ETA_LAG]);
+    let window_end = lag + 100.0 / 40.0;
+    assert!(
+        times.iter().any(|&t| t > lag && t < window_end),
+        "an observation must sit inside the infusion window [{lag}, {window_end}]"
+    );
+    assert!(
+        times.iter().any(|&t| t > window_end),
+        "an observation must sit past the window end {window_end}, or `K_INF_END` has \
+         nothing downstream to record its injection"
+    );
+
+    let a = ode_subject_sensitivities(&model, &s0, &theta, &eta).expect("supported");
+    let b = ode_subject_sensitivities(&model, &s1, &theta, &eta).expect("supported");
+    let p0 = compute_predictions_with_tv(&model, &s0, &theta, &eta);
+
+    // The `CMT=1` twin is live on the η_LAG axis — the axis this defect moves.
+    let twin_lag_grad = b
+        .obs
+        .iter()
+        .map(|o| o.df_deta[ETA_LAG].abs())
+        .fold(0.0_f64, |acc, g| {
+            assert!(
+                g.is_finite(),
+                "CMT=1 twin produced a non-finite η_LAG gradient"
+            );
+            acc.max(g)
+        });
+    assert!(
+        twin_lag_grad > 1.0,
+        "CMT=1 twin's |∂f/∂η_LAG| peaks at {twin_lag_grad}, too small for the CMT=0 arm's \
+         zero to mean anything"
+    );
+
+    for (j, o) in a.obs.iter().enumerate() {
+        assert_eq!(o.f, 0.0, "obs {j}: CMT=0 infusion must deliver nothing");
+        assert_eq!(
+            p0[j], 0.0,
+            "obs {j}: production must agree it delivers nothing"
+        );
+        for (k, g) in o.df_deta.iter().enumerate() {
+            assert_eq!(
+                *g, 0.0,
+                "obs {j} (t = {}): ∂f/∂η[{k}] = {g} on a subject that receives no drug \
+                 (general two-sided rate-off branch, #1077)",
+                times[j]
+            );
+        }
+        for (m, g) in o.df_dtheta.iter().enumerate() {
+            assert_eq!(
+                *g, 0.0,
+                "obs {j} (t = {}): ∂f/∂θ[{m}] = {g} on a subject that receives no drug",
+                times[j]
+            );
+        }
+    }
+}
+
+/// A `CMT=0` infusion must not contaminate **another** dose's saltation.
+///
+/// `boundary_velocity` builds `v⁻`/`v⁺` by looping over every dose and adding the rate of
+/// each infusion window spanning the instant, so its own compartment test is reachable
+/// only when some *other* event takes a general two-sided saltation while a `CMT=0`
+/// window happens to be open underneath it. None of the single-dose fixtures above can
+/// see it: with the forcing, rate-on and rate-off sites all skipping the `CMT=0` dose, no
+/// general saltation is taken at all and `boundary_velocity` never runs. Mutation testing
+/// found that guard alive and unobservable — four gates covering for the fifth, which is a
+/// test hole and not belt-and-braces.
+///
+/// **Why this asserts the Hessian, and why that is not optional.** Removing the guard adds
+/// the same constant `r` to `v⁻[c]` *and* `v⁺[c]`, and the saltation is
+/// `u[c] += (v⁻[c] − v⁺[c])·δ + coef2·δ²` with `coef2 = ½(J⁻·v⁻ + J⁺·v⁺) − J⁺·v⁻`. The
+/// contamination cancels exactly in the first-order difference, so `f`, `∂f/∂η` and
+/// `∂f/∂θ` do **not** move; it survives only as `½·r·(J⁻ − J⁺)` in `coef2`, i.e. on `δ²`,
+/// i.e. in `d2f_deta2` / `d2f_deta_dtheta` — and only when the Jacobian actually jumps.
+/// A version of this test comparing the value and first-order blocks alone was written
+/// first and left the mutation alive.
+///
+/// The geometry, every piece load-bearing:
+///   * dose 1 is a `CMT=0` infusion with a **50 h** window, open across dose 2's arrival —
+///     a short window simply would not span the boundary;
+///   * dose 2 is a `CMT=1` **infusion** with a lagtime, so its arrival takes the lagged
+///     rate-on arm that calls `boundary_velocity` (a lagged *bolus* takes a different
+///     injection path and never reaches it);
+///   * `WT` varies per record, which does double duty — it forces the *general* two-sided
+///     branch instead of the closed-form `inject_rate_saltation` fast path (which never
+///     calls `boundary_velocity`), and it makes `J⁻ ≠ J⁺` so the contamination survives
+///     `coef2` at all.
+///
+/// The oracle is a differential pair rather than another bank of zeros: deleting dose 1
+/// must change nothing, because a `CMT=0` infusion contributes nothing. Measured
+/// deviation across all four blocks is **exactly `0.0`** — bit-identical, not merely close
+/// — so this asserts equality rather than a tolerance. (It is bit-identical despite dose 1
+/// contributing three extra break times because all three fall where the state is still
+/// identically zero, before dose 2 arrives.)
+#[test]
+fn ode_provider_cmt_zero_infusion_does_not_contaminate_another_doses_saltation() {
+    let model = parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse lag+inf TV ODE");
+    let times = [2.0, 10.0, 14.0, 20.0, 30.0];
+    let theta = vec![1.0, 10.0, 8.0, 0.75];
+    let eta = vec![0.1, 0.05];
+    const ETA_LAG: usize = 1;
+
+    // The `CMT=1` infusion whose lagged arrival carries the saltation under test.
+    let live_dose = DoseEvent::new(5.0, 100.0, 1, 40.0, false, 0.0);
+    // The inert `CMT=0` infusion: 1000 mg at 20 mg/h = a 50 h window.
+    let inert_dose = DoseEvent::new(0.0, 1000.0, 0, 20.0, false, 0.0);
+
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mk = |doses: Vec<DoseEvent>| {
+        let mut s = bolus_subject(&times);
+        let n_doses = doses.len();
+        s.doses = doses;
+        s.covariates = wt(62.0);
+        s.dose_covariates = vec![wt(62.0); n_doses];
+        s.obs_covariates = vec![wt(64.0), wt(68.0), wt(75.0), wt(82.0), wt(90.0)];
+        s
+    };
+    // Doses in time order, as every walk expects.
+    let with_inert = mk(vec![inert_dose.clone(), live_dose.clone()]);
+    let reference = mk(vec![live_dose.clone()]);
+
+    assert!(
+        ode_tvcov_supported(&model, &with_inert) && ode_tvcov_supported(&model, &reference),
+        "both arms must reach the event-driven walk, where `boundary_velocity` lives"
+    );
+
+    // Asserted, not assumed: dose 2's lagged arrival has to land strictly inside dose 1's
+    // open window, or `boundary_velocity`'s spanning test excludes dose 1 and the mutation
+    // is unreachable all over again.
+    let lag = theta[2] * f64::exp(eta[ETA_LAG]);
+    let inert_open = inert_dose.time + lag;
+    let inert_close = inert_open + inert_dose.amt / inert_dose.rate;
+    let live_arrival = live_dose.time + lag;
+    assert!(
+        live_arrival > inert_open && live_arrival < inert_close,
+        "dose 2 arrives at {live_arrival}, which must sit strictly inside dose 1's window \
+         [{inert_open}, {inert_close}]"
+    );
+
+    let a = ode_subject_sensitivities(&model, &with_inert, &theta, &eta).expect("supported");
+    let b = ode_subject_sensitivities(&model, &reference, &theta, &eta).expect("supported");
+    assert_eq!(a.obs.len(), times.len());
+    assert_eq!(b.obs.len(), times.len());
+
+    // The reference must be a live curve on the η_LAG axis — the axis the contaminated
+    // `coef2` moves. Finiteness is checked before folding because `f64::max` silently
+    // discards `NaN`, so a diverged solve would otherwise pass this on the strength of
+    // whichever records happened to work.
+    let mut peak_f = 0.0_f64;
+    let mut peak_lag_grad = 0.0_f64;
+    let mut peak_lag_hess = 0.0_f64;
+    for o in &b.obs {
+        assert!(
+            o.f.is_finite(),
+            "reference produced a non-finite prediction"
+        );
+        assert!(
+            o.df_deta[ETA_LAG].is_finite() && o.d2f_deta2[ETA_LAG * 2 + ETA_LAG].is_finite(),
+            "reference produced a non-finite η_LAG derivative"
+        );
+        peak_f = peak_f.max(o.f.abs());
+        peak_lag_grad = peak_lag_grad.max(o.df_deta[ETA_LAG].abs());
+        peak_lag_hess = peak_lag_hess.max(o.d2f_deta2[ETA_LAG * 2 + ETA_LAG].abs());
+    }
+    // Measured: 5.168625231607172 / 31.408784904925405. The Hessian floor matters most —
+    // it is the block the mutation moves, so a fixture whose `∂²f/∂η_LAG²` were ~0 would
+    // make the comparison below vacuous however non-trivial the value curve looked.
+    assert!(
+        peak_f > 1.0 && peak_lag_grad > 1.0 && peak_lag_hess > 1.0,
+        "reference must be non-trivial: peak |f| {peak_f}, peak |∂f/∂η_LAG| {peak_lag_grad}, \
+         peak |∂²f/∂η_LAG²| {peak_lag_hess}"
+    );
+
+    for (j, (x, y)) in a.obs.iter().zip(b.obs.iter()).enumerate() {
+        assert_eq!(
+            x.f, y.f,
+            "obs {j}: an inert CMT=0 infusion moved the prediction"
+        );
+        assert_eq!(x.df_deta, y.df_deta, "obs {j}: it moved ∂f/∂η");
+        assert_eq!(x.df_dtheta, y.df_dtheta, "obs {j}: it moved ∂f/∂θ");
+        assert_eq!(
+            x.d2f_deta2, y.d2f_deta2,
+            "obs {j}: an inert CMT=0 infusion moved ∂²f/∂η² — its rate leaked into a \
+             neighbouring dose's saltation velocities (#1077, `boundary_velocity`)"
+        );
+        assert_eq!(
+            x.d2f_deta_dtheta, y.d2f_deta_dtheta,
+            "obs {j}: an inert CMT=0 infusion moved ∂²f/∂η∂θ (#1077, `boundary_velocity`)"
+        );
+    }
+}
+
+/// **#1129: an `EVID=3` reset strictly between a lagged infusion's dose record and its
+/// arrival must not touch the gradient.** The reset lands on an already-empty system, so
+/// it is a physical no-op — prediction *and* every derivative must be identical with and
+/// without it.
+///
+/// This geometry was uncovered when #1129 was filed. The nearest existing tests miss it in
+/// two different ways: `ode_provider_lagtime_reset_hessian_matches_fd_of_grad` uses a
+/// **bolus** and places the reset *at* the second dose's record time, and
+/// `ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production` is
+/// deliberately a bolus too. The uncovered cell is a reset landing strictly inside
+/// `(dose record, lagged **infusion** arrival)`, where `reset_floor` turns finite while a
+/// pending infusion window is still ahead of it — and both the `K_DOSE` rate-on branch and
+/// the `K_INF_END` rate-off branch take `reset_floor` as an argument.
+///
+/// The issue reported `∂f/∂η_LAG` **flipping sign**, `+7.14133` → `−12.53131`, against an
+/// FD reference of `+7.14133`, with `f` and `∂f/∂η_CL` untouched — invisible in any
+/// prediction and reaching FOCEI only through the inner EBE search and the `h` matrix. At
+/// this SHA both arms give `+7.141334` and match FD, so this is a regression pin rather
+/// than a fix; it is here because nothing else asserts it.
+///
+/// Three teeth, since "the two arms agree" is satisfiable by a fixture where neither arm
+/// does anything:
+///   1. both arms are also checked against central FD of the production predictor, so a
+///      change that corrupts *both* identically still fails;
+///   2. the reset must sit strictly between the record and the arrival, asserted from the
+///      realised lag rather than assumed from the θ;
+///   3. `∂f/∂η_LAG` must be large — it is the axis that flipped, and the issue's own
+///      numbers put the defect at ~20 units on it.
+#[test]
+fn ode_provider_reset_before_a_lagged_infusion_arrival_leaves_the_gradient_alone() {
+    let model = parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse lag+inf ODE");
+    // `T_inf = AMT/RATE = 4`, arrival ≈ 8.410, window end ≈ 12.410; the sample at 13 is
+    // past the end, so it sees the whole delivered mass and both boundaries.
+    let times = [13.0];
+    let theta = vec![1.0, 10.0, 8.0, 0.75];
+    let eta = vec![0.12, 0.05];
+    const ETA_LAG: usize = 1;
+    const RESET_AT: f64 = 2.0;
+
+    // Flat `WT` — #1129 reproduces with no time-varying covariate, so this must not need
+    // one. (The covariate is present but constant, so every snapshot is equal.)
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mk = |resets: Vec<f64>| {
+        let mut s = bolus_subject(&times);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)];
+        s.covariates = wt(70.0);
+        s.dose_covariates = vec![wt(70.0)];
+        s.obs_covariates = vec![wt(70.0)];
+        s.reset_covariates = vec![wt(70.0); resets.len()];
+        s.reset_times = resets;
+        s
+    };
+    let no_reset = mk(vec![]);
+    let with_reset = mk(vec![RESET_AT]);
+
+    // (2) The reset has to land strictly inside `(dose record, arrival)`, which is the
+    // whole point — a reset after the arrival, or at the record, is a different cell that
+    // the tests named above already cover.
+    let lag = theta[2] * f64::exp(eta[ETA_LAG]);
+    let arrival = no_reset.doses[0].time + lag;
+    assert!(
+        RESET_AT > no_reset.doses[0].time && RESET_AT < arrival,
+        "reset {RESET_AT} must sit strictly between the dose record {} and the arrival \
+         {arrival}",
+        no_reset.doses[0].time
+    );
+    assert!(
+        times[0] > arrival + no_reset.doses[0].amt / no_reset.doses[0].rate,
+        "the sample must sit past the infusion window end, so the rate-off boundary is \
+         upstream of it"
+    );
+
+    let fd_deta = |s: &Subject, k: usize| -> f64 {
+        let h = 1e-6;
+        let mut ep = eta.clone();
+        ep[k] += h;
+        let mut em = eta.clone();
+        em[k] -= h;
+        (compute_predictions_with_tv(&model, s, &theta, &ep)[0]
+            - compute_predictions_with_tv(&model, s, &theta, &em)[0])
+            / (2.0 * h)
+    };
+
+    let a = ode_subject_sensitivities(&model, &no_reset, &theta, &eta).expect("supported");
+    let b = ode_subject_sensitivities(&model, &with_reset, &theta, &eta).expect("supported");
+
+    // (3) The lagtime axis must actually be live. Measured `+7.141334`; the defect moved it
+    // by ~19.7, so a fixture whose η_LAG gradient were near zero could not show it.
+    assert!(
+        a.obs[0].df_deta[ETA_LAG].abs() > 1.0,
+        "∂f/∂η_LAG is {} — too small for this fixture to witness a ~20-unit corruption",
+        a.obs[0].df_deta[ETA_LAG]
+    );
+
+    // (1) Both arms against FD of production. `2e-3` relative is the tolerance the rest of
+    // this module's `check_vs_production` uses for a central-difference reference; the
+    // defect under test is a 275% error on this element, nowhere near it.
+    for (name, s, sens) in [("no reset", &no_reset, &a), ("reset", &with_reset, &b)] {
+        for k in 0..model.n_eta {
+            let fd = fd_deta(s, k);
+            assert!(
+                fd.is_finite(),
+                "{name}: FD reference for η[{k}] is not finite"
+            );
+            approx::assert_relative_eq!(
+                sens.obs[0].df_deta[k],
+                fd,
+                max_relative = 2e-3,
+                epsilon = 1e-6
+            );
+        }
+    }
+
+    // The reset is a physical no-op, so the two arms must agree — on the value and on
+    // every derivative block, not just the one that flipped.
+    assert_eq!(a.obs[0].f, b.obs[0].f, "the reset moved the prediction");
+    assert_eq!(
+        a.obs[0].df_deta, b.obs[0].df_deta,
+        "an EVID=3 reset of an already-empty system moved ∂f/∂η (#1129)"
+    );
+    assert_eq!(
+        a.obs[0].df_dtheta, b.obs[0].df_dtheta,
+        "an EVID=3 reset of an already-empty system moved ∂f/∂θ (#1129)"
+    );
+    assert_eq!(
+        a.obs[0].d2f_deta2, b.obs[0].d2f_deta2,
+        "an EVID=3 reset of an already-empty system moved ∂²f/∂η² (#1129)"
+    );
+}
