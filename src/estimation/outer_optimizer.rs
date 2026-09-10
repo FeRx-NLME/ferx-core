@@ -1737,8 +1737,8 @@ fn optimize_nlopt_once(
     // where the local optimizer can land in a degenerate basin from a
     // far-from-truth start. The pre-search runs the same FOCE objective
     // as the main optimizer (no shortcuts), so each global eval is a
-    // full inner-loop pass; budget is `global_maxeval` (default
-    // `200 * (n_params + 1)` when 0).
+    // full inner-loop pass; budget is `global_maxeval` (0 → auto:
+    // `30 * (n_params + 1)`, see `run_global_presearch`).
     if options.global_search {
         let pre_x = run_global_presearch(
             model,

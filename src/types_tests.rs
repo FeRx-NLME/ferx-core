@@ -3027,3 +3027,173 @@ fn non_interaction_stage_walks_the_whole_method_chain() {
     };
     assert_eq!(chain.non_interaction_stage(), None);
 }
+
+// ---------------------------------------------------------------------------
+// #956: the covariance keys are one group, and the group is framework-level.
+//
+// `cov_inner_tol` shipped in *no* advertised key list while having a working
+// `apply_fit_option` arm, so `unsupported_keys_warnings` announced that a value the
+// parser had just applied would be ignored. The fix lists it with its five siblings in
+// `framework_keys()` rather than in nine `method_specific_keys` arms — a per-method list
+// re-arms the same trap for the next covariance-capable method — and the one case where
+// the group really is inert (a chain ending in Bayes) becomes a rule over the group,
+// mirroring the `ode_*` model-conditional notice above.
+// ---------------------------------------------------------------------------
+
+/// The [`covariance_keys`] analogue of [`ode_solver_keys_are_a_subset_of_framework_keys`].
+#[test]
+fn covariance_keys_are_a_subset_of_framework_keys() {
+    let fw = framework_keys();
+    for k in covariance_keys() {
+        assert!(
+            fw.contains(k),
+            "`{k}` is in covariance_keys() but not framework_keys() — it would \
+             spuriously warn as method-unsupported (#956)"
+        );
+    }
+}
+
+/// Every method advertises the *whole* covariance group, not most of it.
+///
+/// This is the guard the #956 bug needed and did not have. The reverse scraper in
+/// `model_parser_tests` unions the ten `method_specific_keys` arms, so a key present in
+/// any one arm satisfies it — deleting `cov_inner_tol` from eight of nine arms leaves it
+/// green. This asserts per method, so a covariance key that drifts back into per-method
+/// lists and is forgotten in one of them names that method.
+#[test]
+fn every_method_advertises_the_whole_covariance_key_group() {
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+        EstimationMethod::Vi,
+    ] {
+        for k in covariance_keys() {
+            let advertised = framework_keys().contains(k) || method_specific_keys(m).contains(k);
+            assert!(
+                advertised,
+                "method `{}` advertises neither `{k}` in framework_keys() nor in its \
+                 method_specific_keys() arm — a fit setting it would be told the value \
+                 it just applied will be ignored (#956)",
+                m.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn bayes_chain_warns_that_covariance_keys_have_no_effect() {
+    let opts = FitOptions {
+        method: EstimationMethod::Bayes,
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    let w = opts.unsupported_keys_warnings();
+
+    assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
+    // Pinned in full for the same reason as the `ode_reltol` notice above: the string
+    // reaches the CLI and the fit YAML verbatim, and a `\`-continuation that is not
+    // exactly right ships a run of spaces that `contains` cannot see.
+    assert_eq!(
+        w[0],
+        "fit option `cov_inner_tol` configures the post-fit covariance step, but this \
+         fit ends in Bayesian estimation, which reports posterior credible intervals \
+         instead of Hessian standard errors and runs no covariance step, so it has no \
+         effect."
+    );
+    // The method-level phrasing would be the wrong diagnosis, and is what the key's
+    // omission from `method_specific_keys` used to produce: "not used by method `Bayes`"
+    // is the text a *misspelled* key gets, and it lists every method-specific key as the
+    // suggested alternative.
+    assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
+}
+
+#[test]
+fn bayes_chain_warns_once_per_distinct_covariance_key() {
+    let mut keys: Vec<&str> = covariance_keys().to_vec();
+    keys.push("cov_inner_tol");
+    let opts = FitOptions {
+        method: EstimationMethod::Bayes,
+        ..opts_with_user_set_keys(&keys)
+    };
+
+    let w = opts.unsupported_keys_warnings();
+    assert_eq!(
+        w.len(),
+        covariance_keys().len(),
+        "one notice per distinct key, got: {w:?}"
+    );
+    for k in covariance_keys() {
+        assert!(
+            w.iter().any(|m| m.contains(k)),
+            "no notice named `{k}`: {w:?}"
+        );
+    }
+    for m in &w {
+        assert!(
+            !m.contains("  "),
+            "notice contains a run of spaces — check the `\\` line continuations: {m:?}"
+        );
+    }
+}
+
+/// The notice follows the covariance step, not the presence of a Bayes stage.
+///
+/// `[bayes, focei]` ends on FOCEI, which runs the step and consumes every covariance
+/// key; `[focei, bayes]` does not, because the step only ever runs on the chain's last
+/// estimating stage (#615) and Bayes disables its own. The pair straddles the predicate:
+/// a rule keyed on "the chain contains Bayes" passes the second and fails the first.
+#[test]
+fn covariance_key_notice_follows_the_last_estimating_stage() {
+    let ends_estimating = FitOptions {
+        methods: vec![EstimationMethod::Bayes, EstimationMethod::FoceI],
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    assert_eq!(
+        ends_estimating.covariance_stage(),
+        Some(EstimationMethod::FoceI)
+    );
+    assert!(
+        ends_estimating.unsupported_keys_warnings().is_empty(),
+        "a chain that ends in FOCEI runs the covariance step: {:?}",
+        ends_estimating.unsupported_keys_warnings()
+    );
+
+    let ends_bayes = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Bayes],
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    assert_eq!(ends_bayes.covariance_stage(), Some(EstimationMethod::Bayes));
+    assert_eq!(ends_bayes.unsupported_keys_warnings().len(), 1);
+}
+
+/// A trailing evaluation-only stage does not take ownership of the covariance step.
+///
+/// `[bayes, imp]` under `imp_eval_only` estimates in Bayes and only *evaluates* in IMP,
+/// so `is_last_estimating_stage` puts the step on the Bayes stage and the keys are inert
+/// — the same rule `fit_inner` runs, reached through the same helper rather than a
+/// second copy of it.
+#[test]
+fn eval_only_trailing_stage_leaves_the_covariance_step_on_bayes() {
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Bayes, EstimationMethod::Imp],
+        imp_eval_only: true,
+        ..opts_with_user_set_keys(&["fd_hessian_step"])
+    };
+    assert_eq!(opts.eval_only_methods(), vec![EstimationMethod::Imp]);
+    assert_eq!(opts.covariance_stage(), Some(EstimationMethod::Bayes));
+    assert_eq!(opts.unsupported_keys_warnings().len(), 1);
+
+    // Without the eval-only flag the IMP stage estimates, so it owns the step.
+    let estimating = FitOptions {
+        imp_eval_only: false,
+        ..opts.clone()
+    };
+    assert_eq!(estimating.covariance_stage(), Some(EstimationMethod::Imp));
+    assert!(estimating.unsupported_keys_warnings().is_empty());
+}

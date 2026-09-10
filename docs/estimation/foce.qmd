@@ -281,6 +281,22 @@ When `covariance = true`, ferx-core computes the variance-covariance matrix of t
 - **Relative standard errors (%RSE)** for assessing estimation precision
 - **Omega SEs** via delta method from the Cholesky parameterization
 
+### Which stage runs it, and when it does not run at all {#which-stage-runs-the-covariance-step}
+
+In a method chain the covariance step runs **once**, on the last stage that estimates — a trailing evaluation-only stage (`imp_eval_only`, `agq_eval_only`) reads out a likelihood at fixed parameters and does not take ownership of it. Recomputing the step after every stage would pay for it several times over for one reported result ([#615](https://github.com/FeRx-NLME/ferx-core/issues/615)).
+
+Bayesian estimation is the one method that never runs it: `method = bayes` reports posterior credible intervals from the sampled chain, not Hessian standard errors, so ferx disables the covariance and SIR steps for it. That makes all six covariance keys — `covariance`, `covariance_method`, `covariance_fallback`, `analytic_cov_hessian`, `fd_hessian_step`, `cov_inner_tol` — inert when a fit *ends* in `bayes`, and setting one there is reported as such:
+
+```
+fit option `cov_inner_tol` configures the post-fit covariance step, but this fit
+ends in Bayesian estimation, which reports posterior credible intervals instead of
+Hessian standard errors and runs no covariance step, so it has no effect.
+```
+
+Where the Bayes stage falls in the chain is what decides this, not its presence: `methods = [bayes, focei]` ends on FOCEI, which runs the step and consumes every one of those keys, so no notice is issued. `methods = [focei, bayes]` does not.
+
+Every other estimator — FOCE, FOCEI, Laplace/AGQ, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP, VI — runs the covariance step and honours all six keys. They are framework-level for that reason, rather than listed per method ([#956](https://github.com/FeRx-NLME/ferx-core/issues/956)).
+
 ### How the Hessian is built
 
 The covariance is `2·H⁻¹`, where `H` is the Hessian of the objective. There are two routes to `H`, and both produce the same object — the observed information at the converged point.
@@ -357,7 +373,7 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
   covariance_method = rsr
 ```
 
-`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite FD Hessian (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
+`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite covariance Hessian, analytic R-matrix or FD stencil alike (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
 
 #### NONMEM cross-check (S / RSR, FOCEI)
 
@@ -410,7 +426,7 @@ let fit_with_cov = run_covariance(&fit, None, None, &opts)?;
 
 `run_covariance` reconstructs the fitted parameters from the `FitResult`, re-runs the final inner loop (cold-started, exactly as the inline covariance path in `fit()` does) to rebuild the covariance-step inputs, and calls the same FD-Hessian covariance step `fit()` runs inline — so the result matches fitting with `covariance = true`. For an **in-memory** fit from any packed-Cholesky-space optimizer (BOBYQA/SLSQP/MMA, BFGS, the trust region, or Gauss-Newton) the match is **bit-for-bit**: the fit carries the optimizer's exact Cholesky factor and `run_covariance` reuses it. A fit **reloaded from a `.fitrx` bundle**, or produced by SAEM / importance-sampling / Bayes (which rebuild `omega` from the reported matrix), instead reconstructs the factor by re-decomposing `fit.omega`, so it matches only up to finite-difference noise (~1e-5, platform dependent). The returned `FitResult` is a clone of `fit` with `covariance_matrix`, `se_theta` / `se_omega` / `se_sigma` / `se_kappa`, `covariance_status`, and the condition-number diagnostics refreshed. `run_covariance_step` on the passed options is ignored — calling the function is itself the request.
 
-A covariance step that runs but cannot produce a usable matrix (a non-positive-definite or structurally-unusable FD Hessian) is **not** an error: the returned fit reports `covariance_status = Failed` with a diagnostic in `warnings`, mirroring the inline `fit()` behaviour. `Err` is reserved for input problems — a missing or hash-mismatched model/dataset, a dimension mismatch, or an IOV model supplied without its population.
+A covariance step that runs but cannot produce a usable matrix (a non-positive-definite or structurally-unusable covariance Hessian) is **not** an error: the returned fit reports `covariance_status = Failed` with a diagnostic in `warnings`, mirroring the inline `fit()` behaviour. `Err` is reserved for input problems — a missing or hash-mismatched model/dataset, a dimension mismatch, or an IOV model supplied without its population.
 
 The second and third arguments (`Option<&CompiledModel>` / `Option<&Population>`) behave exactly as for `run_sir`: `Some(...)` is used as-is (caller owns verification), `None` re-reads from `fit.model_path` / `fit.data_path` with SHA-256 integrity checks that refuse stale source. See [Caller-supplied vs. re-read inputs](sir.qmd#caller-supplied-vs.-re-read-inputs).
 
@@ -428,7 +444,7 @@ SEs in the regularised directions are inflated (since `1/λ_clipped` is larger t
 
 ### SIR fallback for non-PD Hessians
 
-When a model is poorly identified or converges to a saddle point, the FD Hessian can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
+When a model is poorly identified or converges to a saddle point, the covariance Hessian — whether `R` came from the analytic route or the FD stencil — can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
 
 ```
 [fit_options]

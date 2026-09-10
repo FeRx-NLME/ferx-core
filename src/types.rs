@@ -5369,7 +5369,8 @@ pub enum CovarianceStatus {
     Computed,
     /// Step was attempted but failed (e.g. singular Hessian).
     Failed,
-    /// FD Hessian was non-PD; SIR was run as a fallback and succeeded.
+    /// Covariance Hessian was non-PD (analytic R-matrix or FD stencil alike); SIR was
+    /// run as a fallback and succeeded.
     SirFallback,
 }
 
@@ -6579,7 +6580,11 @@ pub struct FitOptions {
     /// routes to the same quantity. Set `false` to force finite differences.
     pub analytic_cov_hessian: bool,
     pub fd_hessian_step: f64,
-    /// What to do when the FD Hessian is non-positive-definite.
+    /// What to do when the covariance Hessian is non-positive-definite.
+    ///
+    /// Not FD-specific despite the historical wording elsewhere: the non-PD branch runs on
+    /// whichever `R` was assembled, so it applies equally to the exact analytic R-matrix
+    /// (see [`analytic_cov_hessian`](Self::analytic_cov_hessian)).
     /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
     /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
     /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
@@ -7895,6 +7900,37 @@ impl FitOptions {
         }
     }
 
+    /// The methods running as pure likelihood evaluators for this fit: `imp` under
+    /// `imp_eval_only`, `laplace` under `agq_eval_only`. Chain-wide, not per-stage.
+    ///
+    /// Feeds [`crate::api::is_last_estimating_stage`], which is how both
+    /// [`Self::covariance_stage`] and `fit_inner` decide which stage owns the covariance
+    /// step. One implementation, so the diagnostic and the run cannot disagree about it.
+    pub(crate) fn eval_only_methods(&self) -> Vec<EstimationMethod> {
+        let mut v = Vec::new();
+        if self.imp_eval_only {
+            v.push(EstimationMethod::Imp);
+        }
+        if self.agq_eval_only {
+            v.push(EstimationMethod::Laplace);
+        }
+        v
+    }
+
+    /// The chain stage that would run the post-fit covariance step: the last stage that
+    /// estimates, ignoring a trailing run of evaluation-only stages (#615).
+    ///
+    /// `None` only for an empty chain, which `method_chain` never produces. Note this
+    /// answers *which stage owns the step*, not whether it runs — `covariance = false`
+    /// and a Bayes stage both suppress it, and the caller decides what that means.
+    pub(crate) fn covariance_stage(&self) -> Option<EstimationMethod> {
+        let chain = self.method_chain();
+        let eval_only = self.eval_only_methods();
+        (0..chain.len())
+            .find(|&i| crate::api::is_last_estimating_stage(&chain, i, &eval_only))
+            .map(|i| chain[i])
+    }
+
     /// The first stage of the method chain with no η–ε interaction — plain
     /// FOCE, or Gauss-Newton without `interaction = true` — or `None` when
     /// every stage has one (FOCEI, Laplace/AGQ, or a Monte-Carlo estimator).
@@ -8076,7 +8112,44 @@ impl FitOptions {
                 available.join(", ")
             ));
         }
+        warnings.extend(self.inert_covariance_key_notices());
         warnings
+    }
+
+    /// Notices for [`covariance_keys`] set on a chain whose covariance step never runs.
+    ///
+    /// Bayesian estimation reports posterior credible intervals and explicitly disables
+    /// the Hessian covariance and SIR steps (`fit_inner`), so all six covariance keys are
+    /// inert when the stage that would own the step ([`Self::covariance_stage`]) is Bayes.
+    ///
+    /// This is one rule over the group rather than an omission from each method's key
+    /// list. A key withheld from `method_specific_keys` produces the *wrong* diagnostic
+    /// for two of the three readers: the parser cannot distinguish "not a covariance-step
+    /// method" from "misspelled", so it prints "not used by method `Bayes`" — the same
+    /// text a typo gets — and lists every method-specific key as the suggested
+    /// alternative. It also scales wrongly: covering six keys × N methods by omission is
+    /// 6N chances to forget one, and forgetting one is #956.
+    fn inert_covariance_key_notices(&self) -> Vec<String> {
+        if !matches!(self.covariance_stage(), Some(EstimationMethod::Bayes)) {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut notices = Vec::new();
+        for key in &self.user_set_keys {
+            if !covariance_keys().contains(&key.as_str()) {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            notices.push(format!(
+                "fit option `{key}` configures the post-fit covariance step, but this fit \
+                 ends in Bayesian estimation, which reports posterior credible intervals \
+                 instead of Hessian standard errors and runs no covariance step, so it \
+                 has no effect."
+            ));
+        }
+        notices
     }
 
     /// [`Self::unsupported_keys_warnings`] plus the **model-conditional** notices.
@@ -8155,6 +8228,31 @@ pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
     ]
 }
 
+/// The covariance subset of [`framework_keys`]: knobs that only ever reach the post-fit
+/// covariance step ([`crate::estimation::covariance::run_covariance_step`]).
+///
+/// Kept as its own list for the same reason as [`ode_solver_keys`]: they are
+/// framework-level with respect to the *method* — every estimator that runs a covariance
+/// step honours all six — but the step itself is skipped when the chain's last estimating
+/// stage is Bayes, and [`FitOptions::unsupported_keys_warnings`] says so for exactly these
+/// keys. A unit test pins the subset relation so the two lists cannot drift.
+///
+/// `cov_inner_tol` belongs here rather than in nine `method_specific_keys` arms: it is the
+/// covariance step's own EBE tolerance, so its applicability is decided by whether that
+/// step runs, never by the estimator. Listing it per method is what shipped #956's bug —
+/// an omission from every arm made a key the parser had just applied report itself as
+/// ignored — and a per-method list re-arms it for the next covariance-capable method.
+pub(crate) fn covariance_keys() -> &'static [&'static str] {
+    &[
+        "covariance",
+        "covariance_method",
+        "covariance_fallback",
+        "analytic_cov_hessian",
+        "fd_hessian_step",
+        "cov_inner_tol",
+    ]
+}
+
 /// Framework-level fit-option keys: consumed by every method and typically
 /// exposed as dedicated top-level arguments in the language wrappers
 /// (`covariance`, `verbose`, `bloq_method`, `threads`, `sir`, ...). Kept
@@ -8162,11 +8260,13 @@ pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
 /// can list only method-specific suggestions without conflating the layers.
 pub fn framework_keys() -> &'static [&'static str] {
     &[
+        // Covariance step (`covariance_keys()`, kept in the same order).
         "covariance",
         "covariance_method",
         "covariance_fallback",
         "analytic_cov_hessian",
         "fd_hessian_step",
+        "cov_inner_tol",
         "verbose",
         "sir",
         "sir_samples",

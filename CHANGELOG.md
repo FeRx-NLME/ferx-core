@@ -287,6 +287,15 @@ section of the SDLC for the versioning policy).
   conditional NLL as `ofv`), which is what a correct continuation of the chain resumes
   from — so a consumer comparing checkpoints must read `method_chain` / `stage_idx`
   first.
+- `cov_inner_tol` no longer reports that it is ignored for estimators whose covariance step
+  applies it (#956). It is now a framework-level covariance key like `covariance_method` and
+  `fd_hessian_step`, so every current and future estimator that runs the covariance step
+  accepts it. A fit whose last estimating stage is `bayes` runs no covariance step, and now
+  says so for all six covariance keys — "configures the post-fit covariance step … has no
+  effect" — instead of the misleading "not used by method `Bayes`" (#956).
+- `cov_inner_tol` now rejects a non-positive or non-finite value at parse time, as
+  `fd_hessian_step` already did (#956). Such a value used to parse and then silently make
+  every covariance-step EBE reconvergence exhaust `inner_maxiter`.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so
