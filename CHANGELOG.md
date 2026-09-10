@@ -305,8 +305,12 @@ section of the SDLC for the versioning policy).
   the first sample past the window end) for a subject that receives no drug and predicts
   `0.0` everywhere. Reachable only from a hand-built model spec that runs no validation;
   no validated fit changes. The compartment test is now one shared predicate asked by
-  every infusion-forcing site on both engines, rather than four hand-written copies plus
-  one site that was missing it.
+- The analytic ODE sensitivity walk no longer injects a rate-off boundary term for `CMT=0`
+  infusions on an unbound compartment (#1077). `check_dose_compartments` already rejects
+  such zero-order `CMT=0` infusions with `E_DOSE_CMT_NOT_INFUSABLE`, so this change is
+  user-visible only through hand-built specs. The walk now uses the same shared
+  `infusion_has_rate_channel` predicate as production, preventing spurious
+  `∂f/∂η_LAG` jumps when both engines predict `f ≡ 0`.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so
