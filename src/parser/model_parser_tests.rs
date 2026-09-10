@@ -22226,3 +22226,49 @@ fn every_supported_unary_fn_parses_in_a_model_file() {
             .unwrap_or_else(|e| panic!("`{name}(...)` is whitelisted but does not parse: {e}"));
     }
 }
+
+/// The other half of the `unreachable!` contract: what the three `UnaryFn`
+/// consumers do when the invariant is violated anyway.
+///
+/// `every_supported_unary_fn_has_an_arm_in_all_three_consumers` pins that each
+/// whitelisted name has a real arm. These pin that a name *without* one is a
+/// loud panic naming the consumer that lacks it — the property the whole fix
+/// rests on, since the alternative (`_ => v` / `_ => da`) is the silent
+/// identity #1332 is about. Tests can build the node directly, which production
+/// cannot: `parse_atom` is `Expression`'s only constructor and rejects the name
+/// first.
+///
+/// One test per consumer, each asserting *its own* name in the message, because
+/// a single combined test would be satisfied by whichever consumer panicked
+/// first and would stay green with the other two arms deleted.
+mod unreachable_unary_fn_arms {
+    use super::*;
+
+    /// A name that is deliberately not in `SUPPORTED_UNARY_FNS`.
+    fn out_of_whitelist() -> Expression {
+        assert!(
+            !SUPPORTED_UNARY_FNS.contains(&"tanh"),
+            "this test needs `tanh` to stay outside the whitelist; if it became a \
+             builtin, pick another name rather than deleting the test"
+        );
+        unary("tanh", lit(0.5))
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_expr, `tanh`")]
+    fn eval_expr_panics_rather_than_returning_the_argument() {
+        eval_at(&out_of_whitelist(), &[], &[], &[], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "compile_expr_into, `tanh`")]
+    fn the_bytecode_compiler_panics_rather_than_emitting_a_no_op() {
+        compile_bytecode(&out_of_whitelist());
+    }
+
+    #[test]
+    #[should_panic(expected = "differentiate_with_chain, `tanh`")]
+    fn the_differentiator_panics_rather_than_passing_the_derivative_through() {
+        differentiate(&out_of_whitelist(), DiffAxis::Theta(0));
+    }
+}
