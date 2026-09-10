@@ -19,6 +19,10 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+
+- **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
+
 ### Performance
 
 - **`focei, n_agq > 1` (the Gauss-Newton-anchored FOCEI quadrature refinement) now assembles

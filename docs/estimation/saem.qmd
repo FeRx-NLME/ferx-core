@@ -122,7 +122,27 @@ $$
 
 where $\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}$ is the empirical mean of the post-MH random effects for the eta paired with $\theta_j$. For a log-mu-referenced model where $\log P_i = \log \theta + \eta_i$ with $\eta_i \sim N(0, \omega^2)$, this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size $\gamma_k$. After the update the etas are re-centred by the same shift so they remain deviations from the new $\log \theta_j$.
 
-NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.
+NLopt still runs for any remaining thetas (non-mu-referenced); the closed-form-updated thetas are pinned at their new values for the NLopt call.
+
+#### Scalar residual-error update
+
+For a single, free additive or proportional residual SD in a single-population,
+uncensored Gaussian model whose free structural thetas are all log-mu-referenced,
+SAEM also averages the residual sufficient statistic instead of replacing the SD
+with the latest MCMC draw's conditional optimum. For additive error it stores
+
+$$
+S_r \leftarrow (1-\gamma_k)S_r + \gamma_k\sum_{ij}(y_{ij}-f_{ij})^2,
+\qquad \sigma = \sqrt{S_r/n_{\mathrm{obs}}}.
+$$
+
+For proportional error, the summand is divided by $f_{ij}^2$. This reduces
+otherwise persistent final-draw Monte Carlo noise in the residual SD. It is an
+internal exact M-step for that restricted likelihood, not a new fit option.
+Combined or multi-endpoint error, `block_sigma`, M3 censoring, IOV,
+`iiv_on_ruv`, FREM, custom residual magnitude, log-transform-both-sides,
+mixtures, fixed residual SDs, and models with a free numerical structural theta
+continue to use the general NLopt M-step.
 
 #### The NLopt M-step (BOBYQA) {#saem-mstep-bobyqa}
 
