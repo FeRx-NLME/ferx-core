@@ -23,6 +23,20 @@ section of the SDLC for the versioning policy).
 
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
+- **`method = laplace` now assembles its `½·log|H|` gradient term analytically by default,
+  instead of rebuilding the conditional Hessian at `x ± h` for every free population
+  parameter.** Both routes compute the same derivative — every benchmarked configuration
+  returned an identical OFV — so this is a cost change, not an accuracy one. It was previously
+  opt-in because the only closed-form fixture measured was a **diagonal** Ω, where the two
+  routes cost the same by construction and successive sessions measured opposite signs. On a
+  **block** Ω, where the call-count gap is real, the analytic route measured 11520 → 8160
+  provider calls for −24% provider time on 5 of 5 reps at an identical outer-iteration count;
+  on an ODE fixture, 10270 → 6470 calls and −35% time. **On ODE models the optimizer's path
+  changes** (the benchmark fixture converges in 37 outer iterations instead of 56), so
+  converged estimates may shift within the convergence tolerance. `FERX_AGQ_GRID_RESPONSE=fd`
+  restores the old route for benchmarking, and the finite-difference sweep remains the
+  automatic fallback wherever the analytic route is out of scope (#1335).
+
 ### Performance
 
 - **`focei` with `n_agq > 1` now contracts the analytic grid-response gradient term once per

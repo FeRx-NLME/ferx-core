@@ -2,9 +2,12 @@
 #
 # Same structural/error model and data as examples/warfarin.ferx, but every η pair is
 # correlated (`block_omega` over all three), which is where the call-count comparison
-# below would predict the analytic grid response wins (measured: it does not — see
-# `plans/laplace-sensitivity-speed.qmd`; this route stays opt-in via
-# `FERX_AGQ_GRID_RESPONSE=analytic`, dispatched by `agq::use_analytic_grid_response`):
+# below predicts the analytic grid response wins — and, measured on this fixture, it does:
+# 11520 → 8160 calls for −24% provider time, 5/5 reps, identical outer-iteration count and
+# identical OFV. That measurement is what moved the exact anchor to analytic-by-default
+# (#1335); see `plans/laplace-sensitivity-speed.qmd` and
+# `agq::use_analytic_grid_response`. An earlier revision of this header said the opposite —
+# it was written before this fixture had been run, from the diagonal-Ω result:
 #
 #   n_theta = 3, d = n_eta = 3, n_free = n_theta + n_omega(6) + n_sigma(1) = 10
 #   FD:       2·n_free            = 20 perturbed-anchor rebuilds

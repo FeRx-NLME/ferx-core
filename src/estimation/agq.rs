@@ -144,34 +144,55 @@ fn grid_response_override() -> GridResponseOverride {
 
 /// Whether the analytic grid response is the default for this anchor, absent an override.
 ///
-/// **The two anchors default oppositely, and that is deliberate, not provisional.**
+/// **Both anchors now default to analytic (#1335).** They used to default oppositely.
 ///
 /// [`HessianAnchor::GaussNewton`] → [`crate::estimation::focei_htilde_dx`] needs no third
 /// order at all: `H̃` is bilinear in first-order sensitivities, so its derivative comes from
 /// the *second*-order blocks the plain provider already returns — one extra
 /// `subject_sensitivities` call, independent of `n_free`, in place of the FD route's
-/// `2·n_free` full anchor rebuilds. There is no call-count-vs-per-call-cost trade to
-/// mismeasure here the way there is for `Exact`: this is default-on.
+/// `2·n_free` full anchor rebuilds. This has always been default-on.
 ///
 /// [`HessianAnchor::Exact`] → [`crate::estimation::laplace_h_deriv`] genuinely needs the
 /// third-order jet (`H` carries the `Aⱼ`-weighted curvature term `H̃` does not), so it pays
-/// the covariance provider's `1 + 2(n_theta + n_eta)`-evaluation sweep. A raw call-count
-/// model predicts a win over `2·n_free` in most cases, but the measured wall-clock benchmark
-/// on `warfarin.ferx` (`plans/laplace-sensitivity-speed/`) showed the opposite for the
-/// analytic provider's own *time*: fewer calls (6840 → 6460) but **more** total time (0.098s
-/// → 0.131s, +34%) — each evaluation does materially more work per call than a plain anchor
-/// rebuild. Stays opt-in until a densely-parameterised case (block-Ω) shows a repeatable
-/// wall-clock win.
+/// the covariance provider's `1 + 2(n_theta + n_eta)`-evaluation sweep — materially more work
+/// per call than a plain anchor rebuild, against materially fewer calls. That trade sat close
+/// enough to parity that an early measurement on the **diagonal-Ω** fixture came out +34%
+/// *slower*, which is why this route was opt-in; a later session on the same fixture came out
+/// ~14% faster. Both were real. The deciding measurement was the one nobody had run: the
+/// **block-Ω** case, where the call-count gap is wide (`2·n_free = 20` FD rebuilds vs
+/// `1 + 2(n_theta + d) = 13` provider evaluations) rather than equal by construction as it is
+/// on the diagonal fixture.
 ///
-/// Deliberately an environment variable and not a `[fit_options]` key: both routes compute
-/// the same derivative and differ only in cost, so there is nothing for a *user* to choose
-/// yet. Same mechanism, and the same "no overhead when off", as
-/// [`crate::sens::provider::profile_report`]'s `FERX_PROFILE`.
-fn use_analytic_grid_response(anchor: HessianAnchor) -> bool {
+/// Measured on `plans/laplace-sensitivity-speed/` (5 interleaved reps, `ci-test`,
+/// `RAYON_NUM_THREADS=1`, commit `f2434247`), `fd` → `analytic` provider time:
+///
+/// | fixture | calls | provider time | reps won | outer iters |
+/// |---|---|---|---|---|
+/// | diagonal Ω, closed-form | 6840 → 6460 | 0.0586s → 0.0556s (−5%) | 4/5 | 37 → 37 |
+/// | block Ω (3×3) | 11520 → 8160 | 0.0880s → 0.0670s (−24%) | 5/5 | 47 → 47 |
+/// | ODE | 10270 → 6470 | 1.581s → 1.029s (−35%) | 5/5 | 56 → 37 |
+///
+/// Every arm returned an identical OFV, which is the point: the two routes compute the same
+/// derivative and differ only in cost. The diagonal case remains near parity and one rep of
+/// five still favoured `fd` — it is the least-parameterised fixture and cannot settle this
+/// either way. Block-Ω is the one that does: a 24% win on **identical** outer-iteration count,
+/// so it is a like-for-like comparison on one optimiser path rather than two trajectories. The
+/// ODE row is a larger win but *not* like-for-like (56 → 37 iterations), so read its call count
+/// rather than its time.
+///
+/// Deliberately an environment variable and not a `[fit_options]` key: both routes compute the
+/// same derivative and differ only in cost, so there is nothing for a *user* to choose. It is
+/// **kept, not removed, now that `Auto` no longer branches**, because it is the harness
+/// `plans/laplace-sensitivity-speed/bench.sh` drives and the only way to re-measure a decision
+/// this doc records as session-sensitive. Costs one `OnceLock` read when unset — the same
+/// mechanism as [`crate::sens::provider::profile_report`]'s `FERX_PROFILE`.
+/// Takes no anchor argument, now that the answer does not depend on one: a parameter the body
+/// ignores would read as "this is still anchor-scoped" to the next person. `analytic_grid_response`
+/// still dispatches on the anchor internally, and still declines per-anchor to the FD route.
+fn use_analytic_grid_response() -> bool {
     match grid_response_override() {
         GridResponseOverride::ForceFd => false,
-        GridResponseOverride::ForceAnalytic => true,
-        GridResponseOverride::Auto => matches!(anchor, HessianAnchor::GaussNewton),
+        GridResponseOverride::ForceAnalytic | GridResponseOverride::Auto => true,
     }
 }
 
@@ -1339,11 +1360,13 @@ fn grid_response_correction(
         .collect();
 
     // Assemble `dH/dx` (or `dH̃/dx`) in closed form instead of rebuilding the anchor at
-    // `x ± h` for every free coordinate. `GaussNewton` is the default (see
-    // `use_analytic_grid_response`); `Exact` is opt-in via `FERX_AGQ_GRID_RESPONSE=analytic`.
+    // `x ± h` for every free coordinate. Both anchors take this route by default (#1335; see
+    // `use_analytic_grid_response` for the measurement that moved `Exact` onto it);
+    // `FERX_AGQ_GRID_RESPONSE=fd` forces the sweep below for benchmarking.
     // Declines — leaving `out` untouched — outside its narrower scope, or when the
-    // regularised anchor is ill-conditioned; the FD sweep below then runs exactly as before.
-    if use_analytic_grid_response(anchor) {
+    // regularised anchor is ill-conditioned; the FD sweep below then runs exactly as before,
+    // which is why that sweep is not dead code and must keep working.
+    if use_analytic_grid_response() {
         if let Some(gs) = node_grads.as_ref() {
             if analytic_grid_response(
                 anchor, model, subject, params, template, stack, h, x, b_hat, nodes, &db_dx, gs,
@@ -2817,6 +2840,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Absent an override, the analytic grid response is the default (#1335). The `Exact`
+    /// anchor is the half that changed; `GaussNewton` was always analytic.
+    ///
+    /// There is deliberately no per-anchor assertion, because there is no longer a per-anchor
+    /// decision: [`use_analytic_grid_response`] takes no anchor. A test that passed one in
+    /// would be asserting against a parameter the body ignores.
+    ///
+    /// The two *forced* arms are not tested here. [`grid_response_override`] memoizes the
+    /// environment in a `OnceLock`, so setting `FERX_AGQ_GRID_RESPONSE` from inside one test of
+    /// a shared binary would leak into every other test's view of it — and into this one's.
+    /// `plans/laplace-sensitivity-speed/bench.sh` exercises those arms as separate processes,
+    /// which is the only way to do it honestly.
+    #[test]
+    fn the_analytic_grid_response_is_the_default() {
+        assert!(
+            use_analytic_grid_response(),
+            "the analytic grid response is the default for both anchors (#1335); if this fails,              check whether FERX_AGQ_GRID_RESPONSE is set in the environment running the suite"
+        );
     }
 
     /// The FD route must stay reachable: a model outside `laplace_h_deriv`'s scope (here an

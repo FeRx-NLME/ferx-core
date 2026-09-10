@@ -378,19 +378,35 @@ Both anchors also have an analytic route for that last order, replacing the
   blocks (`∂²f/∂η∂θ`, `∂²f/∂η²`) the provider already returns for FOCEI's own
   `theta_block`/`sigma_block` terms — no third order at all. One extra ordinary
   sensitivity call replaces the whole FD sweep, at zero call-count-vs-per-call-cost
-  ambiguity. This is the default for this anchor.
+  ambiguity. This has always been the default for this anchor.
 - **`laplace`, `n_agq = 1` (exact `H`)** — needs the full third-order jet, so each
-  analytic evaluation costs materially more than a plain anchor rebuild; whether
-  that is a net win is representation-dependent (diagonal vs block Ω, closed-form
-  vs ODE) and close enough to parity to need re-measuring rather than trusting one
-  past run. This route stays opt-in.
+  analytic evaluation costs materially more than a plain anchor rebuild, against
+  materially fewer calls. Whether that nets out is representation-dependent, and on
+  a **diagonal** Ω the two costs are equal by construction (`n_free = n_theta + d`
+  either way), which is why successive benchmark sessions on that fixture measured
+  opposite signs. The **block-Ω** case is where the call-count gap is real — 20 FD
+  rebuilds against 13 provider evaluations — and it measured −24% provider time on
+  5 of 5 reps at an identical outer-iteration count and identical OFV. That made it
+  the default too.
 
-`FERX_AGQ_GRID_RESPONSE` overrides the per-anchor default: `fd` forces the
-finite-difference sweep, `analytic` forces the analytic route, and any other value
-(including an unset-but-misspelled one, e.g. `analytical`) is rejected outright
-rather than silently falling back to the default — a benchmark's "candidate" arm
-that quietly becomes identical to its baseline would otherwise report "no
-difference" instead of an error.
+So **both anchors now use the analytic route by default.** Both compute the same
+derivative, so this is a cost choice, not an accuracy one: every benchmarked arm
+returned an identical OFV. On an ODE `laplace` fit the route does change the
+optimizer's path — the benchmark fixture converges in 37 outer iterations instead of
+56 — so converged estimates can move within the convergence tolerance.
+
+`FERX_AGQ_GRID_RESPONSE` is retained as a benchmarking escape hatch rather than
+removed: `fd` forces the finite-difference sweep, `analytic` is now also the
+default, and any other value (including an unset-but-misspelled one, e.g.
+`analytical`) is rejected outright rather than silently falling back — a benchmark's
+"candidate" arm that quietly becomes identical to its baseline would otherwise
+report "no difference" instead of an error. It is deliberately an environment
+variable and not a `[fit_options]` key: there is nothing here for a *user* to
+choose.
+
+The finite-difference sweep is also still the live fallback, not dead code: the
+analytic route declines — out of its narrower scope (M3 censoring, say), or on an
+ill-conditioned anchor — and the FD sweep then runs exactly as before.
 
 ### Every model gets this gradient — including TTE and categorical
 

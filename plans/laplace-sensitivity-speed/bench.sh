@@ -8,19 +8,33 @@
 # Both anchors are covered:
 #
 #   * `laplace, n_agq=1` (`HessianAnchor::Exact`) — `estimation::laplace_h_deriv`, needs the
-#     covariance provider's third-order jet. `fd` is the unconditional DEFAULT here (see
-#     `agq::use_analytic_grid_response`); `analytic` stays opt-in because the win is
-#     representation-dependent, not because it loses outright: 3 interleaved reps on this
-#     binary (`8e03e076`, 2026-09-09) —
+#     covariance provider's third-order jet. `analytic` is the DEFAULT here as of #1335 (see
+#     `agq::use_analytic_grid_response`); `fd` forces the old perturbed-anchor sweep for
+#     comparison. It was opt-in until the block-Ω fixture was measured — the win is
+#     representation-dependent, and the diagonal fixture alone could not settle it.
+#
+#     Session 2 (5 interleaved reps, `f2434247`, 2026-09-10, RAYON_NUM_THREADS=1) — the run
+#     that flipped the default. Every arm returned an identical OFV:
+#       diagonal-Ω  (`warfarin_laplace.ferx`):             6840→6460 calls, 0.0586→0.0556s
+#         (−5%, 4/5 reps), iters 37→37 — still near parity, as below
+#       block-Ω     (`warfarin_block_omega_laplace.ferx`): 11520→8160 calls, 0.0880→0.0670s
+#         (−24%, 5/5 reps), iters 47→47 — the DECIDING case: a wide call-count gap
+#         (20 FD rebuilds vs 13 provider evaluations) and a like-for-like iteration count
+#       ODE         (`warfarin_ode_laplace.ferx`):         10270→6470 calls, 1.581→1.029s
+#         (−35%, 5/5 reps), iters 56→37 — bigger, but NOT like-for-like; read the call count
+#
+#     Session 1 (3 interleaved reps, `8e03e076`, 2026-09-09) — block-Ω not yet run —
 #       diagonal-Ω, analytic 1cpt (`warfarin_laplace.ferx`):  6840→6460 calls,  provider time
 #         0.070/0.061/0.055s → 0.053/0.057/0.050s (~14% faster, all 3 reps)
 #       ODE (`warfarin_ode_laplace.ferx`):                    10270→7660 calls, provider time
 #         ~1.66s → ~1.20s avg (~27% faster, all 3 reps; also fewer outer iterations, 56→44,
 #         so the two routes do not walk the identical path — see CHANGELOG)
-#     Both cases now favor `analytic`; keep re-measuring before flipping the default, since
-#     an earlier pass on this same non-ODE case had recorded the opposite sign (+34% slower) —
-#     numbers this close to parity are sensitive to machine/toolchain state, which is exactly
-#     why this script exists rather than a one-line claim.
+#     Both cases favored `analytic` in session 1 too, but block-Ω had not been run, so
+#     the default was left alone: an earlier pass on the same non-ODE case had recorded the
+#     opposite sign (+34% slower). Both were real — numbers this close to parity are
+#     sensitive to machine/toolchain state, which is exactly why this script exists rather
+#     than a one-line claim, and why the diagonal fixture alone was never going to settle
+#     it. Session 2 added block-Ω and that is what flipped the default (#1335).
 #   * `focei, n_agq=3` (`HessianAnchor::GaussNewton`) — `estimation::focei_htilde_dx`, needs
 #     no third order at all (`H̃` is bilinear in first-order sensitivities), so it costs one
 #     extra plain `subject_sensitivities` call, independent of `n_free`. `analytic` is the

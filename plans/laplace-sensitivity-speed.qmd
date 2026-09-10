@@ -283,10 +283,23 @@ provider's third-order sweep already reaches it via `ode_analytical_supported`. 
 pass on the same non-ODE fixture had recorded the opposite sign (fewer calls, 6840 → 6460, yet
 **more** total provider time, 0.098s → 0.131s, +34% — the number the previous revision of this
 section reported). Both measurements are real; the difference is machine/toolchain state
-moving a case that sits close to parity, not a defect in either run. That volatility, not a
-settled loss, is why this stays behind `FERX_AGQ_GRID_RESPONSE=analytic` rather than becoming
-the default — flip it only after a benchmark run stable enough to trust across repeated
-sessions, on both the closed-form and ODE fixtures.
+moving a case that sits close to parity, not a defect in either run. That volatility, not a settled loss, is why this stayed behind `FERX_AGQ_GRID_RESPONSE=analytic` for as long as the **diagonal-Ω** fixture was the only closed-form case measured. On that fixture the two routes cost the same by construction (`n_free = n_theta + d = 7` either way), so it was never going to settle the question in either direction.
+
+### Session 2 — the run that flipped the default (#1335)
+
+5 interleaved reps, `ci-test`, `RAYON_NUM_THREADS=1`, commit `f2434247` (which also carries the #1333 contraction, so the `analytic` arm benefits from it — not apples-to-apples against session 1, but it is the configuration the flip lands on). Exact anchor, `fd` → `analytic`:
+
+| Fixture | Provider calls | Provider time | Reps won | Outer iters | OFV |
+|---|---|---|---|---|---|
+| diagonal Ω, closed-form | 6840 → 6460 (−5.6%) | 0.0586s → 0.0556s (−5%) | 4/5 | 37 → 37 | identical |
+| **block Ω (3×3)** | 11520 → 8160 (−29%) | 0.0880s → 0.0670s (**−24%**) | **5/5** | 47 → 47 | identical |
+| ODE | 10270 → 6470 (−37%) | 1.581s → 1.029s (−35%) | 5/5 | 56 → 37 | identical |
+
+**Block-Ω is the case that decided it, and it had never been run on this anchor.** The block-Ω row recorded further up this page is the *Gauss-Newton* anchor — a different route, already analytic-by-default — which is why the exact anchor's densely-parameterised case was genuinely unmeasured despite `agq.rs` naming it as the bar. There the call-count gap is wide rather than equal by construction: `2·n_free = 20` FD anchor rebuilds against `1 + 2(n_theta + d) = 13` provider evaluations. It won on 5 of 5 reps at an **identical** outer-iteration count (47 → 47) and an identical OFV, so it is a like-for-like comparison on one optimiser path rather than two trajectories.
+
+Two honest caveats. The diagonal row is still near parity and one rep of five favoured `fd`; nothing here claims that case improved. And the ODE row, though the largest win, is **not** like-for-like — outer iterations move 56 → 37 — so its call count is the number to quote, not its time. Every arm of every fixture returned an identical OFV, which is the load-bearing observation: the two routes compute the same derivative and differ only in cost.
+
+The `FERX_AGQ_GRID_RESPONSE` harness is **kept** now that `Auto` no longer branches. It is what `bench.sh` drives, it is the only way to re-measure a quantity this page documents as session-sensitive, and the design note above ("keep an internal way to force the baseline and candidate paths") asks for exactly that. The FD sweep also remains the live fallback whenever `analytic_grid_response` declines — out of scope, or an ill-conditioned anchor — so it is not dead code either way.
 
 ### Gauss-Newton anchor (`focei, n_agq > 1`, `HessianAnchor::GaussNewton`) —
 ### `src/estimation/focei_htilde_dx.rs`
