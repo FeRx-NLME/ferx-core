@@ -1137,14 +1137,54 @@ fn an_inverted_theta_is_not_also_reported_against_its_declared_range() {
 /// `check_packed_start_in_box` so such a caller learns where the invariant
 /// comes from.
 ///
-/// Tests run in debug, so the assertion is live here.
+/// Asserted across **both** profiles rather than under `#[should_panic]`, which
+/// pins one message and so can only hold in one of them. The `Tests (release
+/// semantics)` job builds `--profile ci-fast` with `debug_assertions = false`,
+/// where the `debug_assert!` is compiled out and `f64::clamp` panics with
+/// `core`'s own `min > max, or either was NaN` — a real panic, but not the
+/// string the guarantor arm names. Measured: `should_panic(expected =
+/// "E_INIT_BOUNDS_INVERTED")` failed that job with `panic did not contain
+/// expected string` at `core/src/num/f64.rs:1643`.
+///
+/// A `#[cfg(debug_assertions)]` gate would have turned that red into silence —
+/// the test would stop *existing* in the one job that disagreed, which is the
+/// trap `outer_optimizer_tests.rs:2194` documents. So assert whichever the
+/// current build promises, and assert the panic **itself** in both: the
+/// precondition is violated either way, only the message differs.
+///
+/// The panic hook is left alone deliberately, following that same sibling:
+/// swapping in a silent one is process-global and races the parallel harness.
 #[test]
-#[should_panic(expected = "E_INIT_BOUNDS_INVERTED")]
 fn clamping_into_an_empty_box_names_its_guarantor() {
     let bounds = crate::estimation::parameterization::PackedBounds {
         lower: vec![5.0],
         upper: vec![2.0],
     };
-    let mut x = [3.0];
-    crate::estimation::parameterization::clamp_to_bounds(&mut x, &bounds);
+    let caught = std::panic::catch_unwind(|| {
+        let mut x = [3.0];
+        crate::estimation::parameterization::clamp_to_bounds(&mut x, &bounds);
+    });
+    let payload = caught.expect_err("an empty box must panic in either profile");
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    if cfg!(debug_assertions) {
+        assert!(
+            msg.contains("E_INIT_BOUNDS_INVERTED"),
+            "the guard must name the check that is supposed to have stopped the \
+             fit first — got {msg:?}"
+        );
+        assert!(
+            msg.contains("coordinate 0"),
+            "…and which coordinate — got {msg:?}"
+        );
+    } else {
+        assert!(
+            msg.contains("min > max"),
+            "with the guard compiled out the clamp still panics, from `core` and \
+             without the guarantor's name — got {msg:?}"
+        );
+    }
 }
