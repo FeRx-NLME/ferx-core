@@ -1349,6 +1349,7 @@ pub(crate) fn covariate_relation_estimates(
             parameter: rel.parameter.clone(),
             covariate: rel.covariate.clone(),
             form: rel.form.label().to_string(),
+            op: rel.op.label().to_string(),
             center_source: rel.center.map(|c| c.label()),
             center: rel.resolved_center,
             expression: match &rel.form {

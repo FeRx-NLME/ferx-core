@@ -231,6 +231,222 @@ fn linear_bounds_follow_the_psn_table() {
     assert!((theta.upper - 1.0 / 20.0).abs() < 1e-15);
 }
 
+/// The PsN bounds encode the positivity of a *factor*, so they must not be
+/// reused for a relation that adds a term (#1316 review).
+///
+/// The regression this exists to catch: `linear_family_thetas` applied
+/// `[1/(c−max), 1/(c−min)]` under both operators. Those bounds cap the whole
+/// additive term at ~±1 absolute unit over the covariate's range, which on a
+/// realistic weight range is a slope bound of ±0.04 — tighter than the 0.05 the
+/// docs use and the 0.04 the NONMEM anchor uses, both of which sit *at or
+/// outside* it. A covsearch additive candidate (which always takes these
+/// defaults) would then be estimated against a pinned bound, and its ΔOFV would
+/// under-detect the effect with no warning.
+///
+/// A differential pair: the two models differ by one character, and the
+/// multiplicative arm is asserted too, so the test cannot pass by widening both.
+#[test]
+fn additive_default_bounds_are_not_the_multiplicative_positivity_bounds() {
+    // The span of `data/two_cpt_oral_cov.csv`, median 70 — so the bound this
+    // compares against is the measured one, `θ ∈ [−0.0422, 0.0400]`.
+    let pop = population("WT", &[45.0, 60.0, 70.0, 80.0, 93.7]);
+    let mul = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = median)"),
+        &pop,
+    )
+    .expect("binding should succeed");
+    let add = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = median) +"),
+        &pop,
+    )
+    .expect("binding should succeed");
+    let mul = mul.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    let add = add.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+
+    // The multiplicative arm keeps PsN's table, unchanged.
+    assert!((mul.lower - 1.0 / (70.0 - 93.7)).abs() < 1e-15, "{mul:?}");
+    assert!((mul.upper - 1.0 / (70.0 - 45.0)).abs() < 1e-15, "{mul:?}");
+
+    // The additive arm is scale-free: null at 0, effectively unbounded.
+    assert!((add.lower + 1e6).abs() < 1e-9, "{add:?}");
+    assert!((add.upper - 1e6).abs() < 1e-9, "{add:?}");
+    assert!(add.init > 0.0 && add.init < 0.01, "{add:?}");
+
+    // The straddle, stated as the property rather than as two numbers: the
+    // slope this feature's own docs and anchor use is *outside* the
+    // multiplicative bound and inside the additive one. Without it the two arms
+    // could drift to any pair of different numbers and still pass.
+    let doc_slope = 0.05;
+    assert!(
+        doc_slope > mul.upper,
+        "the multiplicative bound must exclude {doc_slope}, else this pair proves nothing: {mul:?}"
+    );
+    assert!(doc_slope < add.upper, "{add:?}");
+}
+
+/// `linear_relative` is `linear` reparameterized as `θ_rel = c·θ_abs`, and that
+/// identity has to survive the operator switch: both spellings must start the
+/// optimiser at the same covariate effect.
+///
+/// The **bounds** deliberately do *not* follow the init through that scaling,
+/// unlike the multiplicative twin where they must (there they are `1/(c − min)`
+/// and `1/(c − max)`, in the same units as the init). Under `+` they are the
+/// fixed scale-free sentinels, so both spellings carry the same pair — asserted
+/// here, since the reparameterization is the obvious reason to scale them and
+/// the init assertion alone would not notice.
+#[test]
+fn the_additive_init_is_the_same_effect_in_both_linear_parameterizations() {
+    let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
+    let abs = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = median) +"),
+        &pop,
+    )
+    .expect("binding should succeed");
+    let rel = bind(
+        &model(
+            "  WT continuous",
+            "  CL ~ WT linear_relative(center = median) +",
+        ),
+        &pop,
+    )
+    .expect("binding should succeed");
+    let abs = abs.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    let rel = rel.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    // θ_rel = 70 · θ_abs.
+    assert!(
+        (rel.init - 70.0 * abs.init).abs() < 1e-15,
+        "{:?} vs {:?}",
+        rel,
+        abs
+    );
+    // The bounds are the sentinels on both sides — not `70 ×` them.
+    for theta in [&abs, &rel] {
+        assert_eq!(theta.lower, -1e6, "{theta:?}");
+        assert_eq!(theta.upper, 1e6, "{theta:?}");
+    }
+}
+
+/// Additive `categorical` shifts the parameter by `θ_k` outright, so PsN's
+/// `θ_k > −1` — the bound that keeps the factor `1 + θ_k` positive — does not
+/// apply to it either.
+#[test]
+fn additive_categorical_bounds_drop_the_factor_positivity_floor() {
+    let pop = population("SEX", &[0.0, 1.0, 1.0, 1.0]);
+    let mul = bind(
+        &model(
+            "  SEX categorical(levels = [0, 1])",
+            "  CL ~ SEX categorical(ref = 1)",
+        ),
+        &pop,
+    )
+    .expect("binding should succeed");
+    let add = bind(
+        &model(
+            "  SEX categorical(levels = [0, 1])",
+            "  CL ~ SEX categorical(ref = 1) +",
+        ),
+        &pop,
+    )
+    .expect("binding should succeed");
+    let mul = mul.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    let add = add.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    assert!((mul.lower + 1.0).abs() < 1e-15, "{mul:?}");
+    assert!((mul.upper - 5.0).abs() < 1e-15, "{mul:?}");
+    // A clearance shift of −2 L/h is representable additively; −1 is not the
+    // floor it is multiplicatively.
+    assert!(add.lower < -1.0, "{add:?}");
+    assert!(add.upper > 5.0, "{add:?}");
+}
+
+/// `θ_cat2 = 1 + θ_cat` is an exact reparameterization, so it has to survive the
+/// operator switch: `categorical2`'s additive defaults must be the image of
+/// `categorical`'s, not a second hand-written pair.
+///
+/// The two axes are independent — the operator picks the bounds, the shape maps
+/// them — and this is what pins that they compose. `relation_effect` emits
+/// `θ_k − 1` under `+` where `categorical` emits `θ_k`, so an unmapped bound
+/// would put the two spellings on different models.
+#[test]
+fn additive_categorical2_defaults_stay_the_image_of_categorical() {
+    let pop = population("SEX", &[0.0, 1.0, 1.0, 1.0]);
+    let of = |form: &str, op: &str| {
+        let text = model(
+            "  SEX categorical(levels = [0, 1])",
+            &format!("  CL ~ SEX {form}(ref = 1) {op}"),
+        );
+        let bound = bind(&text, &pop).expect("binding should succeed");
+        bound.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone()
+    };
+
+    // Multiplicatively, the documented image: (−0.001, −1, 5) → (0.999, 0, 6).
+    let (cat, cat2) = (of("categorical", "*"), of("categorical2", "*"));
+    assert!((cat2.init - (cat.init + 1.0)).abs() < 1e-15, "{cat2:?}");
+    assert!((cat2.lower - (cat.lower + 1.0)).abs() < 1e-15, "{cat2:?}");
+    assert!((cat2.upper - (cat.upper + 1.0)).abs() < 1e-15, "{cat2:?}");
+    assert!((cat2.lower - 0.0).abs() < 1e-15, "{cat2:?}");
+    assert!((cat2.upper - 6.0).abs() < 1e-15, "{cat2:?}");
+
+    // …and additively, the same map applied to the scale-free bounds. Asserted
+    // against the multiplicative arm as well, so a change that made the additive
+    // branch ignore the shape (or the shape branch ignore the operator) fails
+    // here rather than passing on one axis.
+    let (cat, cat2) = (of("categorical", "+"), of("categorical2", "+"));
+    assert!((cat2.init - (cat.init + 1.0)).abs() < 1e-15, "{cat2:?}");
+    assert!((cat2.lower - (cat.lower + 1.0)).abs() < 1e-15, "{cat2:?}");
+    assert!((cat2.upper - (cat.upper + 1.0)).abs() < 1e-15, "{cat2:?}");
+    assert!(cat.lower < -1.0, "the operator axis still applies: {cat:?}");
+    assert!(cat2.lower < 0.0, "…and it survives the shape map: {cat2:?}");
+}
+
+/// The centre gate is part of the same positivity story, so it must not reject
+/// an additive relation (#1316 review).
+///
+/// `center = 0` is the natural spelling of an uncentred additive slope `θ·WT`.
+/// It is rejected multiplicatively — correctly, the PsN bounds are unordered
+/// there — and the shared gate rejected it under `+` too, citing a factor the
+/// additive form does not have.
+///
+/// The single-slope forms only: `hockey` needs its breakpoint inside the range
+/// for a reason that is about support rather than positivity, and so keeps the
+/// requirement under `+` — see
+/// `an_additive_hockey_breakpoint_outside_the_data_is_rejected`.
+#[test]
+fn a_centre_outside_the_observed_range_is_legal_for_an_additive_relation() {
+    let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
+    let err = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 0)"),
+        &pop,
+    )
+    .expect_err("a centre below the range has no ordered multiplicative bounds");
+    assert!(err.contains("strictly inside"), "{err}");
+
+    let ok = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 0) +"),
+        &pop,
+    )
+    .expect("an additive relation has no factor to keep positive");
+    let theta = ok.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    assert!((theta.lower + 1e6).abs() < 1e-9, "{theta:?}");
+}
+
+/// …but the *degenerate* case is still an error, for its own reason: a constant
+/// covariate makes `θ·(c₀ − c)` a constant shift, confounded with the typical
+/// value. Dropping the whole gate under `+` would have lost this.
+#[test]
+fn a_constant_covariate_is_still_rejected_for_an_additive_relation() {
+    let pop = population("WT", &[70.0, 70.0, 70.0]);
+    // A symbolic centre. The literal-centre arm — which resolves at parse time
+    // and so never meets the data on its own — is
+    // `a_constant_covariate_is_rejected_for_a_literal_additive_centre`.
+    let err = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = median) +"),
+        &pop,
+    )
+    .expect_err("a constant covariate leaves nothing to estimate");
+    assert!(err.contains("constant"), "{err}");
+    assert!(err.contains("confounded"), "{err}");
+}
+
 #[test]
 fn hockey_bounds_follow_the_psn_table() {
     let text = model("  WT continuous", "  CL ~ WT hockey(breakpoint = median)");
@@ -436,6 +652,37 @@ fn the_echoed_relation_table_keeps_level_and_expression() {
         .expect("the expr relation is echoed");
     assert_eq!(expr.expression.as_deref(), Some("1 + 0.1 * SEX"));
     assert!(expr.thetas.is_empty());
+}
+
+/// …and which *operator* each relation used (#1316 review).
+///
+/// The two spellings generate different models — one multiplies the parameter,
+/// the other shifts it — and echoed identically, so a caller reading the table
+/// back (ferx-r, `ferx allometry`) reported an additive relation as
+/// multiplicative. Both arms are asserted, and against each other, so the field
+/// cannot pass by being a constant.
+#[test]
+fn the_echoed_relation_table_keeps_the_operator() {
+    let text = model(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70)\n  V ~ WT linear(center = 70) +",
+    );
+    let parsed = parse_full_model(&text).expect("model should parse");
+    let names = parsed.model.theta_names.clone();
+    let theta = parsed.model.default_params.theta.clone();
+    let fixed = vec![false; theta.len()];
+    let rels =
+        crate::api::covariate_relation_estimates(&parsed.model, &names, &theta, None, &fixed);
+
+    let cl = rels.iter().find(|r| r.parameter == "CL").expect("echoed");
+    let v = rels.iter().find(|r| r.parameter == "V").expect("echoed");
+    assert_eq!(cl.op, "*");
+    assert_eq!(v.op, "+");
+    // Everything else about the two rows is identical, which is exactly why the
+    // operator has to be carried: without it these two are the same record.
+    assert_eq!(cl.form, v.form);
+    assert_eq!(cl.center, v.center);
+    assert_ne!(cl.op, v.op);
 }
 
 #[test]
@@ -645,4 +892,108 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
         });
     assert!(cl.contains("present(WT)"), "{cl}");
     assert!(cl.contains("^THETA_CL_WT"), "{cl}");
+}
+
+/// A `hockey` breakpoint outside the observed range is rejected under `+` too.
+///
+/// The additive defaults drop the multiplicative centre-inside-range rule
+/// because that rule keeps a *factor* positive, and `+` has no factor. The
+/// hockey rule survives the drop for a different reason: outside the range one
+/// arm holds no subjects, so its θ has an identically zero gradient and the
+/// covariance step is singular. Dropping both together (#1316 review) accepted
+/// `hockey(breakpoint = 0) +` on a realistic weight range.
+///
+/// A differential pair on the **form**, at the same out-of-range centre, so the
+/// relaxation the additive path does keep is asserted next to the one it must
+/// not: `linear(center = 0) +` is the uncentred slope and is fine.
+#[test]
+fn an_additive_hockey_breakpoint_outside_the_data_is_rejected() {
+    let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
+    let err = bind(
+        &model("  WT continuous", "  CL ~ WT hockey(breakpoint = 0) +"),
+        &pop,
+    )
+    .expect_err("one arm holds no subjects");
+    assert!(err.contains("outside the observed range"), "{err}");
+    assert!(
+        err.contains("[50, 90]"),
+        "the message states the range: {err}"
+    );
+
+    // Same operator, same centre, single slope: accepted.
+    bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 0) +"),
+        &pop,
+    )
+    .expect("an uncentred additive slope needs no split, so no support rule applies");
+
+    // Same form, same operator, inside the range: accepted. Without this the
+    // check could pass by rejecting every additive hockey.
+    bind(
+        &model("  WT continuous", "  CL ~ WT hockey(breakpoint = 70) +"),
+        &pop,
+    )
+    .expect("a breakpoint inside the range splits the data");
+
+    // And the multiplicative twin still fails, from its own bounds rule.
+    assert!(
+        bind(
+            &model("  WT continuous", "  CL ~ WT hockey(breakpoint = 0)"),
+            &pop,
+        )
+        .is_err(),
+        "the multiplicative rule is unchanged"
+    );
+}
+
+/// A constant covariate is rejected for an additive relation with a **literal**
+/// centre — the case the check could not previously see.
+///
+/// `linear(center = 70) +` has scale-free defaults, so it is fully built at
+/// parse time, `needs_data()` is false, and `bind_covariate_stats` used to
+/// return before summarising anything. The relation then reached the fit with
+/// `θ·(70 − 70) ≡ 0`: a θ the optimiser cannot move, on data the multiplicative
+/// twin refuses. Which is why the check now lives on the data path rather than
+/// in the θ builder.
+#[test]
+fn a_constant_covariate_is_rejected_for_a_literal_additive_centre() {
+    let pop = population("WT", &[70.0, 70.0, 70.0, 70.0]);
+    let err = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 70) +"),
+        &pop,
+    )
+    .expect_err("θ·(70 − 70) is identically zero");
+    assert!(err.contains("has nothing to estimate"), "{err}");
+    assert!(err.contains("constant"), "{err}");
+
+    // An explicit θ does not rescue it: the defect is the design, not the bounds.
+    assert!(
+        bind(
+            &model(
+                "  WT continuous",
+                "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+            ),
+            &pop,
+        )
+        .is_err(),
+        "an explicit bound cannot make a constant shift identifiable"
+    );
+
+    // The symbolic-centre arm, which the parse-time check did cover, still fails.
+    assert!(
+        bind(
+            &model("  WT continuous", "  CL ~ WT linear(center = median) +"),
+            &pop,
+        )
+        .is_err(),
+        "a symbolic centre on constant data is unchanged"
+    );
+
+    // The straddle: the same relation on data that varies is accepted, so the
+    // test cannot pass by rejecting every additive linear relation.
+    bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 70) +"),
+        &population("WT", &[50.0, 70.0, 90.0]),
+    )
+    .expect("a covariate that varies has something to estimate");
 }

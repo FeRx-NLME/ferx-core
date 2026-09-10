@@ -51,8 +51,18 @@ section of the SDLC for the versioning policy).
   one carries, so θ = 0, a covariate at its centre and a missing covariate all mean "no
   effect" (the missing-value guard is `else 0.0` under `+`, `else 1.0` under `*`).
   Multiplicative and additive relations may be mixed on one parameter, and an additive
-  relation carries no top-level-product requirement. Mu-referencing switches off for a
-  parameter with an additive relation — the typical value is a sum — and the parser warns.
+  relation carries no top-level-product requirement. Its default θ bounds are scale-free
+  (`±1e6`) rather than PsN's `[1/(c−max), 1/(c−min)]`, which encode the positivity of a
+  factor the additive form does not have, and a centre outside the observed covariate range
+  is legal under `+` for the same reason — except for `hockey`, whose breakpoint must still
+  lie inside the range or one arm holds no subjects. That check and the constant-covariate
+  one now run whenever the model meets a dataset, so they also cover an additive relation
+  with a *literal* centre, which resolves without consulting the data. Mu-referencing
+  switches off for a parameter with an additive relation — the typical value is a sum — and
+  the parser warns, for the methods whose M-step reads mu-references (SAEM / IMP / IMPMAP /
+  BAYES), naming every such stage of a chained `method = [saem, focei]`. The relation table on `FitResult` and in
+  `{model}-fit.yaml` gains an `op` field, so a caller reading the model back can tell the two
+  spellings apart.
   This is the last MFL operator: `COVARIATE(..., +)` is no longer a search coverage gap, and
   `ferx covsearch` explores `CL-WT-linear-add` as a candidate of its own. **Note:** Pharmpy
   reuses the multiplicative template under `+`, so a model translated from Pharmpy will not
@@ -67,7 +77,8 @@ section of the SDLC for the versioning policy).
   factor itself (`θ = 1.3` → "30% higher") and bounded below at `0`, where
   `1 + θ` with `θ < −1` can turn the parameter negative. Defaults are the image of
   `categorical`'s under that map: init `0.999`, bounds `(0, 6)` — the bounds
-  Pharmpy uses verbatim. Note the **null moves with the form**: `fix = 1` is "no
+  Pharmpy uses verbatim — and the image of the scale-free additive bounds when
+  the relation is written with `+`. Note the **null moves with the form**: `fix = 1` is "no
   effect" for `categorical2` where `fix = 0` is for `categorical`. Search spaces
   now resolve `COVARIATE?(CL, SEX, cat2)` instead of reporting a coverage gap.
 

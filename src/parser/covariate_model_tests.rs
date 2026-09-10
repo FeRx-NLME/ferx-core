@@ -36,6 +36,15 @@ fn model_with(covariates: &str, covariate_model: &str) -> String {
     )
 }
 
+/// [`model_with`] plus a `[fit_options] method`, for the warnings that are
+/// scoped to the methods that actually read `mu_refs`.
+fn model_with_method(covariates: &str, covariate_model: &str, method: &str) -> String {
+    format!(
+        "{}\n[fit_options]\n\x20 method = {method}\n",
+        model_with(covariates, covariate_model)
+    )
+}
+
 fn spec(covariates: &str, covariate_model: &str) -> CovariateModelSpec {
     parse_full_model(&model_with(covariates, covariate_model))
         .expect("model should parse")
@@ -1304,9 +1313,10 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
     // differ in exactly one character — the trailing `+` — so they sit on
     // opposite sides of `detect_mu_refs`' predicate, and a change that made the
     // detector match a sum (or stopped it matching a product) reddens this.
-    let mul = parse_full_model(&model_with(
+    let mul = parse_full_model(&model_with_method(
         "  WT continuous",
         "  CL ~ WT linear(center = 70) => THETA_CL_WT(0.02, -1, 1)",
+        "saem",
     ))
     .expect("model should parse");
     assert!(
@@ -1323,9 +1333,10 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
         mul.model.parse_warnings
     );
 
-    let add = parse_full_model(&model_with(
+    let add = parse_full_model(&model_with_method(
         "  WT continuous",
         "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+        "saem",
     ))
     .expect("model should parse");
     assert!(
@@ -1347,9 +1358,12 @@ fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_
 fn a_parameter_with_no_eta_gets_no_mu_reference_warning() {
     // The warning names a performance cliff that only exists for an η the
     // M-step would otherwise shift; `V = TVV` carries none.
-    let parsed = parse_full_model(&model_with(
+    // Under `saem`, so the warning is suppressed by the missing η and not by
+    // the method gate — with `focei` here the assertion could not fail.
+    let parsed = parse_full_model(&model_with_method(
         "  WT continuous",
         "  V ~ WT linear(center = 70) + => THETA_V_WT(0.02, -1, 1)",
+        "saem",
     ))
     .expect("model should parse");
     assert!(
@@ -1360,6 +1374,115 @@ fn a_parameter_with_no_eta_gets_no_mu_reference_warning() {
             .any(|w| w.contains("additive (`+`) [covariate_model]")),
         "{:?}",
         parsed.model.parse_warnings
+    );
+}
+
+/// The mu-referencing warning describes the SAEM/IMP M-step, so it must not
+/// fire for a method that never reads `mu_refs` (#1316 review).
+///
+/// Its own last sentence says FOCE/FOCEI are unaffected, yet it was pushed
+/// unconditionally at parse time — a paragraph on every FOCEI fit about a path
+/// that run does not take. A differential pair on the *method*, with the
+/// additive relation held fixed, so it straddles the gate that was added.
+#[test]
+fn the_mu_reference_warning_is_scoped_to_the_methods_that_read_mu_refs() {
+    let relation = "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)";
+    let fired = |method: &str| {
+        let parsed = parse_full_model(&model_with_method("  WT continuous", relation, method))
+            .expect("model should parse");
+        // The classification itself is method-independent — only the warning is
+        // scoped — so a gate that silently disabled the detection would not
+        // pass here either.
+        assert!(
+            !parsed.model.mu_refs.contains_key("ETA_CL"),
+            "the sum is not a mu-ref shape under {method}: {:?}",
+            parsed.model.mu_refs
+        );
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("additive (`+`) [covariate_model]"))
+            .cloned()
+    };
+
+    let saem = fired("saem").expect("SAEM uses the mu-ref M-step, so the cliff is real");
+    assert!(
+        saem.contains("SAEM"),
+        "the warning names the method: {saem}"
+    );
+    for method in ["imp", "impmap", "bayes"] {
+        assert!(
+            fired(method).is_some(),
+            "{method} reads mu_refs and must be warned"
+        );
+    }
+    for method in ["focei", "foce", "laplace"] {
+        assert!(
+            fired(method).is_none(),
+            "{method} never uses the mu-ref M-step, so the warning is noise"
+        );
+    }
+    for method in ["gn", "gn_hybrid"] {
+        assert!(
+            fired(method).is_none(),
+            "{method} re-centres with mu_refs but runs no closed-form M-step"
+        );
+    }
+}
+
+/// The gate reads the whole method **chain**, not `fit_options.method`.
+///
+/// `method` is the *last* stage of a chained fit — `method = [saem, focei]`
+/// leaves `method == FoceI` — so a gate reading it alone suppresses the warning
+/// on exactly the chain that pays for the loss (the SAEM stage still runs), and
+/// labels `[focei, imp]` with FOCEI, a stage the sentence is not about. The
+/// scalar-method test above cannot fail on either, since every method it feeds
+/// is its own chain.
+#[test]
+fn the_mu_reference_warning_reads_every_stage_of_a_chained_method() {
+    let relation = "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)";
+    let fired = |method: &str| {
+        parse_full_model(&model_with_method("  WT continuous", relation, method))
+            .expect("model should parse")
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("additive (`+`) [covariate_model]"))
+            .cloned()
+    };
+
+    // The warning survives a stage that does not use mu-referencing being
+    // *last*, and names the stage that does — not the one `method` holds.
+    // The stage list is the text between "theta and" and "the numerical
+    // M-step" — matched as a whole, since the closing sentence names FOCE/FOCEI
+    // on every warning and a bare `contains` would read that as the label.
+    let named = |w: &str| {
+        w.split(" theta and ")
+            .nth(1)
+            .and_then(|rest| rest.split(" use").next())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("the warning names its stages: {w}"))
+    };
+    let saem_then_focei =
+        fired("[saem, focei]").expect("the SAEM stage still runs, and still pays the cliff");
+    assert_eq!(named(&saem_then_focei), "SAEM", "{saem_then_focei}");
+    let focei_then_imp = fired("[focei, imp]").expect("the IMP stage uses the mu-ref M-step");
+    assert_eq!(named(&focei_then_imp), "IMP", "{focei_then_imp}");
+    // Every mu-step stage is named, in chain order, and only once.
+    let two = fired("[saem, imp]").expect("both stages use the mu-ref M-step");
+    assert!(two.contains("SAEM / IMP"), "{two}");
+    assert!(two.contains("use the numerical M-step"), "{two}");
+    assert!(
+        saem_then_focei.contains("uses the numerical M-step"),
+        "one stage takes the singular verb: {saem_then_focei}"
+    );
+
+    // The straddle: a chain with no mu-step stage at all stays quiet, so the
+    // assertions above are about the chain and not about chained syntax.
+    assert!(
+        fired("[foce, focei]").is_none(),
+        "neither stage uses the mu-ref M-step"
     );
 }
 

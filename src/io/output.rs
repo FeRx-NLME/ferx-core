@@ -2037,6 +2037,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    covariate: {}", yaml_quote(&rel.covariate))
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    form: {}", yaml_quote(&rel.form)).map_err(|e| e.to_string())?;
+            // How the effect combined. Without it the echo of an additive
+            // relation is byte-identical to its multiplicative twin, and a
+            // caller reading the model back reports the wrong one.
+            writeln!(f, "    op: {}", yaml_quote(&rel.op)).map_err(|e| e.to_string())?;
             if let Some(center) = rel.center {
                 // Both forms: the value the expression was built with, and the
                 // statistic it was written as — a run launched symbolically is
@@ -4297,6 +4301,7 @@ mod tests {
                 parameter: "CL".to_string(),
                 covariate: "SEX".to_string(),
                 form: "categorical".to_string(),
+                op: "*".to_string(),
                 center_source: Some("mode".to_string()),
                 center: Some(0.0),
                 expression: None,
@@ -4312,6 +4317,7 @@ mod tests {
                 parameter: "V".to_string(),
                 covariate: "WT".to_string(),
                 form: "expr".to_string(),
+                op: "+".to_string(),
                 center_source: None,
                 center: None,
                 expression: Some("1 + 0.1 * WT".to_string()),
@@ -4328,6 +4334,9 @@ mod tests {
         assert!(yaml.contains("        level: 1"), "{yaml}");
         // …the `expr` relation carries the expression that actually ran…
         assert!(yaml.contains("    expression: \"1 + 0.1 * WT\""), "{yaml}");
+        // …each relation says how it combined, and the two differ…
+        assert!(yaml.contains("    op: \"*\""), "{yaml}");
+        assert!(yaml.contains("    op: \"+\""), "{yaml}");
         // …and its empty θ list is an empty *sequence*, not `null`.
         assert!(yaml.contains("    thetas: []"), "{yaml}");
         // (A relation that does generate θ still opens a block sequence.)
