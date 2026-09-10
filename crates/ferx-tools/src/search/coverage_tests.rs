@@ -86,7 +86,8 @@ fn the_remaining_gap_rows() {
     assert_eq!(gaps("TRANSITS(2)"), vec!["TRANSITS(n, DEPOT)"]);
     assert_eq!(gaps("TRANSITS(N)"), Vec::<String>::new());
     assert_eq!(gaps("METABOLITE(PSC)"), vec!["METABOLITE(...)"]);
-    assert_eq!(gaps("COVARIATE(CL,SEX,cat2)"), vec!["COVARIATE(..., cat2)"]);
+    // `cat2` became `categorical2` in #1312, so it is no longer a gap.
+    assert_eq!(gaps("COVARIATE(CL,SEX,cat2)"), Vec::<String>::new());
     assert_eq!(
         gaps("COVARIATE(CL,WT,custom)"),
         vec!["COVARIATE(..., custom)"]

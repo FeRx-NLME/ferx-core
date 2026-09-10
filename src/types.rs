@@ -1492,10 +1492,19 @@ impl CovariateDecl {
 /// | 5 `power` | [`CovariateForm::Power`] |
 /// | arbitrary `[code]` | [`CovariateForm::Expr`] |
 ///
-/// [`CovariateForm::LinearRelative`] has no PsN state number: it is an exact
-/// reparameterization of `Linear` (`θ_rel = c·θ_abs`) that makes θ
-/// dimensionless, so the two give the same OFV on the same data and differ only
-/// in the scale θ and its SE are reported on.
+/// [`CovariateForm::LinearRelative`] and [`CovariateForm::Categorical2`] have
+/// no PsN state number: each is an exact reparameterization of the state above
+/// it — `θ_rel = c·θ_abs` for the former, `θ_cat2 = 1 + θ_cat` for the latter —
+/// so the pair gives the same OFV on the same data and differs only in the
+/// scale θ and its SE are reported on. `Categorical2` is Pharmpy MFL's `cat2`.
+/// `#[non_exhaustive]`: adding a variant to a public enum breaks any downstream
+/// exhaustive `match`, which is what made #1312's `Categorical2` a breaking
+/// change rather than an additive one. Level grouping (`groups = [[1,2],[3,4]]`,
+/// the out-of-scope note on that issue) is the next variant, so the attribute
+/// goes in with the release that already breaks — from here on a new form is
+/// genuinely additive. Variants stay constructible; only downstream exhaustive
+/// matching is forbidden, so a caller writes a `_` arm.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CovariateForm {
@@ -1516,6 +1525,12 @@ pub enum CovariateForm {
     Hockey,
     /// `1 + θ_k` at each non-reference level, `1` at the reference level.
     Categorical,
+    /// `θ_k` at each non-reference level, `1` at the reference level — Pharmpy
+    /// MFL's `cat2`. Same degrees of freedom as [`CovariateForm::Categorical`]
+    /// (one θ per non-reference level) and an exact reparameterization of it
+    /// (`θ_cat2 = 1 + θ_cat`); what moves is the **null**, from `θ = 0` to
+    /// `θ = 1`, and with it the reading of `fix = v`.
+    Categorical2,
     /// Verbatim ferx expression, the equivalent of PsN's `[code]` escape hatch.
     /// The string is the expression source with the surrounding quotes removed.
     Expr(String),
@@ -1532,6 +1547,7 @@ impl CovariateForm {
             CovariateForm::Power => "power",
             CovariateForm::Hockey => "hockey",
             CovariateForm::Categorical => "categorical",
+            CovariateForm::Categorical2 => "categorical2",
             CovariateForm::Expr(_) => "expr",
         }
     }
@@ -1542,7 +1558,10 @@ impl CovariateForm {
     /// rather than silently producing a factor keyed on a level that does not
     /// exist.
     pub fn is_categorical(&self) -> bool {
-        matches!(self, CovariateForm::Categorical)
+        matches!(
+            self,
+            CovariateForm::Categorical | CovariateForm::Categorical2
+        )
     }
 }
 

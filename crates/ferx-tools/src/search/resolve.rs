@@ -414,8 +414,13 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                         let kind = ctx.covariate_kind(cov);
                         let effect_list: Vec<CovariateEffect> = match effects {
                             // Pharmpy expands `*` to the continuous forms; on a
-                            // declared categorical covariate the only form that
-                            // can apply is `cat`.
+                            // declared categorical covariate ferx expands it to
+                            // `cat`. Since #1312 `cat2` is a second categorical
+                            // form, but it stays out of the wildcard: Pharmpy's
+                            // own expansion never reaches it, and adding it here
+                            // would silently double every categorical pair's
+                            // candidate count on an existing search space. Ask
+                            // for it by name.
                             Modes::Wildcard => match kind {
                                 Some(CovariateKind::Categorical) => vec![CovariateEffect::Cat],
                                 _ => CovariateEffect::CONTINUOUS.to_vec(),
@@ -680,7 +685,7 @@ fn check_effect_kind(
     match kind {
         Some(CovariateKind::Categorical) if !effect.is_categorical() => Err(format!(
             "search space: in `{feature}`: `{cov}` is declared categorical, and `{}` is a \
-             continuous form; use `cat`",
+             continuous form; use `cat` or `cat2`",
             effect.label()
         )),
         Some(CovariateKind::Continuous) if effect.is_categorical() => Err(format!(

@@ -1441,6 +1441,75 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     );
 }
 
+/// **End-to-end**: the Gauss-Newton-anchored analytic grid response
+/// (`focei_htilde_dx::subject_htilde_dx_iov`, wired into `agq.rs`'s `analytic_grid_response`)
+/// must match FD of the actual IOV population objective — not just the isolated unit-level
+/// FD-parity in `focei_htilde_dx::tests`, which pins the derivative formula but never
+/// exercises the `agq.rs` dispatch (`stack.is_iov()`, the joint `omega_joint_inv`, the
+/// `subject_eta_dx_iov`-sourced `db_dx`) that a real fit actually uses.
+#[test]
+fn iov_gauss_newton_anchored_gradient_matches_fd() {
+    use ferx_core::estimation::agq;
+    use ferx_core::estimation::parameterization::{pack_params, unpack_params};
+    use ferx_core::types::HessianAnchor::GaussNewton;
+
+    let parsed = parse_full_model(WARFARIN_IOV_SRC).expect("IOV model must parse");
+    let model = &parsed.model;
+    let pop = warfarin_iov();
+    let template = &model.default_params;
+    let x0 = pack_params(template);
+    let np = x0.len();
+
+    let ofv = |x: &[f64], n: usize| -> f64 {
+        let params = unpack_params(x, template);
+        let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+            model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+        );
+        2.0 * agq::agq_population_nll(model, &pop, &params, &ehs, &kaps, n, GaussNewton)
+    };
+
+    let n = 3usize;
+    let params = unpack_params(&x0, template);
+    let (ehs, _h, _s, kaps) = ferx_core::estimation::inner_optimizer::run_inner_loop_warm(
+        model, &pop, &params, 500, 1e-12, None, None, 0, 0,
+    );
+    let g = agq::agq_population_gradient(
+        model,
+        &pop,
+        &params,
+        template,
+        &x0,
+        &ehs,
+        &kaps,
+        n,
+        GaussNewton,
+    )
+    .expect("GN-anchored analytic gradient must be available under IOV");
+
+    let mut fd = vec![0.0f64; np];
+    for i in 0..np {
+        let h = 1e-4 * (1.0 + x0[i].abs());
+        let (mut xp, mut xm) = (x0.clone(), x0.clone());
+        xp[i] += h;
+        xm[i] -= h;
+        fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
+    }
+
+    let scale = fd
+        .iter()
+        .chain(g.iter())
+        .fold(1e-6f64, |m, v| m.max(v.abs()));
+    let max_diff = g
+        .iter()
+        .zip(fd.iter())
+        .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        max_diff / scale < 2e-3,
+        "IOV GN-anchored analytic gradient must match FD of its objective, got {:.3e}          (analytic={g:?}, fd={fd:?})",
+        max_diff / scale
+    );
+}
+
 /// The grid is `n_agq^d` with `d = n_eta + K·n_kappa`, and `K` lives in the *data* — so the
 /// cap has to be enforced where the population is visible, not at model-check time. A node
 /// count that is fine without IOV can be intractable with it.

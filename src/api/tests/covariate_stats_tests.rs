@@ -188,6 +188,35 @@ fn auto_levels_are_discovered_from_the_data() {
     assert_eq!(names, vec!["THETA_CL_SEX_1", "THETA_CL_SEX_2"]);
 }
 
+/// `categorical2(ref = mode)` binds like `categorical(ref = mode)` (#1312) —
+/// the reference is the most common level and the θ are the rest. This is also
+/// the round-trip of what `Relation::render()` writes for the form.
+#[test]
+fn categorical2_binds_its_reference_to_the_mode() {
+    let text = model(
+        "  SEX categorical(levels = auto)",
+        "  CL ~ SEX categorical2(ref = mode)",
+    );
+    // 2 is the mode, so it is the reference and 0 / 1 carry the θ.
+    let pop = population("SEX", &[0.0, 1.0, 2.0, 2.0]);
+    let bound = bind(&text, &pop).expect("binding should succeed");
+    let rel = &bound.covariate_model.as_ref().unwrap().relations[0];
+    assert_eq!(rel.resolved_center, Some(2.0));
+    let names: Vec<String> = rel.thetas.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(names, vec!["THETA_CL_SEX_0", "THETA_CL_SEX_1"]);
+    // …and the bound factor is the `cat2` shape, not the `cat` one.
+    assert!(
+        cl_line(&bound).contains("(if (SEX == 0) THETA_CL_SEX_0 else "),
+        "{}",
+        cl_line(&bound)
+    );
+    assert!(
+        !cl_line(&bound).contains("1 + THETA"),
+        "{}",
+        cl_line(&bound)
+    );
+}
+
 #[test]
 fn linear_bounds_follow_the_psn_table() {
     // PsN state 2: init 0.001/(med−min), lower 1/(med−max), upper 1/(med−min).
@@ -341,6 +370,39 @@ fn a_categorical_value_outside_the_declared_levels_is_rejected() {
         .find(|d| d.code == "E_COV_LEVEL_UNKNOWN")
         .unwrap_or_else(|| panic!("{diags:?}"));
     assert!(hit.message.contains("2.0"), "{}", hit.message);
+}
+
+/// The same silent-reference trap on `categorical2` (#1312).
+///
+/// The fallthrough of the generated chain is still the reference branch — `1`
+/// — so an undeclared code is modelled as reference in exactly the same way,
+/// and the check has to fire for both forms. It keys on `is_categorical()`, so
+/// this is the test that a new categorical variant cannot slip past it.
+#[test]
+fn a_categorical2_value_outside_the_declared_levels_is_rejected_too() {
+    let text = model(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0)",
+    );
+    let parsed = parse_full_model(&text).expect("model should parse");
+
+    let clean = population("SEX", &[0.0, 1.0, 0.0]);
+    assert!(
+        crate::api::check_model_data(&parsed.model, &clean)
+            .iter()
+            .all(|d| d.code != "E_COV_LEVEL_UNKNOWN"),
+        "a dataset inside the declared levels must pass"
+    );
+
+    let dirty = population("SEX", &[0.0, 1.0, 2.0]);
+    let diags = crate::api::check_model_data(&parsed.model, &dirty);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_COV_LEVEL_UNKNOWN")
+        .unwrap_or_else(|| panic!("{diags:?}"));
+    assert!(hit.message.contains("2.0"), "{}", hit.message);
+    // …and it names the form that was actually written, not `categorical`.
+    assert!(hit.message.contains("categorical2(...)"), "{}", hit.message);
 }
 
 /// The echoed relation table has to be machine-readable on its own: which

@@ -337,8 +337,8 @@ fn parse_relation_line(
     };
     if form_src.is_empty() {
         return Err(format!(
-            "[covariate_model]: `{param} ~ {covariate}` states no form — expected one of \
-             none, linear, linear_relative, exponential, power, hockey, categorical, expr"
+            "[covariate_model]: `{param} ~ {covariate}` states no form — expected one of {}",
+            form_list()
         ));
     }
     let decl = ctx
@@ -487,6 +487,7 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
         "power" => CovariateForm::Power,
         "hockey" => CovariateForm::Hockey,
         "categorical" => CovariateForm::Categorical,
+        "categorical2" => CovariateForm::Categorical2,
         "expr" => {
             let text = body
                 .trim()
@@ -504,9 +505,9 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
         }
         other => {
             return Err(format!(
-                "[covariate_model]: unknown form `{other}`{} — expected one of none, linear, \
-                 linear_relative, exponential, power, hockey, categorical, expr",
-                did_you_mean(other)
+                "[covariate_model]: unknown form `{other}`{} — expected one of {}",
+                did_you_mean(other),
+                form_list()
             ))
         }
     };
@@ -582,7 +583,7 @@ fn center_argument(
             return Ok(None);
         }
         CovariateForm::Hockey => ("breakpoint", CovariateStat::Median),
-        CovariateForm::Categorical => ("ref", CovariateStat::Mode),
+        CovariateForm::Categorical | CovariateForm::Categorical2 => ("ref", CovariateStat::Mode),
         _ => ("center", CovariateStat::Median),
     };
     for key in ["center", "breakpoint", "ref"] {
@@ -606,8 +607,8 @@ fn check_kind(form: &CovariateForm, decl: &CovariateDecl) -> Result<(), String> 
     }
     match (form.is_categorical(), decl.kind) {
         (true, CovariateKind::Continuous) => Err(format!(
-            "[covariate_model]: `categorical(...)` on `{}`, which [covariates] declares \
-             continuous",
+            "[covariate_model]: `{}(...)` on `{}`, which [covariates] declares continuous",
+            form.label(),
             decl.name
         )),
         (false, CovariateKind::Categorical) => Err(format!(
@@ -708,12 +709,13 @@ fn build_thetas(
         // can never help.
         let levels = levels_of(decl, summary).unwrap_or_default();
         return Err(format!(
-            "[covariate_model]: `{} ~ {} categorical(...)` has nothing to estimate — `{}` has \
+            "[covariate_model]: `{} ~ {} {}(...)` has nothing to estimate — `{}` has \
              {} level{} ({}), and a categorical relation spends one θ per *non-reference* level. \
              Declare the levels the data actually carries (`{} categorical(levels = [...])` in \
              [covariates]), or drop the relation.",
             rel.parameter,
             rel.covariate,
+            rel.form.label(),
             decl.name,
             levels.len(),
             if levels.len() == 1 { "" } else { "s" },
@@ -762,17 +764,27 @@ fn build_thetas(
         return Ok(Vec::new());
     };
     let mut out = match rel.form {
-        CovariateForm::Categorical => {
+        CovariateForm::Categorical | CovariateForm::Categorical2 => {
             let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
+            // The two shapes differ by `θ_cat2 = 1 + θ_cat`, so `categorical2`
+            // takes the *image* of `categorical`'s defaults under exactly that
+            // map: bounds (−1, 5) → (0, 6) — which is what Pharmpy's `cat2`
+            // uses verbatim — and init −0.001 → 0.999, so the two forms start
+            // at the identical model. (Pharmpy's own `cat2` init is 1.01; ferx
+            // already differs on the `cat` init's sign, following PsN.)
+            let (init, lower, upper) = match rel.form {
+                CovariateForm::Categorical2 => (0.999, 0.0, 6.0),
+                // PsN's categorical θ is null at 0 and bounded symmetrically
+                // about it, so the parameterization has no preferred sign.
+                _ => (-0.001, -1.0, 5.0),
+            };
             non_reference_levels(rel, decl, summary)?
                 .into_iter()
                 .map(|level| CovariateTheta {
-                    // PsN's categorical θ is null at 0 and bounded symmetrically
-                    // about it, so the parameterization has no preferred sign.
                     name: format!("{base}_{}", level_suffix(level)),
-                    init: -0.001,
-                    lower: -1.0,
-                    upper: 5.0,
+                    init,
+                    lower,
+                    upper,
                     fixed: false,
                     level: Some(level),
                 })
@@ -897,17 +909,21 @@ fn expected_theta_count(
     Ok(match rel.form {
         CovariateForm::None | CovariateForm::Expr(_) => 0,
         CovariateForm::Hockey => 2,
-        CovariateForm::Categorical => match levels_of(decl, summary) {
-            Some(levels) => levels.len().saturating_sub(1),
-            None => {
-                return Err(format!(
-                    "[covariate_model]: `categorical(...)` on `{}` needs its levels, but \
-                     [covariates] declares none. Write `{} categorical(levels = [0, 1])` for a \
-                     θ vector fixed by the file, or `levels = auto` to read them off the data.",
-                    decl.name, decl.name
-                ))
+        CovariateForm::Categorical | CovariateForm::Categorical2 => {
+            match levels_of(decl, summary) {
+                Some(levels) => levels.len().saturating_sub(1),
+                None => {
+                    return Err(format!(
+                        "[covariate_model]: `{}(...)` on `{}` needs its levels, but [covariates] \
+                         declares none. Write `{} categorical(levels = [0, 1])` for a θ vector \
+                         fixed by the file, or `levels = auto` to read them off the data.",
+                        rel.form.label(),
+                        decl.name,
+                        decl.name
+                    ))
+                }
             }
-        },
+        }
         _ => 1,
     })
 }
@@ -983,7 +999,9 @@ fn theta_declaration(theta: &CovariateTheta) -> String {
 /// The two operators share the *shape* of each form and differ in its null:
 /// the multiplicative template is `1 + …` (or `exp(…)` / `(…)^θ`), whose
 /// neutral value is `1`, and the additive one is the same expression minus that
-/// `1`, so `θ = 0` and a covariate at its centre both contribute `0`. This is
+/// `1`, so a covariate at its centre contributes `0` and so does a θ at the
+/// *form's* null — `0` everywhere except `categorical2`, whose θ is the factor
+/// itself and whose null is `1` (#1312), hence its `θ_k - 1`. This is
 /// where ferx parts company with Pharmpy, which reuses the multiplicative
 /// template verbatim under `+` — see [`CovariateOp`].
 fn relation_effect(rel: &CovariateRelation) -> Option<String> {
@@ -1042,15 +1060,27 @@ fn relation_effect(rel: &CovariateRelation) -> Option<String> {
                 )
             }
         }
-        CovariateForm::Categorical => {
+        CovariateForm::Categorical | CovariateForm::Categorical2 => {
+            // `categorical` reads its θ as an offset from the reference
+            // (`1 + θ_k`), `categorical2` as the factor itself (`θ_k`). Only
+            // the non-reference branch differs.
+            let offset = matches!(rel.form, CovariateForm::Categorical);
             let mut expr = String::from("(");
             for theta in &rel.thetas {
-                let level = fmt(theta.level?);
-                if add {
-                    expr.push_str(&format!("if ({cov} == {level}) {} else ", theta.name));
-                } else {
-                    expr.push_str(&format!("if ({cov} == {level}) 1 + {} else ", theta.name));
-                }
+                // Null-subtraction under `+` is the same one every other
+                // additive template applies, and it is per *form*, not shared:
+                // `categorical`'s multiplicative branch is `1 + θ_k`, so its
+                // additive one is `θ_k`; `categorical2`'s is `θ_k` against a
+                // reference of `1`, so its additive one is `θ_k - 1`. That
+                // keeps `θ_cat2 = 1 + θ_cat` an exact reparameterization under
+                // `+` too — and keeps `cat +` and `cat2 +` from being the same
+                // text, which would make them duplicate search candidates.
+                let body = match (add, offset) {
+                    (false, true) => format!("1 + {}", theta.name),
+                    (false, false) | (true, true) => theta.name.clone(),
+                    (true, false) => format!("{} - 1", theta.name),
+                };
+                expr.push_str(&format!("if ({cov} == {}) {body} else ", fmt(theta.level?)));
             }
             // The reference level, and anything not listed, is the null.
             expr.push_str(if add { "0)" } else { "1)" });
@@ -1402,18 +1432,8 @@ fn join_names(names: &[String]) -> String {
 
 /// A one-edit-away suggestion for a misspelled form name.
 fn did_you_mean(word: &str) -> String {
-    const FORMS: &[&str] = &[
-        "none",
-        "linear",
-        "linear_relative",
-        "exponential",
-        "power",
-        "hockey",
-        "categorical",
-        "expr",
-    ];
     let lower = word.to_lowercase();
-    match FORMS
+    match FORM_SPELLINGS
         .iter()
         .filter(|f| levenshtein(&lower, f) <= 2)
         .min_by_key(|f| levenshtein(&lower, f))
@@ -1421,6 +1441,32 @@ fn did_you_mean(word: &str) -> String {
         Some(best) => format!(" (did you mean `{best}`?)"),
         None => String::new(),
     }
+}
+
+/// Every form the block accepts, in the order the diagnostics list them.
+///
+/// The two "expected one of …" messages and [`did_you_mean`] all read this one
+/// array. They used to carry their own copies, and #1312 added `categorical2`
+/// to two of the three — the missing-form diagnostic kept listing eight forms
+/// and quietly hid the new one from anyone who left the form off. A single list
+/// removes that failure mode rather than fixing one instance of it;
+/// `every_form_the_parser_accepts_is_offered_by_both_diagnostics` pins that it
+/// stays complete.
+const FORM_SPELLINGS: &[&str] = &[
+    "none",
+    "linear",
+    "linear_relative",
+    "exponential",
+    "power",
+    "hockey",
+    "categorical",
+    "categorical2",
+    "expr",
+];
+
+/// `FORM_SPELLINGS` as the diagnostics render it.
+fn form_list() -> String {
+    FORM_SPELLINGS.join(", ")
 }
 
 /// Levenshtein distance, for the did-you-mean above only.

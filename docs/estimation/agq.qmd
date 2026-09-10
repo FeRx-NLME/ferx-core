@@ -354,8 +354,33 @@ alternative costs `2 × n_free` *full population objective* evaluations, each
 re-solving every subject's inner loop. On warfarin that is the difference between
 6.5 s and 0.4 s.
 
-A fully analytic `dH/dθ` would need third derivatives (`∂³nll/∂η²∂θ`); the provider
-stops at `∂²f/∂η∂θ`, so that one order is finite-differenced.
+A fully analytic `dH/dθ` needs third derivatives (`∂³nll/∂η²∂θ`); the provider's
+ordinary second-order call stops at `∂²f/∂η∂θ`, so by default that one order is
+finite-differenced, as described above.
+
+### Analytic instead of finite-difference `dH/dθ`
+
+Both anchors also have an analytic route for that last order, replacing the
+`2 × n_free` perturbed-anchor rebuilds with a fixed number of extra provider calls:
+
+- **`focei`, `n_agq > 1` (Gauss-Newton `H̃`)** — `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` is bilinear
+  in *first*-order sensitivities, so `dH̃/dθ` needs only the mixed second-order
+  blocks (`∂²f/∂η∂θ`, `∂²f/∂η²`) the provider already returns for FOCEI's own
+  `theta_block`/`sigma_block` terms — no third order at all. One extra ordinary
+  sensitivity call replaces the whole FD sweep, at zero call-count-vs-per-call-cost
+  ambiguity. This is the default for this anchor.
+- **`laplace`, `n_agq = 1` (exact `H`)** — needs the full third-order jet, so each
+  analytic evaluation costs materially more than a plain anchor rebuild; whether
+  that is a net win is representation-dependent (diagonal vs block Ω, closed-form
+  vs ODE) and close enough to parity to need re-measuring rather than trusting one
+  past run. This route stays opt-in.
+
+`FERX_AGQ_GRID_RESPONSE` overrides the per-anchor default: `fd` forces the
+finite-difference sweep, `analytic` forces the analytic route, and any other value
+(including an unset-but-misspelled one, e.g. `analytical`) is rejected outright
+rather than silently falling back to the default — a benchmark's "candidate" arm
+that quietly becomes identical to its baseline would otherwise report "no
+difference" instead of an error.
 
 ### Every model gets this gradient — including TTE and categorical
 
