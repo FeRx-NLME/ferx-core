@@ -297,8 +297,12 @@ section of the SDLC for the versioning policy).
   `E_THETA_INIT_OUTSIDE_BOUNDS` before the first objective evaluation. No model
   shipped with ferx is affected — the exact predicate over every `.ferx` in the
   repository finds none — but a model file of your own with a mistyped bound will now
-  be reported instead of quietly fitted from somewhere else. `maxiter = 0` runs are
-  exempt, as for `E_OMEGA_INIT_AT_RAIL`.
+  be reported instead of quietly fitted from somewhere else. The comparison is against
+  the **declared** numbers, so `theta TVCL(-5.0, 0.0, 10.0)` is caught even though the
+  start and the declared lower bound both pack onto ferx's internal `1e-10` floor, and
+  the message names where the fit really begins (`1e-10`, which is neither the declared
+  value nor the declared bound). `maxiter = 0` runs are exempt, as for
+  `E_OMEGA_INIT_AT_RAIL`.
 
 ### Fixed
 - The `{model}.tmp` checkpoint written by a **deterministic** stage (`foce`, `focei`,
@@ -341,9 +345,15 @@ section of the SDLC for the versioning policy).
   `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter whose whole range
   falls below ferx's internal `1e-10` packing floor — both produce an empty optimizer
   box, and the bound clamp panicked on it. ferx now reports
-  `E_THETA_BOUNDS_INVERTED`, naming which of the three causes applies. It is the one
+  `E_INIT_BOUNDS_INVERTED`, naming which of the three causes applies. It is the one
   start-side check with no `maxiter = 0` exemption, because an evaluation-only run
-  clamps the start too.
+  clamps the start too. Only the affected coordinate is silenced, so `ferx check` still
+  reports the rest of the file in the same pass.
+- The `W_INIT_OUTSIDE_BOUNDS` message for a `sigma` now says which scale its numbers are
+  on (#1251). ferx stores σ as a standard deviation and square-roots a plain
+  `sigma X ~ v` declaration, so the quoted number is an SD that need not appear in the
+  model file: `sigma PROP_ERR ~ 1e6` now reads `an SD of 1.000e3` rather than
+  `a value of 1.000e3`.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so

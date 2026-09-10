@@ -166,6 +166,158 @@ fn a_theta_start_strictly_outside_its_declared_range_is_an_error() {
     );
 }
 
+// ── T16 (#1309 review round 2): a declared lower bound of `0` ──────────────
+
+/// Regression: judging the declared question on the **packed** scale, which
+/// `pack_with_bounds` has already made unanswerable.
+///
+/// `pack_params` floors the *value* at `THETA_PACK_FLOOR` and `unpinned_bounds`
+/// floors the *bound* at the same constant, so `theta TVCL(-5.0, 0.0, 10.0)`
+/// arrives with `packed == lower == ln(1e-10)` and the packed comparison sees a
+/// start sitting exactly on its bound. Measured at `9ed38f6c`: **zero**
+/// diagnostics, while the fit begins from `1e-10` — neither the declared `-5`
+/// nor the declared `0`. NM-TRAN rejects `$THETA (0, -5, 10)` with the same
+/// error 24 the message cites.
+///
+/// A declared lower of `0` is not a corner: `theta TVLAG(0.0, 0.0, 12.0)` is
+/// one of T3b's own live fixtures and T3's identity arm is
+/// `theta TVCL(-5.0, -1.0, 10.0)`, so the fixture set was literally one number
+/// away from this case and never crossed the two.
+///
+/// The **premise** is asserted first — that the packed comparison really is
+/// blind here — so this cannot quietly become a test of the packed predicate
+/// if the flooring ever changes.
+///
+/// The differential control is the second arm: `theta TVCL(1e-12, 0.0, 10.0)`
+/// is *inside* its declared range (`1e-12 >= 0`) and must stay silent, even
+/// though it too is moved to `1e-10` by the floor. Without it a predicate that
+/// simply reported every sub-floor θ would pass. (That second move is the
+/// `1e-10` invisibility deferred to #1307 — a different object, and not this
+/// error's.)
+#[test]
+fn a_theta_below_a_declared_lower_bound_of_zero_is_still_an_error() {
+    let params = params_with_theta("theta TVCL(-5.0, 0.0, 10.0)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    // Premise: the packed walk cannot see this, because both sides floor.
+    let start = pack_with_bounds(p);
+    assert_eq!(
+        start.packed[0].to_bits(),
+        start.bounds.lower[0].to_bits(),
+        "premise: value and bound both floor to ln(1e-10), so the packed          comparison is an equality — packed {} vs lower {}",
+        start.packed[0],
+        start.bounds.lower[0],
+    );
+    let kinds = coordinate_kinds(p);
+    assert_eq!(
+        coordinates_outside_bounds(&start, &kinds).count(),
+        0,
+        "premise: nothing is outside the packed box"
+    );
+
+    // …and the declared question is answered anyway.
+    let diags = box_diags(&params);
+    let msg = only_message(&diags);
+    assert_eq!(diags[0].code, "E_THETA_INIT_OUTSIDE_BOUNDS");
+    assert!(diags[0].is_error(), "{msg}");
+    assert!(msg.contains("starts at -5e0"), "{msg}");
+    assert!(
+        msg.contains("below its own declared lower bound of 0e0"),
+        "{msg}"
+    );
+    // The message names where the fit really begins — the floor, not the
+    // declared bound. `1e-10` formats as `1e-10` under `{:e}`.
+    assert!(
+        msg.contains("the fit begins from 1e-10"),
+        "the start is clamped into the packed box, whose lower is the floor and          not the declared 0 — {msg}"
+    );
+
+    // Differential control: inside the declared range, and silent, although the
+    // floor moves it just the same.
+    assert!(
+        box_diags(&params_with_theta("theta TVCL(1e-12, 0.0, 10.0)")).is_empty(),
+        "1e-12 is inside [0, 10]; the floor moving it to 1e-10 is #1307's          object, not this error's"
+    );
+}
+
+/// A **FIX**-ed θ outside its own declared range is not reported, and the
+/// reason is not the reason it holds for every other coordinate.
+///
+/// T5 pins the Ω case, where the exclusion is structural: `pack_with_bounds`
+/// sets `lower == upper == packed[i]`, so a strict inequality against the box
+/// is false by construction and there is deliberately no mask consult to
+/// mutate. `theta_outside_declared_range` never looks at that box — it compares
+/// the declared numbers — so the pin is invisible to it and it needs an
+/// explicit `theta_fixed` consult. Without one this fixture is refused with
+/// `E_THETA_INIT_OUTSIDE_BOUNDS` while the fit would have run at exactly the
+/// declared `0.05`, moving nothing: a false positive on a working model.
+///
+/// The premise is asserted first — the box really is pinned to the declared
+/// value, so nothing is silently moved and there is nothing to report.
+#[test]
+fn a_fixed_theta_outside_its_declared_range_is_left_alone() {
+    let params = params_with_theta("theta TVCL(0.05, 0.1, 10.0, FIX)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    assert!(p.theta_fixed[0], "premise: the declaration is FIX-ed");
+    let start = pack_with_bounds(p);
+    assert_eq!(
+        (
+            start.bounds.lower[0].to_bits(),
+            start.bounds.upper[0].to_bits()
+        ),
+        (start.packed[0].to_bits(), start.packed[0].to_bits()),
+        "premise: the box is pinned to the packed start, so the fit runs at \
+         the declared 0.05 and the clamp moves nothing"
+    );
+
+    assert!(
+        box_diags(&params).is_empty(),
+        "a FIX-ed θ is fitted at its declared value; refusing it would break a \
+         model that works"
+    );
+    // And the un-FIX-ed twin — one token changed — *is* refused, so this test
+    // cannot pass by the check having stopped firing.
+    let free = box_diags(&params_with_theta("theta TVCL(0.05, 0.1, 10.0)"));
+    assert_eq!(free.len(), 1, "{free:#?}");
+    assert_eq!(free[0].code, "E_THETA_INIT_OUTSIDE_BOUNDS");
+}
+
+// ── T17 (#1309 review round 2): the remedy must be representable ───────────
+
+/// Regression: advertising a range ferx cannot pack.
+///
+/// `theta TVCL(0.05, 0.1, 1e12)` used to suggest `inside (1e-1, 1e12)`; obeying
+/// it with `1e10` then trips `W_INIT_OUTSIDE_BOUNDS` for exceeding the hidden
+/// `1e9` cap, so the remedy sent the user from one diagnostic to another. Every
+/// other arm already clamps its advice to `(THETA_PACK_FLOOR, THETA_PACK_CEIL)`.
+///
+/// Asserted as a **straddle**: the same declaration with an upper below the cap
+/// keeps quoting the user's own number, so this cannot go green by the advice
+/// always naming the cap.
+#[test]
+fn the_theta_remedy_never_advertises_a_bound_ferx_cannot_represent() {
+    let capped = box_diags(&params_with_theta("theta TVCL(0.05, 0.1, 1e12)"));
+    let suggestion = capped[0]
+        .suggestion
+        .clone()
+        .unwrap_or_else(|| panic!("the error carries a remedy: {capped:#?}"));
+    assert!(
+        suggestion.contains("inside (1e-1, 1e9)"),
+        "the advice must be the intersection of the declared range with what          the packer can represent — {suggestion}"
+    );
+
+    // Straddle: an upper *below* the cap is quoted verbatim.
+    let uncapped = box_diags(&params_with_theta("theta TVCL(0.05, 0.1, 1e8)"));
+    let suggestion = uncapped[0].suggestion.clone().unwrap();
+    assert!(
+        suggestion.contains("inside (1e-1, 1e8)"),
+        "a declared upper the packer can represent is the user's own number —          {suggestion}"
+    );
+}
+
 // ── T3b: exactly on a bound is left alone, and the test says why ────────────
 
 /// Regression: an inclusive (`<=` / `>=`) rule. NM-TRAN rejects `init == bound`
@@ -317,9 +469,20 @@ fn a_fixed_omega_start_is_never_out_of_box_because_the_box_is_pinned_to_it() {
 /// pins "the fit is not refused" without running one.
 #[test]
 fn a_sigma_start_outside_either_rail_is_a_warning_that_does_not_refuse_the_fit() {
-    for line in [
-        "sigma PROP_ERR ~ 0.0 (sd)", // packs to ln(1e-10) = -23.03, below -8
-        "sigma PROP_ERR ~ 1e6 (sd)", // packs to +13.8, above +5
+    // Four arms, and the last two are the point: `(sd)` keeps the declared
+    // number, a plain `sigma X ~ v` declares the **variance** and
+    // `model_parser` square-roots it, so the number the message quotes is an
+    // SD that appears nowhere in the model file. `~ 1e6` reports `1.000e3`.
+    // Round 1's review fixed exactly this trap on the `block_omega` arm (L vs
+    // L²); Σ was the one arm that kept a scale-free noun (#1309 review).
+    for (line, quoted) in [
+        // packs to ln(1e-10) = -23.03, below -8
+        ("sigma PROP_ERR ~ 0.0 (sd)", "an SD of 1.000e-10"),
+        // packs to +13.8, above +5
+        ("sigma PROP_ERR ~ 1e6 (sd)", "an SD of 1.000e6"),
+        // the plain spelling: sqrt(1e6) = 1e3, and sqrt(1e-9) = 3.162e-5
+        ("sigma PROP_ERR ~ 1e6", "an SD of 1.000e3"),
+        ("sigma PROP_ERR ~ 1e-9", "an SD of 3.162e-5"),
     ] {
         let diags = box_diags(&params_with_sigma(line));
         let msg = only_message(&diags);
@@ -329,14 +492,26 @@ fn a_sigma_start_outside_either_rail_is_a_warning_that_does_not_refuse_the_fit()
         );
         assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
         assert!(msg.contains("PROP_ERR"), "{msg}");
+        // The number itself, so a change of scale or of format reddens this.
+        // Nothing anywhere read this arm's number before (#1309 review
+        // finding 3): `hit.packed.exp()` → `hit.packed` was a silent
+        // regression across the whole corpus.
+        assert!(msg.contains(quoted), "{line}: must quote {quoted} — {msg}");
+        // …and say which scale it is on, since the plain spelling's declared
+        // number is a variance.
+        assert!(
+            msg.contains("SD rail of"),
+            "{line}: the rail is an SD too, and must say so — {msg}"
+        );
         // The remedy quotes the interval `unpinned_bounds` actually pushed.
         // Before #1309's review it carried its own `(-8.0).exp()` / `5.0.exp()`
         // literals, so moving the rail would have left the message naming the
         // old one with nothing to catch it: these are `SIGMA_PACK_LOWER` and
         // `SIGMA_PACK_UPPER` read back, at three digits.
         assert!(
-            msg.contains("inside (3.355e-4, 1.484e2)"),
-            "{line}: the remedy must quote the rails the box uses — {msg}"
+            msg.contains("at an SD inside (3.355e-4, 1.484e2)"),
+            "{line}: the remedy must quote the rails the box uses, on the scale \
+             they are on — {msg}"
         );
         assert!(
             crate::diagnostics::first_error(&diags).is_ok(),
@@ -386,10 +561,16 @@ fn the_eval_only_exemption_is_a_straddle_not_a_blanket_silence() {
 /// Regression: a whole coordinate kind + side falling between the two checks,
 /// or being claimed by both.
 ///
-/// Asserted as **sets of `(index, side)`** over a template carrying an
-/// out-of-box coordinate of every reachable kind and side at once — not as
-/// `diags.len() == 1` on a single-coordinate fixture, which stays green when a
-/// kind moves from one consumer to the other.
+/// Asserted as **sets of `(index, side)`** — not as `diags.len() == 1` on a
+/// single-coordinate fixture, which stays green when a kind moves from one
+/// consumer to the other.
+///
+/// The property asserted is generic over the kinds, but the fixture is **not
+/// exhaustive over them** and must not be read as though it were: it carries
+/// θ-Below-declared, Ω-diagonal-Below, Ω-diagonal-Above and Σ-Below. Absent are
+/// the Ω off-diagonal (T13), a `block_omega` diagonal (T14), Σ-Above, the θ
+/// internal cap (T4), Ω_IOV and both mixture segments. Widening this fixture is
+/// welcome; believing it already covers them is what to avoid (#1309 review).
 ///
 /// The two claims must be **disjoint** (nothing double-reported) and together
 /// **exhaustive** (nothing dropped) over `coordinates_outside_bounds`.
@@ -426,10 +607,12 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
         .map(|h| (h.index, h.side))
         .collect();
     // Four kinds+sides, or the fixture has stopped exercising the partition.
+    // Four of the nine reachable combinations, not all of them — see the doc
+    // comment.
     assert_eq!(
         all.len(),
         4,
-        "fixture must carry every reachable kind and side: {all:?}"
+        "fixture must carry the four kinds and sides it is built for: {all:?}"
     );
 
     // What #1229 claims: `packed <= lower` on the Ω / Ω_IOV / mixture-Ω
@@ -492,75 +675,140 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// the box while another drifted in — this fails on the *identity* of the
 /// coordinate, so either direction reddens.
 ///
-/// The ten entries below are all `OmegaDiagonal` / `Below`, i.e. all already in
-/// #1229's scope: eight simulate-only adaptive-dosing models declaring
-/// `omega ~ 1e-10`, and two `reset_init_snapshot_*` anchors declaring `~ 0.0`.
+/// The eleven entries below are all `OmegaDiagonal` / `Below`, i.e. all already
+/// in #1229's scope: eight simulate-only adaptive-dosing models declaring
+/// `omega ~ 1e-10`, two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
+/// `tests/fixtures/iov_scaling.ferx` declaring `kappa KAPPA_V ~ 0.000001`.
 /// **Zero** θ, Σ, off-diagonal or upper-rail hits — which is what makes this
 /// change safe for everything shipped.
+///
+/// The walk is over the **whole tree**, not `examples/` + `nonmem_anchor/`.
+/// Round 1's review verified the wider scope by hand and the committed test did
+/// not inherit it: `.ferx` files also live in `tests/fixtures/`, `tests/nonmem/`,
+/// `tests/reference/` and `tools/`, and `tests/fixtures/` is where the next
+/// fixture lands. The eleventh entry is exactly what the narrower sweep missed
+/// (#1309 review).
+///
+/// Both start-side predicates are ratcheted here, not just the out-of-box one.
+/// `coordinates_with_inverted_bounds` is the newest arm, it is an **error**, and
+/// it is the one arm with no `maxiter = 0` exemption — so it refuses a model in
+/// strictly more situations than anything else in this file, and it shipped with
+/// no corpus guard at all. The corpus carries **zero** inverted boxes; this is
+/// what keeps that true.
 #[test]
-fn no_shipped_model_file_starts_outside_its_box_except_the_known_ten() {
+fn no_shipped_model_file_starts_outside_its_box_except_the_known_eleven() {
     let allowed: std::collections::BTreeSet<&str> = [
-        "adaptive_platelet_ladder.ferx::ETA_CL",
-        "adaptive_vanco_auc.ferx::ETA_CL",
-        "adaptive_vanco_iov.ferx::ETA_CL",
-        "adaptive_vanco_iov_loading.ferx::ETA_CL",
-        "adaptive_vanco_loading.ferx::ETA_CL",
-        "adaptive_vanco_renal.ferx::ETA_CL",
-        "adaptive_vanco_renal_iov.ferx::ETA_CL",
-        "adaptive_vanco_renal_loading.ferx::ETA_CL",
-        "reset_init_snapshot_fit.ferx::ETA_CL",
-        "reset_init_snapshot_occ.ferx::ETA_CL",
+        "examples/adaptive_platelet_ladder.ferx::ETA_CL",
+        "examples/adaptive_vanco_auc.ferx::ETA_CL",
+        "examples/adaptive_vanco_iov.ferx::ETA_CL",
+        "examples/adaptive_vanco_iov_loading.ferx::ETA_CL",
+        "examples/adaptive_vanco_loading.ferx::ETA_CL",
+        "examples/adaptive_vanco_renal.ferx::ETA_CL",
+        "examples/adaptive_vanco_renal_iov.ferx::ETA_CL",
+        "examples/adaptive_vanco_renal_loading.ferx::ETA_CL",
+        "nonmem_anchor/reset_init_snapshot_fit.ferx::ETA_CL",
+        "nonmem_anchor/reset_init_snapshot_occ.ferx::ETA_CL",
+        "tests/fixtures/iov_scaling.ferx::KAPPA_V",
     ]
     .into_iter()
     .collect();
 
-    let mut found = std::collections::BTreeSet::new();
-    let mut parsed_files = 0usize;
-    for dir in ["examples", "nonmem_anchor"] {
+    // Every `.ferx` in the repository, `target/` and the git plumbing aside.
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+            return;
         };
         for e in entries.flatten() {
             let path = e.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("ferx") {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // A file this build cannot parse (a feature-gated block) is not
-            // evidence either way; the count below keeps that from silently
-            // becoming "no files were checked".
-            let Ok(model) = crate::parser::model_parser::parse_model_string(&src) else {
-                continue;
-            };
-            parsed_files += 1;
-            let p = &model.default_params;
-            let start = pack_with_bounds(p);
-            let kinds = coordinate_kinds(p);
-            let names = crate::estimation::parameterization::coordinate_names(p);
-            let file = path.file_name().unwrap().to_string_lossy().to_string();
-            for hit in coordinates_outside_bounds(&start, &kinds) {
-                assert_eq!(
-                    (hit.kind, hit.side),
-                    (PackedCoordKind::OmegaDiagonal, BoxSide::Below),
-                    "{file}: a shipped model may only be out of box on the \
-                     variance rail #1229 already owns, got {:?} {:?} on {}",
-                    hit.kind,
-                    hit.side,
-                    names[hit.index],
-                );
-                found.insert(format!("{file}::{}", names[hit.index]));
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if path.is_dir() {
+                // `target/` holds build output, `.claude/worktrees/` holds
+                // whole other checkouts of this repo — neither is this tree.
+                if matches!(name.as_str(), "target" | ".git" | ".claude" | "_site") {
+                    continue;
+                }
+                collect(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("ferx") {
+                out.push(path);
             }
         }
+    }
+    let mut files = Vec::new();
+    collect(std::path::Path::new("."), &mut files);
+    files.sort();
+
+    let mut found = std::collections::BTreeSet::new();
+    let mut inverted = Vec::new();
+    let mut declared = Vec::new();
+    let mut parsed_files = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // A file this build cannot parse (a feature-gated block) is not
+        // evidence either way; the count below keeps that from silently
+        // becoming "no files were checked".
+        let Ok(model) = crate::parser::model_parser::parse_model_string(&src) else {
+            continue;
+        };
+        parsed_files += 1;
+        let p = &model.default_params;
+        let start = pack_with_bounds(p);
+        let kinds = coordinate_kinds(p);
+        let names = crate::estimation::parameterization::coordinate_names(p);
+        let file = path
+            .strip_prefix("./")
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        for hit in coordinates_outside_bounds(&start, &kinds) {
+            assert_eq!(
+                (hit.kind, hit.side),
+                (PackedCoordKind::OmegaDiagonal, BoxSide::Below),
+                "{file}: a shipped model may only be out of box on the \
+                 variance rail #1229 already owns, got {:?} {:?} on {}",
+                hit.kind,
+                hit.side,
+                names[hit.index],
+            );
+            found.insert(format!("{file}::{}", names[hit.index]));
+        }
+        for hit in
+            crate::estimation::parameterization::coordinates_with_inverted_bounds(&start, &kinds)
+        {
+            inverted.push(format!("{file}::{}", names[hit.index]));
+        }
+        // The declared-scale θ predicate is strictly stronger than the packed
+        // one on the declared sides (#1309 review finding 1), so it gets its
+        // own row rather than riding on the sweep above: a shipped θ outside
+        // its declaration would be an *error* at fit time.
+        declared.extend(
+            crate::estimation::parameterization::theta_outside_declared_range(p)
+                .map(|hit| format!("{file}::{} starts at {:e}", names[hit.index], hit.value)),
+        );
     }
 
     // Guard against the walk finding nothing because the paths moved: this is a
     // positive count, so an empty sweep fails rather than passing vacuously.
+    // 154 parsed at the time of writing, over 176 found.
     assert!(
-        parsed_files >= 100,
+        parsed_files >= 150,
         "expected the shipped model corpus, parsed only {parsed_files} files — \
          has the working directory or the layout changed?"
+    );
+    assert!(
+        inverted.is_empty(),
+        "no shipped model may have an empty optimizer box — \
+         `E_INIT_BOUNDS_INVERTED` refuses these even at `maxiter = 0`: {inverted:?}"
+    );
+    assert!(
+        declared.is_empty(),
+        "no shipped model may start a theta outside its declared range — \
+         `E_THETA_INIT_OUTSIDE_BOUNDS` refuses these: {declared:?}"
     );
     let found_refs: std::collections::BTreeSet<&str> = found.iter().map(String::as_str).collect();
     assert_eq!(
@@ -611,7 +859,7 @@ fn a_theta_whose_packed_box_is_empty_is_an_error_not_a_panic() {
 
         let diags = check_packed_start_in_box(p, &FitOptions::default());
         let msg = only_message(&diags);
-        assert_eq!(diags[0].code, "E_THETA_BOUNDS_INVERTED");
+        assert_eq!(diags[0].code, "E_INIT_BOUNDS_INVERTED");
         assert!(diags[0].is_error(), "{line}: {msg}");
         assert!(msg.contains("TVCL"), "{line}: {msg}");
         assert!(msg.contains("empty optimizer box"), "{line}: {msg}");
@@ -653,7 +901,7 @@ fn the_empty_box_error_survives_the_eval_only_exemption() {
     let empty = model_with_parameters(&params_with_theta("theta TVCL(1.0, 5.0, 2.0)"));
     let d = check_packed_start_in_box(&empty.default_params, &eval_only);
     assert_eq!(d.len(), 1, "an empty box is reported even at maxiter = 0");
-    assert_eq!(d[0].code, "E_THETA_BOUNDS_INVERTED");
+    assert_eq!(d[0].code, "E_INIT_BOUNDS_INVERTED");
 
     // The other side of the straddle: a merely out-of-box start on the same
     // model shape stays exempt, so this test pins the *difference* rather than
@@ -796,4 +1044,107 @@ fn a_block_omega_diagonal_is_reported_as_a_cholesky_diagonal_not_a_variance() {
         dmsg.contains("rail of 1.628e5"),
         "the rail, at three digits: {dmsg}"
     );
+}
+
+// ── T18 (#1309 review round 2): an empty box silences one coordinate ───────
+
+/// Regression: `if !diags.is_empty() { return diags; }` — one inverted box
+/// suppressing every verdict on every *other* coordinate in the file.
+///
+/// The comment justifying the early return read "an empty box makes every other
+/// verdict on **that coordinate** meaningless", which is true and is narrower
+/// than what the code did. `fit()` stops at the first error either way, so the
+/// loss was entirely in `ferx check`, whose job is to report a whole model in
+/// one pass: a file with a swapped `TVCL` bound *and* an `omega ~ 1e8` reported
+/// only the first.
+///
+/// Asserted as a **pair**: the same `omega ~ 1e8` with and without the inverted
+/// θ beside it. Without the second half a fix that simply stopped reporting the
+/// inverted box would pass.
+#[test]
+fn an_empty_box_silences_its_own_coordinate_and_no_other() {
+    let both = box_diags(
+        "  theta TVCL(1.0, 5.0, 2.0)\n\
+         \x20 theta TVV(50.0, 0.1, 500.0)\n\
+         \x20 omega ETA_CL ~ 1e8\n\
+         \x20 omega ETA_V ~ 0.09\n\
+         \x20 sigma PROP_ERR ~ 0.04 (sd)\n",
+    );
+    let codes: Vec<&str> = both.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(
+        codes,
+        ["E_INIT_BOUNDS_INVERTED", "W_INIT_OUTSIDE_BOUNDS"],
+        "both coordinates must be reported in one pass: {both:#?}"
+    );
+    assert!(both[0].message.contains("TVCL"), "{:?}", both[0].message);
+    assert!(both[1].message.contains("ETA_CL"), "{:?}", both[1].message);
+    // The inverted coordinate itself gets exactly one verdict — `packed < lower`
+    // and `packed > upper` are both true on an empty box, so the second walk
+    // must not pile on.
+    assert!(
+        !both[1].message.contains("TVCL"),
+        "the inverted coordinate is claimed once: {:?}",
+        both[1].message
+    );
+
+    // The control: the same Ω on a model whose θ is fine. Identical verdict, so
+    // the pair above is measuring the suppression and not the Ω arm.
+    let omega_only = box_diags(
+        "  theta TVCL(5.0, 0.1, 10.0)\n\
+         \x20 theta TVV(50.0, 0.1, 500.0)\n\
+         \x20 omega ETA_CL ~ 1e8\n\
+         \x20 omega ETA_V ~ 0.09\n\
+         \x20 sigma PROP_ERR ~ 0.04 (sd)\n",
+    );
+    assert_eq!(omega_only.len(), 1, "{omega_only:#?}");
+    assert_eq!(omega_only[0].message, both[1].message);
+}
+
+/// A θ whose box is empty is claimed by the empty-box arm **only** — the
+/// declared-range walk must not report it a second time.
+///
+/// `theta TVCL(1.0, 5.0, 2.0)` has `1.0 < 5.0`, so
+/// `theta_outside_declared_range` fires on it in isolation; what keeps the user
+/// from seeing two contradictory messages about one declaration is the
+/// `inverted` consult, and this is the assertion that consult can fail.
+#[test]
+fn an_inverted_theta_is_not_also_reported_against_its_declared_range() {
+    let params = params_with_theta("theta TVCL(1.0, 5.0, 2.0)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    // Premise: the declared-range walk *does* claim this coordinate on its own.
+    assert_eq!(
+        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
+        1,
+        "premise: 1.0 is below the declared lower of 5.0, so the walk fires \
+         and the `inverted` consult is what suppresses it"
+    );
+    let diags = box_diags(&params);
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    assert_eq!(diags[0].code, "E_INIT_BOUNDS_INVERTED");
+}
+
+// ── T19 (#1309 review round 2): the clamp's precondition ───────────────────
+
+/// Regression: `clamp_to_bounds` silently accepting an empty box in debug.
+///
+/// `f64::clamp` panics on `min > max` deep inside `core::num`, with a message
+/// that names neither the coordinate nor the guarantor. Every call site is
+/// downstream of `fit_inner` today, so the panic is unreachable — but that is a
+/// property of the call graph, not of the function, and a future producer of a
+/// *narrowed* box reopens it. The `debug_assert!` names
+/// `check_packed_start_in_box` so such a caller learns where the invariant
+/// comes from.
+///
+/// Tests run in debug, so the assertion is live here.
+#[test]
+#[should_panic(expected = "E_INIT_BOUNDS_INVERTED")]
+fn clamping_into_an_empty_box_names_its_guarantor() {
+    let bounds = crate::estimation::parameterization::PackedBounds {
+        lower: vec![5.0],
+        upper: vec![2.0],
+    };
+    let mut x = [3.0];
+    crate::estimation::parameterization::clamp_to_bounds(&mut x, &bounds);
 }

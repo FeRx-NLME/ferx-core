@@ -1291,7 +1291,7 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
         let d = report
             .diagnostics
             .iter()
-            .find(|d| d.code == "E_THETA_BOUNDS_INVERTED")
+            .find(|d| d.code == "E_INIT_BOUNDS_INVERTED")
             .unwrap_or_else(|| panic!("{tag}: code absent: {:?}", report.diagnostics));
         assert!(d.message.contains(cause), "{tag}: {}", d.message);
         assert_eq!(
@@ -1314,7 +1314,7 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
         !ok_report
             .diagnostics
             .iter()
-            .any(|d| d.code == "E_THETA_BOUNDS_INVERTED"),
+            .any(|d| d.code == "E_INIT_BOUNDS_INVERTED"),
         "an upper bound above the 1e-10 floor leaves a representable box: {:?}",
         ok_report.diagnostics
     );

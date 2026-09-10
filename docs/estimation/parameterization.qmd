@@ -146,11 +146,29 @@ at `1e-10` and the box floors the bound at `1e-10`, so a start below it compares
 *equal* and nothing has been moved relative to the box. A declared range that
 lies entirely below the floor is a different matter — see below.
 
+That flooring is also why the **declared** verdict is not decided on the packed
+scale. `theta TVCL(-5.0, 0.0, 10.0)` packs the start and its declared lower onto
+the same $\ln(10^{-10}) = -23.0259$, so a packed comparison would see a start
+sitting exactly on its bound and say nothing — while the fit actually begins
+from $10^{-10}$, which is neither the declared $-5$ nor the declared $0$. A
+declared lower bound of `0` is the idiomatic spelling for a positive parameter
+(`theta TVLAG(0.0, 0.0, 12.0)` ships in this repo), so the shape most likely to
+carry the mistake was the one shape the packed predicate could not see.
+`E_THETA_INIT_OUTSIDE_BOUNDS` therefore compares `theta[i]` against
+`theta_lower[i]` / `theta_upper[i]` directly, on the natural scale, and reports
+where the fit really starts. The internal guards keep the packed comparison,
+which is the only scale on which they exist. Over every `.ferx` file in this
+repository the two predicates give the same answer — zero out-of-box thetas —
+so the stronger one costs nothing.
+
 #### When the box is empty
 
 A packed box can come out **empty** — `lower > upper` — and then there is no
-side to be outside of. That is `E_THETA_BOUNDS_INVERTED`, an error, with three
-causes:
+side to be outside of. That is `E_INIT_BOUNDS_INVERTED`, an error, with three
+causes. The code is not Theta-specific even though only a `theta` can reach it
+through the parser: every other segment's bounds are compile-time constants, and
+a FIX pin is `lower == upper`, which is equal rather than inverted. The three
+causes are:
 
 - the declared bounds are swapped, `theta TVCL(1.0, 5.0, 2.0)`;
 - the declared range lies entirely **above** the `1e9` cap, which the box
@@ -167,7 +185,9 @@ is not clamped at all — `clamp_to_bounds()` cannot clamp into an interval that
 does not exist — and an evaluation-only run clamps too, so exempting it would
 leave the aborting case unreported. The remedy is to rescale the parameter (fit
 it in different units, or factor out a constant) so its range lands inside
-$(10^{-10}, 10^{9})$.
+$(10^{-10}, 10^{9})$. Only the affected coordinate is silenced by it: the rest
+of the file is still walked, so `ferx check` reports a swapped `TVCL` bound and
+an `omega ~ 1e8` in the same pass.
 
 Three things the comparison deliberately does not do:
 
