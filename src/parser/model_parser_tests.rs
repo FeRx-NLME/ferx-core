@@ -8341,7 +8341,8 @@ fn test_ode_block_supports_if_statements() {
     let ode = parsed.model.ode_spec.as_ref().expect("ode_spec present");
     // States are [depot, central]; params are [CL, V] (declaration order in
     // [individual_parameters]). du must match n_states.
-    let params = vec![2.0, 10.0];
+    let mut params = vec![f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    params[..2].copy_from_slice(&[2.0, 10.0]);
 
     // central > 0 → if-branch fires, du[central] = -CL/V * central
     let u_pos = vec![0.0, 5.0];
