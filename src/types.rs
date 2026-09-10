@@ -1492,10 +1492,19 @@ impl CovariateDecl {
 /// | 5 `power` | [`CovariateForm::Power`] |
 /// | arbitrary `[code]` | [`CovariateForm::Expr`] |
 ///
-/// [`CovariateForm::LinearRelative`] has no PsN state number: it is an exact
-/// reparameterization of `Linear` (`θ_rel = c·θ_abs`) that makes θ
-/// dimensionless, so the two give the same OFV on the same data and differ only
-/// in the scale θ and its SE are reported on.
+/// [`CovariateForm::LinearRelative`] and [`CovariateForm::Categorical2`] have
+/// no PsN state number: each is an exact reparameterization of the state above
+/// it — `θ_rel = c·θ_abs` for the former, `θ_cat2 = 1 + θ_cat` for the latter —
+/// so the pair gives the same OFV on the same data and differs only in the
+/// scale θ and its SE are reported on. `Categorical2` is Pharmpy MFL's `cat2`.
+/// `#[non_exhaustive]`: adding a variant to a public enum breaks any downstream
+/// exhaustive `match`, which is what made #1312's `Categorical2` a breaking
+/// change rather than an additive one. Level grouping (`groups = [[1,2],[3,4]]`,
+/// the out-of-scope note on that issue) is the next variant, so the attribute
+/// goes in with the release that already breaks — from here on a new form is
+/// genuinely additive. Variants stay constructible; only downstream exhaustive
+/// matching is forbidden, so a caller writes a `_` arm.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CovariateForm {
@@ -1516,6 +1525,12 @@ pub enum CovariateForm {
     Hockey,
     /// `1 + θ_k` at each non-reference level, `1` at the reference level.
     Categorical,
+    /// `θ_k` at each non-reference level, `1` at the reference level — Pharmpy
+    /// MFL's `cat2`. Same degrees of freedom as [`CovariateForm::Categorical`]
+    /// (one θ per non-reference level) and an exact reparameterization of it
+    /// (`θ_cat2 = 1 + θ_cat`); what moves is the **null**, from `θ = 0` to
+    /// `θ = 1`, and with it the reading of `fix = v`.
+    Categorical2,
     /// Verbatim ferx expression, the equivalent of PsN's `[code]` escape hatch.
     /// The string is the expression source with the surrounding quotes removed.
     Expr(String),
@@ -1532,6 +1547,7 @@ impl CovariateForm {
             CovariateForm::Power => "power",
             CovariateForm::Hockey => "hockey",
             CovariateForm::Categorical => "categorical",
+            CovariateForm::Categorical2 => "categorical2",
             CovariateForm::Expr(_) => "expr",
         }
     }
@@ -1542,7 +1558,67 @@ impl CovariateForm {
     /// rather than silently producing a factor keyed on a level that does not
     /// exist.
     pub fn is_categorical(&self) -> bool {
-        matches!(self, CovariateForm::Categorical)
+        matches!(
+            self,
+            CovariateForm::Categorical | CovariateForm::Categorical2
+        )
+    }
+}
+
+/// How a relation's effect combines with the parameter it acts on (#1313).
+///
+/// The default, and everything the block could express before, is
+/// [`CovariateOp::Multiply`]: the effect is a factor on a top-level product.
+/// [`CovariateOp::Add`] makes it a term added to the parameter instead —
+/// `CL = TVCL * exp(ETA_CL) + θ·(WT − 70)`, the MFL `COVARIATE(CL, WT, lin, +)`
+/// operator.
+///
+/// # ferx's additive effect is null-at-zero; Pharmpy's is not
+///
+/// Pharmpy reuses the *multiplicative* template under `+`, so its additive
+/// linear effect adds `1 + θ·(WT − median)`: a covariate sitting at its centre
+/// adds `1` to the parameter, and `θ = 0` is not "no effect". ferx drops that
+/// leading `1` — `θ·(COV − c)` for `linear`, `exp(θ·(COV − c)) − 1` for
+/// `exponential`, `(COV/c)^θ − 1` for `power`, `θ_k` per non-reference level
+/// for `categorical` — so that θ = 0, a covariate at its centre and a *missing*
+/// covariate all mean the same thing: no effect. The units work out too, which
+/// they do not when a dimensionless `1` is added to a clearance.
+///
+/// The cost is that a model translated from Pharmpy with `+` does **not**
+/// round-trip to the same equations; the two differ by a constant `1` on the
+/// parameter. The MFL coverage check says so out loud rather than translating
+/// silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CovariateOp {
+    /// `param * effect` — a factor on a top-level product, and the default.
+    #[default]
+    Multiply,
+    /// `param + effect` — a term added to the parameter, null at `θ = 0`.
+    Add,
+}
+
+impl CovariateOp {
+    /// The spelling used in the `[covariate_model]` block and in output: `*`
+    /// or `+`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CovariateOp::Multiply => "*",
+            CovariateOp::Add => "+",
+        }
+    }
+
+    /// The value a relation contributes for a subject whose covariate is
+    /// missing: `1` for a factor, `0` for an added term.
+    ///
+    /// Sharing one neutral element across both operators is the bug this
+    /// method exists to prevent — a missing covariate under `+` would
+    /// otherwise silently add `1` to the parameter.
+    pub fn neutral(&self) -> f64 {
+        match self {
+            CovariateOp::Multiply => 1.0,
+            CovariateOp::Add => 0.0,
+        }
     }
 }
 
@@ -1614,11 +1690,16 @@ pub struct CovariateTheta {
 /// dropping one is a pure line insert/delete.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CovariateRelation {
-    /// The `[individual_parameters]` name the factor multiplies into, e.g. `CL`.
+    /// The `[individual_parameters]` name the effect acts on, e.g. `CL`.
     pub parameter: String,
     /// The `[covariates]` column, e.g. `WT`.
     pub covariate: String,
     pub form: CovariateForm,
+    /// How the effect combines with the parameter — a factor (`*`, the
+    /// default and the spelling every relation had before #1313) or an added
+    /// term (`+`). Written as a trailing token on the block line.
+    #[serde(default)]
+    pub op: CovariateOp,
     /// `center = …` / `breakpoint = …` / `ref = …`, as written. `None` for
     /// `none` and `expr(...)`, which take no constant.
     pub center: Option<CovariateStat>,

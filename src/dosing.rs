@@ -830,6 +830,27 @@ pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && lag > 0.0
 }
 
+/// Whether this seeded steady-state dose is the **bolus** case the dual event walk
+/// serves analytically (#1311) — the subset of [`ss_seeded_at_record`] with no
+/// previous-cycle infusion rate still running across the record.
+///
+/// Spelled once, deliberately. `sens::propagate`'s dual walk reads it twice per dose —
+/// at the `DoseRecord`, to seed the periodic state at phase [`ss_seed_phase`], and again
+/// at the `Dose`, to *suppress* the arrival-time re-equilibration that would otherwise
+/// discard what the walk just propagated. Two differently-spelled copies that drifted
+/// would make the walk either seed and then throw the seed away, or never load a state
+/// at all; neither is a compile error and both are wrong in *value*.
+///
+/// `rate <= 0.0` is the bolus half, and it nests inside the FD decline that
+/// `sens::provider::ss_lagtime_walk_unsupported` applies with
+/// [`DoseEvent::is_infusion`]: `{rate > 0} ⊆ {is_infusion}`, and a
+/// `rate <= 0 ∧ is_infusion` dose (a modeled-duration window) is declined to FD upstream,
+/// so the walk is never handed one. That containment is what makes this predicate the
+/// bolus test rather than merely a rate test — assert it, do not re-derive it.
+pub(crate) fn ss_bolus_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
+    dose.rate <= 0.0 && ss_seeded_at_record(dose, lag)
+}
+
 /// Cycle phase the dose **record** sits at, for a steady-state dose seeded there.
 ///
 /// The pulse preceding the record landed at `dose.time − ss_seed_phase(…)`, so a

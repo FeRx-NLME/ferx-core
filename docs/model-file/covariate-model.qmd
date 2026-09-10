@@ -51,7 +51,7 @@ writing it classically. Both are first-class.
 ## Grammar
 
 ```
-PARAM ~ COV form(kwargs) [=> THETA_NAME(init, lower, upper)[, ...]]
+PARAM ~ COV form(kwargs) [*|+] [=> THETA_NAME(init, lower, upper)[, ...]]
 ```
 
 - `PARAM` — a top-level `[individual_parameters]` name.
@@ -60,11 +60,18 @@ PARAM ~ COV form(kwargs) [=> THETA_NAME(init, lower, upper)[, ...]]
   anyway, **the declaration is required here**: the form and the levels are read
   off it, so guessing would make the generated θ vector depend on the dataset.
 - `=> …` — optional. Left out, the θ is named `THETA_<PARAM>_<COV>` (with
-  `_LO`/`_HI` for `hockey` and `_<LEVEL>` for `categorical`) and takes the
+  `_LO`/`_HI` for `hockey` and `_<LEVEL>` for both categorical forms) and takes the
   form's default init and bounds. A `theta` of that name already declared in
   `[parameters]` takes precedence and is used as declared.
+- `*` / `+` — optional, and the **last token before any `=>` clause**. `*` is
+  the default: the effect is a factor on the parameter. `+` makes it a term
+  added to the parameter instead — see
+  [Multiplicative and additive effects](#multiplicative-and-additive-effects).
 
-`fix = v` on any form pins the θ at `v` and declares it `FIX`.
+`fix = v` on any form pins the θ at `v` and declares it `FIX`. It pins the θ as
+written, and does not reinterpret it per form: the no-effect value is `fix = 0`
+for every form whose θ is an offset, and `fix = 1` for `categorical2`, whose θ
+*is* the factor.
 
 ## Forms
 
@@ -77,10 +84,79 @@ PARAM ~ COV form(kwargs) [=> THETA_NAME(init, lower, upper)[, ...]]
 | `power(center=c)` | `(COV/c)^θ` | the classical allometric factor |
 | `hockey(breakpoint=b)` | `1 + θ_lo·(COV − b)` below `b`, `1 + θ_hi·(COV − b)` above | **two** θ |
 | `categorical(ref=r)` | `1 + θ_k` at each non-reference level, `1` at `r` | one θ per non-reference level |
+| `categorical2(ref=r)` | `θ_k` at each non-reference level, `1` at `r` | same θ count; θ is the factor itself, null at **1** |
 | `expr("…")` | verbatim | escape hatch |
 
 `none` exists so a search can record "tested, rejected" in the file and have the
 generated model round-trip through the parser unchanged.
+
+## Multiplicative and additive effects
+
+The table above is the **multiplicative** form of each relation, which is the
+default and everything the block could express before. A trailing `+` makes the
+relation a term added to the parameter instead:
+
+```
+[covariate_model]
+  CL ~ WT linear(center = 70) +
+  →  CL = TVCL * exp(ETA_CL) + (if (present(WT)) (THETA_CL_WT * (WT - 70)) else 0.0)
+```
+
+The additive form of each relation is the multiplicative one **minus its
+leading `1`**, so that θ = 0 means no effect:
+
+| form | factor (`*`) | term (`+`) |
+|---|---|---|
+| `linear(center=c)` | `1 + θ·(COV − c)` | `θ·(COV − c)` |
+| `linear_relative(center=c)` | `1 + θ·(COV/c − 1)` | `θ·(COV/c − 1)` |
+| `exponential(center=c)` | `exp(θ·(COV − c))` | `exp(θ·(COV − c)) − 1` |
+| `power(center=c)` | `(COV/c)^θ` | `(COV/c)^θ − 1` |
+| `hockey(breakpoint=b)` | `1 + θ_lo/θ_hi·(COV − b)` | `θ_lo/θ_hi·(COV − b)` |
+| `categorical(ref=r)` | `1 + θ_k`, `1` at `r` | `θ_k`, `0` at `r` |
+| `expr("…")` | verbatim | verbatim (the operator says how it combines, it does not rewrite it) |
+
+Three things therefore mean the same thing under `+` — θ = 0, a covariate
+sitting exactly at its centre, and a covariate that is **missing** — and all
+three contribute nothing. The units work out too: `θ·(WT − 70)` is a clearance,
+where a dimensionless `1` added to a clearance is not.
+
+::: {.callout-warning}
+## This is not Pharmpy's additive effect
+
+Pharmpy's MFL has the same operator — `COVARIATE(CL, WT, lin, +)` — but reuses
+the *multiplicative* template under it, so its additive linear effect adds
+`1 + θ·(WT − median)`. A covariate at its centre then adds `1` to the parameter
+and θ = 0 is not "no effect". ferx drops that leading `1`, so a model translated
+from Pharmpy with `+` does **not** reproduce Pharmpy's equations: the two differ
+by a constant `1` on the parameter. Both fit, so the difference is invisible
+unless it is stated — `ferx_search()` states it as a note on any space that asks
+for `+`.
+:::
+
+::: {.callout-warning}
+## An additive effect can drive a parameter negative
+
+A factor scales a parameter and cannot change its sign; a term can. With
+`CL ~ WT linear(center = 70) +` at θ = 0.05, a 45 kg subject contributes
+`−1.25` to a typical `CL` of 4, and an individual with `ETA_CL` below `−0.4`
+lands at a *negative* clearance. Neither ferx nor NONMEM refuses that — the
+expression is what it says — but the individual objective around it is no longer
+well behaved, and an inner optimizer can find a different mode there.
+
+This is a property of the model, not of the block: bound θ so the term cannot
+exceed the parameter over the covariate's observed range, or use a
+multiplicative form.
+:::
+
+::: {.callout-note}
+## Mu-referencing switches off for an additive relation
+
+An additive term makes the typical value a sum, so it is no longer log-linear in
+one θ and the SAEM mu-reference detector does not match it. The parameter's η
+falls back to the numerical M-step under `method = saem` / `imp`, which is
+slower but correct — the covariate effect is in the expression either way. The
+parser says so in a warning naming the parameter. FOCE/FOCEI are unaffected.
+:::
 
 ### Coming from PsN `scm`
 
@@ -96,15 +172,39 @@ Every `scm` state is expressible:
 | 5 `power` | `(COV/median)**THETA(1)` | `power(center = median)` |
 | arbitrary `[code]` | NONMEM verbatim | `expr("…")` |
 
-The **default inits and bounds are PsN's, verbatim**:
+`categorical2` has **no** `scm` state: PsN's categorical state is state 2, the
+`1 + θ` shape. It is Pharmpy MFL's `cat2`, an exact reparameterization of
+`categorical` by `θ_cat2 = 1 + θ_cat` — same degrees of freedom, same OFV at
+the corresponding θ, and the same reference factor of `1`. Use it when the
+multiplicative reading is what you want to report (`θ = 1.3` → "30% higher")
+and when `θ > 0` matters: `1 + θ` with `θ < −1` can turn the parameter
+negative, `θ` alone bounded below at `0` cannot.
+
+The **default inits and bounds are PsN's, verbatim** (`categorical2`, which has
+no PsN state, takes the image of `categorical`'s row — see below):
 
 | form | init | lower | upper |
 |---|---|---|---|
 | `linear` | `0.001/(c−min)` | `1/(c−max)` | `1/(c−min)` |
 | `categorical` | `−0.001` | `−1` | `5` |
+| `categorical2` | `0.999` | `0` | `6` |
 | `hockey` (θ_lo, θ_hi) | `0.001/(c−min)`, `0.001/(c−max)` | `−1e6`, `1/(c−max)` | `1/(c−min)`, `1e6` |
 | `exponential` | `0.001` | `−100` | `1e6` |
 | `power` | `0.001` | `−100` | `1e6` |
+
+`categorical2`'s row is the image of `categorical`'s under `θ_cat2 = 1 + θ_cat`,
+so the two forms start at the *identical model* and admit the identical set of
+factors. Its bounds `(0, 6)` are also Pharmpy's `cat2` bounds verbatim; its
+init is not — Pharmpy uses `1.01`, ferx `0.999`, because ferx follows PsN's
+sign on the `categorical` init (`−0.001`, where Pharmpy uses `+0.001`) and
+carries that choice across the reparameterization rather than mixing the two.
+
+Both shapes are anchored against NONMEM 7.5.1 on the same 60-subject dataset
+(`tests/nonmem/covariate_cat2.{ctl,ext}` and its `cat` twin,
+`tests/covariate_cat2_nonmem.rs`). NONMEM reaches OFV −73.8266171 from either
+spelling with its two θ exactly 1 apart; ferx reaches −73.8266174 from either,
+matching every NONMEM estimate to within 3.5e-6 relative and the θ(SEX) SE to
+1.3e-3.
 
 The linear bounds are not cosmetic: `θ ∈ [1/(c−max), 1/(c−min)]` is exactly what
 keeps `1 + θ·(COV − c)` positive over the observed covariate range.
@@ -254,12 +354,32 @@ When the RHS is **not** a top-level product — a sum, a logit transform, a
 mixture branch — there is no unambiguous place for the factor, and that is a
 hard error rather than a guess. Every factor of the product has to be a plain
 multiplicative term, so `CL = TVCL * exp(ETA_CL) + BASE_CL` is rejected too: the
-factor would otherwise scale the first addend alone. Wire it by hand instead:
+factor would otherwise scale the first addend alone. This applies to a
+multiplicative relation only — an additive one is appended to the right-hand
+side rather than multiplied into it, so it has nothing to be ambiguous about.
+Wire it by hand instead:
 
 ```
 [individual_parameters]
   CL = TVCL * COV_CL * exp(ETA_CL)   # COV_CL = the factor, placed where you want it
 ```
+
+Additive terms are appended **after** the finished product, so both kinds on one
+parameter land in one rewrite and read left to right in declaration order:
+
+```
+CL ~ WT  power(center = 70)
+CL ~ AGE linear(center = 40) +
+  →  CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)
+          + (if (present(AGE)) (THETA_CL_AGE * (AGE - 40)) else 0.0)
+```
+
+The product is rebuilt from the right-hand side the *model file* carries, before
+any term is appended to it, so a multiplicative relation can never be multiplied
+into one addend of a sum this block created — whatever order the two lines are
+written in. When the right-hand side is not a plain product, the appended sum
+parenthesises it, since `if (c) a else b + t` would otherwise put the term
+inside the `else` arm.
 
 An η reached through an intermediate still counts as η-bearing, so the factor
 lands in front of it:
@@ -289,6 +409,14 @@ A missing covariate is `NaN`, so `present(...)` is false and the factor is
 exactly `1.0`. This is not belt-and-braces: division by a missing value
 **underflows to `0.0`** in ferx rather than producing an infinity, so an
 unguarded factor would zero the parameter silently instead of failing loudly.
+
+The neutral value is the **operator's**, not a shared `1.0`: an additive
+relation guards to `0.0`, because a missing covariate must contribute nothing
+and `+ 1.0` is not nothing.
+
+```
+(if (present(WT)) (THETA_CL_WT * (WT - 70)) else 0.0)
+```
 
 For this to hold on real data, "missing" has to survive the reader. A covariate
 column that exists but carries no value for a subject — every cell `.` — is read

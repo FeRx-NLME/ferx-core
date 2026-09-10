@@ -8,7 +8,7 @@
 //! written by hand.
 
 use super::*;
-use crate::types::{CovariateForm, CovariateStat};
+use crate::types::{CovariateForm, CovariateOp, CovariateStat};
 
 /// The model every edit test starts from: one-compartment oral, three θ, three
 /// η, a proportional error model — deliberately comment- and alignment-heavy,
@@ -214,6 +214,7 @@ fn canonical_hash_changes_for_every_semantic_edit() {
             parameter: "CL".into(),
             covariate: "WT".into(),
             form: CovariateForm::Power,
+            op: CovariateOp::Multiply,
             center: Some(CovariateStat::Literal(70.0)),
             fix: None,
             thetas: vec![],
@@ -742,6 +743,7 @@ fn power_on_wt() -> Relation {
         parameter: "CL".into(),
         covariate: "WT".into(),
         form: CovariateForm::Power,
+        op: CovariateOp::Multiply,
         center: Some(CovariateStat::Median),
         fix: None,
         thetas: vec![RelationTheta {
@@ -775,6 +777,14 @@ fn relation_rendering_uses_the_keyword_each_form_actually_takes() {
     categorical.center = Some(CovariateStat::Mode);
     categorical.thetas.clear();
     assert_eq!(categorical.render(), "CL ~ WT categorical(ref = mode)");
+
+    // #1312: `categorical2` centres on `ref` as well — rendering it with
+    // `center` would be a parse error on the way back in.
+    let mut categorical2 = power_on_wt();
+    categorical2.form = CovariateForm::Categorical2;
+    categorical2.center = Some(CovariateStat::Mode);
+    categorical2.thetas.clear();
+    assert_eq!(categorical2.render(), "CL ~ WT categorical2(ref = mode)");
 
     let mut none = power_on_wt();
     none.form = CovariateForm::None;
@@ -826,6 +836,63 @@ fn drop_covariate_relation_removes_the_line_and_its_orphaned_theta() {
     assert!(text
         .block_lines("individual_parameters")
         .contains(&"CL = TVCL * exp(ETA_CL)".to_string()));
+}
+
+/// covsearch's backward step removes a whole relation rather than zeroing its
+/// θ, so it is indifferent to which categorical form the relation carries
+/// (#1312).
+///
+/// That is worth pinning rather than assuming, because the null moved with the
+/// form: an elimination implemented as "set θ to 0" would be correct for
+/// `categorical` and would leave a `categorical2` relation at a factor of
+/// *zero*. `DropCovariateRelation` is keyed on the `(parameter, covariate)`
+/// pair and deletes the line, which is why the new form needs no change there.
+#[test]
+fn dropping_a_categorical2_relation_removes_it_like_any_other() {
+    let src = BASE
+        .replace(
+            "[covariates]\n  WT continuous",
+            "[covariate_model]\n  CL ~ SEX categorical2(ref = mode)\n  V ~ WT power(center = \
+             median)\n\n[covariates]\n  WT continuous\n  SEX categorical(levels = [0, 1])",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta THETA_CL_SEX_1(0.999, 0.0, 6.0)\n  theta \
+             THETA_V_WT(0.75, 0.01, 5.0)",
+        );
+    let mut text = ModelText::parse(&src).expect("the seeded model must parse");
+    // Non-degeneracy: the relation and its θ are there to start with, so the
+    // assertions below are not passing on an empty block.
+    assert_eq!(text.block_lines("covariate_model").len(), 2);
+    assert!(text
+        .block_lines("parameters")
+        .iter()
+        .any(|l| l.contains("THETA_CL_SEX_1")));
+
+    apply(
+        &mut text,
+        ModelEdit::DropCovariateRelation {
+            param: "CL".into(),
+            cov: "SEX".into(),
+        },
+    );
+
+    // The line is gone — not neutralised by a `fix`, which for this form would
+    // have to be `fix = 1` and not the `fix = 0` an offset form would take.
+    assert_eq!(
+        text.block_lines("covariate_model"),
+        vec!["V ~ WT power(center = median)"]
+    );
+    let params = text.block_lines("parameters");
+    assert!(
+        !params.iter().any(|l| l.contains("THETA_CL_SEX_1")),
+        "the orphaned θ must go with the relation: {params:?}"
+    );
+    // …and the other relation is untouched.
+    assert!(
+        params.iter().any(|l| l.starts_with("theta THETA_V_WT(")),
+        "{params:?}"
+    );
 }
 
 #[test]
@@ -2599,4 +2666,43 @@ fn a_stale_alias_is_still_dropped_when_the_binding_moves() {
     // The parameter it bridged to is unreferenced now and goes with it.
     assert!(!out.contains("TLAG"), "{out}");
     assert!(!out.contains("TVLAG("), "{out}");
+}
+
+#[test]
+fn the_additive_operator_is_rendered_as_a_trailing_token_and_parses_back() {
+    // The operator has to survive an edit → text → parse round trip: a search
+    // that proposes an additive relation writes the line here and reads the
+    // relation back off the parsed model.
+    let mut add = power_on_wt();
+    add.op = CovariateOp::Add;
+    add.center = Some(CovariateStat::Literal(70.0));
+    assert_eq!(
+        add.render(),
+        "CL ~ WT power(center = 70) + => THETA_CL_WT(0.75, 0.01, 5.0)"
+    );
+    // `*` is the default and is left unwritten, so an edit passing a
+    // multiplicative relation through does not rewrite the line.
+    let mut mul = add.clone();
+    mul.op = CovariateOp::Multiply;
+    assert_eq!(
+        mul.render(),
+        "CL ~ WT power(center = 70) => THETA_CL_WT(0.75, 0.01, 5.0)"
+    );
+
+    let mut text = base();
+    apply(&mut text, ModelEdit::AddCovariateRelation(add.clone()));
+    let parsed = crate::parser::model_parser::parse_full_model(&text.render())
+        .unwrap_or_else(|e| panic!("the edited model must parse: {e}"));
+    let relations = parsed
+        .model
+        .covariate_model
+        .as_ref()
+        .expect("the block is recorded")
+        .relations
+        .clone();
+    assert_eq!(relations.len(), 1);
+    assert_eq!(relations[0].op, CovariateOp::Add);
+    // …and back out again: `From<&CovariateRelation>` is what a search uses to
+    // re-propose a relation it found in the parent model.
+    assert_eq!(Relation::from(&relations[0]).op, CovariateOp::Add);
 }

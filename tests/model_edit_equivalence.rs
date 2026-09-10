@@ -29,7 +29,7 @@ use ferx_core::edit::{
     NewParameter, Relation, RelationTheta, SigmaDecl, StructuralSpec, ThetaDecl, TimeVaryingDecl,
 };
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::{CovariateForm, CovariateStat, FitOptions};
+use ferx_core::types::{CovariateForm, CovariateOp, CovariateStat, FitOptions};
 use ferx_core::{fit, predict, read_nonmem_csv};
 
 const DATA: &str = "data/two_cpt_oral_cov.csv";
@@ -235,6 +235,7 @@ fn wt_on_cl() -> Relation {
         parameter: "CL".into(),
         covariate: "WT".into(),
         form: CovariateForm::Power,
+        op: CovariateOp::Multiply,
         center: Some(CovariateStat::Literal(70.0)),
         fix: None,
         thetas: vec![RelationTheta {

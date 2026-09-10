@@ -119,7 +119,7 @@ keyword.
 
 The MFL effect names map onto `[covariate_model]` forms as `lin` → `linear`,
 `piece_lin` → `hockey`, `exp` → `exponential`, `pow` → `power`,
-`cat` → `categorical`.
+`cat` → `categorical`, `cat2` → `categorical2`.
 
 ### Deviations from Pharmpy
 
@@ -137,8 +137,12 @@ Three, all deliberate:
   NODEPOT by Pharmpy's own grammar.
 - **`COVARIATE(..., *)` on a categorical covariate is `cat`.** Pharmpy expands
   the effect wildcard to the four continuous forms regardless; ferx knows the
-  covariate's declared kind, so on a categorical one the wildcard is the only
-  form that can apply.
+  covariate's declared kind, so on a categorical one the wildcard becomes `cat`.
+  It is `cat` alone, not `cat` and `cat2`: Pharmpy's expansion never reaches
+  `cat2` either, and since the two are the same test in different coordinates
+  (see [`categorical2`](../model-file/covariate-model.qmd#forms)), expanding to
+  both would double every categorical pair's candidate count for nothing. Ask
+  for `cat2` by name.
 
 ### Anchored against Pharmpy
 
@@ -230,8 +234,9 @@ silently.
 | `TRANSITS(n, DEPOT)`, and `TRANSITS(n)` (Pharmpy's default is DEPOT) | ✗ | needs a separate depot with its own `ka`: an `[odes]` model with `transit(...) - KA*depot`; write `NODEPOT` |
 | `LAGTIME(ON / OFF)` | ✓ | `lagtime=` binding |
 | `COVARIATE(..., lin / piece_lin / exp / pow / cat)` | ✓ | `[covariate_model]` forms `linear` / `hockey` / `exponential` / `power` / `categorical` |
-| `COVARIATE(..., cat2 / custom)` | ✗ | no second categorical form; a search cannot invent an `expr(...)` |
-| `COVARIATE(..., +)` | ✗ | relations are multiplicative factors on a top-level product |
+| `COVARIATE(..., cat2)` | ✓ | `[covariate_model]` form `categorical2` — the same θ count as `cat`, with the θ read as the factor itself |
+| `COVARIATE(..., custom)` | ✗ | a search cannot invent an `expr(...)` |
+| `COVARIATE(..., +)` | ✓ | the block's trailing operator token — but ferx's additive effect is [null at the form's own null](../model-file/covariate-model.qmd#multiplicative-and-additive-effects) where Pharmpy's is not, so a `+` space carries a note saying the equations will not match Pharmpy's |
 | `ALLOMETRY(c, ref)` | ✓ | `power(center = ref, fix = 0.75)` |
 | `IIV(p, EXP / ADD / PROP)` | ✓ | `ferx-core::edit` add / drop η; [iivsearch](iivsearch.qmd) searches the `EXP` form only |
 | `IIV(p, LOG / RE_LOG)` | ✗ | the edit layer writes `exp`, `add` and `prop` forms only |
