@@ -44,6 +44,19 @@ section of the SDLC for the versioning policy).
 - **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
 
 ### Added
+- **`categorical2` — a second `[covariate_model]` categorical form, Pharmpy MFL's
+  `cat2` (#1312).** `categorical2(ref = r)` contributes `θ_k` at each non-reference
+  level and `1` at the reference, where `categorical` contributes `1 + θ_k`. Same
+  degrees of freedom (one θ per non-reference level) and an exact
+  reparameterization — `θ_cat2 = 1 + θ_cat` gives the same OFV on the same data —
+  so it is a choice of how θ reads, not a cheaper test: the θ is the multiplicative
+  factor itself (`θ = 1.3` → "30% higher") and bounded below at `0`, where
+  `1 + θ` with `θ < −1` can turn the parameter negative. Defaults are the image of
+  `categorical`'s under that map: init `0.999`, bounds `(0, 6)` — the bounds
+  Pharmpy uses verbatim. Note the **null moves with the form**: `fix = 1` is "no
+  effect" for `categorical2` where `fix = 0` is for `categorical`. Search spaces
+  now resolve `COVARIATE?(CL, SEX, cat2)` instead of reporting a coverage gap.
+
 - **`ferx globalsearch` — global model search with pyDarwin's genetic algorithm or
   exhaustive enumeration, ranked on pyDarwin's penalized fitness (#1185, P6 of #1175).**
   The `.ferxsearch` space is laid out as one grid — every structural category an axis with
@@ -232,6 +245,19 @@ section of the SDLC for the versioning policy).
   build one with `NewParameter::new(name, theta, init, lower, upper)` and the `.with_iiv(...)` /
   `.fixed()` builders, which makes the next field addition non-breaking. Its fields stay public
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
+
+### Changed
+- **BREAKING (pre-1.0 minor bump, 0.3.1 → 0.4.0): `CovariateForm` gained a variant
+  and is now `#[non_exhaustive]` (#1312).** Adding `CovariateForm::Categorical2`
+  to a public enum breaks any downstream crate that `match`es it exhaustively —
+  the code compiles against 0.3.1 and fails to compile against 0.4.0 with
+  `non-exhaustive patterns: CovariateForm::Categorical2 not covered`.
+  **Migration:** add a `_ => …` arm (or a `CovariateForm::Categorical2` arm) to
+  any `match` on `CovariateForm`. Nothing else changes: variants are still
+  constructible, the serde representation of every existing variant is
+  unchanged, and `.ferx` files, `FitResult` and sdtab are untouched. The enum is
+  now `#[non_exhaustive]`, so the `_` arm is required from here on and the next
+  form — level grouping — will be genuinely additive.
 
 ### Fixed
 - A fit no longer stops on its first evaluation and reports every parameter at its

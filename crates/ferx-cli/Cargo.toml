@@ -1,6 +1,6 @@
 [package]
 name = "ferx-cli"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Command-line interface for the ferx NLME modeling engine"
 license = "MIT"
@@ -25,8 +25,8 @@ path = "src/main.rs"
 # instead of linking the rlib it just built, and `--no-default-features` is
 # silently defeated for `ferx-core` everywhere (harmless only while
 # `default = []`; `survival` is slated to become default-on).
-ferx-core = { path = "../..", version = "0.3.1", default-features = false }
-ferx-tools = { path = "../ferx-tools", version = "0.3.1" }
+ferx-core = { path = "../..", version = "0.4.0", default-features = false }
+ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
 indicatif = "0.18.4"
 # Matches the root package and `ferx-tools`: see the note there — floats must
 # reload as themselves, not to within 1 ULP.

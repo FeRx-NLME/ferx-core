@@ -2509,14 +2509,18 @@ fn covariate_form_labels_are_the_block_spellings() {
         (CovariateForm::Power, "power"),
         (CovariateForm::Hockey, "hockey"),
         (CovariateForm::Categorical, "categorical"),
+        (CovariateForm::Categorical2, "categorical2"),
         (CovariateForm::Expr("(WT/70)^0.75".into()), "expr"),
     ];
     for (form, label) in &cases {
         assert_eq!(&form.label(), label);
     }
-    // Only `categorical` reads a categorical column; the check against the
-    // `[covariates]` declaration is keyed on this.
+    // The two categorical forms read a categorical column; the check against
+    // the `[covariates]` declaration is keyed on this, so a new categorical
+    // variant left out of `is_categorical` would be checked against the wrong
+    // column kind (#1312).
     assert!(CovariateForm::Categorical.is_categorical());
+    assert!(CovariateForm::Categorical2.is_categorical());
     assert!(!CovariateForm::Power.is_categorical());
     assert!(!CovariateForm::Expr("1".into()).is_categorical());
 }

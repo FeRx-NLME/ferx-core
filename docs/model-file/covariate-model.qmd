@@ -60,11 +60,14 @@ PARAM ~ COV form(kwargs) [=> THETA_NAME(init, lower, upper)[, ...]]
   anyway, **the declaration is required here**: the form and the levels are read
   off it, so guessing would make the generated θ vector depend on the dataset.
 - `=> …` — optional. Left out, the θ is named `THETA_<PARAM>_<COV>` (with
-  `_LO`/`_HI` for `hockey` and `_<LEVEL>` for `categorical`) and takes the
+  `_LO`/`_HI` for `hockey` and `_<LEVEL>` for both categorical forms) and takes the
   form's default init and bounds. A `theta` of that name already declared in
   `[parameters]` takes precedence and is used as declared.
 
-`fix = v` on any form pins the θ at `v` and declares it `FIX`.
+`fix = v` on any form pins the θ at `v` and declares it `FIX`. It pins the θ as
+written, and does not reinterpret it per form: the no-effect value is `fix = 0`
+for every form whose θ is an offset, and `fix = 1` for `categorical2`, whose θ
+*is* the factor.
 
 ## Forms
 
@@ -77,6 +80,7 @@ PARAM ~ COV form(kwargs) [=> THETA_NAME(init, lower, upper)[, ...]]
 | `power(center=c)` | `(COV/c)^θ` | the classical allometric factor |
 | `hockey(breakpoint=b)` | `1 + θ_lo·(COV − b)` below `b`, `1 + θ_hi·(COV − b)` above | **two** θ |
 | `categorical(ref=r)` | `1 + θ_k` at each non-reference level, `1` at `r` | one θ per non-reference level |
+| `categorical2(ref=r)` | `θ_k` at each non-reference level, `1` at `r` | same θ count; θ is the factor itself, null at **1** |
 | `expr("…")` | verbatim | escape hatch |
 
 `none` exists so a search can record "tested, rejected" in the file and have the
@@ -96,15 +100,39 @@ Every `scm` state is expressible:
 | 5 `power` | `(COV/median)**THETA(1)` | `power(center = median)` |
 | arbitrary `[code]` | NONMEM verbatim | `expr("…")` |
 
-The **default inits and bounds are PsN's, verbatim**:
+`categorical2` has **no** `scm` state: PsN's categorical state is state 2, the
+`1 + θ` shape. It is Pharmpy MFL's `cat2`, an exact reparameterization of
+`categorical` by `θ_cat2 = 1 + θ_cat` — same degrees of freedom, same OFV at
+the corresponding θ, and the same reference factor of `1`. Use it when the
+multiplicative reading is what you want to report (`θ = 1.3` → "30% higher")
+and when `θ > 0` matters: `1 + θ` with `θ < −1` can turn the parameter
+negative, `θ` alone bounded below at `0` cannot.
+
+The **default inits and bounds are PsN's, verbatim** (`categorical2`, which has
+no PsN state, takes the image of `categorical`'s row — see below):
 
 | form | init | lower | upper |
 |---|---|---|---|
 | `linear` | `0.001/(c−min)` | `1/(c−max)` | `1/(c−min)` |
 | `categorical` | `−0.001` | `−1` | `5` |
+| `categorical2` | `0.999` | `0` | `6` |
 | `hockey` (θ_lo, θ_hi) | `0.001/(c−min)`, `0.001/(c−max)` | `−1e6`, `1/(c−max)` | `1/(c−min)`, `1e6` |
 | `exponential` | `0.001` | `−100` | `1e6` |
 | `power` | `0.001` | `−100` | `1e6` |
+
+`categorical2`'s row is the image of `categorical`'s under `θ_cat2 = 1 + θ_cat`,
+so the two forms start at the *identical model* and admit the identical set of
+factors. Its bounds `(0, 6)` are also Pharmpy's `cat2` bounds verbatim; its
+init is not — Pharmpy uses `1.01`, ferx `0.999`, because ferx follows PsN's
+sign on the `categorical` init (`−0.001`, where Pharmpy uses `+0.001`) and
+carries that choice across the reparameterization rather than mixing the two.
+
+Both shapes are anchored against NONMEM 7.5.1 on the same 60-subject dataset
+(`tests/nonmem/covariate_cat2.{ctl,ext}` and its `cat` twin,
+`tests/covariate_cat2_nonmem.rs`). NONMEM reaches OFV −73.8266171 from either
+spelling with its two θ exactly 1 apart; ferx reaches −73.8266174 from either,
+matching every NONMEM estimate to within 3.5e-6 relative and the θ(SEX) SE to
+1.3e-3.
 
 The linear bounds are not cosmetic: `θ ∈ [1/(c−max), 1/(c−min)]` is exactly what
 keeps `1 + θ·(COV − c)` positive over the observed covariate range.

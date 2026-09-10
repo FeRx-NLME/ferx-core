@@ -442,6 +442,22 @@ fn categorical_form_on_a_continuous_covariate_and_vice_versa_are_errors() {
         e.contains("`WT` is declared continuous, and `cat` is a categorical form"),
         "{e}"
     );
+    // #1312: `cat2` is a categorical form on both sides of the check — it
+    // resolves on `SEX` and is refused on `WT`, exactly like `cat`.
+    let e = resolve_err("COVARIATE?(CL,@CONTINUOUS,cat2)", &ctx());
+    assert!(
+        e.contains("`WT` is declared continuous, and `cat2` is a categorical form"),
+        "{e}"
+    );
+    let r = resolved("COVARIATE?(CL,SEX,cat2)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIATE?(CL,SEX,cat2)");
+    assert_eq!(r.covariate_effects.len(), 1);
+    // …but `cat2` stays out of the `*` expansion, as it does in Pharmpy: the
+    // wildcard on a categorical covariate is `cat` alone, so an existing space
+    // does not silently double its categorical candidate count.
+    let r = resolved("COVARIATE?(CL,SEX,*)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIATE?(CL,SEX,cat)");
+    assert_eq!(r.covariate_effects.len(), 1);
 }
 
 // --- Pharmpy's override rules -----------------------------------------------------

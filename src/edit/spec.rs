@@ -759,7 +759,7 @@ impl Relation {
         }
         let keyword = match self.form {
             CovariateForm::Hockey => "breakpoint",
-            CovariateForm::Categorical => "ref",
+            CovariateForm::Categorical | CovariateForm::Categorical2 => "ref",
             _ => "center",
         };
         let mut args: Vec<String> = Vec::new();
