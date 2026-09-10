@@ -1310,16 +1310,7 @@ fn fit_inner(
     let mut vi_stage_idx: Option<usize> = None;
     // The methods running as pure likelihood evaluators for this fit. Chain-wide, not
     // per-stage, so it is built once here and read both inside the loop and after it.
-    let eval_only_methods: Vec<EstimationMethod> = {
-        let mut v = Vec::new();
-        if options.imp_eval_only {
-            v.push(EstimationMethod::Imp);
-        }
-        if options.agq_eval_only {
-            v.push(EstimationMethod::Laplace);
-        }
-        v
-    };
+    let eval_only_methods: Vec<EstimationMethod> = options.eval_only_methods();
     // Per-stage convergence wall time, parallel to `chain`/`method_chain`
     // (#713). Excludes the covariance step, which is timed separately below
     // and only ever runs on the last estimating stage.

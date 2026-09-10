@@ -4469,17 +4469,58 @@ fn test_cov_inner_tol_does_not_warn() {
 }
 
 #[test]
-fn test_cov_inner_tol_warns_for_bayes() {
-    // Bayes reports posterior credible intervals and explicitly disables the
-    // Hessian covariance step, so this covariance-only tolerance has no effect.
+fn test_cov_inner_tol_reports_no_effect_for_bayes() {
+    // Bayes reports posterior credible intervals and explicitly disables the Hessian
+    // covariance step, so this covariance-only tolerance has no effect — but it is a
+    // *covariance* key, not a key FOCEI happens to have and Bayes happens to lack, so
+    // it says so in those terms rather than "not used by method `Bayes`". The group rule
+    // and its per-key text are pinned in `types_tests`; this is the parser end of it.
     let opts = parse_fit_options(&[
         "method = bayes".to_string(),
         "cov_inner_tol = 1e-11".to_string(),
     ])
     .unwrap();
+    assert_eq!(
+        opts.cov_inner_tol,
+        Some(1e-11),
+        "the value is still applied"
+    );
     let warnings = opts.unsupported_keys_warnings();
     assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
     assert!(warnings[0].contains("cov_inner_tol"), "got: {warnings:?}");
+    assert!(
+        warnings[0].contains("runs no covariance step"),
+        "got: {warnings:?}"
+    );
+    assert!(
+        !warnings[0].contains("is not used by method"),
+        "got: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_cov_inner_tol_rejects_non_positive_and_non_finite() {
+    // Validated like its covariance-step sibling `fd_hessian_step`, not like `inner_tol`
+    // (which shares the historical gap): a value that no EBE can ever satisfy makes every
+    // covariance-step reconvergence burn the full `inner_maxiter` and reports nothing, so
+    // the SEs come out of unconverged modes silently.
+    for bad in ["0", "-1e-11", "nan", "inf"] {
+        let err = match parse_fit_options(&[format!("cov_inner_tol = {bad}")]) {
+            Ok(_) => panic!("`cov_inner_tol = {bad}` must not parse"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("cov_inner_tol") && err.contains("positive finite"),
+            "value `{bad}` gave an unhelpful error: {err}"
+        );
+    }
+    // The neighbouring valid range is untouched.
+    assert_eq!(
+        parse_fit_options(&["cov_inner_tol = 1e-11".to_string()])
+            .unwrap()
+            .cov_inner_tol,
+        Some(1e-11)
+    );
 }
 
 /// The reverse of [`every_advertised_fit_option_key_has_an_apply_fit_option_arm`].
@@ -4495,11 +4536,16 @@ fn test_cov_inner_tol_warns_for_bayes() {
 fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
     use crate::types::{framework_keys, method_specific_keys, EstimationMethod};
 
-    // Keys that legitimately have an arm but no advertisement, because they never
-    // reach `user_set_keys` and so can never trigger the warning: the
-    // `[data_selection]` keys return early by design (they are data filters, not
-    // estimation options). `method`/`methods` select the chain itself.
-    const EXEMPT: &[&str] = &["ignore", "accept", "ignore_subjects", "method", "methods"];
+    // Keys that legitimately have an arm but no advertisement, because they never reach
+    // `user_set_keys` and so can never trigger the warning: the `[data_selection]` keys
+    // are data filters, not estimation options, and each `return Ok(true)` ahead of the
+    // `user_set_keys.push`.
+    //
+    // `method`/`methods` are deliberately *not* here. They have no `apply_fit_option` arm
+    // at all — the function's own doc says the `method` list-chain syntax stays in the
+    // block parser — so exempting them would pre-authorise a future `"method" => …` arm
+    // to skip this guard, for nothing in return today.
+    const EXEMPT: &[&str] = &["ignore", "accept", "ignore_subjects"];
 
     // Walked line-wise rather than by byte offset: `str::lines()` strips a trailing
     // `\r`, so this is line-ending agnostic. Searching for a literal "\n}\n" is not —
@@ -4538,23 +4584,54 @@ fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
         if line.len() - t.len() != KEY_ARM_INDENT {
             continue;
         }
-        if !t.starts_with('"') || !t.contains("=>") {
+        // `head` is everything left of the `=>`; `split(..).next()` on a non-empty `&str`
+        // is always `Some`, so index it rather than writing a `let … else` that can never
+        // take its `else` branch. Only a chain of string literals separated by `|` is an
+        // arm head we trust.
+        let head = t.split("=>").next().unwrap_or(t);
+        let is_key_head = t.starts_with('"')
+            && t.contains("=>")
+            && head.split('|').all(|p| {
+                let p = p.trim();
+                p.starts_with('"') && p.ends_with('"') && p.len() > 2
+            });
+        if is_key_head {
+            for part in head.split('|') {
+                arm_keys.push(part.trim().trim_matches('"').to_string());
+            }
             continue;
         }
-        let Some(head) = t.split("=>").next() else {
-            continue;
-        };
-        // Only a chain of string literals separated by `|` is an arm head we trust.
-        let looks_like_head = head.split('|').all(|p| {
-            let p = p.trim();
-            p.starts_with('"') && p.ends_with('"') && p.len() > 2
-        });
-        if !looks_like_head {
-            continue;
-        }
-        for part in head.split('|') {
-            arm_keys.push(part.trim().trim_matches('"').to_string());
-        }
+        // Not a key head — and at this indent, inside this function, the only such lines
+        // are the `_ =>` wildcard and ordinary statements. Anything else that *looks*
+        // like arm material is the silent failure mode this assert exists for.
+        //
+        // rustfmt is how a key vanishes without a word: there is no `rustfmt.toml`, so
+        // `max_width = 100`, and an alias chain past that wraps to
+        //
+        //     "some_long_key_name"
+        //     | "some_other_long_key_alias" => {
+        //
+        // where the first line has no `=>` and the second does not start with `"`, so the
+        // filter above drops *both* keys and an unadvertised key sails through. The
+        // existing `"impmap_defensive_alpha" | "imp_defensive_alpha" => {` head is
+        // already ~61 columns, so a three-way chain gets there. The `> 80` floor below is
+        // far too coarse to see one key go (120 today), which is why this is per line.
+        //
+        // Exact as written: of the 208 non-blank lines at this indent, 114 contain `=>`
+        // and all but `_ => return Ok(false),` parse as key heads, and none begins with
+        // `|` or with a bare `"` — measured, not assumed.
+        assert!(
+            !t.starts_with('|') && !t.starts_with('"'),
+            "line at KEY_ARM_INDENT looks like part of a match-arm head but does not \
+             parse as one, so its key(s) would be dropped silently — rustfmt wrapping a \
+             long arm head does exactly this. Widen the scraper (or the arm) rather than \
+             leaving the key unscraped: {t:?}"
+        );
+        assert!(
+            !t.contains("=>") || t.starts_with('_'),
+            "unrecognised match arm at KEY_ARM_INDENT: {t:?} — only the `_` wildcard is \
+             expected here besides string-literal key heads"
+        );
     }
     // Over-matching is self-detecting: a scraped non-key is unadvertised and fails the
     // assertion below (that is how the `>= 8` bug surfaced). Under-matching is the

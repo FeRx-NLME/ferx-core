@@ -7663,7 +7663,12 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
-        "cov_inner_tol" => opts.cov_inner_tol = Some(parse_f64("cov_inner_tol")?),
+        // Validated like its covariance-step sibling `fd_hessian_step`, not like
+        // `inner_tol`: a non-positive or non-finite value reaches `find_ebe`'s
+        // convergence test through `effective_cov_inner_tol`, where no subject can ever
+        // satisfy it, so every covariance-step EBE burns the full `inner_maxiter` and the
+        // SEs come out of unconverged modes with nothing said about it.
+        "cov_inner_tol" => opts.cov_inner_tol = Some(parse_pos_finite("cov_inner_tol")?),
         "outer_xtol" => opts.outer_xtol = parse_pos_finite("outer_xtol")?,
         "outer_ftol" => opts.outer_ftol = Some(parse_pos_finite("outer_ftol")?),
         "ode_reltol" => opts.ode_reltol = parse_pos_finite("ode_reltol")?,
