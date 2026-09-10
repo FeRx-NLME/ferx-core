@@ -3,6 +3,7 @@
 //! doc / Key Modules table for the split rationale.
 use super::*;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::estimation::inner_optimizer::InnerFdConfig;
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -1511,7 +1512,7 @@ fn fit_inner(
                 stage_opts.mu_referencing,
             );
             let (eta_hats, h_matrices, _stats, kappas) =
-                crate::estimation::inner_optimizer::run_inner_loop_warm(
+                crate::estimation::inner_optimizer::run_inner_loop_warm_with_fd_config(
                     model,
                     population,
                     &stage_params,
@@ -1521,6 +1522,7 @@ fn fit_inner(
                     Some(&mu_k),
                     stage_opts.min_obs_for_convergence_check as usize,
                     stage_opts.inner_restarts,
+                    InnerFdConfig::from_options(&stage_opts),
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,
@@ -1589,7 +1591,7 @@ fn fit_inner(
                     stage_opts.mu_referencing,
                 );
                 let (eta_hats, h_matrices, _stats, kappas) =
-                    crate::estimation::inner_optimizer::run_inner_loop_warm(
+                    crate::estimation::inner_optimizer::run_inner_loop_warm_with_fd_config(
                         model,
                         population,
                         &stage_params,
@@ -1599,6 +1601,7 @@ fn fit_inner(
                         Some(&mu_k),
                         stage_opts.min_obs_for_convergence_check as usize,
                         stage_opts.inner_restarts,
+                        InnerFdConfig::from_options(&stage_opts),
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,

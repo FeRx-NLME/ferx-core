@@ -3000,19 +3000,29 @@ pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, populati
 pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
     let chain = options.method_chain();
     let mut diags = Vec::new();
-    if options.outer_fd_method != OuterFdMethod::Fixed && options.outer_fd_noise_abs.is_none() {
+    // The gate must check what its message promises. An adaptive search divides
+    // by `noise`, so `Some(0.0)` — unreachable from the `.ferx` parser, but an
+    // ordinary field assignment from the Rust API or ferx-r — makes every
+    // interval unusable, every coordinate fall back, and, before the fallback
+    // existed, every outer gradient identically zero: a "converged" fit at the
+    // initial estimates, complete with standard errors.
+    fn usable_noise(v: Option<f64>) -> bool {
+        matches!(v, Some(n) if n.is_finite() && n > 0.0)
+    }
+    if options.outer_fd_method != OuterFdMethod::Fixed && !usable_noise(options.outer_fd_noise_abs)
+    {
         diags.push(Diagnostic::error(
             "E_OUTER_FD_NOISE_REQUIRED",
-            "outer_fd_method = shi/gill requires a positive outer_fd_noise_abs estimate",
+            "outer_fd_method = shi/gill requires a positive, finite outer_fd_noise_abs estimate",
         ));
     }
     if options.inner_fd_method != InnerFdMethod::Fixed
-        && (options.inner_fd_objective_noise_abs.is_none()
-            || options.inner_fd_prediction_noise_abs.is_none())
+        && (!usable_noise(options.inner_fd_objective_noise_abs)
+            || !usable_noise(options.inner_fd_prediction_noise_abs))
     {
         diags.push(Diagnostic::error(
             "E_INNER_FD_NOISE_REQUIRED",
-            "inner_fd_method = shi requires positive inner_fd_objective_noise_abs and inner_fd_prediction_noise_abs estimates",
+            "inner_fd_method = shi requires positive, finite inner_fd_objective_noise_abs and inner_fd_prediction_noise_abs estimates",
         ));
     }
 
@@ -5070,6 +5080,10 @@ mod kappa_weight_tests;
 #[cfg(test)]
 #[path = "tests/vi_option_tests.rs"]
 mod vi_option_tests;
+
+#[cfg(test)]
+#[path = "tests/fd_method_option_tests.rs"]
+mod fd_method_option_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network

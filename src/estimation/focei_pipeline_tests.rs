@@ -222,6 +222,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &etas[i],
                             &bounds,
                             &opts,
+                            per_subject_noise_abs(opts.outer_fd_noise_abs, pop.subjects.len()),
                         ),
                         _ => subject_reconverged_fd_gradient(
                             &x,
@@ -231,6 +232,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &etas[i],
                             &bounds,
                             &opts,
+                            per_subject_noise_abs(opts.outer_fd_noise_abs, pop.subjects.len()),
                         ),
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {

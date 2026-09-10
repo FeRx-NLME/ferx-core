@@ -28,9 +28,9 @@
 //! so a full averaging window is collected *after* settling before breaking. Otherwise
 //! early stopping would simply trade under-convergence for a noisy last iterate.
 
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_with_fd_config, InnerFdConfig};
 use nalgebra::DVector;
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params,
@@ -917,7 +917,7 @@ pub fn run_vi(
     // produces both. It is cheap: warm-starting from `μ` lands the EBE search
     // essentially on top of its answer.
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
+    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm_with_fd_config(
         model,
         population,
         &final_params,
@@ -927,6 +927,7 @@ pub fn run_vi(
         Some(&final_mu_k),
         0,
         0,
+        InnerFdConfig::from_options(options),
     );
 
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under

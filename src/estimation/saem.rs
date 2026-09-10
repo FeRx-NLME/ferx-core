@@ -1,3 +1,6 @@
+use crate::estimation::fixed_eta_gradient::{
+    obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
+};
 /// SAEM (Stochastic Approximation EM) for NLME population parameter estimation.
 ///
 /// Reference: Delyon, Lavielle, Moulines (1999) Annals of Statistics 94–128.
@@ -6,10 +9,7 @@
 /// Two-phase step-size schedule (Monolix convention):
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
-use crate::estimation::fixed_eta_gradient::{
-    obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
-};
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_with_fd_config, InnerFdConfig};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
@@ -3458,7 +3458,7 @@ pub fn run_saem(
                 .map(|e| DVector::from_column_slice(e))
                 .collect();
             let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-            let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
+            let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm_with_fd_config(
                 model,
                 population,
                 &final_params,
@@ -3467,7 +3467,8 @@ pub fn run_saem(
                 Some(&warm_etas),
                 Some(&saem_final_mu_k),
                 0, // SAEM: no EBE convergence tracking
-                0, // SAEM final EBE is warm-started; no inner multi-start
+                0, // SAEM final EBE is warm-started; no inner multi-start,
+                InnerFdConfig::from_options(options),
             );
             let ofv = 2.0
                 * pop_nll(

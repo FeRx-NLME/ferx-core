@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+
+- **Experimental noise-aware finite-difference intervals (#1314).** Five new `[fit_options]` keys let a fit choose the interval policy for its *numerical* derivatives instead of the historical prescribed steps: `outer_fd_method` (`fixed` / `shi` / `gill`) with `outer_fd_noise_abs`, and `inner_fd_method` (`fixed` / `shi`) with `inner_fd_objective_noise_abs` and `inner_fd_prediction_noise_abs`. `shi` runs the Shi–Xie–Xuan–Nocedal centred interval search against the supplied absolute noise bound; `gill` is a bounded one-sided curvature/noise balance. Useful when the objective is genuinely noisy (ODE solver tolerance, FD-inner FOCE) and the fixed step is either swamped by noise or too wide. **The default on every key is `fixed`, and the fixed path is unchanged** — including the objective wall a guard-rejected trial point contributes to the stencil. An adaptive method that cannot fit a usable interval falls back to the fixed stencil for that coordinate. Requires a positive, finite noise estimate; the model check rejects the configuration otherwise (`E_OUTER_FD_NOISE_REQUIRED` / `E_INNER_FD_NOISE_REQUIRED`). See [Fit options](https://ferx-nlme.github.io/ferx-core/model-file/fit-options.html).
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences

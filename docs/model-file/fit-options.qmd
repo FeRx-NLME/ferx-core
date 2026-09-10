@@ -84,8 +84,8 @@ The population-parameter search: which algorithm, when it stops, and whether a g
 | `optimizer` | `auto`, `bobyqa`, `slsqp`, `nlopt_lbfgs`, `mma`, `trust_region` (plus deprecated aliases `bfgs`/`lbfgs` → `nlopt_lbfgs`) | `auto` | Outer-loop optimisation algorithm. Applies to `method = foce` / `focei` and to the FOCEI polish phase of `method = gn_hybrid`. The default `auto` picks per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are (ODE/PD models, LTBS/SDE, or `gradient = fd`) — see the [Outer Optimizers](../estimation/optimizers.qmd) page for the applicability matrix and the benchmarking (#490) behind these defaults. The fit output records the resolved pick (e.g. `auto (nlopt_lbfgs)`). Ignored (with a runtime warning) under `method = saem` / `imp` / `gn`. `bfgs` and `lbfgs` are deprecated aliases that now select `nlopt_lbfgs` (the hand-rolled built-in BFGS/L-BFGS is slated for removal — see #483). |
 | `outer_xtol` | float | `1e-4` | Relative **step** tolerance: how far the optimizer's step must shrink before it declares success. `1e-4` in scaled log-space is a ~0.01% move on the natural parameter scale. Affects `bobyqa` (the `auto` pick for FD-objective models — ODE/PD, LTBS/SDE, `gradient = fd`, and TTE), where it is NLopt's `xtol_rel`, and `trust_region`, where it is the step limb of the no-progress stopping rule (#1000; see [Trust-region convergence reporting](../estimation/optimizers.qmd#trust-region-convergence-reporting)). The remaining gradient-based NLopt optimizers use their own fixed internal tolerances. Must be positive and finite. |
 | `outer_ftol` | float | auto | Relative **objective** tolerance: the relative OFV change below which the optimizer stops. Applies to `bobyqa` (NLopt `ftol_rel`) and to `trust_region`, where it is the objective limb of the no-progress stopping rule (#1000; see [Trust-region convergence reporting](../estimation/optimizers.qmd#trust-region-convergence-reporting)) — both resolve it the same way. **Unset = auto**: `1e-8` for a pure-TTE model and `1e-6` otherwise. The TTE tightening fixes #469 — on the near-flat frailty-ω² ridge of a *nonlinear* hazard parameter (the whole ridge spans &lt;0.01 OFV) the historical `1e-6` stopped the optimizer short, leaving the variance above its own minimum (a Weibull shape-frailty read ω² 0.204 vs the NONMEM/nlmixr2 0.175 consensus; at `1e-8` it lands 0.176). The `1e-6` floor for non-TTE fits is deliberate: a TTE hazard objective is evaluated *exactly*, but on a **noisy** objective (ODE solver error, FD-inner FOCE such as LTBS) `1e-8` is unreachable, so BOBYQA grinds toward its maxeval budget instead of converging (≈3× the evaluations on an ODE fit). Set an explicit value to pin it for every model — e.g. `outer_ftol = 1e-8` to tighten an LTBS flat-ridge fit, accepting the cost. Must be positive and finite. |
-| `outer_fd_method` | `fixed`, `shi`, `gill` | `fixed` | Scalar outer-FD interval policy. `fixed` preserves the historical centred stencil; `shi` is bounded central search; experimental `gill` is forward. Adaptive modes require `outer_fd_noise_abs`. |
-| `outer_fd_noise_abs` | positive float | unset | Absolute scalar-objective noise bound required by adaptive outer FD. |
+| `outer_fd_method` | `fixed`, `shi`, `gill` | `fixed` | Interval policy for **numerical** outer gradients. `fixed` is the historical stencil, unchanged. Experimental — see [Noise-aware FD intervals](#noise-aware-finite-difference-intervals). |
+| `outer_fd_noise_abs` | positive float | unset | Absolute OFV noise bound. Required (positive, finite) by `outer_fd_method = shi`/`gill`. |
 | `steihaug_max_iters` | integer | adaptive | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`). Default (unset) uses `ceil(sqrt(n_params)).clamp(5, n_params)` — typically 5 for standard NLME models. Set explicitly (e.g. `steihaug_max_iters = 50`) to pin the budget. |
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
@@ -99,9 +99,9 @@ The per-subject empirical-Bayes search that the outer objective is built from.
 | `inner_maxiter` | integer | `200` | Max iterations for the inner (per-subject EBE) optimizer |
 | `inner_optimizer` | `auto`, `bfgs`, `lbfgs`, `nelder_mead` | `auto` | Inner-loop (per-subject EBE) optimisation algorithm. `auto` uses dense BFGS, switching to limited-memory L-BFGS above 32 random effects. The explicit values pin a single algorithm with **no** automatic switching: `bfgs` (dense), `lbfgs` (limited-memory two-loop recursion — cheaper per step at high random-effect dimension), `nelder_mead` (derivative-free, for diagnosing gradient issues). All gradient-based variants converge to the same EBE; the choice trades per-step cost against memory. Applies to every method with an inner loop (`foce`/`focei`/`gn`/`gn_hybrid`/`saem`/`impmap`). |
 | `inner_tol` | float | `1e-5` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. Residual noise in the EBE solution propagates into the marginal objective the outer optimizer sees, so this is not a free speed knob in either direction — see [Choosing `inner_tol`](#choosing-inner-tol). |
-| `inner_fd_method` | `fixed`, `shi` | `fixed` | Inner FD interval policy. `shi` adapts scalar posterior gradients and prediction Jacobians; it requires both noise settings. |
-| `inner_fd_objective_noise_abs` | positive float | unset | Absolute scalar-posterior noise bound for adaptive inner gradients. |
-| `inner_fd_prediction_noise_abs` | positive float | unset | Absolute prediction noise bound for adaptive inner Jacobians. |
+| `inner_fd_method` | `fixed`, `shi` | `fixed` | Interval policy for **numerical** inner derivatives — the EBE posterior gradient and the prediction Jacobian, on models outside the analytic sensitivity scope. `fixed` (default) is unchanged. `shi` requires both `inner_fd_*_noise_abs` keys. Experimental — see [Noise-aware finite-difference intervals](#noise-aware-finite-difference-intervals). |
+| `inner_fd_objective_noise_abs` | positive float | unset | Absolute noise bound on one subject's posterior objective. Required by `inner_fd_method = shi`; must be positive and finite. |
+| `inner_fd_prediction_noise_abs` | positive float | unset | Absolute noise bound on a single prediction, in DV units. Required by `inner_fd_method = shi`; must be positive and finite. |
 | `inner_restarts` | integer | `1` | Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a **multimodal individual objective**. A subject that a single warm-started BFGS would leave in the wrong basin re-solves from `N` Ω-scaled cold-start seeds and keeps the lowest-objective mode; unimodal subjects are bit-identical to `0` and pay only a flatness probe. Set `0` to disable — see [Escaping a multimodal individual objective](#escaping-a-multimodal-individual-objective). |
 | `reconverge_gradient_interval` | integer ≥ 0 | `0` | How often to re-solve each subject's inner EBE loop during the population gradient instead of holding the EBEs (η̂) and FOCE Hessian fixed. `0` (default) never reconverges — the cheap fixed-EBE gradient is used. `1` reconverges on every gradient evaluation, at roughly **5–6× the per-gradient cost**; `N` reconverges on evaluations `0, N, 2N, …` and uses the cheap gradient in between. Raise it when a gradient optimizer stalls above the derivative-free optimum. IOV models (`kappa`/`block_kappa`) always reconverge and ignore this setting. See [Gradient accuracy vs cost](../estimation/foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes). |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. Under a `[mixture]` model this also switches off the class-aware mu-referencing θ shift for SAEM and estimating IMP/IMPMAP (see [Mixture models](../estimation/mixture.qmd#mu-referencing-under-a-mixture)). |
@@ -566,6 +566,70 @@ Notes:
   is well-conditioned even near constraints. The Steihaug CG budget defaults to
   `ceil(sqrt(n_params))` — typically 5 for standard NLME models, which is far
   cheaper than the previous FD-Hessian path (O(n²) OFV evaluations per Hessian).
+
+## Noise-aware finite-difference intervals {#noise-aware-finite-difference-intervals}
+
+*Experimental (#1314).* Every key here defaults to `fixed`, which is the
+historical behaviour, bit-for-bit.
+
+ferx computes most gradients analytically (`sens/`), but some derivatives are
+necessarily numerical: the outer gradient of models outside the analytic scope,
+the reconverged-EBE outer gradient, and the inner EBE gradient / prediction
+Jacobian when the analytic provider does not cover a model. Those use a
+prescribed interval — `1e-4·(1 + |x|)` outer, `1e-7·(1 + |x|)` inner. A
+prescribed interval is a bet that the objective is smooth at that scale. On a
+genuinely noisy objective (ODE solver tolerance, an FD-inner FOCE marginal) the
+bet can be wrong in either direction: too small and the difference is
+noise, too large and it is a chord across curvature.
+
+`shi` instead *searches* for the interval, using the Shi–Xie–Xuan–Nocedal test:
+widen or narrow until the stencil's third difference is comparable to — but not
+swamped by — the noise you declare. `gill` is a bounded one-sided variant that
+balances curvature against noise. Both need you to state the noise: there is no
+way to infer it from a single evaluation.
+
+### Choosing the noise bounds
+
+The bound is **absolute**, in the units of the thing being differenced, and it
+is a bound on the *error of one evaluation*, not a standard deviation.
+
+- `outer_fd_noise_abs` is in OFV units. For an ODE model, the practical floor is
+  set by `ode_reltol`/`ode_abstol`: an OFV of order 1000 solved at
+  `ode_reltol = 1e-6` is not reproducible below roughly `1e-3`. Start there and
+  compare fits.
+- `inner_fd_objective_noise_abs` is one subject's posterior objective, so it is
+  smaller than the OFV bound by roughly the subject count.
+- `inner_fd_prediction_noise_abs` is one prediction, in DV units.
+
+ferx does **not** guess these. `outer_fd_method = shi` with no
+`outer_fd_noise_abs` is rejected before the fit starts
+(`E_OUTER_FD_NOISE_REQUIRED`), as is a zero or non-finite one — a zero bound
+would make every candidate interval unusable and quietly disable the search.
+
+### What happens when no interval fits
+
+A search can fail to place a stencil: the coordinate sits against a bound, every
+trial point is rejected by the EBE guard, or the interval stops being
+representable in floating point. In that case the coordinate falls back to the
+**fixed** stencil for that gradient evaluation. It is never left at zero — a
+zero derivative does not read as "unknown" to an optimizer, it reads as
+"stationary", and a gradient of them is reported as convergence.
+
+A near-quadratic coordinate is a legitimate non-acceptance too: its third
+difference never rises above the noise however wide the interval grows, so the
+search returns its widest bound-limited interval rather than one the test
+endorsed.
+
+### Scope
+
+`inner_fd_method` is honoured wherever a fit re-solves EBEs from its
+`[fit_options]` — the FOCE/FOCEI objective and gradient, the reconverged-EBE
+gradient, SAEM/IMP/VI/SIR inner loops, the covariance step and post-hoc EBEs.
+Utility paths with no `FitOptions` of their own (`simulate()`, the starting-value
+sweep) always use the fixed policy.
+
+Neither key affects an analytic gradient. If a model is fully inside the
+analytic sensitivity scope, setting these changes nothing.
 
 ## Parameter Scaling and EBE Convergence
 

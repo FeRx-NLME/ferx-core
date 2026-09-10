@@ -7,7 +7,7 @@
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_with_fd_config, InnerFdConfig};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
     compute_bounds, compute_mu_k, coordinate_names, pack_params, packed_fixed_mask, unpack_params,
@@ -676,7 +676,7 @@ fn run_sir_core_scoped(
 
             // Run inner loop warm-started from ML EBEs
             let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (ehs, hms, _, _kappas) = run_inner_loop_warm(
+            let (ehs, hms, _, _kappas) = run_inner_loop_warm_with_fd_config(
                 model,
                 population,
                 &params_k,
@@ -686,6 +686,7 @@ fn run_sir_core_scoped(
                 Some(&sir_mu_k),
                 0, // SIR: no EBE convergence tracking
                 0, // SIR: warm-started; no inner multi-start
+                InnerFdConfig::from_options(options),
             );
 
             // Compute OFV — through the method-aware seam, so an AGQ fit's SIR weights come

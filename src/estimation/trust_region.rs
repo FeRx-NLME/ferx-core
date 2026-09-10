@@ -1,3 +1,4 @@
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_with_fd_config, InnerFdConfig};
 use argmin::core::{
     CostFunction, Error, Executor, Gradient, Hessian, IterState, OptimizationResult, Problem,
     Solver, State, TerminationReason, TerminationStatus, KV,
@@ -7,7 +8,6 @@ use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
     ofv_is_valid, pop_nll_opts, resolve_outer_ftol, OuterResult,
 };
@@ -56,7 +56,7 @@ impl FoceiProblem<'_> {
             Some(warm.as_slice())
         };
         let mu_k = compute_mu_k(self.model, &params.theta, self.options.mu_referencing);
-        let (etas, h_mats, _, _kappas) = run_inner_loop_warm(
+        let (etas, h_mats, _, _kappas) = run_inner_loop_warm_with_fd_config(
             self.model,
             self.population,
             &params,
@@ -66,6 +66,7 @@ impl FoceiProblem<'_> {
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
+            InnerFdConfig::from_options(self.options),
         );
         *self.cached_etas.lock().unwrap() = etas.clone();
         (etas, h_mats)
@@ -764,7 +765,7 @@ pub fn optimize_trust_region(
 
     let final_params = unpack_params(&best_x, init_params);
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
+    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm_with_fd_config(
         model,
         population,
         &final_params,
@@ -774,6 +775,7 @@ pub fn optimize_trust_region(
         Some(&final_mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
+        InnerFdConfig::from_options(options),
     );
 
     let final_ofv = 2.0

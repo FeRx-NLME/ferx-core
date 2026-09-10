@@ -1,16 +1,81 @@
 use super::*;
 use std::collections::HashMap;
 
+/// Deterministic pseudo-noise keyed on the probe point, so the objective stays a
+/// *function* (the same `x` always scores the same) while being unresolvable at
+/// small intervals. See `finite_difference_tests.rs` for the same helper.
+fn ripple(x: f64, amp: f64) -> f64 {
+    let bits = x.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let unit = ((bits >> 11) as f64) / ((1u64 << 53) as f64);
+    amp * (2.0 * unit - 1.0)
+}
+
+/// The point of a noise-aware stencil is to beat the fixed one *on a noisy
+/// objective*. On a smooth one it cannot: a central difference of `x³` is exact
+/// at any interval, so a fixture like that passes identically under
+/// `InnerFdMethod::Fixed` and says nothing about which policy ran.
+///
+/// So this straddles the policies on an objective built to defeat the fixed
+/// `h = 1e-7·(1 + |x|)`: with noise of amplitude 1e-6, that interval sees a
+/// signal-to-noise ratio of `2·1e-6 / (1e-7·12) ≈ 1.7`, and the realised errors
+/// below are measured, not assumed.
 #[test]
-fn shi_inner_gradient_uses_noise_aware_stencil() {
-    let obj = |x: &[f64]| x[0].powi(3);
-    let config = InnerFdConfig {
+fn shi_inner_gradient_beats_the_fixed_stencil_on_a_noisy_objective() {
+    let obj = |x: &[f64]| x[0].powi(3) + ripple(x[0], 1e-6);
+    let shi = InnerFdConfig {
         method: InnerFdMethod::Shi,
-        objective_noise_abs: Some(1e-8),
-        prediction_noise_abs: Some(1e-8),
+        objective_noise_abs: Some(1e-6),
+        prediction_noise_abs: Some(1e-6),
     };
-    let gradient = gradient_fd_config(&obj, &[2.0], 1, config);
-    assert!((gradient[0] - 12.0).abs() < 1e-3);
+
+    let fixed_err = (gradient_fd_config(&obj, &[2.0], 1, InnerFdConfig::fixed())[0] - 12.0).abs();
+    let shi_err = (gradient_fd_config(&obj, &[2.0], 1, shi)[0] - 12.0).abs();
+
+    // Straddle, measured: the fixed stencil's realised error here is 1.831 —
+    // it is genuinely defeated — against the adaptive interval's 4.948e-5, a
+    // factor of 37000. If the fixed arm ever stops failing, the comparison
+    // below is satisfied by both policies and can no longer fail.
+    assert!(
+        fixed_err > 1.0,
+        "fixture no longer defeats the fixed stencil (error {fixed_err}); it has \
+         stopped testing which policy ran"
+    );
+    assert!(
+        shi_err < 1e-3,
+        "adaptive interval error {shi_err} (fixed stencil: {fixed_err})"
+    );
+}
+
+/// `Fixed` must not quietly route through the adaptive search even when noise
+/// bounds are present: the default path has to stay the historical stencil.
+#[test]
+fn fixed_inner_gradient_ignores_the_noise_bounds() {
+    let obj = |x: &[f64]| x[0].powi(3);
+    let with_noise = InnerFdConfig {
+        method: InnerFdMethod::Fixed,
+        objective_noise_abs: Some(1e-6),
+        prediction_noise_abs: Some(1e-6),
+    };
+    assert_eq!(
+        gradient_fd_config(&obj, &[2.0], 1, with_noise),
+        gradient_fd_config(&obj, &[2.0], 1, InnerFdConfig::fixed()),
+    );
+}
+
+/// A missing noise bound must fall back to the fixed stencil, not to a zero
+/// gradient: an all-zero inner gradient reads to BFGS as "already at the EBE".
+#[test]
+fn shi_inner_gradient_falls_back_without_a_noise_bound() {
+    let obj = |x: &[f64]| x[0].powi(3);
+    let no_noise = InnerFdConfig {
+        method: InnerFdMethod::Shi,
+        objective_noise_abs: None,
+        prediction_noise_abs: None,
+    };
+    assert_eq!(
+        gradient_fd_config(&obj, &[2.0], 1, no_noise),
+        gradient_fd_config(&obj, &[2.0], 1, InnerFdConfig::fixed()),
+    );
 }
 
 /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
@@ -1268,31 +1333,77 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
     let eta = [0.1, -0.05, 2.5];
 
     let mut scratch = pk::EventPkParams::default();
-    let jac = compute_jacobian_fd_config(
-        &model,
-        &subject,
-        &theta,
-        &eta,
-        &mut scratch,
-        None,
-        InnerFdConfig {
-            method: InnerFdMethod::Shi,
-            objective_noise_abs: Some(1e-8),
-            prediction_noise_abs: Some(1e-8),
-        },
-    );
+    let mut jacobian = |config| {
+        compute_jacobian_fd_config(&model, &subject, &theta, &eta, &mut scratch, None, config)
+    };
 
-    // Row 2 (FREM obs) must be exactly [0, 0, 1]
-    assert_eq!(jac[(2, 0)], 0.0, "FREM row: ∂Y/∂η_CL must be exactly 0");
-    assert_eq!(jac[(2, 1)], 0.0, "FREM row: ∂Y/∂η_V must be exactly 0");
-    assert_eq!(jac[(2, 2)], 1.0, "FREM row: ∂Y/∂η_COV must be exactly 1");
+    // The FREM row is overwritten by `overwrite_frem_pseudo_obs_rows` whatever
+    // the FD columns held, so it holds under either interval policy — and, by
+    // the same token, an assertion on that row alone cannot see which policy
+    // ran. It is checked under both; the PK rows below are what observe the
+    // columns themselves.
+    for (label, config) in [
+        ("fixed", InnerFdConfig::fixed()),
+        (
+            "shi",
+            InnerFdConfig {
+                method: InnerFdMethod::Shi,
+                objective_noise_abs: Some(1e-8),
+                prediction_noise_abs: Some(1e-8),
+            },
+        ),
+    ] {
+        let jac = jacobian(config);
+        // Row 2 (FREM obs) must be exactly [0, 0, 1]
+        assert_eq!(jac[(2, 0)], 0.0, "{label}: FREM ∂Y/∂η_CL must be exactly 0");
+        assert_eq!(jac[(2, 1)], 0.0, "{label}: FREM ∂Y/∂η_V must be exactly 0");
+        assert_eq!(
+            jac[(2, 2)],
+            1.0,
+            "{label}: FREM ∂Y/∂η_COV must be exactly 1"
+        );
 
-    // PK rows should be non-zero for at least CL (row 0, col 0)
+        // PK rows should be non-zero for at least CL (row 0, col 0)
+        assert!(
+            jac[(0, 0)].abs() > 1e-10,
+            "{label}: PK row ∂Y/∂η_CL should be nonzero"
+        );
+    }
+
+    // The two policies must agree on the *computed* rows. This is the assertion
+    // the Shi arm is actually visible in: a helper returning a constant column
+    // still satisfies every FREM-row check above, but not this one.
+    let fixed = jacobian(InnerFdConfig::fixed());
+    let shi = jacobian(InnerFdConfig {
+        method: InnerFdMethod::Shi,
+        objective_noise_abs: Some(1e-8),
+        prediction_noise_abs: Some(1e-8),
+    });
+    let mut worst = 0.0_f64;
+    for row in 0..2 {
+        for col in 0..3 {
+            let (a, b) = (fixed[(row, col)], shi[(row, col)]);
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "non-finite Jacobian entry at ({row}, {col}): {a} vs {b}"
+            );
+            worst = worst.max((a - b).abs());
+        }
+    }
     assert!(
-        jac[(0, 0)].abs() > 1e-10,
-        "PK row: ∂Y/∂η_CL should be nonzero"
+        worst < FIXED_SHI_TOL,
+        "policies disagree on the PK Jacobian rows by {worst}"
     );
 }
+
+/// Bound for the fixed-vs-Shi PK-Jacobian agreement above.
+///
+/// **Measured**, not argued: the realised worst |fixed − shi| over the six PK
+/// entries is `9.786e-7`, so this is ~10× headroom. The difference is the two
+/// policies' truncation error — Shi settles on a much wider interval than the
+/// fixed `1e-6·(1+|η|)` and pays `O(h²)` for it — and it is the quantity that
+/// moves if either column stops being computed.
+const FIXED_SHI_TOL: f64 = 1e-5;
 
 #[test]
 fn test_nelder_mead_nan_objective_does_not_panic() {

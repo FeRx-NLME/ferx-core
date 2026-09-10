@@ -16,6 +16,7 @@
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
+use crate::estimation::inner_optimizer::InnerFdConfig;
 use crate::estimation::parameterization::{compute_mu_k, pack_params, packed_len, unpack_params};
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::io::hash::sha256_file;
@@ -277,7 +278,7 @@ fn run_covariance_scoped(
     };
     let mu_k = compute_mu_k(model_ref, &params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, kappas) =
-        crate::estimation::inner_optimizer::run_inner_loop_warm(
+        crate::estimation::inner_optimizer::run_inner_loop_warm_with_fd_config(
             model_ref,
             pop_ref,
             &params,
@@ -289,6 +290,7 @@ fn run_covariance_scoped(
             // Cold reconvergence: match the fit's inner multi-start so the EBEs
             // land in the same basin (else SEs would differ from the inline path).
             options.inner_restarts,
+            InnerFdConfig::from_options(options),
         );
 
     // --- Run the covariance step (UNGATED: calling `run_covariance` IS the

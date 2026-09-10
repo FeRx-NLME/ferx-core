@@ -1,5 +1,5 @@
 use crate::estimation::finite_difference::{
-    adaptive_first_derivative, shi_central_vector_derivative, AxisBounds,
+    shi_central_vector_derivative, shi_first_derivative, AxisBounds,
 };
 use crate::pk;
 #[cfg(test)]
@@ -1577,7 +1577,7 @@ fn compute_jacobian_fd_iov(
                     },
                 ) {
                     for row in 0..n_obs {
-                        h[(row, col)] = column[row];
+                        h[(row, col)] = column.derivative[row];
                     }
                     continue;
                 }
@@ -3359,11 +3359,18 @@ fn backtracking_line_search(
     (0.0, f0)
 }
 
-/// Central finite difference gradient (optimized step size)
+/// [`gradient_fd_config`] under the default `Fixed` policy. Only the tests
+/// reach it: every production caller threads the fit's configured policy.
+#[cfg(test)]
 fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
     gradient_fd_config(obj, x, n, InnerFdConfig::fixed())
 }
 
+/// Central finite difference gradient (optimized step size).
+///
+/// `config` selects the interval policy: `Fixed` keeps the historical
+/// `1e-7·(1+|x|)` stencil, `Shi` searches for a noise-aware interval and falls
+/// back to that same stencil when no interval fits.
 fn gradient_fd_config(
     obj: &dyn Fn(&[f64]) -> f64,
     x: &[f64],
@@ -3377,8 +3384,7 @@ fn gradient_fd_config(
         let h = 1e-7 * (1.0 + x[i].abs());
         if config.method == InnerFdMethod::Shi {
             if let Some(noise) = config.objective_noise_abs {
-                if let Some(d) = adaptive_first_derivative(
-                    OuterFdMethod::Shi,
+                if let Some(est) = shi_first_derivative(
                     x[i],
                     h,
                     AxisBounds {
@@ -3393,7 +3399,7 @@ fn gradient_fd_config(
                         y.is_finite().then_some(y)
                     },
                 ) {
-                    g[i] = d;
+                    g[i] = est.derivative[0];
                     continue;
                 }
             }
@@ -3416,25 +3422,6 @@ fn gradient_fd_config(
 /// pre-built `EventSchedule` so each of the `2 * n_eta` perturbed
 /// prediction calls avoids the per-event-param Vec allocation and
 /// the per-call event-merge sort.
-fn compute_jacobian_fd(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> DMatrix<f64> {
-    compute_jacobian_fd_config(
-        model,
-        subject,
-        theta,
-        eta,
-        scratch,
-        schedule,
-        InnerFdConfig::fixed(),
-    )
-}
-
 fn compute_jacobian_fd_config(
     model: &CompiledModel,
     subject: &Subject,
@@ -3476,7 +3463,7 @@ fn compute_jacobian_fd_config(
                     },
                 ) {
                     for i in 0..n_obs {
-                        h[(i, j)] = column[i];
+                        h[(i, j)] = column.derivative[i];
                     }
                     continue;
                 }
@@ -3555,7 +3542,7 @@ pub fn run_inner_loop_warm(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
-    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
+    run_inner_loop_warm_with_fd_config(
         model,
         population,
         params,
@@ -3566,6 +3553,46 @@ pub fn run_inner_loop_warm(
         min_obs,
         restarts,
         InnerFdConfig::fixed(),
+    )
+}
+
+/// [`run_inner_loop_warm`] under an explicit inner finite-difference policy.
+///
+/// Every caller that holds a [`FitOptions`] routes here. The reason is not
+/// tidiness: the outer objective and the reconverged-FD outer *gradient* both
+/// re-solve the EBEs, and a gradient that differences fixed-policy EBEs against
+/// a Shi-policy objective is a difference of two different functions. The
+/// no-`FitOptions` callers (`simulate`, the start-value sweep, tests) keep the
+/// `Fixed` wrapper, which is the default policy in any case.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_inner_loop_warm_with_fd_config(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    fd_config: InnerFdConfig,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        fd_config,
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)

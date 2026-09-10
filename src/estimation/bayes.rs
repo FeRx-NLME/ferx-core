@@ -19,6 +19,7 @@
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
+use crate::estimation::inner_optimizer::InnerFdConfig;
 use crate::estimation::mixture::combine_subject;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps};
@@ -1476,7 +1477,7 @@ pub fn run_bayes(
         )
     } else {
         let (eta_hats, h_matrices, inner_stats, kappas) =
-            crate::estimation::inner_optimizer::run_inner_loop_warm(
+            crate::estimation::inner_optimizer::run_inner_loop_warm_with_fd_config(
                 model,
                 population,
                 &mean_params,
@@ -1486,6 +1487,7 @@ pub fn run_bayes(
                 None,
                 0,
                 0,
+                InnerFdConfig::from_options(options),
             );
         // OFV at the posterior mean (2·Σ individual_nll, IOV-aware). NOTE: this is
         // the posterior-mean joint NLL ×2, NOT a FOCE/Laplace marginal OFV — it is
