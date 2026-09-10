@@ -3818,12 +3818,28 @@ pub fn parse_full_model_with(
         // performance cliff a user should not have to infer from a slow fit.
         // Only a parameter that actually carries an eta is worth naming.
         //
-        // And only for a method that *reads* `mu_refs` at all: the warning's own
-        // last sentence says FOCE/FOCEI are unaffected, so emitting it on a
-        // FOCEI fit is a paragraph about a path that run never takes. The
-        // consumers are the EM / importance-sampling / Bayes family (grep
-        // `mu_refs` under `src/estimation/`: saem, importance_sampling, impmap,
-        // bayes — `parameterization` serves those).
+        // And only for a method whose *M-step* reads `mu_refs`, which is the
+        // cliff this warning is about: SAEM's closed-form θ update, and the
+        // importance-sampling / Bayes family that shares it (grep `mu_refs`
+        // under `src/estimation/`: saem, importance_sampling, impmap, bayes —
+        // `parameterization` serves those). Losing the anchor there swaps a
+        // closed form for a numerical M-step.
+        //
+        // Not "the methods that read `mu_refs` at all", which is every method:
+        // `compute_mu_k` is called from `outer_optimizer`, `gauss_newton`,
+        // `covariance`, `run_covariance` and `sir` too, because mu-referencing
+        // also re-centres the inner search into psi-space (`psi = eta + mu_k`)
+        // for FOCE/FOCEI/GN. That is a conditioning change, not a change of
+        // algorithm — no step becomes numerical that was not — so it is not
+        // worth a paragraph on every FOCEI fit, and the warning's own last
+        // sentence says as much.
+        //
+        // Read the whole **chain**, not `fit_options.method`: that field is the
+        // *last* stage of a chained fit (`methods` holds the rest, and
+        // `method = [saem, focei]` leaves `method == FoceI`), so reading it
+        // alone silences the warning on exactly the chain that pays for it, and
+        // labels `[focei, imp]` with only its last stage. Same reasoning as
+        // `FitOptions::non_interaction_stage`.
         //
         // This reads the method the *model file* states, which is the only one a
         // parse-time warning can see: a caller that parses a FOCEI file and then
@@ -3831,13 +3847,19 @@ pub fn parse_full_model_with(
         // model file is the spelling this block exists to warn about, and the
         // detection itself (`mu_refs`, `has_conditional_eta_params`) is not
         // gated — only the message is.
-        let method_uses_mu_refs = matches!(
-            fit_options.method,
-            EstimationMethod::Saem
-                | EstimationMethod::Imp
-                | EstimationMethod::Impmap
-                | EstimationMethod::Bayes
-        );
+        let mut mu_step_stages: Vec<EstimationMethod> = Vec::new();
+        for stage in fit_options.method_chain() {
+            let uses_mu_step = matches!(
+                stage,
+                EstimationMethod::Saem
+                    | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
+                    | EstimationMethod::Bayes
+            );
+            if uses_mu_step && !mu_step_stages.contains(&stage) {
+                mu_step_stages.push(stage);
+            }
+        }
         let additive_params: Vec<String> = match &model.covariate_model {
             Some(spec) => {
                 let mut out: Vec<String> = Vec::new();
@@ -3858,15 +3880,17 @@ pub fn parse_full_model_with(
             }
             None => Vec::new(),
         };
-        if method_uses_mu_refs && !additive_params.is_empty() {
+        if !mu_step_stages.is_empty() && !additive_params.is_empty() {
+            let stages: Vec<&str> = mu_step_stages.iter().map(|m| m.label()).collect();
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for parameter(s) with an additive (`+`) \
                  [covariate_model] relation: {}. The typical value is a sum, so it is not \
-                 log-linear in one theta and {} uses the numerical M-step for these etas. \
-                 Use a multiplicative relation to keep mu-referencing (FOCE/FOCEI do not use \
-                 it and are unaffected).",
+                 log-linear in one theta and {} {} the numerical M-step for these etas. \
+                 Use a multiplicative relation to keep mu-referencing (FOCE/FOCEI use \
+                 mu_refs only to re-centre the inner search, so they lose no closed form).",
                 additive_params.join(", "),
-                fit_options.method.label(),
+                stages.join(" / "),
+                if stages.len() == 1 { "uses" } else { "use" },
             ));
         }
     }

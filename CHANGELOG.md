@@ -54,9 +54,13 @@ section of the SDLC for the versioning policy).
   relation carries no top-level-product requirement. Its default θ bounds are scale-free
   (`±1e6`) rather than PsN's `[1/(c−max), 1/(c−min)]`, which encode the positivity of a
   factor the additive form does not have, and a centre outside the observed covariate range
-  is legal under `+` for the same reason. Mu-referencing switches off for a parameter with an
-  additive relation — the typical value is a sum — and the parser warns, for the methods that
-  read mu-references (SAEM / IMP / IMPMAP / BAYES). The relation table on `FitResult` and in
+  is legal under `+` for the same reason — except for `hockey`, whose breakpoint must still
+  lie inside the range or one arm holds no subjects. That check and the constant-covariate
+  one now run whenever the model meets a dataset, so they also cover an additive relation
+  with a *literal* centre, which resolves without consulting the data. Mu-referencing
+  switches off for a parameter with an additive relation — the typical value is a sum — and
+  the parser warns, for the methods whose M-step reads mu-references (SAEM / IMP / IMPMAP /
+  BAYES), naming every such stage of a chained `method = [saem, focei]`. The relation table on `FitResult` and in
   `{model}-fit.yaml` gains an `op` field, so a caller reading the model back can tell the two
   spellings apart.
   This is the last MFL operator: `COVARIATE(..., +)` is no longer a search coverage gap, and

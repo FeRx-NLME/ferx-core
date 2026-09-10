@@ -1420,9 +1420,70 @@ fn the_mu_reference_warning_is_scoped_to_the_methods_that_read_mu_refs() {
     for method in ["focei", "foce", "laplace"] {
         assert!(
             fired(method).is_none(),
-            "{method} never reads mu_refs, so the warning is noise"
+            "{method} never uses the mu-ref M-step, so the warning is noise"
         );
     }
+    for method in ["gn", "gn_hybrid"] {
+        assert!(
+            fired(method).is_none(),
+            "{method} re-centres with mu_refs but runs no closed-form M-step"
+        );
+    }
+}
+
+/// The gate reads the whole method **chain**, not `fit_options.method`.
+///
+/// `method` is the *last* stage of a chained fit — `method = [saem, focei]`
+/// leaves `method == FoceI` — so a gate reading it alone suppresses the warning
+/// on exactly the chain that pays for the loss (the SAEM stage still runs), and
+/// labels `[focei, imp]` with FOCEI, a stage the sentence is not about. The
+/// scalar-method test above cannot fail on either, since every method it feeds
+/// is its own chain.
+#[test]
+fn the_mu_reference_warning_reads_every_stage_of_a_chained_method() {
+    let relation = "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)";
+    let fired = |method: &str| {
+        parse_full_model(&model_with_method("  WT continuous", relation, method))
+            .expect("model should parse")
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("additive (`+`) [covariate_model]"))
+            .cloned()
+    };
+
+    // The warning survives a stage that does not use mu-referencing being
+    // *last*, and names the stage that does — not the one `method` holds.
+    // The stage list is the text between "theta and" and "the numerical
+    // M-step" — matched as a whole, since the closing sentence names FOCE/FOCEI
+    // on every warning and a bare `contains` would read that as the label.
+    let named = |w: &str| {
+        w.split(" theta and ")
+            .nth(1)
+            .and_then(|rest| rest.split(" use").next())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("the warning names its stages: {w}"))
+    };
+    let saem_then_focei =
+        fired("[saem, focei]").expect("the SAEM stage still runs, and still pays the cliff");
+    assert_eq!(named(&saem_then_focei), "SAEM", "{saem_then_focei}");
+    let focei_then_imp = fired("[focei, imp]").expect("the IMP stage uses the mu-ref M-step");
+    assert_eq!(named(&focei_then_imp), "IMP", "{focei_then_imp}");
+    // Every mu-step stage is named, in chain order, and only once.
+    let two = fired("[saem, imp]").expect("both stages use the mu-ref M-step");
+    assert!(two.contains("SAEM / IMP"), "{two}");
+    assert!(two.contains("use the numerical M-step"), "{two}");
+    assert!(
+        saem_then_focei.contains("uses the numerical M-step"),
+        "one stage takes the singular verb: {saem_then_focei}"
+    );
+
+    // The straddle: a chain with no mu-step stage at all stays quiet, so the
+    // assertions above are about the chain and not about chained syntax.
+    assert!(
+        fired("[foce, focei]").is_none(),
+        "neither stage uses the mu-ref M-step"
+    );
 }
 
 #[test]

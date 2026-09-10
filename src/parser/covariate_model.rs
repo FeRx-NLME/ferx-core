@@ -821,8 +821,11 @@ fn build_thetas(
         CovariateForm::Linear | CovariateForm::LinearRelative | CovariateForm::Hockey => {
             if rel.op == CovariateOp::Add {
                 // The additive defaults are scale-free, so unlike the
-                // multiplicative ones they do not wait on a dataset.
-                additive_linear_family_thetas(rel, summary, center)?
+                // multiplicative ones they do not wait on a dataset. What the
+                // data still decides for them — a constant covariate, a hockey
+                // breakpoint with an empty arm — is decided in
+                // `check_relation_against_data`, once a population is bound.
+                additive_linear_family_thetas(rel, center)?
             } else {
                 let Some(summary) = summary else {
                     return Ok(Vec::new());
@@ -859,45 +862,31 @@ const ADDITIVE_THETA_BOUNDS: (f64, f64) = (-1e6, 1e6);
 ///
 /// The multiplicative twin ([`linear_family_thetas`]) derives both bounds *and*
 /// its init from the covariate's spread, because both encode the positivity of
-/// `1 + θ·(COV − c)`. None of that survives the drop of the leading `1`, so the
-/// only thing the data is still consulted for here is the degenerate case: a
-/// constant covariate makes `θ·(c₀ − c)` a constant shift, confounded with the
-/// typical value, and no bound can make it identifiable.
+/// `1 + θ·(COV − c)`. None of that survives the drop of the leading `1`, so
+/// nothing here consults the data at all: an additive relation with a literal
+/// centre is fully built at parse time.
 ///
-/// That last check is best-effort, and the asymmetry with the multiplicative
-/// path is worth stating: there, the *bounds* need the spread, so the relation
-/// is unresolved until a dataset arrives and a constant covariate is always
-/// caught. Here nothing else needs data, so an additive relation with a
-/// **literal** centre is fully built at parse time and is never handed a
-/// summary. Making it wait for data anyway would be a false requirement — the
-/// defaults below do not depend on the dataset — so the check fires only for a
-/// symbolic centre (`center = median`, …).
+/// That is also why the two degenerate *designs* — a constant covariate, a
+/// `hockey` breakpoint outside the observed range — are not checked here. They
+/// are properties of the dataset rather than of the bounds, so they are checked
+/// once, against the data, in [`check_relation_against_data`]. Checking them
+/// here too would fire only on the relations that happen to be handed a summary
+/// (those with a *symbolic* centre), which is the subset that needs the check
+/// least.
 ///
 /// The init is `0.001` in the *absolute* slope, scaled for `linear_relative`
 /// exactly as the multiplicative path scales it, so the two spellings still
-/// start the optimiser at the same covariate effect.
+/// start the optimiser at the same covariate effect. The **bounds** are not
+/// scaled, unlike the multiplicative twin's: there they are `1/(c − min)` and
+/// `1/(c − max)`, in the same units as the init, so the reparameterization has
+/// to carry them along; here they are the fixed scale-free sentinels of
+/// [`ADDITIVE_THETA_BOUNDS`], and scaling a sentinel by the centre would make
+/// the "effectively unbounded" width depend on the covariate's units without
+/// bounding anything (and flip it for a negative centre).
 fn additive_linear_family_thetas(
     rel: &CovariateRelation,
-    summary: Option<&CovariateSummary>,
     center: f64,
 ) -> Result<Vec<CovariateTheta>, String> {
-    if let Some(summary) = summary {
-        if summary.min == summary.max {
-            return Err(format!(
-                "[covariate_model]: `{} ~ {} {} +` has nothing to estimate — `{}` is constant \
-                 ({}) in the data, so the added term `θ·({} − {center})` is a constant shift, \
-                 confounded with the typical value of `{}`. Drop the relation, or supply data \
-                 where the covariate varies.",
-                rel.parameter,
-                rel.covariate,
-                rel.form.label(),
-                rel.covariate,
-                summary.min,
-                rel.covariate,
-                rel.parameter,
-            ));
-        }
-    }
     let scale = if matches!(rel.form, CovariateForm::LinearRelative) {
         center
     } else {
@@ -933,6 +922,87 @@ fn additive_linear_family_thetas(
             level: None,
         }],
     })
+}
+
+/// Whether a relation's validity depends on the dataset *after* its θ are
+/// built — the predicate [`check_relation_against_data`] is scoped to, and the
+/// one [`crate::api::bind_covariate_stats`] reads to decide whether a model
+/// with nothing left to resolve still has to be summarised.
+///
+/// Only the additive linear family qualifies. Every multiplicative default
+/// bound is already a function of the covariate's spread, so
+/// [`linear_family_thetas`] cannot build a θ at all for a degenerate design and
+/// the relation never gets this far; the additive defaults are scale-free
+/// ([`ADDITIVE_THETA_BOUNDS`]) and so build fine for designs that cannot be
+/// estimated.
+pub(crate) fn wants_data_check(rel: &CovariateRelation) -> bool {
+    rel.op == CovariateOp::Add
+        && matches!(
+            rel.form,
+            CovariateForm::Linear | CovariateForm::LinearRelative | CovariateForm::Hockey
+        )
+}
+
+/// Reject an additive relation the *data* shows has nothing to estimate.
+///
+/// Two of the conditions the multiplicative path gets for free from its bounds
+/// are about the **design**, not about keeping a factor positive, and so
+/// survive the drop of the leading `1`:
+///
+/// * a **constant** covariate makes `θ·(c₀ − c)` a constant shift, confounded
+///   with the parameter's typical value — no bound can make that identifiable;
+/// * a `hockey` **breakpoint** outside the observed range leaves one arm with
+///   no subjects, so that arm's θ has an identically zero gradient and the
+///   covariance step is singular. This is the one centre rule that does *not*
+///   relax under `+`: it is about support, not about factor positivity. Hence
+///   `linear(center = 0) +` — the uncentred slope — is accepted and
+///   `hockey(breakpoint = 0) +` on `WT ∈ [45, 94]` is not.
+///
+/// Called once, from [`crate::api::bind_covariate_stats`], which is why it can
+/// be stated as a rule about the data rather than about the parse: an additive
+/// relation with a **literal** centre resolves at parse time, is therefore
+/// never handed a `CovariateSummary` by the parser, and a copy of these checks
+/// inside the θ builder would silently skip exactly that case.
+pub(crate) fn check_relation_against_data(
+    rel: &CovariateRelation,
+    summary: &CovariateSummary,
+) -> Result<(), String> {
+    if !wants_data_check(rel) {
+        return Ok(());
+    }
+    // `None` only while the relation is unresolved, which
+    // `assert_covariate_model_bound` has already refused by the time this runs.
+    let Some(center) = rel.resolved_center else {
+        return Ok(());
+    };
+    if summary.min == summary.max {
+        return Err(format!(
+            "[covariate_model]: `{} ~ {} {} +` has nothing to estimate — `{}` is constant \
+             ({}) in the data, so the added term `θ·({} − {center})` is a constant shift, \
+             confounded with the typical value of `{}`. Drop the relation, or supply data \
+             where the covariate varies.",
+            rel.parameter,
+            rel.covariate,
+            rel.form.label(),
+            rel.covariate,
+            summary.min,
+            rel.covariate,
+            rel.parameter,
+        ));
+    }
+    if matches!(rel.form, CovariateForm::Hockey) && !(summary.min < center && center < summary.max)
+    {
+        return Err(format!(
+            "[covariate_model]: `{} ~ {} hockey(breakpoint = {center}) +` puts its breakpoint \
+             outside the observed range of `{}`, which spans [{}, {}] in the data — one arm \
+             then holds no subjects and its θ has an identically zero gradient, which also \
+             makes the covariance step singular. Move the breakpoint inside the range, or use \
+             `linear` (whose single slope needs no split, and which under `+` accepts any \
+             centre).",
+            rel.parameter, rel.covariate, rel.covariate, summary.min, summary.max,
+        ));
+    }
+    Ok(())
 }
 
 /// PsN's default init/bounds for the linear family under `*`.

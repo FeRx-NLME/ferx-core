@@ -27,13 +27,22 @@
 
 use std::collections::HashSet;
 
-use crate::parser::covariate_model::CovariateStatBindings;
+use crate::parser::covariate_model::{
+    check_relation_against_data, wants_data_check, CovariateStatBindings,
+};
 use crate::parser::model_parser::parse_full_model_with;
 use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
 
 /// Resolve every symbolic statistic in `parsed`'s `[covariate_model]` block
 /// against `population`, re-parsing the model so the desugared expressions
 /// carry the resolved values.
+///
+/// It also **validates** every relation against the summarised data, which is a
+/// second reason to summarise: an additive (`+`) relation's defaults are
+/// scale-free, so unlike a multiplicative one it resolves at parse time with a
+/// literal centre and would otherwise never meet the dataset it cannot be
+/// estimated on (a constant covariate, a `hockey` breakpoint with an empty
+/// arm — `covariate_model::check_relation_against_data`).
 ///
 /// A no-op (and no re-parse) for the overwhelming majority of models: those
 /// with no `[covariate_model]` block, and those whose relations are all stated
@@ -46,7 +55,9 @@ pub fn bind_covariate_stats(
     let Some(spec) = parsed.model.covariate_model.as_ref() else {
         return Ok(());
     };
-    if spec.unresolved().is_empty() {
+    let needs_rebind = !spec.unresolved().is_empty();
+    let needs_check = spec.relations.iter().any(wants_data_check);
+    if !needs_rebind && !needs_check {
         return Ok(());
     }
     // Summarise every covariate any relation reads, not only the unresolved
@@ -62,12 +73,37 @@ pub fn bind_covariate_stats(
         stats.insert(name.to_string(), summarize(name, population)?);
     }
 
-    let model_name = parsed.model.name.clone();
-    parsed.bindings.covariate_stats = stats;
-    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
-    parsed.model = rebound.model;
-    parsed.model.name = model_name;
-    assert_covariate_model_bound(&parsed.model)
+    if needs_rebind {
+        let model_name = parsed.model.name.clone();
+        parsed.bindings.covariate_stats = stats.clone();
+        let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+        parsed.model = rebound.model;
+        parsed.model.name = model_name;
+        assert_covariate_model_bound(&parsed.model)?;
+    }
+    // After the re-parse, so a symbolic centre is checked at the value it
+    // actually resolved to rather than at the statistic's name.
+    check_relations_against_data(&parsed.model, &stats)
+}
+
+/// Run `check_relation_against_data` over every relation the model carries.
+///
+/// A relation whose covariate is missing from `stats` is skipped rather than
+/// failed: `stats` is built from the relations themselves, so that can only
+/// happen if a caller hands in a partial table.
+fn check_relations_against_data(
+    model: &CompiledModel,
+    stats: &CovariateStatBindings,
+) -> Result<(), String> {
+    let Some(spec) = model.covariate_model.as_ref() else {
+        return Ok(());
+    };
+    for rel in &spec.relations {
+        if let Some(summary) = stats.get(&rel.covariate) {
+            check_relation_against_data(rel, summary)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reject a model whose `[covariate_model]` still carries a relation waiting on

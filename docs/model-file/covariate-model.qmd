@@ -153,9 +153,15 @@ multiplicative form.
 
 An additive term makes the typical value a sum, so it is no longer log-linear in
 one θ and the SAEM mu-reference detector does not match it. The parameter's η
-falls back to the numerical M-step under `method = saem` / `imp`, which is
-slower but correct — the covariate effect is in the expression either way. The
-parser says so in a warning naming the parameter. FOCE/FOCEI are unaffected.
+falls back to the numerical M-step under `method = saem` / `imp` / `impmap` /
+`bayes`, which is slower but correct — the covariate effect is in the expression
+either way. The parser says so in a warning naming the parameter and the stages
+it applies to, reading **every** stage of a chained `method = [saem, focei]`,
+not just the last.
+
+FOCE/FOCEI (and `gn` / `gn_hybrid`) also read the mu-references, but only to
+re-centre the inner search into `psi = eta + mu_k`; no closed-form step is lost
+there, so they are not warned about.
 :::
 
 ### Coming from PsN `scm`
@@ -238,6 +244,20 @@ bounds entirely:
 | `categorical2` | `0.999` | `−1e6 + 1` | `1e6 + 1` |
 | `exponential`, `power` | `0.001` | `−100` | `1e6` |
 
+`linear_relative` scales its **init** by the centre, because `θ_rel = c·θ_abs`
+and the two spellings have to start the optimiser at the same covariate effect;
+it does not scale its bounds. Multiplicatively it must — there the bounds are
+`1/(c − min)` and `1/(c − max)`, in the same units as the init — but here they
+are fixed scale-free sentinels, and multiplying a sentinel by the centre would
+make the "effectively unbounded" width depend on the covariate's units without
+bounding anything.
+
+`exponential` and `power` keep the multiplicative row unchanged, and that is
+deliberate: their additive templates are `exp(θ·(COV − c)) − 1` and
+`(COV/c)^θ − 1`, so θ sits inside an exponent either way, in the covariate's
+units and not the parameter's. Nothing about those bounds encodes a leading `1`
+to drop.
+
 `categorical2`'s row stays the image of `categorical`'s under
 `θ_cat2 = 1 + θ_cat` here too — its additive template is `θ_k − 1` where
 `categorical`'s is `θ_k` — so the two spellings remain the identical model
@@ -250,10 +270,23 @@ illustration — so a slope of that size would be estimated *at* its bound, and 
 covariate search would under-detect the effect with no warning.
 
 The centre rule relaxes with the bounds: under `+` a centre outside the observed
-range is fine (`linear(center = 0) +` is just the uncentred slope `θ·COV`). A
-covariate that is **constant** in the data is still rejected when the centre is
-symbolic, since `θ·(c₀ − c)` is then a constant shift confounded with the
-parameter's typical value.
+range is fine for the single-slope forms (`linear(center = 0) +` is just the
+uncentred slope `θ·COV`).
+
+Two degenerate *designs* are still rejected, once a dataset is bound — they are
+properties of the data rather than of the bounds, so they hold under `+` too:
+
+- a covariate that is **constant** in the data, since `θ·(c₀ − c)` is then a
+  constant shift confounded with the parameter's typical value;
+- a `hockey` **breakpoint outside the observed range**, since one arm then holds
+  no subjects and its θ has an identically zero gradient (which also makes the
+  covariance step singular). This is the one part of the centre rule that does
+  *not* relax under `+`: it is about support, not about keeping a factor
+  positive.
+
+Both are checked whenever the model meets a dataset, including for a **literal**
+centre — an additive relation with one resolves without ever consulting the
+data, so the check cannot live in the parser.
 
 Bound an additive θ yourself once you know the parameter's scale — a clearance
 term is worth a very different bound from a lag-time one:

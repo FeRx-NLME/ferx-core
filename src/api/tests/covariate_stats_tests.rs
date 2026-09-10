@@ -287,6 +287,13 @@ fn additive_default_bounds_are_not_the_multiplicative_positivity_bounds() {
 /// `linear_relative` is `linear` reparameterized as `θ_rel = c·θ_abs`, and that
 /// identity has to survive the operator switch: both spellings must start the
 /// optimiser at the same covariate effect.
+///
+/// The **bounds** deliberately do *not* follow the init through that scaling,
+/// unlike the multiplicative twin where they must (there they are `1/(c − min)`
+/// and `1/(c − max)`, in the same units as the init). Under `+` they are the
+/// fixed scale-free sentinels, so both spellings carry the same pair — asserted
+/// here, since the reparameterization is the obvious reason to scale them and
+/// the init assertion alone would not notice.
 #[test]
 fn the_additive_init_is_the_same_effect_in_both_linear_parameterizations() {
     let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
@@ -303,10 +310,20 @@ fn the_additive_init_is_the_same_effect_in_both_linear_parameterizations() {
         &pop,
     )
     .expect("binding should succeed");
-    let abs = abs.covariate_model.as_ref().unwrap().relations[0].thetas[0].init;
-    let rel = rel.covariate_model.as_ref().unwrap().relations[0].thetas[0].init;
+    let abs = abs.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
+    let rel = rel.covariate_model.as_ref().unwrap().relations[0].thetas[0].clone();
     // θ_rel = 70 · θ_abs.
-    assert!((rel - 70.0 * abs).abs() < 1e-15, "{rel} vs {abs}");
+    assert!(
+        (rel.init - 70.0 * abs.init).abs() < 1e-15,
+        "{:?} vs {:?}",
+        rel,
+        abs
+    );
+    // The bounds are the sentinels on both sides — not `70 ×` them.
+    for theta in [&abs, &rel] {
+        assert_eq!(theta.lower, -1e6, "{theta:?}");
+        assert_eq!(theta.upper, 1e6, "{theta:?}");
+    }
 }
 
 /// Additive `categorical` shifts the parameter by `θ_k` outright, so PsN's
@@ -388,6 +405,11 @@ fn additive_categorical2_defaults_stay_the_image_of_categorical() {
 /// It is rejected multiplicatively — correctly, the PsN bounds are unordered
 /// there — and the shared gate rejected it under `+` too, citing a factor the
 /// additive form does not have.
+///
+/// The single-slope forms only: `hockey` needs its breakpoint inside the range
+/// for a reason that is about support rather than positivity, and so keeps the
+/// requirement under `+` — see
+/// `an_additive_hockey_breakpoint_outside_the_data_is_rejected`.
 #[test]
 fn a_centre_outside_the_observed_range_is_legal_for_an_additive_relation() {
     let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
@@ -413,8 +435,9 @@ fn a_centre_outside_the_observed_range_is_legal_for_an_additive_relation() {
 #[test]
 fn a_constant_covariate_is_still_rejected_for_an_additive_relation() {
     let pop = population("WT", &[70.0, 70.0, 70.0]);
-    // A symbolic centre, which is what puts a summary in front of the check —
-    // see `additive_linear_family_thetas` for why a literal centre does not.
+    // A symbolic centre. The literal-centre arm — which resolves at parse time
+    // and so never meets the data on its own — is
+    // `a_constant_covariate_is_rejected_for_a_literal_additive_centre`.
     let err = bind(
         &model("  WT continuous", "  CL ~ WT linear(center = median) +"),
         &pop,
@@ -869,4 +892,108 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
         });
     assert!(cl.contains("present(WT)"), "{cl}");
     assert!(cl.contains("^THETA_CL_WT"), "{cl}");
+}
+
+/// A `hockey` breakpoint outside the observed range is rejected under `+` too.
+///
+/// The additive defaults drop the multiplicative centre-inside-range rule
+/// because that rule keeps a *factor* positive, and `+` has no factor. The
+/// hockey rule survives the drop for a different reason: outside the range one
+/// arm holds no subjects, so its θ has an identically zero gradient and the
+/// covariance step is singular. Dropping both together (#1316 review) accepted
+/// `hockey(breakpoint = 0) +` on a realistic weight range.
+///
+/// A differential pair on the **form**, at the same out-of-range centre, so the
+/// relaxation the additive path does keep is asserted next to the one it must
+/// not: `linear(center = 0) +` is the uncentred slope and is fine.
+#[test]
+fn an_additive_hockey_breakpoint_outside_the_data_is_rejected() {
+    let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
+    let err = bind(
+        &model("  WT continuous", "  CL ~ WT hockey(breakpoint = 0) +"),
+        &pop,
+    )
+    .expect_err("one arm holds no subjects");
+    assert!(err.contains("outside the observed range"), "{err}");
+    assert!(
+        err.contains("[50, 90]"),
+        "the message states the range: {err}"
+    );
+
+    // Same operator, same centre, single slope: accepted.
+    bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 0) +"),
+        &pop,
+    )
+    .expect("an uncentred additive slope needs no split, so no support rule applies");
+
+    // Same form, same operator, inside the range: accepted. Without this the
+    // check could pass by rejecting every additive hockey.
+    bind(
+        &model("  WT continuous", "  CL ~ WT hockey(breakpoint = 70) +"),
+        &pop,
+    )
+    .expect("a breakpoint inside the range splits the data");
+
+    // And the multiplicative twin still fails, from its own bounds rule.
+    assert!(
+        bind(
+            &model("  WT continuous", "  CL ~ WT hockey(breakpoint = 0)"),
+            &pop,
+        )
+        .is_err(),
+        "the multiplicative rule is unchanged"
+    );
+}
+
+/// A constant covariate is rejected for an additive relation with a **literal**
+/// centre — the case the check could not previously see.
+///
+/// `linear(center = 70) +` has scale-free defaults, so it is fully built at
+/// parse time, `needs_data()` is false, and `bind_covariate_stats` used to
+/// return before summarising anything. The relation then reached the fit with
+/// `θ·(70 − 70) ≡ 0`: a θ the optimiser cannot move, on data the multiplicative
+/// twin refuses. Which is why the check now lives on the data path rather than
+/// in the θ builder.
+#[test]
+fn a_constant_covariate_is_rejected_for_a_literal_additive_centre() {
+    let pop = population("WT", &[70.0, 70.0, 70.0, 70.0]);
+    let err = bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 70) +"),
+        &pop,
+    )
+    .expect_err("θ·(70 − 70) is identically zero");
+    assert!(err.contains("has nothing to estimate"), "{err}");
+    assert!(err.contains("constant"), "{err}");
+
+    // An explicit θ does not rescue it: the defect is the design, not the bounds.
+    assert!(
+        bind(
+            &model(
+                "  WT continuous",
+                "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+            ),
+            &pop,
+        )
+        .is_err(),
+        "an explicit bound cannot make a constant shift identifiable"
+    );
+
+    // The symbolic-centre arm, which the parse-time check did cover, still fails.
+    assert!(
+        bind(
+            &model("  WT continuous", "  CL ~ WT linear(center = median) +"),
+            &pop,
+        )
+        .is_err(),
+        "a symbolic centre on constant data is unchanged"
+    );
+
+    // The straddle: the same relation on data that varies is accepted, so the
+    // test cannot pass by rejecting every additive linear relation.
+    bind(
+        &model("  WT continuous", "  CL ~ WT linear(center = 70) +"),
+        &population("WT", &[50.0, 70.0, 90.0]),
+    )
+    .expect("a covariate that varies has something to estimate");
 }
