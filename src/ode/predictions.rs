@@ -2598,7 +2598,28 @@ fn subject_dose_attrs(
     (dose_lagtimes, dose_f_bio)
 }
 
-/// Build the extended parameter slice required for a standalone RHS read at `t`.
+/// Per-dose lagtimes only — the half of [`subject_dose_attrs`] that
+/// [`rhs_ext_params_at`] needs. Callers that read `H`/`h` at many `times` for the same
+/// subject (the TTE hazard readouts, #1261) compute this once and reuse it, rather than
+/// re-walking the dose list — and recomputing the unused `F`/bioavailability half — on
+/// every timepoint.
+#[cfg(feature = "survival")]
+#[inline]
+pub(crate) fn dose_lagtimes_for(
+    subject: &Subject,
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+) -> Vec<f64> {
+    subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_params_flat))
+        .collect()
+}
+
+/// Build the extended parameter slice required for a standalone RHS read at `t`, from
+/// a dose-lagtime vector and first-dose time the caller has already computed (via
+/// [`dose_lagtimes_for`] / [`earliest_dose_time`]) — once per subject, not once per `t`.
 ///
 /// Integrating prediction paths keep this slice live and update its TAD anchor at
 /// each segment boundary. Readout-only callers (the TTE hazard derivative) do not
@@ -2608,14 +2629,14 @@ fn subject_dose_attrs(
 #[cfg(feature = "survival")]
 #[inline]
 pub(crate) fn rhs_ext_params_at(
-    ode: &OdeSpec,
-    subject: &Subject,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    first_dose_time: f64,
     pk_params_flat: &[f64],
     t: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
-    let (dose_lagtimes, _) = subject_dose_attrs(subject, ode, pk_params_flat);
-    let mut ext_params = seed_ext_params(pk_params_flat, earliest_dose_time(&subject.doses));
-    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor_for(&subject.doses, &dose_lagtimes, t);
+    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor_for(doses, dose_lagtimes, t);
     ext_params
 }
 

@@ -320,9 +320,19 @@ fn try_joint_pktte_shared_solve(
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let (mut preds, chz_states) =
         crate::ode::ode_predictions_and_chz(ode, &pk.values, theta, eta, subject, &times);
+    let dose_lagtimes = crate::ode::predictions::dose_lagtimes_for(subject, ode, &pk.values);
+    let first_dose_time = crate::ode::predictions::earliest_dose_time(&subject.doses);
     let rhs_params = times
         .iter()
-        .map(|&t| crate::ode::predictions::rhs_ext_params_at(ode, subject, &pk.values, t))
+        .map(|&t| {
+            crate::ode::predictions::rhs_ext_params_at(
+                &subject.doses,
+                &dose_lagtimes,
+                first_dose_time,
+                &pk.values,
+                t,
+            )
+        })
         .collect();
     // Apply exactly the post-processing the standalone no-TV ODE prediction path does
     // (compute_predictions_with_tv_into_with_schedule): init impulse, [scaling], LTBS.
@@ -4159,25 +4169,17 @@ mod tests {
         .expect("joint PK-TTE model must parse")
     }
 
-    /// A joint PK-TTE subject whose first record is a dose at **t = 10** — so the
-    /// integration starts at 10 and a TTE time below it is genuinely pre-start.
-    ///
-    /// `make_simple_subject` cannot host one: it doses at `t = 0`, and `entry_time` is
-    /// gated `> 0.0` ("no truncation"), so there is no positive time before its start.
-    /// PK observations sit at 12 / 16 / 24, all *after* the dose, which keeps
-    /// `t_last ≥ subject_integration_start` and so routes the pre-start read through the
-    /// engines' pre-first-break **fill** rather than through the `k = 0` boundary visit
-    /// that covers a degenerate every-time-before-the-dose timeline (#1218).
-    /// #1261: a TTE hazard readout must receive the dose-time anchors the ODE
-    /// integration used. A bare `PkParams::values` slice made TAD NaN, which the
-    /// scorer converted into its finite 1e20 rejection sentinel.
+    /// Plain no-TV `[odes]` block (does not itself read `TAD`) plus an `OdeAccumulated`
+    /// hazard that does — the exact model shape `try_joint_pktte_shared_solve`'s
+    /// `model_uses_time_anywhere` guard admits to the #570 shared solve, since that
+    /// check is scoped to the PK program and does not inspect the injected
+    /// `d/dt(__chz_*)` hazard line. Shared by the two tests below: one exercising
+    /// `tte_endpoint_nll` / `ode_cumhaz_hazard` directly, the other the production
+    /// `individual_nll_into_with_schedule` entry point FOCE/FOCEI actually calls.
     #[cfg(feature = "survival")]
-    #[test]
-    fn tte_hazard_readout_uses_the_current_tad_anchor() {
+    fn tad_hazard_two_dose_model() -> CompiledModel {
         use crate::parser::model_parser::parse_model_string;
-        use crate::types::{EventType, ObsRecord};
-
-        let model = parse_model_string(
+        parse_model_string(
             r"
 [parameters]
 theta TVCL(1.0, 0.01, 100.0)
@@ -4201,7 +4203,27 @@ hazard = H0 * (1.0 + KT * TAD)
 DV ~ proportional(PROP_ERR)
 ",
         )
-        .expect("TAD-reading ODE hazard must parse");
+        .expect("TAD-reading ODE hazard must parse")
+    }
+
+    /// A joint PK-TTE subject whose first record is a dose at **t = 10** — so the
+    /// integration starts at 10 and a TTE time below it is genuinely pre-start.
+    ///
+    /// `make_simple_subject` cannot host one: it doses at `t = 0`, and `entry_time` is
+    /// gated `> 0.0` ("no truncation"), so there is no positive time before its start.
+    /// PK observations sit at 12 / 16 / 24, all *after* the dose, which keeps
+    /// `t_last ≥ subject_integration_start` and so routes the pre-start read through the
+    /// engines' pre-first-break **fill** rather than through the `k = 0` boundary visit
+    /// that covers a degenerate every-time-before-the-dose timeline (#1218).
+    /// #1261: a TTE hazard readout must receive the dose-time anchors the ODE
+    /// integration used. A bare `PkParams::values` slice made TAD NaN, which the
+    /// scorer converted into its finite 1e20 rejection sentinel.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_hazard_readout_uses_the_current_tad_anchor() {
+        use crate::types::{EventType, ObsRecord};
+
+        let model = tad_hazard_two_dose_model();
         let (chz_state, hazard) = match model.endpoints.get(&3) {
             Some(EndpointLikelihood::Tte {
                 hazard: h @ HazardSpec::OdeAccumulated { chz_state },
@@ -4259,6 +4281,116 @@ DV ~ proportional(PROP_ERR)
         );
         assert_relative_eq!(cum[0], 3.234, epsilon = 2e-4);
         assert_relative_eq!(haz[0], 0.118, epsilon = 2e-6);
+    }
+
+    /// #1261 code-review follow-up: the sibling test above calls `tte_endpoint_nll` and
+    /// `ode_cumhaz_hazard` directly, never the dispatcher FOCE/FOCEI's inner loop
+    /// actually calls. `individual_nll_into_with_schedule` builds `joint_share` for this
+    /// exact model shape (plain no-TV `[odes]` + an `OdeAccumulated` hazard reading
+    /// `TAD`) and routes the TTE term through `tte_ode_nll_from_shared` /
+    /// `share.rhs_params[i]` instead — the #1261 fix's real call site
+    /// (`src/stats/likelihood.rs`, the `(ode.rhs)(st, &share.rhs_params[i], t, &mut du)`
+    /// line). A revert there would go uncaught by every other test in this file.
+    ///
+    /// Isolate the TTE contribution by subtracting a PK-only sibling model/subject that
+    /// drops `[event_model]` and the CMT-3 record entirely: both share the identical
+    /// `[odes]` block, doses, and PK observation, so the Gaussian data term is the same
+    /// between the two calls and cancels in the difference — the #570 shared solve's own
+    /// invariant is that its predictions are bit-identical to the standalone no-TV path
+    /// the PK-only sibling takes (`try_joint_pktte_shared_solve` returns `None` for it,
+    /// since it declares no TTE endpoint to share).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn hot_path_individual_nll_reads_the_shared_solve_tad_anchor() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        let model = tad_hazard_two_dose_model();
+        let pk_only_model = parse_model_string(
+            r"
+[parameters]
+theta TVCL(1.0, 0.01, 100.0)
+theta TVV(10.0, 0.1, 500.0)
+sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+CL = TVCL
+V = TVV
+[structural_model]
+ode(obs_cmt=central, states=[central])
+[odes]
+d/dt(central) = -CL / V * central
+[error_model]
+DV ~ proportional(PROP_ERR)
+",
+        )
+        .expect("PK-only sibling model must parse");
+
+        let mut subject = make_simple_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.obs_times = vec![30.0];
+        subject.observations = vec![0.0];
+        subject.obs_cmts = vec![1];
+        subject.cens = vec![0];
+        subject.occasions = vec![1];
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 30.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        let mut pk_only_subject = subject.clone();
+        pk_only_subject.obs_records = Vec::new();
+
+        let eta = [];
+
+        // The fixture must actually reach the shared solve — otherwise this test would
+        // silently exercise the pre-#570 fallback the sibling test already covers,
+        // rather than the `tte_ode_nll_from_shared` dispatch under review here.
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &model.default_params.theta, &eta)
+                .is_some(),
+            "fixture must qualify for the #570 shared solve"
+        );
+
+        let mut scratch = crate::pk::EventPkParams::default();
+        let p = &model.default_params;
+        let nll_full = individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            &p.theta,
+            &eta,
+            &p.omega,
+            &p.sigma.values,
+            &model.residual_correlations,
+            &mut scratch,
+            None,
+        );
+
+        let pk_p = &pk_only_model.default_params;
+        let nll_pk_only = individual_nll_into_with_schedule(
+            &pk_only_model,
+            &pk_only_subject,
+            &pk_p.theta,
+            &eta,
+            &pk_p.omega,
+            &pk_p.sigma.values,
+            &pk_only_model.residual_correlations,
+            &mut scratch,
+            None,
+        );
+
+        // Same H(30) = 3.234, h(30) = .118 as the sibling test — the isolated TTE term
+        // the shared solve must have contributed.
+        let expected_tte = 3.234_f64 - 0.118_f64.ln();
+        assert_relative_eq!(nll_full - nll_pk_only, expected_tte, epsilon = 2e-4);
+        assert!(
+            nll_full < 1e10,
+            "the old NaN-TAD path returns the finite 1e20 sentinel through this exact \
+             dispatcher; got {nll_full}"
+        );
     }
 
     /// Construct a subject with a positive pre-start TTE time and later PK observations.
