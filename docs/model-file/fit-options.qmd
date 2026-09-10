@@ -606,6 +606,39 @@ ferx does **not** guess these. `outer_fd_method = shi` with no
 (`E_OUTER_FD_NOISE_REQUIRED`), as is a zero or non-finite one — a zero bound
 would make every candidate interval unusable and quietly disable the search.
 
+### When it is worth turning on
+
+Rarely, and the threshold is measurable. The fixed stencil's noise-driven error
+is about `ε/h`, so against a gradient of size `|g|` it only matters once
+`ε ≳ |g|·h` — with the outer `h ≈ 2e-4` that is an OFV noise of order `1e-3`.
+
+Measured on `examples/mm_iv.ferx` (Michaelis-Menten ODE, FD inner gradients),
+worst relative outer-gradient error against each objective's own true gradient,
+with controlled noise of amplitude `ε` added:
+
+| `ε` (OFV units) | `fixed` | `shi` | `gill` |
+|---|---|---|---|
+| 1e-6 | 8.6e-4 | 8.6e-4 | 4.7e-3 |
+| 1e-4 | 1.1e-2 | 6.9e-5 | 1.2e-2 |
+| 1e-2 | 1.1e0 | 2.4e-3 | 2.6e-1 |
+| 1e0 | 1.1e2 | 1.2e-1 | 2.0e0 |
+
+`fixed` degrades linearly in `ε`, as `ε/h` predicts; `shi` holds the gradient to
+three digits where `fixed` has lost it entirely, and is ~1000× more accurate at
+the top of that range.
+
+That is the case *for* the option. The case for leaving it off is the same
+model's real noise: measured at `3e-8`–`3e-6` across `ode_reltol` from 1e-12 to
+1e-3 and `inner_tol` to 1e-2 — one to three orders of magnitude below the
+threshold. In that regime `shi` matches `fixed` to within a factor of two (and
+was slightly worse in two of five settings, from growing `h` into curvature),
+so it buys nothing. **Measure your objective's noise before enabling this.** If
+it is far below `|g|·h`, the fixed stencil is already resolving your gradient.
+
+`gill` was worse than `fixed` at every noise level tested, including 300× worse
+on a clean objective — it is one-sided, and its interval comes from an estimated
+second derivative that is itself noise-limited. Prefer `shi`.
+
 ### What happens when no interval fits
 
 A search can fail to place a stencil: the coordinate sits against a bound, every

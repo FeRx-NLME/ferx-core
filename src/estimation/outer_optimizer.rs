@@ -3814,3 +3814,7 @@ mod tests;
 #[cfg(test)]
 #[path = "outer_fd_interval_tests.rs"]
 mod outer_fd_interval_tests;
+
+#[cfg(test)]
+#[path = "fd_interval_evidence_tests.rs"]
+mod fd_interval_evidence_tests;
