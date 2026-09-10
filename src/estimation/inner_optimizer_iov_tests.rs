@@ -3445,3 +3445,129 @@ fn power_exponent_inner_eta_gradient_matches_fd() {
         approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
     }
 }
+
+/// #1327: on an **exact** (closed-form) IOV objective, a BFGS "failure" must keep the
+/// lower-objective of {BFGS partial, Nelder–Mead restart} — the `argmin_inner_fallback`
+/// policy the non-IOV `find_ebe` has used since #378 — rather than adopt the NM result
+/// unconditionally.
+///
+/// What it catches: a cold-started closed-form BFGS that arrives at the mode and stalls at a
+/// gradient norm just above `tol` (busulfan DCM+IOV subject 261: partial at NLL 94.6,
+/// |g| ≈ 7e-5 > 1e-5) was replaced by an NM from the cold seed that stops at NLL ≈ 5030.
+/// Every cold-started evaluation — the final inner loop, an `outer_maxiter = 0`
+/// re-evaluation — then scored such subjects thousands of −2LL units too high, while the
+/// warm-started trajectory (BFGS converging within `tol` from the previous mode) never
+/// tripped the fallback: the reported OFV sat 9 300 above the value the optimizer minimised.
+///
+/// The fixture forces the fallback deterministically: `max_iter = 1` makes BFGS report
+/// non-convergence after a single exact-gradient line search, which already moves the
+/// objective well below the cold seed's; the NM restart it triggers runs `5 · max_iter`
+/// iterations from the zero seed with NM's `0.00025` initial simplex step, so it barely
+/// leaves the seed (NLL 504.9 → 501.0). Under the pre-#1327 policy that NM point is
+/// returned; under the fix the partial (NLL −1.1, against a converged mode of −4.1) is
+/// kept. Verified by mutation: restoring the unconditional-NM arm turns this red.
+#[test]
+fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  iov_column = OCC
+"#,
+    )
+    .expect("closed-form IOV model parses");
+    assert!(
+        !skip_ode_iov_nm_fallback(&model),
+        "fixture must take the closed-form NM fallback arm"
+    );
+    set_ebe_warm_start(false);
+
+    // Two occasions, one 100 mg IV bolus each; observations simulated at
+    // CL = 5·exp(−1.5), V = 50 (see the test doc) so the mode is far from the zero seed.
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![2.0, 6.0, 26.0, 30.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![1.913, 1.749, 3.032, 2.773],
+        obs_cmts: vec![1; 4],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        reset_occasions: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let params = model.default_params.clone();
+    let cold_nll = individual_nll_iov(
+        &model,
+        &subject,
+        &params.theta,
+        &[0.0],
+        &[vec![0.0], vec![0.0]],
+        &params.omega,
+        params.omega_iov.as_ref(),
+        &params.sigma.values,
+    );
+
+    // `max_iter = 1`: BFGS cannot certify convergence, so the fallback fires.
+    let ebe = find_ebe_iov(&model, &subject, &params, 1, 1e-5, None, None);
+    assert!(
+        !ebe.converged && ebe.used_fallback,
+        "fixture must trip the NM fallback (converged={}, fallback={})",
+        ebe.converged,
+        ebe.used_fallback
+    );
+    assert!(ebe.nll.is_finite(), "fallback returned a non-finite NLL");
+
+    // The converged solve is the floor and the yardstick. Measured on this fixture:
+    // cold-seed NLL 504.88; converged mode −4.13; the one-line-search BFGS partial −1.11
+    // (gap 3.0); the unconditionally-adopted 5-iteration NM from the zero seed 500.98
+    // (gap 505). The bound is ~3× the realised gap of the kept partial and 50× below the
+    // old policy's, so it fails on exactly the mutation it exists to catch and nothing else.
+    let full = find_ebe_iov(&model, &subject, &params, 200, 1e-5, None, None);
+    assert!(full.converged, "reference solve must converge");
+    assert!(
+        ebe.nll >= full.nll - 1e-9,
+        "kept partial ({:.4}) cannot undercut the converged mode ({:.4})",
+        ebe.nll,
+        full.nll
+    );
+    assert!(
+        ebe.nll < full.nll + 10.0,
+        "the BFGS partial must survive the fallback: returned NLL {:.4}, converged mode {:.4}, \
+         cold-seed NLL {:.4} (the pre-#1327 unconditional NM restart returns ≈ 501)",
+        ebe.nll,
+        full.nll,
+        cold_nll
+    );
+}

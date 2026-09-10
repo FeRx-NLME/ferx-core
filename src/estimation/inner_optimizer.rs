@@ -1331,26 +1331,31 @@ fn find_ebe_iov(
         None,
         enable_stall,
     );
-    // On BFGS failure, recover with the same ODE-gated policy as the non-IOV `find_ebe`
-    // (cold seed = prior mode `bsv_psi = μ`, κ = 0): for ODE objectives keep the
-    // lower-objective of {BFGS partial, NM restart} so a correct η̂ floored above `tol` by
-    // solver noise is never discarded (#555); for exact objectives recover with NM from the
-    // cold seed, as prior releases, so a non-stationary low-objective partial can't be kept.
+    // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
+    // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
+    // (`argmin_inner_fallback`). This holds for ODE objectives (#555, a gradient-noise floor
+    // blocks certification at a genuine mode) AND for exact objectives (#378 for the non-IOV
+    // path; #1327 here): a closed-form BFGS started far from the mode routinely arrives at it
+    // and stalls at a gradient norm just above `tol` (busulfan DCM+IOV subject 261: partial
+    // at the mode, NLL 94.6, |g| ≈ 7e-5 > 1e-5). Until #1327 this branch then replaced that
+    // partial *unconditionally* with an 11-dimensional Nelder–Mead from the cold seed, which
+    // stops at NLL ≈ 5030 with κ tens of prior SDs out — so every cold-started evaluation
+    // (the final inner loop, an `outer_maxiter = 0` re-evaluation) scored a handful of
+    // subjects thousands of −2LL units too high, while the warm-started trajectory (whose
+    // BFGS converges within `tol` from the previous mode) never saw it. The reported OFV
+    // sat 9 300 above the value the optimizer had minimised. IOV + FREM is unsupported
+    // (`foce_subject_nll_iov` returns a sentinel for it), so the FREM-only "take NM
+    // unconditionally to re-center the proposal" arm of the non-IOV path has no twin here.
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
         if skip_ode_iov_nm_fallback(model) {
             (false, false)
-        } else if enable_stall {
+        } else {
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
             x = best;
             (ok, true)
-        } else {
-            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
-            x = if warm { partial } else { cold };
-            let nm_ok = nelder_mead_minimize(&obj, &mut x, n_flat, max_iter * 5, tol);
-            (nm_ok, true)
         }
     } else {
         (false, false)

@@ -25,6 +25,7 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- Fixed the IOV inner loop discarding a converged-in-all-but-name BFGS solution for a far worse Nelder–Mead restart from the cold seed, which made every cold-started evaluation of a `kappa` model (the reported final OFV, `outer_maxiter = 0` re-evaluations, `.fitrx` reloads) score some subjects thousands of −2LL units above the value the optimizer had minimised — 9 300 on a `[covariate_nn]` + IOV busulfan fit (#1327).
 - Fixed ODE-accumulated survival hazards that read `TAD`, which could reject valid multi-dose subjects with a misleading finite objective (#1261).
 
 ### Performance
