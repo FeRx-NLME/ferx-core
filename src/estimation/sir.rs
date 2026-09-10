@@ -10,8 +10,7 @@
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
-    compute_bounds, compute_mu_k, coordinate_names, pack_params, packed_fixed_mask, unpack_params,
-    PackedBounds,
+    compute_mu_k, coordinate_names, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -510,8 +509,14 @@ fn run_sir_core_scoped(
         return Err("sir_resamples must be <= sir_samples".to_string());
     }
 
-    // Pack ML estimates as the proposal center
-    let x_hat = pack_params(params);
+    // Pack ML estimates as the proposal center. The FIX mask and the box come
+    // out of the same walk (#1252) — both are consulted below, and building the
+    // box requires the packed vector anyway.
+    let PackedStart {
+        packed: x_hat,
+        bounds,
+        fixed: fixed_mask,
+    } = pack_with_bounds(params);
     let n_packed = x_hat.len();
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
@@ -532,7 +537,6 @@ fn run_sir_core_scoped(
     // with at least one FIX-ed parameter. Sampling on the free block instead
     // keeps fixed indices exactly at `x_hat`, and uses `d = n_free` as the
     // Student-t dimensionality so the importance weights are consistent.
-    let fixed_mask = packed_fixed_mask(params);
     let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     if n_free == 0 {
@@ -562,7 +566,6 @@ fn run_sir_core_scoped(
     //    In packed (log) space that is a proposal sd of thousands: every draw
     //    lands outside the parameter bounds and is rejected. Those directions
     //    are shrunk so ±2 sd still fits inside the room the ML estimate has.
-    let bounds = compute_bounds(params);
     let coord_names = coordinate_names(params);
     let free_names: Vec<String> = free_idx
         .iter()

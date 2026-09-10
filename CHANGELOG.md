@@ -93,6 +93,20 @@ section of the SDLC for the versioning policy).
   refits nothing. `models.csv`, `generations.csv`, `final.ferx` and every candidate under
   `models/` are written; `docs/tools/global-search.qmd` says when a global search beats the
   stepwise tools and when it does not.
+- **An initial estimate that lies outside its own optimizer bounds is no longer
+  clamped in silence (#1251).** A `theta` whose start is *strictly* outside the
+  range it declares is now refused before any fitting
+  (`E_THETA_INIT_OUTSIDE_BOUNDS`) — until now `theta TVCL(0.05, 0.1, 10.0)` quietly
+  fitted from `0.1`, a factor of two, on every run; NM-TRAN refuses the same stream
+  outright (error 24). A start outside one of ferx's *internal* rails instead — the
+  hidden `1e9` theta cap, the `omega` `±6` / off-diagonal `±10` guards, the `sigma`
+  `[-8, 5]` guard — is a `W_INIT_OUTSIDE_BOUNDS` warning, carrying the new
+  `init_outside_bounds` warning category. Both are reported by `ferx check` without
+  a `--data` file, and both share `E_OMEGA_INIT_AT_RAIL`'s `maxiter = 0` exemption.
+  A start sitting *exactly* on a bound is left alone: there the clamp is a no-op, so
+  nothing is moved. The new category is deliberately distinct from
+  `boundary_estimate`, which is about where a fit *ended* and which drives
+  `bootstrap`'s replicate filter and `reject_on_boundary`.
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences
@@ -277,6 +291,19 @@ section of the SDLC for the versioning policy).
   now `#[non_exhaustive]`, so the `_` arm is required from here on and the next
   form — level grouping — will be genuinely additive.
 
+- **`fit()` now refuses a `theta` whose initial estimate is strictly outside its own
+  declared range (#1251).** It previously accepted the model and clamped the start
+  onto the bound, so a model file that fitted before now stops with
+  `E_THETA_INIT_OUTSIDE_BOUNDS` before the first objective evaluation. No model
+  shipped with ferx is affected — the exact predicate over every `.ferx` in the
+  repository finds none — but a model file of your own with a mistyped bound will now
+  be reported instead of quietly fitted from somewhere else. The comparison is against
+  the **declared** numbers, so `theta TVCL(-5.0, 0.0, 10.0)` is caught even though the
+  start and the declared lower bound both pack onto ferx's internal `1e-10` floor, and
+  the message names where the fit really begins (`1e-10`, which is neither the declared
+  value nor the declared bound). `maxiter = 0` runs are exempt, as for
+  `E_OMEGA_INIT_AT_RAIL`.
+
 ### Fixed
 - The `{model}.tmp` checkpoint written by a **deterministic** stage (`foce`, `focei`,
   `laplace`, `gn`, `gn_hybrid`) now stores the **best** point that stage has reached,
@@ -313,6 +340,20 @@ section of the SDLC for the versioning policy).
   by every site on either engine that turns a rate on or off: four of the walk's rate-*on*
   sites spelled it inline as `cmt_raw() >= 1` and the rate-*off* saltation at the
   infusion-window end asked nothing at all.
+- **A `theta` whose declared range cannot be represented no longer aborts the fit
+  (#1251).** `theta TVCL(1.0, 5.0, 2.0)` — bounds swapped — and
+  `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter whose whole range
+  falls below ferx's internal `1e-10` packing floor — both produce an empty optimizer
+  box, and the bound clamp panicked on it. ferx now reports
+  `E_INIT_BOUNDS_INVERTED`, naming which of the three causes applies. It is the one
+  start-side check with no `maxiter = 0` exemption, because an evaluation-only run
+  clamps the start too. Only the affected coordinate is silenced, so `ferx check` still
+  reports the rest of the file in the same pass.
+- The `W_INIT_OUTSIDE_BOUNDS` message for a `sigma` now says which scale its numbers are
+  on (#1251). ferx stores σ as a standard deviation and square-roots a plain
+  `sigma X ~ v` declaration, so the quoted number is an SD that need not appear in the
+  model file: `sigma PROP_ERR ~ 1e6` now reads `an SD of 1.000e3` rather than
+  `a value of 1.000e3`.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so

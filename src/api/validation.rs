@@ -3902,24 +3902,18 @@ fn rail_variance_is_the_floor(template: &ModelParameters, i: usize) -> bool {
 ///
 /// `coordinate_kinds` decides *whether* a
 /// coordinate qualifies; the segment boundaries below only decide *which
-/// keyword* to print, and they are re-derived the way `packed_len` derives them
-/// because the packed vector carries no provenance. All three live arms
-/// (`omega`, `kappa`, `[mixture] omega(2)`) are pinned by a sibling test
-/// asserting that keyword in the message, so a layout change that moves a
-/// segment reddens rather than silently mislabelling a declaration.
+/// keyword* to print, and they come from
+/// [`packed_segments`](crate::estimation::parameterization) — the one
+/// derivation of the packed layout (#1252) — because the packed vector carries
+/// no provenance. All three live arms (`omega`, `kappa`, `[mixture] omega(2)`)
+/// are pinned by a sibling test asserting that keyword in the message, so a
+/// layout change that moves a segment reddens rather than silently
+/// mislabelling a declaration.
 fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<VarianceDecl>> {
-    use crate::estimation::parameterization::{
-        coordinate_kinds, omega_packed_len, PackedCoordKind,
-    };
+    use crate::estimation::parameterization::{coordinate_kinds, packed_segments, PackedCoordKind};
 
-    let n_theta = template.theta.len();
-    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-    let n_sigma = template.sigma.values.len();
-    let n_iov = template
-        .omega_iov
-        .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let iov_end = n_theta + n_omega + n_sigma + n_iov;
+    let segs = packed_segments(template);
+    let iov_end = segs.mixture_omega_start();
 
     coordinate_kinds(template)
         .iter()
@@ -3928,7 +3922,7 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
             if *kind != PackedCoordKind::OmegaDiagonal {
                 return None;
             }
-            if i < n_theta + n_omega {
+            if i < segs.sigma_start() {
                 Some(VarianceDecl::Omega {
                     block: !template.omega.diagonal,
                 })
@@ -4013,9 +4007,7 @@ pub(crate) fn check_variance_init_rails(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<Diagnostic> {
-    use crate::estimation::parameterization::{
-        compute_bounds, coordinate_names, pack_params, packed_fixed_mask,
-    };
+    use crate::estimation::parameterization::{coordinate_names, pack_with_bounds, PackedStart};
 
     // A clamped start is only trapped when something searches — an eval-only
     // run clamps too, it just does not hold. See `outer_search_runs`.
@@ -4023,9 +4015,11 @@ pub(crate) fn check_variance_init_rails(
         return Vec::new();
     }
 
-    let packed = pack_params(init_params);
-    let bounds = compute_bounds(init_params);
-    let fixed = packed_fixed_mask(init_params);
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+    } = pack_with_bounds(init_params);
     let decls = variance_decl_by_coordinate(init_params);
     // Built only if something actually fires: `coordinate_names` allocates a
     // `String` per coordinate, and this runs on the successful path of every
@@ -4149,6 +4143,418 @@ pub(crate) fn check_variance_init_rails(
 #[cfg(test)]
 #[path = "tests/variance_init_rail_tests.rs"]
 mod variance_init_rail_tests;
+
+/// The `W_` token carried inside the message text of every start-outside-the-box
+/// *warning*, so [`crate::types::classify_warning`] can recover
+/// `WarningCode::InitOutsideBounds` from the flat string `fit()` stores.
+///
+/// A token rather than a prose match, following `W_ABSORPTION_TWIN_DECLINED`:
+/// the nearest prose arm is `"optimizer bound"` → `BoundaryEstimate`, whose
+/// category drives `bootstrap`'s `skip_estimate_near_boundary` and
+/// `Strictness::reject_on_boundary`, both on by default. A message that drifted
+/// into that arm would silently drop bootstrap replicates.
+const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
+
+/// Report an initial estimate that packs **strictly outside** its own box, and
+/// is therefore silently moved by `clamp_to_bounds` before the first objective
+/// evaluation (#1251).
+///
+/// Data-independent, exactly like [`check_variance_init_rails`]: the predicate
+/// is a property of the initial parameters alone, so `ferx check model.ferx`
+/// reports it without a `--data` file.
+///
+/// # Severity, and where each verdict comes from
+///
+/// | coordinate | whose bound | verdict |
+/// |---|---|---|
+/// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
+/// | θ strictly outside its **declared** lower / upper | the user's | **error** |
+/// | θ above the hidden `1e9` cap | ferx's | warning |
+/// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
+/// | Ω / Ω_IOV / mixture-Ω **diagonal**, above `+6` | ferx's | warning |
+/// | Ω off-diagonal, outside `±10` | ferx's | warning |
+/// | Σ, outside `[−8, 5]` | ferx's | warning |
+///
+/// There is no row for the hidden `1e-10` **floor**, and that is a property of
+/// the packing rather than an omission: `packed = max(θ, 1e-10).ln()` is floored
+/// identically to the bound, so a start below the floor compares *equal*, and a
+/// declared range lying entirely below it empties the box instead — the first
+/// row, not the third (#1309 review).
+///
+/// That same flooring is why the **declared** θ row is judged on the natural
+/// scale and not the packed one. `theta TVCL(-5.0, 0.0, 10.0)` packs to
+/// `packed == lower == ln(1e-10)`, so a packed comparison sees a start sitting
+/// exactly on its bound and says nothing — while the fit begins from `1e-10`,
+/// which is neither the declared `-5` nor the declared `0`. A declared lower of
+/// `0` is the idiomatic spelling for a positive parameter, so that was the
+/// shape most likely to carry the defect. [`theta_outside_declared_range`]
+/// answers the declared question; the packed walk keeps ferx's internal rails,
+/// and the two partition the θ segment (#1309 review).
+///
+/// The empty box is first because it is the one arm that stops a **crash**
+/// rather than a silent clamp: `clamp_to_bounds` calls `f64::clamp`, which
+/// panics on `min > max`, and every optimizer entry clamps the start before its
+/// first objective evaluation — `evaluate_at_initial_params` included, which is
+/// why this row alone ignores the `maxiter = 0` exemption.
+///
+/// The θ error follows NM-TRAN, which refuses the identical stream outright
+/// (error 24, before any estimation), and the clamp really does move the start:
+/// `theta TVCL(0.05, 0.1, 10.0)` fits from `0.1`, a factor of two.
+///
+/// The Ω **upper** rail is a warning and not an error, measured rather than
+/// assumed. On `examples/warfarin.ferx`, `omega ETA_CL ~ 1e8` (packed `+9.21`
+/// against the `+6` rail, clamped to a variance of `1.6e5`) recovers the base
+/// optimum under **all eight** optimizer × method arms: `foce` and `focei`
+/// each × `bobyqa`, `slsqp`, `lbfgs`, `bfgs`, with θ and ω agreeing to 5–6
+/// significant figures and |ΔOFV| ≤ 0.14 — and in the two arms that differ at
+/// all, the clamped start ends up *better*. That is the opposite of the lower
+/// rail, where every default path is trapped, which is why #1229 is an error
+/// and this is not. NONMEM's own `$OMEGA 1e8` run fails (`ROUNDING ERRORS`,
+/// OFV 117.63 worse) but starts literally at `1e8`; ferx clamps to `1.6e5`
+/// first, so the two are different experiments and the ferx arm decides.
+///
+/// # Scope, against `check_variance_init_rails`
+///
+/// The two partition the out-of-box set. #1229 claims `packed <= lower` on the
+/// coordinates `variance_decl_by_coordinate` marks — a superset of "strictly
+/// below" that also takes equality — so this check claims every strictly-outside
+/// coordinate **except** those. Disjoint, and together exhaustive.
+pub(crate) fn check_packed_start_in_box(
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    use crate::estimation::parameterization::{
+        coordinate_kinds, coordinate_names, coordinates_outside_bounds,
+        coordinates_with_inverted_bounds, pack_with_bounds, theta_outside_declared_range,
+        theta_representable_range, BoxSide, PackedCoordKind, SIGMA_PACK_LOWER, SIGMA_PACK_UPPER,
+        THETA_PACK_CEIL, THETA_PACK_FLOOR,
+    };
+
+    let start = pack_with_bounds(init_params);
+    let kinds = coordinate_kinds(init_params);
+    // The #1229 scope gate, reused as the partition: `Some` exactly on the
+    // Ω / Ω_IOV / mixture-Ω diagonals it claims.
+    let decls = variance_decl_by_coordinate(init_params);
+    // Allocated only if something fires — `coordinate_names` builds a `String`
+    // per coordinate and this runs on the successful path of every fit.
+    let mut names: Option<Vec<String>> = None;
+
+    let mut diags = Vec::new();
+
+    // ── an EMPTY box, before the eval-only exemption ────────────────────────
+    //
+    // Deliberately **not** exempt at `maxiter = 0`, unlike everything below.
+    // The exemption exists because a clamped start does not *stick* without a
+    // search; an empty box is not clamped at all — `clamp_to_bounds` calls
+    // `f64::clamp`, which panics on `min > max` — and
+    // `evaluate_at_initial_params` clamps too. So an eval-only run on an empty
+    // box aborts the process, and gating this on `outer_search_runs` would
+    // leave exactly that case uncovered.
+    //
+    // The indices claimed here are excluded from both walks below rather than
+    // returning outright: `ferx check` reports a whole model in one pass, and a
+    // file with a swapped `TVCL` bound *and* an `omega ~ 1e8` should say both
+    // (#1309 review). `fit()` stops at the first error either way.
+    let mut inverted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for hit in coordinates_with_inverted_bounds(&start, &kinds) {
+        inverted.insert(hit.index);
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(hit.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", hit.index));
+        // Only THETA can reach this through the parser — every other segment's
+        // bounds are constants and a FIX pin is `lower == upper` — so the
+        // `cause` clause is THETA-shaped and a non-THETA coordinate simply
+        // reports its packed bounds. See `coordinates_with_inverted_bounds`.
+        let cause = if hit.kind == PackedCoordKind::Theta {
+            let (lo, hi) = (
+                init_params.theta_lower[hit.index],
+                init_params.theta_upper[hit.index],
+            );
+            if !(lo <= hi) {
+                format!(
+                    "its declared range is empty — the lower bound {lo:e} is above the upper \
+                     bound {hi:e}. Swap them, or widen the range"
+                )
+            } else if lo > THETA_PACK_CEIL {
+                format!(
+                    "its declared range ({lo:e}, {hi:e}) lies entirely above ferx's internal \
+                     upper cap of {THETA_PACK_CEIL:e}, which the packer substitutes for the \
+                     declared upper, so the box has no representable value left. Rescale \
+                     {name} — different units, or a factored-out constant — so its range fits \
+                     below {THETA_PACK_CEIL:e}"
+                )
+            } else {
+                format!(
+                    "its declared range ({lo:e}, {hi:e}) lies entirely below ferx's internal \
+                     lower floor of {THETA_PACK_FLOOR:e}, which the packer substitutes for the \
+                     declared lower, so the box has no representable value left. Rescale \
+                     {name} — different units, or a factored-out constant — so its range \
+                     reaches above {THETA_PACK_FLOOR:e}"
+                )
+            }
+        } else {
+            "its packed bounds are not orderable".to_string()
+        };
+        diags.push(
+            Diagnostic::error(
+                "E_INIT_BOUNDS_INVERTED",
+                format!(
+                    "`{name}` has an empty optimizer box — {cause}. In the optimizer's packed \
+                     space the lower bound is {:.6} and the upper is {:.6}, so no start can be \
+                     placed inside it and the fit cannot begin.",
+                    hit.lower, hit.upper,
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(format!(
+                "give {name} a non-empty range that ferx can represent \
+                 ({THETA_PACK_FLOOR:e}, {THETA_PACK_CEIL:e})"
+            )),
+        );
+    }
+
+    // Same exemption as the rail check: an eval-only run clamps too, it just
+    // does not hold. `tests/check_command.rs` pins that `fit()` succeeds at
+    // `outer_maxiter = 0` on a start that would otherwise be refused. The
+    // empty-box errors already collected are **not** exempt and ride out with
+    // it — an eval-only run clamps into the empty box too, and aborts.
+    if !outer_search_runs(options) {
+        return diags;
+    }
+
+    // ── θ against its own DECLARED range ────────────────────────────────────
+    //
+    // Judged on the natural scale, not the packed one, and that is the whole
+    // reason this is a separate walk: `pack_params` floors the value at
+    // `THETA_PACK_FLOOR` and `unpinned_bounds` floors the bound at the same
+    // constant, so `theta TVCL(-5.0, 0.0, 10.0)` packs to `packed == lower`
+    // and the packed comparison reports nothing at all. See
+    // `theta_outside_declared_range` (#1309 review).
+    //
+    // The `(index, side)` pairs claimed here are the ones the rail walk below
+    // skips, so the two partition the θ segment: a declared violation is an
+    // error here, and what is left over on θ is an internal cap, hence a
+    // warning there.
+    let mut declared_hits: std::collections::BTreeSet<(usize, BoxSide)> =
+        std::collections::BTreeSet::new();
+    for hit in theta_outside_declared_range(init_params) {
+        if inverted.contains(&hit.index) {
+            continue;
+        }
+        declared_hits.insert((hit.index, hit.side));
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(hit.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", hit.index));
+        // The interval a start actually has to land inside: the declaration
+        // intersected with ferx's packing caps. Two things read it.
+        //
+        // Where the fit *begins*, which is not always the bound the user
+        // declared — for a declared lower at or below `THETA_PACK_FLOOR` the
+        // box starts at the floor, so `theta TVCL(-5.0, 0.0, 10.0)` begins from
+        // `1e-10` and not from `0`.
+        //
+        // And the remedy, which has to name a range ferx can represent: with
+        // `theta TVCL(0.05, 0.1, 1e12)` the declared upper is above the hidden
+        // `1e9` cap, so advertising it sends the user to a value that then
+        // trips `W_INIT_OUTSIDE_BOUNDS`.
+        //
+        // Both are taken on the **natural** scale rather than by unpacking
+        // `start.bounds`, because `exp(ln(x))` is not the identity: that route
+        // prints `9.999999999999996e-11` for the floor and
+        // `1.0000000000000002e-1` for a declared `0.1`. `unpinned_bounds` packs
+        // this same interval, so there is nothing to drift from (#1309 review).
+        let (lo_advice, hi_advice) = theta_representable_range(init_params, hit.index);
+        let effective = init_params.theta[hit.index].clamp(lo_advice, hi_advice);
+        diags.push(
+            Diagnostic::error(
+                "E_THETA_INIT_OUTSIDE_BOUNDS",
+                format!(
+                    "`theta {name}` starts at {value:e}, {side} its own declared \
+                     {bound_word} bound of {bound:e}. The optimizer clamps the start into its \
+                     box before the first objective evaluation, so the fit begins from \
+                     {effective:e} — silently, on every run, and every estimate that depends on \
+                     {name} moves with it. Start {name} inside its declared range, or widen the \
+                     range. NONMEM refuses the same declaration outright, at NM-TRAN time and \
+                     before any estimation (error 24).",
+                    value = hit.value,
+                    bound = hit.bound,
+                    side = hit.side.direction(),
+                    bound_word = hit.side.bound_name(),
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(format!(
+                "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
+                 the declared range"
+            )),
+        );
+    }
+
+    // No `inverted` consult here: `coordinates_outside_bounds` already declines
+    // a coordinate whose bounds are not finite and orderable, so a second test
+    // would reject exactly what the first one rejects — the redundant gate
+    // CLAUDE.md names as a test hole. The declared-range walk above needs its
+    // consult because it never looks at the packed box at all.
+    for hit in coordinates_outside_bounds(&start, &kinds) {
+        // Below a variance rail is #1229's error, reported there with its own
+        // three-way message about what the declaration probably was. Reporting
+        // it here too would double-report it.
+        if hit.side == BoxSide::Below && decls.get(hit.index).is_some_and(Option::is_some) {
+            continue;
+        }
+        // A θ already reported against its own declaration. What is left on the
+        // θ segment is therefore always one of ferx's internal caps — see the
+        // `PackedCoordKind::Theta` arm below, which relies on exactly that.
+        if declared_hits.contains(&(hit.index, hit.side)) {
+            continue;
+        }
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(hit.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", hit.index));
+        let side = hit.side.direction();
+
+        // Everything reaching here is one of ferx's internal rails. The reporting scale
+        // is read back off the *packed* coordinate, never from
+        // `coordinate_values`: for a `block_omega` the natural-scale entry is
+        // the matrix variance while the coordinate clamped is `L_ii`, and
+        // quoting the former produces a message that contradicts itself.
+        //
+        // Every number below that is *computed* (an `exp()` of a packed value)
+        // is printed at `{:.3e}`, not `{:e}`. `{:e}` on `(2.0 * 6.0).exp()`
+        // prints `1.6275479141900392e5`, seventeen digits of a rail whose
+        // definition is `exp(12)`; `{:.3e}` prints `1.628e5` (#1309 review).
+        // Declared literals keep `{:e}`, which round-trips them exactly.
+        let (start_desc, rail_desc, remedy) = match hit.kind {
+            // Reachable on the **upper** side only, and that is a property of
+            // the packing plus the partition rather than of this arm.
+            // `Below`: `packed = max(θ, 1e-10).ln()` against
+            // `lower = max(θ_lower, 1e-10).ln()` fires only when
+            // `θ_lower > 1e-10` and `θ < θ_lower`, which is a *declared*
+            // violation and so was claimed by `theta_outside_declared_range`
+            // above; on the identity branch `packed` and `lower` are the
+            // declared numbers themselves, likewise claimed. `Above`: the same
+            // argument leaves only `θ_upper > THETA_PACK_CEIL`, where the cap
+            // ferx substitutes is what the start exceeds. A declared range
+            // falling *entirely* outside the caps does not arrive here at all:
+            // it inverts the box, and `E_INIT_BOUNDS_INVERTED` above claims it.
+            // So the cap named here is unconditionally `THETA_PACK_CEIL`
+            // (#1309 review).
+            PackedCoordKind::Theta => (
+                format!("a value of {:e}", init_params.theta[hit.index]),
+                format!(
+                    "ferx's internal upper cap of {THETA_PACK_CEIL:e} (the declared bound is \
+                     {:e}, which the packer cannot represent)",
+                    init_params.theta_upper[hit.index],
+                ),
+                format!(
+                    "start {name} inside ({:e}, {:e})",
+                    THETA_PACK_FLOOR, THETA_PACK_CEIL
+                ),
+            ),
+            PackedCoordKind::OmegaDiagonal => {
+                // `exp(2·ln(L_ii)) = L_ii²`, which **is** the variance on a
+                // diagonal Ω and is **not** on a block one: there `L_ii` is
+                // what is left of the eta's variance after the off-diagonals,
+                // so quoting `L_ii²` as "a variance" names a number that
+                // appears nowhere in the model file. Measured on
+                // `block_omega (ETA_CL, ETA_V) = [0.09, 100.0, 4e5]`, whose
+                // declared ETA_V variance is 4e5: this arm printed 2.889e5.
+                // `decls` is `Some` on every Ω diagonal and already carries the
+                // block/diagonal split #1229 established, so the wording comes
+                // from the same source as the rail check's (#1309 review).
+                let block_kw = decls
+                    .get(hit.index)
+                    .and_then(Option::as_ref)
+                    .and_then(VarianceDecl::block_keyword);
+                let l_squared = (2.0 * hit.packed).exp();
+                let rail = (2.0 * hit.bound).exp();
+                (
+                    match block_kw {
+                        Some(kw) => format!(
+                            "a `{kw}` Cholesky diagonal of L = {:.3e} (L² = {l_squared:.3e}, \
+                             which is what is left of {name}'s variance once the \
+                             off-diagonals are accounted for, not the variance declared for it)",
+                            hit.packed.exp(),
+                        ),
+                        None => format!("a variance of {l_squared:.3e}"),
+                    },
+                    format!(
+                        "the optimizer's {bound_word} variance rail of {rail:.3e}",
+                        bound_word = hit.side.bound_name(),
+                    ),
+                    match block_kw {
+                        Some(_) => format!(
+                            "reduce {name}'s declared variance, or the covariances involving \
+                             it, until its Cholesky diagonal is below {:.3e}",
+                            hit.bound.exp()
+                        ),
+                        None => format!(
+                            "start {name} below {rail:.3e}, or `FIX` it if it is meant to be \
+                             that large"
+                        ),
+                    },
+                )
+            }
+            PackedCoordKind::OmegaOffDiagonal => (
+                format!("a Cholesky element of {:.3e}", hit.packed),
+                format!(
+                    "the optimizer's {} rail of {:e}",
+                    hit.side.bound_name(),
+                    hit.bound
+                ),
+                format!("reduce the covariances involving {name}"),
+            ),
+            // Σ is stored, packed and railed on the **SD** scale
+            // (`SigmaVector::values`; `model_parser` square-roots a plain
+            // `sigma X ~ v` declaration and keeps a `(sd)` one), so every
+            // number here is an SD and none of them need appear in the model
+            // file: `sigma PROP_ERR ~ 1e6` reports `1.000e3`. Naming the scale
+            // is the whole remedy — `ModelParameters` does not record which
+            // spelling was written, so the message cannot convert back
+            // (#1309 review). Same defect the `block_omega` L-vs-L² arm above
+            // fixes, on the one arm that had kept a scale-free noun.
+            PackedCoordKind::Sigma => (
+                format!("an SD of {:.3e}", hit.packed.exp()),
+                format!(
+                    "the optimizer's {bound_word} SD rail of {:.3e}",
+                    hit.bound.exp(),
+                    bound_word = hit.side.bound_name(),
+                ),
+                format!(
+                    "start {name} at an SD inside ({:.3e}, {:.3e}) — a plain \
+                     `sigma {name} ~ v` declares the **variance** `v`, whose square root is \
+                     what is railed here",
+                    SIGMA_PACK_LOWER.exp(),
+                    SIGMA_PACK_UPPER.exp()
+                ),
+            ),
+        };
+        diags.push(
+            Diagnostic::warning(
+                START_OUT_OF_BOX_TOKEN,
+                format!(
+                    "{START_OUT_OF_BOX_TOKEN}: {name} starts at {start_desc}, {side} \
+                     {rail_desc}. The start is clamped onto that rail before the first \
+                     objective evaluation, so the fit begins from the rail and not from what \
+                     was declared. {remedy}."
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(remedy),
+        );
+    }
+    diags
+}
+
+#[cfg(test)]
+#[path = "tests/packed_start_box_tests.rs"]
+mod packed_start_box_tests;
 
 /// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
 /// resets under an SDE model, and a negative typical-value lag time. These are
@@ -5348,6 +5754,15 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    *actual* `init_params`; here the parsed inits are all there is, which
     //    is exactly what the model file declares.
     diags.extend(check_variance_init_rails(
+        &parsed.model.default_params,
+        &parsed.fit_options,
+    ));
+
+    // 2b-ter. Initial estimates strictly outside their own packed box (#1251).
+    //    Same inputs, same data-independence: `ferx check model.ferx` reports a
+    //    θ outside its declared range without a dataset, exactly as `fit()`
+    //    refuses it.
+    diags.extend(check_packed_start_in_box(
         &parsed.model.default_params,
         &parsed.fit_options,
     ));
