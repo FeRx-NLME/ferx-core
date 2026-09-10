@@ -797,6 +797,36 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
+/// Whether a zero-order input into this dose's compartment has a rate channel at all —
+/// the compartment half of "this infusion contributes a `+rate`", spelled **once** for
+/// every engine (#1077).
+///
+/// `CMT=0` is NONMEM's *default dose compartment*: defined for a bolus, where both
+/// engines resolve it to state index 0 (#899), and **not** defined for a zero-order
+/// input, which has no default target. `check_dose_compartments` rejects such a row
+/// outright (`E_DOSE_CMT_NOT_INFUSABLE`, both engines), so this is reachable only from a
+/// hand-built spec that runs no validation — but *there* every engine has to read it the
+/// same way, which is the whole reason it is one function.
+///
+/// Two callers, and #1077 is both of them disagreeing in turn. The value path
+/// ([`crate::ode::predictions::infusion_contributes`]) once had no compartment test at
+/// all and delivered such an infusion while the analytic sensitivity walk
+/// (`sens/ode_provider.rs`) dropped it — a *value* divergence, closed by #1196 step 3
+/// giving the value path this test. What that left was the walk disagreeing with
+/// **itself**: four rate-*on* sites spelled `cmt_raw() >= 1` and the rate-*off* saltation
+/// at `K_INF_END` did not, so a lagged `CMT=0` infusion delivered nothing (`f ≡ 0`, both
+/// engines) yet moved `∂f/∂η_LAG` by `+1.8878965164` at the first observation past the
+/// window end, where central FD of the predictor is exactly `0.0`.
+///
+/// Deliberately **not** folded into [`is_real_infusion`]: that predicate answers "are
+/// this row's `rate`/`duration` usable", the break-time builders ask it about every
+/// infusion including a `CMT=0` one (they must still break at its window end for the
+/// segment structure to line up), and only the *forcing* sites ask this.
+#[inline]
+pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
+    d.cmt_raw() != 0
+}
+
 // ---------------------------------------------------------------------------
 // Where a lagged steady-state dose loads, and what the previous cycle leaves
 // running across the dose record (#1121).
@@ -1406,5 +1436,45 @@ mod tad_referent_tests {
             Some(17.0),
             "no wrap without an interval"
         );
+    }
+}
+
+#[cfg(test)]
+mod infusion_rate_channel_tests {
+    use super::*;
+
+    /// The convention, stated once: `CMT=0` is the default dose *bolus* compartment
+    /// (`cmt_idx() == 0`, same state as `CMT=1`), and it is **not** a zero-order input
+    /// target. So the two resolved accessors deliberately disagree with this predicate on
+    /// `CMT=0`, and that disagreement is the whole content of the function — a version
+    /// that returned `d.cmt_idx() < n` or `d.cmt_1based() >= 1` would be `true`
+    /// everywhere and silently re-open #1077 on all six call sites at once.
+    #[test]
+    fn only_cmt_zero_lacks_a_rate_channel() {
+        let cmt0 = DoseEvent::new(0.0, 100.0, 0, 40.0, false, 0.0);
+        let cmt1 = DoseEvent::new(0.0, 100.0, 1, 40.0, false, 0.0);
+        let cmt3 = DoseEvent::new(0.0, 100.0, 3, 40.0, false, 0.0);
+
+        assert!(!infusion_has_rate_channel(&cmt0));
+        assert!(infusion_has_rate_channel(&cmt1));
+        assert!(infusion_has_rate_channel(&cmt3));
+
+        // `CMT=0` and `CMT=1` are the same *state*: the predicate is about the dose's
+        // spelling, not about where the compartment is, which is why it cannot be derived
+        // from either resolved accessor.
+        assert_eq!(cmt0.cmt_idx(), cmt1.cmt_idx());
+        assert_eq!(cmt0.cmt_1based(), cmt1.cmt_1based());
+    }
+
+    /// Orthogonal to `is_real_infusion`, on purpose: the break-time builders ask *that*
+    /// about every infusion — including a `CMT=0` one, whose window end must still break
+    /// the timeline for the segment structure to line up — and only the forcing sites ask
+    /// this. Folding the two would delete a break and change segment geometry.
+    #[test]
+    fn it_is_independent_of_whether_the_row_is_a_real_infusion() {
+        let bolus_cmt0 = DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0);
+        let inf_cmt0 = DoseEvent::new(0.0, 100.0, 0, 40.0, false, 0.0);
+        assert!(!is_real_infusion(&bolus_cmt0) && !infusion_has_rate_channel(&bolus_cmt0));
+        assert!(is_real_infusion(&inf_cmt0) && !infusion_has_rate_channel(&inf_cmt0));
     }
 }

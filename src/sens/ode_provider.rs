@@ -5087,10 +5087,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // Infusions this side sees (mode-aware effective forcing `inf_eff[k].0`).
         if has_any_infusion {
             for (k, d) in subject.doses.iter().enumerate() {
-                // `d.cmt < 1`: an infusion with `CMT=0` has no target and is rejected up
-                // front on both engines (#375 / #899) — see the `filter` in the saltation
-                // walk below. Unreachable from a validated call.
-                if !is_inf(d) || d.cmt_raw() < 1 {
+                // `CMT=0` has no rate channel — the shared predicate, not a local
+                // `cmt_raw() >= 1` (#1077; see `infusion_has_rate_channel`). Rejected up
+                // front on both engines (`E_DOSE_CMT_NOT_INFUSABLE`), so unreachable from
+                // a validated call; it must still read the same here as in the walk's
+                // forcing and in its rate-off saltation, or the gradient carries a
+                // boundary the trajectory never had.
+                if !is_inf(d) || !crate::dosing::infusion_has_rate_channel(d) {
                     continue;
                 }
                 let iws = d.time + lag_val(k);
@@ -5324,13 +5327,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     .doses
                     .iter()
                     .enumerate()
-                    // `d.cmt >= 1`: an infusion with `CMT=0` has no target — the default dose
-                    // compartment is defined for a bolus but not for a zero-order input, so
-                    // both engines reject it up front (analytical since #375, ODE since #899;
-                    // the datareader does *not* reject it, contrary to #472 #6 / #473 #3 —
-                    // only a *missing* CMT column defaults to 1). Unreachable from a validated
-                    // call, kept for hand-built specs that run no validation.
-                    .filter(|(_, d)| is_inf(d) && d.cmt_raw() >= 1)
+                    // An infusion with `CMT=0` has no target — the default dose compartment
+                    // is defined for a bolus but not for a zero-order input. It is the
+                    // *validator* that rejects it (`check_dose_compartments`, both engines
+                    // since #899), not the datareader, which passes an explicitly written
+                    // `CMT=0` through unchanged (contrary to #472 #6 / #473 #3 — only a
+                    // *missing* CMT column defaults to 1). So this is unreachable from a
+                    // validated call and live for a hand-built spec, where it must agree
+                    // with `active_infusions` and with the rate-off saltation below —
+                    // hence the shared predicate rather than a local `cmt_raw() >= 1`
+                    // (#1077).
+                    .filter(|(_, d)| is_inf(d) && crate::dosing::infusion_has_rate_channel(d))
                     .filter(|(k, d)| {
                         // (Lagged) window start; an infusion before the most recent reset is
                         // off (#472 review #1) and the window tolerance is production's
@@ -5725,13 +5732,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // there is tracked in #1072.
                             //
                             // `CMT=0`: the walk's own segment forcing skips this infusion
-                            // entirely (`cmt_raw() >= 1`, mirrored in `boundary_velocity`),
-                            // so there is no rate boundary here to differentiate — injecting
-                            // one would give the gradient a jump the trajectory never had
-                            // (#1060 review #11). Unreachable from a validated call; that the
-                            // walk skips it at all while production's `active_infusions`
-                            // delivers it — a *value* divergence — is tracked in #1077.
-                            if d.cmt_raw() >= 1 {
+                            // entirely (`infusion_has_rate_channel`, mirrored in
+                            // `boundary_velocity`), so there is no rate boundary here to
+                            // differentiate — injecting one would give the gradient a jump
+                            // the trajectory never had (#1060 review #11). Since #1196 step 3
+                            // production's `active_infusions` skips it too, so the *value*
+                            // divergence #1077 reported is closed; the rate-off half of this
+                            // pair at `K_INF_END` still needs the same test, which is what
+                            // makes it one shared predicate rather than five spellings.
+                            if crate::dosing::infusion_has_rate_channel(d) {
                                 let post_params = arrival_post_params();
                                 let prep_post = prep_for(post_params);
                                 // Strict membership (#1060 review #2): only forcings that
@@ -6234,9 +6243,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // #530: a modeled-duration dose's window end `t+dur` moves with `D` (the `dtinf`
             // jet below carries `∂/∂D`); a modeled-rate dose is already `is_rate_defined`.
             let is_modeled = modeled_at(idx).is_some();
-            // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
-            // The former `d.cmt >= 1` gate dropped this saltation term for such a dose — again
-            // a wrong gradient rather than a visibly zero value.
+            // `CMT=0`: **no** rate turns off here, because none was ever turned on — the
+            // segment forcing and the rate-on saltation both skip such an infusion
+            // (`infusion_has_rate_channel`). This site did not, which is the half of #1077
+            // that survived #1196 step 3 giving the value path the same test: measured on a
+            // lagged `CMT=0` infusion (`ONECPT_IV_LAG_INF_ODE`, `RATE=40`, `AMT=100`), both
+            // engines predict `f ≡ 0` at every observation — no drug ever enters the system
+            // — while this saltation moved `∂f/∂η_LAG` to `+1.8878965164` at the first
+            // observation past the window end, against a central-FD reference of exactly
+            // `0.0`. #899 removed a `d.cmt >= 1` gate here on the premise that the walk
+            // delivered such an infusion; it does not, so the gate belongs — but as the one
+            // predicate every other site asks, not as a fifth local spelling of it.
             // `K_SS_INF_END` closes the *previous* cycle's window, which opened at the
             // dose record rather than at the arrival — so that, not the arrival, is what the
             // reset test must compare (#1121). The shift `δ` is the same either way: the
@@ -6249,6 +6266,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             };
             if (has_lagtime || is_rate_defined || is_modeled)
                 && window_start >= reset_floor
+                && crate::dosing::infusion_has_rate_channel(d)
                 && d.cmt_idx() < n_states
             {
                 let cmt = d.cmt_idx();
@@ -6927,10 +6945,12 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // inside or outside each infusion window). `F` is resolved per dose compartment
         // (`dose_f_bio[k]`, #486); pre-scale `F·rate` as a dual once per segment so the RHS
         // closure (every RK45 stage) just adds it. Skipped for bolus-only subjects; the
-        // `cmt >= 1` guard, the `reset_floor` (an infusion before the most recent reset is
-        // off — its window may straddle the reset, #472 review #1/#6), and production's
-        // `INFUSION_EPS` window tolerance all come via the shared `infusion_spans_segment`
-        // predicate (#472 review [7]).
+        // `reset_floor` (an infusion before the most recent reset is off — its window may
+        // straddle the reset, #472 review #1/#6) and production's `INFUSION_EPS` window
+        // tolerance both come via the shared `infusion_spans_segment` predicate
+        // (#472 review [7]), which is purely temporal — the compartment test is the
+        // separate `infusion_has_rate_channel` below (#1077; this comment used to claim
+        // `infusion_spans_segment` carried it, and it never has).
         let active_inf: Vec<(usize, T)> = if !has_any_infusion {
             Vec::new()
         } else {
@@ -6938,7 +6958,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 .doses
                 .iter()
                 .enumerate()
-                .filter(|(_, d)| d.is_infusion() && d.cmt_raw() >= 1)
+                .filter(|(_, d)| d.is_infusion() && crate::dosing::infusion_has_rate_channel(d))
                 .filter(|(_, d)| {
                     infusion_spans_segment(d.time, d.duration, t_start, t_end, reset_floor)
                 })

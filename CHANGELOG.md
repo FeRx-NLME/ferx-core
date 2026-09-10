@@ -296,6 +296,17 @@ section of the SDLC for the versioning policy).
 - `cov_inner_tol` now rejects a non-positive or non-finite value at parse time, as
   `fd_hessian_step` already did (#956). Such a value used to parse and then silently make
   every covariance-step EBE reconvergence exhaust `inner_maxiter`.
+- The analytic ODE sensitivity walk no longer injects a rate-off boundary term for a
+  `CMT=0` infusion, whose rate it never turns on (#1077). `CMT=0` is NONMEM's default
+  dose *bolus* compartment and has no meaning for a zero-order input, so both predictors
+  drop such a row and `check_dose_compartments` rejects it outright
+  (`E_DOSE_CMT_NOT_INFUSABLE`) — but when the dose also carried a lagtime the gradient
+  walk still fired the infusion-end saltation, reporting a finite `∂f/∂η_LAG` (+1.89 at
+  the first sample past the window end) for a subject that receives no drug and predicts
+  `0.0` everywhere. Reachable only from a hand-built model spec that runs no validation;
+  no validated fit changes. The compartment test is now one shared predicate asked by
+  every infusion-forcing site on both engines, rather than four hand-written copies plus
+  one site that was missing it.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so

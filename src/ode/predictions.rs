@@ -1910,7 +1910,10 @@ pub(crate) fn infusion_contributes(
     d: &DoseEvent,
     n_states: usize,
 ) -> bool {
-    if !is_real_infusion(d) || d.cmt_raw() == 0 {
+    // The `CMT=0` half is [`crate::dosing::infusion_has_rate_channel`] rather than a
+    // local `cmt_raw() == 0`, so this resolver and the analytic sensitivity walk cannot
+    // spell it differently — which is exactly what they did through #1077.
+    if !is_real_infusion(d) || !crate::dosing::infusion_has_rate_channel(d) {
         return false;
     }
     // One binding, so the range test and the forcing test provably ask about the same
