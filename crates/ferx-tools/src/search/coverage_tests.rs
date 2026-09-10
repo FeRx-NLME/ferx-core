@@ -92,7 +92,17 @@ fn the_remaining_gap_rows() {
         gaps("COVARIATE(CL,WT,custom)"),
         vec!["COVARIATE(..., custom)"]
     );
-    assert_eq!(gaps("COVARIATE(CL,WT,pow,+)"), vec!["COVARIATE(..., +)"]);
+    // The `+` operator is expressible as of #1313 — the block spells it as a
+    // trailing operator token. ferx's additive template is null-at-zero where
+    // Pharmpy's is not, but that is a semantic divergence `resolve` states as a
+    // note, not a feature with no candidate.
+    assert_eq!(gaps("COVARIATE(CL,WT,pow,+)"), Vec::<String>::new());
+    // …and a form gap under `+` is still a gap: dropping the operator check
+    // must not have dropped the form check with it.
+    assert_eq!(
+        gaps("COVARIATE(CL,WT,custom,+)"),
+        vec!["COVARIATE(..., custom)"]
+    );
     // IOV is searchable since #1183 — in the exponential form only, which is
     // the form `[iov]` estimates; both covariance levels are blocks.
     assert_eq!(gaps("IOV(CL,EXP)"), Vec::<String>::new());

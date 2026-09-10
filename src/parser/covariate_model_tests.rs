@@ -941,3 +941,472 @@ fn a_malformed_theta_clause_is_an_error() {
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => ");
     assert!(e.contains("empty `=>` clause"), "{e}");
 }
+
+// ── The additive operator (#1313) ──────────────────────────────────────────
+
+/// `[CL, V]` as the compiled model computes them, for a given θ override and
+/// covariate map — the first two slots of the fixed PK-parameter layout.
+fn pk_values(model_text: &str, thetas: &[(&str, f64)], covariates: &[(&str, f64)]) -> Vec<f64> {
+    let parsed = parse_full_model(model_text).expect("model should parse");
+    let mut theta = vec![1.0; parsed.model.theta_names.len()];
+    for (name, value) in thetas {
+        let i = parsed
+            .model
+            .theta_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("θ `{name}` is declared: {:?}", parsed.model.theta_names));
+        theta[i] = *value;
+    }
+    let eta = vec![0.0; parsed.model.eta_names.len()];
+    let map: std::collections::HashMap<String, f64> = covariates
+        .iter()
+        .map(|(n, v)| ((*n).to_string(), *v))
+        .collect();
+    (parsed.model.pk_param_fn)(&theta, &eta, &map, 0.0).values[..2].to_vec()
+}
+
+#[test]
+fn the_additive_operator_drops_the_leading_one_from_every_form() {
+    // The choice #1313 had to settle. Pharmpy reuses the *multiplicative*
+    // template under `+`, so its additive linear effect adds
+    // `1 + θ·(WT − 70)` and a subject at the centring weight has `1` added to
+    // their clearance. ferx drops that `1`, so θ = 0 and COV = centre are both
+    // "no effect". Every expected string below carries no leading `1`, and a
+    // switch to the Pharmpy-verbatim convention reddens all six.
+    let cases: [(&str, &str); 6] = [
+        (
+            "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+            "(THETA_CL_WT * (WT - 70))",
+        ),
+        (
+            "  CL ~ WT linear_relative(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+            "(THETA_CL_WT * (WT / 70 - 1))",
+        ),
+        (
+            "  CL ~ WT exponential(center = 70) +",
+            "(exp(THETA_CL_WT * (WT - 70)) - 1)",
+        ),
+        (
+            "  CL ~ WT power(center = 70) +",
+            "((WT / 70)^THETA_CL_WT - 1)",
+        ),
+        (
+            "  CL ~ WT hockey(breakpoint = 70) + => T_LO(0.01, -1, 1), T_HI(0.02, -1, 1)",
+            "(if (WT <= 70) T_LO * (WT - 70) else T_HI * (WT - 70))",
+        ),
+        ("  CL ~ WT expr(\"0.5 * (WT - 70)\") +", "(0.5 * (WT - 70))"),
+    ];
+    for (line, term) in cases {
+        let s = spec("  WT continuous", line);
+        assert_eq!(
+            cl_line(&s),
+            format!("CL = TVCL * exp(ETA_CL) + (if (present(WT)) {term} else 0.0)"),
+            "additive desugar of `{line}`"
+        );
+        assert!(
+            !term.contains("1 +"),
+            "the additive template must not carry Pharmpy's leading `1`: {term}"
+        );
+    }
+}
+
+#[test]
+fn an_additive_categorical_contributes_zero_at_the_reference_level() {
+    let s = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) +",
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * exp(ETA_CL) + \
+         (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 else 0) else 0.0)"
+    );
+    // The multiplicative twin on the same form and levels keeps its `1`s: the
+    // two templates differ, and one is not the other with a different join.
+    let mul = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0)",
+    );
+    assert_eq!(
+        cl_line(&mul),
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + THETA_CL_SEX_1 else 1) else 1.0) \
+         * exp(ETA_CL)"
+    );
+}
+
+#[test]
+fn an_additive_categorical2_subtracts_its_own_null_not_a_shared_zero() {
+    // #1312 met #1313: `categorical2` reads its θ as the factor itself against
+    // a reference of `1`, so the additive template subtracts *that* null —
+    // `θ_k - 1` — where `categorical`, whose branch is `1 + θ_k`, subtracts the
+    // `1` it carries and lands on a bare `θ_k`. A regression that shares one
+    // null across the forms writes the same text for both and turns `cat +`
+    // and `cat2 +` into duplicate search candidates.
+    let cat2 = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0) +",
+    );
+    assert_eq!(
+        cl_line(&cat2),
+        "CL = TVCL * exp(ETA_CL) + \
+         (if (present(SEX)) (if (SEX == 1) THETA_CL_SEX_1 - 1 else 0) else 0.0)"
+    );
+    let cat = spec(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) +",
+    );
+    assert_ne!(
+        cl_line(&cat2),
+        cl_line(&cat),
+        "the two additive categorical forms must not desugar to the same text"
+    );
+
+    // …and `θ_cat2 = 1 + θ_cat` stays an exact reparameterization under `+`,
+    // asserted on numbers: the same subject, the same level, one θ apart.
+    let tvcl = 4.0;
+    let text2 = model_with(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical2(ref = 0) +",
+    );
+    let text1 = model_with(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0) +",
+    );
+    let v2 = pk_values(
+        &text2,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)],
+        &[("SEX", 1.0)],
+    );
+    let v1 = pk_values(
+        &text1,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 0.3)],
+        &[("SEX", 1.0)],
+    );
+    assert!(
+        (v2[0] - v1[0]).abs() < 1e-12,
+        "θ_cat2 = 1 + θ_cat must give the same CL: {} vs {}",
+        v2[0],
+        v1[0]
+    );
+    // The effect is live at that level — without this the two agree because
+    // both contributed nothing.
+    assert!(
+        (v2[0] - (tvcl + 0.3)).abs() < 1e-12,
+        "expected TVCL + (θ_cat2 - 1), got {}",
+        v2[0]
+    );
+    // `categorical2`'s null moves with the form: θ = 1, not θ = 0, is "no
+    // effect" — and the reference level contributes nothing either way.
+    let null = pk_values(
+        &text2,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.0)],
+        &[("SEX", 1.0)],
+    );
+    assert_eq!(null[0], tvcl, "θ_cat2 = 1 adds nothing");
+    let reference = pk_values(
+        &text2,
+        &[("TVCL", tvcl), ("THETA_CL_SEX_1", 1.3)],
+        &[("SEX", 0.0)],
+    );
+    assert_eq!(reference[0], tvcl, "the reference level adds nothing");
+}
+
+#[test]
+fn theta_at_zero_and_a_covariate_at_its_centre_are_both_no_effect() {
+    // The property the null-at-zero choice buys, asserted on numbers rather
+    // than on text: under Pharmpy's convention each of these would be
+    // `TVCL + 1`, not `TVCL`.
+    let text = model_with(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+    );
+    let tvcl = 4.0;
+
+    let at_centre = pk_values(
+        &text,
+        &[("TVCL", tvcl), ("THETA_CL_WT", 0.02)],
+        &[("WT", 70.0)],
+    );
+    assert_eq!(at_centre[0], tvcl, "a covariate at its centre adds nothing");
+
+    let theta_zero = pk_values(
+        &text,
+        &[("TVCL", tvcl), ("THETA_CL_WT", 0.0)],
+        &[("WT", 120.0)],
+    );
+    assert_eq!(theta_zero[0], tvcl, "θ = 0 adds nothing");
+
+    // …and the effect is live off-centre, so the two assertions above are not
+    // passing because the term was dropped altogether.
+    let off_centre = pk_values(
+        &text,
+        &[("TVCL", tvcl), ("THETA_CL_WT", 0.02)],
+        &[("WT", 120.0)],
+    );
+    assert!(
+        (off_centre[0] - (tvcl + 0.02 * 50.0)).abs() < 1e-12,
+        "expected TVCL + θ*(120 - 70), got {}",
+        off_centre[0]
+    );
+}
+
+#[test]
+fn the_missing_covariate_guard_is_per_operator_on_one_model() {
+    // Both relations read the same column on the same model, so a regression
+    // that shares one neutral element across the operators cannot pass by
+    // getting one of them right.
+    let text = model_with(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)\n  V ~ WT power(center = 70)",
+    );
+    let s = parse_full_model(&text)
+        .expect("model should parse")
+        .model
+        .covariate_model
+        .expect("recorded");
+    assert!(cl_line(&s).ends_with("else 0.0)"), "{}", cl_line(&s));
+    let v = s
+        .desugared_individual_parameters
+        .iter()
+        .find(|l| l.trim_start().starts_with("V "))
+        .expect("V is assigned")
+        .clone();
+    assert!(v.trim().ends_with("else 1.0)"), "{v}");
+
+    let thetas = [
+        ("TVCL", 4.0),
+        ("TVV", 40.0),
+        ("THETA_CL_WT", 0.02),
+        ("THETA_V_WT", 0.75),
+    ];
+    let missing = pk_values(&text, &thetas, &[("WT", f64::NAN)]);
+    // A missing covariate must leave BOTH parameters exactly as they were: a
+    // shared `1.0` guard would make CL 5.0 instead of 4.0, and a shared `0.0`
+    // guard would zero V.
+    assert_eq!(missing[0], 4.0, "additive: a missing covariate must add 0");
+    assert_eq!(
+        missing[1], 40.0,
+        "multiplicative: a missing covariate must multiply by 1"
+    );
+}
+
+#[test]
+fn a_multiplicative_and_an_additive_relation_on_one_parameter_both_land() {
+    let s = spec(
+        "  WT continuous\n  AGE continuous",
+        "  CL ~ WT power(center = 70)\n  CL ~ AGE linear(center = 40) + => THETA_CL_AGE(0.1, -1, 1)",
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL) \
+         + (if (present(AGE)) (THETA_CL_AGE * (AGE - 40)) else 0.0)"
+    );
+}
+
+#[test]
+fn a_multiplicative_relation_declared_after_an_additive_one_still_joins_the_product() {
+    // The `is_simple_factor` case that motivated `non_product_error`: if the
+    // additive term were appended first, the factor would be multiplied into
+    // one addend of the sum — or the relation would be rejected outright. The
+    // product is rebuilt from the *original* right-hand side, so declaration
+    // order cannot reach either.
+    let s = spec(
+        "  WT continuous\n  AGE continuous",
+        "  CL ~ AGE linear(center = 40) + => THETA_CL_AGE(0.1, -1, 1)\n  CL ~ WT power(center = 70)",
+    );
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL) \
+         + (if (present(AGE)) (THETA_CL_AGE * (AGE - 40)) else 0.0)"
+    );
+
+    // And the arithmetic is what the text says: the factor scales only the
+    // typical value, the term is added to the whole thing.
+    let text = model_with(
+        "  WT continuous\n  AGE continuous",
+        "  CL ~ AGE linear(center = 40) + => THETA_CL_AGE(0.1, -1, 1)\n  CL ~ WT power(center = 70)",
+    );
+    let v = pk_values(
+        &text,
+        &[("TVCL", 4.0), ("THETA_CL_WT", 1.0), ("THETA_CL_AGE", 0.1)],
+        &[("WT", 140.0), ("AGE", 60.0)],
+    );
+    assert!(
+        (v[0] - (4.0 * 2.0 + 0.1 * 20.0)).abs() < 1e-12,
+        "expected TVCL*(140/70)^1 + 0.1*(60-40) = 10, got {}",
+        v[0]
+    );
+}
+
+#[test]
+fn an_additive_relation_needs_no_top_level_product() {
+    // A shape `non_product_error` rejects for a multiplicative relation is
+    // legal for an additive one: there is nothing to multiply into.
+    let text = model_with(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+    )
+    .replace("CL = TVCL * exp(ETA_CL)", "CL = exp(TVCL + ETA_CL)");
+    let s = parse_full_model(&text)
+        .expect("an additive relation on a log-transformed RHS must parse")
+        .model
+        .covariate_model
+        .expect("recorded");
+    assert_eq!(
+        cl_line(&s),
+        "CL = exp(TVCL + ETA_CL) + (if (present(WT)) (THETA_CL_WT * (WT - 70)) else 0.0)"
+    );
+}
+
+#[test]
+fn a_conditional_right_hand_side_is_parenthesised_before_a_term_is_appended() {
+    // `if (c) a else b + t` binds the term inside the `else` arm. The taken
+    // branch here is the `then` one, so an unparenthesised append would drop
+    // the covariate effect entirely — silently, and only for the subjects on
+    // that branch.
+    let text = model_with(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+    )
+    .replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = if (TVV > 1) 1.2 else TVCL * exp(ETA_CL)",
+    );
+    let s = parse_full_model(&text)
+        .expect("model should parse")
+        .model
+        .covariate_model
+        .expect("recorded");
+    assert_eq!(
+        cl_line(&s),
+        "CL = (if (TVV > 1) 1.2 else TVCL * exp(ETA_CL)) \
+         + (if (present(WT)) (THETA_CL_WT * (WT - 70)) else 0.0)"
+    );
+
+    // TVV is 40, so the `then` branch is taken and the term must still be
+    // added: 1.2 + 0.02*(120 - 70) = 2.2, not 1.2.
+    let v = pk_values(
+        &text,
+        &[("TVV", 40.0), ("THETA_CL_WT", 0.02)],
+        &[("WT", 120.0)],
+    );
+    assert!(
+        (v[0] - 2.2).abs() < 1e-12,
+        "the term must be added to the conditional, not inside its else arm: {}",
+        v[0]
+    );
+}
+
+#[test]
+fn mu_referencing_is_off_for_an_additive_relation_and_on_for_its_multiplicative_twin() {
+    // The #619 classification, pinned rather than incidental. The two models
+    // differ in exactly one character — the trailing `+` — so they sit on
+    // opposite sides of `detect_mu_refs`' predicate, and a change that made the
+    // detector match a sum (or stopped it matching a product) reddens this.
+    let mul = parse_full_model(&model_with(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) => THETA_CL_WT(0.02, -1, 1)",
+    ))
+    .expect("model should parse");
+    assert!(
+        mul.model.mu_refs.contains_key("ETA_CL"),
+        "a multiplicative relation keeps the mu-ref anchor: {:?}",
+        mul.model.mu_refs
+    );
+    assert!(
+        !mul.model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("additive (`+`) [covariate_model]")),
+        "no additive warning on a multiplicative model: {:?}",
+        mul.model.parse_warnings
+    );
+
+    let add = parse_full_model(&model_with(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.02, -1, 1)",
+    ))
+    .expect("model should parse");
+    assert!(
+        !add.model.mu_refs.contains_key("ETA_CL"),
+        "an additive term makes the typical value a sum, which is not a mu-ref shape: {:?}",
+        add.model.mu_refs
+    );
+    let warning = add
+        .model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("additive (`+`) [covariate_model]"))
+        .unwrap_or_else(|| panic!("expected a warning: {:?}", add.model.parse_warnings));
+    assert!(warning.contains("CL"), "{warning}");
+    assert!(warning.contains("numerical M-step"), "{warning}");
+}
+
+#[test]
+fn a_parameter_with_no_eta_gets_no_mu_reference_warning() {
+    // The warning names a performance cliff that only exists for an η the
+    // M-step would otherwise shift; `V = TVV` carries none.
+    let parsed = parse_full_model(&model_with(
+        "  WT continuous",
+        "  V ~ WT linear(center = 70) + => THETA_V_WT(0.02, -1, 1)",
+    ))
+    .expect("model should parse");
+    assert!(
+        !parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("additive (`+`) [covariate_model]")),
+        "{:?}",
+        parsed.model.parse_warnings
+    );
+}
+
+#[test]
+fn the_operator_token_is_optional_and_explicit_star_is_the_default() {
+    let implicit = spec("  WT continuous", "  CL ~ WT power(center = 70)");
+    let explicit = spec("  WT continuous", "  CL ~ WT power(center = 70) *");
+    assert_eq!(cl_line(&implicit), cl_line(&explicit));
+    assert_eq!(implicit.relations[0].op, CovariateOp::Multiply);
+    assert_eq!(explicit.relations[0].op, CovariateOp::Multiply);
+
+    let add = spec("  WT continuous", "  CL ~ WT power(center = 70) +");
+    assert_eq!(add.relations[0].op, CovariateOp::Add);
+}
+
+#[test]
+fn the_operator_is_read_before_the_theta_clause() {
+    let s = spec(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70) + => THETA_CL_WT(0.01, -1, 1)",
+    );
+    assert_eq!(s.relations[0].op, CovariateOp::Add);
+    assert_eq!(s.generated_thetas, vec!["  theta THETA_CL_WT(0.01, -1, 1)"]);
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * exp(ETA_CL) + (if (present(WT)) (THETA_CL_WT * (WT - 70)) else 0.0)"
+    );
+}
+
+#[test]
+fn an_operator_with_no_form_is_an_error() {
+    let e = err("  WT continuous", "  CL ~ WT +");
+    assert!(e.contains("states no form"), "{e}");
+
+    // …and with no covariate either, the operator split is what catches it.
+    let e = err("  WT continuous", "  CL ~ +");
+    assert!(e.contains("states the `+` operator but no form"), "{e}");
+}
+
+#[test]
+fn the_two_operators_are_still_one_line_per_pair() {
+    // `CL ~ WT linear` and `CL ~ WT linear +` are *competing* models of the
+    // same pair, not two effects to be combined — the block's one-line-per-pair
+    // rule is what says so, and it must not be read as operator-scoped.
+    let e = err(
+        "  WT continuous",
+        "  CL ~ WT linear(center = 70)\n  CL ~ WT linear(center = 70) +",
+    );
+    assert!(e.contains("declared more than once"), "{e}");
+}

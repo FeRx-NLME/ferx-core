@@ -702,3 +702,41 @@ fn parameter_wildcard_honours_a_let_of_its_symbol() {
     let r = resolved("LET(PK,[CL,V]);COVARIATE?(*,WT,pow)", &ode);
     assert_eq!(r.mfl.render(), "COVARIATE?(CL,WT,pow);COVARIATE?(V,WT,pow)");
 }
+
+#[test]
+fn an_additive_operator_resolves_and_carries_the_pharmpy_divergence_note() {
+    // #1313: `+` is expressible, so it resolves like any other space — and it
+    // is *not* Pharmpy's arithmetic, which the note is the only thing saying.
+    let r = resolved("COVARIATE?(CL,WT,lin,+)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIATE?(CL,WT,lin,+)");
+    assert_eq!(r.covariate_effects.len(), 1);
+    assert_eq!(r.covariate_effects[0].op, CovariateOp::Add);
+    let note = r
+        .notes
+        .iter()
+        .find(|n| n.contains("COVARIATE(..., +)"))
+        .unwrap_or_else(|| panic!("expected the divergence note: {:?}", r.notes));
+    assert!(note.contains("null at theta = 0"), "{note}");
+    assert!(note.contains("Pharmpy"), "{note}");
+
+    // Said once per space, not once per effect: a space that expands to six
+    // additive effects must not print six copies.
+    let many = resolved("COVARIATE?([CL,V1,KA],[WT,CRCL],lin,+)", &ctx());
+    assert_eq!(many.covariate_effects.len(), 6);
+    assert_eq!(
+        many.notes
+            .iter()
+            .filter(|n| n.contains("COVARIATE(..., +)"))
+            .count(),
+        1
+    );
+
+    // And a multiplicative space says nothing — the note must not become
+    // background noise on every search.
+    let mul = resolved("COVARIATE?(CL,WT,lin)", &ctx());
+    assert!(
+        !mul.notes.iter().any(|n| n.contains("COVARIATE(..., +)")),
+        "{:?}",
+        mul.notes
+    );
+}

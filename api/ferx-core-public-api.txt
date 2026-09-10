@@ -291,6 +291,7 @@ pub ferx_core::edit::Relation::center: core::option::Option<ferx_core::Covariate
 pub ferx_core::edit::Relation::covariate: alloc::string::String
 pub ferx_core::edit::Relation::fix: core::option::Option<f64>
 pub ferx_core::edit::Relation::form: ferx_core::CovariateForm
+pub ferx_core::edit::Relation::op: ferx_core::CovariateOp
 pub ferx_core::edit::Relation::parameter: alloc::string::String
 pub ferx_core::edit::Relation::thetas: alloc::vec::Vec<ferx_core::edit::RelationTheta>
 impl core::convert::From<&ferx_core::CovariateRelation> for ferx_core::edit::Relation
@@ -2167,6 +2168,12 @@ pub ferx_core::types::CovariateLevels::Auto
 pub ferx_core::types::CovariateLevels::Declared(alloc::vec::Vec<f64>)
 impl ferx_core::CovariateLevels
 pub fn ferx_core::CovariateLevels::declared(&self) -> core::option::Option<&[f64]>
+pub enum ferx_core::types::CovariateOp
+pub ferx_core::types::CovariateOp::Add
+pub ferx_core::types::CovariateOp::Multiply
+impl ferx_core::CovariateOp
+pub fn ferx_core::CovariateOp::label(&self) -> &'static str
+pub fn ferx_core::CovariateOp::neutral(&self) -> f64
 pub enum ferx_core::types::CovariateStat
 pub ferx_core::types::CovariateStat::Literal(f64)
 pub ferx_core::types::CovariateStat::Max
@@ -2633,6 +2640,7 @@ pub ferx_core::types::CovariateRelation::center: core::option::Option<ferx_core:
 pub ferx_core::types::CovariateRelation::covariate: alloc::string::String
 pub ferx_core::types::CovariateRelation::fix: core::option::Option<f64>
 pub ferx_core::types::CovariateRelation::form: ferx_core::CovariateForm
+pub ferx_core::types::CovariateRelation::op: ferx_core::CovariateOp
 pub ferx_core::types::CovariateRelation::parameter: alloc::string::String
 pub ferx_core::types::CovariateRelation::resolved_center: core::option::Option<f64>
 pub ferx_core::types::CovariateRelation::source_line: alloc::string::String
@@ -3385,6 +3393,12 @@ pub ferx_core::CovariateLevels::Auto
 pub ferx_core::CovariateLevels::Declared(alloc::vec::Vec<f64>)
 impl ferx_core::CovariateLevels
 pub fn ferx_core::CovariateLevels::declared(&self) -> core::option::Option<&[f64]>
+pub enum ferx_core::CovariateOp
+pub ferx_core::CovariateOp::Add
+pub ferx_core::CovariateOp::Multiply
+impl ferx_core::CovariateOp
+pub fn ferx_core::CovariateOp::label(&self) -> &'static str
+pub fn ferx_core::CovariateOp::neutral(&self) -> f64
 pub enum ferx_core::CovariateStat
 pub ferx_core::CovariateStat::Literal(f64)
 pub ferx_core::CovariateStat::Max
@@ -3964,6 +3978,7 @@ pub ferx_core::CovariateRelation::center: core::option::Option<ferx_core::Covari
 pub ferx_core::CovariateRelation::covariate: alloc::string::String
 pub ferx_core::CovariateRelation::fix: core::option::Option<f64>
 pub ferx_core::CovariateRelation::form: ferx_core::CovariateForm
+pub ferx_core::CovariateRelation::op: ferx_core::CovariateOp
 pub ferx_core::CovariateRelation::parameter: alloc::string::String
 pub ferx_core::CovariateRelation::resolved_center: core::option::Option<f64>
 pub ferx_core::CovariateRelation::source_line: alloc::string::String

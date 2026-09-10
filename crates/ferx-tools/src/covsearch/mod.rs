@@ -480,6 +480,7 @@ impl Space {
                             parameter: r.parameter.clone(),
                             covariate: r.covariate.clone(),
                             form: r.form.clone(),
+                            op: r.op,
                         },
                         origin: Origin::Base,
                     })
