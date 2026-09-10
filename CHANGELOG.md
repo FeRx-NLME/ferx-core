@@ -260,14 +260,19 @@ section of the SDLC for the versioning policy).
   form — level grouping — will be genuinely additive.
 
 ### Fixed
-- The `{model}.tmp` checkpoint now stores the **best** point the fit has reached, not
-  whichever evaluation happened to be running when the write interval elapsed (#1317).
-  The objective is evaluated at every point the optimizer probes, so a write landing
-  mid-line-search recorded a throwaway trial point: on a `[covariate_nn]` FOCEI fit
-  plateaued at OFV 51786 the checkpoint held OFV 2.76e6. Resuming from such a file
+- The `{model}.tmp` checkpoint written by a **deterministic** stage (`foce`, `focei`,
+  `laplace`, `gn`, `gn_hybrid`) now stores the **best** point that stage has reached,
+  not whichever evaluation happened to be running when the write interval elapsed
+  (#1317). The objective is evaluated at every point the optimizer probes, so a write
+  landing mid-line-search recorded a throwaway trial point: on a `[covariate_nn]` FOCEI
+  fit plateaued at OFV 51786 the checkpoint held OFV 2.76e6. Resuming from such a file
   restarted the fit from the probe, and anything reading the checkpoint as "where the
   fit is" (a resume, a progress monitor, a scorer) saw a point orders of magnitude off.
-  The stored `iter` is now the evaluation at which that best point was seen.
+  For these stages the stored `iter` is now the evaluation at which that best point was
+  seen. A `saem` stage is unchanged: it saves its *latest* state (with that iteration's
+  conditional NLL as `ofv`), which is what a correct continuation of the chain resumes
+  from — so a consumer comparing checkpoints must read `method_chain` / `stage_idx`
+  first.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so
