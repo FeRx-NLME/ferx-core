@@ -306,15 +306,13 @@ section of the SDLC for the versioning policy).
   drop such a row and `check_dose_compartments` rejects it outright
   (`E_DOSE_CMT_NOT_INFUSABLE`) — but when the dose also carried a lagtime the gradient
   walk still fired the infusion-end saltation, reporting a finite `∂f/∂η_LAG` (+1.89 at
-  the first sample past the window end) for a subject that receives no drug and predicts
-  `0.0` everywhere. Reachable only from a hand-built model spec that runs no validation;
-  no validated fit changes. The compartment test is now one shared predicate asked by
-- The analytic ODE sensitivity walk no longer injects a rate-off boundary term for `CMT=0`
-  infusions on an unbound compartment (#1077). `check_dose_compartments` already rejects
-  such zero-order `CMT=0` infusions with `E_DOSE_CMT_NOT_INFUSABLE`, so this change is
-  user-visible only through hand-built specs. The walk now uses the same shared
-  `infusion_has_rate_channel` predicate as production, preventing spurious
-  `∂f/∂η_LAG` jumps when both engines predict `f ≡ 0`.
+  the first sample past the window end, against a central-difference reference of exactly
+  `0.0`) for a subject that receives no drug and predicts `0.0` everywhere. Reachable only
+  from a hand-built model spec that runs no validation; no validated fit changes. The
+  compartment test is now one shared predicate (`dosing::infusion_has_rate_channel`), asked
+  by every site on either engine that turns a rate on or off: four of the walk's rate-*on*
+  sites spelled it inline as `cmt_raw() >= 1` and the rate-*off* saltation at the
+  infusion-window end asked nothing at all.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so
