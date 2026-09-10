@@ -1451,6 +1451,104 @@ fn failure_is_converged_plateau(
     made_progress && plateaued && consistent && left_init
 }
 
+/// The best point an optimizer has seen so far — a run's single source of truth
+/// for "where the fit actually is".
+///
+/// Two consumers, which used to disagree because each tracked it (or failed to)
+/// on its own:
+///
+/// - the final restore (#59): NLopt hands back the *last* evaluated point, not
+///   the best one, so `x0` is replaced with `x` here before the final inner loop
+///   and the covariance step;
+/// - the checkpoint (#1317): the objective closure runs at every probe the
+///   optimizer tries, so a `.tmp` write whose interval elapsed during an L-BFGS
+///   line search recorded the probe. Observed on a `[covariate_nn]` FOCEI fit
+///   plateaued at OFV 51786: the checkpoint held 2.76e6 — five orders of
+///   magnitude off — and resuming from it restarted the fit at the probe.
+///
+/// Points are ranked by `ofv`, the objective the optimizer actually minimises
+/// (the *penalized* one under NN regularization), so the incumbent can never
+/// lose to a point that merely fits the data better. `ofv_clean` — the
+/// unpenalized −2LL at the same point — is carried alongside for the consumers
+/// that must report or compare an unpenalized number (the plateau
+/// self-consistency check, the checkpoint's `ofv` field).
+///
+/// `x` is in whatever space its owner optimises in: scaled `xs` for the NLopt
+/// driver, the real packed vector for the built-in BFGS and Gauss-Newton loops.
+/// [`BestPoint::write_checkpoint`] therefore takes the map into packed space
+/// rather than assuming one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BestPoint {
+    inner: Option<BestPointInner>,
+}
+
+/// The incumbent held by a [`BestPoint`].
+#[derive(Debug, Clone)]
+pub(crate) struct BestPointInner {
+    /// The point, in its owner's optimizer space (see [`BestPoint`]).
+    pub(crate) x: Vec<f64>,
+    /// Objective minimised by the optimizer at `x` (penalized under NN regularization).
+    pub(crate) ofv: f64,
+    /// Unpenalized −2LL at the same point.
+    pub(crate) ofv_clean: f64,
+    /// Iteration / eval index at which `x` was seen.
+    pub(crate) iter: usize,
+}
+
+impl BestPoint {
+    /// An empty tracker (nothing observed yet).
+    pub(crate) const fn new() -> Self {
+        Self { inner: None }
+    }
+
+    /// Record an eval, keeping it when it improves on the incumbent. Returns
+    /// whether it was adopted. The first observation is always kept — a run
+    /// whose every eval is non-finite must still hand *something* to the #59
+    /// restore — and a NaN `ofv` can never displace a finite incumbent, since
+    /// every comparison against NaN is false. The NaN incumbent needs the second
+    /// clause to be displaceable at all: `5.0 < NaN` is also false, so without it
+    /// a run whose *first* eval blew up would keep that point for the rest of the
+    /// fit and hand it to both consumers.
+    pub(crate) fn observe(&mut self, iter: usize, x: &[f64], ofv: f64, ofv_clean: f64) -> bool {
+        if self
+            .inner
+            .as_ref()
+            .is_none_or(|b| ofv < b.ofv || (b.ofv.is_nan() && !ofv.is_nan()))
+        {
+            self.inner = Some(BestPointInner {
+                x: x.to_vec(),
+                ofv,
+                ofv_clean,
+                iter,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The incumbent, or `None` before the first observation.
+    pub(crate) fn get(&self) -> Option<&BestPointInner> {
+        self.inner.as_ref()
+    }
+
+    /// The incumbent's ranking objective, or `+∞` when nothing has been seen.
+    pub(crate) fn ofv(&self) -> f64 {
+        self.inner.as_ref().map(|b| b.ofv).unwrap_or(f64::INFINITY)
+    }
+
+    /// Write a checkpoint (#755) at the **best** point seen rather than at the
+    /// caller's current one (#1317), mapping `x` into packed parameter space
+    /// with `to_packed` (a plain copy where the owner already works there).
+    /// Callers gate this on [`crate::io::checkpoint::is_due`], so the mapping
+    /// allocates only when a write will actually happen.
+    pub(crate) fn write_checkpoint(&self, to_packed: impl FnOnce(&[f64]) -> Vec<f64>) {
+        if let Some(b) = self.get() {
+            crate::io::checkpoint::maybe_write(b.iter, b.ofv_clean, &to_packed(&b.x));
+        }
+    }
+}
+
 /// Run the NLopt outer optimizer, retrying once if the fit never left its
 /// initial estimates.
 ///
@@ -1676,7 +1774,7 @@ fn optimize_nlopt_once(
     // regularization) and ranks the points; `ofv_clean` is the −2LL at the same
     // point, kept so the plateau self-consistency check compares it against the
     // equally clean `final_ofv` instead of against a penalized number.
-    let best_seen: Arc<Mutex<Option<(Vec<f64>, f64, f64)>>> = Arc::new(Mutex::new(None));
+    let best_seen: Arc<Mutex<BestPoint>> = Arc::new(Mutex::new(BestPoint::new()));
     let best_seen_cl = Arc::clone(&best_seen);
 
     let last_gradient: Arc<Mutex<Option<Vec<f64>>>> = Arc::new(Mutex::new(None));
@@ -1966,12 +2064,7 @@ fn optimize_nlopt_once(
                 // Gate on the global best (same tracker as the `best_seen` update
                 // below) so `last_gradient` always reflects the best point seen.
                 {
-                    let global_best = best_seen_cl
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|(_, o, _)| *o)
-                        .unwrap_or(f64::INFINITY);
+                    let global_best = best_seen_cl.lock().unwrap().ofv();
                     if ofv < global_best {
                         *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
                     }
@@ -2033,12 +2126,10 @@ fn optimize_nlopt_once(
         // `best_seen` tracks the global minimum across the whole run so the
         // final restore (issue #59) lands on the true best point, even when the
         // optimizer drifts away from it before terminating.
-        {
-            let mut bs = best_seen_cl.lock().unwrap();
-            if bs.as_ref().is_none_or(|(_, prev, _)| ofv < *prev) {
-                *bs = Some((xs.to_vec(), ofv, ofv_clean));
-            }
-        }
+        best_seen_cl
+            .lock()
+            .unwrap()
+            .observe(state.n_evals, xs, ofv, ofv_clean);
         // After updating best_ofv, check whether we've stalled. If yes,
         // `stagnation_stopped` is latched and the early-return at the
         // top of the closure trips on the next eval.
@@ -2092,12 +2183,18 @@ fn optimize_nlopt_once(
             );
         }
 
-        // Checkpoint (#755): pack the current estimates only when a write is due.
-        // The objective runs once per eval, so gate on `is_due` to avoid a
-        // per-eval allocation on the (default) no-checkpoint-due path.
+        // Checkpoint (#755): unscale the *best-seen* point only when a write is
+        // due. The objective runs once per eval, so gate on `is_due` to avoid a
+        // per-eval allocation on the (default) no-checkpoint-due path. Writing
+        // the best point rather than this eval's is what stops a line-search
+        // probe that happens to land on the due window from being recorded as
+        // where the fit is (#1317) — `best_seen` is updated just above, so it is
+        // never empty here, and it is the same tracker the #59 restore reads.
         if crate::io::checkpoint::is_due() {
-            let packed = crate::estimation::parameterization::pack_params(&params);
-            crate::io::checkpoint::maybe_write(state.n_evals, ofv_clean, &packed);
+            best_seen_cl
+                .lock()
+                .unwrap()
+                .write_checkpoint(|best_xs| (0..n).map(|i| best_xs[i] * scale[i]).collect());
         }
 
         state.prev_x = xs.to_vec();
@@ -2266,15 +2363,15 @@ fn optimize_nlopt_once(
     // check below, and mixing a penalized best with a clean final would loosen
     // that check by exactly the penalty magnitude.
     let mut best_seen_ofv: Option<f64> = None;
-    if let Some((best_xs, _best_penalized, best_clean)) = best_seen.lock().unwrap().clone() {
-        if best_xs.len() == n {
-            x0.copy_from_slice(&best_xs);
-            best_seen_ofv = Some(best_clean);
+    if let Some(best) = best_seen.lock().unwrap().get() {
+        if best.x.len() == n {
+            x0.copy_from_slice(&best.x);
+            best_seen_ofv = Some(best.ofv_clean);
             if options.verbose {
                 eprintln!(
                     "Restored best-seen point (OFV = {:.6}) for final inner loop \
                      and covariance step.",
-                    best_clean,
+                    best.ofv_clean,
                 );
             }
         }
@@ -2667,6 +2764,8 @@ fn optimize_bfgs(
     let mut converged = false;
     let mut n_iterations = 0;
     let mut stall_count = 0;
+    // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
+    let mut best = BestPoint::new();
 
     for iter in 1..=options.outer_maxiter {
         n_iterations = iter;
@@ -2822,11 +2921,16 @@ fn optimize_bfgs(
             );
         }
 
-        // Checkpoint (#755): recompute the unscaled packed point when a write is
-        // due (the trace's `x_real` is scoped to the trace block above).
+        // Checkpoint (#755): unscale the best-seen point when a write is due (the
+        // trace's `x_real` is scoped to the trace block above). Armijo makes the
+        // accepted iterates of this loop monotone in `f_val`, so the incumbent is
+        // normally this iteration's point; tracking it explicitly keeps the
+        // written point correct anyway when the penalized objective the line
+        // search ranks on and the clean OFV the checkpoint reports diverge under
+        // NN regularization, and keeps every driver on one rule (#1317).
+        best.observe(iter, &xs, f_val, clean_ofv_at(&xs, f_val, &scale));
         if crate::io::checkpoint::is_due() {
-            let x_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-            crate::io::checkpoint::maybe_write(iter, clean_ofv_at(&xs, f_val, &scale), &x_real);
+            best.write_checkpoint(|best_xs| (0..n).map(|i| best_xs[i] * scale[i]).collect());
         }
 
         let rel_change = (f_val - prev_ofv).abs() / (f_val.abs() + 1.0);

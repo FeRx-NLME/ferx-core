@@ -10,7 +10,9 @@
 use ferx_core::estimation::parameterization::{coordinate_names, pack_params};
 use ferx_core::io::checkpoint::{self, Checkpoint, SCHEMA_VERSION};
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::{fit, read_nonmem_csv, CompiledModel, EstimationMethod, FitOptions, Population};
+use ferx_core::{
+    fit, read_nonmem_csv, CompiledModel, EstimationMethod, FitOptions, Optimizer, Population,
+};
 use std::path::Path;
 
 const MODEL_SRC: &str = r"
@@ -292,4 +294,67 @@ fn saem_fit_checkpoints_and_cleans_up() {
         "checkpoint must be removed after a successful SAEM fit"
     );
     checkpoint::remove(&path);
+}
+
+/// The built-in BFGS/L-BFGS outer loop owns a third write site (the NLopt driver
+/// and Gauss-Newton are the other two), so it needs its own run: the tests above
+/// route to NLopt and to GN and never enter it.
+#[test]
+fn builtin_bfgs_fit_checkpoints_and_cleans_up() {
+    let _guard = fit_guard();
+    let (model, pop) = load_model_and_pop();
+    let path = tmp_path("bfgs_run");
+    checkpoint::remove(&path);
+
+    let mut opts = base_opts(&path);
+    opts.optimizer = Optimizer::Lbfgs; // the built-in loop, not NLopt's L-BFGS
+    opts.outer_maxiter = 2;
+    opts.checkpoint_interval_secs = 0;
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short BFGS fit runs");
+    assert!(result.theta[0].is_finite());
+    assert!(
+        checkpoint::load(&path).is_none(),
+        "checkpoint must be removed after a successful built-in BFGS fit"
+    );
+    checkpoint::remove(&path);
+}
+
+/// #1317 guard: the outer drivers must checkpoint through
+/// `BestPoint::write_checkpoint`, never at the eval that happens to be current
+/// when the interval elapses. The unit tests around `BestPoint` pin the
+/// tracker's behaviour but cannot see the call sites, so reverting one driver to
+/// a direct `maybe_write` of its current point — the exact defect #1317 reports,
+/// an L-BFGS line-search probe recorded as the fit's position — leaves them all
+/// green. Counting the direct callers per file is what dies on that edit.
+///
+/// The permitted direct callers are `BestPoint::write_checkpoint` itself and
+/// SAEM, whose current iterate *is* the state being checkpointed (there is no
+/// "probe" to confuse it with: the stochastic approximation has no line search).
+#[test]
+fn optimizer_loops_checkpoint_through_the_best_point_tracker() {
+    for (file, allowed, why) in [
+        (
+            "src/estimation/outer_optimizer.rs",
+            1usize,
+            "only BestPoint::write_checkpoint may call maybe_write",
+        ),
+        (
+            "src/estimation/gauss_newton.rs",
+            0,
+            "GN must checkpoint via BestPoint::write_checkpoint",
+        ),
+        (
+            "src/estimation/saem.rs",
+            1,
+            "SAEM's current iterate is its state, so it writes directly",
+        ),
+    ] {
+        let src = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        let n = src.matches("maybe_write(").count();
+        assert_eq!(
+            n, allowed,
+            "{file}: {n} direct `maybe_write(` call(s), expected {allowed} — {why}"
+        );
+    }
 }
