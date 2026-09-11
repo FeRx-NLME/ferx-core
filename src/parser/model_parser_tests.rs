@@ -22058,6 +22058,66 @@ fn unknown_function_name_is_a_parse_error_in_every_block() {
     }
 }
 
+/// An unknown name is judged as a *name*, whatever arity it is called with.
+///
+/// `pow(x, y)` is one of the migration triggers #1332 names, and it used to
+/// reach the comma branch first and be reported as "`pow` takes 1 argument" —
+/// a hard error, so never the dangerous silent identity, but one that sends the
+/// reader looking for an arity bug in a function ferx does not have. The guard
+/// now sits above the argument loop, so the diagnostic is the same for every
+/// arity.
+///
+/// The three names ferx *does* take with more than one argument keep their own
+/// arity messages, asserted here so moving the guard cannot have swallowed them
+/// (`test_clamp_arity_diagnostics` pins the rest).
+#[test]
+fn an_unknown_name_is_rejected_at_every_arity() {
+    for call in [
+        "pow(TVCL, 2.0)",
+        "atan2(TVCL, TVV)",
+        "fma(TVCL, TVV, 1.0)",
+        "tanh()",
+    ] {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {call}\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        let err = parse_model_string(&src).expect_err(&format!("`{call}` must be rejected"));
+        let fname = call.split('(').next().unwrap();
+        assert!(
+            err.contains("unknown function") && err.contains(fname),
+            "`{call}`: expected the unknown-function diagnostic, got: {err}"
+        );
+        assert!(
+            !err.contains("takes 1 argument"),
+            "`{call}`: reported an arity for a function ferx does not have: {err}"
+        );
+    }
+
+    // min / max / clamp are exempt from the name guard and keep arity messages.
+    for (call, want) in [
+        ("min(TVCL)", "exactly two arguments"),
+        ("max(TVCL)", "exactly two arguments"),
+        ("clamp(TVCL)", "three arguments"),
+    ] {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {call}\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        let err = parse_model_string(&src).expect_err(&format!("`{call}` must be rejected"));
+        assert!(
+            err.contains(want) && !err.contains("unknown function"),
+            "`{call}`: expected the arity message, got: {err}"
+        );
+    }
+}
+
 /// The straddle for the test above: the *same* fixtures with a whitelisted name
 /// in the hole must parse. Without this, a rejection could be coming from an
 /// unrelated error on the probe line and the mutation "delete the guard" would
@@ -22156,17 +22216,26 @@ fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
         ("inv_logit", 0.5),
         ("expit", 0.5),
     ];
+    // The probe table must equal the const as a *multiset*, asserted as one
+    // comparison of sorted vectors rather than as a set of membership and
+    // length checks. The earlier spelling — equal lengths plus "every const
+    // name has a probe" — was not exact: replacing one const entry with a copy
+    // of another keeps the length and keeps every (surviving) const name
+    // present in the probes, so it stayed green while silently dropping the
+    // replaced function from the whitelist and making `ceil(...)` a parse
+    // error. Sorted-vector equality catches that, a name added to either side,
+    // and a duplicated row on either side, in a single gate — separate
+    // membership and uniqueness assertions would reject several of those inputs
+    // twice over and cover for each other.
+    let mut want: Vec<&str> = SUPPORTED_UNARY_FNS.to_vec();
+    want.sort_unstable();
+    let mut got: Vec<&str> = probes.iter().map(|(p, _)| *p).collect();
+    got.sort_unstable();
     assert_eq!(
-        probes.len(),
-        SUPPORTED_UNARY_FNS.len(),
-        "every whitelisted name needs a probe here"
+        got, want,
+        "the probe table and SUPPORTED_UNARY_FNS have drifted; every whitelisted name \
+         needs exactly one probe here, and every probe a whitelist entry"
     );
-    for n in SUPPORTED_UNARY_FNS {
-        assert!(
-            probes.iter().any(|(p, _)| p == n),
-            "`{n}` is whitelisted but has no probe"
-        );
-    }
 
     let eta: &[f64] = &[];
     let vars: &[f64] = &[];

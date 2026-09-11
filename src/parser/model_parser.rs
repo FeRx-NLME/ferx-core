@@ -22400,6 +22400,35 @@ fn parse_atom(
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
                 let is_clamp = func_name == "clamp";
+                // Reject an unrecognised name here — *before* any argument is
+                // parsed (#1332). An unrecognised name used to become
+                // `UnaryFn(name, arg)`, which every consumer evaluated as the
+                // identity, so `CL = TVCL * tanh(ETA_CL)` parsed, fitted,
+                // converged and computed `TVCL * ETA_CL`. This is the single site
+                // that builds the node, so the check covers every block whose
+                // expressions go through `parse_atom`, not one block's path.
+                //
+                // Placed above the argument loop rather than next to the `UnaryFn`
+                // return so the *name* is judged before the *arity*: a
+                // two-argument `pow(x, y)` would otherwise fall into the comma
+                // branch below and be reported as "`pow` takes 1 argument", which
+                // sends the reader looking for an arity bug in a function ferx
+                // does not have. `min`/`max`/`clamp` are exempt because they are
+                // desugared below and never reach `UnaryFn`; they keep their own
+                // arity diagnostics.
+                if !is_min_max && !is_clamp && !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
+                    if func_name == "present" {
+                        return Err(format!(
+                            "`present(...)` is a condition, not a value — write it as a test, \
+                             e.g. `if (present(WT)) ... else ...`, rather than in `{name}(...)` \
+                             value position."
+                        ));
+                    }
+                    return Err(format!(
+                        "unknown function `{name}`. Supported: {}",
+                        supported_function_list()
+                    ));
+                }
                 let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
                 if (is_min_max || is_clamp) && tokens.get(p) == Some(&Token::Comma) {
                     let (arg2, p) = parse_add_sub(tokens, p + 1, ctx)?;
@@ -22527,27 +22556,11 @@ fn parse_atom(
                         "`{func_name}` takes exactly three arguments: `clamp(x, lo, hi)`."
                     ));
                 }
-                // Any name reaching here is a one-argument call. Reject it unless
-                // it is a builtin the three `UnaryFn` consumers actually implement
-                // (#1332): an unrecognised name used to become `UnaryFn(name, arg)`,
-                // which every consumer evaluated as the identity, so
-                // `CL = TVCL * tanh(ETA_CL)` parsed, fitted, converged and computed
-                // `TVCL * ETA_CL`. The check lives here — the single site that builds
-                // the node — so it covers every block whose expressions go through
-                // `parse_atom`, not one block's path.
-                if !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
-                    if func_name == "present" {
-                        return Err(format!(
-                            "`present(...)` is a condition, not a value — write it as a test, \
-                             e.g. `if (present(WT)) ... else ...`, rather than in `{name}(...)` \
-                             value position."
-                        ));
-                    }
-                    return Err(format!(
-                        "unknown function `{name}`. Supported: {}",
-                        supported_function_list()
-                    ));
-                }
+                // `func_name` is whitelisted: the guard above rejected anything
+                // else, and `min`/`max`/`clamp` have returned by now. Deliberately
+                // *not* re-checked here — two gates rejecting the same inputs
+                // would cover for each other, and deleting either would leave the
+                // suite green.
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
             }
 
