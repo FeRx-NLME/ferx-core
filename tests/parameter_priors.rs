@@ -148,6 +148,74 @@ fn fit_refuses_a_prior_the_final_method_cannot_apply() {
     assert!(fit_model(&model, &pop, &short_focei()).is_ok());
 }
 
+/// The penalty has to reach every optimizer that claims to apply priors, not
+/// only the default one.
+///
+/// `foce`/`focei` route through NLopt by default, so the built-in BFGS outer
+/// loop and the Gauss-Newton optimizer each assemble the penalized objective in
+/// their *own* code — `run_bfgs_outer`'s `f_only`/`fdfg`/`clean_ofv_at`, and
+/// `gauss_newton`'s BHHH assembly. A prior dropped in either is invisible: the
+/// fit converges, the report recomputes `ofv_prior` at the final estimate and
+/// shows a plausible non-zero penalty, and only the estimate is wrong.
+///
+/// So the assertion is the *identity* `ofv == ofv_data + ofv_prior` with
+/// `ofv_prior > 0` — `ofv_prior > 0` alone passes on an engine that never saw
+/// the penalty, since the report computes it independently.
+#[test]
+fn every_prior_applying_optimizer_carries_the_penalty() {
+    let model = warfarin_with(&params_with_cl_prior(0.15, 25.0));
+    let pop = warfarin_population();
+
+    let cases: [(&str, FitOptions); 3] = [
+        ("builtin bfgs", {
+            let mut o = short_focei();
+            o.optimizer = ferx_core::types::Optimizer::Bfgs;
+            o
+        }),
+        ("gn", short_fit_options(EstimationMethod::FoceGn)),
+        (
+            "gn_hybrid",
+            short_fit_options(EstimationMethod::FoceGnHybrid),
+        ),
+    ];
+
+    for (label, opts) in cases {
+        let r = fit_model(&model, &pop, &opts)
+            .unwrap_or_else(|e| panic!("{label} must accept a prior: {e}"));
+        assert!(
+            r.ofv_prior > 0.0,
+            "{label}: the prior half must be reported"
+        );
+        assert!(
+            (r.ofv - (r.ofv_data + r.ofv_prior)).abs() < 1e-9,
+            "{label}: ofv {} != ofv_data {} + ofv_prior {}",
+            r.ofv,
+            r.ofv_data,
+            r.ofv_prior
+        );
+        assert!(r.ofv.is_finite() && r.ofv_data.is_finite(), "{label}");
+        assert_eq!(r.prior_summary.len(), 1, "{label}");
+        assert_eq!(r.prior_summary[0].name, "TVCL", "{label}");
+    }
+
+    // The control: the unpriored twin under the same three engines reports a
+    // zero prior half, so the identity above is not satisfied by an engine that
+    // reports `ofv_data == ofv` regardless.
+    let unpriored = warfarin_with(BASE_PARAMS);
+    let mut bfgs = short_focei();
+    bfgs.optimizer = ferx_core::types::Optimizer::Bfgs;
+    for (label, opts) in [
+        ("builtin bfgs", bfgs),
+        ("gn", short_fit_options(EstimationMethod::FoceGn)),
+    ] {
+        let r = fit_model(&unpriored, &pop, &opts)
+            .unwrap_or_else(|e| panic!("{label} unpriored must fit: {e}"));
+        assert_eq!(r.ofv_prior, 0.0, "{label}");
+        assert_eq!(r.ofv_data, r.ofv, "{label}");
+        assert!(r.prior_summary.is_empty(), "{label}");
+    }
+}
+
 /// A chain whose *final* stage applies priors is fine even when an earlier one
 /// does not — the last stage is the one whose estimates are reported.
 #[test]

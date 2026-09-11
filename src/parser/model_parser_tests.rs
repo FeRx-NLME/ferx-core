@@ -22455,12 +22455,27 @@ fn a_bare_rse_above_one_is_rejected_as_ambiguous() {
 /// its place.
 #[test]
 fn a_malformed_prior_call_is_rejected() {
-    let cases: [(&str, &str); 5] = [
+    let cases: [(&str, &str); 13] = [
         ("prior(0.15)", "expected"),
         ("prior(0.15, 0.25)", "rse"),
         ("prior(0.15, cv = 25%)", "unknown prior argument"),
         ("prior(0.15, rse = 25%, sd = 0.1)", "expected"),
         ("prior(abc, rse = 25%)", "not a number"),
+        // The first argument is the central value; any other key there is a
+        // mistake rather than a second spread.
+        ("prior(mean = 0.15, rse = 25%)", "central value"),
+        // Non-finite central value — caught before it can reach the packed
+        // `ln` and become a silent NaN prior mean.
+        ("prior(inf, rse = 25%)", "must be finite"),
+        ("prior(nan, rse = 25%)", "must be finite"),
+        // Unparseable and out-of-range spreads, both spellings. A spread of 0
+        // is a point mass, not a prior, and a negative one is nonsense; either
+        // would otherwise divide the penalty by zero or flip its sign.
+        ("prior(0.15, rse = abc%)", "not a number"),
+        ("prior(0.15, rse = 0%)", "must be > 0"),
+        ("prior(0.15, rse = -5%)", "must be > 0"),
+        ("prior(0.15, sd = abc)", "not a number"),
+        ("prior(0.15, sd = 0)", "must be > 0"),
     ];
     for (call, needle) in cases {
         let err = parse_err(&priored_model(&format!(
@@ -22474,6 +22489,48 @@ fn a_malformed_prior_call_is_rejected() {
             "`{call}` should mention `{needle}`: {err}"
         );
     }
+}
+
+/// `value = 0.15` is the long spelling of the bare first argument, and means
+/// exactly the same thing.
+///
+/// Asserted as an *equality* against the bare form rather than merely parsing,
+/// because the failure mode worth catching is the two spellings resolving to
+/// different priors — which no "it parses" check can see.
+#[test]
+fn the_central_value_may_be_written_with_its_keyword() {
+    let parse_one = |call: &str| {
+        parse_full_model(&priored_model(&format!(
+            "  theta TVCL(0.2, 0.001, 10.0) {call}\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  \
+             sigma PROP_ERR ~ 0.04\n\n"
+        )))
+        .unwrap_or_else(|e| panic!("`{call}` must parse: {e}"))
+        .model
+        .priors
+        .remove(0)
+    };
+
+    let keyed = parse_one("prior(value = 0.15, rse = 25%)");
+    let bare = parse_one("prior(0.15, rse = 25%)");
+    assert_eq!(keyed.name, bare.name);
+    assert_eq!(keyed.value, bare.value);
+    assert_eq!(keyed.spread, bare.spread);
+    assert_eq!(keyed.value, 0.15);
+}
+
+/// An unterminated `prior(` is an error naming the line, not a panic and not a
+/// silently dropped tail.
+#[test]
+fn an_unbalanced_prior_call_is_rejected() {
+    let err = parse_err(&priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior(0.15, rse = 25%\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    ));
+    assert!(err.contains("prior"), "got: {err}");
 }
 
 /// A `prior(...)` on a declaration that cannot carry one must be an error, not

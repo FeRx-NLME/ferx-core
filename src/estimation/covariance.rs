@@ -1727,6 +1727,59 @@ mod tests {
         assert!(warning.contains("covariance_method = r"), "{warning}");
     }
 
+    /// A priored fit at scale stays on `R` instead of being auto-routed to the
+    /// cross-product (#254).
+    ///
+    /// `S` is a sum of per-*subject* scores and a prior has no subject
+    /// decomposition, so the usual large-problem fallback would silently report
+    /// unpenalized standard errors for a penalized fit. The straddle is the
+    /// pair: identical `n` and identical `explicitly_set`, differing only in
+    /// `has_priors`, so the two arms land on *different* methods. Without both
+    /// sides this passes on an implementation that never routes at all.
+    #[test]
+    fn a_priored_fit_stays_on_the_hessian_at_scale() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, true);
+        assert_eq!(
+            routed,
+            CovarianceMethod::Hessian,
+            "a prior must keep the covariance step on R"
+        );
+        let warning = warning.expect("staying on the slow estimator must be reported");
+        // The message has to say *why* the usual fallback was skipped, or the
+        // user reads it as the plain large-problem warning and switches to `s`
+        // by hand — which is the outcome this branch exists to prevent.
+        assert!(warning.contains("parameter priors"), "{warning}");
+        assert!(warning.contains("cannot represent a prior"), "{warning}");
+        // And the cost, as in the other two arms.
+        assert!(
+            warning.contains(&(n * (n + 1) / 2).to_string()),
+            "message must name the stencil size: {warning}"
+        );
+
+        // The straddle: same n, same `explicitly_set`, no prior — routed away.
+        let (unpriored, _) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, false);
+        assert_eq!(
+            unpriored,
+            CovarianceMethod::CrossProduct,
+            "without a prior the same inputs must still route to S"
+        );
+
+        // Below the threshold the prior changes nothing: the guard is about
+        // scale, and a small priored fit is not warned at all.
+        let (small, small_warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM,
+            CovarianceMethod::Hessian,
+            false,
+            true,
+        );
+        assert_eq!(small, CovarianceMethod::Hessian);
+        assert!(small_warning.is_none(), "{small_warning:?}");
+    }
+
     #[test]
     fn a_non_hessian_request_is_never_rerouted() {
         // `s` and `rsr` already cost one pass; the guard has nothing to say.

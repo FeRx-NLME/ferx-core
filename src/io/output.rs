@@ -4650,6 +4650,99 @@ mod tests {
         print_results(&r);
     }
 
+    /// The three renderers of the per-parameter prior report (#254) — the file
+    /// summary, the YAML, and the stderr printer — must all emit it, and all
+    /// three must stay silent on an unpriored fit.
+    ///
+    /// The report is the only place a MAP fit says how far the data pulled each
+    /// estimate from its prior, so a renderer that silently drops it leaves a
+    /// penalized fit indistinguishable from an unpenalized one in the output the
+    /// user actually reads. Every assertion below is paired with its negative on
+    /// the *same* `FitResult` with `prior_summary` cleared, so none of them can
+    /// pass on a renderer that prints the block unconditionally.
+    #[test]
+    fn the_prior_report_renders_in_the_summary_the_yaml_and_the_printer() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.ofv = 110.0;
+        r.ofv_data = 100.0;
+        r.ofv_prior = 10.0;
+        r.prior_summary = vec![
+            crate::types::PriorSummary {
+                name: "TVCL".to_string(),
+                prior_value: 0.15,
+                estimate: 0.132,
+                shift_in_prior_sds: -0.48,
+                penalty: 0.2304,
+                family: "lognormal".to_string(),
+                prior_lower_95: 0.0919,
+                prior_upper_95: 0.2449,
+            },
+            crate::types::PriorSummary {
+                name: "HILL".to_string(),
+                prior_value: 1.0,
+                estimate: 1.4,
+                shift_in_prior_sds: 0.8,
+                penalty: 0.64,
+                family: "normal".to_string(),
+                prior_lower_95: 0.02,
+                prior_upper_95: 1.98,
+            },
+        ];
+
+        // --- The file summary -------------------------------------------------
+        let summary = format_summary(&r);
+        assert!(summary.contains("Parameter Priors"), "{summary}");
+        // Both rows, and the OFV split labelled under the penalized total.
+        assert!(summary.contains("TVCL"), "{summary}");
+        assert!(summary.contains("HILL"), "{summary}");
+        assert!(summary.contains("lognormal"), "{summary}");
+        assert!(summary.contains("normal"), "{summary}");
+        assert!(summary.contains("data:  100.0000"), "{summary}");
+        assert!(summary.contains("prior: 10.0000"), "{summary}");
+        // The shift is the column the report exists for, so it must be the
+        // standardized one and not a raw difference (−0.48, not −0.018).
+        assert!(summary.contains("-0.48"), "{summary}");
+
+        // --- The YAML ---------------------------------------------------------
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("read yaml");
+        assert!(yaml.contains("\nparameter_priors:"), "{yaml}");
+        assert!(yaml.contains("  - name: TVCL"), "{yaml}");
+        assert!(yaml.contains("    shift_in_prior_sds: -0.480000"), "{yaml}");
+        assert!(yaml.contains("    penalty: 0.230400"), "{yaml}");
+        assert!(yaml.contains("    family: lognormal"), "{yaml}");
+        assert!(
+            yaml.contains("    prior_95: [0.091900, 0.244900]"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("  ofv_data: 100.000000"), "{yaml}");
+        assert!(yaml.contains("  ofv_prior: 10.000000"), "{yaml}");
+
+        // --- The stderr printer ----------------------------------------------
+        // No capture here; this is the smoke half — the formatting it shares
+        // with the summary is asserted above, through the one `write_prior_summary`.
+        print_results(&r);
+
+        // --- The negative, on the same result --------------------------------
+        // Without this every assertion above is satisfied by a renderer that
+        // emits the block unconditionally, which would put an empty prior table
+        // into every unpriored fit's output.
+        r.prior_summary.clear();
+        r.ofv_prior = 0.0;
+        r.ofv_data = r.ofv;
+        let plain = format_summary(&r);
+        assert!(!plain.contains("Parameter Priors"), "{plain}");
+        assert!(!plain.contains("prior:"), "{plain}");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let plain_yaml = std::fs::read_to_string(&path).expect("read yaml");
+        assert!(!plain_yaml.contains("parameter_priors:"), "{plain_yaml}");
+        assert!(!plain_yaml.contains("ofv_prior:"), "{plain_yaml}");
+        assert!(!plain_yaml.contains("ofv_data:"), "{plain_yaml}");
+        print_results(&r);
+    }
+
     #[test]
     fn print_results_smoke_comprehensive() {
         // Exercises the maximal-section path of the stderr printer.

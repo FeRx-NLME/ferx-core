@@ -438,6 +438,56 @@ fn a_non_positive_spread_is_an_error() {
     }
 }
 
+/// A non-finite central value is rejected *before* the positivity check, and
+/// says so in those words.
+///
+/// The ordering is the point: `!(NaN > 0.0)` is `true`, so a positivity test
+/// reached first would report a `NaN` as "must be > 0" and send the user looking
+/// at the sign of a value that has no sign. Asserted on the message, not merely
+/// on `is_err`, because both branches return `Err` and only the text
+/// distinguishes them.
+#[test]
+fn a_non_finite_central_value_is_rejected_as_non_finite() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let f = Fixture::new(0.2, 0.001, 0.1, 0.1).with_prior("TVCL", value, PriorSpread::Rse(0.2));
+        let msg = err_of(&f);
+        assert!(
+            msg.contains("finite"),
+            "{value}: must be reported as non-finite, not as non-positive: {msg}"
+        );
+    }
+
+    // The straddle: the same coordinate with a finite positive value resolves,
+    // so the check rejects non-finiteness rather than every value.
+    assert!(Fixture::new(0.2, 0.001, 0.1, 0.1)
+        .with_prior("TVCL", 0.15, PriorSpread::Rse(0.2))
+        .build()
+        .is_ok());
+}
+
+/// A non-finite *spread* is rejected in both spellings.
+///
+/// `a_non_positive_spread_is_an_error` covers zero and negative; these are the
+/// values that pass `> 0` and would otherwise produce an `sd` of `NaN` or `inf`
+/// — a penalty that is silently zero (`z = finite/inf`) or `NaN` for the whole
+/// fit, neither of which any outcome assertion would attribute to the prior.
+#[test]
+fn a_non_finite_spread_is_an_error() {
+    for spread in [
+        PriorSpread::Rse(f64::NAN),
+        PriorSpread::Rse(f64::INFINITY),
+        PriorSpread::Sd(f64::NAN),
+        PriorSpread::Sd(f64::INFINITY),
+    ] {
+        let f = Fixture::new(0.2, 0.001, 0.1, 0.1).with_prior("TVCL", 0.15, spread);
+        let msg = err_of(&f);
+        assert!(
+            msg.contains("finite") || msg.contains("> 0"),
+            "{spread:?}: {msg}"
+        );
+    }
+}
+
 /// A `block_omega` element has no variance of its own to prior — the packed
 /// coordinates are Cholesky entries — so v1 rejects it by name rather than
 /// priding a Cholesky diagonal as if it were a variance.
