@@ -1789,3 +1789,140 @@ fn dcm_iov_gate_and_walk_agree_on_absolute_axis_features() {
         &with_init
     ));
 }
+
+/// The walk-side half of the P2 gate: a DCM whose weight block *does* fit one occasion
+/// (12 weights + 2 η + 1 κ = 15 ≤ 24, so the model-level gate is analytic) but whose
+/// 11-occasion subject stacks past the cap (12 + 2 + 11 = 25) needs a non-identity chunk;
+/// with an `[initial_conditions]` impulse the walk must decline *that subject* (per-subject
+/// FD, surfaced by the FD-fallback warning), while the same subject on the same network
+/// without the impulse is served through the chunks. Pinned so the identity-chunk gate in
+/// `run_obs_iov` cannot be dropped without a red test: without it the impulse program
+/// would seed its direct θ/η references on axes that belong to another chunk.
+#[test]
+fn dcm_iov_walk_declines_absolute_axis_step_only_off_the_identity_chunk() {
+    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
+
+    const SMALL_DCM_IOV: &str = r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP ~ 0.04 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  center = [70, 90]
+  scale  = [15, 30]
+  outputs = [CL, V]
+  layers = [2]
+  activation = tanh
+  output = softplus
+  init = [0.5, 20]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = focei
+  iov_column = OCC
+"#;
+    let plain = parse_model_string(SMALL_DCM_IOV).expect("small DCM+IOV parses");
+    let with_init = parse_model_string(&SMALL_DCM_IOV.replace(
+        "[error_model]",
+        "[initial_conditions]\n  init(central) = 0.1 * V\n\n[error_model]",
+    ))
+    .expect("small DCM+IOV+init parses");
+    assert_eq!(plain.n_theta, 12, "2→2→2 network is 12 weights");
+    for m in [&plain, &with_init] {
+        assert!(
+            m.n_theta + m.n_eta + m.n_kappa <= 24,
+            "one occasion must fit the walk, or the model-level gate declines first"
+        );
+        assert!(
+            iov_analytical_supported(m),
+            "model-level gate is analytic for both"
+        );
+    }
+
+    // Eleven occasions: 2 + 11 stacked axes + 12 θ = 25 > 24 → two chunks.
+    let k = 11usize;
+    let mut cov = HashMap::new();
+    cov.insert("WT".to_string(), 72.0);
+    cov.insert("CRCL".to_string(), 95.0);
+    let mut doses = Vec::new();
+    let mut obs_times = Vec::new();
+    let mut occasions = Vec::new();
+    let mut dose_occasions = Vec::new();
+    for g in 0..k {
+        let t0 = 24.0 * g as f64;
+        doses.push(DoseEvent::new(t0, 100.0, 1, 0.0, false, 0.0));
+        obs_times.push(t0 + 2.0);
+        obs_times.push(t0 + 8.0);
+        occasions.push((g + 1) as u32);
+        occasions.push((g + 1) as u32);
+        dose_occasions.push((g + 1) as u32);
+    }
+    let n = obs_times.len();
+    let subject = Subject {
+        id: "1".into(),
+        doses,
+        obs_times,
+        obs_raw_times: Vec::new(),
+        observations: vec![2.0; n],
+        obs_cmts: vec![1; n],
+        covariates: cov,
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        reset_occasions: Vec::new(),
+        cens: vec![0; n],
+        occasions,
+        obs_l2: Vec::new(),
+        dose_occasions,
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let n_st = plain.n_eta + k * plain.n_kappa;
+    assert!(plain.n_theta + n_st > 24, "subject must force chunking");
+    let theta: Vec<f64> = plain
+        .default_params
+        .theta
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| t + 0.3 * ((i as f64) * 0.7 + 0.3).sin())
+        .collect();
+    let stacked = vec![0.05; n_st];
+
+    assert!(
+        subject_sensitivities_iov(&plain, &subject, &theta, &stacked).is_some(),
+        "the plain network is served through two chunks"
+    );
+    assert!(
+        subject_sensitivities_iov(&with_init, &subject, &theta, &stacked).is_none(),
+        "the init impulse cannot run on a non-identity chunk; this subject must decline"
+    );
+    // The same model serves a one-occasion subject on the identity chunk.
+    let mut one = subject.clone();
+    one.doses.truncate(1);
+    one.obs_times.truncate(2);
+    one.observations.truncate(2);
+    one.obs_cmts.truncate(2);
+    one.cens.truncate(2);
+    one.occasions.truncate(2);
+    one.dose_occasions.truncate(1);
+    assert!(
+        subject_sensitivities_iov(&with_init, &one, &theta, &vec![0.05; with_init.n_eta + 1])
+            .is_some(),
+        "on the identity chunk the impulse runs"
+    );
+}
