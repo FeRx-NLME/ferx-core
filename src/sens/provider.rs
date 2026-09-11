@@ -5016,9 +5016,18 @@ fn covariance_sensitivities(
     // tensors. So the contract is that `base_in` must be the jet at *this* `(theta, eta)` from
     // the *same* provider arm, and `debug_assert_base_matches` checks it against a fresh
     // evaluation in debug builds rather than trusting the call graph.
+    //
+    // `debug_assert_base_matches` is a plain function, not the `debug_assert!` macro: only its
+    // body compiles away in release, not its arguments. Calling it as
+    // `debug_assert_base_matches(&supplied, &evaluate(theta, eta)?)` would make the caller
+    // evaluate `evaluate(theta, eta)` to build that argument on *every* build, `Some(base_in)`
+    // included — silently paying back the whole evaluation #1344 item 2 exists to skip. Gate the
+    // evaluation itself on `cfg!(debug_assertions)`, not just the assertion it feeds.
     let mut base = match base_in {
         Some(supplied) => {
-            debug_assert_base_matches(&supplied, &evaluate(theta, eta)?);
+            if cfg!(debug_assertions) {
+                debug_assert_base_matches(&supplied, &evaluate(theta, eta)?);
+            }
             supplied
         }
         None => evaluate(theta, eta)?,

@@ -28,7 +28,10 @@ section of the SDLC for the versioning policy).
   point; the anchor's is now handed over instead of discarded, removing one of the sweep's
   `1 + 2·n_eta` evaluations (7 → 6 on a 3-random-effect model). Debug builds assert the reused
   jet against a fresh evaluation, since a mismatched one would produce wrong derivatives rather
-  than an error (#1344).
+  than an error. Measured against the previous release on warfarin fixtures (`ci-test`,
+  `FERX_PROFILE=1`): provider calls −9.1% on all three (diagonal Ω 4180 → 3800, block Ω
+  5280 → 4800, ODE 4300 → 3910), with OFV and outer-iteration counts unchanged in every case
+  (#1344).
 
 - **SAEM's per-occasion κ sampling now runs in parallel over subjects** instead of serially
   beside the already-parallel η phase. Bit-identical: each subject writes only its own slots and
