@@ -672,10 +672,14 @@ fn dcm_iov_eta_gradient_is_analytic_and_matches_central_fd() {
         crate::sens::provider::iov_analytical_eta_supported(&model),
         "a DCM+IOV model must be inside the eta-only analytic scope"
     );
+    // Since #1339 the full (outer) scope admits a DCM too — the θ-axis clause is on the
+    // declared thetas and the weight columns are chained through the network outputs. The
+    // inner walk keeps the η-only `Dual1` builder for a DCM regardless
+    // (`subject_eta_grad_iov_analytical` pins `eta_only` on `nn_weight_theta_count`), so
+    // this test still exercises exactly the route it did before.
     assert!(
-        !crate::sens::provider::iov_analytical_supported(&model),
-        "and outside the full one — if this flips, the theta-axis accounting changed and \
-         this test no longer exercises the eta-only route"
+        crate::sens::provider::iov_analytical_supported(&model),
+        "a DCM+IOV model is inside the full analytic IOV scope as of #1339"
     );
 
     let mut subject = static_subject();
@@ -770,15 +774,17 @@ fn the_dcm_iov_eta_scope_reaches_the_inner_loop_gate() {
     let model = dcm_iov_model();
     assert!(model.n_kappa > 0, "fixture must carry IOV");
 
-    // The two predicates must genuinely differ on this model, or the rest is vacuous.
+    // Both predicates admit a DCM now: the η-only one since #1015, the strict outer one
+    // since #1339 (declared-θ axis clause + the chained weight columns). What this test
+    // pins is that the *inner* gate reads the η-only predicate — the two agreeing on this
+    // model no longer distinguishes them, so the check below is on the reported route.
     assert!(
         iov_sens_eta_supported(&model),
         "a DCM+IOV model is inside the η-only IOV scope"
     );
     assert!(
-        !iov_sens_supported(&model),
-        "and outside the strict one — if this flips, the θ-axis accounting changed and this \
-         test no longer exercises the relaxation"
+        iov_sens_supported(&model),
+        "a DCM+IOV model is inside the strict (outer) IOV scope as of #1339"
     );
 
     // The reported inner method — which `build_info::gradient_method_inner` and the
@@ -1419,4 +1425,285 @@ fn a_direct_weight_reference_still_matches_central_fd() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DCM + IOV: the analytic OUTER route (#1339)
+// ---------------------------------------------------------------------------
+
+/// The busulfan shape of #1327/#1339: 2-cpt IV infusion, a 4 → 2 → 4 network on every
+/// typical value (22 weights), κ on CL and V1, combined error. `n_theta + n_stacked`
+/// (22 + 3 + 2K) exceeds the walk's 24-axis cap for any K ≥ 1, so the outer walk must
+/// chunk its θ columns — which is the point of the fixture.
+fn dcm_two_kappa_model() -> CompiledModel {
+    parse_model_string(
+        r#"
+[parameters]
+  omega ETA_CL ~ 0.068
+  omega ETA_V1 ~ 0.038
+  omega ETA_V2 ~ 0.077
+  kappa KAPPA_CL ~ 0.0111
+  kappa KAPPA_V1 ~ 0.0153
+  sigma PROP_ERR ~ 0.05 (sd)
+  sigma ADD_ERR  ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [LAGE, LWT, LHT, SEX]
+  center     = [2.639, 3.727, 4.91, 0]
+  scale      = [1.548, 0.907, 0.342, 1]
+  outputs    = [CL, V1, Q, V2]
+  layers     = [2]
+  activation = tanh
+  output     = softplus
+  init       = [11.6, 46.5, 14.3, 10.8]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1 + KAPPA_V1)
+  Q  = TYPICAL_PK.Q
+  V2 = TYPICAL_PK.V2 * exp(ETA_V2)
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method = focei
+  iov_column = OCC
+"#,
+    )
+    .expect("2-κ DCM parses")
+}
+
+/// Three occasions, one 3-hour infusion each, two observations per occasion — the later
+/// doses land with residual drug present (a multi-dose fixture, per CLAUDE.md's
+/// non-degeneracy rule), so κ on a later occasion moves both its own rows and the
+/// carry-over into the next.
+fn dcm_two_kappa_subject() -> Subject {
+    let mut cov = HashMap::new();
+    cov.insert("LAGE".to_string(), 1.8);
+    cov.insert("LWT".to_string(), 3.1);
+    cov.insert("LHT".to_string(), 4.7);
+    cov.insert("SEX".to_string(), 1.0);
+    let dose = |t: f64| DoseEvent::new(t, 100.0, 1, 100.0 / 3.0, false, 0.0);
+    Subject {
+        id: "1".into(),
+        doses: vec![dose(0.0), dose(24.0), dose(48.0)],
+        obs_times: vec![3.5, 6.0, 27.5, 30.0, 51.5, 54.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![1.9, 1.5, 2.3, 1.8, 2.5, 2.0],
+        obs_cmts: vec![1; 6],
+        covariates: cov,
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        reset_occasions: Vec::new(),
+        cens: vec![0; 6],
+        occasions: vec![1, 1, 2, 2, 3, 3],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2, 3],
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// Every weight off zero (a zero hidden→output weight zeroes the whole first layer's
+/// gradient, and a zero hidden activation zeroes the output weights' — the parsed
+/// defaults have both), output biases restored to the declared `init` values so the
+/// typical values stay physiological.
+fn dcm_two_kappa_theta(model: &CompiledModel) -> Vec<f64> {
+    let mut theta: Vec<f64> = model
+        .default_params
+        .theta
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| t + 0.3 * ((i as f64) * 0.7 + 0.3).sin())
+        .collect();
+    for nn in &model.covariate_nns {
+        for (k, v) in [11.6f64, 46.5, 14.3, 10.8].iter().enumerate() {
+            // softplus⁻¹(v) = ln(eᵛ − 1)
+            theta[nn.weights_offset + nn.mapper.mlp().output_bias_index(k)] = (v.exp() - 1.0).ln();
+        }
+    }
+    theta
+}
+
+/// The outer IOV sensitivities of a DCM must be **analytic** and match central finite
+/// differences of `predict_iov` on all four blocks — `∂f/∂θ` over the whole weight block,
+/// `∂f/∂[η, κ]`, `∂²f/∂[η,κ]²` and the mixed `∂²f/∂[η,κ]∂θ` — on a subject whose stacked
+/// width forces the θ columns into two chunks.
+///
+/// What it catches (each verified by mutation while writing it): a weight column left
+/// unchained (`iov_nn_combined_derivs_dyn` without the `∂z/∂w` product reads as zero,
+/// and the FD reference is not); a chunk scattered onto the wrong columns (the second
+/// chunk's `θ_15..θ_21` written at `0..7`); a merge that drops the earlier chunk. The
+/// stacked-η blocks are the same program gradient the inner walk already pins
+/// (`dcm_iov_eta_gradient_is_analytic_and_matches_central_fd`) — checked here too so
+/// the chunked scatter cannot corrupt them.
+#[test]
+fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
+    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
+
+    let model = dcm_two_kappa_model();
+    let subject = dcm_two_kappa_subject();
+    let theta = dcm_two_kappa_theta(&model);
+    let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
+    let n_theta = model.n_theta;
+    assert_eq!(n_theta, 22, "4→2→4 network is 22 weights");
+    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    assert_eq!(k, 3);
+    let n_st = n_eta + k * n_kappa;
+    assert!(
+        n_theta + n_st > 24,
+        "fixture must exceed the single-chunk walk width or the chunking is untested"
+    );
+    assert!(
+        iov_analytical_supported(&model),
+        "a DCM+IOV model must be inside the full analytic IOV scope (#1339)"
+    );
+
+    let stacked: Vec<f64> = (0..n_st)
+        .map(|i| 0.2 * ((i as f64) * 1.3 + 0.5).sin())
+        .collect();
+    let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked)
+        .expect("the analytic IOV outer walk must serve a DCM+IOV subject");
+    assert_eq!(sens.obs.len(), subject.obs_times.len());
+
+    let pred = |st: &[f64], th: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|g| st[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa].to_vec())
+            .collect();
+        crate::pk::predict_iov(&model, &subject, th, &eta_bsv, &kappas)[j]
+    };
+    let he = 1e-6;
+    let heh = 1e-4;
+    let mut n_live_weight_cols = 0usize;
+    for (j, obs) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(obs.f, pred(&stacked, &theta, j), max_relative = 1e-9);
+        for p in 0..n_st {
+            let mut sp = stacked.clone();
+            sp[p] += he;
+            let mut sm = stacked.clone();
+            sm[p] -= he;
+            let g = (pred(&sp, &theta, j) - pred(&sm, &theta, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[p], g, max_relative = 2e-4, epsilon = 1e-7);
+            for q in 0..n_st {
+                let mut pp = stacked.clone();
+                pp[p] += heh;
+                pp[q] += heh;
+                let mut pm = stacked.clone();
+                pm[p] += heh;
+                pm[q] -= heh;
+                let mut mp = stacked.clone();
+                mp[p] -= heh;
+                mp[q] += heh;
+                let mut mm = stacked.clone();
+                mm[p] -= heh;
+                mm[q] -= heh;
+                let hh = (pred(&pp, &theta, j) - pred(&pm, &theta, j) - pred(&mp, &theta, j)
+                    + pred(&mm, &theta, j))
+                    / (4.0 * heh * heh);
+                approx::assert_relative_eq!(
+                    obs.d2f_deta2[p * n_st + q],
+                    hh,
+                    max_relative = 3e-3,
+                    epsilon = 1e-5
+                );
+            }
+        }
+        for m in 0..n_theta {
+            let s = he * (1.0 + theta[m].abs());
+            let mut tp = theta.clone();
+            tp[m] += s;
+            let mut tm = theta.clone();
+            tm[m] -= s;
+            let g = (pred(&stacked, &tp, j) - pred(&stacked, &tm, j)) / (2.0 * s);
+            if g.abs() > 1e-3 {
+                n_live_weight_cols += 1;
+            }
+            approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-4, epsilon = 1e-7);
+            for p in 0..n_st {
+                let sh = heh * (1.0 + theta[m].abs());
+                let mut ep = stacked.clone();
+                ep[p] += heh;
+                let mut em = stacked.clone();
+                em[p] -= heh;
+                let mut tp2 = theta.clone();
+                tp2[m] += sh;
+                let mut tm2 = theta.clone();
+                tm2[m] -= sh;
+                let hh = (pred(&ep, &tp2, j) - pred(&ep, &tm2, j) - pred(&em, &tp2, j)
+                    + pred(&em, &tm2, j))
+                    / (4.0 * heh * sh);
+                approx::assert_relative_eq!(
+                    obs.d2f_deta_dtheta[p * n_theta + m],
+                    hh,
+                    max_relative = 3e-3,
+                    epsilon = 1e-5
+                );
+            }
+        }
+    }
+    // Every weight column must carry signal on at least one observation, or a zeroed
+    // chain would pass the comparison above on that column (both sides zero). Both
+    // chunks (`0..15`, `15..22`) are covered by the whole-block sweep.
+    assert!(
+        n_live_weight_cols >= n_theta,
+        "only {n_live_weight_cols} live (θ, obs) pairs across {n_theta} weight columns — \
+         the probe leaves part of the network silent and the parity there is vacuous"
+    );
+}
+
+/// The relaxation must reach the **outer** dispatch, not just the provider: the strict
+/// IOV predicate, the shared analytic-outer-gradient predicate, and the `auto` optimizer
+/// resolution — which picks the gradient optimizer only when the loop will actually
+/// compute an analytic gradient — all have to agree on a DCM+IOV model. Before #1339 the
+/// reference fit ran derivative-free BOBYQA over 32 coordinates (546 evals to 59 470)
+/// while the analytic base took L-BFGS over 14 (41 evals to 56 916).
+#[test]
+fn dcm_iov_model_gets_the_analytic_outer_gradient_and_a_gradient_optimizer() {
+    use crate::sens::provider::{
+        analytic_outer_gradient_available, iov_analytical_supported, iov_sens_supported,
+    };
+    use crate::types::Optimizer;
+
+    let model = dcm_two_kappa_model();
+    assert!(iov_analytical_supported(&model));
+    assert!(iov_sens_supported(&model));
+    assert!(analytic_outer_gradient_available(&model));
+    assert_eq!(
+        Optimizer::Auto.resolve_auto(&model, true),
+        Optimizer::NloptLbfgs,
+        "auto must resolve to the gradient optimizer now that the outer gradient is analytic"
+    );
+
+    // A DCM that reads a generated weight θ directly breaks the output-channel
+    // factorization the chain relies on; it must decline the outer route (the same
+    // predicate `tvcov_analytical_supported` / `nn_theta_gradient` apply) while the
+    // η-only inner route — which needs no weight columns — still serves it.
+    let direct = parse_model_string(
+        &dcm_model_src()
+            .replace(
+                "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
+                "  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL) + 0.0 * B_TYPICAL_PK_2_1",
+            )
+            .replace(
+                "  omega ETA_V  ~ 0.09",
+                "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05",
+            ),
+    )
+    .expect("direct-weight DCM+IOV parses");
+    assert!(
+        !crate::sens::provider::nn_output_chain_supported(&direct),
+        "fixture must actually trip the direct-reference marker"
+    );
+    assert!(!iov_analytical_supported(&direct));
+    assert!(crate::sens::provider::iov_analytical_eta_supported(&direct));
 }

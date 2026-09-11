@@ -328,6 +328,24 @@ thing to check if a fit is unexpectedly slow. A model that reads a
 generated weight parameter directly (`… + B_TYPICAL_PK_2_1`) still
 routes to FD, as it does for the fixed-η estimators.
 
+A network on an **IOV** model (`kappa` random effects) takes the
+stacked `[η, κ]` walk, and that walk had the same limitation until
+#1339: it seeded every model theta on a dual axis of its own and
+required the `[individual_parameters]` program to reference all of
+them, which no DCM can satisfy. The consequence was not a slower
+gradient but no analytic outer gradient at all — `auto` resolved to
+derivative-free BOBYQA over every weight, and an explicit gradient
+optimizer got reconverged finite differences. On the busulfan
+reference (600 subjects, 22 weights, κ on CL and V1) that was 546
+BOBYQA evaluations against 41 L-BFGS evaluations for the analytic
+covariate model it replaces. The IOV walk now builds its per-occasion
+derivative source the same way the time-varying walk does — declared
+thetas, `[η, κ]`, one axis per network output, weight columns chained
+in through backpropagation — and walks the weight columns in chunks,
+so a DCM with IOV reports an analytic outer gradient and `auto` picks
+L-BFGS. The inner (per-subject) gradient was already analytic for
+these models and is unchanged.
+
 ## Regularization (`nn_l2`, `nn_smooth`)
 
 Because an unregularized DCM can invent spurious covariate-driven
