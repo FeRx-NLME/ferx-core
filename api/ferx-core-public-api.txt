@@ -381,12 +381,14 @@ pub ferx_core::estimation::inner_optimizer::EbeResult::grad_norm: f64
 pub ferx_core::estimation::inner_optimizer::EbeResult::h_matrix: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::estimation::inner_optimizer::EbeResult::hard_reject: bool
 pub ferx_core::estimation::inner_optimizer::EbeResult::kappas: alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
+pub ferx_core::estimation::inner_optimizer::EbeResult::n_iters: u64
 pub ferx_core::estimation::inner_optimizer::EbeResult::nll: f64
 pub ferx_core::estimation::inner_optimizer::EbeResult::used_fallback: bool
 pub struct ferx_core::estimation::inner_optimizer::InnerLoopStats
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_fallback: usize
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_start_rejected: usize
 pub ferx_core::estimation::inner_optimizer::InnerLoopStats::n_unconverged: usize
+pub ferx_core::estimation::inner_optimizer::InnerLoopStats::total_inner_iters: u64
 pub const ferx_core::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM: usize
 pub static ferx_core::estimation::inner_optimizer::PROFILE_INNER_ANALYTIC_GRAD: core::sync::atomic::AtomicU64
 pub static ferx_core::estimation::inner_optimizer::PROFILE_INNER_FD_FALLBACK: core::sync::atomic::AtomicU64

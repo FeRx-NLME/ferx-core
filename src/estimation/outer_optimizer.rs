@@ -1894,6 +1894,7 @@ fn optimize_nlopt_once(
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
                 n_start_rejected: m.ebe_stats.n_start_rejected,
+                total_inner_iters: m.ebe_stats.total_inner_iters,
             };
             let ofv = m.ofv;
             // A derivative-free eval (`grad` is `None` — e.g. BOBYQA, the default)

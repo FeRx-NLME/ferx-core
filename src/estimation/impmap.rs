@@ -370,6 +370,7 @@ fn run_map_multistart(
         n_unconverged: results.iter().filter(|r| !r.converged).count(),
         n_fallback: results.iter().filter(|r| r.used_fallback).count(),
         n_start_rejected: results.iter().filter(|r| r.hard_reject).count(),
+        total_inner_iters: results.iter().map(|r| r.n_iters).sum(),
     };
     let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
     let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();

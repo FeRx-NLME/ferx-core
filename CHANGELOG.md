@@ -19,6 +19,13 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+
+- `EbeResult` now carries `n_iters`, the optimizer iterations spent on that subject's inner solve
+  (main BFGS/L-BFGS/Nelder-Mead plus any fallback/restart/runaway-guard Nelder-Mead runs), and
+  `InnerLoopStats` sums it across subjects as `total_inner_iters` — pure measurement, to profile
+  where inner-loop time goes before optimizing it further (#1345).
+
 ### Changed
 
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**

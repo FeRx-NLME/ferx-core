@@ -56,6 +56,7 @@ fn ebe_guard_rejects_on_hard_reject_and_fraction() {
         n_unconverged,
         n_fallback: 0,
         n_start_rejected,
+        total_inner_iters: 0,
     };
 
     // A single hard reject forces rejection even with a finite OFV, zero unconverged

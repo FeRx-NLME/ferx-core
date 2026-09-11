@@ -1279,22 +1279,23 @@ fn argmin_inner_fallback_keeps_better_basin() {
         }
     };
     set_ebe_warm_start(false);
+    let mut iters = 0u64;
 
     // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
     // keeps the lower-objective partial rather than overwriting with the shallow NM
     // result (the old behaviour, which on this multimodal objective inflated the OFV).
-    let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8);
+    let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8, &mut iters);
     assert!((eta[0] + 2.0).abs() < 1e-2, "kept deep well, got {eta:?}");
 
     // Partial in the shallow well, cold NM seed reaches the deep well: NM wins.
-    let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8);
+    let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8, &mut iters);
     assert!(
         (eta2[0] + 2.0).abs() < 1e-2,
         "NM found deeper well, got {eta2:?}"
     );
 
     // Non-finite partial objective → unusable → NM result is taken.
-    let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8);
+    let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8, &mut iters);
     assert!(
         eta3[0].is_finite(),
         "NaN partial must be discarded, got {eta3:?}"
@@ -1303,7 +1304,7 @@ fn argmin_inner_fallback_keeps_better_basin() {
     // `ebe_warm_start` seeds the single NM from the partial (covers the warm branch):
     // from the deep well it stays there even though the cold seed is far away.
     set_ebe_warm_start(true);
-    let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8);
+    let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8, &mut iters);
     assert!(
         (eta4[0] + 2.0).abs() < 1e-2,
         "warm seed held the deep well, got {eta4:?}"
@@ -3604,10 +3605,11 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     set_ebe_warm_start(false);
     let partial = [-1.5];
     let f_partial = obj(&partial);
+    let mut iters = 0u64;
 
     // Tiny budget: the cold restart converges in the shallow well, the partial wins, the
     // polish cannot certify it.
-    let (eta, ok) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 1, 1e-3);
+    let (eta, ok) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 1, 1e-3, &mut iters);
     assert!(eta[0] < 0.0, "must stay in the deep well, got {eta:?}");
     assert!(
         obj(&eta) <= f_partial,
@@ -3621,7 +3623,7 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     );
 
     // Normal budget: the polish reaches the deep mode and earns the flag.
-    let (eta2, ok2) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 200, 1e-8);
+    let (eta2, ok2) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 200, 1e-8, &mut iters);
     assert!(
         (eta2[0] + 2.0).abs() < 1e-2,
         "polish must reach the deep mode, got {eta2:?}"
@@ -3630,4 +3632,61 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
         ok2,
         "an NM run that ended at the returned point certifies it"
     );
+}
+
+/// `argmin_inner_fallback`'s "polish" branch (non-warm, partial wins over the cold restart)
+/// runs Nelder-Mead *twice* — see its doc comment. The `iters` accumulator must count both
+/// runs, not just one: comparing against the sum of two independent, identically-seeded
+/// `nelder_mead_minimize` calls (deterministic, no RNG) pins the exact count, so a mutation
+/// that threads a throwaway counter into either internal call — instead of the caller's
+/// `iters` — is caught by an unequal total rather than merely a "iters > 0" pass.
+#[test]
+fn argmin_inner_fallback_iters_sum_both_nm_runs_when_polishing() {
+    let obj = |x: &[f64]| -> f64 {
+        let v = x[0];
+        if v < 0.0 {
+            (v + 2.0).powi(2) - 10.0
+        } else {
+            (v - 2.0).powi(2) - 1.0
+        }
+    };
+    set_ebe_warm_start(false);
+    let partial = [-1.5];
+    let cold_seed = [2.0];
+    let max_iter = 200;
+    let tol = 1e-8;
+
+    // Independently reproduce both internal NM runs `argmin_inner_fallback` makes on this
+    // (non-warm, partial-wins) path: the cold restart, then the certifying polish from the
+    // partial — same start points, same `max_iter * 5` budget, same objective.
+    let mut expected_iters = 0u64;
+    let mut cold_restart = cold_seed;
+    nelder_mead_minimize(
+        &obj,
+        &mut cold_restart,
+        1,
+        max_iter * 5,
+        tol,
+        &mut expected_iters,
+    );
+    let mut polish = partial;
+    nelder_mead_minimize(&obj, &mut polish, 1, max_iter * 5, tol, &mut expected_iters);
+    assert!(expected_iters > 0, "sanity: NM must take at least one step");
+
+    let mut fallback_iters = 0u64;
+    let _ = argmin_inner_fallback(
+        &obj,
+        &partial,
+        &cold_seed,
+        1,
+        max_iter,
+        tol,
+        &mut fallback_iters,
+    );
+
+    assert_eq!(
+        fallback_iters, expected_iters,
+        "fallback's polish path must count exactly both NM runs' iterations"
+    );
+    set_ebe_warm_start(false);
 }
