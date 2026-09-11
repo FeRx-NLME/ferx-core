@@ -1126,6 +1126,18 @@ fn fit_inner(
     // the predicate needs no data and fails identically for every method.
     first_error(&check_variance_init_rails(init_params, options))?;
 
+    // An initial estimate that packs strictly outside its own box and is
+    // silently clamped there (#1251). Computed **once**, into a local: it
+    // returns a mix of errors (a θ outside the user's own declared range) and
+    // warnings (the internal Ω / Σ / hidden-θ-cap rails), and `first_error`
+    // consumes only the errors. The non-errors are pushed into
+    // `accumulated_warnings` at the `option_diags` block below — which is not
+    // declared until ~50 lines from here, so this cannot simply be inlined.
+    // Getting that wrong reports every one of these from `ferx check` and drops
+    // them silently from `fit()`, the #1033 failure mode.
+    let start_box_diags = check_packed_start_in_box(init_params, options);
+    first_error(&start_box_diags)?;
+
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
@@ -1234,6 +1246,12 @@ fn fit_inner(
     // computed for `first_error`; re-calling `check_model_options` here would emit
     // every one of these twice.
     for d in option_diags.iter().filter(|d| !d.is_error()) {
+        accumulated_warnings.push(d.message.clone());
+    }
+    // The warning half of the packed-start-in-box check (#1251) — the internal
+    // Ω / Σ / hidden-θ-cap rails. Its error half was consumed by `first_error`
+    // above, on the same `Vec`, for exactly the reason the comment above gives.
+    for d in start_box_diags.iter().filter(|d| !d.is_error()) {
         accumulated_warnings.push(d.message.clone());
     }
     // Experimental-feature notices (data-independent; see check_experimental_features).
@@ -1894,14 +1912,18 @@ fn fit_inner(
         .as_ref()
         .map(|mp| mp.mixest.clone());
     //
-    // ODE models run this pass inside a solver-statistics scope (#1080 Part B): it is the one
+    // ODE models run this pass under solver-statistics collection (#1080 Part B): it is the one
     // production sweep that integrates every subject at the final estimates through the
     // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
     // decisions can be observed without threading a stats sink through every predictor. Costs
     // one thread-local read per segment on the ODE path and nothing at all elsewhere.
-    let solver_stats_scope =
-        integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter);
-    let mut subjects = compute_subject_results(
+    //
+    // The scope used to be opened *here*, around the call. It is now opened per subject inside
+    // it and the counters come back as a return value, because the pass is parallel over
+    // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
+    // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
+    let ode_model = integrates_odes(model);
+    let (mut subjects, mut ode_solver_stats) = compute_subject_results(
         model,
         population,
         &result.params,
@@ -1910,32 +1932,29 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
         mixest_classes.as_deref(),
+        ode_model,
     );
-    let mut ode_solver_stats = solver_stats_scope
-        .map(|scope| scope.collected())
-        .unwrap_or_default();
     // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
     // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
     // sensitivity solve per subject is what makes that clause reportable: the solve the fit's
     // gradient ran throughout, run once more at the estimates the fit reports. No-ops for
     // every model not on the analytic ODE sensitivity path, and for every FD fit.
     //
-    // It gets its **own** scope, and exactly one field crosses back. Sharing the prediction
+    // It gets its **own** scopes, and exactly one field crosses back. Sharing the prediction
     // pass's scope would double every step, clamp and escalation count across two different
     // solves — and worse, a `min_dt` clamp that happened only in the gradient solve would
     // fire the warning's clamp clause, which tells the user their *predictions* were
     // freeze-padded. Only `auto_stiff_rejected_jets` describes something the prediction pass
     // structurally cannot observe, so only it is carried over.
-    if integrates_odes(model) {
-        let sens_scope = crate::ode::solver::SolverStatsScope::enter();
-        sweep_sensitivity_solver_stats(
+    if ode_model {
+        ode_solver_stats.auto_stiff_rejected_jets = sweep_sensitivity_solver_stats(
             model,
             population,
             &result.params,
             &result.eta_hats,
             mixest_classes.as_deref(),
-        );
-        ode_solver_stats.auto_stiff_rejected_jets = sens_scope.collected().auto_stiff_rejected_jets;
+        )
+        .auto_stiff_rejected_jets;
     }
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto

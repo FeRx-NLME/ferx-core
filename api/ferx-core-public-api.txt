@@ -2477,6 +2477,7 @@ pub ferx_core::types::WarningCode::GradientFallback
 pub ferx_core::types::WarningCode::HighCorrelation
 pub ferx_core::types::WarningCode::ImportanceSampling
 pub ferx_core::types::WarningCode::InflatedRse
+pub ferx_core::types::WarningCode::InitOutsideBounds
 pub ferx_core::types::WarningCode::MuReferencing
 pub ferx_core::types::WarningCode::MultiStart
 pub ferx_core::types::WarningCode::OdeSolver
@@ -3742,6 +3743,7 @@ pub ferx_core::WarningCode::GradientFallback
 pub ferx_core::WarningCode::HighCorrelation
 pub ferx_core::WarningCode::ImportanceSampling
 pub ferx_core::WarningCode::InflatedRse
+pub ferx_core::WarningCode::InitOutsideBounds
 pub ferx_core::WarningCode::MuReferencing
 pub ferx_core::WarningCode::MultiStart
 pub ferx_core::WarningCode::OdeSolver

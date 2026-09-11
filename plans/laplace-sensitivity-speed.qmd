@@ -283,7 +283,7 @@ provider's third-order sweep already reaches it via `ode_analytical_supported`. 
 pass on the same non-ODE fixture had recorded the opposite sign (fewer calls, 6840 → 6460, yet
 **more** total provider time, 0.098s → 0.131s, +34% — the number the previous revision of this
 section reported). Both measurements are real; the difference is machine/toolchain state
-moving a case that sits close to parity, not a defect in either run. That volatility, not a settled loss, is why this stayed behind `FERX_AGQ_GRID_RESPONSE=analytic` for as long as the **diagonal-Ω** fixture was the only closed-form case measured. On that fixture the two routes cost the same by construction (`n_free = n_theta + d = 7` either way), so it was never going to settle the question in either direction.
+moving a case that sits close to parity, not a defect in either run. That volatility, not a settled loss, is why this stayed behind `FERX_AGQ_GRID_RESPONSE=analytic` for as long as the **diagonal-Ω** fixture was the only closed-form case measured. On that fixture, `n_free = n_theta + d + n_sigma = 3 + 3 + 1 = 7`, giving 14 FD rebuilds versus `1 + 2(n_theta + d) = 13` provider evaluations. These similar counts do not imply equal runtime or general diagonal-Ω parity; the measured timing remained inconclusive.
 
 ### Session 2 — the run that flipped the default (#1335)
 
@@ -291,13 +291,13 @@ moving a case that sits close to parity, not a defect in either run. That volati
 
 | Fixture | Provider calls | Provider time | Reps won | Outer iters | OFV |
 |---|---|---|---|---|---|
-| diagonal Ω, closed-form | 6840 → 6460 (−5.6%) | 0.0586s → 0.0556s (−5%) | 4/5 | 37 → 37 | identical |
-| **block Ω (3×3)** | 11520 → 8160 (−29%) | 0.0880s → 0.0670s (**−24%**) | **5/5** | 47 → 47 | identical |
-| ODE | 10270 → 6470 (−37%) | 1.581s → 1.029s (−35%) | 5/5 | 56 → 37 | identical |
+| diagonal Ω, closed-form | 6840 → 6460 (−5.6%) | 0.0586s → 0.0556s (−5%) | 4/5 | 37 → 37 | same to 4 decimals |
+| **block Ω (3×3)** | 11520 → 8160 (−29%) | 0.0880s → 0.0670s (**−24%**) | **5/5** | 47 → 47 | same to 4 decimals |
+| ODE | 10270 → 6470 (−37%) | 1.581s → 1.029s (−35%) | 5/5 | 56 → 37 | same to 4 decimals |
 
-**Block-Ω is the case that decided it, and it had never been run on this anchor.** The block-Ω row recorded further up this page is the *Gauss-Newton* anchor — a different route, already analytic-by-default — which is why the exact anchor's densely-parameterised case was genuinely unmeasured despite `agq.rs` naming it as the bar. There the call-count gap is wide rather than equal by construction: `2·n_free = 20` FD anchor rebuilds against `1 + 2(n_theta + d) = 13` provider evaluations. It won on 5 of 5 reps at an **identical** outer-iteration count (47 → 47) and an identical OFV, so it is a like-for-like comparison on one optimiser path rather than two trajectories.
+**Block-Ω is the case that decided it, and it had never been run on this anchor.** The block-Ω row recorded further up this page is the *Gauss-Newton* anchor — a different route, already analytic-by-default — which is why the exact anchor's densely-parameterised case was genuinely unmeasured despite `agq.rs` naming it as the bar. There the call-count gap is wider than on the diagonal fixture: `2·n_free = 20` FD anchor rebuilds against `1 + 2(n_theta + d) = 13` provider evaluations. It won on 5 of 5 reps at an **identical** outer-iteration count (47 → 47) and matching OFV to four decimals. Equal iteration counts make this a closer comparison, but do not establish identical optimiser trajectories.
 
-Two honest caveats. The diagonal row is still near parity and one rep of five favoured `fd`; nothing here claims that case improved. And the ODE row, though the largest win, is **not** like-for-like — outer iterations move 56 → 37 — so its call count is the number to quote, not its time. Every arm of every fixture returned an identical OFV, which is the load-bearing observation: the two routes compute the same derivative and differ only in cost.
+Two honest caveats. The diagonal row is still near parity and one rep of five favoured `fd`; nothing here claims that case improved. The ODE totals reflect different optimizer trajectories (56 → 37 outer iterations); neither the call-count reduction nor the time reduction isolates per-iteration cost. Every arm of every fixture returned the same OFV to four decimal places. `bench.sh` extracts console output rounded to that precision; it does not compare full-precision OFVs or estimates. Derivative correctness is supported separately by `analytic_grid_response_matches_the_fd_route` (both anchors, node counts 1 and 3, `1e-5` scaled-error tolerance) and the `laplace_h_deriv` tests (including block Ω, combined error and ODE, with `5e-3` tolerance for ODE).
 
 The `FERX_AGQ_GRID_RESPONSE` harness is **kept** now that `Auto` no longer branches. It is what `bench.sh` drives, it is the only way to re-measure a quantity this page documents as session-sensitive, and the design note above ("keep an internal way to force the baseline and candidate paths") asks for exactly that. The FD sweep also remains the live fallback whenever `analytic_grid_response` declines — out of scope, or an ill-conditioned anchor — so it is not dead code either way.
 
@@ -398,8 +398,8 @@ monomorphization. What remains:
   reach IOV (`subject_sensitivities_cov_iov`) except when combined with `has_lagtime()`, so
   it is reachable in principle, but needs the same `[θ, Ω_bsv, σ, Ω_iov]` layout and joint-`Ω⁻¹`
   treatment `subject_htilde_dx_iov` just built, applied to the third-order (not second-order)
-  case — left for a follow-up given `laplace`'s route is opt-in with no proven speed win
-  regardless.
+  case. This remains a follow-up: the default switch does not widen the exact-anchor
+  provider's scope, so Laplace with IOV still uses the FD fallback.
 - **`block_sigma` + IOV** — unreachable through either module today (`score_core`'s own scope
   keeps the two mutually exclusive in practice), so not attempted.
 - A repository-required NONMEM comparison would be owed only if either route becomes the

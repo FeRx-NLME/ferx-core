@@ -15,7 +15,7 @@
 //! perturbed coherently (they share one packed vector).
 
 use crate::estimation::parameterization::{
-    compute_bounds, packed_fixed_mask, unpack_params, PackedBounds,
+    pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
 use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector};
 use nalgebra::{DMatrix, DVector};
@@ -213,7 +213,11 @@ fn draw_asymptotic(
          fit with `covariance = true` and ensure the covariance step succeeds."
             .to_string()
     })?;
-    let x_hat = crate::estimation::parameterization::pack_params(template);
+    let PackedStart {
+        packed: x_hat,
+        bounds,
+        fixed: fixed_mask,
+    } = pack_with_bounds(template);
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed {
         return Err(format!(
@@ -224,8 +228,6 @@ fn draw_asymptotic(
         ));
     }
     let chol = regularised_cholesky(cov)?;
-    let bounds = compute_bounds(template);
-    let fixed_mask = packed_fixed_mask(template);
 
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
@@ -284,10 +286,13 @@ fn draw_sir(
 
     // Bounds-rejection sampling. SIR already filtered for finite weights, but
     // we still validate to be defensive against extreme proposal samples that
-    // slipped through. Precompute bounds + fixed mask once per call.
-    let bounds = compute_bounds(template);
-    let fixed_mask = packed_fixed_mask(template);
-    let x_hat = crate::estimation::parameterization::pack_params(template);
+    // slipped through. Precompute the packed start, bounds and fixed mask in
+    // one walk, once per call.
+    let PackedStart {
+        packed: x_hat,
+        bounds,
+        fixed: fixed_mask,
+    } = pack_with_bounds(template);
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
     let mut tries = 0usize;

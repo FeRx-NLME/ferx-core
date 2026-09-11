@@ -11879,6 +11879,19 @@ fn build_ode_spec(
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+            // The RHS always reserves two trailing slots for dose-time anchors:
+            // TAFD at MAX_PK_PARAMS and TAD at MAX_PK_PARAMS + 1. Passing a bare
+            // PkParams::values array (which ends at MAX_PK_PARAMS) turns either
+            // read into NaN and lets that non-finite value surface much later as a
+            // misleading likelihood sentinel. Keep the interface slice-based, but
+            // make every missing extended-parameter injection fail immediately in
+            // debug/test builds (#1266).
+            debug_assert!(
+                params.len() >= crate::types::MAX_PK_PARAMS + 2,
+                "ODE RHS: params.len() = {} < extended parameter length {} (TAFD/TAD slots)",
+                params.len(),
+                crate::types::MAX_PK_PARAMS + 2,
+            );
             // The integrator always passes a `u` whose length matches the
             // declared state count. The old closure index-panicked on
             // `u[i]` if that contract ever broke; preserve that signal here
@@ -16089,6 +16102,58 @@ fn build_pk_param_fn(
 // `types.rs`). They remain unexported from the crate root — external users
 // can't construct or pattern-match them.
 
+/// Every function name `Expression::UnaryFn` may carry (#1332).
+///
+/// `parse_atom` rejects any other `name(...)` in expression position, so this
+/// list is the *complete* domain of the `UnaryFn` dispatch in the three
+/// consumers that give the node meaning — `eval_expr`, `compile_expr_into` and
+/// `differentiate_with_chain`. Each of those ends its match on
+/// `unreachable!(UNARY_FN_ARM_MISSING)` rather than on the identity
+/// fallthrough it used to carry: an unrecognised name used to be silently the
+/// identity, so `CL = TVCL * tanh(ETA_CL)` parsed, fitted, converged and
+/// computed `TVCL * ETA_CL` with no warning anywhere.
+///
+/// The list and the three matches are pinned against each other by
+/// `every_supported_unary_fn_has_an_arm_in_all_three_consumers`, so adding a
+/// name here without an arm in all three is a red test rather than a
+/// production panic. `Expression` is `pub(crate)` and the parser is its only
+/// constructor, which is what makes the `unreachable!` sound.
+///
+/// `min`/`max`/`clamp` are absent on purpose: they take 2/3 arguments and
+/// `parse_atom` desugars them to `Expression::Conditional`, so they never
+/// reach `UnaryFn`. `present(x)` is a *condition*, parsed by `parse_cond_atom`.
+pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
+    "exp",
+    "log",
+    "ln",
+    "sqrt",
+    "abs",
+    "floor",
+    "ceil",
+    "round",
+    "logit",
+    "inv_logit",
+    "expit",
+];
+
+/// Panic message for the (parser-guaranteed unreachable) tail of each
+/// `UnaryFn` match. Named so all three consumers report the same failure.
+const UNARY_FN_ARM_MISSING: &str =
+    "UnaryFn carries a name outside SUPPORTED_UNARY_FNS — parse_atom is the only \
+     constructor and rejects unknown names (#1332); a name added to the whitelist \
+     needs an arm in eval_expr, compile_expr_into and differentiate_with_chain";
+
+/// The human-facing catalogue of callable names, used by the parse-time
+/// rejection. Kept next to `SUPPORTED_UNARY_FNS` so a new builtin is one edit
+/// away from being advertised, and includes the multi-argument forms the
+/// parser desugars plus the conditions-only `present`.
+fn supported_function_list() -> String {
+    format!(
+        "{}, min(a, b), max(a, b), clamp(x, lo, hi), present(x) (conditions only)",
+        SUPPORTED_UNARY_FNS.join(", ")
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Expression {
     Literal(f64),
@@ -18450,7 +18515,8 @@ fn eval_expr<E: EvalEnv>(
                     let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                     (clamped / (1.0 - clamped)).ln()
                 }
-                _ => v,
+                // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
+                _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
         }
         Expression::Power(base, exp) => {
@@ -18888,9 +18954,8 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         Expression::UnaryFn(name, arg) => {
             compile_expr_into(bc, arg);
             // Names matched here mirror `eval_expression_indexed`'s UnaryFn
-            // dispatch. Anything else becomes a no-op (the slow path returns
-            // the argument unchanged); preserve that with `Op::Abs` of `Abs`
-            // we can't — fall through to push the value as-is.
+            // dispatch, and the match is total over `SUPPORTED_UNARY_FNS`
+            // because `parse_atom` admits nothing else (#1332).
             match name.as_str() {
                 "exp" => bc.ops.push(Op::Exp),
                 "log" | "ln" => bc.ops.push(Op::Ln),
@@ -18901,7 +18966,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
-                _ => { /* unknown function → leave the argument on the stack */ }
+                _ => unreachable!("{UNARY_FN_ARM_MISSING} (compile_expr_into, `{name}`)"),
             }
         }
         Expression::Conditional(cond, t_expr, e_expr) => {
@@ -20816,6 +20881,9 @@ impl ScaleDerivProgram {
     /// `η_k → var(·, n_theta + k)`. `var_duals[i]` is the dual for the individual
     /// parameter at PK slot `var_to_pk_slot[i]` (value + `∂/∂(θ,η)`). Returns the
     /// scale's value, gradient `∂scale/∂(θ,η)`, and Hessian. Requires `M ≥ n_axes()`.
+    ///
+    /// The absolute-axis layout of [`eval_scale_dual_cols`](Self::eval_scale_dual_cols)
+    /// (`theta_cols = None`).
     pub(crate) fn eval_scale_dual<const M: usize>(
         &self,
         theta: &[f64],
@@ -20823,23 +20891,56 @@ impl ScaleDerivProgram {
         cov: &HashMap<String, f64>,
         var_duals: &[crate::sens::dual2::Dual2<M>],
     ) -> crate::sens::dual2::Dual2<M> {
+        self.eval_scale_dual_cols::<M>(theta, eta, cov, var_duals, None, self.n_theta)
+    }
+
+    /// Column-chunked twin of [`eval_scale_dual`](Self::eval_scale_dual): seed the
+    /// program's direct θ / η references on a **θ-column chunk's** axes rather than on
+    /// absolute ones.
+    ///
+    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the
+    /// chunk does not carry enters as a **constant**, which is exactly right per chunk —
+    /// forward-mode axes never interact, so the chunk that owns that column supplies its
+    /// derivative. `eta_axis_base` is the dual axis of `eta[0]` (the chunk's stacked
+    /// block starts right after its θ columns, so `cols.len()` for a chunked caller and
+    /// `n_theta` for an absolute one). `theta_cols = None` is the absolute layout
+    /// `θ_m → m`, i.e. the pre-chunking behaviour entry for entry (#1339).
+    pub(crate) fn eval_scale_dual_cols<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+        var_duals: &[crate::sens::dual2::Dual2<M>],
+        theta_cols: Option<&[usize]>,
+        eta_axis_base: usize,
+    ) -> crate::sens::dual2::Dual2<M> {
         use crate::sens::dual2::Dual2;
+        // θ index → dual axis. `None` is the identity; a chunk maps only the columns it
+        // carries and leaves every other θ a constant.
+        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
+            None => (0..theta.len()).map(Some).collect(),
+            Some(_) => vec![None; theta.len()],
+        };
+        if let Some(cols) = theta_cols {
+            for (c, &m) in cols.iter().enumerate() {
+                if m < theta_axis.len() {
+                    theta_axis[m] = Some(c);
+                }
+            }
+        }
         let theta_d: Vec<Dual2<M>> = theta
             .iter()
             .enumerate()
-            .map(|(m, &v)| {
-                if m < M {
-                    Dual2::var(v, m)
-                } else {
-                    Dual2::constant(v)
-                }
+            .map(|(m, &v)| match theta_axis[m] {
+                Some(ax) if ax < M => Dual2::var(v, ax),
+                _ => Dual2::constant(v),
             })
             .collect();
         let eta_d: Vec<Dual2<M>> = eta
             .iter()
             .enumerate()
             .map(|(k, &v)| {
-                let dim = self.n_theta + k;
+                let dim = eta_axis_base + k;
                 if dim < M {
                     Dual2::var(v, dim)
                 } else {
@@ -21207,7 +21308,8 @@ fn resolve_condition_indices(
 //   UnaryFn("abs", a)      : if a ≥ 0 then a' else −a' (boundary undefined)
 //   UnaryFn("inv_logit"|"expit", a) : inv_logit(a) · (1 − inv_logit(a)) · a'
 //   UnaryFn("logit", a)    : a' / (a · (1 − a))
-//   UnaryFn(unknown, a)    : a' (mirrors the slow path's identity fallthrough)
+//   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
+//                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
 //                            both constant-base and constant-exponent cases)
 //   Conditional(c, t, e)   : Conditional(c, t', e')   (boundary discontinuity
@@ -21418,13 +21520,18 @@ fn differentiate_with_chain(
                     let denom = mul((**arg).clone(), one_minus_a);
                     div(da, denom)
                 }
-                _ => {
-                    // Unknown name — the slow path returns the argument
-                    // unchanged, so the derivative is its argument's
-                    // derivative. (See `eval_expression_indexed`'s
-                    // `_ => v` fallthrough.)
-                    da
+                "floor" | "ceil" | "round" => {
+                    // Piecewise constant: 0 almost everywhere, undefined on the
+                    // integer boundaries (the same convention `BinOp::Mod` takes
+                    // just above). These three had arms in `eval_expr` and in the
+                    // bytecode compiler but none here, so they landed on the
+                    // identity fallthrough and differentiated as `a'` — a value
+                    // path that rounds against an analytic gradient that does not
+                    // (#1332).
+                    Expression::Literal(0.0)
                 }
+                // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
+                _ => unreachable!("{UNARY_FN_ARM_MISSING} (differentiate_with_chain, `{name}`)"),
             }
         }
         Expression::Power(b, e) => {
@@ -22329,6 +22436,35 @@ fn parse_atom(
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
                 let is_clamp = func_name == "clamp";
+                // Reject an unrecognised name here — *before* any argument is
+                // parsed (#1332). An unrecognised name used to become
+                // `UnaryFn(name, arg)`, which every consumer evaluated as the
+                // identity, so `CL = TVCL * tanh(ETA_CL)` parsed, fitted,
+                // converged and computed `TVCL * ETA_CL`. This is the single site
+                // that builds the node, so the check covers every block whose
+                // expressions go through `parse_atom`, not one block's path.
+                //
+                // Placed above the argument loop rather than next to the `UnaryFn`
+                // return so the *name* is judged before the *arity*: a
+                // two-argument `pow(x, y)` would otherwise fall into the comma
+                // branch below and be reported as "`pow` takes 1 argument", which
+                // sends the reader looking for an arity bug in a function ferx
+                // does not have. `min`/`max`/`clamp` are exempt because they are
+                // desugared below and never reach `UnaryFn`; they keep their own
+                // arity diagnostics.
+                if !is_min_max && !is_clamp && !SUPPORTED_UNARY_FNS.contains(&func_name.as_str()) {
+                    if func_name == "present" {
+                        return Err(format!(
+                            "`present(...)` is a condition, not a value — write it as a test, \
+                             e.g. `if (present(WT)) ... else ...`, rather than in `{name}(...)` \
+                             value position."
+                        ));
+                    }
+                    return Err(format!(
+                        "unknown function `{name}`. Supported: {}",
+                        supported_function_list()
+                    ));
+                }
                 let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
                 if (is_min_max || is_clamp) && tokens.get(p) == Some(&Token::Comma) {
                     let (arg2, p) = parse_add_sub(tokens, p + 1, ctx)?;
@@ -22456,6 +22592,11 @@ fn parse_atom(
                         "`{func_name}` takes exactly three arguments: `clamp(x, lo, hi)`."
                     ));
                 }
+                // `func_name` is whitelisted: the guard above rejected anything
+                // else, and `min`/`max`/`clamp` have returned by now. Deliberately
+                // *not* re-checked here — two gates rejecting the same inputs
+                // would cover for each other, and deleting either would leave the
+                // suite green.
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
             }
 

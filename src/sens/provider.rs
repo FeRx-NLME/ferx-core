@@ -934,20 +934,21 @@ const _: () = assert!(
     "MAX_TVCOV_AXES exceeds MAX_ODE_AXES: the TV-cov walk would admit a model whose inner      `param_derivatives_at_cov` dispatch declines, splitting inner/outer analytic scope"
 );
 
-// Seven `disp!(1..=24)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
+// Eight `disp!(1..=24)` dispatch tables key on `MAX_TVCOV_AXES` with a silent `_ => None`:
 // `lognormal_param_derivatives`, `subject_sensitivities_iov`,
 // `subject_eta_grad_iov_analytical`, `subject_sensitivities_tvcov`,
-// `subject_eta_grad_tvcov`, and the two `[covariate_nn]` per-event builders
-// `nn_param_derivatives_at_cov` / `nn_param_eta_derivatives_at_cov` (#1300). Keep all
-// seven in lockstep with the const — bumping it without widening every arm would let an
-// in-scope wider model hit `_ => None` and silently fall back to FD. The mirror of the
-// `MAX_ODE_AXES` tripwire in `ode_provider.rs` (#466 review round 4 #12).
+// `subject_eta_grad_tvcov`, the two `[covariate_nn]` per-event builders
+// `nn_param_derivatives_at_cov` / `nn_param_eta_derivatives_at_cov` (#1300), and their IOV
+// twin `iov_nn_combined_derivs_dyn` (#1339). Keep all eight in lockstep with the const —
+// bumping it without widening every arm would let an in-scope wider model hit `_ => None`
+// and silently fall back to FD. The mirror of the `MAX_ODE_AXES` tripwire in
+// `ode_provider.rs` (#466 review round 4 #12).
 const _: () = assert!(
     MAX_TVCOV_AXES == 24,
     "MAX_TVCOV_AXES changed: widen the disp!(1..=24) tables in lognormal_param_derivatives, \
      subject_sensitivities_iov, subject_eta_grad_iov_analytical, subject_sensitivities_tvcov, \
-     subject_eta_grad_tvcov, nn_param_derivatives_at_cov and nn_param_eta_derivatives_at_cov \
-     to match, then update this assert"
+     subject_eta_grad_tvcov, nn_param_derivatives_at_cov, nn_param_eta_derivatives_at_cov and \
+     iov_nn_combined_derivs_dyn to match, then update this assert"
 );
 
 /// Whether the model's output scaling is one the provider differentiates exactly:
@@ -1422,6 +1423,132 @@ fn iov_combined_derivs<const MP: usize>(
     }
 }
 
+/// Full [`CombinedDerivs`] for a `[covariate_nn]` model at one covariate snapshot — the
+/// IOV twin of [`nn_param_derivatives_at_cov`] (#1339).
+///
+/// The program is evaluated over `Dual2<M>`, `M = n_base + n_eff + n_z`: the declared θ on
+/// `0..n_base`, the combined `[η_bsv, κ]` on `n_base..n_base + n_eff`, and each network
+/// output `z` on its own axis after that (`ModelNnAxisGuard`), the outputs' values coming
+/// from a forward pass at this snapshot (`ModelNnGuard`). The declared-θ columns are read
+/// straight off the θ axes; a weight column is chained through the outputs,
+/// `∂p/∂w_j = Σ_k ∂p/∂z_k · ∂z_k/∂w_j` and `∂²p/∂(η,κ)∂w_j = Σ_k ∂²p/∂(η,κ)∂z_k · ∂z_k/∂w_j`,
+/// with `∂z/∂w` the network's exact backprop Jacobian at this snapshot. `z` never reads η
+/// or κ, so the `∂²p/∂(η,κ)²` block is the program's own.
+///
+/// `M` is bounded by the program's *own* width, not `model.n_theta + n_eff`: the generated
+/// weights (22 on the reference DCM, 84 on its wider sibling) never occupy a dual axis
+/// here, which is what keeps a DCM inside the `1..=24` dispatch at all. `None` only on a
+/// dispatch miss, which `iov_analytical_supported` excludes up front.
+#[cfg(feature = "nn")]
+fn iov_nn_combined_derivs_dyn(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    n_eff: usize,
+    n_rows: usize,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    combined: &[f64],
+) -> Option<CombinedDerivs> {
+    use crate::parser::model_parser::{ModelNnAxisGuard, ModelNnGuard};
+    let n_base = prog.n_theta_axis();
+    let n_theta = model.n_theta;
+    let z_base = n_base + n_eff;
+    let m_dim = z_base + nn_output_count(model);
+    let jacs: Vec<(usize, nalgebra::DMatrix<f64>)> = model
+        .covariate_nns
+        .iter()
+        .map(|nn| {
+            let n_w = nn.mapper.mlp().n_weights();
+            let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
+            let j = nn.mapper.jacobian_raw(w, cov).expect(
+                "NN jacobian_raw failed in iov_nn_combined_derivs_dyn: this indicates a \
+                 wiring bug (wrong weight slice or input/layer count), not a recoverable \
+                 condition",
+            );
+            (nn.weights_offset, j)
+        })
+        .collect();
+    let _nn = ModelNnGuard::enter_for(model, theta, cov);
+    let _axes = ModelNnAxisGuard::enter(z_base);
+    const_dispatch!(
+        m_dim;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| {
+            let p = prog.eval_param_duals::<M>(theta, combined, cov);
+            if p.len() < n_rows {
+                return None;
+            }
+            let mut deta = vec![vec![0.0; n_eff]; n_rows];
+            let mut dtheta = vec![vec![0.0; n_theta]; n_rows];
+            let mut d2eta = vec![vec![vec![0.0; n_eff]; n_eff]; n_rows];
+            let mut d2eta_theta = vec![vec![vec![0.0; n_theta]; n_eff]; n_rows];
+            for i in 0..n_rows {
+                let g = &p[i].grad;
+                let h = &p[i].hess;
+                for m in 0..n_base {
+                    dtheta[i][m] = g[m];
+                }
+                for a in 0..n_eff {
+                    deta[i][a] = g[n_base + a];
+                    for b in 0..n_eff {
+                        d2eta[i][a][b] = h[n_base + a][n_base + b];
+                    }
+                    for m in 0..n_base {
+                        d2eta_theta[i][a][m] = h[n_base + a][m];
+                    }
+                }
+                // Weight columns by the chain rule through this snapshot's outputs.
+                let mut z0 = z_base;
+                for (w_off, jz) in &jacs {
+                    let (n_out, n_w) = jz.shape();
+                    for j in 0..n_w {
+                        let col = w_off + j;
+                        let mut d = 0.0;
+                        for kz in 0..n_out {
+                            d += g[z0 + kz] * jz[(kz, j)];
+                        }
+                        dtheta[i][col] = d;
+                        for a in 0..n_eff {
+                            let mut dd = 0.0;
+                            for kz in 0..n_out {
+                                dd += h[n_base + a][z0 + kz] * jz[(kz, j)];
+                            }
+                            d2eta_theta[i][a][col] = dd;
+                        }
+                    }
+                    z0 += n_out;
+                }
+            }
+            Some(CombinedDerivs {
+                deta,
+                dtheta,
+                d2eta,
+                d2eta_theta,
+            })
+        }
+    )
+}
+
+#[cfg(not(feature = "nn"))]
+fn iov_nn_combined_derivs_dyn(
+    _model: &CompiledModel,
+    _prog: &crate::parser::model_parser::IndivParamProgram,
+    _n_eff: usize,
+    _n_rows: usize,
+    _cov: &std::collections::HashMap<String, f64>,
+    _theta: &[f64],
+    _combined: &[f64],
+) -> Option<CombinedDerivs> {
+    None
+}
+
+/// Dual width of one IOV program evaluation on the outer builder: the declared θ, the
+/// combined `[η_bsv, κ]`, and — for a `[covariate_nn]` model — one axis per network
+/// output. The IOV twin of [`tvcov_program_axes`] (#1339).
+fn iov_program_axes(model: &CompiledModel) -> usize {
+    n_program_theta(model) + model.n_eta + model.n_kappa + nn_output_count(model)
+}
+
 /// True when [`subject_sensitivities_iov`] can serve this model: any analytical
 /// 1-/2-/3-cpt IOV model (`n_kappa > 0`), no ODE, no scaling/LTBS/lagtime, a usable
 /// `[individual_parameters]` program whose axes are `(n_theta, n_eta_bsv+n_kappa)`.
@@ -1524,10 +1651,15 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     // for both loops and `analytic_inner_common_bail` no longer carries an LTBS × IOV clause.
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
+        // No `n_axes() <= MAX_SCALE_AXES` clause, unlike the non-IOV gate: that bound is
+        // the width of the *absolute* `(θ, η)` dispatch `apply_expression_scale_outer`
+        // monomorphises on, and the IOV walk does not use it. `run_obs_iov` evaluates the
+        // scale through `eval_scale_dual_cols` at the chunk's own width `M = nc +
+        // n_stacked`, which `const_dispatch!` already bounds at 24 — so a θ block wider
+        // than the table is chunked, exactly like the `[initial_conditions]` amount
+        // program right below, whose gate carries no width clause either (#1339).
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
-            if p.n_theta_axis() == model.n_theta
-                && p.n_eta_axis() == model.n_eta
-                && (1..=MAX_SCALE_AXES).contains(&p.n_axes()) => {}
+            if p.n_theta_axis() == model.n_theta && p.n_eta_axis() == model.n_eta => {}
         _ => return false,
     }
     // Lagtime is now carried on the IOV walk (#486): the dose arrival `t + ALAG` is threaded
@@ -1567,10 +1699,37 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;
+    // The outer θ-axis clause is on the *declared* θ (`n_program_theta`), not
+    // `model.n_theta`: a `[covariate_nn]` model's generated weights are not referenceable
+    // from the program and reach the PK parameters only through the network outputs,
+    // which the outer builder seeds on their own axes and chains back to the weights
+    // (`iov_nn_combined_derivs_dyn`, #1339 — the IOV twin of #1300). For a model with
+    // no network `n_program_theta == model.n_theta`, so this is the former clause
+    // exactly. Two DCM-only conditions ride along: the output-channel factorization the
+    // chain relies on (a direct read of a generated weight θ breaks it — same predicate
+    // `tvcov_analytical_supported` / `nn_theta_gradient` use), and the builder's own
+    // dual width (declared θ + `[η, κ]` + outputs) fitting its `1..=24` dispatch.
+    // The walk's θ columns are chunked (`subject_sensitivities_iov`), so `model.n_theta`
+    // itself is unbounded here.
+    if require_theta_axis && nn_weight_theta_count(model) > 0 {
+        if !nn_output_chain_supported(model) || iov_program_axes(model) > MAX_TVCOV_AXES {
+            return false;
+        }
+        // No clause here for the three post-walk steps (Form C readout,
+        // `[initial_conditions]` impulse, `ExpressionScale` quotient). They used to be
+        // representable only on the identity θ chunk, which made this gate unanswerable:
+        // whether a subject lands on one chunk depends on its occasion count `K`
+        // (`n_theta + n_eta + K·n_kappa ≤ 24`), and a model-level predicate cannot see
+        // `K`. Any bound written here — `K = 1`, as a first cut did — reports analytic for
+        // a band of models whose every real (`K ≥ 2`) subject then reconverges on FD,
+        // exactly the route/report drift #637 forbids. `run_obs_iov` now runs all three in
+        // the chunk's own basis instead, so there is nothing left to gate (#1339, PR #1340
+        // review P2).
+    }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
             prog_covers_required_pk_slots(model, prog)
-                && (!require_theta_axis || prog.n_theta_axis() == model.n_theta)
+                && (!require_theta_axis || prog.n_theta_axis() == n_program_theta(model))
                 && prog.n_eta_axis() == n_eff
         }
         None => false,
@@ -1733,20 +1892,69 @@ pub fn subject_sensitivities_iov(
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
     let s = build_iov_sources(model, subject, theta, stacked_eta, false)?;
-    // Run the walk over `Dual2<M>` (M = n_theta + n_stacked); the dual width tracks
-    // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
-    // narrow for many occasions whenever n_kappa < n_diff (the usual κ-on-CL case).
-    let m_dim = s.n_theta + s.n_stacked;
-    let mut sens = const_dispatch!(
-        m_dim;
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
-        |M| run_obs_iov::<M>(
-            model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
-            &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
-            s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-            readout,
-        )
-    )?;
+    // Modeled-`RATE=-1/-2` dose resolution (#486): each dose at its occasion's PK jet
+    // (`sources[dose_src[k]].0` is already `pk_param_fn` at that occasion's combined
+    // effect); fixed subjects borrow `subject.doses`. Lagtime under IOV is read at each
+    // dose's *own* occasion snapshot, so an occasion-varying `ALAG` moves that occasion's
+    // arrivals only. Coincident moving breaks — and, under a lagtime, a moving break
+    // landing on a fixed obs/reset/cov-change time — aren't representable by the
+    // single-`dt` walk; decline to FD (#486 review #2).
+    //
+    // All four are dual-free, hence identical for every θ-column chunk, so they are built
+    // once here rather than inside `run_obs_iov` (#1339 / PR #1340 review). The tv-cov
+    // twin `run_obs_tvcov` still rebuilds its own per chunk — a smaller multiple there,
+    // and out of this change's scope.
+    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| s.sources[s.dose_src[k]].0)
+        .collect();
+    let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
+    let dose_lagtimes = dose_lagtime_values(model, &dose_pk);
+    if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
+        return None;
+    }
+    let schedule = crate::pk::event_driven::EventSchedule::for_subject(
+        subject,
+        model.pk_model,
+        &eff_doses,
+        &dose_lagtimes,
+    );
+    // Run the walk over `Dual2<M>` (M = θ-chunk + n_stacked); the dual width tracks
+    // the *unknowns* (n_eta + K·n_kappa + the chunk's θ columns), not the PK axes, so it
+    // stays narrow for many occasions whenever n_kappa < n_diff (the usual κ-on-CL case).
+    // The θ columns are seeded in chunks of at most `MAX_TVCOV_AXES - n_stacked`, each
+    // chunk walked with the stacked axes alongside so the mixed `∂²f/∂(η,κ)∂θ` block
+    // comes out of the same jet — the IOV twin of `subject_sensitivities_tvcov`'s
+    // chunking (#1300). A model whose `n_theta + n_stacked` fits the cap is exactly one
+    // chunk, the pre-#1339 dispatch verbatim; a `[covariate_nn]` model's weight columns
+    // (22 on the reference DCM) are what spill into further chunks. A subject whose
+    // stacked block alone fills the cap leaves no room for a θ column and declines, as
+    // it always did.
+    let chunk_len = MAX_TVCOV_AXES.saturating_sub(s.n_stacked);
+    if s.n_theta > 0 && chunk_len == 0 {
+        return None;
+    }
+    let all_cols: Vec<usize> = (0..s.n_theta).collect();
+    let chunks: Vec<&[usize]> = if all_cols.is_empty() {
+        vec![&all_cols[..]]
+    } else {
+        all_cols.chunks(chunk_len).collect()
+    };
+    let mut acc: Option<SubjectSens> = None;
+    for cols in chunks {
+        let m_dim = cols.len() + s.n_stacked;
+        let into = acc.take();
+        acc = Some(const_dispatch!(
+            m_dim;
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+            |M| run_obs_iov::<M>(
+                model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+                &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
+                s.n_theta, cols, &eff_doses, &schedule, s.scale_groups.as_deref(),
+                s.bsv_amount.as_ref(), readout, into,
+            )
+        )?);
+    }
+    let mut sens = acc?;
     // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
     // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
     // `ln(f/s)` (`predict_iov` logs last, after `apply_scaling`). Post-walk on the full stacked
@@ -1875,6 +2083,10 @@ fn build_iov_sources(
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         if eta_only {
             iov_eta_only_derivs_dyn(model, prog, n_eff, n_diff, cov, theta, combined)
+        } else if nn_weight_theta_count(model) > 0 {
+            // `[covariate_nn]` outer source (#1339): the program's declared θ and the
+            // network outputs on their own axes, weight columns chained in.
+            iov_nn_combined_derivs_dyn(model, prog, n_eff, n_diff, cov, theta, combined)
         } else {
             crate::sens::provider::iov_combined_derivs_dyn(
                 prog, n_theta, n_eff, n_diff, cov, theta, combined,
@@ -2074,8 +2286,12 @@ fn subject_eta_grad_iov_analytical(
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
     // Fall back to the η-only derivative block only when the full route is unavailable,
-    // so every previously-served model keeps its exact prior path and numbers.
-    let eta_only = !iov_analytical_supported(model);
+    // so every previously-served model keeps its exact prior path and numbers. A
+    // `[covariate_nn]` model stays on the η-only block too: its full route exists now
+    // (#1339) but is the outer `Dual2` builder over declared θ + `[η, κ]` + outputs, while
+    // the inner reads `deta` alone — the `Dual1<n_eff>` block is the same gradient at a
+    // fraction of the width, and it is the path every DCM took before #1339.
+    let eta_only = !iov_analytical_supported(model) || nn_weight_theta_count(model) > 0;
     let s = build_iov_sources(model, subject, theta, stacked_eta, eta_only)?;
     let n_dim = s.n_stacked;
     const_dispatch!(
@@ -2090,13 +2306,31 @@ fn subject_eta_grad_iov_analytical(
     )
 }
 
-/// The dual-width-`M` inner of [`subject_sensitivities_iov`] (`M = n_theta +
-/// n_stacked`). Builds each event's PK-param duals seeded directly on the stacked
-/// `(θ, η_bsv, κ)` unknowns (from that event's [`CombinedDerivs`] source), runs the
-/// event-driven sensitivity walk over `Dual2<M>`, and reads `∂conc/∂unknowns`
-/// straight off the resulting dual — the walk composes the whole chain, so there
-/// is no separate two-level assembly. Dual dimension `m < n_theta` is `θ_m`;
-/// `n_theta + p` is stacked-η axis `p`.
+/// The dual-width-`M` inner of [`subject_sensitivities_iov`] for one **θ-column chunk**
+/// (`M = theta_cols.len() + n_stacked`). Builds each event's PK-param duals seeded
+/// directly on the chunk's θ columns and the stacked `(η_bsv, κ)` unknowns (from that
+/// event's [`CombinedDerivs`] source), runs the event-driven sensitivity walk over
+/// `Dual2<M>`, and reads `∂conc/∂unknowns` straight off the resulting dual — the walk
+/// composes the whole chain, so there is no separate two-level assembly. Dual dimension
+/// `c < theta_cols.len()` is `θ_{theta_cols[c]}`; `theta_cols.len() + p` is stacked-η
+/// axis `p`.
+///
+/// The result is scattered into the standard `(n_stacked, n_theta)` [`SubjectSens`] —
+/// into `into` when an earlier chunk built it (only this chunk's θ columns are written;
+/// the η/κ blocks are identical across chunks, forward-mode axes never interact), else
+/// into a fresh one. A single chunk covering `0..n_theta` is the pre-#1339 walk verbatim.
+///
+/// The three post-walk steps — the Form C readout, the `[initial_conditions]` impulse
+/// and the `ExpressionScale` quotient — run on **every** chunk in the chunk's own basis,
+/// not only on the identity one. The readout is chunk-agnostic already (a dual-evaluable
+/// readout carries no `PushTheta`/`PushEta`, so it composes purely from the walk's own
+/// duals); the other two seed their programs' direct θ/η references through
+/// `eval_scale_dual_cols` and scatter at `theta_cols` / `nc + p` rather than at absolute
+/// `m` / `n_theta + p`. A θ outside the chunk enters those programs as a constant, which
+/// is exactly right: the chunk that carries that column supplies its derivative. Getting
+/// this wrong is silent — a chunked walk that declined instead would report analytic and
+/// reconverge every subject on FD, the route/report drift #637 forbids (#1339, PR #1340
+/// review P2).
 ///
 /// `sources[src] = (pk, cd, group)`; `dose_src`/`obs_src`/`pkonly_src` map each
 /// event to its source index. `group = Some(g)` scatters the κ columns to occasion
@@ -2119,32 +2353,41 @@ fn run_obs_iov<const M: usize>(
     n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
+    theta_cols: &[usize],
+    // The subject's resolved doses and event schedule, built once by the caller — both
+    // are dual-free and identical for every θ-column chunk.
+    eff_doses: &[crate::types::DoseEvent],
+    schedule: &crate::pk::event_driven::EventSchedule,
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    into: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
-    use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
+    // Chunk width: the stacked block sits right after this chunk's θ columns.
+    let nc = theta_cols.len();
+    debug_assert_eq!(M, nc + n_stacked);
+
     // Build the `Dual2<M>` for a differentiated PK row `i` of source `cd`/`group`,
-    // carrying `val` and `∂/∂(θ, stacked-η)`. The combined column `c` maps to a
-    // stacked axis: η_bsv (`c < n_eta`) → shared `n_theta + c`; κ (`c ≥ n_eta`) →
-    // group g's block `n_theta + n_eta + g·n_kappa + (c−n_eta)`, or is dropped when
+    // carrying `val` and `∂/∂(θ_chunk, stacked-η)`. The combined column `c` maps to a
+    // stacked axis: η_bsv (`c < n_eta`) → shared `nc + c`; κ (`c ≥ n_eta`) →
+    // group g's block `nc + n_eta + g·n_kappa + (c−n_eta)`, or is dropped when
     // `group` is `None` (pk_only event, κ fixed at 0). The θ-θ Hessian block is
     // unused downstream (left zero).
     let seed = |cd: &CombinedDerivs, group: Option<usize>, i: usize, val: f64| -> Dual2<M> {
-        let kappa_base = group.map(|g| n_theta + n_eta + g * n_kappa);
+        let kappa_base = group.map(|g| nc + n_eta + g * n_kappa);
         let stacked_axis = |c: usize| -> Option<usize> {
             if c < n_eta {
-                Some(n_theta + c)
+                Some(nc + c)
             } else {
                 kappa_base.map(|kb| kb + (c - n_eta))
             }
         };
         let mut grad = [0.0; M];
         let mut hess = [[0.0; M]; M];
-        for m in 0..n_theta.min(M) {
-            grad[m] = cd.dtheta[i][m];
+        for (c, &m) in theta_cols.iter().enumerate().take(M) {
+            grad[c] = cd.dtheta[i][m];
         }
         for c in 0..n_eff {
             let ax = match stacked_axis(c) {
@@ -2159,10 +2402,10 @@ fn run_obs_iov<const M: usize>(
                     }
                 }
             }
-            for m in 0..n_theta.min(M) {
+            for (cc, &m) in theta_cols.iter().enumerate().take(M) {
                 let v = cd.d2eta_theta[i][c][m];
-                hess[ax][m] = v;
-                hess[m][ax] = v;
+                hess[ax][cc] = v;
+                hess[cc][ax] = v;
             }
         }
         Dual2 {
@@ -2214,26 +2457,13 @@ fn run_obs_iov<const M: usize>(
         pk_at_pk_only.push(event_dual(src));
     }
 
-    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet
-    // (`sources[dose_src[k]].0` is already `pk_param_fn` at that occasion's combined
-    // effect) for the schedule's break times — shared with the non-IOV walk via
-    // `resolve_eff_doses` — and build the per-dose duals seeded on the stacked
-    // `(η_bsv, κ)` axes (via the same `seed` used for the PkDuals). Fixed subjects
-    // borrow `subject.doses` and pass no duals.
-    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
-        .map(|k| sources[dose_src[k]].0)
-        .collect();
-    let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
-    // Lagtime under IOV (#486): each dose's lag is read at *its own occasion's* snapshot,
-    // so an occasion-varying `ALAG` (κ on the lag) moves that occasion's arrivals only —
-    // it falls out of the per-dose seeding for free.
-    let dose_lagtimes = dose_lagtime_values(model, &dose_pk);
-    // Coincident moving breaks carrying different jets — and, under a lagtime, a moving
-    // break landing on a fixed obs/reset/cov-change time — aren't representable by the
-    // single-`dt` walk; decline to FD (#486 review #2).
-    if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
-        return None;
-    }
+    // Modeled-`RATE=-1/-2` doses (#486): the per-dose duals seeded on the stacked
+    // `(η_bsv, κ)` axes (via the same `seed` used for the PkDuals). The *values* they
+    // are built from — the resolved doses, the lagtimes, the separability gate and the
+    // event schedule — carry no dual axes at all, so they are chunk-invariant and the
+    // caller hoisted them out of the chunk loop (#1339 / PR #1340 review): recomputing
+    // them per chunk multiplied `resolve_eff_doses` + `EventSchedule::for_subject` by the
+    // chunk count on exactly the wide-weight DCMs the chunking exists for.
     let slot_dual = |k: usize, slot: usize| -> Dual2<M> {
         let (pk, cd, group) = &sources[dose_src[k]];
         let val = pk.values.get(slot).copied().unwrap_or(0.0);
@@ -2244,12 +2474,11 @@ fn run_obs_iov<const M: usize>(
     };
     let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, &slot_dual);
     let dose_lag_dual = dose_lag_duals::<Dual2<M>>(model, subject, &slot_dual);
-    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
     let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
         model.pk_model,
         subject,
-        &schedule,
-        &eff_doses,
+        schedule,
+        eff_doses,
         &dose_lag_dual,
         &dose_inf_dual,
         &pk_at_dose,
@@ -2301,16 +2530,16 @@ fn run_obs_iov<const M: usize>(
         let mut d2f_deta2 = vec![0.0; n_stacked * n_stacked];
         let mut d2f_deta_dtheta = vec![0.0; n_stacked * n_theta];
         for p in 0..n_stacked {
-            df_deta[p] = c.grad[n_theta + p];
+            df_deta[p] = c.grad[nc + p];
             for q in 0..n_stacked {
-                d2f_deta2[p * n_stacked + q] = c.hess[n_theta + p][n_theta + q];
+                d2f_deta2[p * n_stacked + q] = c.hess[nc + p][nc + q];
             }
-            for m in 0..n_theta {
-                d2f_deta_dtheta[p * n_theta + m] = c.hess[n_theta + p][m];
+            for (cc, &m) in theta_cols.iter().enumerate() {
+                d2f_deta_dtheta[p * n_theta + m] = c.hess[nc + p][cc];
             }
         }
-        for m in 0..n_theta {
-            df_dtheta[m] = c.grad[m];
+        for (cc, &m) in theta_cols.iter().enumerate() {
+            df_dtheta[m] = c.grad[cc];
         }
         obs_out.push(ObsSens {
             f: c.value,
@@ -2342,9 +2571,12 @@ fn run_obs_iov<const M: usize>(
                 continue;
             };
             // Baseline amount `A₀` seeded on the stacked axes from the BSV snapshot (group
-            // `None` → κ axes dropped, matching production's κ-less amount). `eval_scale_dual`
-            // seeds direct θ/η references on axes `0..n_theta` / `n_theta..n_theta+n_eta` — the
-            // stacked η_bsv block — so the amount's jet lands on the correct axes.
+            // `None` → κ axes dropped, matching production's κ-less amount).
+            // `eval_scale_dual_cols` seeds the program's direct θ references on *this
+            // chunk's* columns (a θ the chunk does not carry enters as a constant — the
+            // chunk that owns it supplies that derivative) and its direct η references on
+            // the stacked η_bsv block at `nc..nc+n_eta`, so the amount's jet lands on the
+            // same axes the walk's own duals use (#1339).
             let a0_var_duals: Vec<Dual2<M>> = prog
                 .var_to_pk_slot()
                 .iter()
@@ -2358,7 +2590,14 @@ fn run_obs_iov<const M: usize>(
                     None => Dual2::<M>::constant(pk_bsv.values.get(s).copied().unwrap_or(0.0)),
                 })
                 .collect();
-            let a0 = prog.eval_scale_dual::<M>(theta, eta_bsv, cov, &a0_var_duals);
+            let a0 = prog.eval_scale_dual_cols::<M>(
+                theta,
+                eta_bsv,
+                cov,
+                &a0_var_duals,
+                Some(theta_cols),
+                nc,
+            );
             if !a0.value.is_finite() {
                 continue;
             }
@@ -2388,18 +2627,22 @@ fn run_obs_iov<const M: usize>(
                     dv(PK_IDX_Q3, pk_d.q3()),
                     dv(PK_IDX_V3, pk_d.v3()),
                 );
+                // Scatter on the chunk's axes: `θ_{theta_cols[cc]}` sits at `cc`, the
+                // stacked block at `nc..`. The value and the η/κ blocks are added by every
+                // chunk identically (the η/κ axes are chunk-invariant) and the merge below
+                // keeps the first chunk's; only this chunk's θ columns are its own.
                 o.f += c.value;
                 for p in 0..n_stacked {
-                    o.df_deta[p] += c.grad[n_theta + p];
+                    o.df_deta[p] += c.grad[nc + p];
                     for q in 0..n_stacked {
-                        o.d2f_deta2[p * n_stacked + q] += c.hess[n_theta + p][n_theta + q];
+                        o.d2f_deta2[p * n_stacked + q] += c.hess[nc + p][nc + q];
                     }
-                    for m in 0..n_theta {
-                        o.d2f_deta_dtheta[p * n_theta + m] += c.hess[n_theta + p][m];
+                    for (cc, &m) in theta_cols.iter().enumerate() {
+                        o.d2f_deta_dtheta[p * n_theta + m] += c.hess[nc + p][cc];
                     }
                 }
-                for m in 0..n_theta {
-                    o.df_dtheta[m] += c.grad[m];
+                for (cc, &m) in theta_cols.iter().enumerate() {
+                    o.df_dtheta[m] += c.grad[cc];
                 }
             }
         }
@@ -2426,13 +2669,30 @@ fn run_obs_iov<const M: usize>(
             slot_row,
             sprog.var_to_pk_slot(),
             |cd, g, i, v| seed(cd, Some(g), i, v),
-            |var_duals| sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, var_duals),
+            |var_duals| {
+                sprog.eval_scale_dual_cols::<M>(
+                    theta,
+                    eta_bsv,
+                    cov,
+                    var_duals,
+                    Some(theta_cols),
+                    nc,
+                )
+            },
         );
         let mut fk: Vec<f64> = Vec::with_capacity(n_stacked);
         let mut fm: Vec<f64> = Vec::with_capacity(n_theta);
         for (j, o) in obs_out.iter_mut().enumerate() {
             let g = sources[obs_src[j]].2?;
-            apply_scale_quotient_row::<M>(o, &group_scale[g], n_theta, n_stacked, &mut fk, &mut fm);
+            apply_scale_quotient_row::<M>(
+                o,
+                &group_scale[g],
+                n_theta,
+                n_stacked,
+                Some(theta_cols),
+                &mut fk,
+                &mut fm,
+            );
         }
     }
 
@@ -2443,7 +2703,31 @@ fn run_obs_iov<const M: usize>(
         scale_obs_sens(&mut obs_out, k);
     }
 
-    Some(SubjectSens { obs: obs_out })
+    // Merge into an earlier chunk's result: only this chunk's θ columns are new; the
+    // value and the η/κ blocks were built identically by every chunk (the constant
+    // `ScalarScale` divide above scaled this chunk's columns the same way it scaled
+    // theirs), so nothing else is touched (#1339).
+    match into {
+        Some(mut acc) => {
+            // A hard decline, not a `debug_assert`: `zip` on a length mismatch would merge
+            // a prefix and hand back a `SubjectSens` whose θ columns are partly another
+            // chunk's — a silently wrong gradient in release, where the assert is compiled
+            // out. `None` costs the subject an FD reconverge instead (PR #1340 review).
+            if acc.obs.len() != obs_out.len() {
+                return None;
+            }
+            for (a, o) in acc.obs.iter_mut().zip(&obs_out) {
+                for &m in theta_cols {
+                    a.df_dtheta[m] = o.df_dtheta[m];
+                    for p in 0..n_stacked {
+                        a.d2f_deta_dtheta[p * n_theta + m] = o.d2f_deta_dtheta[p * n_theta + m];
+                    }
+                }
+            }
+            Some(acc)
+        }
+        None => Some(SubjectSens { obs: obs_out }),
+    }
 }
 
 /// Light first-order (`Dual1<N>`, `N = n_stacked`) inner of
@@ -2875,7 +3159,7 @@ fn tvcov_program_axes(model: &CompiledModel) -> usize {
 /// records a direct read of a generated weight θ under
 /// `NN_WEIGHT_DIRECT_REFERENCE_MARKER`; such a model declines to FD here exactly as
 /// `nn_theta_gradient::NnGradPlan::build` does.
-fn nn_output_chain_supported(model: &CompiledModel) -> bool {
+pub(crate) fn nn_output_chain_supported(model: &CompiledModel) -> bool {
     !model
         .parse_warnings
         .iter()
@@ -5225,27 +5509,41 @@ fn apply_expression_scale<const M: usize>(
     let mut fk: Vec<f64> = Vec::with_capacity(n_eta);
     let mut fm: Vec<f64> = Vec::with_capacity(n_theta);
     for o in sens.obs.iter_mut() {
-        apply_scale_quotient_row::<M>(o, &s, n_theta, n_eta, &mut fk, &mut fm);
+        // Absolute θ layout: this path seeds `θ_m` on axis `m` (no column chunking).
+        apply_scale_quotient_row::<M>(o, &s, n_theta, n_eta, None, &mut fk, &mut fm);
     }
 }
 
 /// Apply the `ExpressionScale` quotient `f ↦ f/s` to one [`ObsSens`] row given the
 /// precomputed scale jet `s` (value + `∂s/∂(θ, axes)` + Hessian). `n_axes` is the η-axis
 /// count: `n_eta` for the non-IOV path (one subject-static `s`) and `n_stacked` for the
-/// IOV path (a per-occasion-group `s`); the scale's axis `k` is read at dual index
-/// `n_theta + k`, its θ axis `m` at `m`. `fk`/`fm` are caller-owned scratch buffers,
+/// IOV path (a per-occasion-group `s`). `fk`/`fm` are caller-owned scratch buffers,
 /// reused across rows — the second-order update reads the *original* `∂f/∂η` / `∂f/∂θ`
 /// across the whole k/l double loop, so they are snapshotted before `o` is rewritten in
 /// place. Single source for the quotient rule shared by the closed-form/ODE non-IOV
 /// loop and the ODE IOV per-group caller (#575 review — no second copy to keep in sync).
+///
+/// `theta_cols` selects the scale jet's **θ axis layout**: `None` is the absolute one
+/// (`θ_m → m`, the η block at `n_theta + k`), `Some(cols)` a θ-column chunk's
+/// (`θ_{cols[c]} → c`, the η block at `cols.len() + k`). Under a chunk only the θ
+/// columns the chunk carries are rewritten — the rest belong to another chunk and must
+/// be left for it — while the value, the `∂f/∂η` block and the η-η Hessian are rewritten
+/// by every chunk, identically, since the scale's η axes are chunk-invariant (#1339).
+/// `n_theta` is always the full θ width of the `ObsSens` row, chunked or not.
 pub(crate) fn apply_scale_quotient_row<const M: usize>(
     o: &mut ObsSens,
     s: &Dual2<M>,
     n_theta: usize,
     n_axes: usize,
+    theta_cols: Option<&[usize]>,
     fk: &mut Vec<f64>,
     fm: &mut Vec<f64>,
 ) {
+    // Dual axis of this row's θ column `c`, and the θ index it writes.
+    let nc = theta_cols.map_or(n_theta, <[usize]>::len);
+    let col_theta = |c: usize| theta_cols.map_or(c, |t| t[c]);
+    // The stacked/η block sits right after the θ columns in both layouts.
+    let base = nc;
     let f = o.f;
     let inv = 1.0 / s.value;
     let inv2 = inv * inv;
@@ -5258,9 +5556,9 @@ pub(crate) fn apply_scale_quotient_row<const M: usize>(
     for k in 0..n_axes {
         for l in 0..n_axes {
             let idx = k * n_axes + l;
-            let s_k = s.grad[n_theta + k];
-            let s_l = s.grad[n_theta + l];
-            let s_kl = s.hess[n_theta + k][n_theta + l];
+            let s_k = s.grad[base + k];
+            let s_l = s.grad[base + l];
+            let s_kl = s.hess[base + k][base + l];
             o.d2f_deta2[idx] =
                 o.d2f_deta2[idx] * inv - fk[k] * s_l * inv2 - fk[l] * s_k * inv2 - f * s_kl * inv2
                     + 2.0 * f * s_k * s_l * inv3;
@@ -5268,11 +5566,12 @@ pub(crate) fn apply_scale_quotient_row<const M: usize>(
     }
     // η-θ Hessian.
     for k in 0..n_axes {
-        for m in 0..n_theta {
+        for c in 0..nc {
+            let m = col_theta(c);
             let idx = k * n_theta + m;
-            let s_k = s.grad[n_theta + k];
-            let s_m = s.grad[m];
-            let s_km = s.hess[n_theta + k][m];
+            let s_k = s.grad[base + k];
+            let s_m = s.grad[c];
+            let s_km = s.hess[base + k][c];
             o.d2f_deta_dtheta[idx] = o.d2f_deta_dtheta[idx] * inv
                 - fk[k] * s_m * inv2
                 - fm[m] * s_k * inv2
@@ -5282,10 +5581,11 @@ pub(crate) fn apply_scale_quotient_row<const M: usize>(
     }
     // First derivatives and value.
     for k in 0..n_axes {
-        o.df_deta[k] = fk[k] * inv - f * s.grad[n_theta + k] * inv2;
+        o.df_deta[k] = fk[k] * inv - f * s.grad[base + k] * inv2;
     }
-    for m in 0..n_theta {
-        o.df_dtheta[m] = fm[m] * inv - f * s.grad[m] * inv2;
+    for c in 0..nc {
+        let m = col_theta(c);
+        o.df_dtheta[m] = fm[m] * inv - f * s.grad[c] * inv2;
     }
     o.f = f * inv;
 }

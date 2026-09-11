@@ -117,6 +117,98 @@ The remediation there is the data scale rather than the model — rescale DV, or
 use a proportional or log-transformed error model — and the warning message says
 so when the hit is a Sigma.
 
+### The same box, on the way in
+
+`parameter_at_runaway_guard` is about where a fit *ended*. The box also applies
+before the first objective evaluation: `clamp_to_bounds()` moves the packed
+**start** inside it, and until #1251 that happened in silence. A
+`theta TVCL(0.05, 0.1, 10.0)` fits from `0.1` — a factor of two from what was
+written — and reports nothing.
+
+The start is now compared against the same box, by the same walk, with two
+verdicts split on *whose* bound it is:
+
+- **Outside a bound you declared** — a `theta` below its own lower or above its
+  own upper — is an error, `E_THETA_INIT_OUTSIDE_BOUNDS`, refused before any
+  fitting. NM-TRAN refuses the identical stream too (error 24).
+- **Outside one of the internal guards above** — the hidden `1e9` Theta cap, the
+  Omega rails, the Sigma rails — is a `W_INIT_OUTSIDE_BOUNDS` warning
+  carrying the `init_outside_bounds` category. It is a warning because these
+  recover: `omega ETA_CL ~ 1e8` on `examples/warfarin.ferx` packs to $+9.21$
+  against the $+6$ rail, starts from a variance of $1.6\times10^5$, and still
+  reaches the base optimum under all eight optimizer × method combinations. The
+  Omega **lower** rail is the exception and is an error
+  (`E_OMEGA_INIT_AT_RAIL`), because there the fit is genuinely trapped.
+
+There is deliberately no third verdict for the `1e-10` Theta **floor**, and the
+reason is the packing rather than an oversight: `pack_params()` floors the value
+at `1e-10` and the box floors the bound at `1e-10`, so a start below it compares
+*equal* and nothing has been moved relative to the box. A declared range that
+lies entirely below the floor is a different matter — see below.
+
+That flooring is also why the **declared** verdict is not decided on the packed
+scale. `theta TVCL(-5.0, 0.0, 10.0)` packs the start and its declared lower onto
+the same $\ln(10^{-10}) = -23.0259$, so a packed comparison would see a start
+sitting exactly on its bound and say nothing — while the fit actually begins
+from $10^{-10}$, which is neither the declared $-5$ nor the declared $0$. A
+declared lower bound of `0` is the idiomatic spelling for a positive parameter
+(`theta TVLAG(0.0, 0.0, 12.0)` ships in this repo), so the shape most likely to
+carry the mistake was the one shape the packed predicate could not see.
+`E_THETA_INIT_OUTSIDE_BOUNDS` therefore compares `theta[i]` against
+`theta_lower[i]` / `theta_upper[i]` directly, on the natural scale, and reports
+where the fit really starts. The internal guards keep the packed comparison,
+which is the only scale on which they exist. Over every `.ferx` file in this
+repository the two predicates give the same answer — zero out-of-box thetas —
+so the stronger one costs nothing.
+
+#### When the box is empty
+
+A packed box can come out **empty** — `lower > upper` — and then there is no
+side to be outside of. That is `E_INIT_BOUNDS_INVERTED`, an error, with three
+causes. The code is not Theta-specific even though only a `theta` can reach it
+through the parser: every other segment's bounds are compile-time constants, and
+a FIX pin is `lower == upper`, which is equal rather than inverted. The three
+causes are:
+
+- the declared bounds are swapped, `theta TVCL(1.0, 5.0, 2.0)`;
+- the declared range lies entirely **above** the `1e9` cap, which the box
+  substitutes for the declared upper: `theta TVCL(5e9, 2e9, 1e12)` packs to a
+  lower of $21.42$ against an upper of $20.72$;
+- the declared range lies entirely **below** the `1e-10` floor, which the box
+  substitutes for the declared lower: `theta TVCL(1e-12, 1e-13, 1e-11)` — an
+  ordinary declaration of a small parameter, with its own lower bound below its
+  own upper — packs to a lower of $-23.03$ against an upper of $-25.33$.
+
+This is the one start-side check with **no `maxiter = 0` exemption**. The others
+are exempt because a clamped start does not stick without a search; an empty box
+is not clamped at all — `clamp_to_bounds()` cannot clamp into an interval that
+does not exist — and an evaluation-only run clamps too, so exempting it would
+leave the aborting case unreported. The remedy is to rescale the parameter (fit
+it in different units, or factor out a constant) so its range lands inside
+$(10^{-10}, 10^{9})$. Only the affected coordinate is silenced by it: the rest
+of the file is still walked, so `ferx check` reports a swapped `TVCL` bound and
+an `omega ~ 1e8` in the same pass.
+
+Three things the comparison deliberately does not do:
+
+- A start sitting **exactly on** a bound is left alone. There `clamp_to_bounds`
+  is a no-op, so nothing is silently moved and the premise does not apply. (This
+  is a deliberate divergence from NM-TRAN, which also rejects equality, with
+  errors 627 and 628.)
+- A **FIX'd** coordinate is never reported, and needs no special case: its bounds
+  are pinned to its own packed value, so it cannot be strictly outside them.
+- An **evaluation-only** run (`maxiter = 0`) is exempt, exactly as for
+  `E_OMEGA_INIT_AT_RAIL` — with the single exception of the empty box above. It
+  clamps too; it just does not hold the clamped value through a search, and that
+  stickiness is what the check is about.
+
+The comparison is against the **packed** start, which is not quite the same as
+"your initial estimates are inside your own bounds". `pack_params()` clamps
+before any box exists: a residual correlation is squeezed into
+$\pm\texttt{RHO\_Z\_BOUND}$ by `pack_rho`, and Theta / Omega diagonals / Sigma
+are floored at `1e-10`. Values moved by *those* clamps compare equal to their
+(identically floored) bounds and are invisible here.
+
 ## Where the packed space surfaces
 
 It is not purely internal; it shows up in several user-visible places.

@@ -12441,3 +12441,161 @@ fn provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose() {
 
     check_full_provider_vs_fd(&m, &subject, &theta, &eta);
 }
+
+// ── #1339: θ-column chunking on the closed-form IOV outer walk ───────────────
+//
+// `subject_sensitivities_iov` walks its θ columns in chunks of
+// `MAX_TVCOV_AXES − n_stacked` (the IOV twin of the #1300 TV-cov chunking). The three
+// tests below pin the non-NN faces of that: a wide plain IOV model that needs two chunks
+// (the loop and the column merge, against FD), the stacked block filling the cap on its
+// own (no room for a θ column → decline), and a model with no θ at all (exactly one
+// empty chunk, not zero chunks).
+
+/// 2-cpt oral with κ on every PK parameter: `n_eff = 2 + 5`, so a subject with `K`
+/// occasions stacks `2 + 5K` axes next to 5 θ columns — 27 for `K = 4` (two chunks),
+/// 27 stacked alone for `K = 5` (no room for a θ column).
+const TWOCPT_ORAL_FIVE_KAPPA_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV1(10.0, 0.1, 500.0)
+  theta TVQ(0.1, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  kappa KAPPA_V1 ~ 0.02
+  kappa KAPPA_Q ~ 0.02
+  kappa KAPPA_V2 ~ 0.02
+  kappa KAPPA_KA ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V1 = TVV1 * exp(ETA_V1 + KAPPA_V1)
+  Q  = TVQ  * exp(KAPPA_Q)
+  V2 = TVV2 * exp(KAPPA_V2)
+  KA = TVKA * exp(KAPPA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+/// `k` occasions 24 h apart, one oral bolus and two observations each — every later dose
+/// lands with residual drug present.
+fn iov_subject_with_occasions(k: usize) -> Subject {
+    let mut doses = Vec::with_capacity(k);
+    let mut obs_times = Vec::with_capacity(2 * k);
+    let mut occasions = Vec::with_capacity(2 * k);
+    let mut dose_occasions = Vec::with_capacity(k);
+    for g in 0..k {
+        let t0 = 24.0 * g as f64;
+        doses.push(DoseEvent::new(t0, 100.0, 1, 0.0, false, 0.0));
+        obs_times.push(t0 + 2.0);
+        obs_times.push(t0 + 8.0);
+        occasions.push((g + 1) as u32);
+        occasions.push((g + 1) as u32);
+        dose_occasions.push((g + 1) as u32);
+    }
+    let n = obs_times.len();
+    Subject {
+        id: "1".to_string(),
+        doses,
+        obs_times,
+        obs_raw_times: Vec::new(),
+        observations: vec![1.0; n],
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions,
+        obs_l2: Vec::new(),
+        dose_occasions,
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// A plain (no-network) IOV model whose `n_theta + n_stacked` exceeds the 24-axis walk is
+/// served in two θ-column chunks and matches FD of `predict_iov` on all four blocks.
+/// Before #1339 this subject fell to FD (`const_dispatch!` miss at width 27).
+#[test]
+fn iov_walk_chunks_theta_columns_for_a_wide_plain_model() {
+    let model = parse_model_string(TWOCPT_ORAL_FIVE_KAPPA_IOV).expect("parse");
+    assert_eq!((model.n_theta, model.n_eta, model.n_kappa), (5, 2, 5));
+    assert!(iov_analytical_supported(&model));
+    let subject = iov_subject_with_occasions(4);
+    let n_st = model.n_eta + 4 * model.n_kappa;
+    assert!(
+        model.n_theta + n_st > MAX_TVCOV_AXES,
+        "fixture must exceed the single-chunk width"
+    );
+    let stacked: Vec<f64> = (0..n_st)
+        .map(|i| 0.15 * ((i as f64) * 0.9 + 0.4).sin())
+        .collect();
+    check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0, 0.1, 20.0, 1.5], &stacked);
+}
+
+/// When the stacked `[η, κ]` block alone fills the cap there is no room for a θ column:
+/// the walk declines (→ FD for that subject) rather than dispatch a zero-width chunk.
+#[test]
+fn iov_walk_declines_when_the_stacked_block_fills_the_cap() {
+    let model = parse_model_string(TWOCPT_ORAL_FIVE_KAPPA_IOV).expect("parse");
+    let subject = iov_subject_with_occasions(5);
+    let n_st = model.n_eta + 5 * model.n_kappa;
+    assert!(
+        n_st >= MAX_TVCOV_AXES,
+        "fixture must fill the cap with stacked axes"
+    );
+    assert!(
+        subject_sensitivities_iov(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.1, 20.0, 1.5],
+            &vec![0.0; n_st]
+        )
+        .is_none(),
+        "no θ column fits beside {n_st} stacked axes; the walk must decline"
+    );
+}
+
+/// A model with **no θ at all** on the IOV walk: the empty column set must still run
+/// exactly one chunk of width `n_stacked`, not zero chunks. Pinned against FD.
+#[test]
+fn iov_zero_theta_model_walks_one_empty_chunk() {
+    const NO_THETA_IOV: &str = r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = 0.2 * exp(ETA_CL + KAPPA_CL)
+  V  = 10 * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+    let model = parse_model_string(NO_THETA_IOV).expect("parse");
+    assert_eq!(model.n_theta, 0, "fixture must declare no theta");
+    assert!(iov_analytical_supported(&model));
+    let subject = iov_subject();
+    assert!(
+        subject_sensitivities_iov(&model, &subject, &[], &[0.1, -0.05, 0.04, -0.03]).is_some(),
+        "an empty θ set must still walk one chunk"
+    );
+    check_iov_provider_vs_fd(&model, &subject, &[], &[0.1, -0.05, 0.04, -0.03]);
+}

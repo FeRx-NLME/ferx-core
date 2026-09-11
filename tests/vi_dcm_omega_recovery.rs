@@ -184,9 +184,10 @@ impl CovariateDesign {
 ///
 /// The `CRCL` term is busulfan's, `1 + 0.4·tanh((CRCL − 90)/40)`, written out as
 /// `2·inv_logit(2u) − 1` because **`tanh` is not in the `[individual_parameters]` function
-/// set and unknown unary functions there evaluate to their argument rather than erroring**
-/// — so the natural spelling would silently simulate a *linear* `CRCL` effect. (That
-/// silent-identity behaviour is worth fixing on its own; it is not this file's job.)
+/// set**. Since #1332 the natural spelling is a parse error rather than a silent identity
+/// that would have simulated a *linear* `CRCL` effect, so this rewrite is now a
+/// convenience rather than the only thing standing between the fixture and a wrong
+/// data-generating model.
 const TRUTH_SRC: &str = r"
 [parameters]
   theta TVCL(1.0, 0.01, 50.0)
