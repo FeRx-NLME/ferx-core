@@ -21,20 +21,28 @@
 //! # Where the third order comes from
 //!
 //! Not from new sensitivity equations: from
-//! [`crate::sens::provider::subject_sensitivities_cov`], the sweep the analytic covariance
-//! (#436) already uses, which central-differences the `Dual2` second-order jet along each
-//! `(θ, η)` axis. That is `1 + 2(n_theta + n_eta)` provider evaluations with **no inner
-//! re-solve**, and it reaches both the closed-form kernels and the augmented ODE solve.
-//! Reusing it rather than writing a second FD sweep also means the step heuristic
-//! (`third_order_fd_step`, solver-tolerance aware) and the route-switch guards are shared.
+//! [`crate::sens::provider::subject_sensitivities_cov_eta_only`], the sweep the analytic
+//! covariance (#436) already uses, restricted to the **η axes** — it central-differences the
+//! `Dual2` second-order jet, with **no inner re-solve**, and it reaches both the closed-form
+//! kernels and the augmented ODE solve. Reusing it rather than writing a second FD sweep also
+//! means the step heuristic (`third_order_fd_step`, solver-tolerance aware) and the
+//! route-switch guards are shared.
+//!
+//! **η axes only, which is `1 + 2·n_eta` evaluations rather than `1 + 2(n_theta + n_eta)`**
+//! (#1342). This assembly reads `∂³f/∂η³` and `∂³f/∂η²∂θ` and nothing else; the θ axes exist to
+//! build `d2f_dtheta2` and `d3f_deta_dtheta2`, which only the covariance assembly consumes, so
+//! sweeping them here computed `2·n_theta` jets per subject and discarded them. `∂³f/∂η²∂θ` is
+//! still had exactly, from `∂/∂η` of the base `∂²f/∂η∂θ` instead of `∂/∂θ` of `∂²f/∂η²` — the
+//! same mixed partial by Clairaut. See [`crate::sens::provider::ThirdOrderAxes`].
 //!
 //! **This is the default route as of #1335, and a raw call-count comparison is still not the
-//! whole story.** `2p` perturbed anchors and `1 + 2(n_theta + n_eta)` provider evaluations are
-//! different work units: each call here does materially more work (a full third-order jet plus
-//! the residual σ/f central differences below) than a plain anchor rebuild, so fewer calls does
-//! not automatically mean less time. On the **diagonal-Ω** fixture the two sit so close to
-//! parity that successive sessions measured opposite signs (+34% slower, then ~14% faster, both
-//! real) — which is why this route was opt-in for as long as that was the only fixture measured.
+//! whole story.** `2p` perturbed anchors and `1 + 2·n_eta` provider evaluations are different
+//! work units: each call here does materially more work (a full third-order jet plus the
+//! residual σ/f central differences below) than a plain anchor rebuild, so fewer calls does not
+//! automatically mean less time. On the **diagonal-Ω** fixture the two sat so close to parity,
+//! back when this swept every θ axis too, that successive sessions measured opposite signs
+//! (+34% slower, then ~14% faster, both real) — which is why this route was opt-in for as long
+//! as that was the only fixture measured. Dropping the θ axes moved that case off parity.
 //!
 //! The **block-Ω** case decided it, and it is the one to reason from: there the call-count gap
 //! is wide (`2·n_free = 20` FD rebuilds vs `1 + 2(n_theta + d) = 13` provider evaluations)
@@ -109,7 +117,7 @@ use crate::estimation::parameterization::{lower_tri_entries, packed_len};
 use crate::estimation::sens_outer_gradient::{
     err_terms, score_core, sigma_fd_step, theta_dx_chain,
 };
-use crate::sens::provider::subject_sensitivities_cov;
+use crate::sens::provider::subject_sensitivities_cov_eta_only;
 use crate::stats::residual_error::residual_rd2;
 use crate::types::{BloqMethod, CompiledModel, ModelParameters, Subject};
 
@@ -183,7 +191,7 @@ pub(crate) fn subject_h_inner_dx(
     // The third-order jet. Its `obs` base blocks are bit-identical to
     // `subject_sensitivities`, so `score_core` below sees exactly the values that built the
     // anchor the caller passes to `build_proposal`.
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, b_hat)?;
+    let sens = subject_sensitivities_cov_eta_only(model, subject, &params.theta, b_hat)?;
     let n_obs = subject.observations.len();
     if n_obs == 0 || sens.obs.len() != n_obs {
         return None;
