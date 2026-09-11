@@ -367,11 +367,13 @@ impl DoseEvent {
 ///   7: V3      (peripheral volume 2, 3-cmt only)
 ///   8: LAGTIME (dose/absorption lagtime, default 0.0; equivalent to NONMEM ALAG)
 ///
-/// Slots 0–8 are the named PK parameters above. Slots 9.. are spare capacity
-/// for ODE models, whose `[individual_parameters]` may declare additional
-/// "structural" parameters (rate constants, Emax/EC50, baselines, …) beyond the
-/// named PK slots. `ode_param_slots` routes canonical names to slots 0–8 and
-/// structural names to the remaining free slots, while keeping slots
+/// Slots 0–8 are the named PK parameters above. Slots 9–12 hold the analytic
+/// transit / inverse-Gaussian parameters (`PK_IDX_N`, `PK_IDX_MTT`,
+/// `PK_IDX_MAT`, `PK_IDX_CV2`); for an ODE model they, like every higher slot,
+/// are spare capacity for additional "structural" parameters (rate constants,
+/// Emax/EC50, baselines, …). `ode_param_slots` routes any name
+/// `PkParams::name_to_index` recognises to its fixed slot and structural names
+/// to the lowest remaining free slots, while keeping slots
 /// `PK_IDX_F` and `PK_IDX_LAGTIME` reserved so an undeclared F/lagtime keeps its
 /// default rather than being aliased by a structural parameter (issue #122).
 /// The headroom here therefore bounds how many structural parameters an ODE
@@ -3663,12 +3665,17 @@ pub struct CompiledModel {
     pub eta_names: Vec<String>,
     /// IOV kappa names (length == n_kappa). Empty when no IOV.
     pub kappa_names: Vec<String>,
-    /// Names of the individual parameters declared at the top level of the
-    /// `[individual_parameters]` block, in declaration order (followed by the
-    /// parser-synthesized `__ferx_ro_*` / `__ferx_pktime_*` parameters).
+    /// Names of the individual parameters assigned in `[individual_parameters]`,
+    /// in first-assignment order: every top-level assignment, plus a name
+    /// assigned on every branch of an `if`/`else` when `[odes]`,
+    /// `[structural_model]`, `[scaling]` or `[derived]` reads it (#357). The
+    /// parser-synthesized `__ferx_ro_*` / `__ferx_pktime_*` parameters follow.
     /// Parallel to `pk_indices` on both engines: read the i-th name's value from
-    /// `PkParams.values[pk_indices[i]]`, never from slot `i`. Used by the FFI to
-    /// label per-subject EBE individual parameter values (e.g. `CL`, `V`, `Ka`).
+    /// `PkParams.values[pk_indices[i]]`, never from slot `i`. On an analytical
+    /// model that read is valid only for the names described below: a
+    /// placeholder entry cannot yet be told apart from a genuine `CL` entry
+    /// (#1356). Used by the FFI to label per-subject EBE individual parameter
+    /// values (e.g. `CL`, `V`, `Ka`).
     ///
     /// Where `pk_indices[i]` comes from differs by engine:
     /// - **ODE and compartment-free models** route every name through
@@ -3681,7 +3688,8 @@ pub struct CompiledModel {
     ///   name is bound on the `[structural_model]` line (its canonical PK slot)
     ///   or referenced by a readout (#650, a spare slot). Every other name gets
     ///   a placeholder `0`, which aliases the `CL` slot rather than holding that
-    ///   name's value (#1356). Most such names (e.g. an intermediate `TVCL`) are
+    ///   name's value; a name that differs from a bound name only in case (`v`
+    ///   next to `V`) instead gets that bound name's slot (#1356). Most such names (e.g. an intermediate `TVCL`) are
     ///   never written to `PkParams`; a modeled-dose `D{n}`/`R{n}` is written,
     ///   to a spare slot above `PK_IDX_LAGTIME`, but still cannot be read back
     ///   through `pk_indices`.
@@ -3765,6 +3773,12 @@ pub struct CompiledModel {
     /// value to the correct PK slot. Note: the index here is the
     /// assignment/tv index, *not* the eta index — see `eta_map` for the
     /// latter (they diverge when some params are eta-free).
+    ///
+    /// Also parallel to `indiv_param_names`; see that field for how each
+    /// engine assigns the slot. On an analytical model a name that is neither
+    /// bound on the `[structural_model]` line nor referenced by a readout gets a
+    /// placeholder `0`, which aliases `PK_IDX_CL`, or the slot of a bound name
+    /// it matches case-insensitively (#1356).
     pub pk_indices: Vec<usize>,
     /// Per-tv eta index: `eta_map[i]` is the eta index referenced by the
     /// i-th `[individual_parameters]` assignment, or -1 if the assignment
@@ -4471,7 +4485,12 @@ impl CompiledModel {
     ///      routed to the lag slot: on the analytical engine by a `lagtime=` /
     ///      `alag=` binding on the `[structural_model]` line, on the ODE (and
     ///      compartment-free) layout by `ode_param_slots` sending a bare
-    ///      `LAGTIME`/`ALAG` name to its canonical slot.
+    ///      `LAGTIME`/`ALAG` name to its canonical slot. Two analytical
+    ///      exceptions write the lag slot without `pk_indices` recording it: a
+    ///      variable bound to two roles (e.g. `f=X, lagtime=X`) records only one
+    ///      of them, chosen by `HashMap` iteration order (#1359); and a
+    ///      `lagtime=` binding to a name assigned only inside an `if` without
+    ///      `else` is not in `indiv_param_names` at all.
     ///   2. On the ODE engine, a compartment-indexed `ALAGn`/`LAGTIMEn` (#369)
     ///      is not a canonical PK name, so `ode_param_slots` gives it an ordinary
     ///      structural slot that `pk_indices` cannot identify; it is found by
@@ -4482,7 +4501,8 @@ impl CompiledModel {
     ///      compartment-free layout, and on the analytical engine a false
     ///      positive for a `LAGTIME` declared without a `[structural_model]`
     ///      binding — that value never reaches `PK_IDX_LAGTIME` and no lag is
-    ///      applied; the model is only routed onto the slower lag-aware paths.
+    ///      applied, yet the model is taken off the lag-free fast paths (the
+    ///      explicit sensitivity kernels and the cached event schedule).
     pub fn has_lagtime(&self) -> bool {
         if self.pk_indices.contains(&PK_IDX_LAGTIME) {
             return true;
@@ -4581,7 +4601,8 @@ impl CompiledModel {
     /// either engine). Mirrors [`Self::has_lagtime`]: [`PK_IDX_F`] is in
     /// `pk_indices` when `f=` binds it on the analytical `[structural_model]`
     /// line, or when an ODE / compartment-free model declares a bare `F`
-    /// (`ode_param_slots` routes the canonical name to that slot). The name scan
+    /// (`ode_param_slots` routes the canonical name to that slot); the same two
+    /// analytical exceptions as for the lag slot apply to `f=`. The name scan
     /// below adds a compartment-indexed `Fn`, which routes on the ODE engine
     /// only. It also matches a bare `F` on every engine: redundant on the ODE
     /// layout, and on the analytical engine a false positive for an `F` declared

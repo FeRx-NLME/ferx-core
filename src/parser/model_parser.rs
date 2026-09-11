@@ -360,7 +360,7 @@ fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
 /// downstream block consumes them (issue #357) — promoting *every* such name
 /// would slot throwaway intermediates into the PK array (silently hijacking the
 /// reserved F/lagtime slots, aliasing the CL slot in `pk_indices`, or
-/// exhausting the 16-slot layout). See `parse_full_model`.
+/// exhausting the `MAX_PK_PARAMS`-slot layout). See `parse_full_model`.
 ///
 /// Motivating case: a PK parameter written only inside symmetric `if`/`else`
 /// branches (the natural NONMEM-style `IF (cond) CL = ...` / `IF (!cond) CL =
@@ -1738,7 +1738,7 @@ pub fn parse_full_model_with(
     // Promoting *every* all-branch name (the naive fix) would slot throwaway
     // intermediates into the PK array — silently hijacking the reserved
     // F/lagtime slots, aliasing the CL slot in pk_indices, or exhausting the
-    // 16-slot layout. So a branch-only helper used purely to compute another
+    // MAX_PK_PARAMS-slot layout. So a branch-only helper used purely to compute another
     // param stays branch-local. The ParseCtx still receives the full set (via
     // assigned_vars_in_order) so such helpers parse as Variable, not Covariate.
     let indiv_text = indiv_lines.join("\n");
@@ -15728,8 +15728,10 @@ fn build_ruv_magnitude(
 /// expressions, or full `if (...) { ... } else { ... }` statements.
 ///
 /// `var_names` is the deduplicated list of all variables ever assigned in the
-/// block (in first-occurrence order). For analytical PK models the assignment
-/// order doubles as the slot ordering for `PkParams.values`.
+/// block (in first-occurrence order); that order is the evaluator's var-slot
+/// order only. The `PkParams.values` slot comes from `pk_param_map` and its
+/// spare-slot extensions (analytical) or from `ode_slot_map` (ODE and
+/// compartment-free), never from this order.
 /// Build the `pk_param_fn` closure used by every fit / simulate / predict
 /// call site. When the `nn` feature is on and the model has any
 /// `[covariate_nn]` blocks, `covariate_nns` carries each mapper plus the
