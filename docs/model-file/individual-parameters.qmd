@@ -49,6 +49,9 @@ name from quietly reading as zero and collapsing the formula.
 | `log()`, `ln()` | `log(TVCL)` |
 | `sqrt()` | `sqrt(WT)` |
 | `abs()` | `abs(ETA_CL)` |
+| `floor()`, `ceil()`, `round()` | `floor(AGE / 10)` |
+| `logit()` | `logit(THETA_F)` |
+| `inv_logit()`, `expit()` | `inv_logit(logit(THETA_F) + ETA_F)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
 | `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
@@ -72,6 +75,32 @@ arity is a parse error, and literal bounds the wrong way round
 (`clamp(x, 0.9, 0.1)`) are rejected rather than silently returning `0.9` for
 every `x`; bounds that are not both literals are not checked
 ([#1092](https://github.com/FeRx-NLME/ferx-core/issues/1092)).
+
+The table above is the **complete** list. Calling anything else is a parse error
+naming the call and listing what is available:
+
+```
+unknown function `tanh`. Supported: exp, log, ln, sqrt, abs, floor, ceil, round,
+logit, inv_logit, expit, min(a, b), max(a, b), clamp(x, lo, hi),
+present(x) (conditions only)
+```
+
+Before ferx 0.5 an unrecognised name was silently the **identity**, so
+`CL = TVCL * tanh(ETA_CL)` parsed, passed `ferx check`, fitted and converged
+while computing `TVCL * ETA_CL` — a consistently wrong model with no warning
+anywhere ([#1332](https://github.com/FeRx-NLME/ferx-core/issues/1332)). The
+realistic triggers were ordinary: a function that exists in NONMEM, nlmixr2 or
+mrgsolve but not here (`tanh`, `sinh`, `sign`, `log10`), and plain typos
+(`sqr(x)`, `exp1(x)`). Names are matched case-insensitively, so the NONMEM `$PK`
+spellings `EXP(...)` / `LOG(...)` keep working; `TANH(...)` is rejected exactly
+like `tanh(...)`.
+
+`floor`, `ceil` and `round` are piecewise constant, so their analytic derivative
+is **0** away from a step (the integer boundaries are undefined and ignored, as
+for `%`). A parameter that rounds is therefore flat with respect to the value it
+rounds, which is usually what a dose-band or occasion-index lookup wants — but it
+does mean an `η` that only enters through a rounded quantity gets a zero
+gradient.
 
 ## Continuation Lines
 
