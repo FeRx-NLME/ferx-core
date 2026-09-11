@@ -5403,6 +5403,189 @@ DV ~ additive(EPS)
         );
     }
 
+    // ── κ-phase parallel schedule is bit-identical (#1346 review, 2026-09-11) ──
+
+    /// Mixture **and** IOV together — the two per-subject contexts the κ phase's
+    /// map-then-apply parallelisation (#1344 item 5) has to reconstruct inside
+    /// each `rayon` worker: the per-occasion kappa MH itself, and the mixture
+    /// class guard that must route it into the subject's drawn class before
+    /// proposing κ. Neither the existing serial-IOV nor the existing
+    /// mixture-only SAEM fixtures exercise both at once.
+    fn mix_iov_model() -> CompiledModel {
+        let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  kappa KAPPA_CL ~ 0.03 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        crate::parser::model_parser::parse_model_string(src).expect("mixture+IOV model parses")
+    }
+
+    /// Four subjects, two per class, two occasions each with a dose at the
+    /// occasion boundary — one `kappas[i]` entry per occasion, and a class per
+    /// subject, exactly what the κ phase's per-`i` guard branches on.
+    fn mix_iov_pop() -> Population {
+        use std::collections::HashMap;
+        let subjects = (0..4)
+            .map(|i| {
+                let cl: f64 = if i < 2 { 1.0 } else { 3.0 };
+                let obs_times = vec![0.5, 1.0, 2.0, 4.0];
+                let observations = obs_times
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &t)| {
+                        (10.0 * (-(cl / 10.0) * t).exp()) * (1.0 + 0.02 * ((i + j) as f64).sin())
+                    })
+                    .collect();
+                Subject {
+                    id: (i + 1).to_string(),
+                    doses: vec![
+                        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                        DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
+                    ],
+                    obs_times,
+                    obs_raw_times: Vec::new(),
+                    observations,
+                    obs_cmts: vec![1, 1, 1, 1],
+                    covariates: HashMap::new(),
+                    dose_covariates: Vec::new(),
+                    obs_covariates: Vec::new(),
+                    pk_only_times: Vec::new(),
+                    pk_only_covariates: Vec::new(),
+                    reset_times: Vec::new(),
+                    reset_covariates: Vec::new(),
+                    cens: vec![0, 0, 0, 0],
+                    occasions: vec![1, 1, 2, 2],
+                    obs_l2: Vec::new(),
+                    dose_occasions: vec![1, 2],
+                    reset_occasions: Vec::new(),
+                    fremtype: Vec::new(),
+                    obs_records: vec![],
+                }
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// The regression coverage the PR #1346 review asked for: the κ phase's
+    /// parallelisation is claimed to be **bit-identical** to the serial loop it
+    /// replaced (commit `055e6e2f`) because every access is `[i]`-disjoint and
+    /// every subject's RNG is seeded from `(master_seed, k, i)` alone, never from
+    /// which worker or in what order subjects finish. That claim is a scheduling
+    /// property, not a numerical one, so the oracle for it is the *same* SAEM
+    /// run under a different `rayon` worker count — exactly what every other
+    /// parallel reduction in this file already pins against thread-count
+    /// dependence (`obs_nll_sum_iov` and friends, #703). A defect that let a
+    /// worker read or write another subject's `kappas[i]`, or reseeded from
+    /// anything thread-local, would move `state.kappas` without necessarily
+    /// moving `ofv` — so `kappas` is the field that actually exercises the claim,
+    /// not just a plausible one to also check.
+    #[test]
+    fn kappa_phase_parallel_schedule_is_bit_identical() {
+        let model = mix_iov_model();
+        let population = mix_iov_pop();
+        let opts = FitOptions {
+            saem_n_exploration: 3,
+            saem_n_convergence: 2,
+            saem_n_mh_steps: 4,
+            saem_omega_burnin: 0,
+            saem_seed: Some(20260911),
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+
+        let run = |width: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .build()
+                .expect("thread pool build");
+            pool.install(|| {
+                run_saem(&model, &population, &model.default_params, &opts)
+                    .expect("SAEM run must succeed")
+            })
+        };
+
+        let one_worker = run(1);
+        let four_workers = run(4);
+
+        assert_eq!(
+            one_worker.ofv.to_bits(),
+            four_workers.ofv.to_bits(),
+            "final OFV must not depend on the rayon worker count"
+        );
+        assert_eq!(
+            one_worker.params.theta.len(),
+            four_workers.params.theta.len()
+        );
+        for (m, (a, b)) in one_worker
+            .params
+            .theta
+            .iter()
+            .zip(four_workers.params.theta.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "theta[{m}] must not depend on the rayon worker count"
+            );
+        }
+
+        assert_eq!(one_worker.kappas.len(), four_workers.kappas.len());
+        for (i, (occs_a, occs_b)) in one_worker
+            .kappas
+            .iter()
+            .zip(four_workers.kappas.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                occs_a.len(),
+                occs_b.len(),
+                "subject {i}: occasion count must not depend on the rayon worker count"
+            );
+            for (occ, (ka, kb)) in occs_a.iter().zip(occs_b.iter()).enumerate() {
+                assert_eq!(
+                    ka.as_slice()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    kb.as_slice()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "subject {i} occasion {occ}: kappa must not depend on the rayon worker count"
+                );
+            }
+        }
+    }
+
     // ── IOV omega analytic update formula ──────────────────────────────────
 
     /// The analytic update `(1/N_occ) Σᵢ Σₖ κᵢₖ κᵢₖᵀ` for a 1-dimensional

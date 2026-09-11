@@ -1545,6 +1545,62 @@ fn the_eta_only_sweep_matches_the_full_sweep_on_the_blocks_laplace_reads() {
     );
 }
 
+/// `subject_sensitivities_cov_eta_only`'s `base` parameter (#1344 item 2) exists so a caller
+/// that already holds the jet at `(theta, eta)` — `agq::score_core_at` builds exactly this for
+/// the anchor — can hand it over instead of paying for the identical `subject_sensitivities`
+/// call again. Supplying it must be a pure optimisation: the result has to be bit-identical to
+/// letting the sweep recompute it itself, since a correctly-supplied base *is* the same
+/// evaluation, not an approximation of it.
+///
+/// Regression coverage for the PR #1346 review's testing suggestion (2026-09-11): every other
+/// test of this sweep, including the one directly above, only ever calls with `base = None`, so
+/// a defect confined to the `Some(base)` arm — the one release builds actually take — could ship
+/// with the rest of the suite green. `debug_assert_base_matches` catches a base from the *wrong*
+/// point in debug builds, but says nothing about whether accepting a *correct* one changes the
+/// result, which is what this pins.
+#[test]
+fn the_supplied_base_jet_reproduces_the_recomputed_one() {
+    let m = parse_model_string(ONECPT_IV_2ETA).expect("parse");
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.25, 11.0];
+    let eta = [0.13, -0.09];
+
+    // The exact call `agq::score_core_at` makes to build the jet it then hands to
+    // `subject_h_inner_dx` as `base_jet`.
+    let base = subject_sensitivities(&m, &s, &theta, &eta).expect("in scope");
+
+    let recomputed =
+        subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta, None).expect("in scope");
+    let supplied =
+        subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta, Some(base)).expect("in scope");
+
+    assert_eq!(recomputed.obs.len(), supplied.obs.len());
+    for (j, (r, sup)) in recomputed.obs.iter().zip(supplied.obs.iter()).enumerate() {
+        assert_eq!(r.f, sup.f, "obs {j}: f");
+        assert_eq!(r.df_deta, sup.df_deta, "obs {j}: df/deta");
+        assert_eq!(r.d2f_deta2, sup.d2f_deta2, "obs {j}: d2f/deta2");
+        assert_eq!(r.df_dtheta, sup.df_dtheta, "obs {j}: df/dtheta");
+        assert_eq!(
+            r.d2f_deta_dtheta, sup.d2f_deta_dtheta,
+            "obs {j}: d2f/deta_dtheta"
+        );
+        assert_eq!(r.d3f_deta3, sup.d3f_deta3, "obs {j}: d3f/deta3");
+        assert_eq!(
+            r.d3f_deta2_dtheta, sup.d3f_deta2_dtheta,
+            "obs {j}: d3f/deta2_dtheta"
+        );
+        // Both empty under `EtaOnly`, whichever arm built them — asserted rather than assumed.
+        assert_eq!(r.d2f_dtheta2, sup.d2f_dtheta2, "obs {j}: d2f/dtheta2");
+        assert_eq!(
+            r.d3f_deta_dtheta2, sup.d3f_deta_dtheta2,
+            "obs {j}: d3f/deta_dtheta2"
+        );
+    }
+}
+
 /// `subject_sensitivities_cov` differences the **exact** `Dual2` jet along each `(θ, η)` axis,
 /// so the arithmetic is easy; what is easy to get *wrong* is the row-major index layout of
 /// four differently-shaped tensors. A transposed slice still produces plausible finite
