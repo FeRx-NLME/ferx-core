@@ -4148,19 +4148,10 @@ mod variance_init_rail_tests;
 ///
 /// **This is the gate.** `fit()` calls it before any optimizer runs, so a prior
 /// that survives to `build_prior_set` has already been checked against the very
-/// `ModelParameters` layout the optimizer will pack. Two classes of failure,
-/// both errors rather than warnings:
-///
-/// 1. The prior does not resolve — unknown name, a `FIX`ed parameter, a
-///    `block_omega` element, a duplicate. [`PriorSet::build`] produces the
-///    message; this function only decides the severity and the code.
-/// 2. The chain's **final estimating** stage does not apply priors. An
-///    unapplied prior is worse than an unapplied regularizer: the fit still
-///    converges and still reports estimates, and nothing in the output says the
-///    prior was ignored, so a user reading a stabilized-looking result has no
-///    way to notice they got the unpenalized MLE. An earlier stage that does not
-///    apply them is fine (`[saem, focei]` reports the FOCEI stage's estimates),
-///    which is why only the last element is tested.
+/// `ModelParameters` layout the optimizer will pack. Three classes of failure,
+/// all errors rather than warnings — an unapplied or half-applied prior is
+/// invisible in the output, because the fit still converges and still reports
+/// estimates with nothing saying the prior was dropped.
 pub(crate) fn check_parameter_priors(
     model: &CompiledModel,
     init_params: &ModelParameters,
@@ -4169,38 +4160,83 @@ pub(crate) fn check_parameter_priors(
     if model.priors.is_empty() {
         return Vec::new();
     }
+
+    // 1. The prior does not resolve — unknown name, a FIXed parameter, a block
+    //    element, a duplicate. `PriorSet::build` produces the message; this
+    //    function only decides the severity and the code.
     if let Err(msg) = crate::estimation::priors::PriorSet::build(model, init_params) {
         return vec![Diagnostic::error("E_PRIOR_UNRESOLVED", msg)
             .with_block("parameters")
             .with_suggestion(
                 "A prior must name a `theta`, `omega`, `sigma` or `kappa` declared in \
-                 `[parameters]` that is estimated (not `FIX`) and not part of a \
+                 `[parameters]` that is estimated (not `FIX`) and does not belong to a \
                  `block_omega` / `block_sigma` / `block_kappa`.",
             )];
     }
-    let chain = options.method_chain();
-    let Some(&last) = chain.last() else {
+
+    // 2. The last stage that *estimates* cannot apply priors.
+    //
+    //    Not `chain.last()`: a trailing evaluation-only stage (`imp` under
+    //    `imp_eval_only`, `laplace` under `agq_eval_only`) consumes the preceding
+    //    stage's parameters and runs no optimizer, so it can neither apply a
+    //    prior nor undo one an earlier stage applied. Testing the literal last
+    //    stage is wrong in both directions — `[saem, laplace]` + `agq_eval_only`
+    //    would be accepted (Laplace is supported, but here it only evaluates
+    //    SAEM's estimates, so nothing ever applied the prior) and `[focei, imp]`
+    //    + `imp_eval_only` would be rejected (IMP is unsupported, but FOCEI
+    //    already applied it).
+    //
+    //    `covariance_stage` is the same predicate that decides which stage owns
+    //    the covariance step, for the same reason: one derivation, so the two
+    //    cannot disagree about which stage the reported estimates came from.
+    let Some(last) = options.covariance_stage() else {
         return Vec::new();
     };
-    if applies_parameter_priors(last) {
-        return Vec::new();
+    if !applies_parameter_priors(last) {
+        return vec![Diagnostic::error(
+            "E_PRIOR_METHOD_UNSUPPORTED",
+            format!(
+                "`prior(...)` is declared on {} parameter(s), but the last estimating stage \
+                 (`{}`) does not apply parameter priors — the fit would silently return the \
+                 unpenalized maximum-likelihood estimates.",
+                model.priors.len(),
+                last.label(),
+            ),
+        )
+        .with_block("parameters")
+        .with_suggestion(
+            "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
+             Use one of those as the last estimating stage — chaining is fine, e.g. \
+             `methods = [saem, focei]` — or remove the prior declarations.",
+        )];
     }
-    vec![Diagnostic::error(
-        "E_PRIOR_METHOD_UNSUPPORTED",
-        format!(
-            "`prior(...)` is declared on {} parameter(s), but the final estimation stage \
-             (`{}`) does not apply parameter priors — the fit would silently return the \
-             unpenalized maximum-likelihood estimates.",
-            model.priors.len(),
-            last.label(),
-        ),
-    )
-    .with_block("parameters")
-    .with_suggestion(
-        "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
-         Use one of those as the final stage — chaining is fine, e.g. \
-         `methods = [saem, focei]` — or remove the prior declarations.",
-    )]
+
+    // 3. The requested covariance estimator cannot carry the prior.
+    //
+    //    `S` is a sum over *subjects*, and a prior has no subject decomposition —
+    //    it contributes one score for the whole population, not one per subject —
+    //    so `S⁻¹` cannot represent it and reporting it as a MAP standard error
+    //    would be a plain misstatement. `R` carries the prior's curvature, and so
+    //    does the `R` half of the `RSR` sandwich.
+    if options.run_covariance_step
+        && options.covariance_method == crate::types::CovarianceMethod::CrossProduct
+    {
+        return vec![Diagnostic::error(
+            "E_PRIOR_COV_METHOD_UNSUPPORTED",
+            "`covariance_method = s` (the score cross-product) cannot represent a parameter \
+             prior: `S` is a sum of per-subject scores, and a prior contributes one score for \
+             the whole population rather than one per subject. The reported standard errors \
+             would be the unpenalized ones."
+                .to_string(),
+        )
+        .with_block("fit_options")
+        .with_suggestion(
+            "Use `covariance_method = r` (the default, whose Hessian carries the prior's \
+             curvature) or `rsr`, or set `covariance = false`.",
+        )];
+    }
+
+    Vec::new()
 }
 
 /// Whether an estimation method's optimizer applies parameter priors (#254).

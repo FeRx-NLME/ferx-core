@@ -156,12 +156,33 @@ Priors are applied by the **FOCE family**: `foce`, `focei`, `laplace`, `gn`,
 `gn_hybrid`. They enter the objective, the gradient, and the covariance step's
 Hessian.
 
-If the **final** estimation stage of a chain does not apply priors, the fit is
+If the last **estimating** stage of a chain does not apply priors, the fit is
 **refused** rather than run unpenalized. An unapplied prior is invisible in the
 output — the fit converges, the estimates look reasonable, and nothing says the
 prior was dropped — so a silent fallback would be worse than no feature. Chaining
-is fine as long as the last stage qualifies: `method = [saem, focei]` works,
-because the FOCEI stage is the one whose estimates are reported.
+is fine as long as that stage qualifies: `method = [saem, focei]` works, because
+the FOCEI stage is the one whose estimates are reported.
+
+"Last estimating" is deliberate: a trailing **evaluation-only** stage (`imp` with
+`imp_eval_only`, `laplace` with `agq_eval_only`) only scores the preceding
+stage's parameters, so it neither applies a prior nor undoes one. `method =
+[focei, imp]` with `imp_eval_only = true` is accepted — FOCEI applied the prior —
+while `[saem, laplace]` with `agq_eval_only = true` is refused, because Laplace
+there is only evaluating SAEM's unpriored estimates.
+
+### Covariance estimators
+
+`covariance_method = r` (the default) and `rsr` carry the prior's curvature.
+`covariance_method = s` is **refused** under a prior: `S` is a sum of per-subject
+score cross-products, and a prior contributes one score for the whole population
+rather than one per subject, so `S⁻¹` cannot represent it and reporting it as a
+MAP standard error would be a plain misstatement. For the same reason, a
+large-parameter fit that would normally be auto-routed from `r` to `s` stays on
+`r` when a prior is declared, and says so.
+
+Under SIR (`sir = true`), the importance weights score the penalized objective,
+so the resampled intervals reflect the prior rather than drifting back toward the
+unpenalized MLE.
 
 ## Not supported in v1
 
@@ -202,6 +223,28 @@ $\Omega$ side is genuinely a different prior: lognormal on the variance rather
 than inverse-Wishart. For a diagonal $\Omega$ the two are close in practice and
 neither is more "correct"; they differ in tail behaviour and in how a very small
 variance is penalized.
+
+### The θ prior is anchored against NWPRI
+
+Not just equivalent on paper. With both engines writing the model on the log
+scale and evaluating at the same fixed point, ferx's penalty reproduces NONMEM's:
+
+| | NONMEM 7.5.1 | ferx |
+|---|---|---|
+| null (no prior) | 177.82632978040530 | 177.826330 |
+| prior centred on θ | 177.826 (== null) | — |
+| prior offset from θ | 177.94393305151641 | 177.943933 |
+| **prior contribution** | **0.11760327111** | **0.117603** |
+
+The centred run — prior mean placed exactly on the parameter — reproducing the
+null is what establishes that NWPRI drops the prior's normalisation constant just
+as ferx does, so these are comparable absolutely and not only as a difference.
+Control streams and the measured `.lst` files live in `nonmem_anchor/`; the
+comparison runs as a test (`the_prior_penalty_matches_nonmem_nwpri`).
+
+The **Ω** prior has no NWPRI counterpart to difference against, since NONMEM's is
+an inverse-Wishart. It is pinned instead by closed-form unit tests, including a
+differential pair that catches the variance-vs-SD scale.
 
 ## References
 

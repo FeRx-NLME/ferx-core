@@ -1508,9 +1508,30 @@ pub(crate) fn scale_routed_covariance_method(
     n: usize,
     requested: CovarianceMethod,
     explicitly_set: bool,
+    has_priors: bool,
 ) -> (CovarianceMethod, Option<String>) {
     if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
         return (requested, None);
+    }
+    // #254: `S` is a sum of per-*subject* score cross-products, and a parameter
+    // prior has no subject decomposition — it contributes one score for the whole
+    // population, not N of them — so `S` cannot carry the prior's information at
+    // all. Auto-routing a priored fit onto it would silently report unpenalized
+    // standard errors for a penalized fit, which is the one thing the covariance
+    // wiring exists to prevent. Stay on `R` (which does carry the prior) and say
+    // why it will be slow, rather than being quietly wrong and fast.
+    if has_priors {
+        let stencil = n * (n + 1) / 2;
+        return (
+            requested,
+            Some(format!(
+                "covariance_method = r with {n} free parameters and parameter priors \
+                 declared: the R matrix is a finite-difference Hessian needing {stencil} \
+                 re-converged objective evaluations. The usual large-problem fallback \
+                 (`covariance_method = s`) cannot represent a prior, so it was not used. \
+                 Set `covariance = false` if this does not finish."
+            )),
+        );
     }
     let stencil = n * (n + 1) / 2;
     if explicitly_set {
@@ -1568,6 +1589,7 @@ pub(crate) fn run_covariance_step_inner(
         model.free_packed_dim(),
         options.covariance_method,
         options.covariance_method_set,
+        !model.priors.is_empty(),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -1665,7 +1687,7 @@ mod tests {
         ] {
             for explicit in [false, true] {
                 let (routed, warning) =
-                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit);
+                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit, false);
                 assert_eq!(routed, method);
                 assert!(
                     warning.is_none(),
@@ -1678,7 +1700,8 @@ mod tests {
     #[test]
     fn a_defaulted_hessian_routes_to_the_cross_product_at_scale() {
         let n = COV_HESSIAN_MAX_DIM + 1;
-        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, false);
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, false);
         assert_eq!(routed, CovarianceMethod::CrossProduct);
         let warning = warning.expect("the substitution must be reported");
         assert!(warning.contains("score cross-product"), "{warning}");
@@ -1693,7 +1716,8 @@ mod tests {
     #[test]
     fn an_explicit_hessian_is_honoured_at_scale_but_warned_about() {
         let n = COV_HESSIAN_MAX_DIM + 1;
-        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, true);
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, true, false);
         assert_eq!(
             routed,
             CovarianceMethod::Hessian,
@@ -1708,7 +1732,7 @@ mod tests {
         // `s` and `rsr` already cost one pass; the guard has nothing to say.
         for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
             let (routed, warning) =
-                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false);
+                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false, false);
             assert_eq!(routed, method);
             assert!(warning.is_none());
         }

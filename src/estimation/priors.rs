@@ -47,8 +47,7 @@
 //! never meets a second convention.
 
 use crate::estimation::parameterization::{
-    coordinate_kinds, coordinate_names, packed_fixed_mask, packed_segments, theta_packs_log,
-    PackedCoordKind,
+    coordinate_names, lower_tri_iter, packed_fixed_mask, packed_segments, theta_packs_log,
 };
 use crate::types::{CompiledModel, ModelParameters, PriorSpread, PriorSummary};
 
@@ -385,95 +384,136 @@ struct CoordInfo {
 
 /// Describe every packed coordinate, in [`pack_params`] order.
 ///
-/// This is the one place the packed layout is walked for priors. It leans on
-/// [`coordinate_names`] and [`coordinate_kinds`] for the layout itself, so a
-/// future segment appears here automatically (as an unnamed, rejected
-/// coordinate) rather than being silently mis-indexed.
+/// This is the one place the packed layout is walked for priors. The Ω / Ω_IOV
+/// segments are walked with [`lower_tri_iter`] rather than by offset arithmetic,
+/// because for a **non-diagonal** Ω the packed index is a position in the
+/// column-major lower triangle and is *not* the eta index — so
+/// `omega_init_as_sd[i - omega_start]` reads the wrong flag (or runs off the
+/// end) the moment a `block_omega` is present. Walking the triangle gives each
+/// coordinate its real `(row, col)`, which is what both the scale lookup and the
+/// block test need.
 fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<CoordInfo> {
     let names = coordinate_names(template);
-    let kinds = coordinate_kinds(template);
     let segs = packed_segments(template);
-    let omega_start = segs.omega_start();
-    let sigma_start = segs.sigma_start();
-    let iov_start = segs.iov_start();
-    let iov_end = segs.mixture_omega_start();
+    let mut out: Vec<CoordInfo> = Vec::with_capacity(names.len());
 
-    let omega_is_block = !template.omega.diagonal;
-    let iov_is_block = template.omega_iov.as_ref().is_some_and(|m| !m.diagonal);
+    let name_at = |i: usize| names.get(i).cloned().unwrap_or_else(|| format!("#{i}"));
 
-    (0..names.len())
-        .map(|i| {
-            let kind = kinds.get(i).copied().unwrap_or(PackedCoordKind::Theta);
-            let (scale, rejection) = match kind {
-                PackedCoordKind::Theta => {
-                    let scale = if theta_packs_log(template.theta_lower[i]) {
-                        PriorScale::Log
-                    } else {
-                        PriorScale::Identity
-                    };
-                    (scale, None)
-                }
-                PackedCoordKind::OmegaOffDiagonal => (
-                    PriorScale::Identity,
-                    Some(
-                        "priors on a `block_omega` / `block_sigma` off-diagonal are not \
-                         supported. A correlated block needs an inverse-Wishart prior, \
-                         which v1 deliberately leaves out; declare the diagonal \
-                         variances separately to prior them."
-                            .to_string(),
-                    ),
+    // θ — the prior family follows the packing, which follows the lower bound.
+    for i in 0..segs.theta {
+        let scale = if theta_packs_log(template.theta_lower[i]) {
+            PriorScale::Log
+        } else {
+            PriorScale::Identity
+        };
+        out.push(CoordInfo {
+            coord: i,
+            name: name_at(i),
+            scale,
+            rejection: None,
+        });
+    }
+
+    // Ω, then (below) Ω_IOV: same shape, different `init_as_sd` table and
+    // different keyword in the diagnostic.
+    push_omega_coords(
+        &mut out,
+        &template.omega,
+        &model.omega_init_as_sd,
+        "block_omega",
+        &name_at,
+    );
+
+    // Σ — always diagonal, packed as `ln(SD)`; declared as a variance unless `(sd)`.
+    for s_i in 0..segs.sigma {
+        let i = out.len();
+        out.push(CoordInfo {
+            coord: i,
+            name: name_at(i),
+            scale: sd_or_var_scale(flag_at(&model.sigma_init_as_sd, s_i)),
+            rejection: None,
+        });
+    }
+
+    if let Some(iov) = template.omega_iov.as_ref() {
+        push_omega_coords(
+            &mut out,
+            iov,
+            &model.kappa_init_as_sd,
+            "block_kappa",
+            &name_at,
+        );
+    }
+
+    // Everything past here — `[mixture]` per-class Ω/Σ overrides and the
+    // `block_sigma` ρ coordinates — is out of scope for v1. Filling the tail
+    // generically means a future segment arrives as a *rejected* coordinate
+    // rather than being silently mis-indexed onto one of the tables above.
+    while out.len() < names.len() {
+        let i = out.len();
+        out.push(CoordInfo {
+            coord: i,
+            name: name_at(i),
+            scale: PriorScale::HalfLog,
+            rejection: Some(
+                "priors on a per-class `[mixture]` Ω/Σ override or a `block_sigma` \
+                 correlation are not supported."
+                    .to_string(),
+            ),
+        });
+    }
+    out
+}
+
+/// Append one Ω-family segment (Ω or Ω_IOV) to the coordinate table.
+///
+/// Block membership is decided **per coordinate**, not per matrix. A mixed model
+/// — `block_omega (A, B)` alongside a standalone `omega C ~ …` — is one
+/// non-diagonal `OmegaMatrix`, so a matrix-level `!diagonal` test rejects a prior
+/// on `C` even though `C` is an ordinary independent variance. That is exactly
+/// the arrangement the block diagnostic tells users to reach for ("declare the
+/// diagonal variances separately to prior them"), so getting it wrong makes the
+/// advice impossible to follow.
+///
+/// `free_mask` is what encodes the real structure: a diagonal `(e, e)` is inside
+/// a block iff some off-diagonal in its row or column is a *free* parameter.
+fn push_omega_coords(
+    out: &mut Vec<CoordInfo>,
+    om: &crate::types::OmegaMatrix,
+    init_as_sd: &[bool],
+    block_keyword: &str,
+    name_at: &dyn Fn(usize) -> String,
+) {
+    let n = om.dim();
+    for (r, c) in lower_tri_iter(n, om.diagonal) {
+        let i = out.len();
+        let (scale, rejection) = if r == c {
+            // `init_as_sd` is parallel to the *eta* list, so it is indexed by the
+            // row, never by the packed position.
+            let in_block = (0..n).any(|j| j != r && (om.free_mask[(r, j)] || om.free_mask[(j, r)]));
+            (
+                sd_or_var_scale(flag_at(init_as_sd, r)),
+                in_block.then(|| block_rejection(block_keyword)),
+            )
+        } else {
+            (
+                PriorScale::Identity,
+                Some(
+                    "priors on a `block_omega` / `block_sigma` off-diagonal are not \
+                     supported. A correlated block needs an inverse-Wishart prior, \
+                     which v1 deliberately leaves out; declare the diagonal \
+                     variances separately to prior them."
+                        .to_string(),
                 ),
-                PackedCoordKind::OmegaDiagonal => {
-                    // Which Ω family this diagonal belongs to decides both the
-                    // declared scale (`(sd)` vs the variance default) and
-                    // whether it sits inside a block.
-                    if i < sigma_start {
-                        let as_sd = flag_at(&model.omega_init_as_sd, i - omega_start);
-                        (
-                            sd_or_var_scale(as_sd),
-                            omega_is_block.then(|| block_rejection("block_omega")),
-                        )
-                    } else if i < iov_end {
-                        let as_sd = flag_at(&model.kappa_init_as_sd, i - iov_start);
-                        (
-                            sd_or_var_scale(as_sd),
-                            iov_is_block.then(|| block_rejection("block_kappa")),
-                        )
-                    } else {
-                        (
-                            PriorScale::HalfLog,
-                            Some(
-                                "priors on a per-class `[mixture]` Ω/Σ override are not \
-                                 supported."
-                                    .to_string(),
-                            ),
-                        )
-                    }
-                }
-                PackedCoordKind::Sigma => {
-                    if i < iov_start {
-                        let s = i - sigma_start;
-                        (sd_or_var_scale(flag_at(&model.sigma_init_as_sd, s)), None)
-                    } else {
-                        (
-                            PriorScale::HalfLog,
-                            Some(
-                                "priors on a per-class `[mixture]` Ω/Σ override are not \
-                                 supported."
-                                    .to_string(),
-                            ),
-                        )
-                    }
-                }
-            };
-            CoordInfo {
-                coord: i,
-                name: names[i].clone(),
-                scale,
-                rejection,
-            }
-        })
-        .collect()
+            )
+        };
+        out.push(CoordInfo {
+            coord: i,
+            name: name_at(i),
+            scale,
+            rejection,
+        });
+    }
 }
 
 fn block_rejection(kind: &str) -> String {

@@ -85,6 +85,21 @@ struct FitWire {
     method_chain: Vec<String>,
     converged: bool,
     ofv: f64,
+    /// Parameter-prior split (#254). `Option` so an artifact written before the
+    /// split still loads: `None` means "this file predates priors", and the
+    /// loader reconstructs `ofv_data = ofv`, which is right for every such file
+    /// because no prior could have been applied when it was written.
+    ///
+    /// A *priored* fit must write these. Storing only `ofv` — the penalized
+    /// total — and reconstructing `ofv_data` from it on load would relabel the
+    /// penalized objective as the data likelihood, drop every prior row, and
+    /// break the `aic == ofv_data + 2k` invariant that `aic` was computed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ofv_data: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ofv_prior: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prior_summary: Vec<crate::types::PriorSummary>,
     aic: f64,
     bic: f64,
     n_obs: usize,
@@ -572,6 +587,11 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             .collect(),
         converged: r.converged,
         ofv: r.ofv,
+        // Written only for a priored fit, so an unpriored artifact stays
+        // byte-identical to a pre-#254 one.
+        ofv_data: (!r.prior_summary.is_empty()).then_some(r.ofv_data),
+        ofv_prior: (!r.prior_summary.is_empty()).then_some(r.ofv_prior),
+        prior_summary: r.prior_summary.clone(),
         aic: r.aic,
         bic: r.bic,
         n_obs: r.n_obs,
@@ -1875,14 +1895,14 @@ fn wire_to_fit_result(
         covariance_wall_time_secs: w.covariance_wall_time_secs,
         converged: w.converged,
         ofv: w.ofv,
-        // A checkpoint predates the prior split (#254) and carries only the
-        // single `ofv`. Restoring it as the data half is correct for every
-        // checkpoint that can exist — priors were not applied when it was
-        // written — and keeps `ofv == ofv_data + ofv_prior` an invariant rather
-        // than something a restored result quietly breaks.
-        ofv_data: w.ofv,
-        ofv_prior: 0.0,
-        prior_summary: Vec::new(),
+        // #254. An artifact written before the split carries no `ofv_data`, and
+        // for those `ofv` *is* the data likelihood — no prior could have been
+        // applied. A priored artifact carries both halves and they are restored
+        // as written, so `ofv == ofv_data + ofv_prior` and `aic == ofv_data + 2k`
+        // survive the round trip.
+        ofv_data: w.ofv_data.unwrap_or(w.ofv),
+        ofv_prior: w.ofv_prior.unwrap_or(0.0),
+        prior_summary: std::mem::take(&mut w.prior_summary),
         aic: w.aic,
         bic: w.bic,
         theta: w.theta.estimates,

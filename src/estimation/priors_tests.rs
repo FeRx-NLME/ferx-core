@@ -453,3 +453,68 @@ fn a_prior_on_a_block_omega_element_is_an_error() {
     let msg = err_of(&f);
     assert!(msg.contains("block_omega"), "{msg}");
 }
+
+/// A **mixed** Ω — `block_omega (A, B)` alongside an independent `omega C` — is a
+/// single non-diagonal matrix, so a matrix-level `!diagonal` test rejects a prior
+/// on `C` even though `C` is an ordinary uncorrelated variance.
+///
+/// That is exactly the arrangement the block diagnostic tells users to reach for
+/// ("declare the diagonal variances separately to prior them"), so getting it
+/// wrong makes the advice impossible to follow. Block membership has to come from
+/// `free_mask`, per coordinate.
+///
+/// The second half is the packed-index trap the first half hides: in a
+/// non-diagonal Ω the packed coordinate is a position in the column-major lower
+/// triangle, **not** an eta index, so an `omega_init_as_sd` lookup keyed on the
+/// packed offset reads the wrong flag — here it would read `ETA_A`'s (`false`)
+/// for `ETA_C` and silently switch `C` to the variance scale.
+#[test]
+fn a_prior_on_an_independent_diagonal_of_a_mixed_omega_is_accepted() {
+    // Ω = [[0.09, 0.02, 0], [0.02, 0.20, 0], [0, 0, 0.16]] — A~B correlated, C free.
+    // Packed (column-major lower triangle): (A,A) (B,A) (C,A) (B,B) (C,B) (C,C),
+    // so C's diagonal is packed index 5 while its eta index is 2.
+    //
+    // `CompiledModel` holds boxed closures and is not `Clone`, so the fixture is
+    // built fresh per probe rather than cloned.
+    let mixed = |prior_on: &str, value: f64| -> Fixture {
+        let mut f = Fixture::new(0.2, 0.001, 0.1, 0.1);
+        let m = nalgebra::DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.09, 0.02, 0.0, 0.02, 0.20, 0.0, 0.0, 0.0, 0.16],
+        );
+        let mut free = nalgebra::DMatrix::from_element(3, 3, false);
+        for i in 0..3 {
+            free[(i, i)] = true;
+        }
+        free[(0, 1)] = true;
+        free[(1, 0)] = true;
+        f.model.default_params.omega = OmegaMatrix::from_matrix_with_mask(
+            m,
+            vec!["ETA_A".into(), "ETA_B".into(), "ETA_C".into()],
+            false,
+            free,
+        );
+        f.model.default_params.omega_fixed = vec![false; 3];
+        // Only C is declared `(sd)`.
+        f.model.omega_init_as_sd = vec![false, false, true];
+        f.with_prior(prior_on, value, PriorSpread::Rse(0.4))
+    };
+
+    // C is independent → its prior resolves, on C's own declared (SD) scale.
+    let on_c = mixed("ETA_C", 0.4);
+    let set = on_c
+        .build()
+        .expect("a prior on an independent diagonal of a mixed Omega must resolve");
+    // Ω_CC = 0.16 → SD 0.4, which is the prior mean, so the penalty is exactly 0
+    // on the SD scale. Under the variance scale the mean would be ½·ln(0.4) while
+    // the packed value stays ln(0.4), giving a large penalty — so this pins the
+    // flag lookup, not merely the acceptance.
+    assert_eq!(set.penalty(&on_c.packed()), 0.0);
+
+    // A belongs to the block → still rejected, naming the block.
+    let err = mixed("ETA_A", 0.09)
+        .build()
+        .expect_err("a prior on a block member must still be rejected");
+    assert!(err.contains("block_omega"), "{err}");
+}

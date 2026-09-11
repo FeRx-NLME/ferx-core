@@ -422,3 +422,340 @@ fn a_tight_prior_tightens_the_reported_standard_error() {
         "tightening the prior must tighten the SE: {se_loose} -> {se_tight}"
     );
 }
+
+// ── Review findings on 762f6aa (#1341) ──────────────────────────────────────
+
+/// **Finding 1.** A trailing *evaluation-only* stage is not an estimator, so it
+/// decides nothing about whether the prior was applied.
+///
+/// Both directions, because each alone passes under a different wrong predicate:
+/// `chain.last()` accepts the first and rejects the second, while "any stage
+/// applies priors" accepts both.
+#[test]
+fn the_prior_method_gate_looks_past_evaluation_only_stages() {
+    let model = warfarin_with(&params_with_cl_prior(0.15, 25.0));
+    let pop = warfarin_population();
+
+    // [saem, laplace] with agq_eval_only: Laplace is a supported method, but here
+    // it only evaluates SAEM's estimates. Nothing applied the prior → reject, and
+    // the message must name SAEM rather than the evaluator.
+    let mut eval_tail = short_focei();
+    eval_tail.methods = vec![EstimationMethod::Saem, EstimationMethod::Laplace];
+    eval_tail.agq_eval_only = true;
+    eval_tail.saem_n_exploration = 1;
+    eval_tail.saem_n_convergence = 1;
+    let err = fit_model(&model, &pop, &eval_tail)
+        .expect_err("an eval-only tail must not launder an unsupported estimator");
+    assert!(err.to_lowercase().contains("saem"), "{err}");
+
+    // [focei, imp] with imp_eval_only: IMP is unsupported as an *estimator*, but
+    // here it only scores FOCEI's estimates, which did apply the prior → accept.
+    let mut eval_imp = short_focei();
+    eval_imp.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+    eval_imp.imp_eval_only = true;
+    eval_imp.imp_samples = 20;
+    let r = fit_model(&model, &pop, &eval_imp);
+    assert!(
+        r.is_ok(),
+        "an eval-only IMP tail must not reject a prior FOCEI applied: {:?}",
+        r.err()
+    );
+    let r = r.unwrap();
+    assert!(
+        r.ofv_prior > 0.0,
+        "the prior must still be in the objective"
+    );
+}
+
+/// **Finding 2.** A priored fit must survive a `.fitrx` round trip.
+///
+/// Storing only the penalized `ofv` and reconstructing `ofv_data` from it on load
+/// relabels the penalized objective as the data likelihood, drops every prior
+/// row, and breaks the `aic == ofv_data + 2k` invariant `aic` was computed under.
+#[test]
+fn a_priored_fit_round_trips_through_fitrx() {
+    let model = warfarin_with(&params_with_cl_prior(0.15, 25.0));
+    let saved =
+        fit_model(&model, &warfarin_population(), &short_focei()).expect("priored fit should run");
+    assert!(saved.ofv_prior > 0.0, "fixture must actually carry a prior");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("priored.fitrx");
+    ferx_core::io::fitrx::save_fit(
+        &saved,
+        &warfarin_population(),
+        "",
+        &path,
+        ferx_core::io::fitrx::SaveFitOptions { include_data: None },
+    )
+    .expect("write");
+    let loaded = ferx_core::io::fitrx::load_fit(&path).expect("read").fit;
+
+    // The halves come back as written, not reconstructed from the total.
+    assert_eq!(loaded.ofv, saved.ofv);
+    assert_eq!(loaded.ofv_data, saved.ofv_data);
+    assert_eq!(loaded.ofv_prior, saved.ofv_prior);
+    assert_ne!(
+        loaded.ofv_data, loaded.ofv,
+        "ofv_data must not be the penalized total"
+    );
+    // The invariant `aic` was computed under survives the trip.
+    assert!((loaded.aic - (loaded.ofv_data + 2.0 * loaded.n_parameters as f64)).abs() < 1e-9);
+    // And the per-parameter rows survive.
+    assert_eq!(loaded.prior_summary.len(), saved.prior_summary.len());
+    assert_eq!(loaded.prior_summary[0].name, "TVCL");
+    assert_eq!(
+        loaded.prior_summary[0].shift_in_prior_sds,
+        saved.prior_summary[0].shift_in_prior_sds
+    );
+}
+
+/// The control for the round trip: an **unpriored** fit still loads, and its
+/// `ofv_data` falls back to `ofv` (which for it is the data likelihood).
+#[test]
+fn an_unpriored_fit_still_round_trips_through_fitrx() {
+    let model = warfarin_with(BASE_PARAMS);
+    let saved = fit_model(&model, &warfarin_population(), &short_focei()).expect("unpriored fit");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("plain.fitrx");
+    ferx_core::io::fitrx::save_fit(
+        &saved,
+        &warfarin_population(),
+        "",
+        &path,
+        ferx_core::io::fitrx::SaveFitOptions { include_data: None },
+    )
+    .expect("write");
+    let loaded = ferx_core::io::fitrx::load_fit(&path).expect("read").fit;
+
+    assert_eq!(loaded.ofv, saved.ofv);
+    assert_eq!(loaded.ofv_data, saved.ofv);
+    assert_eq!(loaded.ofv_prior, 0.0);
+    assert!(loaded.prior_summary.is_empty());
+}
+
+/// **Finding 5.** `covariance_method = s` cannot carry a prior, so the
+/// combination is refused rather than reported as a MAP standard error.
+#[test]
+fn a_prior_with_the_cross_product_covariance_is_refused() {
+    let model = warfarin_with(&params_with_cl_prior(0.15, 25.0));
+    let pop = warfarin_population();
+
+    let mut s_method = short_focei();
+    s_method.run_covariance_step = true;
+    s_method.covariance_method = ferx_core::types::CovarianceMethod::CrossProduct;
+    let err = fit_model(&model, &pop, &s_method)
+        .expect_err("covariance_method = s cannot represent a prior");
+    assert!(err.contains("covariance_method = s"), "{err}");
+
+    // The straddle: the same model with the default `r` is accepted, so the gate
+    // rejects the estimator rather than every priored covariance step.
+    let mut r_method = short_focei();
+    r_method.run_covariance_step = true;
+    r_method.covariance_method = ferx_core::types::CovarianceMethod::Hessian;
+    assert!(fit_model(&model, &pop, &r_method).is_ok());
+
+    // And an unpriored fit may still use `s`, so the rejection is about the
+    // prior and not about the method.
+    let plain = warfarin_with(BASE_PARAMS);
+    assert!(fit_model(&plain, &pop, &s_method).is_ok());
+}
+
+/// **Finding 3.** SIR must resample against the *penalized* objective.
+///
+/// SIR approximates the posterior the fit targeted. Under a prior that target is
+/// `L(data)·p(θ)`, so the importance weights have to score both halves. If they
+/// score the data alone while the proposal is centred on the MAP estimate and
+/// shaped by the penalized curvature, the resampling actively pulls the interval
+/// back toward the MLE — a prior then shows up in the point estimate but not in
+/// the reported CI, which is worse than not supporting SIR at all.
+///
+/// # Why RSE = 10%, specifically
+///
+/// This test is only meaningful in the regime where the *weights* decide
+/// something, and that regime had to be measured rather than assumed — the first
+/// version of it used RSE = 2% and was **vacuous**: the penalized proposal is
+/// then so tight that every draw lands within a hair of the MAP, both weightings
+/// agree, and the assertion passed with the prior deleted from the sampler.
+/// Measured on this fixture (MLE 0.135276, prior 0.202914, seed 20254):
+///
+/// | RSE | CI with the prior in the weights | CI without |
+/// |-----|----------------------------------|------------|
+/// | 2%  | (0.1931, 0.2096) | (0.1863, 0.2191) — both at the prior, no signal |
+/// | **10%** | **(0.1384, 0.1927)** | **(0.1251, 0.1572)** — separated |
+/// | 20% | (0.1245, 0.1595) | (0.1215, 0.1595) — prior too weak to matter |
+/// | 40% | (0.1210, 0.1555) | (0.1197, 0.1555) — likewise |
+///
+/// At 10% the point estimate is identical either way (0.156190 — the *fit* is
+/// unaffected, only the resampling is), so anything that moves is the weights.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn sir_intervals_respect_the_prior() {
+    let pop = warfarin_population();
+    let mut opts = FitOptions::default();
+    opts.run_covariance_step = true;
+    opts.sir = true;
+    opts.sir_samples = 600;
+    opts.sir_resamples = 300;
+    opts.sir_seed = Some(20254);
+
+    // The unpriored MLE, so the prior can be placed somewhere the data disagrees
+    // with it and "pulled back toward the MLE" has a direction.
+    let mut mle_opts = opts.clone();
+    mle_opts.sir = false;
+    let mle = fit_model(&warfarin_with(BASE_PARAMS), &pop, &mle_opts).expect("mle fit");
+    let i = mle.theta_names.iter().position(|n| n == "TVCL").unwrap();
+    let cl_mle = mle.theta[i];
+    let prior_at = cl_mle * 1.5;
+
+    let r = fit_model(
+        &warfarin_with(&params_with_cl_prior(prior_at, 10.0)),
+        &pop,
+        &opts,
+    )
+    .expect("priored SIR fit");
+    assert!(r.ofv_prior > 0.0, "the fixture must actually carry a prior");
+
+    let ci = r.sir_ci_theta.as_ref().expect("SIR theta CIs")[i];
+    let est = r.theta[i];
+    let mid = 0.5 * (ci.0 + ci.1);
+
+    // Upper bound: 0.1927 correct vs 0.1572 with the prior dropped. Bound placed
+    // between them, nearer the wrong value so noise in the right arm cannot
+    // reach it.
+    assert!(
+        ci.1 > 0.175,
+        "SIR upper bound collapsed toward the MLE — the weights are scoring the \
+         data alone: CI {ci:?}, est {est}, MLE {cl_mle}, prior {prior_at}"
+    );
+    // Direction: correct puts the resampled mass *above* the MAP point estimate
+    // (toward the prior), the bug puts it below (toward the MLE). Measured
+    // `mid - est` is +0.0093 vs -0.0150, so the sign alone separates them.
+    assert!(
+        mid > est,
+        "the SIR distribution must sit toward the prior, not the MLE: \
+         mid {mid}, est {est}, CI {ci:?}"
+    );
+}
+
+// ── NONMEM anchor for the prior penalty ─────────────────────────────────────
+
+/// The prior's contribution to the objective, anchored against **NONMEM
+/// `$PRIOR NWPRI`**.
+///
+/// # Why this is an anchor and not a story
+///
+/// ferx and NONMEM do not agree on a prior objective by construction — they
+/// disagree about the parameterisation (`CL` vs `log CL`), about which
+/// normalisation constants the objective carries, and about the optimizer path.
+/// The design removes all three:
+///
+/// 1. **Same coordinate.** The model is written on the log scale on both sides
+///    (`CL = EXP(THETA(1) + ETA(1))`), and the ferx θ is declared with a
+///    *negative* lower bound so ferx packs it as the identity. Both engines
+///    therefore put a normal prior on the same number, with the same mean and
+///    the same SD — nothing depends on ferx's packing conventions.
+/// 2. **Same point.** Both run `MAXEVAL=0` / `maxiter = 0`. The quantity under
+///    test is the objective, not a minimizer's path to it, so pinning the point
+///    removes any chance the two engines' optimizers land somewhere different
+///    and confound the comparison.
+/// 3. **A measured null control first.** `prior_theta_null.ctl` and
+///    `prior_theta_null.ferx` are the same model with **no** prior. They agree
+///    (NONMEM 177.82632978040530, ferx 177.826330), which is what makes the
+///    priored comparison meaningful: without it, an agreeing prior term could be
+///    hiding two compensating disagreements.
+///
+/// A third NONMEM run, `prior_theta_nwpri_centered.ctl`, puts the prior mean
+/// *exactly on* `THETA(1)` and reproduces the null objective to printed
+/// precision — so NWPRI, like ferx, drops the prior's normalisation constant.
+/// That is why the absolute values below can be compared directly, rather than
+/// only as a difference.
+///
+/// # Measured
+///
+/// | | NONMEM 7.5.1 | ferx |
+/// |---|---|---|
+/// | null (no prior) | 177.82632978040530 | 177.826330 |
+/// | prior centred on θ | 177.826 (== null) | — |
+/// | prior offset from θ | 177.94393305151641 | 177.943933 |
+/// | **prior contribution** | **0.11760327111** | **0.117603** |
+///
+/// Worst realised disagreement **5.2e-8** on the priored objective and 2.2e-7 on
+/// the null — both at the limit of the six decimals ferx's fit YAML prints, not
+/// a real gap. The closed form is `((-2.0 + 1.89712) / 0.30)² = 0.117603266`,
+/// which both engines reproduce, so this pins ferx against NONMEM *and* against
+/// arithmetic. Bound set at 1e-6: two orders above the realised error, and far
+/// below the 1e-3 that would let the ½-scale or a dropped constant through.
+#[test]
+fn the_prior_penalty_matches_nonmem_nwpri() {
+    let pop = warfarin_population();
+    let mut opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        ..FitOptions::default()
+    };
+    opts.outer_maxiter = 0;
+    opts.run_covariance_step = false;
+
+    // NONMEM 7.5.1, `nonmem_anchor/prior_theta_null.ctl` (MAXEVAL=0).
+    const NM_NULL: f64 = 177.826_329_780_405_3;
+    // NONMEM 7.5.1, `nonmem_anchor/prior_theta_nwpri.ctl` (MAXEVAL=0).
+    const NM_PRIORED: f64 = 177.943_933_051_516_41;
+
+    let null = parse_model_string(
+        &std::fs::read_to_string("nonmem_anchor/prior_theta_null.ferx").expect("null model"),
+    )
+    .expect("null model parses");
+    let priored = parse_model_string(
+        &std::fs::read_to_string("nonmem_anchor/prior_theta_nwpri.ferx").expect("priored model"),
+    )
+    .expect("priored model parses");
+
+    let r_null = fit_model(&null, &pop, &opts).expect("null run");
+    let r_prior = fit_model(&priored, &pop, &opts).expect("priored run");
+
+    // The null control. If this fails the priored comparison below means nothing,
+    // so it is asserted first and separately.
+    assert!(
+        (r_null.ofv - NM_NULL).abs() < 1e-6,
+        "null control disagrees with NONMEM: ferx {} vs NONMEM {NM_NULL}",
+        r_null.ofv
+    );
+    assert_eq!(r_null.ofv_prior, 0.0, "the null run must carry no prior");
+
+    // The priored objective, absolutely — valid because the centered NONMEM run
+    // showed NWPRI drops the same constant ferx does.
+    assert!(
+        (r_prior.ofv - NM_PRIORED).abs() < 1e-6,
+        "priored objective disagrees with NONMEM: ferx {} vs NONMEM {NM_PRIORED}",
+        r_prior.ofv
+    );
+
+    // And the prior's own contribution, as a difference — the form that would
+    // still hold if either engine changed its constants.
+    let nm_delta = NM_PRIORED - NM_NULL;
+    assert!(
+        (r_prior.ofv_prior - nm_delta).abs() < 1e-6,
+        "prior contribution disagrees with NONMEM: ferx {} vs NONMEM {nm_delta}",
+        r_prior.ofv_prior
+    );
+
+    // The data half must be untouched by the prior: same model, same point.
+    assert!(
+        (r_prior.ofv_data - r_null.ofv).abs() < 1e-9,
+        "the prior moved the data likelihood: {} vs {}",
+        r_prior.ofv_data,
+        r_null.ofv
+    );
+
+    // Non-degeneracy: the prior term has to be doing something, or every
+    // assertion above is satisfied by an engine that ignores priors entirely.
+    assert!(
+        r_prior.ofv_prior > 0.1,
+        "the anchor fixture must exercise a non-zero penalty, got {}",
+        r_prior.ofv_prior
+    );
+}
