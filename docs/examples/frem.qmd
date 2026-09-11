@@ -29,9 +29,10 @@ library(ferx)
 
 # Step 1: FREM transformation. Covariates come from the model's [covariates]
 # block, so `covariates` can be omitted to use all of them.
-frem <- ferx_to_frem(
-  model = "warfarin.ferx",
-  data  = "warfarin_cov.csv"
+frem <- ferx_model_to_frem(
+  model      = "warfarin.ferx",
+  data       = "warfarin_cov.csv",
+  output_dir = file.path(tempdir(), "frem")  # default: next to the model file
 )
 # To FREM only a subset, filter with e.g. covariates = "WT".
 
@@ -53,6 +54,7 @@ let frem = prepare_frem(
     &Path::new("warfarin_cov.csv"),
     &[],   // empty filter → all covariates from the [covariates] block
     None, None, None, None,
+    None,  // no prior fit: keep the base model's declared inits
 )?;
 
 let result = fit_from_files(

@@ -56,6 +56,7 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- The FREM docs (`docs/estimation/frem.qmd`, `docs/examples/frem.qmd`) now call the R function by its current name, `ferx_model_to_frem()` (formerly `ferx_to_frem()`), pass `output_dir` so the generated files are not written next to the model, and show `prepare_frem()` with its eighth `fit_init` argument.
 - Fixed the IOV inner loop discarding a converged-in-all-but-name BFGS solution for a far worse Nelder–Mead restart from the cold seed, which made every cold-started evaluation of a `kappa` model (the reported final OFV, `outer_maxiter = 0` re-evaluations, `.fitrx` reloads) score some subjects thousands of −2LL units above the value the optimizer had minimised — 9 300 on a `[covariate_nn]` + IOV busulfan fit (#1327).
 - Fixed ODE-accumulated survival hazards that read `TAD`, which could reject valid multi-dose subjects with a misleading finite objective (#1261).
 - `floor(x)`, `ceil(x)` and `round(x)` now differentiate to `0` rather than to `x`'s own derivative. An `[individual_parameters]` or `[odes]` expression that rounds — a dose-band lookup, an occasion index derived from `TIME` — was feeding a wrong analytic gradient to the estimator while its value path was correct (#1332).
