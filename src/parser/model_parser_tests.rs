@@ -10217,14 +10217,13 @@ fn test_unknown_key_precedes_missing_required() {
 
 #[test]
 fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
-    // Regression for the ODE-with-lagtime path. For ODE models there is
-    // no [structural_model] pk= line, so pk_param_map is empty and
-    // pk_param_fn's ODE branch writes individual parameters by
-    // declaration order. LAGTIME (and ALAG) must also land at the
-    // canonical PK_IDX_LAGTIME slot so `ode_predictions` (which reads
-    // `pk_params_flat[PK_IDX_LAGTIME]`) sees it. `has_lagtime()` must
-    // likewise return true via the indiv_param_names fallback so the
-    // SS/negative-lagtime warning gating fires for ODE users.
+    // Regression for the ODE-with-lagtime path. ODE models have no
+    // [structural_model] pk= line, so pk_param_map is empty and `pk_indices`
+    // is `ode_param_slots`' name→slot map. LAGTIME (and ALAG) is a canonical
+    // name, so it lands at PK_IDX_LAGTIME, where `ode_predictions` (which
+    // reads `pk_params_flat[PK_IDX_LAGTIME]`) sees it, and `has_lagtime()`
+    // must return true so the SS/negative-lagtime warning gating fires for
+    // ODE users.
     let model_str = "
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
@@ -12875,14 +12874,14 @@ fn test_parse_scaling_y_form_c_on_ode() {
         ),
     };
 
-    // ODE writes indiv params sequentially into pk_params_flat[0..n] in
-    // declaration order: [CL, V, KA] -> pk[0..3]. State order: [depot,
-    // central] -> state[0..2]. So y = central / V = state[1] / pk[1].
+    // ODE params are slotted by name (`ode_param_slots`): [CL, V, KA] ->
+    // pk[0], pk[1], pk[4]. State order: [depot, central] -> state[0..2].
+    // So y = central / V = state[1] / pk[1].
     let state = vec![0.0, 100.0]; // depot=0, central=100
     let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
     pk[0] = 1.0; // CL
     pk[1] = 50.0; // V
-    pk[2] = 1.0; // KA
+    pk[4] = 1.0; // KA
     let cov = HashMap::new();
     let y = out_fn(&state, &pk, &[], &[], &cov);
     assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);

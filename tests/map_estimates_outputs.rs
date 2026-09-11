@@ -45,8 +45,10 @@ fn indiv_param_names_mirrors_warfarin_individual_parameters_block() {
         vec!["CL".to_string(), "V".to_string(), "KA".to_string()],
         "indiv_param_names must match the [individual_parameters] block in source order"
     );
-    // Parallel to pk_indices (used by the FFI to read each value out of
-    // the PkParams slot for analytical models).
+    // Parallel to pk_indices on both engines: a consumer such as the R FFI must
+    // read each value from `PkParams.values[pk_indices[i]]`, never slot `i`
+    // (analytical names not bound on [structural_model] carry a placeholder 0;
+    // see #1356).
     assert_eq!(
         model.indiv_param_names.len(),
         model.pk_indices.len(),
