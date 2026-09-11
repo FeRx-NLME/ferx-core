@@ -464,7 +464,10 @@ fn all_invalid_weights_message(
 /// * `params` - ML parameter estimates
 /// * `eta_hats` - ML EBE estimates (for warm-starting inner loop)
 /// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space
-/// * `ofv_hat` - OFV at ML estimates
+/// * `ofv_hat` - the **data** OFV (−2 log L) at the estimates, i.e. what every
+///   optimizer reports as `OuterResult::ofv`. Under parameter priors (#254) the
+///   penalty is added internally, to this baseline and to every draw alike, so
+///   callers pass the clean value and cannot get the two halves out of step.
 /// * `options` - Fit options containing SIR settings
 pub fn run_sir_core(
     model: &CompiledModel,
@@ -518,6 +521,21 @@ fn run_sir_core_scoped(
         fixed: fixed_mask,
     } = pack_with_bounds(params);
     let n_packed = x_hat.len();
+
+    // Parameter priors (#254). SIR approximates the posterior the fit targeted,
+    // so under a prior the target is `L(data) · p(θ)` and the importance weight
+    // must score both halves. Without this the proposal is centred on the MAP
+    // estimate and shaped by the *penalized* curvature, while the weights score
+    // the *unpenalized* likelihood — so the resampling actively pulls the
+    // intervals back toward the MLE and a tight prior vanishes from the reported
+    // CIs, which is worse than not supporting SIR at all.
+    //
+    // `ofv_hat` arrives as the data −2 log L (what every caller has to hand), so
+    // the penalty is added here on **both** sides rather than being the caller's
+    // job — one derivation, so the baseline and the samples cannot disagree
+    // about whether the prior is in.
+    let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
+    let ofv_hat = ofv_hat + priors.penalty(&x_hat);
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
         return Err(format!(
@@ -694,7 +712,10 @@ fn run_sir_core_scoped(
             // Compute OFV — through the method-aware seam, so an AGQ fit's SIR weights come
             // from the AGQ marginal it was actually optimised against, not the FOCE one.
             let nll_k = pop_nll_opts(model, population, &params_k, &ehs, &hms, &_kappas, options);
-            let ofv_k = 2.0 * nll_k;
+            // The prior half, at this draw. `x_k` is already the packed vector
+            // the penalty is defined on. A no-op (`+ 0.0`) for an unpriored fit,
+            // so those weights stay bit-identical.
+            let ofv_k = 2.0 * nll_k + priors.penalty(x_k);
             if !ofv_k.is_finite() {
                 return (f64::NEG_INFINITY, SampleOutcome::NonFiniteOfv);
             }

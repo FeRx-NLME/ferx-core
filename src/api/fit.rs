@@ -1125,6 +1125,14 @@ fn fit_inner(
     // clamped. Placed here — before every population-dependent check — because
     // the predicate needs no data and fails identically for every method.
     first_error(&check_variance_init_rails(init_params, options))?;
+    // #254: refuse a prior that cannot be applied, before any optimizer runs.
+    // See `check_parameter_priors` for why an unapplied prior is an error and
+    // not a warning.
+    first_error(&crate::api::validation::check_parameter_priors(
+        model,
+        init_params,
+        options,
+    ))?;
 
     // An initial estimate that packs strictly outside its own box and is
     // silently clamped there (#1251). Computed **once**, into a local: it
@@ -2003,8 +2011,28 @@ fn fit_inner(
     let n_obs = population.n_obs();
     let n_params = n_params_pre;
 
-    let ofv = result.ofv;
-    let aic = ofv + 2.0 * n_params as f64;
+    // Parameter priors (#254). `result.ofv` is the clean −2LL that every
+    // optimizer reports (the penalty is excluded from it by construction), so
+    // the prior half is recomputed here at the final estimate and the two are
+    // published separately.
+    //
+    // `ofv` becomes the **penalized total** — the objective that was actually
+    // minimised, and the quantity NONMEM's `$PRIOR` also reports — so a
+    // converged minimum, a ΔOFV between two priored models, and the printed
+    // "Final OFV" all mean the same thing. `ofv_prior` is exactly zero for an
+    // unpriored fit, which is every fit that existed before this feature, so
+    // nothing moves there.
+    //
+    // **AIC and BIC keep using `ofv_data`.** A penalized objective is not a log
+    // likelihood, and an information criterion computed from one is not an
+    // information criterion — it would silently reward a tighter prior.
+    let prior_set = crate::estimation::outer_optimizer::build_prior_set(model, &result.params);
+    let packed_final = crate::estimation::parameterization::pack_params(&result.params);
+    let ofv_prior = prior_set.penalty(&packed_final);
+    let prior_summary = prior_set.summarize(&packed_final);
+    let ofv_data = result.ofv;
+    let ofv = ofv_data + ofv_prior;
+    let aic = ofv_data + 2.0 * n_params as f64;
     // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
     // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
     #[cfg(feature = "survival")]
@@ -2017,7 +2045,7 @@ fn fit_inner(
     #[cfg(not(feature = "survival"))]
     let n_for_bic: usize = n_obs;
     let bic = if n_for_bic > 0 {
-        ofv + n_params as f64 * (n_for_bic as f64).ln()
+        ofv_data + n_params as f64 * (n_for_bic as f64).ln()
     } else {
         f64::NAN
     };
@@ -2453,6 +2481,9 @@ fn fit_inner(
         covariance_wall_time_secs,
         converged,
         ofv,
+        ofv_data,
+        ofv_prior,
+        prior_summary,
         aic,
         bic,
         theta: result.params.theta.clone(),

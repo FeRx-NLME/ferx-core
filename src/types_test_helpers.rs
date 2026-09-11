@@ -13,6 +13,7 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
+        priors: Vec::new(),
         covariate_model: None,
         name: "test".into(),
         pk_model: PkModel::OneCptOral,
@@ -142,6 +143,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
         covariate_model: None,
         name: "tv_cov_iv".into(),
         pk_model: PkModel::OneCptIv,
@@ -251,6 +253,9 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
 /// ```
 pub(crate) fn empty_fit_result() -> FitResult {
     FitResult {
+        ofv_data: 0.0,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         covariate_relations: Vec::new(),
         restored_from_checkpoint: false,
         method: EstimationMethod::FoceI,
@@ -380,6 +385,9 @@ pub(crate) fn empty_fit_result() -> FitResult {
 pub(crate) fn minimal_fit_result() -> FitResult {
     let n_eta = 2;
     FitResult {
+        ofv_data: 0.0,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         residual_correlation_fixed: Vec::new(),
         se_residual_correlations: None,
         covariate_relations: Vec::new(),

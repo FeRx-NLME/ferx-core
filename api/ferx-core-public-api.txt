@@ -2390,6 +2390,9 @@ pub ferx_core::types::Prediction::Continuous
 pub ferx_core::types::Prediction::Continuous::pred: f64
 impl ferx_core::Prediction
 pub fn ferx_core::Prediction::prob(&self, k: usize) -> core::option::Option<f64>
+pub enum ferx_core::types::PriorSpread
+pub ferx_core::types::PriorSpread::Rse(f64)
+pub ferx_core::types::PriorSpread::Sd(f64)
 pub enum ferx_core::types::RateMode
 pub ferx_core::types::RateMode::Fixed
 pub ferx_core::types::RateMode::ModeledDuration
@@ -2570,6 +2573,7 @@ pub ferx_core::types::CompiledModel::pk_idx_f64: alloc::vec::Vec<f64>
 pub ferx_core::types::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::types::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::types::CompiledModel::pk_param_fn: ferx_core::PkParamFn
+pub ferx_core::types::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::types::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::CompiledModel::residual_error_eta: core::option::Option<usize>
@@ -2973,6 +2977,8 @@ pub ferx_core::types::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc
 pub ferx_core::types::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::obs_time_range: core::option::Option<(f64, f64)>
 pub ferx_core::types::FitResult::ofv: f64
+pub ferx_core::types::FitResult::ofv_data: f64
+pub ferx_core::types::FitResult::ofv_prior: f64
 pub ferx_core::types::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::types::FitResult::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::omega_init: nalgebra::base::alias::DMatrix<f64>
@@ -2985,6 +2991,7 @@ pub ferx_core::types::FitResult::optimizer: alloc::string::String
 pub ferx_core::types::FitResult::outer_gtol: f64
 pub ferx_core::types::FitResult::outer_maxiter: usize
 pub ferx_core::types::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::prior_summary: alloc::vec::Vec<ferx_core::PriorSummary>
 pub ferx_core::types::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::FitResult::restored_from_checkpoint: bool
@@ -3132,6 +3139,10 @@ pub fn ferx_core::OmegaMatrix::from_chol_factor(l: nalgebra::base::alias::DMatri
 pub fn ferx_core::OmegaMatrix::from_diagonal(variances: &[f64], names: alloc::vec::Vec<alloc::string::String>) -> Self
 pub fn ferx_core::OmegaMatrix::from_matrix(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool) -> Self
 pub fn ferx_core::OmegaMatrix::from_matrix_with_mask(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool, free_mask: nalgebra::base::alias::DMatrix<bool>) -> Self
+pub struct ferx_core::types::ParameterPrior
+pub ferx_core::types::ParameterPrior::name: alloc::string::String
+pub ferx_core::types::ParameterPrior::spread: ferx_core::PriorSpread
+pub ferx_core::types::ParameterPrior::value: f64
 pub struct ferx_core::types::ParsedModel
 pub ferx_core::types::ParsedModel::adaptive_dosing: core::option::Option<ferx_core::sim::adaptive::AdaptiveDosingSpec>
 pub ferx_core::types::ParsedModel::bindings: ferx_core::parser::model_parser::ParseBindings
@@ -3183,6 +3194,15 @@ pub ferx_core::types::PosteriorSummary::q025: f64
 pub ferx_core::types::PosteriorSummary::q975: f64
 pub ferx_core::types::PosteriorSummary::rhat: f64
 pub ferx_core::types::PosteriorSummary::sd: f64
+pub struct ferx_core::types::PriorSummary
+pub ferx_core::types::PriorSummary::estimate: f64
+pub ferx_core::types::PriorSummary::family: alloc::string::String
+pub ferx_core::types::PriorSummary::name: alloc::string::String
+pub ferx_core::types::PriorSummary::penalty: f64
+pub ferx_core::types::PriorSummary::prior_lower_95: f64
+pub ferx_core::types::PriorSummary::prior_upper_95: f64
+pub ferx_core::types::PriorSummary::prior_value: f64
+pub ferx_core::types::PriorSummary::shift_in_prior_sds: f64
 pub struct ferx_core::types::ResidualCorrelation
 pub ferx_core::types::ResidualCorrelation::rho: f64
 pub ferx_core::types::ResidualCorrelation::sigma_i: usize
@@ -3650,6 +3670,9 @@ pub ferx_core::Prediction::Continuous
 pub ferx_core::Prediction::Continuous::pred: f64
 impl ferx_core::Prediction
 pub fn ferx_core::Prediction::prob(&self, k: usize) -> core::option::Option<f64>
+pub enum ferx_core::PriorSpread
+pub ferx_core::PriorSpread::Rse(f64)
+pub ferx_core::PriorSpread::Sd(f64)
 pub enum ferx_core::RateMode
 pub ferx_core::RateMode::Fixed
 pub ferx_core::RateMode::ModeledDuration
@@ -3900,6 +3923,7 @@ pub ferx_core::CompiledModel::pk_idx_f64: alloc::vec::Vec<f64>
 pub ferx_core::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::CompiledModel::pk_param_fn: ferx_core::PkParamFn
+pub ferx_core::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::CompiledModel::residual_error_eta: core::option::Option<usize>
@@ -4356,6 +4380,8 @@ pub ferx_core::FitResult::nlopt_missing_algorithms: alloc::vec::Vec<alloc::strin
 pub ferx_core::FitResult::npde_seed: core::option::Option<u64>
 pub ferx_core::FitResult::obs_time_range: core::option::Option<(f64, f64)>
 pub ferx_core::FitResult::ofv: f64
+pub ferx_core::FitResult::ofv_data: f64
+pub ferx_core::FitResult::ofv_prior: f64
 pub ferx_core::FitResult::omega: nalgebra::base::alias::DMatrix<f64>
 pub ferx_core::FitResult::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::omega_init: nalgebra::base::alias::DMatrix<f64>
@@ -4368,6 +4394,7 @@ pub ferx_core::FitResult::optimizer: alloc::string::String
 pub ferx_core::FitResult::outer_gtol: f64
 pub ferx_core::FitResult::outer_maxiter: usize
 pub ferx_core::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::prior_summary: alloc::vec::Vec<ferx_core::PriorSummary>
 pub ferx_core::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::FitResult::restored_from_checkpoint: bool
@@ -4543,6 +4570,10 @@ pub fn ferx_core::OmegaMatrix::from_chol_factor(l: nalgebra::base::alias::DMatri
 pub fn ferx_core::OmegaMatrix::from_diagonal(variances: &[f64], names: alloc::vec::Vec<alloc::string::String>) -> Self
 pub fn ferx_core::OmegaMatrix::from_matrix(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool) -> Self
 pub fn ferx_core::OmegaMatrix::from_matrix_with_mask(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool, free_mask: nalgebra::base::alias::DMatrix<bool>) -> Self
+pub struct ferx_core::ParameterPrior
+pub ferx_core::ParameterPrior::name: alloc::string::String
+pub ferx_core::ParameterPrior::spread: ferx_core::PriorSpread
+pub ferx_core::ParameterPrior::value: f64
 pub struct ferx_core::ParsedModel
 pub ferx_core::ParsedModel::adaptive_dosing: core::option::Option<ferx_core::sim::adaptive::AdaptiveDosingSpec>
 pub ferx_core::ParsedModel::bindings: ferx_core::parser::model_parser::ParseBindings
@@ -4619,6 +4650,15 @@ pub ferx_core::PreparedRun::init_params: ferx_core::ModelParameters
 pub ferx_core::PreparedRun::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::PreparedRun::parsed: ferx_core::ParsedModel
 pub ferx_core::PreparedRun::population: ferx_core::Population
+pub struct ferx_core::PriorSummary
+pub ferx_core::PriorSummary::estimate: f64
+pub ferx_core::PriorSummary::family: alloc::string::String
+pub ferx_core::PriorSummary::name: alloc::string::String
+pub ferx_core::PriorSummary::penalty: f64
+pub ferx_core::PriorSummary::prior_lower_95: f64
+pub ferx_core::PriorSummary::prior_upper_95: f64
+pub ferx_core::PriorSummary::prior_value: f64
+pub ferx_core::PriorSummary::shift_in_prior_sds: f64
 pub struct ferx_core::ResidualCorrelation
 pub ferx_core::ResidualCorrelation::rho: f64
 pub ferx_core::ResidualCorrelation::sigma_i: usize

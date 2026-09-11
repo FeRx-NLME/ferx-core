@@ -102,6 +102,7 @@ website:
           - estimation/categorical.qmd
           - estimation/ctmm.qmd
           - estimation/mixture.qmd
+          - estimation/priors.qmd
       - text: "Tools"
         href: tools/index.qmd
         contents:

@@ -2536,6 +2536,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             name: "test".into(),
             pk_model: PkModel::OneCptIv,

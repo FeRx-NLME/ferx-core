@@ -861,3 +861,75 @@ where the train says `0.962` and `1.200` — every record after `t = 48` short b
 Mutation-verified: with `restore_chz` writing `0.0` the arm fails at **99.8% relative
 disagreement** on `H`.
 The shape was right; only the origin was wrong.
+
+---
+
+## Parameter priors vs `$PRIOR NWPRI` (#254)
+
+`prior_theta_null.{ctl,ferx}` · `prior_theta_nwpri.{ctl,ferx}` ·
+`prior_theta_nwpri_centered.ctl` · test `the_prior_penalty_matches_nonmem_nwpri`
+(`tests/parameter_priors.rs`)
+
+Anchors the penalty ferx adds for an inline `prior(...)` against NONMEM's
+`$PRIOR NWPRI`, on the warfarin dataset.
+
+### The construction
+
+The two engines do not agree on a priored objective by construction — they
+disagree about parameterisation, about which normalisation constants the
+objective carries, and about the optimizer path. Three choices remove all three:
+
+- **Same coordinate.** Both sides write the model on the log scale
+  (`CL = EXP(THETA(1) + ETA(1))`), and the ferx θ is declared with a *negative*
+  lower bound so ferx packs it as the identity. Both engines then put a normal
+  prior on the same number with the same mean and SD, and nothing rests on ferx's
+  packing conventions.
+- **Same point.** `MAXEVAL=0` / `maxiter = 0`. The quantity under test is the
+  objective, not a minimizer's path to it.
+- **A null control, run first.** Same model, no prior, both engines. If that
+  disagreed, an agreeing prior term would only mean two compensating errors.
+
+A third NONMEM run puts the prior mean *exactly on* `THETA(1)`. It reproduces the
+null objective, which establishes that NWPRI — like ferx — omits the prior's
+normalisation constant. That is what lets the absolute values be compared rather
+than only their difference.
+
+### Measured
+
+| | NONMEM 7.5.1 | ferx |
+|---|---|---|
+| null (no prior) | 177.82632978040530 | 177.826330 |
+| prior centred on θ | 177.826 (== null) | — |
+| prior offset from θ | 177.94393305151641 | 177.943933 |
+| **prior contribution** | **0.11760327111** | **0.117603** |
+
+Worst realised disagreement **5.2e-8** (priored objective) and 2.2e-7 (null) —
+both at the limit of the six decimals ferx's fit YAML prints, not a real gap. The
+closed form is `((-2.0 + 1.89712) / 0.30)² = 0.117603266`, which both engines
+reproduce, so the arm pins ferx against NONMEM *and* against arithmetic. The test
+bound is 1e-6: two orders above the realised error, and far below the 1e-3 that
+would let a dropped constant or a factor-of-two scale error through.
+
+### Two NWPRI traps worth recording
+
+- `NTHETA` / `NETA` must match the **estimation problem's** counts, not the
+  number of parameters you actually want to prior. `NTHETA=1` on a three-θ model
+  fails with `NOT ENOUGH INITIAL THETAS DEFINED FOR COMPUTATIONS: CHECK PRIORS`.
+  The two θ not under test are given prior means equal to their own values (zero
+  quadratic contribution) and a flat variance, so they cancel between the paired
+  runs.
+- `$THETAPV` must use the `BLOCK(n) FIX` form. Per-element `FIX` is rejected with
+  `INPUTS SPECIFIED TO ROUTINE NWPRI ARE INAPPROPRIATE`, a message that names
+  neither the offending record nor the reason.
+
+### What this arm does *not* cover
+
+The Ω prior. ferx puts a lognormal prior on the **variance** (a normal on
+`½·ln(variance)`, its packed coordinate); NWPRI's Ω prior is an inverse-Wishart.
+They are genuinely different priors, so there is no NONMEM run to difference
+against — the Ω scale is pinned instead by the Tier-1 closed forms in
+`src/estimation/priors_tests.rs`, including the variance-vs-`(sd)` differential
+pair whose penalties must differ by exactly 4×. Anchoring Ω would need the
+`$OMEGA 1 FIX` + `EXP(THETA(k))·ETA(1)` reparameterisation, which rests on FOCE's
+marginal being invariant under a linear rescaling of η; that is a separate null
+control and is not yet run.
