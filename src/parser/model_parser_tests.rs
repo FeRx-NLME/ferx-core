@@ -10217,14 +10217,13 @@ fn test_unknown_key_precedes_missing_required() {
 
 #[test]
 fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
-    // Regression for the ODE-with-lagtime path. For ODE models there is
-    // no [structural_model] pk= line, so pk_param_map is empty and
-    // pk_param_fn's ODE branch writes individual parameters by
-    // declaration order. LAGTIME (and ALAG) must also land at the
-    // canonical PK_IDX_LAGTIME slot so `ode_predictions` (which reads
-    // `pk_params_flat[PK_IDX_LAGTIME]`) sees it. `has_lagtime()` must
-    // likewise return true via the indiv_param_names fallback so the
-    // SS/negative-lagtime warning gating fires for ODE users.
+    // Regression for the ODE-with-lagtime path. ODE models have no
+    // [structural_model] pk= line, so pk_param_map is empty and `pk_indices`
+    // is `ode_param_slots`' name→slot map. LAGTIME (and ALAG) is a canonical
+    // name, so it lands at PK_IDX_LAGTIME, where `ode_predictions` (which
+    // reads `pk_params_flat[PK_IDX_LAGTIME]`) sees it, and `has_lagtime()`
+    // must return true so the SS/negative-lagtime warning gating fires for
+    // ODE users.
     let model_str = "
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
@@ -10248,8 +10247,16 @@ fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
   DV ~ proportional(EPS)
 ";
     let parsed = super::parse_full_model(model_str).unwrap();
-    // ODE models must report has_lagtime() via the indiv_param_names
-    // fallback even when pk_indices doesn't contain PK_IDX_LAGTIME.
+    // A bare LAGTIME is a canonical name, so `ode_param_slots` routes it to
+    // PK_IDX_LAGTIME and `pk_indices` carries the slot on the ODE layout too.
+    assert!(
+        parsed
+            .model
+            .pk_indices
+            .contains(&crate::types::PK_IDX_LAGTIME),
+        "pk_indices must carry PK_IDX_LAGTIME on the ODE layout: {:?}",
+        parsed.model.pk_indices
+    );
     assert!(
         parsed.model.has_lagtime(),
         "has_lagtime() must return true for an ODE model declaring LAGTIME"
@@ -10452,6 +10459,73 @@ fn turnover_ode_model(init_lines: &str) -> String {
 }
 
 #[test]
+fn test_ode_pk_indices_are_name_slotted_not_positional() {
+    // Pins the contract documented on `CompiledModel::indiv_param_names`: on the
+    // ODE layout `pk_indices` is `ode_param_slots`' name→slot map, so canonical
+    // names declared out of PK-slot order (V, KA, LAGTIME) and a non-canonical
+    // one (KE) are read through `pk_indices`, never slot `i`. Every value is
+    // distinct and no name sits at its own position, so a positional read
+    // cannot pass by coincidence (#1355).
+    let model_str = "
+[parameters]
+  theta TVV(20.0, 0.1, 1000.0)
+  theta TVKA(1.5)
+  theta TVKE(0.2)
+  theta TVLAG(0.7)
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  V       = TVV * exp(ETA_V)
+  KA      = TVKA
+  KE      = TVKE
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - KE * central
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = super::parse_full_model(model_str).unwrap();
+    let m = &parsed.model;
+    assert_eq!(m.indiv_param_names, vec!["V", "KA", "KE", "LAGTIME"]);
+    assert_eq!(
+        m.pk_indices,
+        vec![
+            crate::types::PK_IDX_V,
+            crate::types::PK_IDX_KA,
+            0,
+            crate::types::PK_IDX_LAGTIME
+        ],
+        "V/KA/LAGTIME take their canonical slots; KE takes the lowest free slot"
+    );
+    let eta = vec![0.0; m.n_eta];
+    let pk = (m.pk_param_fn)(
+        &m.default_params.theta,
+        &eta,
+        &std::collections::HashMap::new(),
+        0.0,
+    );
+    let expected = [20.0, 1.5, 0.2, 0.7];
+    for (i, &want) in expected.iter().enumerate() {
+        let name = &m.indiv_param_names[i];
+        assert_eq!(
+            pk.values[m.pk_indices[i]], want,
+            "{name} read through pk_indices"
+        );
+        assert_ne!(
+            pk.values[i], want,
+            "{name} must not be readable at its positional slot {i}"
+        );
+    }
+}
+
+#[test]
 fn test_init_directive_builds_init_fn() {
     let src = turnover_ode_model("  init(response) = KIN / KOUT");
     let parsed = parse_full_model(&src).unwrap();
@@ -10459,8 +10533,8 @@ fn test_init_directive_builds_init_fn() {
     assert!(ode.init_fn.is_some(), "init_fn should be populated");
 
     // Evaluate at typical values (eta = 0): KIN = 10, KOUT = 2 → 5.0.
-    // For an ODE model, individual params occupy PkParams slots in
-    // declaration order: KIN @ 0, KOUT @ 1.
+    // For an ODE model `ode_param_slots` gives non-canonical names the lowest
+    // free slots, so here KIN @ 0, KOUT @ 1.
     let mut params = [0.0; crate::types::MAX_PK_PARAMS];
     params[0] = 10.0;
     params[1] = 2.0;
@@ -12875,14 +12949,14 @@ fn test_parse_scaling_y_form_c_on_ode() {
         ),
     };
 
-    // ODE writes indiv params sequentially into pk_params_flat[0..n] in
-    // declaration order: [CL, V, KA] -> pk[0..3]. State order: [depot,
-    // central] -> state[0..2]. So y = central / V = state[1] / pk[1].
+    // ODE params are slotted by name (`ode_param_slots`): [CL, V, KA] ->
+    // pk[0], pk[1], pk[4]. State order: [depot, central] -> state[0..2].
+    // So y = central / V = state[1] / pk[1].
     let state = vec![0.0, 100.0]; // depot=0, central=100
     let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
     pk[0] = 1.0; // CL
     pk[1] = 50.0; // V
-    pk[2] = 1.0; // KA
+    pk[4] = 1.0; // KA
     let cov = HashMap::new();
     let y = out_fn(&state, &pk, &[], &[], &cov);
     assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);

@@ -360,7 +360,7 @@ fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
 /// downstream block consumes them (issue #357) — promoting *every* such name
 /// would slot throwaway intermediates into the PK array (silently hijacking the
 /// reserved F/lagtime slots, aliasing the CL slot in `pk_indices`, or
-/// exhausting the 16-slot layout). See `parse_full_model`.
+/// exhausting the `MAX_PK_PARAMS`-slot layout). See `parse_full_model`.
 ///
 /// Motivating case: a PK parameter written only inside symmetric `if`/`else`
 /// branches (the natural NONMEM-style `IF (cond) CL = ...` / `IF (!cond) CL =
@@ -1738,7 +1738,7 @@ pub fn parse_full_model_with(
     // Promoting *every* all-branch name (the naive fix) would slot throwaway
     // intermediates into the PK array — silently hijacking the reserved
     // F/lagtime slots, aliasing the CL slot in pk_indices, or exhausting the
-    // 16-slot layout. So a branch-only helper used purely to compute another
+    // MAX_PK_PARAMS-slot layout. So a branch-only helper used purely to compute another
     // param stays branch-local. The ParseCtx still receives the full set (via
     // assigned_vars_in_order) so such helpers parse as Variable, not Covariate.
     let indiv_text = indiv_lines.join("\n");
@@ -10700,12 +10700,13 @@ fn collect_indiv_param_reads(
 /// (#993). Unlike its `EveryDose` siblings these are inert until a dose codes
 /// `RATE=-2`/`-1`, so nothing is rejected here — see [`DoseAttrConsumption`].
 ///
-/// `slot_map` is parallel to `indiv_var_names` by position but only as a **prefix**:
-/// the `__ferx_pktime_` desugaring appends names after the slot map was built. `get(i)`
-/// is therefore the correct lookup (and matches [`check_dose_attr_double_use`]) — a
-/// real dose attribute is always a user name, hence inside the prefix, while the
-/// synthetic tail is never one. Empty for analytical models, whose indexed
-/// `D{n}`/`R{n}` are recognised by name alone.
+/// `slot_map` is `ode_slot_map`. It is empty for analytical models, whose indexed
+/// `D{n}`/`R{n}` are recognised by name alone, and full-length on the ODE layout:
+/// every name there, readout synthetics included, is already in `indiv_var_names`
+/// when `ode_param_slots` runs, and the `__ferx_pktime_` desugaring that appends names
+/// later only fires for an analytical `pk(...)` mapping. `get(i)` remains the lookup
+/// (and matches [`check_dose_attr_double_use`]); a real dose attribute is always a
+/// user name, never a synthetic one.
 fn record_coded_rate_reads(
     model: &mut CompiledModel,
     indiv_var_names: &[String],
@@ -11986,8 +11987,9 @@ fn build_ode_spec(
         });
 
     // Build the init_fn closure from the extracted `init(state) = expr`
-    // directives. It mirrors the RHS variable binding: individual parameters
-    // by declaration order (PkParams.values slots), plus state names bound to
+    // directives. It mirrors the RHS variable binding: each individual parameter
+    // read from its `indiv_param_slots` slot in `PkParams.values` (name-based, not
+    // declaration position), plus state names bound to
     // 0.0 (no drug present at init time). Returns the full n_states vector so
     // the caller can both seed the integrator and re-seed after a reset.
     let init_fn: Option<Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>> = if init_specs.is_empty() {
@@ -15726,8 +15728,10 @@ fn build_ruv_magnitude(
 /// expressions, or full `if (...) { ... } else { ... }` statements.
 ///
 /// `var_names` is the deduplicated list of all variables ever assigned in the
-/// block (in first-occurrence order). For analytical PK models the assignment
-/// order doubles as the slot ordering for `PkParams.values`.
+/// block (in first-occurrence order); that order is the evaluator's var-slot
+/// order only. The `PkParams.values` slot comes from `pk_param_map` and its
+/// spare-slot extensions (analytical) or from `ode_slot_map` (ODE and
+/// compartment-free), never from this order.
 /// Build the `pk_param_fn` closure used by every fit / simulate / predict
 /// call site. When the `nn` feature is on and the model has any
 /// `[covariate_nn]` blocks, `covariate_nns` carries each mapper plus the
