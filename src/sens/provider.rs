@@ -1710,6 +1710,22 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
         if !nn_output_chain_supported(model) || iov_program_axes(model) > MAX_TVCOV_AXES {
             return false;
         }
+        // The three post-walk steps that seed direct θ/η references on *absolute* axes —
+        // Form C readout, `[initial_conditions]` impulse, `ExpressionScale` quotient —
+        // only run on the identity θ chunk (`run_obs_iov`). A DCM carrying one of them
+        // whose weight block cannot fit the walk alongside even a single occasion's
+        // stacked axes would have every subject decline per-subject while this gate
+        // reported analytic — a gradient optimizer picked for a reconverged-FD gradient,
+        // the route/report drift #637 forbids (PR #1340 review, P2). Decline here
+        // instead; such a DCM keeps the route it had before #1339. A wider-K subject on
+        // a DCM that passes this bound still declines per-subject, reported by the
+        // FD-fallback warning like any other per-subject decline.
+        let absolute_axis_step = model.analytic_readout.is_some()
+            || !model.analytical_init.is_empty()
+            || matches!(model.scaling, ScalingSpec::ExpressionScale { .. });
+        if absolute_axis_step && model.n_theta + n_eff > MAX_TVCOV_AXES {
+            return false;
+        }
     }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {

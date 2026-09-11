@@ -1435,9 +1435,8 @@ fn a_direct_weight_reference_still_matches_central_fd() {
 /// typical value (22 weights), κ on CL and V1, combined error. `n_theta + n_stacked`
 /// (22 + 3 + 2K) exceeds the walk's 24-axis cap for any K ≥ 1, so the outer walk must
 /// chunk its θ columns — which is the point of the fixture.
-fn dcm_two_kappa_model() -> CompiledModel {
-    parse_model_string(
-        r#"
+fn dcm_two_kappa_src() -> &'static str {
+    r#"
 [parameters]
   omega ETA_CL ~ 0.068
   omega ETA_V1 ~ 0.038
@@ -1472,9 +1471,11 @@ fn dcm_two_kappa_model() -> CompiledModel {
 [fit_options]
   method = focei
   iov_column = OCC
-"#,
-    )
-    .expect("2-κ DCM parses")
+"#
+}
+
+fn dcm_two_kappa_model() -> CompiledModel {
+    parse_model_string(dcm_two_kappa_src()).expect("2-κ DCM parses")
 }
 
 /// Three occasions, one 3-hour infusion each, two observations per occasion — the later
@@ -1706,4 +1707,85 @@ fn dcm_iov_model_gets_the_analytic_outer_gradient_and_a_gradient_optimizer() {
     );
     assert!(!iov_analytical_supported(&direct));
     assert!(crate::sens::provider::iov_analytical_eta_supported(&direct));
+}
+
+/// PR #1340 review (P2): the model-level outer gate must not claim a route the walk
+/// declines for every subject.
+///
+/// `run_obs_iov` runs the Form C readout, the `[initial_conditions]` impulse and the
+/// `ExpressionScale` quotient only on the identity θ chunk, because those programs seed
+/// direct θ/η references on absolute axes. A DCM carrying one of them whose weight block
+/// cannot fit the walk alongside even one occasion's stacked axes (22 + 3 + 2 > 24 here)
+/// therefore has every subject decline per-subject — and before the gate below existed,
+/// `iov_analytical_supported` still said analytic, `auto` picked L-BFGS, and every outer
+/// derivative was reconverged FD: the #637 route/report drift, on exactly the model class
+/// this PR exists to make analytic. Pinned as route consistency — gate and walk must agree
+/// on both the plain fixture (analytic, served) and the `init` fixture (declined, `None`)
+/// — so the check cannot be satisfied by a gate that is merely false everywhere.
+#[test]
+fn dcm_iov_gate_and_walk_agree_on_absolute_axis_features() {
+    use crate::sens::provider::{
+        analytic_outer_gradient_available, iov_analytical_supported, subject_sensitivities_iov,
+    };
+    use crate::types::Optimizer;
+
+    let subject = dcm_two_kappa_subject();
+    let stacked_len = |m: &CompiledModel| {
+        m.n_eta + crate::stats::likelihood::iov_occasion_groups(&subject).len() * m.n_kappa
+    };
+
+    // Plain fixture: gate true, walk serves.
+    let plain = dcm_two_kappa_model();
+    let theta = dcm_two_kappa_theta(&plain);
+    assert!(iov_analytical_supported(&plain));
+    assert!(
+        subject_sensitivities_iov(&plain, &subject, &theta, &vec![0.05; stacked_len(&plain)])
+            .is_some(),
+        "gate says analytic, so the walk must serve"
+    );
+
+    // Same network plus an analytic `[initial_conditions]` impulse: the weight block plus one
+    // occasion's `[η, κ]` (22 + 5) already exceeds the 24-axis walk, so the impulse could
+    // only run on a chunk that is not the identity — the walk declines, and the gate must
+    // say so up front rather than advertise a gradient it never computes.
+    let with_init = parse_model_string(&dcm_two_kappa_src().replace(
+        "[error_model]",
+        "[initial_conditions]\n  init(central) = 0.1 * V1\n\n[error_model]",
+    ))
+    .expect("DCM+IOV+init parses");
+    assert!(
+        !with_init.analytical_init.is_empty(),
+        "fixture must carry the init impulse"
+    );
+    assert!(
+        with_init.n_theta + with_init.n_eta + with_init.n_kappa > 24,
+        "fixture must need chunking even for one occasion"
+    );
+    let theta_i = dcm_two_kappa_theta(&with_init);
+    let served = subject_sensitivities_iov(
+        &with_init,
+        &subject,
+        &theta_i,
+        &vec![0.05; stacked_len(&with_init)],
+    )
+    .is_some();
+    assert!(
+        !served,
+        "the chunked walk cannot run the init impulse; it must decline"
+    );
+    assert!(
+        !iov_analytical_supported(&with_init),
+        "gate must agree with the walk: a DCM whose absolute-axis step cannot run on the \
+         identity chunk is outside the analytic outer scope"
+    );
+    assert!(!analytic_outer_gradient_available(&with_init));
+    assert_eq!(
+        Optimizer::Auto.resolve_auto(&with_init, true),
+        Optimizer::Bobyqa,
+        "auto must not pick a gradient optimizer for a model whose outer gradient is FD"
+    );
+    // The inner η-only route needs none of this and still serves the model.
+    assert!(crate::sens::provider::iov_analytical_eta_supported(
+        &with_init
+    ));
 }
