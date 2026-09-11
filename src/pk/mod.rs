@@ -3413,6 +3413,7 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             name: "cl_from_cr".into(),
             pk_model: PkModel::OneCptIv,

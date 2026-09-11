@@ -1,0 +1,212 @@
+---
+pagetitle: "Parameter priors in ferx"
+description-meta: "Stabilize sparse-data fits with per-parameter priors: penalized maximum likelihood (MAP) estimation in the ferx NLME engine, the simple alternative to NONMEM $PRIOR."
+---
+
+# Parameter Priors (penalized ML / MAP)
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+A **prior** pins a parameter near a value you already believe, and lets the data
+move it only as far as the data can pay for. Declare one next to the parameter:
+
+```toml
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)  prior(0.15, rse = 25%)
+  theta TVV(10.0, 0.1, 500.0)   prior(9.8,  rse = 12%)
+  omega ETA_CL ~ 0.09           prior(0.09, rse = 40%)
+```
+
+That is the entire user-facing surface: **a central value and a relative
+uncertainty**, both read off the same row of a published parameter table. There
+is no separate prior problem, no precision or covariance matrix, no
+inverse-Wishart, and no degrees-of-freedom indexing to keep aligned by hand
+(compare [NONMEM `$PRIOR`](#comparison-with-nonmem-prior)).
+
+## When to reach for one
+
+Sparse clinical data — rare disease, pediatrics, TDM-led fits. The likelihood is
+weakly informative, IIV terms collapse onto boundaries, and structural parameters
+drift. A prior taken from a published popPK model stabilizes the fit and lets a
+small local dataset borrow strength from what is already known.
+
+The same mechanism is **model updating**: take a literature model as the prior,
+refit on local sparse data, and get a regularized estimate. That is the
+MAP-Bayesian updating behind much of model-informed precision dosing.
+
+## What a prior does to the objective
+
+The penalty is added to the objective the optimizer minimises:
+
+$$
+\mathrm{OFV}_{\text{total}} \;=\; \mathrm{OFV}_{\text{data}} \;+\; \sum_k \left(\frac{x_k - m_k}{s_k}\right)^2
+$$
+
+where $x_k$ is the parameter on the scale ferx estimates it, $m_k$ is the prior
+centre on that same scale, and $s_k$ comes from the RSE.
+
+Two consequences worth knowing before you read a result:
+
+- **`ofv` is the penalized total.** The fit report splits it into `ofv_data` and
+  `ofv_prior` so you can see how much of the objective the prior is responsible
+  for. Normalisation constants are dropped on both halves (ferx's −2 log L
+  already omits $N\log 2\pi$), so a priored ferx OFV is not absolutely comparable
+  to a priored NONMEM objective — compare a **ΔOFV against a null twin** instead.
+- **AIC and BIC are computed from `ofv_data`.** A penalized objective is not a
+  log-likelihood, and an information criterion built from one would silently
+  reward a tighter prior.
+
+## Which scale the prior lives on
+
+**The prior's central value and its spread are always on the scale the parameter
+was declared on.** If you wrote a variance, the prior is a variance; if you wrote
+`(sd)`, both are standard deviations. Nothing is ever converted by hand.
+
+What the prior *becomes* internally follows from how ferx estimates the
+parameter:
+
+| Declaration | Estimated as | Prior family | From `prior(v, rse = r)` |
+|---|---|---|---|
+| `theta X(init, lower ≥ 0, …)` | $\ln\theta$ | lognormal on $\theta$ | $m=\ln v$, $s=\sqrt{\ln(1+r^2)}$ |
+| `theta X(init, lower < 0, …)` | $\theta$ | normal on $\theta$ | $m=v$, $s=\lvert v\rvert\,r$ |
+| `omega E ~ var` | $\ln(\mathrm{SD})$ | lognormal on the variance | $m=\tfrac12\ln v$, $s=\tfrac12\sqrt{\ln(1+r^2)}$ |
+| `omega E ~ sd (sd)` | $\ln(\mathrm{SD})$ | lognormal on the SD | $m=\ln v$, $s=\sqrt{\ln(1+r^2)}$ |
+| `sigma S ~ var` / `(sd)` | $\ln(\mathrm{SD})$ | as omega | as omega |
+| `kappa K ~ var` / `(sd)` | $\ln(\mathrm{SD})$ | as omega | as omega |
+
+Working on the log-variance scale for $\Omega$ keeps the prior positive and
+symmetric and avoids any matrix algebra.
+
+### The trap: a θ's prior family follows its bounds
+
+A θ declared with a **non-negative** lower bound is estimated as $\ln\theta$, so
+its prior is lognormal. Widen the bound to allow negative values and ferx
+estimates $\theta$ directly, which makes the same `prior(...)` declaration a
+**normal** prior instead. Nothing in the declaration changes; the family does.
+
+This is visible rather than hidden: the fit report prints the realised family and
+the implied 95% prior interval for every priored parameter, so check that column
+rather than inferring the family from the model file.
+
+## Declaring a prior
+
+```
+prior(<value>, rse = <r>%)      # relative uncertainty, as a percent
+prior(<value>, rse = <r>)       # …or as a fraction below 1
+prior(<value>, sd  = <s>)       # absolute SD, on the declared scale
+```
+
+`value =` may be written explicitly (`prior(value = 0.15, rse = 25%)`). Exactly
+one of `rse` / `sd` is required.
+
+**RSE units are validated, not guessed.** `rse = 25%` and `rse = 0.25` both mean
+25%. A bare number greater than 1 is a hard error: `rse = 25` is overwhelmingly a
+percent written without its sign, and reading it as 2500% would produce a prior
+so flat the fit is indistinguishable from an unpriored one — a mistake you would
+never see, because the fit still converges.
+
+Use `sd = ` when a relative uncertainty is meaningless: a θ that can be negative
+(a covariate exponent, a drug-effect slope) whose prior centre sits at or near
+zero. On a log-estimated parameter `sd` is read as the relative spread it implies
+(`sd = 0.03` on a value of `0.15` is `rse = 20%`), so the two spellings never
+disagree.
+
+## Reading the output
+
+```
+--- Objective Function ---
+OFV:  1584.2213
+    data:  1583.9501
+    prior: 0.2712
+AIC:  1595.9501
+BIC:  1612.1530
+
+--- Parameter Priors (penalized ML / MAP) ---
+  PARAMETER               PRIOR     ESTIMATE    SHIFT    PENALTY  PRIOR 95%
+  TVCL                  0.15000      0.13195    -0.52      0.271  [0.0926, 0.2430] (lognormal)
+  SHIFT is (estimate − prior) in prior SDs. Standard errors above are the curvature of
+  the penalized objective — MAP standard errors, not posterior SDs.
+```
+
+`SHIFT` is the column that earns its place. A raw difference only says the
+estimate moved; the standardized one says whether the data and the prior actually
+**disagree** — which is the question a MAP fit is asked. A shift beyond about ±2
+means the data is fighting the prior, and is worth investigating before the
+result is used.
+
+The same values are written to the fit YAML under `objective_function` (as
+`ofv_data` / `ofv_prior`) and `parameter_priors`.
+
+### Standard errors are MAP standard errors
+
+The reported SEs are the curvature of the **penalized** objective, not posterior
+standard deviations. This is deliberate and it is the only defensible choice: a
+sparse fit carries a prior precisely because the data alone does not identify the
+direction, and that is exactly where the unpenalized Hessian goes flat or
+non-positive-definite. Reporting the data-only curvature would give a standard
+error for a quantity the data cannot estimate.
+
+It also means a tighter prior gives a smaller SE, mechanically. Do not read a
+narrow MAP interval as evidence the data was informative — read `SHIFT` and
+`ofv_prior` for that.
+
+## Where it applies
+
+Priors are applied by the **FOCE family**: `foce`, `focei`, `laplace`, `gn`,
+`gn_hybrid`. They enter the objective, the gradient, and the covariance step's
+Hessian.
+
+If the **final** estimation stage of a chain does not apply priors, the fit is
+**refused** rather than run unpenalized. An unapplied prior is invisible in the
+output — the fit converges, the estimates look reasonable, and nothing says the
+prior was dropped — so a silent fallback would be worse than no feature. Chaining
+is fine as long as the last stage qualifies: `method = [saem, focei]` works,
+because the FOCEI stage is the one whose estimates are reported.
+
+## Not supported in v1
+
+Each of these is an **error**, never a silently ignored declaration:
+
+- a prior on a `block_omega` / `block_sigma` / `block_kappa` element — those are
+  estimated as Cholesky entries rather than as variances, and a correlated block
+  needs the inverse-Wishart machinery this feature exists to avoid. Declare the
+  diagonal variances separately to prior them;
+- a prior on a `FIX`ed parameter (it could never move it, so it is a typo);
+- a prior on a θ level block (`theta PLACEBO[STUDY, TIME](…)`) — one declaration
+  standing for many parameters would make one prior mean "the same prior on every
+  level", which is a useful ridge but a different feature;
+- a prior on a per-class `[mixture]` Ω/Σ override.
+
+Also out of scope by design: joint priors across parameters (no precision
+matrices anywhere), and full Bayesian inference — this is MAP / penalized ML, and
+`method = bayes` carries its own priors.
+
+## Comparison with NONMEM `$PRIOR`
+
+NONMEM's `$PRIOR NWPRI` works, and is a known source of friction: a separate
+prior problem, a variance block for the thetas, an inverse-Wishart on $\Omega$
+via a prior matrix plus degrees of freedom, and all the matrix indexing kept
+aligned by hand.
+
+| | NONMEM `$PRIOR NWPRI` | ferx `prior(...)` |
+|---|---|---|
+| Where it is written | a second `$PROBLEM` | inline, next to the parameter |
+| θ prior | `$THETAP` + `$THETAPV` (a variance-covariance matrix) | `prior(value, rse = …)` |
+| Ω prior | inverse-Wishart: `$OMEGAP` + `$OMEGAPD` degrees of freedom | `prior(value, rse = …)` on the declared variance |
+| Correlated priors | supported (full matrices) | not in v1 |
+| Scale conversions | yours | internal |
+
+The θ side is directly equivalent — a normal prior, differing only in whether it
+sits on $\theta$ or $\ln\theta$, which in ferx follows the declared bounds. The
+$\Omega$ side is genuinely a different prior: lognormal on the variance rather
+than inverse-Wishart. For a diagonal $\Omega$ the two are close in practice and
+neither is more "correct"; they differ in tail behaviour and in how a very small
+variance is penalized.
+
+## References
+
+- Gisleskog PO, Karlsson MO, Beal SL. *Use of prior information to stabilize a
+  population data analysis.* J Pharmacokinet Pharmacodyn 29(5):473–505, 2002. The
+  canonical frequentist-prior reference, and exactly the sparse-data clinical use
+  case above.
+- NONMEM 7 guides, `$PRIOR` (`NWPRI`, `TNPRI`).

@@ -1119,6 +1119,7 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             has_conditional_eta_params: false,
             name: "test".into(),

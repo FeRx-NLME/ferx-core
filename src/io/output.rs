@@ -129,6 +129,50 @@ fn block_summary(values: &[f64]) -> (f64, f64, f64) {
     (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
 }
 
+/// Render the per-parameter prior report (#254), or nothing when no prior is in
+/// force.
+///
+/// One writer for both the console (`print_results`) and the file summary, so
+/// the two cannot drift — the numbers a user quotes from a terminal and the ones
+/// in a saved report have to be the same numbers.
+///
+/// The column that earns its place is `shift`: `(x̂ − m)/s` in the space the
+/// prior lives in. A raw difference only says the estimate moved; the
+/// standardized one says whether the data and the prior actually disagree, which
+/// is the question a MAP fit is asked. `family` is printed because it is decided
+/// by the parameter's declared *bounds*, not by the prior declaration — see
+/// [`crate::estimation::priors`].
+fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
+    if result.prior_summary.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n--- Parameter Priors (penalized ML / MAP) ---");
+    let _ = writeln!(
+        out,
+        "  {:<16} {:>12} {:>12} {:>8} {:>10}  {}",
+        "PARAMETER", "PRIOR", "ESTIMATE", "SHIFT", "PENALTY", "PRIOR 95%"
+    );
+    for p in &result.prior_summary {
+        let _ = writeln!(
+            out,
+            "  {:<16} {:>12.5} {:>12.5} {:>8.2} {:>10.3}  [{:.4}, {:.4}] ({})",
+            p.name,
+            p.prior_value,
+            p.estimate,
+            p.shift_in_prior_sds,
+            p.penalty,
+            p.prior_lower_95,
+            p.prior_upper_95,
+            p.family,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  SHIFT is (estimate − prior) in prior SDs. Standard errors above are the \
+         curvature of\n  the penalized objective — MAP standard errors, not posterior SDs."
+    );
+}
+
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
@@ -148,8 +192,19 @@ pub fn print_results(result: &FitResult) {
 
     eprintln!("\n--- Objective Function ---");
     eprintln!("OFV:  {:.4}", result.ofv);
+    if !result.prior_summary.is_empty() {
+        eprintln!("  data:  {:.4}", result.ofv_data);
+        eprintln!("  prior: {:.4}", result.ofv_prior);
+    }
     eprintln!("AIC:  {:.4}", result.aic);
     eprintln!("BIC:  {:.4}", result.bic);
+    {
+        let mut buf = String::new();
+        write_prior_summary(&mut buf, result);
+        if !buf.is_empty() {
+            eprint!("{buf}");
+        }
+    }
 
     eprintln!(
         "\nSubjects: {}  Observations: {}  Parameters: {}",
@@ -691,8 +746,17 @@ pub fn format_summary(result: &FitResult) -> String {
     // --- Objective function ---
     let _ = writeln!(out, "\n--- Objective Function ---");
     let _ = writeln!(out, "  OFV:  {:.4}", result.ofv);
+    // Under parameter priors (#254) the OFV above is the penalized objective
+    // that was minimised, so the split is printed right under it — and AIC/BIC
+    // are labelled with the half they are computed from, since an information
+    // criterion from a penalized objective would not be one.
+    if !result.prior_summary.is_empty() {
+        let _ = writeln!(out, "    data:  {:.4}", result.ofv_data);
+        let _ = writeln!(out, "    prior: {:.4}", result.ofv_prior);
+    }
     let _ = writeln!(out, "  AIC:  {:.4}", result.aic);
     let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
+    write_prior_summary(&mut out, result);
 
     // Failed / SIR-fallback covariance make the SE columns meaningless, so we
     // suppress the derived CV% (mirrors `print_results`).
@@ -1878,8 +1942,39 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
+    // Emitted only under a prior (#254), so an unpriored fit's YAML is
+    // byte-identical to what it was before this feature.
+    if !result.prior_summary.is_empty() {
+        writeln!(f, "  ofv_data: {:.6}", result.ofv_data).map_err(|e| e.to_string())?;
+        writeln!(f, "  ofv_prior: {:.6}", result.ofv_prior).map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # aic/bic are computed from ofv_data: a penalized objective"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(f, "  # is not a log-likelihood.").map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  aic: {:.6}", result.aic).map_err(|e| e.to_string())?;
     writeln!(f, "  bic: {:.6}", result.bic).map_err(|e| e.to_string())?;
+
+    if !result.prior_summary.is_empty() {
+        writeln!(f, "\nparameter_priors:").map_err(|e| e.to_string())?;
+        for p in &result.prior_summary {
+            writeln!(f, "  - name: {}", p.name).map_err(|e| e.to_string())?;
+            writeln!(f, "    prior_value: {:.6}", p.prior_value).map_err(|e| e.to_string())?;
+            writeln!(f, "    estimate: {:.6}", p.estimate).map_err(|e| e.to_string())?;
+            writeln!(f, "    shift_in_prior_sds: {:.6}", p.shift_in_prior_sds)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    penalty: {:.6}", p.penalty).map_err(|e| e.to_string())?;
+            writeln!(f, "    family: {}", p.family).map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    prior_95: [{:.6}, {:.6}]",
+                p.prior_lower_95, p.prior_upper_95
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
 
     writeln!(f, "\ndata:").map_err(|e| e.to_string())?;
     writeln!(f, "  n_subjects: {}", result.n_subjects).map_err(|e| e.to_string())?;
@@ -2660,6 +2755,9 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            ofv_data: 0.0,
+            ofv_prior: 0.0,
+            prior_summary: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             se_residual_correlations: None,
             covariate_relations: Vec::new(),
@@ -3367,6 +3465,9 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            ofv_data: 0.0,
+            ofv_prior: 0.0,
+            prior_summary: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             se_residual_correlations: None,
             covariate_relations: Vec::new(),

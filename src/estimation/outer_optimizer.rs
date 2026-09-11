@@ -1113,6 +1113,7 @@ fn run_global_presearch(
     // distribution + NN architecture. A strict no-op when both λ are 0, so the
     // pre-search objective stays byte-identical for unregularized fits.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = build_prior_set(model, init_params);
 
     // Helper: evaluate the FOCE OFV at a single point in scaled space,
     // independent of any NLopt state. Used to compute the user's initial
@@ -1131,7 +1132,7 @@ fn run_global_presearch(
             Some(&mu_k),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
-        let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta);
+        let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
         let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
         if !raw.is_finite() || guarded {
             1e20
@@ -1168,7 +1169,7 @@ fn run_global_presearch(
             Some(&mu_k),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
-        let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta);
+        let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
 
         let ebe_guard =
             ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
@@ -1370,6 +1371,26 @@ pub(crate) const DIVERGENCE_OFV: f64 = 1e14;
 /// inner objective clamped).
 pub(crate) fn ofv_is_valid(ofv: f64) -> bool {
     ofv.is_finite() && ofv < DIVERGENCE_OFV
+}
+
+/// Resolve a model's declared parameter priors (#254) against `template`'s
+/// packed layout, for an optimizer that needs the penalty on its objective.
+///
+/// **The gate for a bad prior is [`crate::api::validation::check_model_data`],
+/// not this function.** `fit()` calls it before any optimizer runs and refuses
+/// the model with the same message `PriorSet::build` would produce here, so a
+/// prior that reaches this point has already been checked against the very
+/// `ModelParameters` layout passed in. An `Err` here therefore means the caller
+/// bypassed `fit()` entirely — `ferx-tools` driving an optimizer directly, or a
+/// unit test — and the safe answer is an empty set rather than a panic in a
+/// library. The gate is pinned by `fit_refuses_an_unresolvable_prior`; it is
+/// *not* a redundant second check of the same inputs, because failing open here
+/// is exactly what the gate exists to prevent.
+pub(crate) fn build_prior_set(
+    model: &CompiledModel,
+    template: &ModelParameters,
+) -> crate::estimation::priors::PriorSet {
+    crate::estimation::priors::PriorSet::build(model, template).unwrap_or_default()
 }
 
 pub(crate) fn resolve_outer_ftol(
@@ -1585,17 +1606,22 @@ fn optimize_nlopt(
 ) -> OuterResult {
     let first = optimize_nlopt_once(model, population, init_params, options, false);
     // The attempts minimised the *penalized* objective (covariate-NN
-    // regularization), so they are ranked on it too: `result.ofv` is the clean
-    // −2LL, and comparing that alone would prefer the less-regularized attempt —
-    // the opposite of what the penalty asks for. A no-op (`+ 0.0`) when
-    // unregularized.
+    // regularization, parameter priors), so they are ranked on it too:
+    // `result.ofv` is the clean −2LL, and comparing that alone would prefer the
+    // less-regularized attempt — the opposite of what the penalty asks for. A
+    // no-op (`+ 0.0`) when neither penalty is on.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = build_prior_set(model, init_params);
     resolve_stall_retry(
         options.optimizer,
         options.verbose,
         first,
         || optimize_nlopt_once(model, population, init_params, options, true),
-        |result| result.ofv + nn_reg.penalty_value(&result.params.theta),
+        |result| {
+            result.ofv
+                + nn_reg.penalty_value(&result.params.theta)
+                + priors.penalty(&pack_params(&result.params))
+        },
     )
 }
 
@@ -1669,6 +1695,10 @@ fn optimize_nlopt_once(
     // the reported OFV/AIC/BIC) sees the clean −2LL, which is what `final_ofv`
     // recomputes from a fresh `pop_nll_opts` at the end.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    // Parameter priors (#254) ride alongside on exactly the same contract: the
+    // optimizer minimises the penalized objective, everything user-facing keeps
+    // the clean −2LL, and `FitResult` reports the two halves separately.
+    let priors = build_prior_set(model, init_params);
 
     // Per-element scale factors: present O(1) coordinates to NLopt.
     //
@@ -1951,7 +1981,25 @@ fn optimize_nlopt_once(
         } else {
             nn_reg.penalty_and_gradient(&params.theta, &mut nn_grad)
         };
-        let raw_ofv = raw_ofv + nn_penalty;
+        // Parameter priors (#254). Unlike the NN penalty this is already a
+        // function of the packed vector, so there is nothing to map: `x` *is*
+        // the space the penalty is defined in, and `prior_grad` is spliced into
+        // `grad_raw` below without a change of variables.
+        //
+        // Value and gradient come from one call on purpose — see
+        // `PriorSet::penalty_and_gradient`. Taken separately, deleting only the
+        // gradient half left the whole integration suite green.
+        let mut prior_grad: Vec<f64> = if grad.is_some() && priors.is_active() {
+            vec![0.0; n]
+        } else {
+            Vec::new()
+        };
+        let prior_penalty = if prior_grad.is_empty() {
+            priors.penalty(&x)
+        } else {
+            priors.penalty_and_gradient(&x, &mut prior_grad)
+        };
+        let raw_ofv = raw_ofv + nn_penalty + prior_penalty;
 
         // EBE convergence guard: reject step when too many subjects unconverged or any
         // subject was hard-rejected at its inner start.
@@ -2045,6 +2093,13 @@ fn optimize_nlopt_once(
                 // `compute_scale` gives any |w| > 0.1 a non-unit scale.
                 for (gk, nk) in grad_raw.iter_mut().zip(&nn_grad) {
                     *gk += nk;
+                }
+                // Parameter priors (#254): `2(x−m)/s²` at the priored
+                // coordinates, computed above in the same pass as the value and
+                // already in packed-x space, so the `* scale[k]` chain rule
+                // below applies to it unchanged.
+                for (gk, pk) in grad_raw.iter_mut().zip(&prior_grad) {
+                    *gk += pk;
                 }
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
@@ -2608,14 +2663,17 @@ fn optimize_bfgs(
     // reported OFV/AIC/BIC stay the unpenalized −2LL. The trace, checkpoint and
     // verbose `Iter` lines report the clean value too (`clean_ofv_at` below).
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = build_prior_set(model, init_params);
     // The −2LL behind a penalized objective value at scaled point `xs`: what the
     // user-facing streams print, so they agree with the reported `Final OFV`.
     let clean_ofv_at = |xs: &[f64], f_penalized: f64, scale: &[f64]| -> f64 {
-        if !nn_reg.is_active() {
+        if !nn_reg.is_active() && !priors.is_active() {
             return f_penalized;
         }
         let x_real: Vec<f64> = xs.iter().zip(scale).map(|(v, s)| v * s).collect();
-        f_penalized - nn_reg.penalty_value(&unpack_params(&x_real, init_params).theta)
+        f_penalized
+            - nn_reg.penalty_value(&unpack_params(&x_real, init_params).theta)
+            - priors.penalty(&x_real)
     };
 
     // Closures operating on unscaled real (log/Cholesky) space.
@@ -2642,7 +2700,7 @@ fn optimize_bfgs(
             Some(&mu_k),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
-        let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta);
+        let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(x);
         if ofv.is_finite() {
             ofv
         } else {
@@ -2683,6 +2741,9 @@ fn optimize_bfgs(
         // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
         // final reporting.
         let ofv = ofv + nn_reg.penalty_and_gradient(&params.theta, &mut g);
+        // Parameter priors (#254), value and gradient from one call, in the same
+        // packed space `g` is already expressed in.
+        let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
     };

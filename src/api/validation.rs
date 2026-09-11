@@ -4144,6 +4144,85 @@ pub(crate) fn check_variance_init_rails(
 #[path = "tests/variance_init_rail_tests.rs"]
 mod variance_init_rail_tests;
 
+/// Reject a `prior(...)` declaration that cannot be applied (#254).
+///
+/// **This is the gate.** `fit()` calls it before any optimizer runs, so a prior
+/// that survives to `build_prior_set` has already been checked against the very
+/// `ModelParameters` layout the optimizer will pack. Two classes of failure,
+/// both errors rather than warnings:
+///
+/// 1. The prior does not resolve — unknown name, a `FIX`ed parameter, a
+///    `block_omega` element, a duplicate. [`PriorSet::build`] produces the
+///    message; this function only decides the severity and the code.
+/// 2. The chain's **final estimating** stage does not apply priors. An
+///    unapplied prior is worse than an unapplied regularizer: the fit still
+///    converges and still reports estimates, and nothing in the output says the
+///    prior was ignored, so a user reading a stabilized-looking result has no
+///    way to notice they got the unpenalized MLE. An earlier stage that does not
+///    apply them is fine (`[saem, focei]` reports the FOCEI stage's estimates),
+///    which is why only the last element is tested.
+pub(crate) fn check_parameter_priors(
+    model: &CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    if model.priors.is_empty() {
+        return Vec::new();
+    }
+    if let Err(msg) = crate::estimation::priors::PriorSet::build(model, init_params) {
+        return vec![Diagnostic::error("E_PRIOR_UNRESOLVED", msg)
+            .with_block("parameters")
+            .with_suggestion(
+                "A prior must name a `theta`, `omega`, `sigma` or `kappa` declared in \
+                 `[parameters]` that is estimated (not `FIX`) and not part of a \
+                 `block_omega` / `block_sigma` / `block_kappa`.",
+            )];
+    }
+    let chain = options.method_chain();
+    let Some(&last) = chain.last() else {
+        return Vec::new();
+    };
+    if applies_parameter_priors(last) {
+        return Vec::new();
+    }
+    vec![Diagnostic::error(
+        "E_PRIOR_METHOD_UNSUPPORTED",
+        format!(
+            "`prior(...)` is declared on {} parameter(s), but the final estimation stage \
+             (`{}`) does not apply parameter priors — the fit would silently return the \
+             unpenalized maximum-likelihood estimates.",
+            model.priors.len(),
+            last.label(),
+        ),
+    )
+    .with_block("parameters")
+    .with_suggestion(
+        "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
+         Use one of those as the final stage — chaining is fine, e.g. \
+         `methods = [saem, focei]` — or remove the prior declarations.",
+    )]
+}
+
+/// Whether an estimation method's optimizer applies parameter priors (#254).
+///
+/// The FOCE family does: every outer optimizer under `foce` / `focei` /
+/// `laplace` (NLopt, built-in BFGS, trust-region) plus both Gauss–Newton
+/// variants minimise a packed objective the penalty is simply added to.
+///
+/// SAEM, IMP/IMPMAP, Bayes and VI do not, each for its own reason: SAEM's M-step
+/// is closed form and would need a conjugate MAP update rather than an added
+/// term; IMP/IMPMAP need their Monte-Carlo M-step penalized (planned, and the
+/// only one of these that is a straightforward extension); and `bayes` already
+/// carries its own Ω prior, so a second one on the same parameter is a
+/// modelling error rather than a missing feature.
+pub(crate) fn applies_parameter_priors(method: crate::types::EstimationMethod) -> bool {
+    use crate::types::EstimationMethod as M;
+    matches!(
+        method,
+        M::Foce | M::FoceI | M::Laplace | M::FoceGn | M::FoceGnHybrid
+    )
+}
+
 /// The `W_` token carried inside the message text of every start-outside-the-box
 /// *warning*, so [`crate::types::classify_warning`] can recover
 /// `WarningCode::InitOutsideBounds` from the flat string `fit()` stores.

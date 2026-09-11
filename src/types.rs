@@ -2037,6 +2037,83 @@ pub struct ResidualCorrelation {
     pub rho: f64,
 }
 
+/// Spread of a user-declared parameter prior (#254).
+///
+/// Exactly one form is given per prior. `Rse` is the ergonomic one the feature
+/// exists for — a number read straight off a published parameter table — and
+/// `Sd` is the escape hatch for a θ that can be negative, where a *relative*
+/// standard error is meaningless.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum PriorSpread {
+    /// Relative standard error as a **fraction**. `rse = 25%` in the model file
+    /// arrives here as `0.25`; the parser is what normalizes the two spellings,
+    /// so nothing downstream has to know which one was written.
+    Rse(f64),
+    /// Absolute standard deviation, on the same scale the parameter was
+    /// declared on.
+    Sd(f64),
+}
+
+/// A prior declared on one parameter, for penalized-ML / MAP estimation (#254).
+///
+/// Written inline next to the parameter it constrains:
+///
+/// ```text
+/// [parameters]
+///   theta TVCL(0.2, 0.001, 10.0)  prior(0.15, rse = 25%)
+///   omega ETA_CL ~ 0.09           prior(0.09, rse = 40%)
+/// ```
+///
+/// **`value` is on the scale the parameter was declared on** — a variance for a
+/// bare `omega X ~ v`, an SD under `(sd)` — and so is a [`PriorSpread::Sd`].
+/// That single rule is the whole user-facing convention: the RSE comes off the
+/// same row of the same table as the value, and no conversion is ever asked for.
+///
+/// What the prior *becomes* — a normal on θ, a lognormal on θ, a lognormal on a
+/// variance — is decided by how the parameter packs, not by this struct.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ParameterPrior {
+    /// Name of the theta, omega/eta, sigma or kappa this prior applies to, as
+    /// declared in `[parameters]`.
+    pub name: String,
+    /// Prior central value, on the declared scale.
+    pub value: f64,
+    /// Prior spread.
+    pub spread: PriorSpread,
+}
+
+/// One priored parameter's line in the fit report (#254).
+///
+/// Named `shift_in_prior_sds` rather than `shift` because the informative
+/// number is the standardized one: "CL landed 1.8 prior SDs above the prior"
+/// says whether the data and the prior disagree, where a raw difference only
+/// says the parameter moved.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PriorSummary {
+    /// Parameter name as declared.
+    pub name: String,
+    /// Prior central value, on the scale the parameter was declared on.
+    pub prior_value: f64,
+    /// Final estimate, on that same declared scale.
+    pub estimate: f64,
+    /// `(x̂ − m) / s` in packed space — how far the estimate sits from the prior
+    /// mean in prior standard deviations. Signed.
+    pub shift_in_prior_sds: f64,
+    /// This parameter's contribution to [`FitResult::ofv_prior`] (the square of
+    /// `shift_in_prior_sds`).
+    pub penalty: f64,
+    /// Realised prior family: `"lognormal"` for a log-packed coordinate,
+    /// `"normal"` for an identity-packed one. Reported because it is decided by
+    /// the parameter's declared lower bound, not by the prior declaration — so
+    /// widening a θ's bounds to allow negative values moves its prior from
+    /// lognormal to normal, and this field is where that becomes visible.
+    pub family: String,
+    /// Lower end of the implied 95% prior interval, on the declared scale.
+    pub prior_lower_95: f64,
+    /// Upper end of the implied 95% prior interval, on the declared scale.
+    pub prior_upper_95: f64,
+}
+
 /// Full set of model parameters
 #[derive(Debug, Clone)]
 pub struct ModelParameters {
@@ -3734,6 +3811,20 @@ pub struct CompiledModel {
     /// the source text plus an evaluator for the effective SD at a typical arm
     /// size (`γ/√W`), which is the number a reader actually needs.
     pub kappa_weights: Vec<Option<KappaWeight>>,
+    /// Per-parameter priors declared with an inline `prior(value, rse = …)`
+    /// (#254). Empty for an ordinary maximum-likelihood fit, in which case every
+    /// objective is bit-identical to one computed before this field existed.
+    ///
+    /// This rides the **model**, not [`FitOptions`], because a prior changes the
+    /// estimates: a caller who parses a `.ferx` file and then hands `fit()` a
+    /// `FitOptions::default()` must not silently get an unpenalized fit back.
+    /// (The covariate-NN regularizer makes the opposite choice — `nn_l2` is a
+    /// `[fit_options]` key — because there the penalty is a *tuning* knob a
+    /// caller legitimately sweeps.)
+    ///
+    /// Resolved against the packed layout by the internal `PriorSet` once per
+    /// estimation stage.
+    pub priors: Vec<ParameterPrior>,
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
@@ -5863,7 +5954,33 @@ pub struct FitResult {
     /// Full sequence of methods executed, in order. Always has at least one entry.
     pub method_chain: Vec<EstimationMethod>,
     pub converged: bool,
+    /// The objective that was minimised. Equal to `ofv_data + ofv_prior`, so for
+    /// a model with no `prior(...)` declarations (#254) it is the plain −2 log L
+    /// it has always been.
     pub ofv: f64,
+    /// The data half of [`Self::ofv`] — the −2 log L with no prior penalty.
+    ///
+    /// This is what [`Self::aic`] and [`Self::bic`] are computed from, and what
+    /// should be compared against an unpriored fit of the same model.
+    #[serde(default)]
+    pub ofv_data: f64,
+    /// The prior half of [`Self::ofv`]: `Σ ((x̂ − m)/s)²` over the priored
+    /// coordinates (#254). Exactly `0.0` when no prior is declared.
+    ///
+    /// Normalisation constants are omitted here just as they are on the data
+    /// side (ferx's −2 log L drops `N·log(2π)`), so this is not absolutely
+    /// comparable to a NONMEM `$PRIOR` objective — compare ΔOFV against a null
+    /// twin instead.
+    #[serde(default)]
+    pub ofv_prior: f64,
+    /// Per-parameter prior report (#254): where the prior sat, where the
+    /// estimate landed, and how far apart they are in prior SDs. Empty when no
+    /// prior is declared.
+    ///
+    /// When this is non-empty the standard errors in `se_*` are the curvature of
+    /// the **penalized** objective — MAP / penalized-ML SEs, not posterior SDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_summary: Vec<PriorSummary>,
     pub aic: f64,
     pub bic: f64,
     pub theta: Vec<f64>,

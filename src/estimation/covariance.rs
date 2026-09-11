@@ -1142,6 +1142,28 @@ pub(crate) fn compute_covariance(
         }
     }
 
+    // ── Parameter-prior curvature (#254) ─────────────────────────────────────
+    //
+    // The reported SE is the curvature of the objective that was *minimised*, and
+    // under a prior that objective is `OFV_data + Σ((x−m)/s)²`. Leaving the prior
+    // out here would report the unpenalized curvature — wrong in exactly the
+    // regime the feature exists for, since a sparse fit's whole reason for
+    // carrying a prior is that the data alone does not identify the direction,
+    // and that is also where the unpenalized Hessian goes flat (rejected just
+    // below as "zero diagonal — flat objective") or non-PD.
+    //
+    // Added here rather than inside `cov_ofv` for two reasons: the penalty's
+    // second derivative is the exact constant `2/s²` (no stencil, no extra
+    // objective evaluations, no FD noise), and adding it post-assembly covers the
+    // analytic R-matrix route and the FD stencil route with one line instead of
+    // one each. It lands before the ill-conditioning diagnosis on purpose — a
+    // coordinate the prior identifies must read as curved, not as flat.
+    //
+    // Name it in the SE report, not just here: these are penalized-ML / MAP
+    // standard errors, not posterior SDs.
+    let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
+    cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
+
     // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate
     // cause labels — post-hoc checks on `hess` would always read 0 (finite) because
     // non-finite FD results are never stored (only the zero initialisation remains).

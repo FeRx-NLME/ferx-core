@@ -44,6 +44,9 @@ struct FoceiProblem<'a> {
     /// optimizer objective (`cost`/`ofv_fixed`), gradient and Hessian, not to
     /// the final reported OFV, which reuses a clean `pop_nll_opts`.
     nn_reg: crate::estimation::nn_reg::NnRegularizer,
+    /// Parameter priors (#254). Same contract as `nn_reg`: in the optimizer
+    /// objective, gradient and Hessian; out of the reported OFV.
+    priors: crate::estimation::priors::PriorSet,
 }
 
 impl FoceiProblem<'_> {
@@ -83,7 +86,7 @@ impl FoceiProblem<'_> {
             self.options,
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
-        let raw = 2.0 * nll + self.nn_reg.penalty_value(&params.theta);
+        let raw = 2.0 * nll + self.nn_reg.penalty_value(&params.theta) + self.priors.penalty(x);
         if raw.is_finite() {
             raw
         } else {
@@ -230,6 +233,9 @@ impl Gradient for FoceiProblem<'_> {
         // maps 1:1 into `g`. Its curvature goes into `hessian()` below.
         let params = unpack_params(p, self.init_params);
         self.nn_reg.add_packed_gradient(&params.theta, &mut g);
+        // Parameter priors (#254) are defined on the packed vector directly, so
+        // `p` is already the right space.
+        self.priors.add_gradient(p, &mut g);
         Ok(g)
     }
 }
@@ -264,6 +270,12 @@ impl Hessian for FoceiProblem<'_> {
         let params = unpack_params(p, self.init_params);
         self.nn_reg
             .add_packed_hessian(&params.theta, &mut |i, j, v| h[i][j] += v);
+        // Parameter-prior curvature (#254): the exact `2/s²` diagonal, not an
+        // approximation. Same reason it has to be here as the NN term — the
+        // gradient carries the prior's pull, so a quadratic model without its
+        // curvature would read every priored direction as flat and shrink the
+        // radius on steps that were fine. PSD, so the BHHH model stays PSD.
+        self.priors.add_hessian(&mut |i, j, v| h[i][j] += v);
         Ok(h)
     }
 }
@@ -681,6 +693,7 @@ pub fn optimize_trust_region(
         bounds,
         cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
         grad_cache: std::sync::Mutex::new(None),
+        priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
         nn_reg,
     };
 
@@ -968,6 +981,10 @@ mod tests {
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
+            priors: crate::estimation::outer_optimizer::build_prior_set(
+                &model,
+                &model.default_params,
+            ),
         };
 
         // 1. Before cost(): cache is None.
@@ -1263,6 +1280,7 @@ mod tests {
                     population.subjects.len()
                 ]),
                 grad_cache: std::sync::Mutex::new(None),
+                priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
                     &model,
                     &population,
@@ -1357,6 +1375,7 @@ mod tests {
                 ]),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
+                priors: crate::estimation::outer_optimizer::build_prior_set(model, init),
             }
         }
         assert!(fresh(&model, &population, init, &options)

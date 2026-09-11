@@ -1875,6 +1875,14 @@ fn wire_to_fit_result(
         covariance_wall_time_secs: w.covariance_wall_time_secs,
         converged: w.converged,
         ofv: w.ofv,
+        // A checkpoint predates the prior split (#254) and carries only the
+        // single `ofv`. Restoring it as the data half is correct for every
+        // checkpoint that can exist — priors were not applied when it was
+        // written — and keeps `ofv == ofv_data + ofv_prior` an invariant rather
+        // than something a restored result quietly breaks.
+        ofv_data: w.ofv,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         aic: w.aic,
         bic: w.bic,
         theta: w.theta.estimates,

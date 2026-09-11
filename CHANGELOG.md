@@ -19,6 +19,10 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-parameter priors for penalized maximum-likelihood (MAP) estimation**, declared inline as `prior(value, rse = 25%)` on any `theta`, `omega`, `sigma` or `kappa` — the simple alternative to NONMEM `$PRIOR`, with no separate prior problem and no matrices. The fit reports the data and prior halves of the OFV separately plus a per-parameter shift-toward-prior summary; AIC/BIC stay on the data half. Applies to `foce`, `focei`, `laplace`, `gn` and `gn_hybrid` (#254).
+
 ### Changed
 
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
