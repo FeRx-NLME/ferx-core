@@ -20881,6 +20881,9 @@ impl ScaleDerivProgram {
     /// `η_k → var(·, n_theta + k)`. `var_duals[i]` is the dual for the individual
     /// parameter at PK slot `var_to_pk_slot[i]` (value + `∂/∂(θ,η)`). Returns the
     /// scale's value, gradient `∂scale/∂(θ,η)`, and Hessian. Requires `M ≥ n_axes()`.
+    ///
+    /// The absolute-axis layout of [`eval_scale_dual_cols`](Self::eval_scale_dual_cols)
+    /// (`theta_cols = None`).
     pub(crate) fn eval_scale_dual<const M: usize>(
         &self,
         theta: &[f64],
@@ -20888,23 +20891,56 @@ impl ScaleDerivProgram {
         cov: &HashMap<String, f64>,
         var_duals: &[crate::sens::dual2::Dual2<M>],
     ) -> crate::sens::dual2::Dual2<M> {
+        self.eval_scale_dual_cols::<M>(theta, eta, cov, var_duals, None, self.n_theta)
+    }
+
+    /// Column-chunked twin of [`eval_scale_dual`](Self::eval_scale_dual): seed the
+    /// program's direct θ / η references on a **θ-column chunk's** axes rather than on
+    /// absolute ones.
+    ///
+    /// `theta_cols = Some(cols)` means dual axis `c` carries `θ_{cols[c]}`; a θ the
+    /// chunk does not carry enters as a **constant**, which is exactly right per chunk —
+    /// forward-mode axes never interact, so the chunk that owns that column supplies its
+    /// derivative. `eta_axis_base` is the dual axis of `eta[0]` (the chunk's stacked
+    /// block starts right after its θ columns, so `cols.len()` for a chunked caller and
+    /// `n_theta` for an absolute one). `theta_cols = None` is the absolute layout
+    /// `θ_m → m`, i.e. the pre-chunking behaviour entry for entry (#1339).
+    pub(crate) fn eval_scale_dual_cols<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+        var_duals: &[crate::sens::dual2::Dual2<M>],
+        theta_cols: Option<&[usize]>,
+        eta_axis_base: usize,
+    ) -> crate::sens::dual2::Dual2<M> {
         use crate::sens::dual2::Dual2;
+        // θ index → dual axis. `None` is the identity; a chunk maps only the columns it
+        // carries and leaves every other θ a constant.
+        let mut theta_axis: Vec<Option<usize>> = match theta_cols {
+            None => (0..theta.len()).map(Some).collect(),
+            Some(_) => vec![None; theta.len()],
+        };
+        if let Some(cols) = theta_cols {
+            for (c, &m) in cols.iter().enumerate() {
+                if m < theta_axis.len() {
+                    theta_axis[m] = Some(c);
+                }
+            }
+        }
         let theta_d: Vec<Dual2<M>> = theta
             .iter()
             .enumerate()
-            .map(|(m, &v)| {
-                if m < M {
-                    Dual2::var(v, m)
-                } else {
-                    Dual2::constant(v)
-                }
+            .map(|(m, &v)| match theta_axis[m] {
+                Some(ax) if ax < M => Dual2::var(v, ax),
+                _ => Dual2::constant(v),
             })
             .collect();
         let eta_d: Vec<Dual2<M>> = eta
             .iter()
             .enumerate()
             .map(|(k, &v)| {
-                let dim = self.n_theta + k;
+                let dim = eta_axis_base + k;
                 if dim < M {
                     Dual2::var(v, dim)
                 } else {
