@@ -33,7 +33,8 @@ section of the SDLC for the versioning policy).
   of peak memory. The requested width is now enforced exactly. Runs that were
   already inside their budget are unaffected; heavily oversubscribed ones should
   see lower peak memory and steadier per-fit timing rather than higher throughput
-  (#1329).
+  (#1329). Bootstrap's unset thread budget preserves the ambient Rayon pool width,
+  including `RAYON_NUM_THREADS` and caller-configured pools (#1330).
 
 ### Performance
 

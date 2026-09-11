@@ -27,7 +27,7 @@ use std::time::Instant;
 use ferx_core::cancel::is_cancelled;
 use ferx_core::types::CovarianceFallback;
 use ferx_core::{
-    fit, CancelFlag, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix, PoolPlan,
+    fit, CancelFlag, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix,
     Population, PreparedRun, SigmaVector, Strictness, WarningCode,
 };
 
@@ -1165,9 +1165,8 @@ pub fn run_bootstrap_with_progress(
     // `ThreadPoolBuilder` also inherited Rayon's 2 MiB worker stack, which the
     // lanes replace with `FIT_RAYON_STACK_SIZE`.
     //
-    // `None` still means "the engine default width", resolved the same way an
-    // unpinned `fit()` resolves it, so the only change is that it is now a
-    // ceiling.
+    // Resolve the ambient Rayon width before spawning lanes so `None` preserves
+    // the caller's pool configuration, including `RAYON_NUM_THREADS`.
     let width = replicate_lane_width(options.threads, todo.len());
     let mut replicates = crate::lanes::run_in_lanes(width, todo.len(), |k| run_one(&todo[k]))?;
 
@@ -1423,21 +1422,18 @@ fn compute_delta_ofv(
 }
 
 /// How many replicates are admitted at once: [`BootstrapOptions::threads`] when
-/// the caller pinned it, otherwise the engine's own default fit width.
+/// the caller pinned it, otherwise the ambient Rayon pool's width.
 ///
-/// The `None` arm is what it has always been — before #1329 the replicate loop
-/// was a bare `todo.par_iter()` on the ambient Rayon pool, whose width is the
-/// same number [`PoolPlan::from_budget`] resolves a `0` budget to. Spelling it
-/// out is what lets the lanes *bound* it: a lane count has to be a number, and
-/// "let Rayon decide" is precisely the admission nobody was deciding.
+/// Resolve this on the caller before spawning lanes: the old `todo.par_iter()`
+/// used that pool, which can differ from the engine's capped fit default or
+/// from the global Rayon pool when the caller installed a custom pool.
 ///
 /// `Some(0)` is one lane rather than none, matching the old `Some(_)` arm, which
 /// ran the replicates serially.
 fn replicate_lane_width(threads: Option<usize>, n_todo: usize) -> usize {
-    match threads {
-        Some(n) => n.max(1),
-        None => PoolPlan::from_budget(0, n_todo).replicates(),
-    }
+    threads
+        .unwrap_or_else(rayon::current_num_threads)
+        .clamp(1, n_todo.max(1))
 }
 
 /// Non-fixed parameters — the chi-square degrees of freedom for the Δofv

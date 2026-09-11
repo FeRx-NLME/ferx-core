@@ -2,6 +2,27 @@ use super::*;
 use ferx_core::{CancelFlag, Subject};
 use nalgebra::DMatrix;
 
+#[test]
+fn replicate_lane_width_preserves_the_ambient_rayon_budget() {
+    // Distinct widths ensure the engine's host-dependent default cannot satisfy
+    // both cases. Local pools avoid mutating process-global configuration.
+    for width in [2, 3] {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .unwrap()
+            .install(|| {
+                assert_eq!(replicate_lane_width(None, 20), width);
+                assert_eq!(replicate_lane_width(None, 1), 1);
+                assert_eq!(replicate_lane_width(None, 0), 1);
+                assert_eq!(replicate_lane_width(Some(4), 20), 4);
+                assert_eq!(replicate_lane_width(Some(4), 2), 2);
+                assert_eq!(replicate_lane_width(Some(0), 20), 1);
+                assert_eq!(replicate_lane_width(Some(1), 20), 1);
+            });
+    }
+}
+
 /// A two-theta, two-eta, one-sigma template with a correlated Omega block.
 ///
 /// The block matters: it is what makes `free_mask` non-trivial, so a
