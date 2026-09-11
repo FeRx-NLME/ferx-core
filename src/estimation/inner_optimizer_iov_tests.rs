@@ -3571,3 +3571,63 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
         cold_nll
     );
 }
+
+/// PR #1337 review (P1): the convergence flag must belong to the point that is returned.
+///
+/// Scenario: the BFGS partial sits on the slope of the deep well (not a mode) and wins on
+/// objective; the cold NM restart, seeded exactly at the shallow well's minimum, converges
+/// there. The old helper returned the partial with the *restart's* `true`, reporting a
+/// non-stationary point as a converged EBE — which bypasses `max_unconverged_frac` and
+/// AGQ's per-subject acceptance. Two assertions, one per half of the fix:
+///
+/// * with a budget too small to polish the partial to the mode, the returned point is at
+///   least as good as the partial and the flag is `false` (the restart's `true` must not
+///   leak through);
+/// * with a normal budget the polish reaches the deep mode and reports `true` — the flag is
+///   earned by the returned point, not inherited.
+///
+/// Objective: deep well at x = −2 (f = −10), shallow well at x = +2 (f = −1). Budgets:
+/// `max_iter = 1` gives each NM 5 iterations — enough for a restart seeded on the shallow
+/// minimum to collapse its 0.1-wide simplex under `tol = 1e-3`, not enough for a polish
+/// from x = −1.5 to reach x = −2 within `tol`. Verified by mutation: returning the
+/// restart's flag turns the first half red.
+#[test]
+fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
+    let obj = |x: &[f64]| -> f64 {
+        let v = x[0];
+        if v < 0.0 {
+            (v + 2.0).powi(2) - 10.0
+        } else {
+            (v - 2.0).powi(2) - 1.0
+        }
+    };
+    set_ebe_warm_start(false);
+    let partial = [-1.5];
+    let f_partial = obj(&partial);
+
+    // Tiny budget: the cold restart converges in the shallow well, the partial wins, the
+    // polish cannot certify it.
+    let (eta, ok) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 1, 1e-3);
+    assert!(eta[0] < 0.0, "must stay in the deep well, got {eta:?}");
+    assert!(
+        obj(&eta) <= f_partial,
+        "returned point ({:.4}) must not be worse than the partial ({f_partial:.4})",
+        obj(&eta)
+    );
+    assert!(
+        !ok,
+        "a partial that was neither BFGS- nor NM-certified must not report converged \
+         (the restart converged in the shallow well; its flag must not leak)"
+    );
+
+    // Normal budget: the polish reaches the deep mode and earns the flag.
+    let (eta2, ok2) = argmin_inner_fallback(&obj, &partial, &[2.0], 1, 200, 1e-8);
+    assert!(
+        (eta2[0] + 2.0).abs() < 1e-2,
+        "polish must reach the deep mode, got {eta2:?}"
+    );
+    assert!(
+        ok2,
+        "an NM run that ended at the returned point certifies it"
+    );
+}

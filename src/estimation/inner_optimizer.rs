@@ -495,16 +495,21 @@ pub struct InnerLoopStats {
 ///
 /// The restart seeds from the BFGS `partial` when `ebe_warm_start` is set (it sits on the
 /// steep prior slope, so NM reaches the mode in fewer steps), else from `cold_seed` (η=0
-/// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). Exactly **one** NM solve
-/// runs, so enabling `ebe_warm_start` is never slower than leaving it off.
+/// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). One NM solve runs when
+/// the restart wins or under `ebe_warm_start`; a second, started from the partial, runs
+/// only when a cold restart loses to the partial (see below).
 ///
-/// Returns `(eta, nm_converged)`. The **value** is the lower-objective of the BFGS partial
+/// Returns `(eta, converged)`. The **value** is the lower-objective of the BFGS partial
 /// and the NM restart — the substantive #555 fix: the previous code overwrote `eta` with the
 /// NM restart unconditionally, discarding a correct partial that BFGS had reached but not
-/// gnorm-verified. `nm_converged` is the Nelder–Mead convergence flag (as the pre-#555 code
-/// reported), so the per-subject convergence/diagnostic semantics are unchanged; the η̂
-/// *value* fed to the FOCEI gradient is what improves. A non-finite `obj(partial)` (NaN/∞)
-/// makes the partial unusable so the NM result is taken.
+/// gnorm-verified. `converged` is the Nelder–Mead flag **of the run that ended at the
+/// returned point** (PR #1337 review): when the restart wins it is that restart's flag;
+/// when the partial wins, the partial — which its own BFGS run did *not* certify — is
+/// polished by an NM started from it, and that run's end point and flag are returned (the
+/// end point is never worse than the partial). Returning the restart's flag with the
+/// partial's point reported a converged EBE whenever NM had converged in a *worse* basin,
+/// which bypassed `max_unconverged_frac` and AGQ's per-subject acceptance. A non-finite
+/// `obj(partial)` (NaN/∞) makes the partial unusable so the NM result is taken.
 fn argmin_inner_fallback(
     obj: &dyn Fn(&[f64]) -> f64,
     partial: &[f64],
@@ -527,12 +532,31 @@ fn argmin_inner_fallback(
     // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
     // partial is kept.
     let nm_strictly_better = f_nm < partial_f;
-    let best = if partial_usable && !nm_strictly_better {
-        partial.to_vec()
+    if !partial_usable || nm_strictly_better {
+        return (eta_nm, nm_ok);
+    }
+    // The partial wins on objective. Its own BFGS run did not certify it, and `nm_ok`
+    // describes a point we are not returning (NM may well have *converged* — in a worse
+    // basin), so it must not be reported as this point's status: `EbeResult.converged`
+    // feeds `max_unconverged_frac` and AGQ's per-subject acceptance (PR #1337 review).
+    // Certify the partial the same derivative-free way NM certifies its own result: a
+    // second NM started *from the partial*. Its end point is what is returned (never
+    // worse than the partial, NM keeps its best vertex) and its flag is the flag — a
+    // genuine mode collapses the simplex within `tol` in a few iterations, a
+    // non-stationary partial keeps descending and reports `false` when the budget ends.
+    // Under `ebe_warm_start` the single NM above already ran from the partial and ended
+    // at its value, so that run is the certification and nothing is re-run.
+    if warm {
+        return (partial.to_vec(), nm_ok);
+    }
+    let mut polished = partial.to_vec();
+    let polished_ok = nelder_mead_minimize(obj, &mut polished, n, max_iter * 5, tol);
+    let f_polished = obj(&polished);
+    if f_polished.is_finite() && f_polished <= partial_f {
+        (polished, polished_ok)
     } else {
-        eta_nm
-    };
-    (best, nm_ok)
+        (partial.to_vec(), false)
+    }
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
