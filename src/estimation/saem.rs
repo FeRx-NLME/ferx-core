@@ -2783,69 +2783,97 @@ pub fn run_saem(
         // ---- Step 1b: Per-occasion kappa MH (IOV models only) ----
         // For each subject, propose one new kappa per occasion and accept/reject
         // using the full IOV individual NLL (kappa prior + observation likelihood).
-        // This is a sequential per-subject loop (non-parallel) because the kappa
-        // MH is cheap (low-dimensional, analytical PK) and share-free.
+        // Parallel over subjects, and **bit-identical** to the serial loop it replaces
+        // (#1344 item 5). Every access is `[i]`-disjoint — reads `etas[i]`, `kappas[i]`,
+        // `kappa_step_scales[i]`; writes `kappas[i]`, `nll_cache[i]` and the two counters —
+        // and each subject's RNG is seeded from `(master_seed, k, i)`, so no subject's draws
+        // depend on the order subjects are visited in. That is what makes this a scheduling
+        // change rather than a numerical one.
+        //
+        // Shaped as map-then-apply rather than a six-way `par_iter_mut().zip(..)`: the κ MH
+        // both reads and writes `kappas[i]`, so the mutable shape needs the state
+        // destructured into disjoint slices and threaded through nested tuples, which is
+        // unreadable at six fields. The cost is one clone of `kappas[i]` (n_occ × n_kappa
+        // f64s) per subject per iteration, against a full `individual_nll_iov` per proposal.
+        //
+        // The previous comment here said this loop was serial because the κ MH is "cheap
+        // (low-dimensional, analytical PK) and share-free". Share-free is why this is safe.
+        // Cheap is why the win is unmeasured: no one has profiled the phase's share of a
+        // SAEM IOV fit, so treat this as removing a known serialisation, not as a measured
+        // speedup.
         if n_kappa > 0 {
             if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
-                for i in 0..n_subjects {
-                    let subject = &population.subjects[i];
-                    // Mixture (#985): κ must be sampled inside the subject's drawn
-                    // class — under that class's `MIXNUM` branch and its Ω/σ.
-                    // Without the guard every subject's κ would be proposed against
-                    // the class-1 typical values and class-1 Ω/σ, corrupting
-                    // `state.kappas` (hence `s2_iov`, Ω_IOV and the θ/σ M-step)
-                    // for every class-2+ subject (#987 review).
-                    let cls = saem_mix.as_ref().map(|m| m.classes[i]);
-                    let _class_guard =
-                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
-                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
-                        Some(c) => (&class_omegas[c], class_sigmas[c].as_slice()),
-                        None => (&omega_k, state.sigma_vals.as_slice()),
-                    };
-                    let mut rng = StdRng::seed_from_u64(
-                        master_seed
-                            .wrapping_add(k as u64 * 100_000)
-                            .wrapping_add(i as u64)
-                            .wrapping_add(999_999),
-                    );
-                    // Recompute NLL under the IOV-consistent function before
-                    // proposing kappa.  After the eta MH block, nll_cache[i]
-                    // may have been set by mh_steps via individual_nll_iov
-                    // (with kappas fixed) — but to be safe we always recompute
-                    // with the current kappas so detailed balance is guaranteed:
-                    // both nll_kappa_ref and nll_prop are evaluated by the same
-                    // individual_nll_iov, giving the correct acceptance ratio for
-                    // p(κ | η, θ, data).
-                    let nll_kappa_ref = individual_nll_iov(
-                        model,
-                        subject,
-                        &state.theta,
-                        &state.etas[i],
-                        &state.kappas[i],
-                        omega_i,
-                        Some(omega_iov_cur),
-                        sigma_i,
-                    );
-                    let (n_acc, n_prop, nll_new) = mh_kappa_steps(
-                        &mut state.kappas[i],
-                        nll_kappa_ref,
-                        subject,
-                        model,
-                        &state.theta,
-                        &state.etas[i],
-                        omega_i,
-                        omega_iov_cur,
-                        sigma_i,
-                        state.kappa_step_scales[i],
-                        &mut rng,
-                    );
+                // Shared reborrow: the parallel phase only reads the state.
+                use rayon::prelude::*;
+                let st = &state;
+                let updates: Vec<(Vec<Vec<f64>>, f64, usize, usize)> = (0..n_subjects)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut kappas_i = st.kappas[i].clone();
+                        let subject = &population.subjects[i];
+                        // Mixture (#985): κ must be sampled inside the subject's drawn
+                        // class — under that class's `MIXNUM` branch and its Ω/σ.
+                        // Without the guard every subject's κ would be proposed against
+                        // the class-1 typical values and class-1 Ω/σ, corrupting
+                        // `st.kappas` (hence `s2_iov`, Ω_IOV and the θ/σ M-step)
+                        // for every class-2+ subject (#987 review).
+                        let cls = saem_mix.as_ref().map(|m| m.classes[i]);
+                        let _class_guard = cls
+                            .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                        let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                            Some(c) => (&class_omegas[c], class_sigmas[c].as_slice()),
+                            None => (&omega_k, st.sigma_vals.as_slice()),
+                        };
+                        let mut rng = StdRng::seed_from_u64(
+                            master_seed
+                                .wrapping_add(k as u64 * 100_000)
+                                .wrapping_add(i as u64)
+                                .wrapping_add(999_999),
+                        );
+                        // Recompute NLL under the IOV-consistent function before
+                        // proposing kappa.  After the eta MH block, nll_cache[i]
+                        // may have been set by mh_steps via individual_nll_iov
+                        // (with kappas fixed) — but to be safe we always recompute
+                        // with the current kappas so detailed balance is guaranteed:
+                        // both nll_kappa_ref and nll_prop are evaluated by the same
+                        // individual_nll_iov, giving the correct acceptance ratio for
+                        // p(κ | η, θ, data).
+                        let nll_kappa_ref = individual_nll_iov(
+                            model,
+                            subject,
+                            &st.theta,
+                            &st.etas[i],
+                            &kappas_i,
+                            omega_i,
+                            Some(omega_iov_cur),
+                            sigma_i,
+                        );
+                        let (n_acc, n_prop, nll_new) = mh_kappa_steps(
+                            &mut kappas_i,
+                            nll_kappa_ref,
+                            subject,
+                            model,
+                            &st.theta,
+                            &st.etas[i],
+                            omega_i,
+                            omega_iov_cur,
+                            sigma_i,
+                            st.kappa_step_scales[i],
+                            &mut rng,
+                        );
+                        (kappas_i, nll_new, n_acc, n_prop)
+                    })
+                    .collect();
+                // Applied in subject order, so the counters accumulate identically to the
+                // serial loop however the workers finished.
+                for (i, (kappas_i, nll_new, n_acc, n_prop)) in updates.into_iter().enumerate() {
+                    state.kappas[i] = kappas_i;
                     state.nll_cache[i] = nll_new;
                     state.kappa_accept_counts[i] += n_acc;
                     state.kappa_proposal_counts[i] += n_prop;
                 }
             }
         }
-
         state.steps_since_adapt += 1;
 
         // ---- Step 2: SA update of sufficient statistic for Omega ----

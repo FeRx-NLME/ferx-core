@@ -1477,7 +1477,7 @@ fn the_eta_only_sweep_matches_the_full_sweep_on_the_blocks_laplace_reads() {
     let (n_theta, n_eta) = (theta.len(), eta.len());
 
     let full = subject_sensitivities_cov(&m, &s, &theta, &eta).expect("in scope");
-    let lean = subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta).expect("in scope");
+    let lean = subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta, None).expect("in scope");
     assert_eq!(full.obs.len(), lean.obs.len());
 
     let mut worst = 0.0f64;

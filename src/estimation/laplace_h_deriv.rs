@@ -160,6 +160,7 @@ pub(crate) fn subject_h_inner_dx(
     x: &[f64],
     b_hat: &[f64],
     db_dx: &[DVector<f64>],
+    base_jet: Option<crate::sens::provider::SubjectSens>,
 ) -> Option<Vec<DMatrix<f64>>> {
     let n_theta = params.theta.len();
     let n_eta = params.omega.dim();
@@ -191,7 +192,7 @@ pub(crate) fn subject_h_inner_dx(
     // The third-order jet. Its `obs` base blocks are bit-identical to
     // `subject_sensitivities`, so `score_core` below sees exactly the values that built the
     // anchor the caller passes to `build_proposal`.
-    let sens = subject_sensitivities_cov_eta_only(model, subject, &params.theta, b_hat)?;
+    let sens = subject_sensitivities_cov_eta_only(model, subject, &params.theta, b_hat, base_jet)?;
     let n_obs = subject.observations.len();
     if n_obs == 0 || sens.obs.len() != n_obs {
         return None;
@@ -529,7 +530,7 @@ mod tests {
         let db_dx = subject_eta_dx(model, subject, template, &x, b_hat).expect("eta_dx");
 
         let analytic = subject_h_inner_dx(
-            model, subject, &params, template, &omega_inv, &x, b_hat, &db_dx,
+            model, subject, &params, template, &omega_inv, &x, b_hat, &db_dx, None,
         )
         .expect("in scope");
 
@@ -689,7 +690,7 @@ mod tests {
         let b_hat = [0.05, -0.03, 0.08];
         let db_dx = subject_eta_dx(&model, &subject, &template, &x, &b_hat).expect("eta_dx");
         let analytic = subject_h_inner_dx(
-            &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx,
+            &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx, None,
         )
         .expect("in scope");
         for (k, m) in analytic.iter().enumerate() {
@@ -716,7 +717,7 @@ mod tests {
         let db_dx = vec![DVector::zeros(3); x.len()];
         assert!(
             subject_h_inner_dx(
-                &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx,
+                &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx, None,
             )
             .is_none(),
             "an M3 censored row must decline to the finite-difference route"
@@ -793,7 +794,7 @@ mod tests {
         let db_dx = vec![DVector::zeros(3); x.len()];
         assert!(
             subject_h_inner_dx(
-                &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx,
+                &model, &subject, &params, &template, &omega_inv, &x, &b_hat, &db_dx, None,
             )
             .is_none(),
             "a custom-magnitude model must decline to the finite-difference route"
@@ -818,7 +819,7 @@ mod tests {
         let db_dx = vec![DVector::zeros(3); short_x.len()];
         assert!(
             subject_h_inner_dx(
-                &model, &subject, &params, &template, &omega_inv, short_x, &b_hat, &db_dx,
+                &model, &subject, &params, &template, &omega_inv, short_x, &b_hat, &db_dx, None,
             )
             .is_none(),
             "a packed-length mismatch must decline rather than misread the layout"

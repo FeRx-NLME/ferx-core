@@ -23,6 +23,19 @@ section of the SDLC for the versioning policy).
 
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
+- **`method = laplace` no longer recomputes the sensitivity jet its grid anchor was just built
+  from.** The anchor and the `½·log|H|` derivative sweep needed the same evaluation at the same
+  point; the anchor's is now handed over instead of discarded, removing one of the sweep's
+  `1 + 2·n_eta` evaluations (7 → 6 on a 3-random-effect model). Debug builds assert the reused
+  jet against a fresh evaluation, since a mismatched one would produce wrong derivatives rather
+  than an error (#1344).
+
+- **SAEM's per-occasion κ sampling now runs in parallel over subjects** instead of serially
+  beside the already-parallel η phase. Bit-identical: each subject writes only its own slots and
+  draws from a generator seeded by `(seed, iteration, subject)`, so nothing depends on the order
+  subjects are visited in. Applies to IOV models only; the phase's share of a SAEM fit has not
+  been profiled, so this removes a serialisation rather than promising a speedup (#1344).
+
 - **`method = laplace`'s analytic `½·log|H|` gradient term now sweeps only the random-effect
   axes, not every structural parameter axis as well.** The assembly reads `∂³f/∂η³` and
   `∂³f/∂η²∂θ`; the θ-axis sensitivity evaluations existed to build two blocks only the
