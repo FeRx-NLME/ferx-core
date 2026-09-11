@@ -28,16 +28,23 @@
 //! Reusing it rather than writing a second FD sweep also means the step heuristic
 //! (`third_order_fd_step`, solver-tolerance aware) and the route-switch guards are shared.
 //!
-//! **This does not establish a speedup, and is not the default route.** `2p` perturbed
-//! anchors and `1 + 2(n_theta + n_eta)` provider evaluations are different work units, and a
-//! raw call-count comparison is not the whole story: measured on `warfarin.ferx`
-//! (`plans/laplace-sensitivity-speed/`) this route made *fewer* analytic-provider calls than
-//! the FD sweep it replaces (6840 → 6460) but took *more* total provider time (0.098s →
-//! 0.131s) — each call here does materially more work (a full third-order jet plus the
-//! residual σ/f central differences below) than a plain anchor rebuild. The caller
-//! ([`crate::estimation::agq::use_analytic_grid_response`]) keeps FD as the default and this
-//! route opt-in via `FERX_AGQ_GRID_RESPONSE=analytic` until a densely-parameterised case
-//! (block-Ω) shows a repeatable end-to-end win.
+//! **This is the default route as of #1335, and a raw call-count comparison is still not the
+//! whole story.** `2p` perturbed anchors and `1 + 2(n_theta + n_eta)` provider evaluations are
+//! different work units: each call here does materially more work (a full third-order jet plus
+//! the residual σ/f central differences below) than a plain anchor rebuild, so fewer calls does
+//! not automatically mean less time. On the **diagonal-Ω** fixture the two sit so close to
+//! parity that successive sessions measured opposite signs (+34% slower, then ~14% faster, both
+//! real) — which is why this route was opt-in for as long as that was the only fixture measured.
+//!
+//! The **block-Ω** case decided it, and it is the one to reason from: there the call-count gap
+//! is wide (`2·n_free = 20` FD rebuilds vs `1 + 2(n_theta + d) = 13` provider evaluations)
+//! versus 14 FD rebuilds and 13 provider evaluations on the diagonal fixture. It measured 11520
+//! → 8160 calls for −24% provider time
+//! across 5/5 reps at an **identical** outer-iteration count and OFV matching to four decimals.
+//! Rounded OFV agreement is not a derivative check; the grid-response and Hessian-derivative
+//! parity tests supply that evidence. See
+//! [`crate::estimation::agq::use_analytic_grid_response`] for the full table and for why the
+//! `FERX_AGQ_GRID_RESPONSE` harness is kept rather than removed.
 //!
 //! # The derivative
 //!
