@@ -303,6 +303,8 @@ Two consequences worth knowing:
   to the per-`θ` loop — correct, just slower. Covariates that vary but
   do *not* feed the network are unaffected.
 
+### FOCE / FOCEI: the analytic sensitivity provider
+
 `method = focei` (and `foce`) takes a different route: the analytic
 sensitivity provider. There the weights were never a problem for a
 network fed **static** covariates — the closed-form path never seeds
@@ -327,6 +329,38 @@ the `gradient:` line reports it, and the FD-fallback warning is the
 thing to check if a fit is unexpectedly slow. A model that reads a
 generated weight parameter directly (`… + B_TYPICAL_PK_2_1`) still
 routes to FD, as it does for the fixed-η estimators.
+
+### IOV models
+
+A network on an **IOV** model (`kappa` random effects) takes the
+stacked `[η, κ]` walk, and that walk had the same limitation until
+#1339: it seeded every model theta on a dual axis of its own and
+required the `[individual_parameters]` program to reference all of
+them, which no DCM can satisfy. The consequence was not a slower
+gradient but no analytic outer gradient at all — `auto` resolved to
+derivative-free BOBYQA over every weight, and an explicit gradient
+optimizer got reconverged finite differences. On the busulfan
+reference (600 subjects, 22 weights, κ on CL and V1) that was 546
+BOBYQA evaluations against 41 L-BFGS evaluations for the analytic
+covariate model it replaces. The IOV walk now builds its per-occasion
+derivative source the same way the time-varying walk does — declared
+thetas, `[η, κ]`, one axis per network output, weight columns chained
+in through backpropagation — and walks the weight columns in chunks,
+so a DCM with IOV reports an analytic outer gradient and `auto` picks
+L-BFGS. The inner (per-subject) gradient was already analytic for
+these models and is unchanged.
+
+Three post-walk steps used to need the whole weight block on one chunk,
+because their compiled programs seeded their direct theta / eta
+references on absolute dual axes: an `[initial_conditions]` baseline,
+an `obs_scale` expression, and an analytic Form C readout. They are
+evaluated in each chunk's own basis instead, so they place no extra
+condition on the outer route — a weight block of any width is chunked
+the same way with or without them, and the `obs_scale` expression is
+no longer capped at 24 `(theta, eta)` axes on the IOV path. A model
+whose stacked `[eta, kappa]` block alone fills the 24-axis walk still
+declines per subject (there is no room left for a theta column), as it
+always did; that shows up in the finite-difference fallback warning.
 
 ## Regularization (`nn_l2`, `nn_smooth`)
 

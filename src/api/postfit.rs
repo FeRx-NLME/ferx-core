@@ -580,6 +580,27 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
 /// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
 /// OFV) for every subject the fit assigned to another class.
+///
+/// # Parallel over subjects, and why the stats come back as a value (#1329)
+///
+/// Each subject is independent — one prediction sweep, no cross-subject term and
+/// no reduction — so this runs on the fit's own pool and the results keep their
+/// subject order. Nothing is reassociated, so no output moves by a ULP.
+///
+/// `collect_solver_stats` is the one thing that could not simply be
+/// `par_iter`-ed. [`crate::ode::solver::SolverStatsScope`] is **thread-local**:
+/// a scope the caller opens around this function sees the caller's thread only,
+/// so fanning out without moving the scope inside would have silently reported
+/// zero `min_dt` clamps and zero `auto` escalations — the counters reading clean
+/// for exactly the integrations they exist to surface. Each subject task
+/// therefore opens its own scope, and the per-subject counters are merged here,
+/// **in subject order**, before returning. The merge is over `usize` counters so
+/// the order does not change the sums; it is fixed anyway, so a future
+/// non-additive field cannot become worker-count dependent without this comment
+/// being wrong.
+///
+/// Pass `false` on a model that integrates nothing: entering a scope *activates*
+/// per-segment recording, and a closed-form model has no segments to record.
 pub(crate) fn compute_subject_results(
     model: &CompiledModel,
     population: &Population,
@@ -589,12 +610,17 @@ pub(crate) fn compute_subject_results(
     kappas_per_subject: &[Vec<DVector<f64>>],
     interaction: bool,
     mixest: Option<&[usize]>,
-) -> Vec<SubjectResult> {
-    population
+    collect_solver_stats: bool,
+) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
+    let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> = population
         .subjects
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, subject)| {
+            // Declared before the mixture guard so it is dropped *after* it: the
+            // scope must still be open while this subject's integrations run.
+            let stats_scope =
+                collect_solver_stats.then(crate::ode::solver::SolverStatsScope::enter);
             // Hold this subject's fitted class for the whole per-subject block.
             let _mix_guard = mixest
                 .and_then(|m| m.get(i))
@@ -752,7 +778,7 @@ pub(crate) fn compute_subject_results(
                 )
             };
 
-            SubjectResult {
+            let subject_result = SubjectResult {
                 id: subject.id.clone(),
                 eta: eta.clone(),
                 ipred,
@@ -782,9 +808,21 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
-            }
+            };
+            // Read while the scope is still open; dropping it restores whatever
+            // scope (usually none) this worker had before.
+            let stats = stats_scope.map(|s| s.collected()).unwrap_or_default();
+            (subject_result, stats)
         })
-        .collect()
+        .collect();
+
+    let mut solver_stats = crate::ode::solver::OdeSolverStats::default();
+    let mut subjects = Vec::with_capacity(per_subject.len());
+    for (subject_result, stats) in per_subject {
+        solver_stats.merge(&stats);
+        subjects.push(subject_result);
+    }
+    (subjects, solver_stats)
 }
 
 /// Per-kappa weight of the *median* subject-occasion in this dataset (#1031),
@@ -1111,6 +1149,7 @@ pub(crate) fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&
 /// Free (non-fixed) theta estimates pinned to an optimizer bound, as
 /// `(name, estimate, effective_bound, side)` per hit.
 fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
+    use crate::estimation::parameterization::theta_guard_is_internal;
     let mut hits = Vec::new();
     for i in 0..params.theta.len() {
         if params.theta_fixed.get(i).copied().unwrap_or(false) {
@@ -1146,20 +1185,6 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
         }
     }
     hits
-}
-
-/// Whether a THETA bound reported by `compute_bounds` is an implementation cap
-/// rather than the user's effective declared limit.
-fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
-    use crate::estimation::parameterization::theta_packs_log;
-    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
-    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
-    theta_packs_log(lower)
-        && match side {
-            "lower" => lower <= 1e-10,
-            "upper" => upper >= 1e9,
-            _ => false,
-        }
 }
 
 /// A free parameter coordinate pinned to one of the internal packed-space
@@ -1237,14 +1262,16 @@ pub(crate) fn packed_guard_side(
 /// hidden 1e-10 / 1e9 cap for the declared range; every later coordinate is an
 /// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
 fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
+    use crate::estimation::parameterization::theta_guard_is_internal;
     use crate::estimation::parameterization::{
-        compute_bounds, coordinate_kinds, coordinate_names, coordinate_values, pack_params,
-        packed_fixed_mask,
+        coordinate_kinds, coordinate_names, coordinate_values, pack_with_bounds, PackedStart,
     };
 
-    let packed = pack_params(params);
-    let bounds = compute_bounds(params);
-    let fixed = packed_fixed_mask(params);
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+    } = pack_with_bounds(params);
     let names = coordinate_names(params);
     let estimates = coordinate_values(params);
     let kinds = coordinate_kinds(params);
@@ -1817,34 +1844,57 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
 /// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
 /// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
 /// observe.
+///
+/// Like [`compute_subject_results`], this runs one independent task per subject on the fit's
+/// own pool and **returns** its counters rather than depositing them in a scope the caller
+/// opened (#1329): [`crate::ode::solver::SolverStatsScope`] is thread-local, so a caller-side
+/// scope would have come back empty and `auto_stiff_rejected_jets` — the one counter no `f64`
+/// pass can ever produce — would have been permanently zero again, which is the dead
+/// diagnostic #1080 existed to remove.
 pub(crate) fn sweep_sensitivity_solver_stats(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     mixest: Option<&[usize]>,
-) {
+) -> crate::ode::solver::OdeSolverStats {
+    let mut merged = crate::ode::solver::OdeSolverStats::default();
     if !crate::sens::provider::ode_inner_grad_supported_model(model)
         || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
     {
-        return;
+        return merged;
     }
     let second_order = crate::sens::provider::analytic_outer_gradient_available(model);
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let Some(eta) = eta_hats.get(i) else { continue };
-        // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to its
-        // winning class, so evaluating it under the class-1 default would integrate a
-        // trajectory the fit never reported.
-        let _mix_guard = mixest
-            .and_then(|m| m.get(i))
-            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
-        let (theta, eta) = (&params.theta, eta.as_slice());
-        if second_order {
-            let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
-        } else {
-            let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
-        }
+    let per_subject: Vec<crate::ode::solver::OdeSolverStats> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let Some(eta) = eta_hats.get(i) else {
+                return crate::ode::solver::OdeSolverStats::default();
+            };
+            let stats_scope = crate::ode::solver::SolverStatsScope::enter();
+            // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to
+            // its winning class, so evaluating it under the class-1 default would integrate a
+            // trajectory the fit never reported.
+            let _mix_guard = mixest
+                .and_then(|m| m.get(i))
+                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            let (theta, eta) = (&params.theta, eta.as_slice());
+            if second_order {
+                let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+            } else {
+                let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+            }
+            stats_scope.collected()
+        })
+        .collect();
+    // In subject order, so a future non-additive counter cannot become
+    // worker-count dependent.
+    for stats in &per_subject {
+        merged.merge(stats);
     }
+    merged
 }
 
 /// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080

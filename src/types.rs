@@ -5467,6 +5467,18 @@ pub enum WarningCode {
     /// THETA bound, this is an implementation constraint, so the affected fit
     /// result is not an interior optimum.
     ParameterAtRunawayGuard,
+    /// One or more **initial estimates** pack outside their own optimizer box
+    /// and were silently clamped onto it before the first objective evaluation
+    /// (#1251). A property of the *start*, decided before any fitting.
+    ///
+    /// Deliberately **not** [`WarningCode::BoundaryEstimate`], which is about
+    /// where a fit *ended*: `model_selection::estimate_near_boundary` reads that
+    /// category, and it drives `bootstrap`'s `skip_estimate_near_boundary` and
+    /// `Strictness::reject_on_boundary` — both on by default. Reusing it would
+    /// make a start-side notice drop bootstrap replicates and reject search
+    /// candidates, under a failure line reading "estimate pinned to a declared
+    /// bound: … *starts at* …".
+    InitOutsideBounds,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
@@ -5549,6 +5561,7 @@ impl WarningCode {
             WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::BoundaryEstimate => "boundary_estimate",
             WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
+            WarningCode::InitOutsideBounds => "init_outside_bounds",
             WarningCode::InflatedRse => "inflated_rse",
             WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
@@ -5660,6 +5673,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.contains("w_init_outside_bounds") {
+        // #1251: an initial estimate that packs outside its own box and is
+        // clamped there before the first objective evaluation. Matched on its
+        // `W_` token and placed with the other token arms, ahead of every prose
+        // arm — the message names a coordinate and quotes bounds, and the
+        // nearest prose arm ("optimizer bound") is a *post-fit* boundary
+        // estimate whose category drives `skip_estimate_near_boundary` and
+        // `reject_on_boundary`. A near-miss phrasing there would silently drop
+        // bootstrap replicates.
+        (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the

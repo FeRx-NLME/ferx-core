@@ -761,6 +761,52 @@ fn classify_warning_recognizes_internal_runaway_guard() {
     assert_eq!(off_diag.severity, WarningSeverity::Critical);
 }
 
+/// #1251: a **start** outside its own box is `InitOutsideBounds`, and must not
+/// reach `BoundaryEstimate`, which is about where a fit *ended*.
+///
+/// This is not a taxonomy preference. `model_selection::estimate_near_boundary`
+/// reads `BoundaryEstimate` off `warnings_structured`, and it drives two
+/// **default-on** filters: `bootstrap`'s `skip_estimate_near_boundary`
+/// (`BootstrapOptions::default`) and `Strictness::reject_on_boundary`. Measured
+/// before the split: a start-side message carrying the phrase "optimizer bound"
+/// classified as `BoundaryEstimate`, `estimate_near_boundary` returned `true`,
+/// and `check_strictness` failed the fit with *"estimate pinned to a declared
+/// bound: TVCL **starts at** 1.00e11 …"*. A bootstrap would have dropped every
+/// replicate of a model whose start was clamped.
+///
+/// So the discriminator is asserted, not just the category (#1255): the two
+/// messages are classified side by side, and the start-side one is required to
+/// keep out of the estimate-side arm.
+#[test]
+fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
+    let start_side = classify_warning(
+        "W_INIT_OUTSIDE_BOUNDS: TVCL starts at a value of 1.0e11, above ferx's internal \
+         upper cap of 1.0e9. The start is clamped onto that rail before the first \
+         objective evaluation.",
+    );
+    let estimate_side = classify_warning(
+        "Parameter estimate(s) pinned to an optimizer bound: TVKA (50.0000 at upper bound).",
+    );
+
+    assert_eq!(start_side.category, WarningCode::InitOutsideBounds);
+    assert_eq!(start_side.severity, WarningSeverity::Warning);
+    assert_eq!(estimate_side.category, WarningCode::BoundaryEstimate);
+    assert_ne!(
+        start_side.category, estimate_side.category,
+        "the two must not share an arm — `estimate_near_boundary` reads the \
+         estimate-side one and drops bootstrap replicates on it"
+    );
+
+    // And the separation is by an explicit `W_` token, not by prose: a message
+    // that merely avoids the phrase "optimizer bound" would fall through to
+    // `General` instead, losing the typing altogether.
+    assert_eq!(
+        classify_warning("TVCL starts outside its packed box.").category,
+        WarningCode::General,
+        "without the token there is no arm to land in — which is why the token exists"
+    );
+}
+
 /// #778: the `WarningCode` serde token is a public API an agent / the R
 /// wrapper pins against. This snapshot fails loudly if a variant's token
 /// drifts, and asserts `as_str()` and the serde representation agree.
@@ -785,6 +831,7 @@ fn warning_code_tokens_are_stable() {
         (EtaShrinkage, "eta_shrinkage"),
         (BoundaryEstimate, "boundary_estimate"),
         (ParameterAtRunawayGuard, "parameter_at_runaway_guard"),
+        (InitOutsideBounds, "init_outside_bounds"),
         (InflatedRse, "inflated_rse"),
         (HighCorrelation, "high_correlation"),
         (DataQuality, "data_quality"),
@@ -988,6 +1035,13 @@ fn classify_warning_roundtrips_every_engine_message() {
             "Parameter estimate(s) pinned to an optimizer bound: CL (0.0010 at lower bound).",
             Warning,
             "boundary_estimate",
+        ),
+        (
+            "W_INIT_OUTSIDE_BOUNDS: ETA_CL starts at a variance of 1.0e8, above the \
+             optimizer's upper variance rail of 1.6e5. The start is clamped onto that \
+             rail before the first objective evaluation.",
+            Warning,
+            "init_outside_bounds",
         ),
         (
             "High relative standard error (RSE > 50%): TVCL (72%).",

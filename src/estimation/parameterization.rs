@@ -30,6 +30,67 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 
+/// Smallest THETA value the log packing represents: `pack_params` floors at it
+/// and `compute_bounds` floors the declared *lower* bound at it, so a
+/// declaration reaching below it arrives at the optimizer as this number.
+pub(crate) const THETA_PACK_FLOOR: f64 = 1e-10;
+
+/// Largest THETA value the log packing represents: `compute_bounds` ceilings
+/// the declared *upper* bound at it. Same story as [`THETA_PACK_FLOOR`] at the
+/// other end.
+///
+/// Both are spelled once here because three places read them — the packer, the
+/// box, and [`theta_guard_is_internal`], which exists to say "this bound is
+/// ours, not the user's" — and a diagnostic that quotes the cap has to quote the
+/// number the box actually used. Writing `ln(1e9).exp()` instead prints
+/// `9.999999999999993e8`.
+pub(crate) const THETA_PACK_CEIL: f64 = 1e9;
+
+/// Whether the THETA bound [`compute_bounds`] reports for coordinate `i` is one
+/// of ferx's own implementation caps rather than the user's effective declared
+/// limit. `side` is `"lower"` or `"upper"`.
+///
+/// Only the log-packed branch has caps: it floors the declared lower at `1e-10`
+/// and ceilings the declared upper at `1e9`, so a declaration reaching past
+/// either arrives at the packer as ferx's number, not the user's. The identity
+/// branch (`theta_lower < 0`) passes both bounds through untouched and is
+/// therefore never internal.
+///
+/// The distinction decides *whose* fault a bound hit is. Its consumer is the
+/// post-fit runaway guard (`api::postfit`), which routes an internal-cap hit
+/// away from the "relax your bound" advice. It lives here, with the caps it
+/// describes.
+///
+/// The **start**-side check (`check_packed_start_in_box`) used to call this too,
+/// to split its θ hits into "declared" and "internal". It no longer does: the
+/// split there is now which of two walks claimed the coordinate — see
+/// [`theta_outside_declared_range`], which answers the declared question on the
+/// natural scale and so does not need to know whose number a *packed* bound
+/// came from (#1309 review).
+pub(crate) fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
+    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
+    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
+    theta_packs_log(lower)
+        && match side {
+            "lower" => lower <= THETA_PACK_FLOOR,
+            "upper" => upper >= THETA_PACK_CEIL,
+            _ => false,
+        }
+}
+
+/// Packed lower rail for a SIGMA coordinate: `exp(-8) ≈ 3.4e-4`.
+///
+/// Named because three places spell it — [`unpinned_bounds`], which pushes it;
+/// the start-side diagnostic, which quotes the interval back at the user; and
+/// the docs tables. Before #1309's review the diagnostic carried its own
+/// literal `-8.0`, so moving the rail would have left the message quoting the
+/// old one with nothing to catch it.
+pub(crate) const SIGMA_PACK_LOWER: f64 = -8.0;
+
+/// Packed upper rail for a SIGMA coordinate: `exp(5) ≈ 148`. See
+/// [`SIGMA_PACK_LOWER`].
+pub(crate) const SIGMA_PACK_UPPER: f64 = 5.0;
+
 /// Unconstrained-space bound for a Fisher-z (`atanh ρ`) residual-correlation
 /// coordinate (#847). `tanh(3) ≈ 0.995_05`, so `1 − ρ² ≥ 9.9e-3`.
 ///
@@ -93,7 +154,7 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     // can be expressed at all).
     for (i, &th) in params.theta.iter().enumerate() {
         if theta_packs_log(params.theta_lower[i]) {
-            v.push(th.max(1e-10).ln());
+            v.push(th.max(THETA_PACK_FLOOR).ln());
         } else {
             v.push(th);
         }
@@ -398,8 +459,8 @@ pub(crate) fn packed_held_mask(template: &ModelParameters) -> Vec<bool> {
 /// always `false`. Layout mirrors [`packed_fixed_mask`]:
 /// `[theta, Ω (lower-tri col-major), sigma, Ω_IOV (lower-tri col-major)]`.
 pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
-    let mut mask = vec![false; packed_len(template)];
-    let n_theta = template.theta.len();
+    let segs = packed_segments(template);
+    let mut mask = vec![false; segs.total()];
 
     // Mark the lower-triangle off-diagonals of `om` that are structural zeros,
     // walking the same column-major order `packed_fixed_mask` / `pack_params` use.
@@ -416,12 +477,10 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
         }
     };
 
-    mark(&mut mask, &template.omega, n_theta);
+    mark(&mut mask, &template.omega, segs.omega_start());
 
     if let Some(ref iov) = template.omega_iov {
-        let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-        let iov_start = n_theta + n_omega + template.sigma.values.len();
-        mark(&mut mask, iov, iov_start);
+        mark(&mut mask, iov, segs.iov_start());
     }
 
     mask
@@ -490,20 +549,82 @@ pub(crate) fn coordinate_kinds(template: &ModelParameters) -> Vec<PackedCoordKin
     kinds
 }
 
+/// Length of each segment of the packed vector, in [`pack_params`] order:
+/// `[theta, Ω, sigma, Ω_IOV, mixture-Ω, mixture-Σ, ρ]`.
+///
+/// The packed vector carries no provenance, so every consumer that needs to
+/// know *which kind of declaration* a coordinate came from has to re-derive
+/// these boundaries. Before #1252 three places did so independently
+/// ([`packed_len`], `omega_structural_zero_mask`'s `iov_start`, and
+/// `api::validation::variance_decl_by_coordinate`), each with its own copy of
+/// the `omega_packed_len` / `map_or(0, …)` arithmetic. One derivation, so a
+/// layout change moves every consumer together — and the offsets are only ever
+/// spelled once, here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackedSegments {
+    pub(crate) theta: usize,
+    pub(crate) omega: usize,
+    pub(crate) sigma: usize,
+    pub(crate) iov: usize,
+    pub(crate) mixture_omega: usize,
+    pub(crate) mixture_sigma: usize,
+    pub(crate) rho: usize,
+}
+
+impl PackedSegments {
+    /// First Ω coordinate (== the θ count).
+    pub(crate) fn omega_start(self) -> usize {
+        self.theta
+    }
+    /// First Σ coordinate.
+    pub(crate) fn sigma_start(self) -> usize {
+        self.omega_start() + self.omega
+    }
+    /// First Ω_IOV coordinate.
+    pub(crate) fn iov_start(self) -> usize {
+        self.sigma_start() + self.sigma
+    }
+    /// First `[mixture]` Ω-override coordinate — i.e. one past the last Ω_IOV.
+    pub(crate) fn mixture_omega_start(self) -> usize {
+        self.iov_start() + self.iov
+    }
+    /// First `[mixture]` Σ-override coordinate.
+    pub(crate) fn mixture_sigma_start(self) -> usize {
+        self.mixture_omega_start() + self.mixture_omega
+    }
+    /// First `block_sigma` residual-correlation coordinate (#847) — they are
+    /// packed last.
+    pub(crate) fn rho_start(self) -> usize {
+        self.mixture_sigma_start() + self.mixture_sigma
+    }
+    /// Total packed length.
+    pub(crate) fn total(self) -> usize {
+        self.rho_start() + self.rho
+    }
+}
+
+/// Per-segment lengths of `template`'s packed vector. See [`PackedSegments`].
+pub(crate) fn packed_segments(template: &ModelParameters) -> PackedSegments {
+    let (mixture_omega, mixture_sigma) = template.mixture.as_ref().map_or((0, 0), |mix| {
+        (mix.omega_override_addr.len(), mix.sigma_override_addr.len())
+    });
+    PackedSegments {
+        theta: template.theta.len(),
+        omega: omega_packed_len(template.omega.dim(), template.omega.diagonal),
+        sigma: template.sigma.values.len(),
+        iov: template
+            .omega_iov
+            .as_ref()
+            .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal)),
+        mixture_omega,
+        mixture_sigma,
+        rho: template.residual_correlations.len(),
+    }
+}
+
 /// Compute the number of packed parameters
 pub fn packed_len(template: &ModelParameters) -> usize {
-    let n_theta = template.theta.len();
-    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-    let n_sigma = template.sigma.values.len();
-    let n_iov = template
-        .omega_iov
-        .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let n_mixture = template.mixture.as_ref().map_or(0, |mix| {
-        mix.omega_override_addr.len() + mix.sigma_override_addr.len()
-    });
-    let n_rho = template.residual_correlations.len();
-    n_theta + n_omega + n_sigma + n_iov + n_mixture + n_rho
+    packed_segments(template).total()
 }
 
 /// Index of the first `block_sigma` residual-correlation coordinate in the
@@ -511,7 +632,365 @@ pub fn packed_len(template: &ModelParameters) -> usize {
 /// since they are packed last. Callers that assemble or read a ρ slot must go
 /// through this rather than re-deriving the offset.
 pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
-    packed_len(template) - template.residual_correlations.len()
+    packed_segments(template).rho_start()
+}
+
+/// A packed start, the box it is optimized inside, and its FIX mask — the three
+/// vectors every optimizer entry point needs, produced together (#1252).
+///
+/// [`compute_bounds`] cannot build the box without *also* building the packed
+/// vector and the FIX mask (a FIX-ed coordinate is pinned at its own packed
+/// value), and before #1252 it discarded both, leaving each of its fourteen
+/// production callers to recompute one or two of them immediately afterwards.
+/// This is the shape that hands them back.
+///
+/// It is also the substrate the two box predicates share: the post-fit
+/// `runaway_guard_estimates` (is the **estimate** on a guard?) and the
+/// start-side `check_packed_start_in_box` (is the **start** outside the box?)
+/// walk the same three vectors and differ only in the comparison.
+pub(crate) struct PackedStart {
+    /// [`pack_params`] of the template.
+    pub(crate) packed: Vec<f64>,
+    /// [`compute_bounds`] of the template — FIX coordinates already pinned.
+    pub(crate) bounds: PackedBounds,
+    /// [`packed_fixed_mask`] of the template.
+    pub(crate) fixed: Vec<bool>,
+}
+
+/// Pack `template`, bound it, and mask its FIX coordinates in one **call**.
+///
+/// Not in one traversal, and the distinction is worth keeping straight: the
+/// body still walks the template once per product (`pack_params`,
+/// `packed_fixed_mask`, `unpinned_bounds`) plus once more to apply the FIX pin.
+/// What #1252 needed was not fewer traversals — measured, all fourteen call
+/// sites together are 0.0034% of a fit — but that the three products stop being
+/// computed and discarded: [`compute_bounds`] built the packed vector and the
+/// FIX mask internally and threw both away, leaving each caller to rebuild one
+/// or two of them immediately afterwards, from arithmetic that had to agree.
+///
+/// Byte-for-byte what `(pack_params, compute_bounds, packed_fixed_mask)`
+/// produce separately — [`compute_bounds`] is now this function with two of its
+/// three results dropped, so there is no second copy of the box to drift.
+pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
+    let packed = pack_params(template);
+    let fixed = packed_fixed_mask(template);
+    let mut bounds = unpinned_bounds(template);
+
+    // Pin any FIX parameters to their packed (log-space) initial value.
+    // We build the box first, then overwrite lower=upper=packed[i] for fixed
+    // indices. Box-before-overwrite is correct even for block Cholesky
+    // off-diagonals, whose "packed" value is the raw L[i,j] (not log-transformed).
+    for (i, &is_fixed) in fixed.iter().enumerate() {
+        if is_fixed {
+            bounds.lower[i] = packed[i];
+            bounds.upper[i] = packed[i];
+        }
+    }
+
+    PackedStart {
+        packed,
+        bounds,
+        fixed,
+    }
+}
+
+/// Which side of its own box a packed start fell off.
+///
+/// `Ord` so a `(index, side)` pair can key the set `check_packed_start_in_box`
+/// uses to partition the θ segment between its declared-range and its
+/// internal-rail walks; the ordering itself carries no meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BoxSide {
+    /// `packed < lower`.
+    Below,
+    /// `packed > upper`.
+    Above,
+}
+
+impl BoxSide {
+    /// The `"lower"` / `"upper"` token the bound-side helpers spell, notably
+    /// [`theta_guard_is_internal`].
+    pub(crate) fn bound_name(self) -> &'static str {
+        match self {
+            BoxSide::Below => "lower",
+            BoxSide::Above => "upper",
+        }
+    }
+
+    /// The word for a message: which way the start lies from its bound.
+    pub(crate) fn direction(self) -> &'static str {
+        match self {
+            BoxSide::Below => "below",
+            BoxSide::Above => "above",
+        }
+    }
+}
+
+/// A packed coordinate whose start lies **strictly** outside its own box.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutOfBox {
+    /// Index into the packed vector.
+    pub(crate) index: usize,
+    /// What kind of quantity the coordinate holds — which decides how to read
+    /// `packed` and `bound` back onto a reporting scale.
+    pub(crate) kind: PackedCoordKind,
+    /// The packed start.
+    pub(crate) packed: f64,
+    /// The bound it fell outside, in the same packed space.
+    pub(crate) bound: f64,
+    pub(crate) side: BoxSide,
+}
+
+/// Every packed coordinate whose start is **strictly** outside its own box —
+/// the coordinates `clamp_to_bounds` will silently move before the first
+/// objective evaluation (#1251).
+///
+/// Strict, not `<=`/`>=`, and that is the whole of it: at `packed == bound` the
+/// clamp is a **no-op**, so nothing is moved and there is nothing to report.
+/// (NM-TRAN disagrees and rejects `init == bound` too, with errors 627/628; the
+/// two live fixtures in this repo with that shape — `theta TVF(1.0, 0.01, 1.0)`
+/// and `theta TVLAG(0.0, 0.0, 12.0)` — are both idiomatic, and an inclusive
+/// rule would reject both to catch nothing.)
+///
+/// **There is deliberately no `fixed` consult.** [`pack_with_bounds`] pins a
+/// FIX-ed coordinate to `lower == upper == packed[i]` *from this same packed
+/// vector*, so a strict inequality is structurally false for it. A mask test
+/// here would be a second gate rejecting exactly what the first one already
+/// rejects — the shape that cannot fail and cannot be mutation-tested.
+///
+/// Two things it cannot see, both because [`pack_params`] clamps *before* any
+/// box exists:
+///
+/// * **ρ**: [`pack_rho`] clamps into `±RHO_Z_BOUND` and `compute_bounds` pushes
+///   `±RHO_Z_BOUND` — the same constant — so a ρ slot is never outside.
+/// * **the `1e-10` value floor** on θ / Ω diagonals / Σ / mixture overrides: the
+///   bound is floored identically, so a floored start compares equal. That also
+///   makes a `NaN` θ invisible, since `f64::max` discards `NaN` and
+///   `NaN.max(1e-10)` is `1e-10`.
+///
+/// The second of those defeats the **θ** half of #1251 outright whenever the
+/// declared lower bound is itself at or below the floor, `theta TVCL(-5.0, 0.0,
+/// 10.0)` being the idiomatic spelling — so a θ is judged against its
+/// *declaration* by [`theta_outside_declared_range`] instead, and this walk
+/// keeps only ferx's internal rails on that segment (#1309 review).
+pub(crate) fn coordinates_outside_bounds<'a>(
+    start: &'a PackedStart,
+    kinds: &'a [PackedCoordKind],
+) -> impl Iterator<Item = OutOfBox> + 'a {
+    (0..start.packed.len()).filter_map(move |index| {
+        // A coordinate any one of the parallel vectors is too short to describe
+        // cannot be judged. `ModelParameters` is public and every producer in
+        // the crate keeps these in lockstep, so this only guards a hand-built
+        // one against a panic.
+        let (&packed, &lower, &upper, &kind) = (
+            start.packed.get(index)?,
+            start.bounds.lower.get(index)?,
+            start.bounds.upper.get(index)?,
+            kinds.get(index)?,
+        );
+        // An **unbounded** box places nothing: `theta_lower = -inf` /
+        // `theta_upper = +inf` is what `model_parser` gives an auto-declared
+        // theta, and `clamp(-inf, inf)` is a well-defined no-op, so there is
+        // genuinely nothing to report. The packed value is left to speak
+        // otherwise: `±inf` really is outside, and `NaN` compares false either
+        // way.
+        if !lower.is_finite() || !upper.is_finite() {
+            return None;
+        }
+        // An **empty** box is a different thing, and declining it here is not
+        // benign: `clamp_to_bounds` calls `f64::clamp`, which panics on
+        // `min > max`. It is claimed by `coordinates_with_inverted_bounds`
+        // below, whose diagnostic is an error precisely so the fit stops here
+        // rather than in the clamp (#1309 review).
+        if lower > upper {
+            return None;
+        }
+        let (bound, side) = if packed < lower {
+            (lower, BoxSide::Below)
+        } else if packed > upper {
+            (upper, BoxSide::Above)
+        } else {
+            return None;
+        };
+        Some(OutOfBox {
+            index,
+            kind,
+            packed,
+            bound,
+            side,
+        })
+    })
+}
+
+/// The declared range of θ `i` intersected with ferx's packing caps, on the
+/// **natural** scale — the interval a start actually has to land inside.
+///
+/// [`unpinned_bounds`] packs exactly this, so the two cannot drift: the caps
+/// live here and the `ln` lives there. Reading the interval back out of the
+/// packed box instead would go through `exp(ln(x))`, which is not the identity
+/// — `exp(ln(1e-10))` is `9.999999999999996e-11` and `exp(ln(1e9))` is
+/// `9.999999999999993e8`, so a diagnostic quoting it hands the user seventeen
+/// digits of a number they wrote as `1e9` (#1309 review).
+///
+/// The identity branch (`theta_lower < 0`) has no caps and passes both bounds
+/// through, matching [`theta_guard_is_internal`], which is never internal there.
+pub(crate) fn theta_representable_range(params: &ModelParameters, i: usize) -> (f64, f64) {
+    let (lower, upper) = (params.theta_lower[i], params.theta_upper[i]);
+    if theta_packs_log(lower) {
+        (lower.max(THETA_PACK_FLOOR), upper.min(THETA_PACK_CEIL))
+    } else {
+        (lower, upper)
+    }
+}
+
+/// A θ whose **initial estimate** lies strictly outside its own **declared**
+/// range, judged on the natural scale rather than the packed one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutOfDeclaredRange {
+    /// Index into `theta` — which is also the packed index, since θ occupies
+    /// the leading segment.
+    pub(crate) index: usize,
+    /// Which declared bound the estimate fell outside.
+    pub(crate) side: BoxSide,
+    /// The declared initial estimate, `theta[index]`.
+    pub(crate) value: f64,
+    /// The declared bound it fell outside — the user's own literal, never a
+    /// cap ferx substituted.
+    pub(crate) bound: f64,
+}
+
+/// Every θ whose initial estimate is strictly outside its own **declared**
+/// range — the question [`coordinates_outside_bounds`] cannot answer, because
+/// the packer floors *both* the value and the bound at [`THETA_PACK_FLOOR`]
+/// before any box exists (#1309 review).
+///
+/// The gap is not exotic. `theta TVCL(-5.0, 0.0, 10.0)` packs to
+/// `packed = lower = ln(1e-10) = -23.0259`, so the packed comparison sees a
+/// start exactly *on* its bound and reports nothing — while the fit actually
+/// begins from `1e-10`, which is neither the declared `-5` nor the declared
+/// `0`. A declared lower bound of `0` is the idiomatic spelling for a
+/// positive parameter (`theta TVLAG(0.0, 0.0, 12.0)` ships in this repo), so
+/// the shape most likely to carry the defect was the one shape invisible to
+/// the packed predicate. NM-TRAN rejects `$THETA (0, -5, 10)` with error 24.
+///
+/// On the declared sides this predicate is **strictly stronger** than the
+/// packed one and never weaker: for a log-packed θ with `theta_lower >
+/// THETA_PACK_FLOOR`, `packed < lower` holds exactly when `theta < theta_lower`
+/// up to `ln`'s rounding, which can only lose hits, never invent them. Measured
+/// over every `.ferx` in the tree at the time of writing — 154 that parse — it
+/// finds **zero** violations, the same answer the packed walk gives.
+///
+/// Not judged here, deliberately:
+///
+/// * a **FIX**-ed θ, and this walk needs an explicit `theta_fixed` consult
+///   where [`coordinates_outside_bounds`] deliberately has none. There the
+///   exclusion is structural — [`pack_with_bounds`] pins a FIX-ed coordinate to
+///   `lower == upper == packed[i]`, so a strict inequality against its own box
+///   is false by construction. This walk never looks at that box, so the pin is
+///   invisible to it, and `theta TVCL(0.05, 0.1, 10.0, FIX)` would be reported
+///   as an error while the fit runs at exactly the declared `0.05` with nothing
+///   moved. A false positive that refuses a working model is worse than the
+///   silence this check exists to end.
+/// * a **non-finite** bound. `model_parser` gives an auto-declared theta
+///   `(-inf, +inf)`; there is no declaration to violate.
+/// * an **empty** declared range (`lower > upper`), and a `NaN` bound with it.
+///   That is [`coordinates_with_inverted_bounds`]' object, and its caller runs
+///   that walk first and excludes what it claims. A declared range that is
+///   empty always packs to an empty box — `ln` is monotone and both caps only
+///   push the bounds further apart — so nothing escapes between the two.
+/// * a `NaN` **estimate**, which compares false against either bound. Same
+///   blind spot the packed walk documents, and the same reason.
+pub(crate) fn theta_outside_declared_range(
+    params: &ModelParameters,
+) -> impl Iterator<Item = OutOfDeclaredRange> + '_ {
+    (0..params.theta.len()).filter_map(move |index| {
+        let (&value, &lower, &upper) = (
+            params.theta.get(index)?,
+            params.theta_lower.get(index)?,
+            params.theta_upper.get(index)?,
+        );
+        // See the FIX note above: the box pin this walk cannot see.
+        if params.theta_fixed.get(index).copied().unwrap_or(false) {
+            return None;
+        }
+        let (side, bound) = if lower.is_finite() && value < lower {
+            (BoxSide::Below, lower)
+        } else if upper.is_finite() && value > upper {
+            (BoxSide::Above, upper)
+        } else {
+            return None;
+        };
+        Some(OutOfDeclaredRange {
+            index,
+            side,
+            value,
+            bound,
+        })
+    })
+}
+
+/// A packed coordinate whose **box itself** is empty — `lower > upper`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InvertedBox {
+    /// Index into the packed vector.
+    pub(crate) index: usize,
+    /// What kind of quantity the coordinate holds. Only [`PackedCoordKind::Theta`]
+    /// is reachable through the parser; see [`coordinates_with_inverted_bounds`].
+    pub(crate) kind: PackedCoordKind,
+    /// The packed lower bound — the larger of the two.
+    pub(crate) lower: f64,
+    /// The packed upper bound.
+    pub(crate) upper: f64,
+}
+
+/// Every packed coordinate whose box is **empty**: `lower > upper`, so no value
+/// is inside it and `clamp_to_bounds` cannot clamp into it (#1309 review).
+///
+/// This is not a variant of "outside the box" — there is no side to be outside
+/// of — and it is not cosmetic. `clamp_to_bounds` calls [`f64::clamp`], which
+/// **panics** on `min > max`; every optimizer entry point clamps the start
+/// before its first evaluation, `evaluate_at_initial_params` included, so an
+/// empty box aborts the process rather than producing a diagnostic. Reporting
+/// it as an error is what stops the fit before the clamp.
+///
+/// **Only THETA can reach this**, and the reason is worth stating because it is
+/// what keeps the check from needing a per-kind message: every other segment's
+/// bounds are compile-time constants ([`unpinned_bounds`] pushes `±6`, `±10`,
+/// `[-8, 5]` and `±RHO_Z_BOUND`), and [`pack_with_bounds`] pins a FIX-ed
+/// coordinate to `lower == upper`, which is equal, not inverted. The iterator
+/// is written over every coordinate anyway, so a future rail that could invert
+/// is reported rather than silently skipped.
+///
+/// With `theta_lower <= theta_upper` the box still inverts in two ways, both
+/// from caps [`unpinned_bounds`] applies and the declaration does not mention:
+/// `theta_lower > `[`THETA_PACK_CEIL`] and `theta_upper < `[`THETA_PACK_FLOOR`].
+/// `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter — is the
+/// second, and it packs to `lower = -23.03` against `upper = -25.33`.
+pub(crate) fn coordinates_with_inverted_bounds<'a>(
+    start: &'a PackedStart,
+    kinds: &'a [PackedCoordKind],
+) -> impl Iterator<Item = InvertedBox> + 'a {
+    (0..start.packed.len()).filter_map(move |index| {
+        // Same short-vector guard as `coordinates_outside_bounds`.
+        let (&lower, &upper, &kind) = (
+            start.bounds.lower.get(index)?,
+            start.bounds.upper.get(index)?,
+            kinds.get(index)?,
+        );
+        // `!(lower <= upper)` rather than `lower > upper` so a `NaN` bound is
+        // caught too: `clamp` panics on a `NaN` min or max just as it does on
+        // an inverted pair, and `NaN > x` is false.
+        if lower.is_nan() || upper.is_nan() || lower > upper {
+            Some(InvertedBox {
+                index,
+                kind,
+                lower,
+                upper,
+            })
+        } else {
+            None
+        }
+    })
 }
 
 /// Compute box constraints for the packed parameter vector.
@@ -519,7 +998,20 @@ pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
 /// Parameters marked FIX are given `lower == upper == packed_value`, which
 /// pins them for every optimizer that respects box bounds (NLopt SLSQP/L-BFGS/MMA,
 /// the hand-rolled BFGS, and the Gauss-Newton clamp on proposed steps).
+///
+/// A caller that also needs the packed vector or the FIX mask — which is every
+/// production caller — should use `pack_with_bounds` and take `.bounds` from it
+/// rather than pairing this with a second [`pack_params`] walk (#1252).
+/// (`pack_with_bounds` is crate-internal, so it is not a link here.)
 pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
+    pack_with_bounds(template).bounds
+}
+
+/// The box *before* FIX coordinates are pinned to their packed value — the
+/// declared-θ / rail arithmetic on its own. Private because a caller that saw
+/// this box would judge a FIX-ed coordinate against a rail it is never
+/// optimized against; [`pack_with_bounds`] is the only way in.
+fn unpinned_bounds(template: &ModelParameters) -> PackedBounds {
     let n_theta = template.theta.len();
     let n_eta = template.omega.dim();
     let n_sigma = template.sigma.values.len();
@@ -528,14 +1020,18 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     let mut upper = Vec::new();
 
     // Theta bounds — packed in whichever space `pack_params` uses
-    // (log when sign-constrained, identity otherwise).
+    // (log when sign-constrained, identity otherwise). The interval itself
+    // comes from `theta_representable_range`, so the cap policy has one
+    // definition and the diagnostics can quote it without an `exp(ln(x))`
+    // round trip, which is not the identity (#1309 review).
     for i in 0..n_theta {
+        let (lo, hi) = theta_representable_range(template, i);
         if theta_packs_log(template.theta_lower[i]) {
-            lower.push(template.theta_lower[i].max(1e-10).ln());
-            upper.push(template.theta_upper[i].min(1e9).ln());
+            lower.push(lo.ln());
+            upper.push(hi.ln());
         } else {
-            lower.push(template.theta_lower[i]);
-            upper.push(template.theta_upper[i]);
+            lower.push(lo);
+            upper.push(hi);
         }
     }
 
@@ -561,8 +1057,8 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
 
     // Sigma bounds (log-transformed)
     for _ in 0..n_sigma {
-        lower.push(-8.0); // exp(-8) ≈ 3e-4
-        upper.push(5.0); // exp(5) ≈ 148
+        lower.push(SIGMA_PACK_LOWER); // exp(-8) ≈ 3e-4
+        upper.push(SIGMA_PACK_UPPER); // exp(5) ≈ 148
     }
 
     // IOV bounds: diagonal same as BSV diagonal; off-diagonal same as BSV off-diagonal.
@@ -587,8 +1083,8 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
             upper.push(6.0);
         }
         for _ in 0..mix.sigma_override_addr.len() {
-            lower.push(-8.0);
-            upper.push(5.0);
+            lower.push(SIGMA_PACK_LOWER);
+            upper.push(SIGMA_PACK_UPPER);
         }
     }
 
@@ -598,19 +1094,6 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     for _ in 0..template.residual_correlations.len() {
         lower.push(-RHO_Z_BOUND);
         upper.push(RHO_Z_BOUND);
-    }
-
-    // Pin any FIX parameters to their packed (log-space) initial value.
-    // We pack first, then overwrite lower=upper=packed[i] for fixed indices.
-    // Pack-before-overwrite is correct even for block Cholesky off-diagonals,
-    // whose "packed" value is the raw L[i,j] (not log-transformed).
-    let packed = pack_params(template);
-    let fixed_mask = packed_fixed_mask(template);
-    for i in 0..fixed_mask.len() {
-        if fixed_mask[i] {
-            lower[i] = packed[i];
-            upper[i] = packed[i];
-        }
     }
 
     PackedBounds { lower, upper }
@@ -853,9 +1336,36 @@ pub fn remove_scale(x_scaled: &[f64], scale: &[f64]) -> Vec<f64> {
     x_scaled.iter().zip(scale).map(|(v, s)| v * s).collect()
 }
 
-/// Clamp a vector to box constraints
+/// Clamp a vector to box constraints.
+///
+/// # Panics
+///
+/// [`f64::clamp`] panics on `min > max` or on a `NaN` bound, so this **requires
+/// a non-empty, orderable box** on every coordinate. That is a precondition of
+/// the function, not a property of `PackedBounds`: `unpinned_bounds` applies
+/// caps the declaration does not mention, and `theta TVCL(1e-12, 1e-13, 1e-11)`
+/// — an ordinary small parameter — packs to `lower = -23.03` against
+/// `upper = -25.33`.
+///
+/// The guarantor today is `api::validation::check_packed_start_in_box`, whose
+/// `E_INIT_BOUNDS_INVERTED` arm (`coordinates_with_inverted_bounds`) stops
+/// the fit with a diagnostic before any optimizer entry point clamps. Every
+/// current call site is downstream of `fit_inner`, so the panic is unreachable
+/// — but that is a property of the call graph, and a future producer of a
+/// *narrowed* box (a search bounding a candidate, a tool rewriting
+/// `theta_lower`) reopens it. The `debug_assert!` below names the guarantor so
+/// such a caller fails loudly in debug rather than inside `core::num` (#1309
+/// review).
 pub fn clamp_to_bounds(x: &mut [f64], bounds: &PackedBounds) {
     for i in 0..x.len() {
+        debug_assert!(
+            bounds.lower[i] <= bounds.upper[i],
+            "coordinate {i} has no orderable packed box (lower {}, upper {}); \
+             `check_packed_start_in_box` must have reported E_INIT_BOUNDS_INVERTED \
+             and stopped the fit before reaching the clamp",
+            bounds.lower[i],
+            bounds.upper[i],
+        );
         x[i] = x[i].clamp(bounds.lower[i], bounds.upper[i]);
     }
 }
@@ -1085,6 +1595,285 @@ mod tests {
         let template = make_template();
         // 2 theta + 2 diagonal omega + 1 sigma = 5
         assert_eq!(packed_len(&template), 5);
+    }
+
+    // ── #1252: `pack_with_bounds` / `packed_segments` ───────────────────────
+
+    /// A template carrying **every** packed segment at once, each with a free
+    /// coordinate (so its rail is observable) *and* a FIX-ed one (so the pin
+    /// is): θ in both packings plus a FIX, a 3×3 `block_omega` with the third
+    /// eta FIX-ed, two Σ with the second FIX-ed, a diagonal Ω_IOV with the
+    /// second κ FIX-ed, **three** `[mixture]` Ω overrides and **two** Σ
+    /// overrides (one FIX-ed each), and one `block_sigma` ρ.
+    ///
+    /// Not a model anyone would write — a block Ω under a `[mixture]` is not
+    /// something the parser emits. That is the point: this is a test of the
+    /// *packer's layout*, and the only way one walk can be shown to visit
+    /// every segment is to give it every segment.
+    ///
+    /// The two mixture segments have **different** lengths on purpose. With two
+    /// of each, swapping `mixture_omega` and `mixture_sigma` in
+    /// `packed_segments` left the whole suite green — a mutation the fixture,
+    /// not the assertion, was blind to.
+    ///
+    /// Packed layout, 19 coordinates:
+    /// `[θ×3 | Ω×6 | Σ×2 | Ω_IOV×2 | mixΩ×3 | mixΣ×2 | ρ×1]`.
+    fn make_all_segments_template() -> ModelParameters {
+        let om = DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.09, 0.02, 0.01, 0.02, 0.04, 0.005, 0.01, 0.005, 0.16],
+        );
+        let eta_names: Vec<String> = vec!["eta_cl".into(), "eta_v".into(), "eta_ka".into()];
+        let omega = OmegaMatrix::from_matrix(om, eta_names.clone(), false);
+        let iov =
+            OmegaMatrix::from_diagonal(&[0.05, 0.06], vec!["kappa_cl".into(), "kappa_v".into()]);
+        let sigma = SigmaVector {
+            values: vec![0.3, 1.0],
+            names: vec!["sig_prop".into(), "sig_add".into()],
+        };
+        let mix_class = |v: f64| OmegaMatrix::from_diagonal(&[v, 0.04, 0.16], eta_names.clone());
+        ModelParameters {
+            theta: vec![10.0, -0.8, 0.8],
+            theta_names: vec!["tvcl".into(), "gamma".into(), "tvf".into()],
+            // `gamma`'s negative lower bound is what selects identity packing.
+            theta_lower: vec![0.01, -3.0, 0.1],
+            theta_upper: vec![1000.0, 3.0, 1.0],
+            theta_fixed: vec![false, false, true],
+            omega,
+            omega_fixed: vec![false, false, true],
+            sigma,
+            sigma_fixed: vec![false, true],
+            omega_iov: Some(iov),
+            kappa_fixed: vec![false, true],
+            mixture: Some(crate::types::MixtureParams {
+                omega: vec![mix_class(0.09), mix_class(0.25), mix_class(0.36)],
+                sigma: vec![
+                    SigmaVector {
+                        values: vec![0.3, 1.0],
+                        names: vec!["sig_prop".into(), "sig_add".into()],
+                    },
+                    SigmaVector {
+                        values: vec![0.5, 1.0],
+                        names: vec!["sig_prop".into(), "sig_add".into()],
+                    },
+                    SigmaVector {
+                        values: vec![0.7, 1.0],
+                        names: vec!["sig_prop".into(), "sig_add".into()],
+                    },
+                ],
+                omega_override_addr: vec![(1, 0), (2, 0), (1, 1)],
+                omega_override_fixed: vec![false, false, true],
+                sigma_override_addr: vec![(1, 0), (2, 0)],
+                sigma_override_fixed: vec![false, true],
+            }),
+            residual_correlations: vec![ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 0.42,
+            }],
+            residual_correlation_fixed: vec![false],
+        }
+    }
+
+    /// T1 (#1252). One walk produces the packed vector, the box and the FIX
+    /// mask, and each is what the three separate functions produce.
+    ///
+    /// The `packed` / `fixed` halves are compared against `pack_params` /
+    /// `packed_fixed_mask` — genuinely separate walks. The **box** is not
+    /// compared against `compute_bounds`, which is now this function with two
+    /// results dropped and would agree with itself whatever it did; it is
+    /// pinned against the rails spelled out in `unpinned_bounds`, per segment,
+    /// so dropping a segment from that walk reddens here rather than merely
+    /// shifting both sides of a self-comparison.
+    #[test]
+    fn pack_with_bounds_agrees_with_the_three_separate_walks() {
+        let t = make_all_segments_template();
+        let start = pack_with_bounds(&t);
+
+        // 3 θ + 6 Ω (3×3 lower triangle) + 2 Σ + 2 Ω_IOV + 3 mixΩ + 2 mixΣ + 1 ρ
+        assert_eq!(start.packed.len(), 19, "every segment must be present");
+        assert_eq!(start.bounds.lower.len(), 19);
+        assert_eq!(start.bounds.upper.len(), 19);
+        assert_eq!(start.fixed.len(), 19);
+
+        // Bit-for-bit against the separate walks, not merely close: the whole
+        // point of #1252 is that nothing downstream can tell the difference.
+        let separate_packed = pack_params(&t);
+        let separate_fixed = packed_fixed_mask(&t);
+        for i in 0..19 {
+            assert_eq!(
+                start.packed[i].to_bits(),
+                separate_packed[i].to_bits(),
+                "packed[{i}]"
+            );
+            assert_eq!(start.fixed[i], separate_fixed[i], "fixed[{i}]");
+        }
+
+        // The FIX mask this template declares, per segment.
+        assert_eq!(
+            start.fixed,
+            vec![
+                false, false, true, // θ: tvf is FIX
+                false, false, true, false, true, true, // Ω: eta_ka FIX ⇒ (2,0),(2,1),(2,2)
+                false, true, // Σ
+                false, true, // Ω_IOV
+                false, false, true, // mixture Ω overrides
+                false, true,  // mixture Σ overrides
+                false, // ρ
+            ]
+        );
+
+        // The box, segment by segment. Free coordinates carry their rail;
+        // FIX-ed coordinates are pinned to their own packed value.
+        let (lo, hi) = (&start.bounds.lower, &start.bounds.upper);
+        // θ0 log-packed (lower ≥ 0): the declared range in log space.
+        assert_relative_eq!(lo[0], 0.01f64.ln(), epsilon = 1e-12);
+        assert_relative_eq!(hi[0], 1000.0f64.ln(), epsilon = 1e-12);
+        // θ1 identity-packed (negative lower): the declared range verbatim.
+        assert_relative_eq!(lo[1], -3.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[1], 3.0, epsilon = 1e-12);
+        // Ω diagonals [-6, 6], off-diagonals [-10, 10].
+        assert_relative_eq!(lo[3], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[3], 6.0, epsilon = 1e-12);
+        assert_relative_eq!(lo[4], -10.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[4], 10.0, epsilon = 1e-12);
+        assert_relative_eq!(lo[6], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[6], 6.0, epsilon = 1e-12);
+        // Σ [-8, 5].
+        assert_relative_eq!(lo[9], -8.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[9], 5.0, epsilon = 1e-12);
+        // Ω_IOV diagonal, same rails as the BSV diagonal.
+        assert_relative_eq!(lo[11], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[11], 6.0, epsilon = 1e-12);
+        // Mixture Ω override takes the Ω-diagonal rail; Σ override the Σ rail.
+        assert_relative_eq!(lo[13], -6.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[13], 6.0, epsilon = 1e-12);
+        assert_relative_eq!(lo[16], -8.0, epsilon = 1e-12);
+        assert_relative_eq!(hi[16], 5.0, epsilon = 1e-12);
+        // ρ in Fisher-z space.
+        assert_relative_eq!(lo[18], -RHO_Z_BOUND, epsilon = 1e-12);
+        assert_relative_eq!(hi[18], RHO_Z_BOUND, epsilon = 1e-12);
+
+        // Every FIX-ed coordinate is pinned to its own packed value — and the
+        // pin is *observable*, i.e. it is not merely the rail it would have
+        // carried anyway. Without the second half a `pack_with_bounds` that
+        // forgot to pin would still pass on a coordinate sitting on its rail.
+        for i in 0..19 {
+            if !start.fixed[i] {
+                continue;
+            }
+            assert_eq!(lo[i].to_bits(), start.packed[i].to_bits(), "lower pin @{i}");
+            assert_eq!(hi[i].to_bits(), start.packed[i].to_bits(), "upper pin @{i}");
+            assert!(
+                lo[i] > -5.9 && hi[i] < 5.9,
+                "the pin at {i} must be distinguishable from the rail it replaced, got {}",
+                lo[i]
+            );
+        }
+    }
+
+    /// T2 (#1252). `packed_segments` names the same boundaries the packed
+    /// vector actually has.
+    ///
+    /// `pack_params` and `coordinate_names` are two walks of the layout that do
+    /// not consult `packed_segments`, so they are the oracle: an off-by-one in
+    /// any segment start puts a boundary on the wrong coordinate *name*, which
+    /// is what this asserts, rather than on an arithmetic identity that would
+    /// shift on both sides together.
+    #[test]
+    fn packed_segments_boundaries_land_on_the_right_coordinates() {
+        let t = make_all_segments_template();
+        let segs = packed_segments(&t);
+        let names = coordinate_names(&t);
+        let kinds = coordinate_kinds(&t);
+
+        assert_eq!(segs.total(), pack_params(&t).len());
+        assert_eq!(segs.total(), packed_len(&t));
+        assert_eq!(segs.total(), names.len());
+        assert_eq!(segs.rho_start(), rho_packed_start(&t));
+
+        assert_eq!(
+            (
+                segs.theta,
+                segs.omega,
+                segs.sigma,
+                segs.iov,
+                segs.mixture_omega,
+                segs.mixture_sigma,
+                segs.rho
+            ),
+            (3, 6, 2, 2, 3, 2, 1)
+        );
+
+        // Each start lands on the first coordinate of its segment, identified
+        // by the name the *other* walk gives it.
+        assert_eq!(names[0], "tvcl");
+        assert_eq!(names[segs.omega_start()], "eta_cl");
+        assert_eq!(names[segs.sigma_start()], "sig_prop");
+        assert_eq!(names[segs.iov_start()], "kappa_cl");
+        // Mixture overrides and ρ have no distinct declared name, so they are
+        // identified by kind and by the coordinate *before* them belonging to
+        // the previous segment.
+        assert_eq!(names[segs.mixture_omega_start() - 1], "kappa_v");
+        assert_eq!(
+            kinds[segs.mixture_omega_start()],
+            PackedCoordKind::OmegaDiagonal
+        );
+        assert_eq!(kinds[segs.mixture_sigma_start()], PackedCoordKind::Sigma);
+        assert_eq!(
+            kinds[segs.rho_start()],
+            PackedCoordKind::OmegaOffDiagonal,
+            "a ρ slot is bounded symmetrically, so it takes the off-diagonal kind"
+        );
+        assert_eq!(segs.rho_start(), segs.total() - 1);
+    }
+
+    /// #1309 review. `coordinates_with_inverted_bounds` claims exactly the
+    /// boxes `clamp_to_bounds` cannot clamp into, and `coordinates_outside_bounds`
+    /// claims none of them — the two are disjoint by construction, and the
+    /// second's `lower > upper` skip is only safe because the first exists.
+    ///
+    /// Driven off a hand-built `PackedStart` rather than a model file: the
+    /// unbounded (`±inf`) and `NaN` rows are shapes the parser cannot produce
+    /// for a THETA, and they are the two that decide whether the skip in
+    /// `coordinates_outside_bounds` is a silent drop or a routed one.
+    #[test]
+    fn an_empty_or_unorderable_box_is_claimed_by_the_inverted_walk_and_by_nothing_else() {
+        // [inverted, NaN lower, NaN upper, unbounded, ordinary-but-outside, inside]
+        let start = PackedStart {
+            packed: vec![0.0, 0.0, 0.0, 5.0, -3.0, 0.5],
+            bounds: PackedBounds {
+                lower: vec![2.0, f64::NAN, -1.0, f64::NEG_INFINITY, -1.0, 0.0],
+                upper: vec![1.0, 1.0, f64::NAN, f64::INFINITY, 1.0, 1.0],
+            },
+            fixed: vec![false; 6],
+        };
+        let kinds = vec![PackedCoordKind::Theta; 6];
+
+        let inverted: Vec<usize> = coordinates_with_inverted_bounds(&start, &kinds)
+            .map(|h| h.index)
+            .collect();
+        assert_eq!(
+            inverted,
+            vec![0, 1, 2],
+            "an inverted pair and either bound being NaN all panic `f64::clamp`"
+        );
+
+        let outside: Vec<(usize, BoxSide)> = coordinates_outside_bounds(&start, &kinds)
+            .map(|h| (h.index, h.side))
+            .collect();
+        assert_eq!(
+            outside,
+            vec![(4, BoxSide::Below)],
+            "index 3 is unbounded (clamp(-inf, inf) is a no-op), index 5 is inside, \
+             and 0..=2 belong to the inverted walk"
+        );
+
+        // Disjoint, asserted rather than read off the two lists above.
+        for (i, _) in &outside {
+            assert!(!inverted.contains(i), "coordinate {i} claimed twice");
+        }
     }
 
     /// A two-sigma template carrying one `block_sigma` off-diagonal (#847).

@@ -252,8 +252,11 @@ fn freeze_flat_thetas(
         return None;
     }
 
-    let bounds = compute_bounds(init_params);
-    let mut x = pack_params(init_params);
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let params = unpack_params(&x, init_params);
     let n_subj = population.subjects.len();
@@ -415,8 +418,11 @@ fn evaluate_at_initial_params(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    let bounds = compute_bounds(init_params);
-    let mut x = pack_params(init_params);
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let params = unpack_params(&x, init_params);
 
@@ -1642,8 +1648,11 @@ fn optimize_nlopt_once(
     options: &FitOptions,
     hold_cap_at_init: bool,
 ) -> (OuterResult, bool) {
-    let bounds = compute_bounds(init_params);
-    let mut x0 = pack_params(init_params);
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
     let n = x0.len();
     let n_subj = population.subjects.len();
@@ -2580,8 +2589,11 @@ fn optimize_bfgs(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    let bounds = compute_bounds(init_params);
-    let mut x = pack_params(init_params);
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let n = x.len();
     let n_subj = population.subjects.len();

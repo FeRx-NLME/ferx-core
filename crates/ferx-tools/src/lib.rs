@@ -87,6 +87,7 @@ pub mod gam;
 pub mod globalsearch;
 pub mod iivsearch;
 pub mod iovsearch;
+pub(crate) mod lanes;
 pub mod modelsearch;
 pub mod ruvsearch;
 pub mod search;

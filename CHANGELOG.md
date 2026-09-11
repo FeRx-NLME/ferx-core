@@ -21,8 +21,6 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
-- **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
-
 - **`method = laplace`'s analytic `½·log|H|` gradient term now sweeps only the random-effect
   axes, not every structural parameter axis as well.** The assembly reads `∂³f/∂η³` and
   `∂³f/∂η²∂θ`; the θ-axis sensitivity evaluations existed to build two blocks only the
@@ -38,13 +36,17 @@ section of the SDLC for the versioning policy).
   2e-4 (7e-7 relative), well inside the convergence tolerance. Closed-form fixtures were
   unaffected, and `focei` is untouched (#1342).
 
+- `[covariate_nn]` models with IOV (`kappa`) now get the exact analytic FOCE/FOCEI outer gradient: the stacked `[η, κ]` sensitivity walk seeds the declared thetas, the random effects and one axis per network output, chains the weight columns in through backpropagation, and walks them in chunks — so `auto` resolves to L-BFGS instead of derivative-free BOBYQA over every weight, and `gradient:` reports analytic (#1339). This covers IOV models carrying an `[initial_conditions]` baseline, an `obs_scale` expression or an analytic Form C readout as well, and no longer caps the `obs_scale` expression's `(θ, η)` width at 24.
+- **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
+- **Calling a function ferx does not have is now a parse error naming the call and listing what is available, instead of silently evaluating as the identity.** `CL = TVCL * tanh(ETA_CL)` used to parse, pass `ferx check`, fit and converge while computing `TVCL * ETA_CL`. This applies to every block that parses expressions (`[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, `[error_model]` magnitudes) and to conditions. Model files that relied on the no-op were already computing something other than what they read as, so the new errors are all true positives. Names remain case-insensitive, so `EXP(...)` / `LOG(...)` are unaffected; `present(x)` in value position now points at condition position (#1332).
+
 - **`method = laplace` now assembles its `½·log|H|` gradient term analytically by default,
   instead of rebuilding the conditional Hessian at `x ± h` for every free population
-  parameter.** Both routes compute the same derivative — every benchmarked configuration
-  returned an identical OFV — so this is a cost change, not an accuracy one. It was previously
-  opt-in because the only closed-form fixture measured was a **diagonal** Ω, where the two
-  routes cost the same by construction and successive sessions measured opposite signs. On a
-  **block** Ω, where the call-count gap is real, the analytic route measured 11520 → 8160
+  parameter.** Derivative-parity tests validate the two routes within numerical tolerances;
+  benchmark OFVs agree at the console's four-decimal precision. It was previously
+  opt-in because the only closed-form fixture measured was a **diagonal** Ω, with similar
+  call counts (14 FD rebuilds versus 13 provider evaluations) and timing results of opposite
+  signs across sessions. On a **block** Ω, with a wider call-count gap, the analytic route measured 11520 → 8160
   provider calls for −24% provider time on 5 of 5 reps at an identical outer-iteration count;
   on an ODE fixture, 10270 → 6470 calls and −35% time. **On ODE models the optimizer's path
   changes** (the benchmark fixture converges in 37 outer iterations instead of 56), so
@@ -52,7 +54,31 @@ section of the SDLC for the versioning policy).
   restores the old route for benchmarking, and the finite-difference sweep remains the
   automatic fallback wherever the analytic route is out of scope (#1335).
 
+### Fixed
+
+- Fixed the IOV inner loop discarding a converged-in-all-but-name BFGS solution for a far worse Nelder–Mead restart from the cold seed, which made every cold-started evaluation of a `kappa` model (the reported final OFV, `outer_maxiter = 0` re-evaluations, `.fitrx` reloads) score some subjects thousands of −2LL units above the value the optimizer had minimised — 9 300 on a `[covariate_nn]` + IOV busulfan fit (#1327).
+- Fixed ODE-accumulated survival hazards that read `TAD`, which could reject valid multi-dose subjects with a misleading finite objective (#1261).
+- `floor(x)`, `ceil(x)` and `round(x)` now differentiate to `0` rather than to `x`'s own derivative. An `[individual_parameters]` or `[odes]` expression that rounds — a dose-band lookup, an occasion index derived from `TIME` — was feeding a wrong analytic gradient to the estimator while its value path was correct (#1332).
+
+- **A `threads` budget is now a real ceiling on how many fits run at once in
+  `bootstrap`, `modelsearch`, `covsearch`, `iivsearch`, `ruvsearch` and
+  `globalsearch`.** Each replicate or candidate runs its own `fit()` on a nested
+  thread pool, and a worker blocked on that nesting kept taking more work, so a
+  run asked for 4 concurrent fits could hold far more — and that many fits' worth
+  of peak memory. The requested width is now enforced exactly. Runs that were
+  already inside their budget are unaffected; heavily oversubscribed ones should
+  see lower peak memory and steadier per-fit timing rather than higher throughput
+  (#1329). Bootstrap's unset thread budget preserves the ambient Rayon pool width,
+  including `RAYON_NUM_THREADS` and caller-configured pools (#1330).
+
 ### Performance
+
+- **The post-fit per-subject diagnostics pass (IPRED / PRED / IWRES / CWRES,
+  per-subject OFV) and the post-fit analytic-sensitivity sweep now run in
+  parallel over subjects** on the pool the fit already uses, instead of one
+  subject at a time. Output is unchanged bit-for-bit and the ODE-solver
+  diagnostic counters are unchanged; the gain is on the final pass of a fit with
+  many subjects, and is largest on ODE models (#1329).
 
 - **`focei` with `n_agq > 1` now contracts the analytic grid-response gradient term once per
   subject instead of once per population parameter.** The node gradients, weights and node
@@ -60,8 +86,8 @@ section of the SDLC for the versioning policy).
   out of the coordinate loop, taking the contraction from `O(p·Q·d²)` to `O(Q·d² + p·d²)` for
   `p` free parameters, `Q = n_agq^d` nodes and `d` random effects. The one-node grid
   additionally skips the node-displacement term and the five `d×d` matrix products behind it
-  outright, since its nodes sit at `z = 0` — that arm is reached by the opt-in
-  `FERX_AGQ_GRID_RESPONSE=analytic` route for `laplace`, not by any default configuration.
+  outright, since its nodes sit at `z = 0` — that arm is now reached by the default
+  analytic route for `laplace` (#1335).
   **No wall-clock figure is claimed**: this reduces the contraction around the `Q`
   node-gradient evaluations, not their number, and those dominate on ODE models. Gradients
   move only by floating-point reassociation — measured worst relative change `1.7e-15`, a few
@@ -83,9 +109,9 @@ section of the SDLC for the versioning policy).
   σ-direct derivative, correlated residuals (`block_sigma`), and **IOV** (the stacked `[η, κ]`
   system, via a dedicated joint-prior assembly) — only mixture models keep the pre-existing
   finite-difference route. `laplace`/AGQ's exact-Hessian
-  anchor gained the same analytic route for closed-form and **ODE** models (opt-in via
-  `FERX_AGQ_GRID_RESPONSE=analytic` — no repeatable wall-clock win was measured there, so it
-  is not the default; its value is an exact, FD-noise-free gradient) (#251).
+  anchor gained the same analytic route for closed-form and **ODE** models, initially opt-in
+  via `FERX_AGQ_GRID_RESPONSE=analytic` and now the default after the block-Ω benchmark
+  described above (#251, #1335).
 
 - **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
 
@@ -135,6 +161,20 @@ section of the SDLC for the versioning policy).
   refits nothing. `models.csv`, `generations.csv`, `final.ferx` and every candidate under
   `models/` are written; `docs/tools/global-search.qmd` says when a global search beats the
   stepwise tools and when it does not.
+- **An initial estimate that lies outside its own optimizer bounds is no longer
+  clamped in silence (#1251).** A `theta` whose start is *strictly* outside the
+  range it declares is now refused before any fitting
+  (`E_THETA_INIT_OUTSIDE_BOUNDS`) — until now `theta TVCL(0.05, 0.1, 10.0)` quietly
+  fitted from `0.1`, a factor of two, on every run; NM-TRAN refuses the same stream
+  outright (error 24). A start outside one of ferx's *internal* rails instead — the
+  hidden `1e9` theta cap, the `omega` `±6` / off-diagonal `±10` guards, the `sigma`
+  `[-8, 5]` guard — is a `W_INIT_OUTSIDE_BOUNDS` warning, carrying the new
+  `init_outside_bounds` warning category. Both are reported by `ferx check` without
+  a `--data` file, and both share `E_OMEGA_INIT_AT_RAIL`'s `maxiter = 0` exemption.
+  A start sitting *exactly* on a bound is left alone: there the clamp is a no-op, so
+  nothing is moved. The new category is deliberately distinct from
+  `boundary_estimate`, which is about where a fit *ended* and which drives
+  `bootstrap`'s replicate filter and `reject_on_boundary`.
 - **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
   FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
   solve and obtain the required third-order prediction blocks by central differences
@@ -319,6 +359,19 @@ section of the SDLC for the versioning policy).
   now `#[non_exhaustive]`, so the `_` arm is required from here on and the next
   form — level grouping — will be genuinely additive.
 
+- **`fit()` now refuses a `theta` whose initial estimate is strictly outside its own
+  declared range (#1251).** It previously accepted the model and clamped the start
+  onto the bound, so a model file that fitted before now stops with
+  `E_THETA_INIT_OUTSIDE_BOUNDS` before the first objective evaluation. No model
+  shipped with ferx is affected — the exact predicate over every `.ferx` in the
+  repository finds none — but a model file of your own with a mistyped bound will now
+  be reported instead of quietly fitted from somewhere else. The comparison is against
+  the **declared** numbers, so `theta TVCL(-5.0, 0.0, 10.0)` is caught even though the
+  start and the declared lower bound both pack onto ferx's internal `1e-10` floor, and
+  the message names where the fit really begins (`1e-10`, which is neither the declared
+  value nor the declared bound). `maxiter = 0` runs are exempt, as for
+  `E_OMEGA_INIT_AT_RAIL`.
+
 ### Fixed
 - The `{model}.tmp` checkpoint written by a **deterministic** stage (`foce`, `focei`,
   `laplace`, `gn`, `gn_hybrid`) now stores the **best** point that stage has reached,
@@ -348,15 +401,27 @@ section of the SDLC for the versioning policy).
   drop such a row and `check_dose_compartments` rejects it outright
   (`E_DOSE_CMT_NOT_INFUSABLE`) — but when the dose also carried a lagtime the gradient
   walk still fired the infusion-end saltation, reporting a finite `∂f/∂η_LAG` (+1.89 at
-  the first sample past the window end) for a subject that receives no drug and predicts
-  `0.0` everywhere. Reachable only from a hand-built model spec that runs no validation;
-  no validated fit changes. The compartment test is now one shared predicate asked by
-- The analytic ODE sensitivity walk no longer injects a rate-off boundary term for `CMT=0`
-  infusions on an unbound compartment (#1077). `check_dose_compartments` already rejects
-  such zero-order `CMT=0` infusions with `E_DOSE_CMT_NOT_INFUSABLE`, so this change is
-  user-visible only through hand-built specs. The walk now uses the same shared
-  `infusion_has_rate_channel` predicate as production, preventing spurious
-  `∂f/∂η_LAG` jumps when both engines predict `f ≡ 0`.
+  the first sample past the window end, against a central-difference reference of exactly
+  `0.0`) for a subject that receives no drug and predicts `0.0` everywhere. Reachable only
+  from a hand-built model spec that runs no validation; no validated fit changes. The
+  compartment test is now one shared predicate (`dosing::infusion_has_rate_channel`), asked
+  by every site on either engine that turns a rate on or off: four of the walk's rate-*on*
+  sites spelled it inline as `cmt_raw() >= 1` and the rate-*off* saltation at the
+  infusion-window end asked nothing at all.
+- **A `theta` whose declared range cannot be represented no longer aborts the fit
+  (#1251).** `theta TVCL(1.0, 5.0, 2.0)` — bounds swapped — and
+  `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter whose whole range
+  falls below ferx's internal `1e-10` packing floor — both produce an empty optimizer
+  box, and the bound clamp panicked on it. ferx now reports
+  `E_INIT_BOUNDS_INVERTED`, naming which of the three causes applies. It is the one
+  start-side check with no `maxiter = 0` exemption, because an evaluation-only run
+  clamps the start too. Only the affected coordinate is silenced, so `ferx check` still
+  reports the rest of the file in the same pass.
+- The `W_INIT_OUTSIDE_BOUNDS` message for a `sigma` now says which scale its numbers are
+  on (#1251). ferx stores σ as a standard deviation and square-roots a plain
+  `sigma X ~ v` declaration, so the quoted number is an SD that need not appear in the
+  model file: `sigma PROP_ERR ~ 1e6` now reads `an SD of 1.000e3` rather than
+  `a value of 1.000e3`.
 - A fit no longer stops on its first evaluation and reports every parameter at its
   initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
   Bayes estimates of *every* evaluation, including the ones the line search rejects, so

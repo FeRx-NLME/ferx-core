@@ -736,7 +736,15 @@ pub(crate) fn compute_covariance(
             initial_eps
         ));
     }
-    let bounds = compute_bounds(template);
+    // One walk for the box and the FIX mask (#1252) — `compute_bounds` builds
+    // the mask internally to pin FIX-ed coordinates, so taking it here costs
+    // nothing and saves the second walk this function used to do further down.
+    // The packed start is dropped: `x_hat` is the caller's, not the template's.
+    let PackedStart {
+        bounds,
+        fixed: fixed_mask,
+        ..
+    } = pack_with_bounds(template);
     // Mixture models (#983 Phase 6) build the FD Hessian on the K-fold mixture
     // objective and skip the single-population reconvergence / analytic R-matrix
     // (both single-population-only). Gated on `template.mixture`.
@@ -921,8 +929,8 @@ pub(crate) fn compute_covariance(
 
     // FIX parameters contribute no information — skip their FD stencils and,
     // after inverting the Hessian of the free block, leave their covariance
-    // rows/cols at zero (→ SE = 0 downstream).
-    let fixed_mask = packed_fixed_mask(template);
+    // rows/cols at zero (→ SE = 0 downstream). `fixed_mask` came from the same
+    // `pack_with_bounds` walk as `bounds`, at the top of this function.
     // Structural-zero Ω off-diagonals (the cross-block elements of a mixed
     // block+diagonal Ω, where `free_mask[(i,j)] == false`) are not estimated
     // parameters — the analytical population gradient zeroes them, so their
