@@ -1548,16 +1548,26 @@ fn dcm_two_kappa_theta(model: &CompiledModel) -> Vec<f64> {
 /// the chunked scatter cannot corrupt them.
 #[test]
 fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
-    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
-
     let model = dcm_two_kappa_model();
     let subject = dcm_two_kappa_subject();
     let theta = dcm_two_kappa_theta(&model);
+    assert_eq!(model.n_theta, 22, "4→2→4 network is 22 weights");
+    check_dcm_iov_outer_vs_fd(&model, &subject, &theta);
+}
+
+/// FD-parity harness for the analytic IOV **outer** walk on a θ block wide enough to be
+/// chunked: compares all four `SubjectSens` blocks against central differences of
+/// `predict_iov`, and asserts that every θ column is *live* on at least one observation
+/// so no column's parity is the vacuous `0 == 0`. Shared by the plain DCM fixture and by
+/// the absolute-axis-step fixtures (`[initial_conditions]`, `obs_scale`), which run the
+/// same walk with one extra post-walk step in the chunk's own basis (#1339).
+fn check_dcm_iov_outer_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[f64]) {
+    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
+
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
     let n_theta = model.n_theta;
-    assert_eq!(n_theta, 22, "4→2→4 network is 22 weights");
-    let k = crate::stats::likelihood::iov_occasion_groups(&subject).len();
+    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
     assert_eq!(k, 3);
     let n_st = n_eta + k * n_kappa;
     assert!(
@@ -1565,14 +1575,14 @@ fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
         "fixture must exceed the single-chunk walk width or the chunking is untested"
     );
     assert!(
-        iov_analytical_supported(&model),
+        iov_analytical_supported(model),
         "a DCM+IOV model must be inside the full analytic IOV scope (#1339)"
     );
 
     let stacked: Vec<f64> = (0..n_st)
         .map(|i| 0.2 * ((i as f64) * 1.3 + 0.5).sin())
         .collect();
-    let sens = subject_sensitivities_iov(&model, &subject, &theta, &stacked)
+    let sens = subject_sensitivities_iov(model, subject, theta, &stacked)
         .expect("the analytic IOV outer walk must serve a DCM+IOV subject");
     assert_eq!(sens.obs.len(), subject.obs_times.len());
 
@@ -1581,11 +1591,26 @@ fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
         let kappas: Vec<Vec<f64>> = (0..k)
             .map(|g| st[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa].to_vec())
             .collect();
-        crate::pk::predict_iov(&model, &subject, th, &eta_bsv, &kappas)[j]
+        crate::pk::predict_iov(model, subject, th, &eta_bsv, &kappas)[j]
     };
     let he = 1e-6;
     let heh = 1e-4;
-    let mut n_live_weight_cols = 0usize;
+    // Per *column* liveness, not a count of live `(θ, obs)` pairs: a pair count can be
+    // satisfied by a subset of the columns firing on many observations while a whole
+    // chunk stays silent, and the parity on a silent column is vacuous (0 vs 0).
+    let mut live_weight_col = vec![false; n_theta];
+    // Peak |∂f/∂θ_m| over the observations, reported when a column comes out silent so the
+    // threshold below can be read off a measurement rather than argued about.
+    let mut peak_col = vec![0.0f64; n_theta];
+    // A column counts as live when its FD gradient is far enough above the parity
+    // assertion's own `epsilon = 1e-7` that a wrong analytic value of 0 would actually
+    // fail it: `|0 − g| = g > max(1e-7, 2e-4·g)` for any `g` past ~1e-7, so 100× that is
+    // ample headroom. Measured quietest columns across the three fixtures this harness
+    // serves: 1.9e-3 (plain DCM), 8.1e-4 (`[initial_conditions]`) and 2.7e-5 (`obs_scale`,
+    // whose `f/(TVBASE·e^η·V1)` divides every derivative by ~20). An absolute `1e-3` bar —
+    // the first cut — is really a bar on the *prediction's scale*, and silently declared
+    // 18 of the 23 obs_scale columns dark.
+    const LIVE_COL_MIN: f64 = 1e-5;
     for (j, obs) in sens.obs.iter().enumerate() {
         approx::assert_relative_eq!(obs.f, pred(&stacked, &theta, j), max_relative = 1e-9);
         for p in 0..n_st {
@@ -1621,13 +1646,17 @@ fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
         }
         for m in 0..n_theta {
             let s = he * (1.0 + theta[m].abs());
-            let mut tp = theta.clone();
+            let mut tp = theta.to_vec();
             tp[m] += s;
-            let mut tm = theta.clone();
+            let mut tm = theta.to_vec();
             tm[m] -= s;
             let g = (pred(&stacked, &tp, j) - pred(&stacked, &tm, j)) / (2.0 * s);
-            if g.abs() > 1e-3 {
-                n_live_weight_cols += 1;
+            assert!(g.is_finite(), "FD probe of θ_{m} at obs {j} is not finite");
+            if g.abs() > peak_col[m] {
+                peak_col[m] = g.abs();
+            }
+            if g.abs() > LIVE_COL_MIN {
+                live_weight_col[m] = true;
             }
             approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-4, epsilon = 1e-7);
             for p in 0..n_st {
@@ -1636,9 +1665,9 @@ fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
                 ep[p] += heh;
                 let mut em = stacked.clone();
                 em[p] -= heh;
-                let mut tp2 = theta.clone();
+                let mut tp2 = theta.to_vec();
                 tp2[m] += sh;
-                let mut tm2 = theta.clone();
+                let mut tm2 = theta.to_vec();
                 tm2[m] -= sh;
                 let hh = (pred(&ep, &tp2, j) - pred(&ep, &tm2, j) - pred(&em, &tp2, j)
                     + pred(&em, &tm2, j))
@@ -1655,10 +1684,15 @@ fn dcm_iov_outer_sensitivities_are_analytic_and_match_fd_of_predict_iov() {
     // Every weight column must carry signal on at least one observation, or a zeroed
     // chain would pass the comparison above on that column (both sides zero). Both
     // chunks (`0..15`, `15..22`) are covered by the whole-block sweep.
+    let dead: Vec<(usize, f64)> = (0..n_theta)
+        .filter(|&m| !live_weight_col[m])
+        .map(|m| (m, peak_col[m]))
+        .collect();
     assert!(
-        n_live_weight_cols >= n_theta,
-        "only {n_live_weight_cols} live (θ, obs) pairs across {n_theta} weight columns — \
-         the probe leaves part of the network silent and the parity there is vacuous"
+        dead.is_empty(),
+        "weight columns {dead:?} (index, peak |∂f/∂θ|) of {n_theta} are silent on every \
+         observation — the probe leaves part of the network dark and the parity there is \
+         vacuous"
     );
 }
 
@@ -1709,97 +1743,203 @@ fn dcm_iov_model_gets_the_analytic_outer_gradient_and_a_gradient_optimizer() {
     assert!(crate::sens::provider::iov_analytical_eta_supported(&direct));
 }
 
-/// PR #1340 review (P2): the model-level outer gate must not claim a route the walk
-/// declines for every subject.
+/// PR #1340 review (P2): the `[initial_conditions]` impulse must run **off** the identity
+/// θ chunk, in the chunk's own basis, and match FD there.
 ///
-/// `run_obs_iov` runs the Form C readout, the `[initial_conditions]` impulse and the
-/// `ExpressionScale` quotient only on the identity θ chunk, because those programs seed
-/// direct θ/η references on absolute axes. A DCM carrying one of them whose weight block
-/// cannot fit the walk alongside even one occasion's stacked axes (22 + 3 + 2 > 24 here)
-/// therefore has every subject decline per-subject — and before the gate below existed,
-/// `iov_analytical_supported` still said analytic, `auto` picked L-BFGS, and every outer
-/// derivative was reconverged FD: the #637 route/report drift, on exactly the model class
-/// this PR exists to make analytic. Pinned as route consistency — gate and walk must agree
-/// on both the plain fixture (analytic, served) and the `init` fixture (declined, `None`)
-/// — so the check cannot be satisfied by a gate that is merely false everywhere.
+/// The impulse is one of three post-walk steps whose program seeds *direct* θ / η
+/// references; the first cut of #1339 could only place those on absolute axes, so a
+/// chunked walk declined them and the model-level gate had to guess whether any subject
+/// would ever land on one chunk. It cannot: that depends on the subject's occasion count
+/// `K` (`n_theta + n_eta + K·n_kappa ≤ 24`), which a model-level predicate never sees, so
+/// every bound written there reported analytic for a band of models whose real (`K ≥ 2`)
+/// subjects all reconverged on FD — the #637 route/report drift. `eval_scale_dual_cols`
+/// removes the question by seeding on the chunk's columns instead.
+///
+/// The fixture is built so the mutation is reachable on **both** halves of the mapping:
+/// `init(central) = TVBASE * exp(ETA_CL)` reads a declared θ *and* an η directly, the
+/// subject needs two chunks (23 θ, 9 stacked → `[0..15]`, `[15..23]`), and the θ it reads
+/// sits in the first chunk only — so a walk that kept seeding `θ_m → m` would write the
+/// second chunk's `θ_15` axis, and one that kept the η block at `n_theta + k` would land
+/// on a κ axis. Both show up as an FD mismatch here.
 #[test]
-fn dcm_iov_gate_and_walk_agree_on_absolute_axis_features() {
-    use crate::sens::provider::{
-        analytic_outer_gradient_available, iov_analytical_supported, subject_sensitivities_iov,
-    };
-    use crate::types::Optimizer;
+fn dcm_iov_init_impulse_matches_fd_off_the_identity_chunk() {
+    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
 
+    let src = dcm_two_kappa_src()
+        .replace(
+            "[covariate_nn TYPICAL_PK]",
+            "  theta TVBASE(0.4, 0.01, 10.0)\n\n[covariate_nn TYPICAL_PK]",
+        )
+        .replace(
+            "[error_model]",
+            "[initial_conditions]\n  init(central) = TVBASE * exp(ETA_CL) * V1\n\n[error_model]",
+        );
+    let model = parse_model_string(&src).expect("DCM+IOV+init parses");
     let subject = dcm_two_kappa_subject();
-    let stacked_len = |m: &CompiledModel| {
-        m.n_eta + crate::stats::likelihood::iov_occasion_groups(&subject).len() * m.n_kappa
-    };
+    let theta = dcm_two_kappa_theta(&model);
 
-    // Plain fixture: gate true, walk serves.
-    let plain = dcm_two_kappa_model();
-    let theta = dcm_two_kappa_theta(&plain);
-    assert!(iov_analytical_supported(&plain));
     assert!(
-        subject_sensitivities_iov(&plain, &subject, &theta, &vec![0.05; stacked_len(&plain)])
-            .is_some(),
-        "gate says analytic, so the walk must serve"
-    );
-
-    // Same network plus an analytic `[initial_conditions]` impulse: the weight block plus one
-    // occasion's `[η, κ]` (22 + 5) already exceeds the 24-axis walk, so the impulse could
-    // only run on a chunk that is not the identity — the walk declines, and the gate must
-    // say so up front rather than advertise a gradient it never computes.
-    let with_init = parse_model_string(&dcm_two_kappa_src().replace(
-        "[error_model]",
-        "[initial_conditions]\n  init(central) = 0.1 * V1\n\n[error_model]",
-    ))
-    .expect("DCM+IOV+init parses");
-    assert!(
-        !with_init.analytical_init.is_empty(),
+        !model.analytical_init.is_empty(),
         "fixture must carry the init impulse"
     );
-    assert!(
-        with_init.n_theta + with_init.n_eta + with_init.n_kappa > 24,
-        "fixture must need chunking even for one occasion"
-    );
-    let theta_i = dcm_two_kappa_theta(&with_init);
-    let served = subject_sensitivities_iov(
-        &with_init,
-        &subject,
-        &theta_i,
-        &vec![0.05; stacked_len(&with_init)],
-    )
-    .is_some();
-    assert!(
-        !served,
-        "the chunked walk cannot run the init impulse; it must decline"
-    );
-    assert!(
-        !iov_analytical_supported(&with_init),
-        "gate must agree with the walk: a DCM whose absolute-axis step cannot run on the \
-         identity chunk is outside the analytic outer scope"
-    );
-    assert!(!analytic_outer_gradient_available(&with_init));
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&with_init, true),
-        Optimizer::Bobyqa,
-        "auto must not pick a gradient optimizer for a model whose outer gradient is FD"
+        model.n_theta, 23,
+        "one declared θ ahead of the 22 network weights"
     );
-    // The inner η-only route needs none of this and still serves the model.
-    assert!(crate::sens::provider::iov_analytical_eta_supported(
-        &with_init
-    ));
+    let n_stacked =
+        model.n_eta + crate::stats::likelihood::iov_occasion_groups(&subject).len() * model.n_kappa;
+    assert!(
+        model.n_theta + n_stacked > 24,
+        "fixture must force a second θ chunk, or the absolute-axis mutation is unreachable"
+    );
+    // The declared θ the init reads is column 0 — first chunk — while the second chunk
+    // starts at 15, so an absolute `θ_m → m` seeding corrupts the second chunk's columns.
+    assert_eq!(
+        model.covariate_nns[0].weights_offset, 1,
+        "the declared θ must precede the weight block"
+    );
+
+    assert!(
+        iov_analytical_supported(&model),
+        "an absolute-axis step no longer narrows the outer IOV gate (#1339)"
+    );
+    assert!(
+        subject_sensitivities_iov(&model, &subject, &theta, &vec![0.05; n_stacked]).is_some(),
+        "gate says analytic, so the chunked walk must serve the subject"
+    );
+    check_dcm_iov_outer_vs_fd(&model, &subject, &theta);
 }
 
-/// The walk-side half of the P2 gate: a DCM whose weight block *does* fit one occasion
-/// (12 weights + 2 η + 1 κ = 15 ≤ 24, so the model-level gate is analytic) but whose
-/// 11-occasion subject stacks past the cap (12 + 2 + 11 = 25) needs a non-identity chunk;
-/// with an `[initial_conditions]` impulse the walk must decline *that subject* (per-subject
-/// FD, surfaced by the FD-fallback warning), while the same subject on the same network
-/// without the impulse is served through the chunks. Pinned so the identity-chunk gate in
-/// `run_obs_iov` cannot be dropped without a red test: without it the impulse program
-/// would seed its direct θ/η references on axes that belong to another chunk.
+/// The `ExpressionScale` `obs_scale` quotient, the third absolute-axis step, on the same
+/// two-chunk geometry — see `dcm_iov_init_impulse_matches_fd_off_the_identity_chunk`.
+///
+/// The quotient is applied per occasion group and rewrites the whole `ObsSens` row, so it
+/// also pins the half the init impulse cannot: under a chunk it must rewrite **only** the
+/// θ columns the chunk carries. A version that looped `0..n_theta` would divide the other
+/// chunk's columns a second time when they are merged, which the θ block of the FD
+/// comparison catches.
 #[test]
-fn dcm_iov_walk_declines_absolute_axis_step_only_off_the_identity_chunk() {
+fn dcm_iov_expression_scale_matches_fd_off_the_identity_chunk() {
+    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
+    use crate::types::ScalingSpec;
+
+    let src = dcm_two_kappa_src()
+        .replace(
+            "[covariate_nn TYPICAL_PK]",
+            "  theta TVBASE(0.4, 0.01, 10.0)\n\n[covariate_nn TYPICAL_PK]",
+        )
+        .replace(
+            "[error_model]",
+            "[scaling]\n  obs_scale = TVBASE * exp(ETA_V1) * V1\n\n[error_model]",
+        );
+    let model = parse_model_string(&src).expect("DCM+IOV+obs_scale parses");
+    let subject = dcm_two_kappa_subject();
+    let theta = dcm_two_kappa_theta(&model);
+
+    assert!(
+        matches!(model.scaling, ScalingSpec::ExpressionScale { .. }),
+        "fixture must carry an ExpressionScale obs_scale"
+    );
+    let n_stacked =
+        model.n_eta + crate::stats::likelihood::iov_occasion_groups(&subject).len() * model.n_kappa;
+    assert!(
+        model.n_theta + n_stacked > 24,
+        "fixture must force a second θ chunk, or the absolute-axis mutation is unreachable"
+    );
+    assert!(
+        iov_analytical_supported(&model),
+        "an absolute-axis step no longer narrows the outer IOV gate (#1339)"
+    );
+    assert!(
+        subject_sensitivities_iov(&model, &subject, &theta, &vec![0.05; n_stacked]).is_some(),
+        "gate says analytic, so the chunked walk must serve the subject"
+    );
+    check_dcm_iov_outer_vs_fd(&model, &subject, &theta);
+}
+
+/// The analytic Form C readout, the last of the three post-walk steps, on the same
+/// two-chunk geometry — see `dcm_iov_init_impulse_matches_fd_off_the_identity_chunk`.
+///
+/// Unlike the other two this one was always chunk-agnostic and needed no fix: a
+/// dual-evaluable readout carries no `PushTheta`/`PushEta` op (the parser clears
+/// `dual_evaluable` when it cannot desugar one), so it composes purely from the walk's own
+/// per-observation PK duals, which are already in the chunk's basis. The first cut of
+/// #1339 declined it anyway, alongside the two that did need remapping. Pinned here so a
+/// future reader does not re-add that decline "for symmetry": a chunked DCM with a
+/// nonlinear readout is served, and its four blocks match FD.
+///
+/// Run on a wide stack: the readout adds a `[Dual2<M>; N_PK]` PK-slot vector and the
+/// bytecode jet on top of the walk's own frames, and at the chunked width `M = 24` that
+/// clears the 2 MiB default test-thread stack in a debug build (measured: passes at 4 MiB,
+/// aborts at 2). Production fits already run on the 32 MiB Rayon stack
+/// (`api::FIT_RAYON_STACK_SIZE`) for exactly this reason, so mirror it rather than shrink
+/// a fixture that has to be wide to chunk at all.
+#[test]
+fn dcm_iov_form_c_readout_matches_fd_off_the_identity_chunk() {
+    std::thread::Builder::new()
+        .stack_size(crate::api::FIT_RAYON_STACK_SIZE)
+        .spawn(dcm_iov_form_c_readout_body)
+        .expect("spawn wide-stack test thread")
+        .join()
+        .expect("chunked DCM+IOV Form C readout test panicked");
+}
+
+fn dcm_iov_form_c_readout_body() {
+    use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
+
+    let src = dcm_two_kappa_src()
+        .replace(
+            "[covariate_nn TYPICAL_PK]",
+            "  theta TVBMAX(3.0, 0.01, 100.0)\n\n[covariate_nn TYPICAL_PK]",
+        )
+        .replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V1 + TVBMAX * (central / V1) / (2.0 + central / V1)\n\n\
+             [error_model]",
+        );
+    let model = parse_model_string(&src).expect("DCM+IOV+Form C readout parses");
+    let subject = dcm_two_kappa_subject();
+    let theta = dcm_two_kappa_theta(&model);
+
+    assert!(
+        model
+            .analytic_readout
+            .as_ref()
+            .and_then(|ar| ar.program.as_ref())
+            .is_some(),
+        "fixture must carry a compiled Form C readout program"
+    );
+    let n_stacked =
+        model.n_eta + crate::stats::likelihood::iov_occasion_groups(&subject).len() * model.n_kappa;
+    assert!(
+        model.n_theta + n_stacked > 24,
+        "fixture must force a second θ chunk, or the chunked readout is untested"
+    );
+    assert!(
+        iov_analytical_supported(&model),
+        "a Form C readout no longer narrows the outer IOV gate (#1339)"
+    );
+    assert!(
+        subject_sensitivities_iov(&model, &subject, &theta, &vec![0.05; n_stacked]).is_some(),
+        "gate says analytic, so the chunked walk must serve the subject"
+    );
+    check_dcm_iov_outer_vs_fd(&model, &subject, &theta);
+}
+
+/// The exact band PR #1340's review named: a DCM whose weight block fits **one** occasion
+/// (12 weights + 2 η + 1 κ = 15 ≤ 24, so any `K = 1` model-level bound reads analytic) but
+/// whose real, many-occasion subjects stack past the cap (12 + 2 + 11 = 25) and need a
+/// second θ chunk. With an `[initial_conditions]` impulse the first cut of #1339 declined
+/// every such subject while the gate still advertised an analytic outer gradient — the
+/// #637 route/report drift, and `K ≥ 2` is the normal case for IOV data, so it was not a
+/// minority of subjects but all of them.
+///
+/// Both subjects are served now, and the 11-occasion one's `∂f/∂θ` is pinned against
+/// central differences of `predict_iov`: a chunked impulse that kept seeding its direct
+/// θ / η references on absolute axes writes another chunk's columns, which shows up here
+/// as a θ-gradient mismatch rather than as a silent FD fallback.
+#[test]
+fn dcm_iov_chunked_init_impulse_serves_a_many_occasion_subject() {
     use crate::sens::provider::{iov_analytical_supported, subject_sensitivities_iov};
 
     const SMALL_DCM_IOV: &str = r#"
@@ -1907,22 +2047,47 @@ fn dcm_iov_walk_declines_absolute_axis_step_only_off_the_identity_chunk() {
         subject_sensitivities_iov(&plain, &subject, &theta, &stacked).is_some(),
         "the plain network is served through two chunks"
     );
+    let sens = subject_sensitivities_iov(&with_init, &subject, &theta, &stacked)
+        .expect("the chunked walk must serve the init impulse on a many-occasion subject");
+
+    // θ-gradient parity against central differences of `predict_iov`. First order only:
+    // the mixed and η blocks are covered on the wider fixture by
+    // `dcm_iov_init_impulse_matches_fd_off_the_identity_chunk`, and this test exists for
+    // the `K = 11` geometry, not for a second copy of that sweep.
+    let n_theta = with_init.n_theta;
+    let pred = |th: &[f64], j: usize| -> f64 {
+        let eta_bsv = stacked[..with_init.n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..k)
+            .map(|g| {
+                stacked[with_init.n_eta + g * with_init.n_kappa
+                    ..with_init.n_eta + (g + 1) * with_init.n_kappa]
+                    .to_vec()
+            })
+            .collect();
+        crate::pk::predict_iov(&with_init, &subject, th, &eta_bsv, &kappas)[j]
+    };
+    let mut live = vec![false; n_theta];
+    for (j, obs) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(obs.f, pred(&theta, j), max_relative = 1e-9);
+        for m in 0..n_theta {
+            let s = 1e-6 * (1.0 + theta[m].abs());
+            let mut tp = theta.clone();
+            tp[m] += s;
+            let mut tm = theta.clone();
+            tm[m] -= s;
+            let g = (pred(&tp, j) - pred(&tm, j)) / (2.0 * s);
+            if g.abs() > 1e-3 {
+                live[m] = true;
+            }
+            approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-4, epsilon = 1e-7);
+        }
+    }
+    // Columns 12.. do not exist here (12 weights), but a silent column inside the block
+    // would make its own parity vacuous — the second chunk is `[11..12]`, one column, so
+    // this is the assertion that keeps the chunked half of the sweep non-degenerate.
+    let dead: Vec<usize> = (0..n_theta).filter(|&m| !live[m]).collect();
     assert!(
-        subject_sensitivities_iov(&with_init, &subject, &theta, &stacked).is_none(),
-        "the init impulse cannot run on a non-identity chunk; this subject must decline"
-    );
-    // The same model serves a one-occasion subject on the identity chunk.
-    let mut one = subject.clone();
-    one.doses.truncate(1);
-    one.obs_times.truncate(2);
-    one.observations.truncate(2);
-    one.obs_cmts.truncate(2);
-    one.cens.truncate(2);
-    one.occasions.truncate(2);
-    one.dose_occasions.truncate(1);
-    assert!(
-        subject_sensitivities_iov(&with_init, &one, &theta, &vec![0.05; with_init.n_eta + 1])
-            .is_some(),
-        "on the identity chunk the impulse runs"
+        dead.is_empty(),
+        "weight columns {dead:?} of {n_theta} are silent on every observation"
     );
 }

@@ -303,6 +303,8 @@ Two consequences worth knowing:
   to the per-`θ` loop — correct, just slower. Covariates that vary but
   do *not* feed the network are unaffected.
 
+### FOCE / FOCEI: the analytic sensitivity provider
+
 `method = focei` (and `foce`) takes a different route: the analytic
 sensitivity provider. There the weights were never a problem for a
 network fed **static** covariates — the closed-form path never seeds
@@ -328,6 +330,8 @@ thing to check if a fit is unexpectedly slow. A model that reads a
 generated weight parameter directly (`… + B_TYPICAL_PK_2_1`) still
 routes to FD, as it does for the fixed-η estimators.
 
+### IOV models
+
 A network on an **IOV** model (`kappa` random effects) takes the
 stacked `[η, κ]` walk, and that walk had the same limitation until
 #1339: it seeded every model theta on a dual axis of its own and
@@ -345,6 +349,18 @@ in through backpropagation — and walks the weight columns in chunks,
 so a DCM with IOV reports an analytic outer gradient and `auto` picks
 L-BFGS. The inner (per-subject) gradient was already analytic for
 these models and is unchanged.
+
+Three post-walk steps used to need the whole weight block on one chunk,
+because their compiled programs seeded their direct theta / eta
+references on absolute dual axes: an `[initial_conditions]` baseline,
+an `obs_scale` expression, and an analytic Form C readout. They are
+evaluated in each chunk's own basis instead, so they place no extra
+condition on the outer route — a weight block of any width is chunked
+the same way with or without them, and the `obs_scale` expression is
+no longer capped at 24 `(theta, eta)` axes on the IOV path. A model
+whose stacked `[eta, kappa]` block alone fills the 24-axis walk still
+declines per subject (there is no room left for a theta column), as it
+always did; that shows up in the finite-difference fallback warning.
 
 ## Regularization (`nn_l2`, `nn_smooth`)
 
