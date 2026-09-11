@@ -22534,6 +22534,74 @@ fn a_prior_after_a_kappa_weight_modifier_is_still_seen() {
     assert!(model.kappa_weights[0].is_some());
 }
 
+/// A parameter *named* `prior` is not the modifier either.
+///
+/// `prior` is a legal name (every declaration regex takes `\w+`), so these are
+/// valid models that predate #254 and must keep parsing. Both spellings are
+/// here because they fail differently: `omega PRIOR ~ 0.1` reaches the
+/// call-shape test and was reported as "`prior` must be written as a call",
+/// while `theta prior(0.1, 0, 10)` *is* a call and was peeled off as a
+/// three-argument modifier, erroring on the argument list instead. Neither is
+/// caught by the `MY_prior` test below, whose left-boundary guard fires first.
+#[test]
+fn a_parameter_named_prior_is_not_the_modifier() {
+    // `~` form: the keyword sits in the name slot with no `(` after it.
+    let omega_named_prior = priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega PRIOR ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("exp(ETA_CL)", "exp(PRIOR)");
+    let model = parse_full_model(&omega_named_prior)
+        .unwrap_or_else(|e| panic!("`omega PRIOR ~ 0.09` must parse: {e}"))
+        .model;
+    assert!(model.priors.is_empty());
+    assert!(model.eta_names.iter().any(|n| n == "PRIOR"));
+
+    // Call form: the keyword sits in the name slot *and* is followed by `(`, so
+    // only the preceding `theta` separates it from a real modifier.
+    let theta_named_prior = priored_model(
+        "  theta prior(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("CL = TVCL", "CL = prior");
+    let model = parse_full_model(&theta_named_prior)
+        .unwrap_or_else(|e| panic!("`theta prior(...)` must parse: {e}"))
+        .model;
+    assert!(model.priors.is_empty());
+    assert!(model.theta_names.iter().any(|n| n == "prior"));
+
+    // The straddle, on the *same* declarations: one token further right and the
+    // identical keyword is the modifier again. Without this a fix that simply
+    // stopped recognising `prior` anywhere would pass the two halves above.
+    let both = priored_model(
+        "  theta prior(0.2, 0.001, 10.0) prior(0.2, rse = 25%)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega PRIOR ~ 0.09 prior(0.09, rse = 40%)\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("CL = TVCL", "CL = prior")
+    .replace("exp(ETA_CL)", "exp(PRIOR)");
+    let model = parse_full_model(&both)
+        .unwrap_or_else(|e| panic!("a modifier after a same-named declaration must parse: {e}"))
+        .model;
+    let names: Vec<&str> = model.priors.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["prior", "PRIOR"]);
+
+    // And the bare-tail safety net still fires: a `prior` that is neither a name
+    // slot nor a call is an error, not a silently dropped tail.
+    let err = parse_err(&priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    ));
+    assert!(err.contains("must be written as a call"), "got: {err}");
+}
+
 /// A name containing `prior` is not the modifier.
 #[test]
 fn an_identifier_containing_prior_is_not_the_modifier() {

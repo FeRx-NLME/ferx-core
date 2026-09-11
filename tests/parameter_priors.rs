@@ -535,31 +535,62 @@ fn an_unpriored_fit_still_round_trips_through_fitrx() {
     assert!(loaded.prior_summary.is_empty());
 }
 
-/// **Finding 5.** `covariance_method = s` cannot carry a prior, so the
-/// combination is refused rather than reported as a MAP standard error.
+/// **Finding 5.** Neither covariance estimator built on `S` can carry a prior,
+/// so `s` and `rsr` are both refused rather than reported as MAP standard
+/// errors.
+///
+/// `s` is the obvious half: `S⁻¹` is the unpenalized information outright.
+/// `rsr` is the half that was missed when this gate first landed — `R⁻¹ S R⁻¹`
+/// *looks* safe because both `R⁻¹` factors carry the prior's curvature, but the
+/// `S` between them does not, so the sandwich is neither the penalized
+/// estimator nor the unpenalized one and under-states the SE on every priored
+/// coordinate. The old `s` diagnostic recommended `rsr` by name, which is why
+/// the suggestion is asserted here too.
 #[test]
-fn a_prior_with_the_cross_product_covariance_is_refused() {
+fn a_prior_with_an_s_based_covariance_is_refused() {
     let model = warfarin_with(&params_with_cl_prior(0.15, 25.0));
     let pop = warfarin_population();
 
-    let mut s_method = short_focei();
-    s_method.run_covariance_step = true;
-    s_method.covariance_method = ferx_core::types::CovarianceMethod::CrossProduct;
-    let err = fit_model(&model, &pop, &s_method)
-        .expect_err("covariance_method = s cannot represent a prior");
-    assert!(err.contains("covariance_method = s"), "{err}");
+    let with_cov = |m: ferx_core::types::CovarianceMethod| {
+        let mut o = short_focei();
+        o.run_covariance_step = true;
+        o.covariance_method = m;
+        o
+    };
+
+    for (label, method) in [
+        ("s", ferx_core::types::CovarianceMethod::CrossProduct),
+        ("rsr", ferx_core::types::CovarianceMethod::Sandwich),
+    ] {
+        let err = fit_model(&model, &pop, &with_cov(method))
+            .expect_err("an S-based covariance method cannot represent a prior");
+        assert!(
+            err.contains(&format!("covariance_method = {label}")),
+            "the message must name the rejected method: {err}"
+        );
+        // The suggestion must not send the user to the other broken estimator.
+        assert!(
+            !err.contains("`rsr`"),
+            "`rsr` is rejected too and must not be recommended: {err}"
+        );
+
+        // And an unpriored fit may still use it, so the rejection is about the
+        // prior and not about the method.
+        let plain = warfarin_with(BASE_PARAMS);
+        assert!(
+            fit_model(&plain, &pop, &with_cov(method)).is_ok(),
+            "`{label}` without a prior must be untouched"
+        );
+    }
 
     // The straddle: the same model with the default `r` is accepted, so the gate
     // rejects the estimator rather than every priored covariance step.
-    let mut r_method = short_focei();
-    r_method.run_covariance_step = true;
-    r_method.covariance_method = ferx_core::types::CovarianceMethod::Hessian;
-    assert!(fit_model(&model, &pop, &r_method).is_ok());
-
-    // And an unpriored fit may still use `s`, so the rejection is about the
-    // prior and not about the method.
-    let plain = warfarin_with(BASE_PARAMS);
-    assert!(fit_model(&plain, &pop, &s_method).is_ok());
+    assert!(fit_model(
+        &model,
+        &pop,
+        &with_cov(ferx_core::types::CovarianceMethod::Hessian)
+    )
+    .is_ok());
 }
 
 /// **Finding 3.** SIR must resample against the *penalized* objective.

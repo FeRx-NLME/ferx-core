@@ -454,6 +454,53 @@ fn a_prior_on_a_block_omega_element_is_an_error() {
     assert!(msg.contains("block_omega"), "{msg}");
 }
 
+/// Block membership is a property of the **matrix**, not only of the free mask.
+///
+/// A fixed non-zero covariance is still a covariance: the packed coordinate for
+/// row `r > 0` of such a block is `ln(L[r,r])`, and `SD_r² = Σⱼ L[r,j]²`, so
+/// scaling a prior there as if `L[r,r]` were the SD is wrong with nothing in the
+/// output to say so. Today `packed_fixed_mask` fixes the whole row and column of
+/// a FIXed eta, which makes the arrangement unreachable through the parser — so
+/// this is built directly, and it is the reason the predicate consults
+/// `om.matrix` rather than resting on that coupling.
+///
+/// Deleting the `om.matrix` clause from `in_block` reddens the first half here
+/// and nothing else in the suite.
+#[test]
+fn a_prior_on_a_block_diagonal_with_a_fixed_covariance_is_an_error() {
+    // ETA_CL ~ ETA_V correlated, but the off-diagonal is *not* a free parameter:
+    // `free_mask` is the identity while the matrix is genuinely non-diagonal.
+    let fixed_cov = |off: f64| -> Fixture {
+        let mut f = Fixture::new(0.2, 0.001, 0.1, 0.1);
+        let m = nalgebra::DMatrix::from_row_slice(2, 2, &[0.09, off, off, 0.20]);
+        let mut free = nalgebra::DMatrix::from_element(2, 2, false);
+        free[(0, 0)] = true;
+        free[(1, 1)] = true;
+        f.model.default_params.omega = OmegaMatrix::from_matrix_with_mask(
+            m,
+            vec!["ETA_CL".into(), "ETA_V".into()],
+            false,
+            free,
+        );
+        f.model.default_params.omega_fixed = vec![false, false];
+        f.model.omega_init_as_sd = vec![false, false];
+        f.with_prior("ETA_CL", 0.09, PriorSpread::Rse(0.4))
+    };
+
+    let err = fixed_cov(0.02)
+        .build()
+        .expect_err("a diagonal correlated by a fixed covariance is a block member");
+    assert!(err.contains("block_omega"), "{err}");
+
+    // The straddle: the identical shape with a *zero* off-diagonal is an ordinary
+    // independent variance and resolves. Without this the first half is satisfied
+    // by a predicate that rejects every non-`diagonal` matrix outright, which is
+    // the mixed-Ω regression the test above this one exists to prevent.
+    fixed_cov(0.0)
+        .build()
+        .expect("an uncorrelated diagonal must still resolve");
+}
+
 /// A **mixed** Ω — `block_omega (A, B)` alongside an independent `omega C` — is a
 /// single non-diagonal matrix, so a matrix-level `!diagonal` test rejects a prior
 /// on `C` even though `C` is an ordinary uncorrelated variance.

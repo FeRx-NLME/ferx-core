@@ -14691,6 +14691,38 @@ fn split_weight_modifier(
     Ok((stmt.to_string(), Some(expr.to_string())))
 }
 
+/// Whether the word immediately before byte `i` is a `[parameters]`
+/// declaration keyword — i.e. `i` sits in the declaration's *name* slot rather
+/// than in a trailing modifier (#254).
+///
+/// `prior` is a legal parameter name (the declaration regexes all take `\w+`),
+/// so `omega PRIOR ~ 0.1` and `theta prior(0.1, 0, 10)` are valid models that
+/// predate the modifier and must keep their old meaning. A `prior(...)`
+/// modifier only ever follows a *complete* declaration, so the word before it
+/// is a `)`, a number or a `weight =` expression — never one of these
+/// keywords. The `block_*` forms are deliberately absent: their names live
+/// inside the parenthesised list, which the caller already skips on depth.
+fn preceded_by_declaration_keyword(body: &str, i: usize) -> bool {
+    let bytes = body.as_bytes();
+    let mut end = i;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    // No whitespace before `i` means no separate preceding word; the caller's
+    // left-boundary test has already ruled out an identifier char abutting it.
+    if end == i {
+        return false;
+    }
+    let mut start = end;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    matches!(
+        body[start..end].to_ascii_lowercase().as_str(),
+        "theta" | "omega" | "sigma" | "kappa"
+    )
+}
+
 /// Peel a trailing `prior(...)` modifier off a `[parameters]` declaration
 /// (#254), returning the declaration without it plus the parsed prior.
 ///
@@ -14733,6 +14765,16 @@ fn split_prior_modifier(
         // Whole-word on the left, so `MY_prior` is a name and not the modifier.
         let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
         if i > 0 && is_ident(bytes[i - 1]) {
+            continue;
+        }
+        // A declaration's *name* slot is not the modifier. `prior` is a legal
+        // parameter name, so `omega PRIOR ~ 0.1` and `theta prior(0.1, 0, 10)`
+        // are ordinary declarations that predate this feature; the modifier is
+        // always a tail *after* a complete declaration and so never sits in the
+        // token right after `theta` / `omega` / `sigma` / `kappa`. Tested
+        // before the call-shape check below, so the `~` form is skipped rather
+        // than reported as a malformed call.
+        if preceded_by_declaration_keyword(body, i) {
             continue;
         }
         // The modifier is a call, so what follows the keyword must be `(`.

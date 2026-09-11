@@ -172,13 +172,22 @@ there is only evaluating SAEM's unpriored estimates.
 
 ### Covariance estimators
 
-`covariance_method = r` (the default) and `rsr` carry the prior's curvature.
-`covariance_method = s` is **refused** under a prior: `S` is a sum of per-subject
-score cross-products, and a prior contributes one score for the whole population
-rather than one per subject, so `S⁻¹` cannot represent it and reporting it as a
-MAP standard error would be a plain misstatement. For the same reason, a
-large-parameter fit that would normally be auto-routed from `r` to `s` stays on
-`r` when a prior is declared, and says so.
+`covariance_method = r` (the default) is the only estimator accepted under a
+prior; it is the one whose Hessian carries the prior's curvature, so its `R⁻¹` is
+the penalized (MAP) covariance.
+
+Both estimators built on `S` are **refused**. `S` is a sum of per-subject score
+cross-products, and a prior contributes one score for the whole population rather
+than one per subject, so nothing assembled from `S` can represent it:
+
+- `covariance_method = s` is `S⁻¹`, the unpenalized information outright;
+- `covariance_method = rsr` is the `R⁻¹ S R⁻¹` sandwich, which wraps a prior-free
+  `S` in two prior-shrunk `R⁻¹` factors. The result is neither the penalized
+  estimator nor the unpenalized one — it under-states the standard error on every
+  priored coordinate — so it is rejected rather than reported with a caveat.
+
+For the same reason, a large-parameter fit that would normally be auto-routed
+from `r` to `s` stays on `r` when a prior is declared, and says so.
 
 Under SIR (`sir = true`), the importance weights score the penalized objective,
 so the resampled intervals reflect the prior rather than drifting back toward the

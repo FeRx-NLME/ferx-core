@@ -1376,8 +1376,9 @@ pub(crate) fn ofv_is_valid(ofv: f64) -> bool {
 /// Resolve a model's declared parameter priors (#254) against `template`'s
 /// packed layout, for an optimizer that needs the penalty on its objective.
 ///
-/// **The gate for a bad prior is [`crate::api::validation::check_model_data`],
-/// not this function.** `fit()` calls it before any optimizer runs and refuses
+/// **The gate for a bad prior is
+/// [`crate::api::validation::check_parameter_priors`], not this function.**
+/// `api::fit::fit_inner` calls it before any optimizer runs and refuses
 /// the model with the same message `PriorSet::build` would produce here, so a
 /// prior that reaches this point has already been checked against the very
 /// `ModelParameters` layout passed in. An `Err` here therefore means the caller

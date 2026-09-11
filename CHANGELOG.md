@@ -21,7 +21,7 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
-- **Per-parameter priors for penalized maximum-likelihood (MAP) estimation**, declared inline as `prior(value, rse = 25%)` on any `theta`, `omega`, `sigma` or `kappa` — the simple alternative to NONMEM `$PRIOR`, with no separate prior problem and no matrices. The fit reports the data and prior halves of the OFV separately plus a per-parameter shift-toward-prior summary; AIC/BIC stay on the data half, and the prior's curvature reaches the reported standard errors and the SIR intervals. Applies to `foce`, `focei`, `laplace`, `gn` and `gn_hybrid`; a chain whose last estimating stage cannot apply priors, and `covariance_method = s` (which cannot represent one), are refused rather than run unpenalized. The θ prior is anchored against NONMEM `$PRIOR NWPRI` (#254).
+- **Per-parameter priors for penalized maximum-likelihood (MAP) estimation**, declared inline as `prior(value, rse = 25%)` on any `theta`, `omega`, `sigma` or `kappa` — the simple alternative to NONMEM `$PRIOR`, with no separate prior problem and no matrices. The fit reports the data and prior halves of the OFV separately plus a per-parameter shift-toward-prior summary; AIC/BIC stay on the data half, and the prior's curvature reaches the reported standard errors and the SIR intervals. Applies to `foce`, `focei`, `laplace`, `gn` and `gn_hybrid`; a chain whose last estimating stage cannot apply priors, and an `S`-based covariance estimator (`covariance_method = s` or `rsr`, neither of which can represent one), are refused rather than run unpenalized. The θ prior is anchored against NONMEM `$PRIOR NWPRI` (#254).
 
 ### Changed
 

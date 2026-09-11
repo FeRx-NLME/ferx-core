@@ -490,7 +490,21 @@ fn push_omega_coords(
         let (scale, rejection) = if r == c {
             // `init_as_sd` is parallel to the *eta* list, so it is indexed by the
             // row, never by the packed position.
-            let in_block = (0..n).any(|j| j != r && (om.free_mask[(r, j)] || om.free_mask[(j, r)]));
+            // A *free* off-diagonal is the usual marker, but it is not the only
+            // one: a fixed non-zero covariance is still a covariance, and the
+            // packed coordinate for row `r > 0` of such a block is `ln(L[r,r])`,
+            // which is not `ln(SD_r)` (`SD_r² = Σⱼ L[r,j]²`) — so scaling a prior
+            // as if it were would be wrong with nothing to say so. Today
+            // `packed_fixed_mask` fixes the whole row/col of a FIXed eta, which
+            // makes the case unreachable; testing the matrix as well as the mask
+            // means this stays correct without depending on that.
+            let in_block = (0..n).any(|j| {
+                j != r
+                    && (om.free_mask[(r, j)]
+                        || om.free_mask[(j, r)]
+                        || om.matrix[(r, j)] != 0.0
+                        || om.matrix[(j, r)] != 0.0)
+            });
             (
                 sd_or_var_scale(flag_at(init_as_sd, r)),
                 in_block.then(|| block_rejection(block_keyword)),
