@@ -3664,22 +3664,29 @@ pub struct CompiledModel {
     /// IOV kappa names (length == n_kappa). Empty when no IOV.
     pub kappa_names: Vec<String>,
     /// Names of the individual parameters declared at the top level of the
-    /// `[individual_parameters]` block, in declaration order. Parallel to
-    /// `pk_indices`; for analytical models the i-th name is the variable
-    /// whose value lands in `PkParams.values[pk_indices[i]]`. For ODE
-    /// models the i-th name is written sequentially into slot `i` by
-    /// `pk_param_fn`. Used by the FFI to label per-subject EBE individual
-    /// parameter values (e.g. `CL`, `V`, `Ka`).
+    /// `[individual_parameters]` block, in declaration order (followed by any
+    /// parser-synthesized `__ferx_*` parameters). Parallel to `pk_indices` on
+    /// both engines: read the i-th name's value from
+    /// `PkParams.values[pk_indices[i]]`, never from slot `i`. Used by the FFI to
+    /// label per-subject EBE individual parameter values (e.g. `CL`, `V`, `Ka`).
     ///
-    /// Bound: `pk_param_fn` writes at most `MAX_PK_PARAMS` slots (the size
-    /// of the fixed `PkParams.values` array). For analytical models the
-    /// parser already routes assignments through that fixed slot table, so
-    /// excess names are not possible. For ODE models with more than
-    /// `MAX_PK_PARAMS` top-level `[individual_parameters]` assignments,
-    /// names beyond index `MAX_PK_PARAMS - 1` will appear in this list but
-    /// `pk_param_fn` won't store their values — downstream consumers will
-    /// read either zero or NaN for those slots. In practice no PK model
-    /// approaches this limit.
+    /// Where `pk_indices[i]` comes from differs by engine:
+    /// - **ODE and compartment-free models** route every name through
+    ///   `ode_param_slots`: a canonical PK name (`CL`, `V`, `KA`, `F`,
+    ///   `LAGTIME`, …, per `PkParams::name_to_index`) takes its fixed PK slot,
+    ///   and every other name takes the lowest free slot that is not one of the
+    ///   engine-reserved F/lagtime slots. A model declaring `V, KA, KE` in that
+    ///   order therefore stores them at slots `1, 4, 0`, not `0, 1, 2`.
+    /// - **Analytical models** place a name at its PK slot only when it is bound
+    ///   on the `[structural_model]` line, or allocated a spare slot because a
+    ///   readout references it (#650). Any other top-level name (e.g. an
+    ///   intermediate such as `TVCL`) is never written to `PkParams`; its
+    ///   `pk_indices` entry is a placeholder `0`, which aliases the `CL` slot
+    ///   rather than holding that name's value.
+    ///
+    /// Bound: an ODE or compartment-free model whose names do not all fit the
+    /// `MAX_PK_PARAMS`-slot layout is rejected at parse time by
+    /// `ode_param_slots`, so on that layout every entry has a real slot.
     pub indiv_param_names: Vec<String>,
     /// Symbolic partial derivatives of every top-level `[individual_parameters]`
     /// assignment w.r.t. each θ and η axis, precomputed at parse time. Outer
@@ -4458,11 +4465,17 @@ impl CompiledModel {
     /// aware slow paths.
     ///
     /// Checks both routes by which lagtime can be wired in:
-    ///   1. Analytical PK: `pk_indices` contains `PK_IDX_LAGTIME` when the
-    ///      `[structural_model]` line includes `lagtime=` / `alag=`.
-    ///   2. ODE: the LAGTIME/ALAG slot is populated by name in
-    ///      `build_pk_param_fn`'s ODE branch (sequential pk_indices do not
-    ///      reflect this), so we fall back to scanning `indiv_param_names`.
+    ///   1. `pk_indices` contains `PK_IDX_LAGTIME` whenever a parameter is
+    ///      routed to the lag slot: on the analytical engine by a `lagtime=` /
+    ///      `alag=` binding on the `[structural_model]` line, on the ODE (and
+    ///      compartment-free) layout by `ode_param_slots` sending a bare
+    ///      `LAGTIME`/`ALAG` name to its canonical slot.
+    ///   2. A compartment-indexed `ALAGn`/`LAGTIMEn` (#369) is not a canonical
+    ///      PK name, so it takes an ordinary structural slot that `pk_indices`
+    ///      cannot identify; it is found by scanning `indiv_param_names`. The
+    ///      scan also matches a bare `LAGTIME`/`ALAG`, which on the ODE layout
+    ///      route 1 already covers, and which on the analytical engine catches
+    ///      one declared without a `[structural_model]` binding.
     pub fn has_lagtime(&self) -> bool {
         if self.pk_indices.contains(&PK_IDX_LAGTIME) {
             return true;

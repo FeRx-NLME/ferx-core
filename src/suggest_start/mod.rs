@@ -367,10 +367,13 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         return (empty_pop_nca(), warnings);
     }
 
-    // ODE models: pk_indices are sequential (slot i = position i), not semantic.
-    // NCA can't reliably map estimates to the user's parameter names (which could
-    // be KE, EMAX, or anything else — not necessarily CL/V).  Fall back to model
-    // defaults and let the nca_sweep method sweep them via rRMSE.
+    // ODE models: `pk_indices` does route a canonical name (CL, V, KA, …) to its PK
+    // slot (`ode_param_slots`), but that is a naming convention, not a structural
+    // guarantee — the `[odes]` RHS decides what a parameter means, so an ODE `CL`
+    // need not be the clearance NCA estimates, every other name (KE, EMAX, …) sits
+    // in a free slot with no PK meaning, and `pk_model` is only a placeholder.
+    // NCA can't reliably map its estimates onto the user's parameters, so fall
+    // back to model defaults and let the nca_sweep method sweep them via rRMSE.
     if model.ode_spec.is_some() {
         warnings.push(
             "inits_from_nca: ODE model detected; NCA estimation skipped (parameter names are user-defined). Use the nca_sweep method for rRMSE-based sweep.".into(),

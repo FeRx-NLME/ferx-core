@@ -10248,8 +10248,8 @@ fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
   DV ~ proportional(EPS)
 ";
     let parsed = super::parse_full_model(model_str).unwrap();
-    // ODE models must report has_lagtime() via the indiv_param_names
-    // fallback even when pk_indices doesn't contain PK_IDX_LAGTIME.
+    // A bare LAGTIME is a canonical name, so `ode_param_slots` routes it to
+    // PK_IDX_LAGTIME and `pk_indices` carries the slot on the ODE layout too.
     assert!(
         parsed.model.has_lagtime(),
         "has_lagtime() must return true for an ODE model declaring LAGTIME"
