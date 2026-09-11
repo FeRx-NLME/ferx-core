@@ -14370,9 +14370,15 @@ fn bytecode_matches_ast_on_unary_guards() {
     bc_vs_ast(unary("logit", lit(0.3)), v, t, e, c);
     bc_vs_ast(unary("logit", lit(0.0)), v, t, e, c);
     bc_vs_ast(unary("logit", lit(1.0)), v, t, e, c);
-    // Unknown unary name — slow path returns the argument unchanged;
-    // the bytecode no-op'd UnaryFn arm must too.
-    bc_vs_ast(unary("expn", lit(42.0)), v, t, e, c);
+    // `floor` / `ceil` / `round` — the rounding opcodes, checked on both sides
+    // of `.5` and on a negative value (Rust rounds half away from zero).
+    for name in ["floor", "ceil", "round"] {
+        for x in [6.9, -6.9, 2.5, -2.5, 3.0] {
+            bc_vs_ast(unary(name, lit(x)), v, t, e, c);
+        }
+    }
+    // No unknown-name case: since #1332 `parse_atom` cannot build one, and both
+    // evaluators answer an out-of-whitelist name with `unreachable!`.
 }
 
 #[test]
@@ -14769,16 +14775,44 @@ fn differentiate_abs_branches_on_sign() {
     assert_diff_matches_fd(expr, DiffAxis::Theta(0), &[0.3], eta, vars, covs);
 }
 
+/// `floor` / `ceil` / `round` are piecewise constant, so their derivative is 0
+/// away from an integer boundary. They had arms in `eval_expr` and in the
+/// bytecode compiler but none in `differentiate_with_chain`, so they landed on
+/// the old unknown-name identity fallthrough and differentiated as `a'` — a
+/// value path that rounds against an analytic gradient that does not (#1332).
+///
+/// The mutation this exists to catch is deleting the `"floor" | "ceil" |
+/// "round"` arm: the name then hits `unreachable!` and the test panics. The
+/// *pre-#1332* mutation — that arm falling through to `da` — is what the FD
+/// comparison itself catches, which is why the point is chosen strictly inside
+/// a step (`3.0 * θ_0 = 6.9`, FD half-width `3e-5`) where the argument's own
+/// derivative is 3 and the true derivative is 0. On an integer boundary FD
+/// would report `1/(2h)` and measure the discontinuity rather than the arm.
 #[test]
-fn differentiate_unknown_unary_passes_through() {
-    // The slow path returns the argument unchanged for unknown names;
-    // the differentiator must return the argument's derivative.
-    let theta = &[2.0];
+fn differentiate_floor_ceil_round_is_zero_away_from_a_step() {
+    let theta = &[2.3]; // 3·θ₀ = 6.9 — no integer within FD's h = 1e-5
     let eta = &[];
     let vars = &[];
     let covs = &[];
-    let expr = unary("expn", binop(BinOp::Mul, Expression::Theta(0), lit(3.0)));
-    assert_diff_matches_fd(expr, DiffAxis::Theta(0), theta, eta, vars, covs);
+    for (name, want) in [("floor", 6.0), ("ceil", 7.0), ("round", 7.0)] {
+        let expr = unary(name, binop(BinOp::Mul, Expression::Theta(0), lit(3.0)));
+        // The value path really does round — otherwise the derivative being 0
+        // would be trivially right for the wrong reason.
+        let v = eval_at(&expr, theta, eta, vars, covs);
+        assert_eq!(v, want, "`{name}(6.9)` must round to {want}, got {v}");
+        assert_eq!(
+            eval_at(
+                &differentiate(&expr, DiffAxis::Theta(0)),
+                theta,
+                eta,
+                vars,
+                covs
+            ),
+            0.0,
+            "d/dθ₀ {name}(3·θ₀) must be 0, not the argument's derivative (3)"
+        );
+        assert_diff_matches_fd(expr, DiffAxis::Theta(0), theta, eta, vars, covs);
+    }
 }
 
 #[test]
@@ -21871,4 +21905,439 @@ fn power_form_rejects_per_cmt() {
 "#;
     let err = expect_parse_err(content);
     assert!(err.contains("not supported with per-CMT"), "got: {err}");
+}
+
+// ── #1332: an unknown function name is a parse error, not the identity ──────
+//
+// `parse_atom` used to build `Expression::UnaryFn(name, arg)` for *any*
+// identifier followed by `(`, and all three consumers ended their match on a
+// fallthrough that returned the argument unchanged. So `CL = TVCL *
+// tanh(ETA_CL)` parsed, passed `ferx check`, fitted, converged and computed
+// `TVCL * ETA_CL` — the value path and the derivative path agreeing on the
+// *wrong* model, with nothing in `FitResult.warnings` naming the dropped call.
+
+/// A model with one hole per block that routes free expressions through
+/// `parse_atom`. Every hole defaults to something benign, so a probe changes
+/// exactly one block at a time.
+fn unknown_fn_probe_model(ip: &str, ode: &str, scaling: &str, derived: &str, err: &str) -> String {
+    format!(
+        "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{ip}
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+{ode}  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[scaling]
+  y = central / V{scaling}
+
+[derived]
+  CLi = CL{derived}
+
+[error_model]
+  DV ~ {err}
+
+[fit_options]
+  method  = focei
+  maxiter = 10
+"
+    )
+}
+
+/// The blocks a one-argument call can appear in, each carrying `fname(...)`
+/// where the call goes. The check sits at the single site that builds the node,
+/// so it has to bite in all of them — an earlier arity fix that lived on one
+/// block's path would leave the rest silent.
+///
+/// The argument differs by block on purpose: an `[odes]` RHS may not reference a
+/// θ (it is rejected by name resolution before the call is ever evaluated), so
+/// the ODE / scaling / derived probes take the individual parameter `CL`. Using
+/// `TVCL` there would make the *straddle* fixture invalid while the rejection
+/// test still passed, on a different error.
+fn unknown_fn_probe_sources(fname: &str) -> Vec<(&'static str, String)> {
+    let prop = "proportional(PROP_ERR)";
+    vec![
+        (
+            "[individual_parameters]",
+            unknown_fn_probe_model(&format!("  KE = {fname}(TVCL)\n"), "", "", "", prop),
+        ),
+        (
+            "[individual_parameters], inline `if` arm",
+            unknown_fn_probe_model(
+                &format!("  KE = if (TVCL > 0.5) {fname}(TVCL) else 1.0\n"),
+                "",
+                "",
+                "",
+                prop,
+            ),
+        ),
+        (
+            "[odes] statement",
+            unknown_fn_probe_model("", &format!("  KE = {fname}(CL)\n"), "", "", prop),
+        ),
+        (
+            "[odes] condition",
+            unknown_fn_probe_model(
+                "",
+                &format!("  KE = CL/V\n  if ({fname}(CL) > 1.0) {{ KE = 2.0*CL/V }}\n"),
+                "",
+                "",
+                prop,
+            ),
+        ),
+        (
+            "[scaling]",
+            unknown_fn_probe_model("", "", &format!(" * {fname}(CL)"), "", prop),
+        ),
+        (
+            "[derived]",
+            unknown_fn_probe_model("", "", "", &format!("\n  CLd = {fname}(CL)"), prop),
+        ),
+        (
+            "[error_model] magnitude expression",
+            unknown_fn_probe_model(
+                "",
+                "",
+                "",
+                "",
+                &format!("proportional(PROP_ERR * {fname}(TVCL))"),
+            ),
+        ),
+    ]
+}
+
+/// Every realistic trigger — a function that exists in another tool, a typo,
+/// and the `tanh` / `softplus` pair the DCM export (#1331) emits — must be a
+/// hard parse error naming the call, in every block that parses expressions.
+///
+/// The regression this exists to catch is deleting the `SUPPORTED_UNARY_FNS`
+/// guard in `parse_atom`: each case then parses clean and evaluates as the
+/// identity, so every assertion below reddens. That the fixtures *reach* the
+/// guard is pinned by `unknown_fn_probe_sources_parse_when_the_probe_is_known`
+/// below — the same models with a whitelisted name in the hole must parse, so
+/// a rejection here cannot be some earlier validation error on the same line.
+#[test]
+fn unknown_function_name_is_a_parse_error_in_every_block() {
+    for fname in [
+        "tanh",     // exists in NONMEM / mrgsolve, not in ferx
+        "softplus", // emitted by the DCM → population-PK export (#1331)
+        "sinh",
+        "sign",
+        "heaviside",
+        "log10",
+        "sqr",  // typo for sqrt
+        "exp1", // typo for exp
+        "lgo",  // typo for log
+    ] {
+        for (block, src) in unknown_fn_probe_sources(fname) {
+            let err = parse_model_string(&src).err().unwrap_or_else(|| {
+                panic!("`{fname}(...)` in {block} must be rejected, not silently the identity")
+            });
+            assert!(
+                err.contains("unknown function") && err.contains(fname),
+                "`{fname}(...)` in {block}: error must name the call, got: {err}"
+            );
+            assert!(
+                err.contains("Supported:") && err.contains("exp"),
+                "`{fname}(...)` in {block}: error must list what is available, got: {err}"
+            );
+        }
+    }
+}
+
+/// An unknown name is judged as a *name*, whatever arity it is called with.
+///
+/// `pow(x, y)` is one of the migration triggers #1332 names, and it used to
+/// reach the comma branch first and be reported as "`pow` takes 1 argument" —
+/// a hard error, so never the dangerous silent identity, but one that sends the
+/// reader looking for an arity bug in a function ferx does not have. The guard
+/// now sits above the argument loop, so the diagnostic is the same for every
+/// arity.
+///
+/// The three names ferx *does* take with more than one argument keep their own
+/// arity messages, asserted here so moving the guard cannot have swallowed them
+/// (`test_clamp_arity_diagnostics` pins the rest).
+#[test]
+fn an_unknown_name_is_rejected_at_every_arity() {
+    for call in [
+        "pow(TVCL, 2.0)",
+        "atan2(TVCL, TVV)",
+        "fma(TVCL, TVV, 1.0)",
+        "tanh()",
+    ] {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {call}\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        let err = parse_model_string(&src).expect_err(&format!("`{call}` must be rejected"));
+        let fname = call.split('(').next().unwrap();
+        assert!(
+            err.contains("unknown function") && err.contains(fname),
+            "`{call}`: expected the unknown-function diagnostic, got: {err}"
+        );
+        assert!(
+            !err.contains("takes 1 argument"),
+            "`{call}`: reported an arity for a function ferx does not have: {err}"
+        );
+    }
+
+    // min / max / clamp are exempt from the name guard and keep arity messages.
+    for (call, want) in [
+        ("min(TVCL)", "exactly two arguments"),
+        ("max(TVCL)", "exactly two arguments"),
+        ("clamp(TVCL)", "three arguments"),
+    ] {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {call}\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        let err = parse_model_string(&src).expect_err(&format!("`{call}` must be rejected"));
+        assert!(
+            err.contains(want) && !err.contains("unknown function"),
+            "`{call}`: expected the arity message, got: {err}"
+        );
+    }
+}
+
+/// The straddle for the test above: the *same* fixtures with a whitelisted name
+/// in the hole must parse. Without this, a rejection could be coming from an
+/// unrelated error on the probe line and the mutation "delete the guard" would
+/// leave the suite green.
+#[test]
+fn unknown_fn_probe_sources_parse_when_the_probe_is_known() {
+    for (block, src) in unknown_fn_probe_sources("sqrt") {
+        parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("`sqrt(...)` in {block} must parse, got: {e}\n{src}"));
+    }
+}
+
+/// Function names are lower-cased before dispatch, so the NONMEM `$PK`
+/// spellings a model file gets pasted from keep working — `EXP(ETA_CL)` is
+/// `exp`, not an unknown name. The rejection is case-insensitive in the same
+/// way, so `TANH(` is rejected exactly like `tanh(`.
+#[test]
+fn function_name_matching_is_case_insensitive_on_both_sides() {
+    for good in ["EXP(ETA_CL)", "Log(TVCL)", "SQRT(TVCL)", "Inv_Logit(TVCL)"] {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {good}\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("`{good}` must parse (names are lower-cased): {e}"));
+    }
+    for bad in ["TANH(TVCL)", "Tanh(TVCL)"] {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {bad}\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        let err = parse_model_string(&src).expect_err(&format!("`{bad}` must be rejected"));
+        assert!(
+            err.contains("unknown function"),
+            "`{bad}`: got the wrong error: {err}"
+        );
+    }
+}
+
+/// `present(x)` is a condition, not a value (#1111). In value position it used
+/// to become `UnaryFn("present", x)` and hand back `x`; it is now rejected with
+/// a message that points at condition position rather than at the generic
+/// "unknown function" list, since the name *is* known — just not here.
+#[test]
+fn present_in_value_position_is_rejected_and_points_at_conditions() {
+    let src = unknown_fn_probe_model("  KE = present(WT)\n", "", "", "", "proportional(PROP_ERR)");
+    let err = parse_model_string(&src).expect_err("`present` in value position must be rejected");
+    assert!(
+        err.contains("condition") && err.contains("present"),
+        "expected a conditions-only message for `present`, got: {err}"
+    );
+    // …and it still works where it belongs.
+    let ok = unknown_fn_probe_model(
+        "  KE = if (present(WT)) 1.0 else 2.0\n",
+        "",
+        "",
+        "",
+        "proportional(PROP_ERR)",
+    );
+    parse_model_string(&ok).expect("`present` in condition position must still parse");
+}
+
+/// The whitelist ↔ implementation pin. `SUPPORTED_UNARY_FNS` is the complete
+/// domain of the `UnaryFn` dispatch in `eval_expr`, `compile_expr_into` and
+/// `differentiate_with_chain`; each of those now ends on `unreachable!`, so a
+/// name added to the list without an arm in one of them panics here rather than
+/// evaluating as the identity in production.
+///
+/// Panicking is only half the pin — a reintroduced `_ => v` / `_ => da`
+/// fallthrough would not panic, so each probe is also asserted to be
+/// *non*-identity on both the value and the derivative side. The argument is
+/// `2·θ₀`, so the identity fallthrough would give value `x` and derivative `2`;
+/// every probe below is chosen so the true answers are neither.
+///
+/// The `probes` table is required to cover the list exactly, so adding a name
+/// to `SUPPORTED_UNARY_FNS` without a probe here is a red test too.
+#[test]
+fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
+    // (name, x) — `x` is the value the argument takes; θ₀ = x/2.
+    let probes: &[(&str, f64)] = &[
+        ("exp", 0.5),
+        ("log", 2.0),
+        ("ln", 2.0),
+        ("sqrt", 9.0),
+        ("abs", -3.0),
+        ("floor", 6.9),
+        ("ceil", 6.9),
+        ("round", 6.9),
+        ("logit", 0.25),
+        ("inv_logit", 0.5),
+        ("expit", 0.5),
+    ];
+    // The probe table must equal the const as a *multiset*, asserted as one
+    // comparison of sorted vectors rather than as a set of membership and
+    // length checks. The earlier spelling — equal lengths plus "every const
+    // name has a probe" — was not exact: replacing one const entry with a copy
+    // of another keeps the length and keeps every (surviving) const name
+    // present in the probes, so it stayed green while silently dropping the
+    // replaced function from the whitelist and making `ceil(...)` a parse
+    // error. Sorted-vector equality catches that, a name added to either side,
+    // and a duplicated row on either side, in a single gate — separate
+    // membership and uniqueness assertions would reject several of those inputs
+    // twice over and cover for each other.
+    let mut want: Vec<&str> = SUPPORTED_UNARY_FNS.to_vec();
+    want.sort_unstable();
+    let mut got: Vec<&str> = probes.iter().map(|(p, _)| *p).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got, want,
+        "the probe table and SUPPORTED_UNARY_FNS have drifted; every whitelisted name \
+         needs exactly one probe here, and every probe a whitelist entry"
+    );
+
+    let eta: &[f64] = &[];
+    let vars: &[f64] = &[];
+    let covs: &[f64] = &[];
+    for &(name, x) in probes {
+        let theta = &[x / 2.0];
+        let arg = binop(BinOp::Mul, Expression::Theta(0), lit(2.0));
+        let expr = unary(name, arg);
+
+        // 1. `eval_expr` has an arm: the value is not the argument.
+        let v = eval_at(&expr, theta, eta, vars, covs);
+        assert!(v.is_finite(), "`{name}({x})` must be finite, got {v}");
+        assert_ne!(
+            v, x,
+            "`{name}({x})` returned its argument — the identity fallthrough is back"
+        );
+
+        // 2. `compile_expr_into` has an arm: the bytecode agrees bit-for-bit.
+        bc_vs_ast(expr.clone(), vars, theta, eta, covs);
+
+        // 3. `differentiate_with_chain` has an arm: the derivative is neither
+        //    the argument's derivative (2) nor NaN, and it matches FD.
+        let d = eval_at(
+            &differentiate(&expr, DiffAxis::Theta(0)),
+            theta,
+            eta,
+            vars,
+            covs,
+        );
+        assert!(
+            d.is_finite(),
+            "d/dθ₀ `{name}(2·θ₀)` must be finite, got {d}"
+        );
+        assert_ne!(
+            d, 2.0,
+            "d/dθ₀ `{name}(2·θ₀)` is the argument's derivative — the `_ => da` fallthrough is back"
+        );
+        assert_diff_matches_fd(expr, DiffAxis::Theta(0), theta, eta, vars, covs);
+    }
+}
+
+/// Every name in `SUPPORTED_UNARY_FNS` must also be *accepted* by the parser.
+/// Together with the test above this closes the loop: whitelisted ⇒ parses ⇒
+/// has a real arm in all three consumers. A name dropped from the parser's
+/// check (or a check written against a second, drifting list) fails here.
+#[test]
+fn every_supported_unary_fn_parses_in_a_model_file() {
+    for name in SUPPORTED_UNARY_FNS {
+        let src = unknown_fn_probe_model(
+            &format!("  KE = {name}(TVCL)\n"),
+            "",
+            "",
+            "",
+            "proportional(PROP_ERR)",
+        );
+        parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("`{name}(...)` is whitelisted but does not parse: {e}"));
+    }
+}
+
+/// The other half of the `unreachable!` contract: what the three `UnaryFn`
+/// consumers do when the invariant is violated anyway.
+///
+/// `every_supported_unary_fn_has_an_arm_in_all_three_consumers` pins that each
+/// whitelisted name has a real arm. These pin that a name *without* one is a
+/// loud panic naming the consumer that lacks it — the property the whole fix
+/// rests on, since the alternative (`_ => v` / `_ => da`) is the silent
+/// identity #1332 is about. Tests can build the node directly, which production
+/// cannot: `parse_atom` is `Expression`'s only constructor and rejects the name
+/// first.
+///
+/// One test per consumer, each asserting *its own* name in the message, because
+/// a single combined test would be satisfied by whichever consumer panicked
+/// first and would stay green with the other two arms deleted.
+mod unreachable_unary_fn_arms {
+    use super::*;
+
+    /// A name that is deliberately not in `SUPPORTED_UNARY_FNS`.
+    fn out_of_whitelist() -> Expression {
+        assert!(
+            !SUPPORTED_UNARY_FNS.contains(&"tanh"),
+            "this test needs `tanh` to stay outside the whitelist; if it became a \
+             builtin, pick another name rather than deleting the test"
+        );
+        unary("tanh", lit(0.5))
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_expr, `tanh`")]
+    fn eval_expr_panics_rather_than_returning_the_argument() {
+        eval_at(&out_of_whitelist(), &[], &[], &[], &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "compile_expr_into, `tanh`")]
+    fn the_bytecode_compiler_panics_rather_than_emitting_a_no_op() {
+        compile_bytecode(&out_of_whitelist());
+    }
+
+    #[test]
+    #[should_panic(expected = "differentiate_with_chain, `tanh`")]
+    fn the_differentiator_panics_rather_than_passing_the_derivative_through() {
+        differentiate(&out_of_whitelist(), DiffAxis::Theta(0));
+    }
 }
