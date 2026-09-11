@@ -160,8 +160,9 @@ fn grid_response_override() -> GridResponseOverride {
 /// *slower*, which is why this route was opt-in; a later session on the same fixture came out
 /// ~14% faster. Both were real. The deciding measurement was the one nobody had run: the
 /// **block-Ω** case, where the call-count gap is wide (`2·n_free = 20` FD rebuilds vs
-/// `1 + 2(n_theta + d) = 13` provider evaluations) rather than equal by construction as it is
-/// on the diagonal fixture.
+/// `1 + 2(n_theta + d) = 13` provider evaluations). On the diagonal fixture,
+/// `n_free = n_theta + d + n_sigma = 7` gives 14 FD rebuilds versus 13 provider evaluations.
+/// Those are similar counts of different work units, not equal costs by construction.
 ///
 /// Measured on `plans/laplace-sensitivity-speed/` (5 interleaved reps, `ci-test`,
 /// `RAYON_NUM_THREADS=1`, commit `f2434247`), `fd` → `analytic` provider time:
@@ -172,13 +173,14 @@ fn grid_response_override() -> GridResponseOverride {
 /// | block Ω (3×3) | 11520 → 8160 | 0.0880s → 0.0670s (−24%) | 5/5 | 47 → 47 |
 /// | ODE | 10270 → 6470 | 1.581s → 1.029s (−35%) | 5/5 | 56 → 37 |
 ///
-/// Every arm returned an identical OFV, which is the point: the two routes compute the same
-/// derivative and differ only in cost. The diagonal case remains near parity and one rep of
-/// five still favoured `fd` — it is the least-parameterised fixture and cannot settle this
-/// either way. Block-Ω is the one that does: a 24% win on **identical** outer-iteration count,
-/// so it is a like-for-like comparison on one optimiser path rather than two trajectories. The
-/// ODE row is a larger win but *not* like-for-like (56 → 37 iterations), so read its call count
-/// rather than its time.
+/// Every arm matched OFV at the console's four-decimal precision. Derivative correctness
+/// is checked separately by `analytic_grid_response_matches_the_fd_route` and the
+/// `laplace_h_deriv` parity tests; rounded OFVs do not establish gradient equivalence. The
+/// diagonal case remains inconclusive across sessions, with one rep of five
+/// still favouring `fd`. Block-Ω measured a 24% win at equal outer-iteration counts,
+/// making it a closer comparison without establishing identical optimiser trajectories. The
+/// ODE row has different iteration counts (56 → 37); both its call and time totals reflect
+/// different optimiser trajectories and do not isolate per-iteration cost.
 ///
 /// Deliberately an environment variable and not a `[fit_options]` key: both routes compute the
 /// same derivative and differ only in cost, so there is nothing for a *user* to choose. It is
@@ -1678,15 +1680,10 @@ fn analytic_grid_response(
     // two in `node_scale_derivative` — which the per-coordinate form computed for every free
     // coordinate and then multiplied by zero.
     //
-    // **Which configuration reaches this is narrower than "`n_agq = 1`" suggests**, and the
-    // honest scope is worth stating because the saving reads bigger than it is.
-    // [`use_analytic_grid_response`] is default-on for [`HessianAnchor::GaussNewton`] only,
-    // and `FitOptions::hessian_anchor` gives that to `method = focei` alone — so the default
-    // caller here is `focei, n_agq > 1`, where `Q > 1` and `A` is *not* zero. The one-node arm
-    // is therefore reached only on the `Exact` anchor with `FERX_AGQ_GRID_RESPONSE=analytic`,
-    // i.e. the opt-in `laplace` route. It is not dead code — that route exists and is
-    // benchmarked — but it is not on a default path, and the moment hoist above, not this, is
-    // what helps the default one.
+    // Both anchors default to analytic (#1335). The one-node fast path is therefore
+    // reached by default for in-scope `laplace` fits (`Exact`, `n_agq = 1`). The usual
+    // `focei, n_agq > 1` caller uses `GaussNewton` with nonzero node displacement and
+    // benefits from the moment hoist above. Analytic declines still use the FD fallback.
     //
     // Gated on `A` rather than on `nodes.len() == 1`, which makes the skip sound for *any*
     // grid: it fires only when every `A[i,c]` is exactly `0.0`, and then the term it drops is

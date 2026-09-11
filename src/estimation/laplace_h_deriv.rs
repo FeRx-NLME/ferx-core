@@ -38,8 +38,11 @@
 //!
 //! The **block-Ω** case decided it, and it is the one to reason from: there the call-count gap
 //! is wide (`2·n_free = 20` FD rebuilds vs `1 + 2(n_theta + d) = 13` provider evaluations)
-//! rather than equal by construction, and it measured 11520 → 8160 calls for −24% provider time
-//! across 5/5 reps at an **identical** outer-iteration count and identical OFV. See
+//! versus 14 FD rebuilds and 13 provider evaluations on the diagonal fixture. It measured 11520
+//! → 8160 calls for −24% provider time
+//! across 5/5 reps at an **identical** outer-iteration count and OFV matching to four decimals.
+//! Rounded OFV agreement is not a derivative check; the grid-response and Hessian-derivative
+//! parity tests supply that evidence. See
 //! [`crate::estimation::agq::use_analytic_grid_response`] for the full table and for why the
 //! `FERX_AGQ_GRID_RESPONSE` harness is kept rather than removed.
 //!

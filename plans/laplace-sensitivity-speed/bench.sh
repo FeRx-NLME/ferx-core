@@ -14,7 +14,7 @@
 #     representation-dependent, and the diagonal fixture alone could not settle it.
 #
 #     Session 2 (5 interleaved reps, `f2434247`, 2026-09-10, RAYON_NUM_THREADS=1) — the run
-#     that flipped the default. Every arm returned an identical OFV:
+#     that flipped the default. Every arm matched OFV to four decimals:
 #       diagonal-Ω  (`warfarin_laplace.ferx`):             6840→6460 calls, 0.0586→0.0556s
 #         (−5%, 4/5 reps), iters 37→37 — still near parity, as below
 #       block-Ω     (`warfarin_block_omega_laplace.ferx`): 11520→8160 calls, 0.0880→0.0670s
@@ -52,9 +52,9 @@
 # above, ~27% less provider time on `warfarin_ode_laplace.ferx`.
 #
 # `FERX_PROFILE=1` prints the analytic provider's call count and total time — the
-# deterministic, noise-free primary metric (see the module doc in `estimation/agq.rs`); wall
-# time on these small fits is dominated by process/parse overhead and should be read as
-# corroborating, not primary.
+# primary metrics (see `estimation/agq.rs`). Call counts are deterministic for a given
+# trajectory; provider time remains timing-sensitive. Wall time on these small fits is
+# dominated by process/parse overhead and should be read as corroborating, not primary.
 #
 # Usage:  plans/laplace-sensitivity-speed/bench.sh [REPS]
 #
@@ -93,6 +93,8 @@ run() { # run <label> <model> <env-assignment...>
     >"$log" 2>&1 || { echo "FAILED: $label"; sed -n '1,40p' "$log"; return 1; }
   t1=$(python3 -c 'import time;print(time.time())')
   local ofv iters provider
+  # The console prints OFV to four decimals. Equality here is only at displayed
+  # precision; use derivative-parity tests to assess gradient agreement.
   ofv=$(grep -Eo 'OFV[^0-9-]*(-?[0-9.]+)' "$log" | tail -1 | grep -Eo '\-?[0-9.]+$' || echo NA)
   iters=$(grep -Eio 'iterations?[^0-9]*([0-9]+)' "$log" | tail -1 | grep -Eo '[0-9]+$' || echo NA)
   provider=$(grep -o 'subject_sensitivities): [0-9]* calls, [0-9.]*s' "$log" | tail -1 || echo "NA")

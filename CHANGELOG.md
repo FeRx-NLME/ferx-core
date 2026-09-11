@@ -25,11 +25,11 @@ section of the SDLC for the versioning policy).
 
 - **`method = laplace` now assembles its `½·log|H|` gradient term analytically by default,
   instead of rebuilding the conditional Hessian at `x ± h` for every free population
-  parameter.** Both routes compute the same derivative — every benchmarked configuration
-  returned an identical OFV — so this is a cost change, not an accuracy one. It was previously
-  opt-in because the only closed-form fixture measured was a **diagonal** Ω, where the two
-  routes cost the same by construction and successive sessions measured opposite signs. On a
-  **block** Ω, where the call-count gap is real, the analytic route measured 11520 → 8160
+  parameter.** Derivative-parity tests validate the two routes within numerical tolerances;
+  benchmark OFVs agree at the console's four-decimal precision. It was previously
+  opt-in because the only closed-form fixture measured was a **diagonal** Ω, with similar
+  call counts (14 FD rebuilds versus 13 provider evaluations) and timing results of opposite
+  signs across sessions. On a **block** Ω, with a wider call-count gap, the analytic route measured 11520 → 8160
   provider calls for −24% provider time on 5 of 5 reps at an identical outer-iteration count;
   on an ODE fixture, 10270 → 6470 calls and −35% time. **On ODE models the optimizer's path
   changes** (the benchmark fixture converges in 37 outer iterations instead of 56), so
@@ -45,8 +45,8 @@ section of the SDLC for the versioning policy).
   out of the coordinate loop, taking the contraction from `O(p·Q·d²)` to `O(Q·d² + p·d²)` for
   `p` free parameters, `Q = n_agq^d` nodes and `d` random effects. The one-node grid
   additionally skips the node-displacement term and the five `d×d` matrix products behind it
-  outright, since its nodes sit at `z = 0` — that arm is reached by the opt-in
-  `FERX_AGQ_GRID_RESPONSE=analytic` route for `laplace`, not by any default configuration.
+  outright, since its nodes sit at `z = 0` — that arm is now reached by the default
+  analytic route for `laplace` (#1335).
   **No wall-clock figure is claimed**: this reduces the contraction around the `Q`
   node-gradient evaluations, not their number, and those dominate on ODE models. Gradients
   move only by floating-point reassociation — measured worst relative change `1.7e-15`, a few
@@ -68,9 +68,9 @@ section of the SDLC for the versioning policy).
   σ-direct derivative, correlated residuals (`block_sigma`), and **IOV** (the stacked `[η, κ]`
   system, via a dedicated joint-prior assembly) — only mixture models keep the pre-existing
   finite-difference route. `laplace`/AGQ's exact-Hessian
-  anchor gained the same analytic route for closed-form and **ODE** models (opt-in via
-  `FERX_AGQ_GRID_RESPONSE=analytic` — no repeatable wall-clock win was measured there, so it
-  is not the default; its value is an exact, FD-noise-free gradient) (#251).
+  anchor gained the same analytic route for closed-form and **ODE** models, initially opt-in
+  via `FERX_AGQ_GRID_RESPONSE=analytic` and now the default after the block-Ω benchmark
+  described above (#251, #1335).
 
 - **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
 

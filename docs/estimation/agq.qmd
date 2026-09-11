@@ -382,16 +382,24 @@ Both anchors also have an analytic route for that last order, replacing the
 - **`laplace`, `n_agq = 1` (exact `H`)** — needs the full third-order jet, so each
   analytic evaluation costs materially more than a plain anchor rebuild, against
   materially fewer calls. Whether that nets out is representation-dependent, and on
-  a **diagonal** Ω the two costs are equal by construction (`n_free = n_theta + d`
-  either way), which is why successive benchmark sessions on that fixture measured
-  opposite signs. The **block-Ω** case is where the call-count gap is real — 20 FD
+  the measured **diagonal** Ω fixture the call counts are similar:
+  `n_free = n_theta + d + n_sigma = 3 + 3 + 1 = 7` gives 14 FD rebuilds versus
+  `1 + 2(n_theta + d) = 13` provider evaluations. These are different work units;
+  similar counts imply neither equal runtime nor parity for diagonal Ω in general.
+  Successive benchmark sessions on this fixture measured opposite timing signs. The **block-Ω**
+  case is where the call-count gap is real — 20 FD
   rebuilds against 13 provider evaluations — and it measured −24% provider time on
-  5 of 5 reps at an identical outer-iteration count and identical OFV. That made it
+  5 of 5 reps at an identical outer-iteration count and matching OFV to four decimals. That made it
   the default too.
 
-So **both anchors now use the analytic route by default.** Both compute the same
-derivative, so this is a cost choice, not an accuracy one: every benchmarked arm
-returned an identical OFV. On an ODE `laplace` fit the route does change the
+So **both anchors now use the analytic route by default.** The direct grid-response
+parity test compares both anchors at `n_agq = 1` and `3` with a `1e-5` scaled-error
+tolerance; separate Hessian-derivative tests cover block Ω, combined error, and ODE
+models (the ODE test uses `5e-3`). These tests provide the derivative correctness
+evidence. Benchmark OFVs agree at the console's four-decimal precision; that
+agreement does not establish exact equality or gradient equivalence.
+
+On an ODE `laplace` fit the route does change the
 optimizer's path — the benchmark fixture converges in 37 outer iterations instead of
 56 — so converged estimates can move within the convergence tolerance.
 
