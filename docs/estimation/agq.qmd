@@ -392,6 +392,13 @@ Both anchors also have an analytic route for that last order, replacing the
   5 of 5 reps at an identical outer-iteration count and matching OFV to four decimals. That made it
   the default too.
 
+  The sweep then dropped to **`1 + 2·n_eta` evaluations** (13 → 7 on a 3-θ/3-η
+  model): it reads `∂³f/∂η³` and `∂³f/∂η²∂θ`, and the θ axes existed only to build
+  blocks the covariance step consumes. `∂³f/∂η²∂θ` comes instead from `∂/∂η` of
+  `∂²f/∂η∂θ` — the same mixed partial, a cheaper difference direction. That moved
+  even the diagonal fixture decisively off parity: **−36%** provider time against
+  the finite-difference route, where it had been −5%.
+
 So **both anchors now use the analytic route by default.** The direct grid-response
 parity test compares both anchors at `n_agq = 1` and `3` with a `1e-5` scaled-error
 tolerance; separate Hessian-derivative tests cover block Ω, combined error, and ODE

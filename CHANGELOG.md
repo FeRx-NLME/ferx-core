@@ -21,6 +21,21 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **`method = laplace`'s analytic `½·log|H|` gradient term now sweeps only the random-effect
+  axes, not every structural parameter axis as well.** The assembly reads `∂³f/∂η³` and
+  `∂³f/∂η²∂θ`; the θ-axis sensitivity evaluations existed to build two blocks only the
+  covariance step consumes, so they were computed and discarded. `∂³f/∂η²∂θ` is still obtained
+  exactly, from `∂/∂η` of `∂²f/∂η∂θ` instead of `∂/∂θ` of `∂²f/∂η²` — the same mixed partial.
+  Cost per subject per sweep goes from `1 + 2(n_theta + n_eta)` to `1 + 2·n_eta` evaluations:
+  13 → 7 on a 3-θ/3-η model, 33 → 9 at 12 θ and 4 η. Measured against the previous release on
+  warfarin fixtures (5 interleaved reps, `ci-test`): provider calls −34 to −35% and provider
+  time −35 to −38%; against the pre-#1335 finite-difference default, −39 to −58% calls and −36
+  to −59% time, with the ODE fixture's whole-fit wall clock down 38% (1.90s → 1.18s). The two
+  finite-difference directions differ at ~1e-10, so on an ODE model the optimizer path can
+  move: the ODE fixture converges in 38 outer iterations instead of 37 and its OFV moves by
+  2e-4 (7e-7 relative), well inside the convergence tolerance. Closed-form fixtures were
+  unaffected, and `focei` is untouched (#1342).
+
 - `[covariate_nn]` models with IOV (`kappa`) now get the exact analytic FOCE/FOCEI outer gradient: the stacked `[η, κ]` sensitivity walk seeds the declared thetas, the random effects and one axis per network output, chains the weight columns in through backpropagation, and walks them in chunks — so `auto` resolves to L-BFGS instead of derivative-free BOBYQA over every weight, and `gradient:` reports analytic (#1339). This covers IOV models carrying an `[initial_conditions]` baseline, an `obs_scale` expression or an analytic Form C readout as well, and no longer caps the `obs_scale` expression's `(θ, η)` width at 24.
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 - **Calling a function ferx does not have is now a parse error naming the call and listing what is available, instead of silently evaluating as the identity.** `CL = TVCL * tanh(ETA_CL)` used to parse, pass `ferx check`, fit and converge while computing `TVCL * ETA_CL`. This applies to every block that parses expressions (`[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, `[error_model]` magnitudes) and to conditions. Model files that relied on the no-op were already computing something other than what they read as, so the new errors are all true positives. Names remain case-insensitive, so `EXP(...)` / `LOG(...)` are unaffected; `present(x)` in value position now points at condition position (#1332).

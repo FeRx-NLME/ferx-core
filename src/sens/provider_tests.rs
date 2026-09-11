@@ -1442,6 +1442,109 @@ const THREECPT_ORAL: &str = r#"
 
 /// Third-order sensitivities (#436) — the blocks the analytic covariance Hessian consumes.
 ///
+/// The η-only sweep (#1342) must produce the *same* two third-order blocks as the full
+/// `(θ, η)` sweep, at `1 + 2·n_eta` evaluations instead of `1 + 2(n_theta + n_eta)`.
+///
+/// This is the oracle for that change, and it is a comparison of the quantity being changed
+/// against the code being replaced — not a second transcription of the formula. Both sides are
+/// production functions; only the FD direction differs.
+///
+/// `third_order_sensitivities_layouts_and_values` already established that the two directions
+/// agree (its point 2 recomputes `∂³f/∂η²∂θ` by differencing `∂²f/∂η∂θ` along `η` and asserts
+/// `1e-5` relative against the shipped `∂/∂θ` route). That test validates the *arithmetic*; this
+/// one validates that `ThirdOrderAxes::EtaOnly` actually assembles it into the right slots, with
+/// the right symmetrisation, for the real consumer.
+///
+/// Three things are asserted, and the third is the one a careless implementation fails:
+///
+/// 1. `d3f_deta3` agrees — it is differenced along η in both variants, so this should be
+///    **bit-identical**, and asserting equality rather than a tolerance is what would catch the
+///    η axes being swept with a different step or offset.
+/// 2. `d3f_deta2_dtheta` agrees to FD tolerance. It cannot be bit-identical: the two sides
+///    difference different blocks along different axes.
+/// 3. The two θ-swept blocks come back **empty**, not zeroed. A zero-filled tensor would pass
+///    every length check in `laplace_h_deriv` and contract silently into a wrong Hessian; an
+///    empty one trips that check loudly. This is the safety property of the partial result.
+#[test]
+fn the_eta_only_sweep_matches_the_full_sweep_on_the_blocks_laplace_reads() {
+    let m = parse_model_string(ONECPT_IV_2ETA).expect("parse");
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.25, 11.0];
+    let eta = [0.13, -0.09];
+    let (n_theta, n_eta) = (theta.len(), eta.len());
+
+    let full = subject_sensitivities_cov(&m, &s, &theta, &eta).expect("in scope");
+    let lean = subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta).expect("in scope");
+    assert_eq!(full.obs.len(), lean.obs.len());
+
+    let mut worst = 0.0f64;
+    for (j, (f, l)) in full.obs.iter().zip(lean.obs.iter()).enumerate() {
+        // The base jet must be identical — same base evaluation, untouched by either sweep.
+        assert_eq!(f.f, l.f, "obs {j}: base prediction");
+        assert_eq!(f.d2f_deta2, l.d2f_deta2, "obs {j}: base ∂²f/∂η²");
+        assert_eq!(
+            f.d2f_deta_dtheta, l.d2f_deta_dtheta,
+            "obs {j}: base ∂²f/∂η∂θ"
+        );
+
+        // (1) Same axes, same steps ⟹ bit-identical.
+        assert_eq!(
+            f.d3f_deta3, l.d3f_deta3,
+            "obs {j}: ∂³f/∂η³ is differenced along η by both sweeps, so it must be identical"
+        );
+
+        // (3) The θ-swept blocks are absent, not zero.
+        assert!(
+            l.d2f_dtheta2.is_empty(),
+            "obs {j}: the η-only sweep must leave d2f_dtheta2 EMPTY, not zero-filled — a \
+             zero-filled tensor passes a length check and contracts into a wrong Hessian"
+        );
+        assert!(
+            l.d3f_deta_dtheta2.is_empty(),
+            "obs {j}: the η-only sweep must leave d3f_deta_dtheta2 EMPTY, not zero-filled"
+        );
+        // …and the full sweep must still fill them, or this test is passing because the
+        // covariance caller was broken too.
+        assert_eq!(f.d2f_dtheta2.len(), n_theta * n_theta);
+        assert_eq!(f.d3f_deta_dtheta2.len(), n_eta * n_theta * n_theta);
+
+        // (2) Same mixed partial, different FD direction.
+        assert_eq!(l.d3f_deta2_dtheta.len(), n_eta * n_eta * n_theta);
+        let scale = f
+            .d3f_deta2_dtheta
+            .iter()
+            .fold(1e-6f64, |acc, v| acc.max(v.abs()));
+        for idx in 0..n_eta * n_eta * n_theta {
+            let (a, b) = (f.d3f_deta2_dtheta[idx], l.d3f_deta2_dtheta[idx]);
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "obs {j}: non-finite ∂³f/∂η²∂θ at {idx} ({a}, {b}); the relative fold below \
+                 would absorb it"
+            );
+            worst = worst.max((a - b).abs() / scale);
+        }
+    }
+    // **Measured**, not guessed: the worst realised relative discrepancy across every
+    // observation and tensor slot is `1.126e-10` (printed below). The bound is that with ~90×
+    // headroom.
+    //
+    // Deliberately *not* the `1e-5` that `third_order_sensitivities_layouts_and_values` uses
+    // for the arithmetic form of this comparison, which would be five orders too loose here and
+    // would pass on a sweep that had silently lost most of its precision. It can be this tight
+    // because both sides are first central differences of **exact** `Dual2` second-order
+    // quantities, so the discrepancy is the difference of two small truncation errors rather
+    // than either one of them.
+    println!("worst realised eta-only vs full ∂³f/∂η²∂θ relative error: {worst:.3e}");
+    assert!(
+        worst < 1e-8,
+        "the η-only sweep must reproduce ∂³f/∂η²∂θ to finite-difference tolerance; worst \
+         relative error was {worst:.3e}"
+    );
+}
+
 /// `subject_sensitivities_cov` differences the **exact** `Dual2` jet along each `(θ, η)` axis,
 /// so the arithmetic is easy; what is easy to get *wrong* is the row-major index layout of
 /// four differently-shaped tensors. A transposed slice still produces plausible finite

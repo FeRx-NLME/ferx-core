@@ -5060,7 +5060,7 @@ pub fn subject_sensitivities_cov(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    covariance_sensitivities(model, subject, theta, eta, false)
+    covariance_sensitivities(model, subject, theta, eta, false, ThirdOrderAxes::All)
 }
 
 /// Covariance jet over the joint eta/kappa vector, using the closed-form or ODE IOV walk.
@@ -5070,7 +5070,48 @@ pub(crate) fn subject_sensitivities_cov_iov(
     theta: &[f64],
     b: &[f64],
 ) -> Option<SubjectSens> {
-    covariance_sensitivities(model, subject, theta, b, true)
+    covariance_sensitivities(model, subject, theta, b, true, ThirdOrderAxes::All)
+}
+
+/// The same jet as [`subject_sensitivities_cov`], but sweeping **η axes only** — `1 + 2·n_eta`
+/// evaluations instead of `1 + 2(n_theta + n_eta)` (#1342).
+///
+/// For [`crate::estimation::laplace_h_deriv`], which reads `d3f_deta3` and `d3f_deta2_dtheta`
+/// and never touches the two θ-swept blocks. Those come back **empty** rather than zeroed, so a
+/// caller that wrongly reads one trips its own length check instead of contracting zeros. Every
+/// scope gate, step policy and route-switch guard is the full sweep's, because it *is* the full
+/// sweep with a narrower axis set — see [`ThirdOrderAxes`] for why that is exact rather than an
+/// approximation.
+pub(crate) fn subject_sensitivities_cov_eta_only(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    covariance_sensitivities(model, subject, theta, eta, false, ThirdOrderAxes::EtaOnly)
+}
+
+/// Which axes [`covariance_sensitivities`] sweeps a central FD pair along.
+///
+/// The sweep's cost is `1 + 2·(swept axes)` second-order sensitivity evaluations per subject,
+/// and the two variants exist because the two consumers need different blocks (#1342):
+///
+/// | variant | axes | fills | consumer |
+/// |---|---|---|---|
+/// | [`All`](Self::All) | θ and η | all four third/second-order blocks | the covariance assembly |
+/// | [`EtaOnly`](Self::EtaOnly) | η | `d3f_deta3`, `d3f_deta2_dtheta` | [`crate::estimation::laplace_h_deriv`] |
+///
+/// `EtaOnly` is sound because `d3f_deta2_dtheta[(k,l),m] = ∂³f/∂η_k∂η_l∂θ_m` is reachable from
+/// either direction: the `All` sweep takes `∂/∂θ_m` of `∂²f/∂η_k∂η_l`, and `EtaOnly` takes
+/// `∂/∂η_l` of `∂²f/∂η_k∂θ_m`, which every base evaluation already returns. Same mixed partial
+/// by Clairaut; only the finite-difference direction differs. `d2f_dtheta2` and
+/// `d3f_deta_dtheta2` genuinely need θ axes and come back **empty** under `EtaOnly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThirdOrderAxes {
+    /// Sweep θ and η: `1 + 2(n_theta + n_eta)` evaluations.
+    All,
+    /// Sweep η only: `1 + 2·n_eta` evaluations.
+    EtaOnly,
 }
 
 fn covariance_sensitivities(
@@ -5079,6 +5120,7 @@ fn covariance_sensitivities(
     theta: &[f64],
     eta: &[f64],
     iov: bool,
+    axes: ThirdOrderAxes,
 ) -> Option<SubjectSens> {
     let model_supported = if model.ode_spec.is_some() && iov {
         crate::sens::ode_provider::ode_iov_supported(model)
@@ -5184,7 +5226,20 @@ fn covariance_sensitivities(
 
     let n_theta = theta.len();
     let n_eta = eta.len();
-    let n_axes = n_theta + n_eta;
+    // `EtaOnly` sweeps the η axes and nothing else (#1342). The θ axes exist to build
+    // `d2f_dtheta2` and `d3f_deta_dtheta2`, which only the covariance assembly reads; a caller
+    // that needs just the two η-bearing third-order blocks gets them from η differences alone
+    // (see `ThirdOrderAxes`), at `1 + 2·n_eta` evaluations instead of `1 + 2(n_theta + n_eta)`.
+    let n_axes = match axes {
+        ThirdOrderAxes::All => n_theta + n_eta,
+        ThirdOrderAxes::EtaOnly => n_eta,
+    };
+    // Index of the first η axis in the sweep. `All` puts the θ axes first, so η starts at
+    // `n_theta`; `EtaOnly` has no θ axes and η starts at 0. Every `c < eta_base` is a θ axis.
+    let eta_base = match axes {
+        ThirdOrderAxes::All => n_theta,
+        ThirdOrderAxes::EtaOnly => 0,
+    };
 
     let evaluate = |t: &[f64], b: &[f64]| {
         if iov {
@@ -5196,21 +5251,22 @@ fn covariance_sensitivities(
     let mut base = evaluate(theta, eta)?;
     let n_obs = base.obs.len();
 
-    // One central pair per (θ, η) axis. Axis `c < n_theta` is `θ_c`; `c >= n_theta` is
-    // `η_{c-n_theta}` — the same layout the `Dual2` seeding uses.
+    // One central pair per swept axis. Axis `c < eta_base` is `θ_c`; `c >= eta_base` is
+    // `η_{c-eta_base}` — the same layout the `Dual2` seeding uses. Under `EtaOnly`,
+    // `eta_base == 0` so the θ branch is unreachable and every axis is an η axis.
     let mut plus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
     let mut minus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
     let mut steps: Vec<f64> = Vec::with_capacity(n_axes);
     for c in 0..n_axes {
         let (mut tp, mut ep) = (theta.to_vec(), eta.to_vec());
         let (mut tm, mut em) = (theta.to_vec(), eta.to_vec());
-        let h = if c < n_theta {
+        let h = if c < eta_base {
             let h = third_order_fd_step(theta[c], jet_noise);
             tp[c] += h;
             tm[c] -= h;
             h
         } else {
-            let k = c - n_theta;
+            let k = c - eta_base;
             let h = third_order_fd_step(eta[k], jet_noise);
             ep[k] += h;
             em[k] -= h;
@@ -5227,17 +5283,32 @@ fn covariance_sensitivities(
         steps.push(h);
     }
 
+    let eta_only = matches!(axes, ThirdOrderAxes::EtaOnly);
     for j in 0..n_obs {
-        let mut d2f_dtheta2 = vec![0.0f64; n_theta * n_theta];
+        // Under `EtaOnly` the two θ-swept blocks are left **empty**, not zero-filled. Every
+        // consumer of this result length-checks the blocks it reads (`laplace_h_deriv.rs`
+        // does, for the four it uses), so an empty vector makes a caller that wrongly reaches
+        // for one fail its own check loudly instead of silently contracting a tensor of zeros
+        // into a plausible wrong Hessian. That is the entire safety argument for returning a
+        // partially-populated `SubjectSens`.
+        let mut d2f_dtheta2 = if eta_only {
+            Vec::new()
+        } else {
+            vec![0.0f64; n_theta * n_theta]
+        };
+        let mut d3f_deta_dtheta2 = if eta_only {
+            Vec::new()
+        } else {
+            vec![0.0f64; n_eta * n_theta * n_theta]
+        };
         let mut d3f_deta3 = vec![0.0f64; n_eta * n_eta * n_eta];
         let mut d3f_deta2_dtheta = vec![0.0f64; n_eta * n_eta * n_theta];
-        let mut d3f_deta_dtheta2 = vec![0.0f64; n_eta * n_theta * n_theta];
 
         for c in 0..n_axes {
             let (p, m, h2) = (&plus[c].obs[j], &minus[c].obs[j], 2.0 * steps[c]);
             let d = |a: f64, b: f64| (a - b) / h2;
 
-            if c < n_theta {
+            if c < eta_base {
                 // ∂/∂θ_c of the exact first- and second-order blocks.
                 for mm in 0..n_theta {
                     d2f_dtheta2[mm * n_theta + c] = d(p.df_dtheta[mm], m.df_dtheta[mm]);
@@ -5256,11 +5327,50 @@ fn covariance_sensitivities(
                 }
             } else {
                 // ∂/∂η_c of the exact η-η block.
-                let cm = c - n_theta;
+                let cm = c - eta_base;
                 for k in 0..n_eta {
                     for l in 0..n_eta {
                         d3f_deta3[(k * n_eta + l) * n_eta + cm] =
                             d(p.d2f_deta2[k * n_eta + l], m.d2f_deta2[k * n_eta + l]);
+                    }
+                }
+                if eta_only {
+                    // …and `∂/∂η_c` of the exact η-θ block, which is the *same* mixed partial
+                    // `∂³f/∂η_k∂η_c∂θ_m` the `All` sweep gets as `∂/∂θ_m` of `∂²f/∂η_k∂η_c`.
+                    // Clairaut, not an approximation of a different quantity — only the FD
+                    // direction differs, which is what removes the θ axes.
+                    //
+                    // Each off-diagonal η pair is written twice — as `(k,c)` on axis `c` and as
+                    // `(c,k)` on axis `k` — from two different FD estimates of one quantity, so
+                    // it is summed here and halved below. The hit count needs no tally: index
+                    // `(a,b)` is hit once when `a == b` and exactly twice otherwise, which is
+                    // the `0.5` factor applied at the end.
+                    for k in 0..n_eta {
+                        for mm in 0..n_theta {
+                            let v = d(
+                                p.d2f_deta_dtheta[k * n_theta + mm],
+                                m.d2f_deta_dtheta[k * n_theta + mm],
+                            );
+                            d3f_deta2_dtheta[(k * n_eta + cm) * n_theta + mm] += v;
+                            if cm != k {
+                                d3f_deta2_dtheta[(cm * n_eta + k) * n_theta + mm] += v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if eta_only {
+            // Average the two FD estimates of every off-diagonal η pair. The diagonal was
+            // written once, so it is left alone — which is also the symmetrisation: after this
+            // `U[(k,l),m] == U[(l,k),m]` exactly, as the exact tensor requires.
+            for k in 0..n_eta {
+                for l in 0..n_eta {
+                    if k == l {
+                        continue;
+                    }
+                    for mm in 0..n_theta {
+                        d3f_deta2_dtheta[(k * n_eta + l) * n_theta + mm] *= 0.5;
                     }
                 }
             }
