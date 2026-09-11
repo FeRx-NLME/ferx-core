@@ -354,6 +354,16 @@ alternative costs `2 × n_free` *full population objective* evaluations, each
 re-solving every subject's inner loop. On warfarin that is the difference between
 6.5 s and 0.4 s.
 
+The grid sweep itself is contracted once, not once per parameter: the node
+gradients, weights and positions do not depend on which parameter is being
+differentiated, so the two weighted moments `Σⱼ wⱼgⱼ` and `Σⱼ wⱼgⱼzⱼᵀ` are formed
+once and each parameter then costs `O(d²)` — `O(Q·d² + n_free·d²)` rather than
+`O(n_free·Q·d²)` for `Q = n_agq^d` nodes and `d` random effects. At `n_agq = 1`
+every node sits at `z = 0`, so the node-displacement half is identically zero and
+the matrix products behind it are skipped rather than computed and multiplied by
+zero. Neither changes the number of node evaluations, which is what dominates on
+an ODE model.
+
 A fully analytic `dH/dθ` needs third derivatives (`∂³nll/∂η²∂θ`); the provider's
 ordinary second-order call stops at `∂²f/∂η∂θ`, so by default that one order is
 finite-differenced, as described above.

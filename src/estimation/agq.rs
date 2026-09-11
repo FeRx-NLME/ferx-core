@@ -1625,11 +1625,68 @@ fn analytic_grid_response(
     };
 
     let fixed = packed_fixed_mask(template);
+
+    // ── weighted node moments, computed once rather than per coordinate (#1333) ──────────
+    //
+    // Each free coordinate's node contribution is
+    //
+    //     Σ_j w_j Σ_i g_j[i] · ( db_dx[k][i] + √2 Σ_c M_k[i,c] z_j[c] )
+    //
+    // in which `g_j`, `w_j` and `z_j` are properties of the *grid*, not of `k`. Both node
+    // sums therefore hoist out of the coordinate loop:
+    //
+    //     v[i]   = Σ_j w_j g_j[i]
+    //     A[i,c] = Σ_j w_j g_j[i] z_j[c]
+    //     term_k = v·db_dx[k] + √2 Σ_{i,c} A[i,c] M_k[i,c]
+    //
+    // which takes the contraction from `O(p·Q·d²)` to `O(Q·d² + p·d²)` for `p` free
+    // coordinates and `Q = n_agq^d` nodes. It does **not** reduce the `Q` node gradients
+    // themselves — those are the caller's `node_grads`, and on an expensive ODE model they,
+    // not this contraction, are the bill.
+    //
+    // The regrouping reassociates the node sum, so the result moves by rounding; it is not
+    // bit-identical to the per-coordinate form. `the_moment_form_matches_the_per_node_sum`
+    // measures the realised difference and `analytic_grid_response_matches_the_fd_route`
+    // remains the correctness oracle against the independent FD route.
+    let (v, a) = node_moments(d, nodes, node_grads, softmax);
+    // One-node specialization: the one-point Gauss–Hermite rule sits at `z = 0` exactly, so
+    // every `A[i,c]` is exactly `0.0` and the displacement term contributes nothing. Skipping
+    // it skips the **five d×d matrix products** behind `M_k` — three in `factor_derivative`,
+    // two in `node_scale_derivative` — which the per-coordinate form computed for every free
+    // coordinate and then multiplied by zero.
+    //
+    // **Which configuration reaches this is narrower than "`n_agq = 1`" suggests**, and the
+    // honest scope is worth stating because the saving reads bigger than it is.
+    // [`use_analytic_grid_response`] is default-on for [`HessianAnchor::GaussNewton`] only,
+    // and `FitOptions::hessian_anchor` gives that to `method = focei` alone — so the default
+    // caller here is `focei, n_agq > 1`, where `Q > 1` and `A` is *not* zero. The one-node arm
+    // is therefore reached only on the `Exact` anchor with `FERX_AGQ_GRID_RESPONSE=analytic`,
+    // i.e. the opt-in `laplace` route. It is not dead code — that route exists and is
+    // benchmarked — but it is not on a default path, and the moment hoist above, not this, is
+    // what helps the default one.
+    //
+    // Gated on `A` rather than on `nodes.len() == 1`, which makes the skip sound for *any*
+    // grid: it fires only when every `A[i,c]` is exactly `0.0`, and then the term it drops is
+    // exactly `0.0` too. Correctness therefore does not depend on what the one-point rule's
+    // node is — a grid whose every node underflowed takes the same path.
+    //
+    // What the node value decides is whether the one-node route *reaches* the fast path at
+    // all. If Golub–Welsch's `n = 1` eigenvalue ever came back as `1e-17` rather than `0.0`,
+    // every `A[i,c]` would be a denormal instead of a zero, the skip would stop firing, and
+    // the five matrix products would quietly come back with no test failing.
+    // `the_one_point_rule_reaches_the_displacement_free_path` is that missing failure.
+    //
+    // One observable difference, stated rather than assumed away: if `M_k` were non-finite
+    // while the trace term stayed finite, the old form reached `0.0 * inf = NaN` and declined
+    // to the FD route, where this returns the (correct) displacement-free value. That needs an
+    // overflow inside the matrix products on an anchor that already passed
+    // `is_well_conditioned`, since a non-finite `dh[k]` poisons `solved` and the trace first.
+    let displaced = a.iter().any(|&x| x != 0.0);
+
     // Accumulate into a scratch buffer, not `out`: a late non-finite coordinate must leave
     // the caller free to take the FD route with nothing already added (the same
     // all-or-nothing contract the FD loop's `return None`s carry).
     let mut acc_all = vec![0.0f64; x.len()];
-    let mut z = vec![0.0f64; d];
     for k in 0..x.len() {
         if fixed[k] {
             continue;
@@ -1638,21 +1695,18 @@ fn analytic_grid_response(
         let solved = reg.chol.solve(&s_k);
         let mut acc = 0.5 * (0..d).map(|i| solved[(i, i)]).sum::<f64>();
 
-        let m_k = reg.node_scale_derivative(&reg.factor_derivative(&s_k));
-        for (j, g) in node_grads.iter().enumerate() {
-            if softmax[j] == 0.0 {
-                continue; // underflowed node — contributes nothing
-            }
-            grid_z_at(j, nodes, d, &mut z);
-            let mut dot = 0.0;
+        for i in 0..d {
+            acc += v[i] * db_dx[k][i];
+        }
+        if displaced {
+            let m_k = reg.node_scale_derivative(&reg.factor_derivative(&s_k));
+            let mut disp = 0.0;
             for i in 0..d {
-                let mut dbj = db_dx[k][i];
                 for c in 0..d {
-                    dbj += std::f64::consts::SQRT_2 * m_k[(i, c)] * z[c];
+                    disp += a[(i, c)] * m_k[(i, c)];
                 }
-                dot += g[i] * dbj;
             }
-            acc += softmax[j] * dot;
+            acc += std::f64::consts::SQRT_2 * disp;
         }
         if !acc.is_finite() {
             return None;
@@ -1663,6 +1717,51 @@ fn analytic_grid_response(
         *o += a;
     }
     Some(())
+}
+
+/// The two weighted node moments the grid-response contraction needs (#1333):
+///
+/// ```text
+/// v[i]   = Σ_j w_j g_j[i]
+/// A[i,c] = Σ_j w_j g_j[i] z_j[c]
+/// ```
+///
+/// Neither depends on the packed coordinate, so computing them once turns the response's
+/// `O(p·Q·d²)` contraction into `O(Q·d² + p·d²)` — see [`analytic_grid_response`], which is
+/// the only caller and where the algebra is derived.
+///
+/// `w_j == 0.0` nodes are skipped rather than added, matching the per-coordinate form this
+/// replaced: an underflowed node contributes nothing, and letting a `0.0 * inf` through would
+/// turn one into a `NaN` that declines the whole subject to the FD route.
+///
+/// A *pure* function of the grid, so `the_moment_form_matches_the_per_node_sum` can measure
+/// the reassociation against a direct per-node sum without building a model — and so that the
+/// production path and that test share one implementation of the moments rather than two.
+/// `the_one_point_rule_reaches_the_displacement_free_path` pins that `A` really is exactly
+/// zero for the one-point rule, which is what keeps `method = laplace` on the fast path.
+fn node_moments(
+    d: usize,
+    nodes: &[f64],
+    node_grads: &[Vec<f64>],
+    softmax: &[f64],
+) -> (Vec<f64>, DMatrix<f64>) {
+    let mut v = vec![0.0f64; d];
+    let mut a = DMatrix::<f64>::zeros(d, d);
+    let mut z = vec![0.0f64; d];
+    for (j, g) in node_grads.iter().enumerate() {
+        if softmax[j] == 0.0 {
+            continue;
+        }
+        grid_z_at(j, nodes, d, &mut z);
+        for i in 0..d {
+            let wg = softmax[j] * g[i];
+            v[i] += wg;
+            for c in 0..d {
+                a[(i, c)] += wg * z[c];
+            }
+        }
+    }
+    (v, a)
 }
 
 /// `zⱼ` for tensor-grid node `j`, reconstructed from its mixed-radix index.
@@ -3061,6 +3160,170 @@ mod tests {
             }
             assert_eq!(j, grid_size(n, d), "n={n} d={d}: swept node count");
         }
+    }
+
+    /// The one-point rule must put **exactly** `0.0` in every `A[i,c]`, because that — not
+    /// `nodes.len() == 1` — is what puts `method = laplace` on the displacement-free path and
+    /// saves the five d×d matrix products per free coordinate (#1333).
+    ///
+    /// Deliberately `== 0.0` and not a tolerance. A tolerance is the wrong assertion here: a
+    /// `1e-17` node is numerically indistinguishable from zero *for the objective* yet flips
+    /// `a.iter().any(|&x| x != 0.0)` to `true` and silently restores the whole cost. The
+    /// existing `gauss_hermite_matches_known_rules` asserts the node to `1e-14`, which is the
+    /// right bar for the quadrature and cannot see this.
+    ///
+    /// The `n = 3` half is the straddle: it must be non-zero, or the assertion above would
+    /// also pass on a `node_moments` that had been broken to return zero always, and the skip
+    /// would then drop a live displacement term at every `n_agq`.
+    #[test]
+    fn the_one_point_rule_reaches_the_displacement_free_path() {
+        for d in [1usize, 2, 3] {
+            let (nodes, _w) = gauss_hermite(1);
+            assert_eq!(
+                nodes,
+                vec![0.0],
+                "the one-point Gauss-Hermite node must be exactly 0.0"
+            );
+            // One node, unit weight, a gradient with no zeros in it — so a non-zero `A` could
+            // only come from `z`.
+            let grads = vec![(1..=d).map(|i| i as f64).collect::<Vec<f64>>()];
+            let (v, a) = node_moments(d, &nodes, &grads, &[1.0]);
+            assert!(
+                a.iter().all(|&x| x == 0.0),
+                "d={d}: A must be exactly zero at one node, got {a}"
+            );
+            // …and `v` must still carry the weighted gradient, or the coordinate term would
+            // lose its `v·db_dx[k]` half and this test would be passing on a dead moment pair.
+            assert_eq!(v, grads[0], "d={d}: v must be the weighted node gradient");
+
+            let (nodes3, w3) = gauss_hermite(3);
+            let softmax3: Vec<f64> = {
+                let total: f64 = w3.iter().sum();
+                w3.iter().map(|w| w / total).collect()
+            };
+            let n_grid = grid_size(3, d);
+            let grads3: Vec<Vec<f64>> = (0..n_grid)
+                .map(|j| (1..=d).map(|i| (i + j) as f64).collect())
+                .collect();
+            let weights3: Vec<f64> = (0..n_grid)
+                .map(|j| {
+                    let mut idx = j;
+                    let mut w = 1.0;
+                    for _ in 0..d {
+                        w *= softmax3[idx % 3];
+                        idx /= 3;
+                    }
+                    w
+                })
+                .collect();
+            let (_v3, a3) = node_moments(d, &nodes3, &grads3, &weights3);
+            assert!(
+                a3.iter().any(|&x| x != 0.0),
+                "d={d}: A must be live at n_agq = 3, or the one-node assertion proves nothing"
+            );
+        }
+    }
+
+    /// The moment form is an exact regrouping of the per-node sum, so the two may differ only
+    /// by floating-point reassociation (#1333). This measures by how much.
+    ///
+    /// The naive side is written out here rather than kept in production: that is what makes
+    /// this a reference rather than a second copy of the formula nobody diffs. The tolerance
+    /// is the measured worst relative error with headroom — see the assertion.
+    ///
+    /// **This and `analytic_grid_response_matches_the_fd_route` do not cover each other**, and
+    /// the mutations say so rather than the prose guessing. Transposing `m_k` in
+    /// `analytic_grid_response`'s contraction reddens the FD route and leaves this green,
+    /// because this assembles the contraction itself and never calls that function; dropping
+    /// the `z` factor inside [`node_moments`] reddens both, because that *is* shared. So this
+    /// test pins the moments and the regrouping algebra, the FD test pins the production
+    /// assembly around them, and removing either leaves a real defect class unobserved.
+    #[test]
+    fn the_moment_form_matches_the_per_node_sum() {
+        use std::f64::consts::SQRT_2;
+
+        let mut worst = 0.0f64;
+        for (n, d) in [(1usize, 1usize), (3, 1), (3, 2), (3, 3), (5, 2), (2, 3)] {
+            let (nodes, w) = gauss_hermite(n);
+            let total: f64 = w.iter().sum();
+            let softmax_1d: Vec<f64> = w.iter().map(|x| x / total).collect();
+            let n_grid = grid_size(n, d);
+
+            // Deliberately ugly magnitudes: a reassociation test on values that are all ~1.0
+            // measures the best case rather than the realistic one.
+            let grads: Vec<Vec<f64>> = (0..n_grid)
+                .map(|j| {
+                    (0..d)
+                        .map(|i| 1e3 * ((j * 7 + i * 13) as f64).sin() + 1e-4)
+                        .collect()
+                })
+                .collect();
+            let softmax: Vec<f64> = (0..n_grid)
+                .map(|j| {
+                    let mut idx = j;
+                    let mut p = 1.0;
+                    for _ in 0..d {
+                        p *= softmax_1d[idx % n];
+                        idx /= n;
+                    }
+                    p
+                })
+                .collect();
+            let db: Vec<f64> = (0..d).map(|i| 0.25 * (i as f64 + 1.0) - 1e5).collect();
+            let m_k =
+                DMatrix::<f64>::from_fn(d, d, |i, c| 7.5 * ((i * 3 + c * 5) as f64).cos() - 1e-3);
+
+            // The moment form, exactly as `analytic_grid_response` assembles it.
+            let (v, a) = node_moments(d, &nodes, &grads, &softmax);
+            let mut moment = (0..d).map(|i| v[i] * db[i]).sum::<f64>();
+            let mut disp = 0.0;
+            for i in 0..d {
+                for c in 0..d {
+                    disp += a[(i, c)] * m_k[(i, c)];
+                }
+            }
+            moment += SQRT_2 * disp;
+
+            // The per-node form this replaced.
+            let mut naive = 0.0;
+            let mut z = vec![0.0f64; d];
+            for (j, g) in grads.iter().enumerate() {
+                if softmax[j] == 0.0 {
+                    continue;
+                }
+                grid_z_at(j, &nodes, d, &mut z);
+                let mut dot = 0.0;
+                for i in 0..d {
+                    let mut dbj = db[i];
+                    for c in 0..d {
+                        dbj += SQRT_2 * m_k[(i, c)] * z[c];
+                    }
+                    dot += g[i] * dbj;
+                }
+                naive += softmax[j] * dot;
+            }
+
+            assert!(
+                moment.is_finite() && naive.is_finite(),
+                "n={n} d={d}: fixture produced a non-finite term ({moment}, {naive}); the \
+                 relative comparison below would absorb it"
+            );
+            let scale = naive.abs().max(1.0);
+            worst = worst.max((moment - naive).abs() / scale);
+        }
+        // **Measured**, not reasoned: the worst realised relative error across the six grids
+        // above is `1.680e-15` (printed below; `cargo test -- --nocapture` to re-read it),
+        // i.e. a handful of ULP, which is what an exact regrouping should cost. The bound is
+        // that number with ~60× headroom, for a target whose `sin`/`cos` — used to build the
+        // fixture — round differently. It is still ~1e10 tighter than the `1e-5` the FD-parity
+        // oracle uses, so a genuine algebra error in the regrouping cannot hide under it: a
+        // transposed `m_k` index moves this to ~1e-1.
+        println!("worst realised moment-vs-per-node relative error: {worst:.3e}");
+        assert!(
+            worst < 1e-13,
+            "the moment regrouping should differ from the per-node sum only by \
+             reassociation; worst relative error was {worst:.3e}"
+        );
     }
 
     /// Golub–Welsch must reproduce the textbook physicists' Hermite rule.

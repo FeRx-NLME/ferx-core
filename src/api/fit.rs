@@ -1126,6 +1126,18 @@ fn fit_inner(
     // the predicate needs no data and fails identically for every method.
     first_error(&check_variance_init_rails(init_params, options))?;
 
+    // An initial estimate that packs strictly outside its own box and is
+    // silently clamped there (#1251). Computed **once**, into a local: it
+    // returns a mix of errors (a θ outside the user's own declared range) and
+    // warnings (the internal Ω / Σ / hidden-θ-cap rails), and `first_error`
+    // consumes only the errors. The non-errors are pushed into
+    // `accumulated_warnings` at the `option_diags` block below — which is not
+    // declared until ~50 lines from here, so this cannot simply be inlined.
+    // Getting that wrong reports every one of these from `ferx check` and drops
+    // them silently from `fit()`, the #1033 failure mode.
+    let start_box_diags = check_packed_start_in_box(init_params, options);
+    first_error(&start_box_diags)?;
+
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
@@ -1234,6 +1246,12 @@ fn fit_inner(
     // computed for `first_error`; re-calling `check_model_options` here would emit
     // every one of these twice.
     for d in option_diags.iter().filter(|d| !d.is_error()) {
+        accumulated_warnings.push(d.message.clone());
+    }
+    // The warning half of the packed-start-in-box check (#1251) — the internal
+    // Ω / Σ / hidden-θ-cap rails. Its error half was consumed by `first_error`
+    // above, on the same `Vec`, for exactly the reason the comment above gives.
+    for d in start_box_diags.iter().filter(|d| !d.is_error()) {
         accumulated_warnings.push(d.message.clone());
     }
     // Experimental-feature notices (data-independent; see check_experimental_features).

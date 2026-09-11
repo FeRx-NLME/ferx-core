@@ -283,8 +283,8 @@ the variance you declared — a fixed coordinate is pinned at its own packed
 start, so the clamp cannot move it.
 
 This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` starts at
-`0.1`, silently, on every run. A general diagnostic for a start outside its own
-bounds is tracked separately.
+`0.1`, a factor of two. That is now reported too — see
+[Bounds](../estimation/parameterization.qmd#the-same-box-on-the-way-in).
 :::
 
 `predict()` and `simulate()` never apply the check, so a simulation-only fixture

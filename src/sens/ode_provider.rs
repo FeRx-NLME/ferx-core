@@ -3106,6 +3106,9 @@ fn run_subject_iov<const M: usize>(
                 &group_scale[g],
                 n_theta,
                 n_stacked,
+                // The ODE IOV walk seeds every θ on its absolute axis (no column
+                // chunking), so the scale jet is in the absolute layout.
+                None,
                 &mut fk,
                 &mut fm,
             );

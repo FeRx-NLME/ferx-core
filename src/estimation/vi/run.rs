@@ -4,7 +4,8 @@
 //!
 //! 1. Evaluate `−ELBO` and its gradients ([`population_neg_elbo`]).
 //! 2. Adam-step the packed population vector `x` and every subject's `φᵢ`, then
-//!    project `x` back into the declared parameter box ([`compute_bounds`]).
+//!    project `x` back into the declared parameter box
+//!    ([`compute_bounds`](crate::estimation::parameterization::compute_bounds)).
 //! 3. Replace `Ω` with its closed-form maximizer (unless `vi_omega_update = adam`).
 //! 4. Once inside the averaging window, fold `x` and `{φᵢ}` into a Polyak mean.
 //!
@@ -33,7 +34,7 @@ use nalgebra::DVector;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params,
+    clamp_to_bounds, compute_mu_k, pack_params, pack_with_bounds, unpack_params, PackedStart,
 };
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
@@ -554,7 +555,15 @@ pub fn run_vi(
     // nothing about the box NLopt is handed for FOCE/FOCEI, and unlike SAEM's
     // M-step VI has no optimizer to hand it to — so `θ (1.0, 0.1, 10.0)` is
     // enforced by projecting `x` after each step, or it is not enforced at all.
-    let bounds = compute_bounds(init_params);
+    //
+    // Packed here too (#1252): the box cannot be built without the packed start
+    // anyway, so `packed_init` is carried down to where `x` is initialised
+    // rather than re-walked there.
+    let PackedStart {
+        packed: packed_init,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
 
     // Occasions per subject, from the data. Fixed for the run, so compute once: this is
     // what sets each subject's stacked dimension and the pooled `Ω_iov` denominator.
@@ -572,7 +581,7 @@ pub fn run_vi(
     // randomization, so the fit is reproducible by default. The initial estimates
     // are projected too, so `x` is inside the box from the first evaluation
     // onwards rather than only after the first step.
-    let mut x = pack_params(init_params);
+    let mut x = packed_init;
     clamp_to_bounds(&mut x, &bounds);
     // Each subject's `q` starts at *its own* prior: the block-diagonal
     // `Σ_b = Ω ⊕ Ω_iov^{⊗K_i}`, which is `Ω` itself without IOV. Starting at the prior

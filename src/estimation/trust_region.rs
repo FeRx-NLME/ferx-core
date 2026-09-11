@@ -12,7 +12,7 @@ use crate::estimation::outer_optimizer::{
     ofv_is_valid, pop_nll_opts, resolve_outer_ftol, OuterResult,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
+    clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
 use crate::types::{CompiledModel, FitOptions, ModelParameters, Population};
 
@@ -652,8 +652,11 @@ pub fn optimize_trust_region(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    let bounds = compute_bounds(init_params);
-    let mut x0 = pack_params(init_params);
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
 
     let mut warnings = Vec::new();
@@ -663,6 +666,13 @@ pub fn optimize_trust_region(
 
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let nn_reg_active = nn_reg.is_active();
+    // The post-run clamp below needs the box after `problem` has taken it and
+    // argmin has swallowed `problem`. Two `Vec<f64>` copies, against a second
+    // `compute_bounds` walk of the same unchanged template (#1252).
+    let post_run_bounds = PackedBounds {
+        lower: bounds.lower.clone(),
+        upper: bounds.upper.clone(),
+    };
     let problem = FoceiProblem {
         model,
         population,
@@ -724,7 +734,14 @@ pub fn optimize_trust_region(
             // clamped vector. Taking the gradient at the raw point would report a
             // ‖∂OFV/∂x‖ that belongs to a different parameter vector than the
             // estimates it is printed next to.
-            clamp_to_bounds(&mut vec, &compute_bounds(init_params));
+            //
+            // The box the run started from, not a second `compute_bounds` of the
+            // same template (#1252): the box is a property of `init_params`,
+            // which has not moved. `problem` owns the original and argmin does
+            // not hand it back, so the two vectors were copied aside before the
+            // move — cheaper than rebuilding the box, which allocates these two
+            // *and* re-walks the packed vector and the FIX mask to build them.
+            clamp_to_bounds(&mut vec, &post_run_bounds);
             // Gradient at the returned point, for `FitResult.final_gradient` and
             // so the non-convergence warning can quote how far from stationary
             // the fit stopped. Reuses the executor's problem, and with it the
@@ -864,6 +881,10 @@ pub fn optimize_trust_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Production code goes through `pack_with_bounds` (#1252); these two are
+    // still the clearest way for a test to build a box or a packed vector on
+    // its own, so they are imported here rather than at module scope.
+    use crate::estimation::parameterization::{compute_bounds, pack_params};
 
     #[test]
     fn test_adaptive_steihaug_budget() {
