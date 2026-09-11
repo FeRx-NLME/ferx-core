@@ -556,9 +556,12 @@ fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
     let mut params = model.default_params.clone();
     params.theta = result.theta.clone();
     let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
-    let scope = crate::ode::solver::SolverStatsScope::enter();
-    sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    let stats = scope.collected();
+    // Read from the **return value**, not from a scope opened here: the sweep is
+    // parallel over subjects and `SolverStatsScope` is thread-local, so a
+    // caller-side scope sees this thread's work and the sweep does none on it
+    // (#1329). That is the counter-loss the merge exists to prevent, and this
+    // test is where it would have shown up.
+    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
     assert!(
         stats.accepted_steps > 0,
         "the sensitivity sweep integrated nothing: {stats:?}"
@@ -578,6 +581,84 @@ fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
     );
 }
 
+/// The post-fit passes are parallel over subjects (#1329), and both things that makes fragile
+/// are pinned here at once: the **counters** and the **per-subject output**, at one worker and
+/// at eight.
+///
+/// Two assertions, and neither alone is enough:
+///
+/// * equality across widths would be satisfied by counters that are *zero at both* — which is
+///   exactly the bug, since `SolverStatsScope` is thread-local and a caller-side scope reports
+///   nothing once the work moves to workers. So the counters are asserted non-zero first, and
+///   the test states which ones.
+/// * non-zero counters say nothing about whether the merge is order- or width-dependent, which
+///   is what the equality half covers, alongside bit-identical IPRED / IWRES / CWRES / per-
+///   subject OFV. These are independent per-subject computations with no reduction, so
+///   *bit*-identity is the right bar rather than a tolerance: anything looser would pass on a
+///   genuine reassociation.
+///
+/// Eight subjects rather than the fixture's two, so four of the eight workers have real work
+/// and a width-dependent merge has somewhere to show up.
+#[test]
+fn the_parallel_post_fit_pass_is_worker_count_independent() {
+    let model = two_state_model(1000.0);
+    let pop = Population {
+        subjects: (0..8)
+            .map(|i| subject(&format!("{i}"), 1.0 + 0.1 * f64::from(i)))
+            .collect(),
+        ..population()
+    };
+
+    let fit_on = |threads: usize| {
+        let opts = FitOptions {
+            threads: Some(threads),
+            ..one_iteration_opts()
+        };
+        fit(&model, &pop, &model.default_params, &opts).expect("fit")
+    };
+    let serial = fit_on(1);
+    let parallel = fit_on(8);
+
+    let one = ode_solver_entry(&serial).expect("a stiff fixture must carry an ode_solver warning");
+    let many = ode_solver_entry(&parallel).expect("…at both widths");
+    let (one_details, many_details) = (
+        one.details.as_ref().expect("counter payload"),
+        many.details.as_ref().expect("counter payload"),
+    );
+
+    // The payload carries every `OdeSolverStats` field, so this compares the whole merge in
+    // one assertion rather than a hand-picked subset that a new counter would escape.
+    assert_eq!(
+        one_details, many_details,
+        "the merged solver counters must not depend on how many workers ran the post-fit pass"
+    );
+
+    // …and they must be counting something. `accepted_steps` is the prediction pass;
+    // `auto_stiff_segments` is the escalation decision this fixture exists to trigger. A zero
+    // here means the per-subject scopes deposited nothing and the equality above is `0 == 0`.
+    for key in ["accepted_steps", "auto_stiff_segments"] {
+        assert!(
+            one_details[key].as_u64().unwrap_or(0) > 0,
+            "{key} is zero, so the equality assertion above compares nothing: {one_details:?}"
+        );
+    }
+
+    assert_eq!(serial.subjects.len(), parallel.subjects.len());
+    for (a, b) in serial.subjects.iter().zip(&parallel.subjects) {
+        assert_eq!(a.id, b.id, "subject order must be preserved");
+        assert_eq!(a.ipred, b.ipred, "IPRED for subject {}", a.id);
+        assert_eq!(a.pred, b.pred, "PRED for subject {}", a.id);
+        assert_eq!(a.iwres, b.iwres, "IWRES for subject {}", a.id);
+        assert_eq!(a.cwres, b.cwres, "CWRES for subject {}", a.id);
+        assert_eq!(
+            a.ofv_contribution.to_bits(),
+            b.ofv_contribution.to_bits(),
+            "per-subject OFV for subject {}",
+            a.id
+        );
+    }
+}
+
 /// …and it costs nothing on a model that has no ODE sensitivity path to sweep. The helper is
 /// called on every ODE fit, so a model on a closed-form solution must exit before it
 /// integrates anything.
@@ -590,9 +671,7 @@ fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
     let mut params = model.default_params.clone();
     params.theta = result.theta.clone();
     let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
-    let scope = crate::ode::solver::SolverStatsScope::enter();
-    sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    let stats = scope.collected();
+    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
     assert_eq!(stats.accepted_steps, 0, "{stats:?}");
     assert_eq!(stats.attempted_steps, 0, "{stats:?}");
 }
@@ -635,9 +714,7 @@ fn the_sensitivity_sweep_is_a_no_op_when_the_fit_asked_for_fd_gradients() {
         .map(|_| DVector::zeros(model.n_eta))
         .collect();
 
-    let scope = crate::ode::solver::SolverStatsScope::enter();
-    sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    let stats = scope.collected();
+    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
     assert_eq!(stats.accepted_steps, 0, "{stats:?}");
     assert_eq!(stats.attempted_steps, 0, "{stats:?}");
 }
@@ -683,8 +760,9 @@ fn one_obs_at_zero_subject() -> Subject {
 }
 
 /// Counters collected while `f` runs, through the ordinary thread-local scope production
-/// uses (`api::fit`), not through `ode_predictions_with_solver_stats` — which has no
-/// production caller and so could be "fixed" without reaching a user.
+/// uses (`api::postfit`, one per subject task), not through
+/// `ode_predictions_with_solver_stats` — which has no production caller and so could be
+/// "fixed" without reaching a user.
 fn stats_of<R>(f: impl FnOnce() -> R) -> (OdeSolverStats, R) {
     let scope = crate::ode::solver::SolverStatsScope::enter();
     let out = f();
@@ -900,7 +978,8 @@ fn a_fit_over_an_unorderable_timeline_says_so() {
     // **The count is asserted to be lane-independent**, and the test carries no feature gate
     // because of it. The three walks are `ode_predictions` and `ode_predictions_with_states`,
     // both unconditional in the post-fit sweep. The other five recorders sit on engines this
-    // fixture cannot reach: the scope wraps `compute_subject_results` only (`api/fit.rs:1912`),
+    // fixture cannot reach: the scopes are opened per subject task inside
+    // `compute_subject_results` and nowhere else (#1329),
     // so `ode_dense_solve_states`' reachable callers all need a model feature this fixture does
     // not have (a markov endpoint, a hazard state, a TV-covariate model — its
     // `api/output_columns.rs` caller runs after the scope closes), the adaptive pair is

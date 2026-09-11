@@ -14,9 +14,13 @@
 //!   uniqueness", for free, and the same key the journal and the fit cache use.
 //! * **Parallelism that does not oversubscribe.** Candidates are embarrassingly
 //!   parallel and `fit()` already `par_iter`s over subjects, so a naive outer
-//!   `par_iter` nests two pools competing for the same workers. The split is a
-//!   [`PoolPlan`] (#1115), which also gives the outer pool the ferx worker stack
-//!   rather than Rayon's 2 MiB default.
+//!   `par_iter` nests two pools competing for the same workers. How wide each
+//!   level is comes from a [`PoolPlan`] (#1115); how many candidates are
+//!   *admitted* at that width comes from [`crate::lanes`] (#1329), because an
+//!   outer `par_iter` bounds neither — a worker blocked on the inner pool's
+//!   `install` keeps stealing candidates, so the plan's width was an average and
+//!   not a ceiling. Both give the ferx worker stack rather than Rayon's 2 MiB
+//!   default.
 //! * **Retries before the gate.** Each candidate is fitted with
 //!   [`RunOptions::n_starts`] starts, and only then judged by
 //!   [`check_strictness`]. Under automation an init stall (#751) or an inner-EBE
@@ -69,7 +73,6 @@ use ferx_core::{
     bind_theta_levels, check_strictness, fit, CancelFlag, FitResult, GradientMethod, PoolPlan,
     Population, StrictnessVerdict,
 };
-use rayon::prelude::*;
 
 use super::candidate::{Candidate, CandidateError, CandidateResult, RunOptions};
 use super::journal::{self, CandidateRecord, Journal, SearchManifest};
@@ -333,7 +336,7 @@ impl Runner {
         let groups = cost_groups(candidates, &todo);
         let n_fitted = AtomicUsize::new(0);
 
-        let fit_one = |&(i, threads_per_fit): &(usize, usize)| -> Option<(usize, CandidateResult)> {
+        let fit_one = |(i, threads_per_fit): (usize, usize)| -> Option<(usize, CandidateResult)> {
             // Between candidates, not inside one: this is the granularity the
             // cancellation contract promises, and it is why a cancelled run can
             // still return everything that finished.
@@ -399,10 +402,17 @@ impl Runner {
                 continue;
             }
             let plan = PoolPlan::from_budget(self.threads, group.len());
-            let work: Vec<(usize, usize)> =
-                group.iter().map(|i| (*i, plan.threads_per_fit())).collect();
+            // Fixed lanes rather than `plan.install(|| work.par_iter()…)`: each
+            // candidate's `fit()` enters its own inner pool, and an outer Rayon
+            // worker blocked on that nested `install` keeps stealing candidates,
+            // so a width of 4 held far more than four fits — and four fit
+            // stacks' worth of memory was the thing the plan was sizing (#1329).
+            // `plan.replicates()` is still the width; only the admission
+            // changes, and results still come back in group order.
             let done: Vec<(usize, CandidateResult)> =
-                plan.install(|| work.par_iter().filter_map(fit_one).collect())?;
+                crate::lanes::run_in_lanes(plan.replicates(), group.len(), |k| {
+                    fit_one((group[k], plan.threads_per_fit()))
+                })?;
             fitted.extend(done);
         }
 

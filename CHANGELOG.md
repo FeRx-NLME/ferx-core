@@ -45,8 +45,25 @@ section of the SDLC for the versioning policy).
 - Fixed ODE-accumulated survival hazards that read `TAD`, which could reject valid multi-dose subjects with a misleading finite objective (#1261).
 - `floor(x)`, `ceil(x)` and `round(x)` now differentiate to `0` rather than to `x`'s own derivative. An `[individual_parameters]` or `[odes]` expression that rounds — a dose-band lookup, an occasion index derived from `TIME` — was feeding a wrong analytic gradient to the estimator while its value path was correct (#1332).
 
+- **A `threads` budget is now a real ceiling on how many fits run at once in
+  `bootstrap`, `modelsearch`, `covsearch`, `iivsearch`, `ruvsearch` and
+  `globalsearch`.** Each replicate or candidate runs its own `fit()` on a nested
+  thread pool, and a worker blocked on that nesting kept taking more work, so a
+  run asked for 4 concurrent fits could hold far more — and that many fits' worth
+  of peak memory. The requested width is now enforced exactly. Runs that were
+  already inside their budget are unaffected; heavily oversubscribed ones should
+  see lower peak memory and steadier per-fit timing rather than higher throughput
+  (#1329). Bootstrap's unset thread budget preserves the ambient Rayon pool width,
+  including `RAYON_NUM_THREADS` and caller-configured pools (#1330).
 
 ### Performance
+
+- **The post-fit per-subject diagnostics pass (IPRED / PRED / IWRES / CWRES,
+  per-subject OFV) and the post-fit analytic-sensitivity sweep now run in
+  parallel over subjects** on the pool the fit already uses, instead of one
+  subject at a time. Output is unchanged bit-for-bit and the ODE-solver
+  diagnostic counters are unchanged; the gain is on the final pass of a fit with
+  many subjects, and is largest on ODE models (#1329).
 
 - **`focei` with `n_agq > 1` now contracts the analytic grid-response gradient term once per
   subject instead of once per population parameter.** The node gradients, weights and node
