@@ -2567,6 +2567,14 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
     let (iov_inv, log_det_iov) = if let Some(iov) = omega_iov {
         (&iov.inv, iov.log_det)
     } else {
+        // Guaranteed unreachable: the only caller path that admits `omega_iov: None` is
+        // `kappas.is_empty()`, which returns above before this point. `1e20` is a defensive
+        // sentinel, not a real score — loud in debug/test builds so a future caller that
+        // violates the invariant fails here rather than silently scoring a fabricated NLL.
+        debug_assert!(
+            false,
+            "individual_nll_iov_with_scratch: omega_iov is None with kappas non-empty"
+        );
         return 1e20;
     };
 

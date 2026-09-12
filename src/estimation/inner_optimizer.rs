@@ -874,11 +874,16 @@ pub fn find_ebe(
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
     let pred_recycle = RefCell::new(Vec::<f64>::new());
+    // `obj`'s own scratch.
     let eta_work = RefCell::new(DVector::zeros(n_eta));
     let prior_work = RefCell::new(DVector::zeros(n_eta));
-    // The analytic-gradient closure may fall back to finite differences, which
-    // re-enters `obj` while its own scratch borrows are live. Keep the two sets
-    // separate so that fallback remains re-entrant.
+    // `agrad`'s scratch for its analytic-gradient call, kept separate from `obj`'s above.
+    // The `match analytic_eta_nll_gradient_with_schedule(...) { ... }` below has its
+    // scrutinee's `&mut …borrow_mut()` temporaries live for the *whole* match — including
+    // the `None` arm, which calls `gradient_fd(&obj, ..)` and so re-enters `obj` while
+    // those borrows are still outstanding. Sharing one RefCell pair between `obj` and
+    // `agrad` would panic there with "already borrowed"; separate cells keep the fallback
+    // re-entrant.
     let grad_eta_work = RefCell::new(DVector::zeros(n_eta));
     let grad_prior_work = RefCell::new(DVector::zeros(n_eta));
 
@@ -902,8 +907,8 @@ pub fn find_ebe(
             err_keys.as_ref(),
             mult.as_deref(),
             &mut pred_recycle.borrow_mut(),
-            &mut grad_eta_work.borrow_mut(),
-            &mut grad_prior_work.borrow_mut(),
+            &mut eta_work.borrow_mut(),
+            &mut prior_work.borrow_mut(),
         )
     };
 
@@ -944,8 +949,8 @@ pub fn find_ebe(
             mult.as_deref(),
             err_keys.as_ref(),
             &mut obs_grad_recycle.borrow_mut(),
-            &mut eta_work.borrow_mut(),
-            &mut prior_work.borrow_mut(),
+            &mut grad_eta_work.borrow_mut(),
+            &mut grad_prior_work.borrow_mut(),
         ) {
             Some(g) => {
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
