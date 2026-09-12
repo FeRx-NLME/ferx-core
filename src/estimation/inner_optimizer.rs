@@ -2800,6 +2800,7 @@ fn lbfgs_core(
     let mut rho_hist: Vec<f64> = Vec::new();
     let mut g = grad(x);
     let mut f_cur = obj(x);
+    let mut line_search_point = vec![0.0; n];
     // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): for ODE
     // objectives whose gradient norm is floored above `tol` by solver noise, a search that
     // reached the mode declares convergence rather than spinning to `max_iter`. Gated on
@@ -2835,7 +2836,8 @@ fn lbfgs_core(
             };
         }
 
-        let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+        let (alpha, f_new) =
+            backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -2895,6 +2897,15 @@ fn dense_bfgs_core(
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
+    let mut g_vec = DVector::zeros(n);
+    let mut d_vec = DVector::zeros(n);
+    let mut d = vec![0.0; n];
+    let mut s = vec![0.0; n];
+    let mut y = vec![0.0; n];
+    let mut s_vec = DVector::zeros(n);
+    let mut y_vec = DVector::zeros(n);
+    let eye = DMatrix::identity(n, n);
+    let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
     let mut f_cur = obj(x);
@@ -2929,9 +2940,9 @@ fn dense_bfgs_core(
             return true;
         }
 
-        let g_vec = DVector::from_column_slice(&g);
-        let d_vec = -&h_inv * &g_vec;
-        let d: Vec<f64> = d_vec.iter().copied().collect();
+        g_vec.as_mut_slice().copy_from_slice(&g);
+        d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
+        d.copy_from_slice(d_vec.as_slice());
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
@@ -2939,8 +2950,10 @@ fn dense_bfgs_core(
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
             h_inv = init_h_inv(n, precond);
-            let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
-            let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+            d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
+            d.copy_from_slice(d_vec.as_slice());
+            let (alpha, f_new) =
+                backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
             // Even steepest descent found no sufficient-decrease step: report
             // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
@@ -2959,15 +2972,16 @@ fn dense_bfgs_core(
             continue;
         }
 
-        let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+        let (alpha, f_new) =
+            backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
 
-        let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
         for i in 0..n {
+            s[i] = alpha * d[i];
             x[i] += s[i];
         }
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
@@ -2978,14 +2992,15 @@ fn dense_bfgs_core(
         }
 
         let g_new = grad(x);
-        let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
+        for i in 0..n {
+            y[i] = g_new[i] - g[i];
+        }
 
-        let s_vec = DVector::from_column_slice(&s);
-        let y_vec = DVector::from_column_slice(&y);
+        s_vec.as_mut_slice().copy_from_slice(&s);
+        y_vec.as_mut_slice().copy_from_slice(&y);
         let sy = s_vec.dot(&y_vec);
         if sy > 1e-12 {
             let rho = 1.0 / sy;
-            let eye = DMatrix::identity(n, n);
             let s_yt = rho * &s_vec * y_vec.transpose();
             let y_st = rho * &y_vec * s_vec.transpose();
             let s_st = rho * &s_vec * s_vec.transpose();
@@ -3025,9 +3040,17 @@ fn nelder_mead_minimize(
     }
 
     let mut fvals: Vec<f64> = simplex.iter().map(|p| obj(p)).collect();
+    let mut indices: Vec<usize> = (0..=n).collect();
+    let mut centroid = vec![0.0; n];
+    let mut reflected = vec![0.0; n];
+    let mut expanded = vec![0.0; n];
+    let mut contracted = vec![0.0; n];
+    let mut best_point = vec![0.0; n];
 
     for _iter in 0..max_iter {
-        let mut indices: Vec<usize> = (0..=n).collect();
+        for (i, index) in indices.iter_mut().enumerate() {
+            *index = i;
+        }
         // NaN-safe: a non-finite objective (e.g. an ODE prediction that blew
         // up at a simplex vertex) sorts as worst rather than panicking on the
         // `None` that `partial_cmp` returns for NaN. See issue #97.
@@ -3047,7 +3070,7 @@ fn nelder_mead_minimize(
             return true;
         }
 
-        let mut centroid = vec![0.0; n];
+        centroid.fill(0.0);
         for &idx in &indices[..n] {
             for j in 0..n {
                 centroid[j] += simplex[idx][j];
@@ -3058,43 +3081,43 @@ fn nelder_mead_minimize(
         }
 
         // Reflection
-        let reflected: Vec<f64> = (0..n)
-            .map(|j| centroid[j] + alpha * (centroid[j] - simplex[worst][j]))
-            .collect();
+        for j in 0..n {
+            reflected[j] = centroid[j] + alpha * (centroid[j] - simplex[worst][j]);
+        }
         let fr = obj(&reflected);
 
         if fr < fvals[second_worst] && fr >= fvals[best] {
-            simplex[worst] = reflected;
+            std::mem::swap(&mut simplex[worst], &mut reflected);
             fvals[worst] = fr;
             continue;
         }
 
         if fr < fvals[best] {
-            let expanded: Vec<f64> = (0..n)
-                .map(|j| centroid[j] + gamma * (reflected[j] - centroid[j]))
-                .collect();
+            for j in 0..n {
+                expanded[j] = centroid[j] + gamma * (reflected[j] - centroid[j]);
+            }
             let fe = obj(&expanded);
             if fe < fr {
-                simplex[worst] = expanded;
+                std::mem::swap(&mut simplex[worst], &mut expanded);
                 fvals[worst] = fe;
             } else {
-                simplex[worst] = reflected;
+                std::mem::swap(&mut simplex[worst], &mut reflected);
                 fvals[worst] = fr;
             }
             continue;
         }
 
-        let contracted: Vec<f64> = (0..n)
-            .map(|j| centroid[j] + rho * (simplex[worst][j] - centroid[j]))
-            .collect();
+        for j in 0..n {
+            contracted[j] = centroid[j] + rho * (simplex[worst][j] - centroid[j]);
+        }
         let fc = obj(&contracted);
         if fc < fvals[worst] {
-            simplex[worst] = contracted;
+            std::mem::swap(&mut simplex[worst], &mut contracted);
             fvals[worst] = fc;
             continue;
         }
 
-        let best_point = simplex[best].clone();
+        best_point.copy_from_slice(&simplex[best]);
         for i in 0..=n {
             if i != best {
                 for j in 0..n {
@@ -3250,8 +3273,8 @@ fn backtracking_line_search(
     x: &[f64],
     d: &[f64],
     g: &[f64],
-    n: usize,
     f0: f64,
+    x_new: &mut [f64],
 ) -> (f64, f64) {
     let c1 = 1e-4;
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
@@ -3265,9 +3288,8 @@ fn backtracking_line_search(
     }
 
     let mut alpha = 1.0;
-    let mut x_new = vec![0.0; n];
     for _ in 0..MAX_LINE_SEARCH_TRIALS {
-        for i in 0..n {
+        for i in 0..x.len() {
             x_new[i] = x[i] + alpha * d[i];
         }
         let f_new = obj(&x_new);

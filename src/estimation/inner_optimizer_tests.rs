@@ -1,5 +1,43 @@
+#![allow(unexpected_cfgs)]
+
 use super::*;
 use std::collections::HashMap;
+#[cfg(profiling_allocations)]
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(profiling_allocations)]
+struct CountingAllocator;
+
+#[cfg(profiling_allocations)]
+static ALLOCATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(profiling_allocations)]
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(profiling_allocations)]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+#[cfg(profiling_allocations)]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
 /// data term and no PK provider — the inner objective is `½(η'Ω⁻¹η + log|Ω|) + D_ctmm(η)`.
@@ -853,6 +891,334 @@ fn inner_solver_scaling_bench() {
     }
 }
 
+/// Pre-scratch-reuse dense BFGS, retained only as a bitwise regression oracle.
+fn legacy_dense_bfgs(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    let mut h_inv = DMatrix::identity(n, n);
+    let mut g = grad(x);
+    let mut f_cur = obj(x);
+    let mut first_step = true;
+
+    for _ in 0..max_iter {
+        let gnorm = grad_norm_metric(&g, None);
+        if first_step && gnorm > 1.0 {
+            h_inv *= 1.0 / gnorm;
+            first_step = false;
+        }
+        if gnorm < tol {
+            return true;
+        }
+
+        let g_vec = DVector::from_column_slice(&g);
+        let d_vec = -&h_inv * &g_vec;
+        let d: Vec<f64> = d_vec.iter().copied().collect();
+        if d.iter().zip(&g).map(|(di, gi)| di * gi).sum::<f64>() >= 0.0 {
+            h_inv = DMatrix::identity(n, n);
+            let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
+            let (alpha, f_new) = legacy_line_search(obj, x, &d, &g, n, f_cur);
+            if alpha == 0.0 {
+                return false;
+            }
+            for i in 0..n {
+                x[i] += alpha * d[i];
+            }
+            f_cur = f_new;
+            g = grad(x);
+            continue;
+        }
+
+        let (alpha, f_new) = legacy_line_search(obj, x, &d, &g, n, f_cur);
+        if alpha == 0.0 {
+            return false;
+        }
+        let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
+        for i in 0..n {
+            x[i] += s[i];
+        }
+        f_cur = f_new;
+
+        let g_new = grad(x);
+        let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
+        let s_vec = DVector::from_column_slice(&s);
+        let y_vec = DVector::from_column_slice(&y);
+        let sy = s_vec.dot(&y_vec);
+        if sy > 1e-12 {
+            let rho = 1.0 / sy;
+            let eye = DMatrix::identity(n, n);
+            let s_yt = rho * &s_vec * y_vec.transpose();
+            let y_st = rho * &y_vec * s_vec.transpose();
+            let s_st = rho * &s_vec * s_vec.transpose();
+            h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+        }
+        g = g_new;
+    }
+    false
+}
+
+fn legacy_line_search(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    d: &[f64],
+    g: &[f64],
+    n: usize,
+    f0: f64,
+) -> (f64, f64) {
+    let c1 = 1e-4;
+    let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
+    if !(dg < 0.0) || !dg.is_finite() {
+        return (0.0, f0);
+    }
+    let mut alpha = 1.0;
+    let mut x_new = vec![0.0; n];
+    for _ in 0..MAX_LINE_SEARCH_TRIALS {
+        for i in 0..n {
+            x_new[i] = x[i] + alpha * d[i];
+        }
+        let f_new = obj(&x_new);
+        if f_new.is_finite() && f_new <= f0 + c1 * alpha * dg {
+            return (alpha, f_new);
+        }
+        let denom = 2.0 * (f_new - f0 - dg * alpha);
+        let alpha_quad = if f_new.is_finite() && denom > 0.0 {
+            -dg * alpha * alpha / denom
+        } else {
+            0.5 * alpha
+        };
+        alpha = alpha_quad.clamp(0.1 * alpha, 0.5 * alpha);
+        if alpha < 1e-16 {
+            break;
+        }
+    }
+    (0.0, f0)
+}
+
+fn legacy_nelder_mead(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    let mut simplex = Vec::with_capacity(n + 1);
+    simplex.push(x.to_vec());
+    for i in 0..n {
+        let mut point = x.to_vec();
+        let delta = if point[i].abs() > 1e-8 {
+            0.05 * point[i].abs()
+        } else {
+            0.00025
+        };
+        point[i] += delta;
+        simplex.push(point);
+    }
+    let mut fvals: Vec<f64> = simplex.iter().map(|p| obj(p)).collect();
+
+    for _ in 0..max_iter {
+        let mut indices: Vec<usize> = (0..=n).collect();
+        indices.sort_by(|&a, &b| {
+            fvals[a]
+                .partial_cmp(&fvals[b])
+                .unwrap_or(std::cmp::Ordering::Greater)
+        });
+        let best = indices[0];
+        let worst = indices[n];
+        let second_worst = indices[n - 1];
+        if fvals[worst] - fvals[best] < tol {
+            x.copy_from_slice(&simplex[best]);
+            return true;
+        }
+
+        let mut centroid = vec![0.0; n];
+        for &idx in &indices[..n] {
+            for j in 0..n {
+                centroid[j] += simplex[idx][j];
+            }
+        }
+        for value in &mut centroid {
+            *value /= n as f64;
+        }
+
+        let reflected: Vec<f64> = (0..n)
+            .map(|j| centroid[j] + (centroid[j] - simplex[worst][j]))
+            .collect();
+        let fr = obj(&reflected);
+        if fr < fvals[second_worst] && fr >= fvals[best] {
+            simplex[worst] = reflected;
+            fvals[worst] = fr;
+            continue;
+        }
+        if fr < fvals[best] {
+            let expanded: Vec<f64> = (0..n)
+                .map(|j| centroid[j] + 2.0 * (reflected[j] - centroid[j]))
+                .collect();
+            let fe = obj(&expanded);
+            if fe < fr {
+                simplex[worst] = expanded;
+                fvals[worst] = fe;
+            } else {
+                simplex[worst] = reflected;
+                fvals[worst] = fr;
+            }
+            continue;
+        }
+
+        let contracted: Vec<f64> = (0..n)
+            .map(|j| centroid[j] + 0.5 * (simplex[worst][j] - centroid[j]))
+            .collect();
+        let fc = obj(&contracted);
+        if fc < fvals[worst] {
+            simplex[worst] = contracted;
+            fvals[worst] = fc;
+            continue;
+        }
+
+        let best_point = simplex[best].clone();
+        for i in 0..=n {
+            if i != best {
+                for j in 0..n {
+                    simplex[i][j] = best_point[j] + 0.5 * (simplex[i][j] - best_point[j]);
+                }
+                fvals[i] = obj(&simplex[i]);
+            }
+        }
+    }
+    let best = fvals
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater))
+        .map(|(i, _)| i)
+        .unwrap();
+    x.copy_from_slice(&simplex[best]);
+    false
+}
+
+fn run_dense_scratch_fixture(n: usize, legacy: bool) -> (bool, Vec<u64>, u64, usize, usize) {
+    let obj_evals = std::cell::Cell::new(0usize);
+    let grad_evals = std::cell::Cell::new(0usize);
+    let obj = |x: &[f64]| {
+        obj_evals.set(obj_evals.get() + 1);
+        x.iter()
+            .enumerate()
+            .map(|(i, &xi)| {
+                let target = (i + 1) as f64 / n as f64;
+                let residual = xi - target;
+                0.5 * (i + 1) as f64 * residual * residual + 0.01 * residual.powi(4)
+            })
+            .sum::<f64>()
+    };
+    let grad = |x: &[f64]| {
+        grad_evals.set(grad_evals.get() + 1);
+        x.iter()
+            .enumerate()
+            .map(|(i, &xi)| {
+                let target = (i + 1) as f64 / n as f64;
+                let residual = xi - target;
+                (i + 1) as f64 * residual + 0.04 * residual.powi(3)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut x = vec![1.5; n];
+    let converged = if legacy {
+        legacy_dense_bfgs(&obj, &grad, &mut x, n, 200, 1e-10)
+    } else {
+        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, false)
+    };
+    let final_objective = obj(&x).to_bits();
+    (
+        converged,
+        x.iter().map(|v| v.to_bits()).collect(),
+        final_objective,
+        obj_evals.get(),
+        grad_evals.get(),
+    )
+}
+
+#[test]
+fn dense_bfgs_scratch_reuse_is_bitwise_identical_to_legacy() {
+    for n in [2, 4, 8] {
+        assert_eq!(
+            run_dense_scratch_fixture(n, false),
+            run_dense_scratch_fixture(n, true),
+            "dense BFGS changed its path at eta dimension {n}"
+        );
+    }
+}
+
+#[test]
+fn nelder_mead_scratch_reuse_is_bitwise_identical_to_legacy() {
+    for n in [2, 4, 8] {
+        let run = |legacy: bool| {
+            let evals = std::cell::Cell::new(0usize);
+            let obj = |x: &[f64]| {
+                evals.set(evals.get() + 1);
+                x.iter()
+                    .enumerate()
+                    .map(|(i, &xi)| {
+                        let residual = xi - (i + 1) as f64 / n as f64;
+                        (i + 1) as f64 * residual * residual + 0.01 * residual.powi(4)
+                    })
+                    .sum::<f64>()
+            };
+            let mut x = vec![1.5; n];
+            let converged = if legacy {
+                legacy_nelder_mead(&obj, &mut x, n, 2_000, 1e-12)
+            } else {
+                nelder_mead_minimize(&obj, &mut x, n, 2_000, 1e-12)
+            };
+            let final_objective = obj(&x).to_bits();
+            (
+                converged,
+                x.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                final_objective,
+                evals.get(),
+            )
+        };
+        assert_eq!(
+            run(false),
+            run(true),
+            "Nelder-Mead changed its path at eta dimension {n}"
+        );
+    }
+}
+
+#[test]
+#[cfg(profiling_allocations)]
+#[ignore = "allocation microbenchmark: run alone with --ignored --nocapture"]
+fn dense_bfgs_scratch_allocation_bench() {
+    for n in [2, 4, 8] {
+        ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        std::hint::black_box(run_dense_scratch_fixture(n, true));
+        let current = (
+            ALLOCATION_CALLS.load(Ordering::Relaxed),
+            ALLOCATED_BYTES.load(Ordering::Relaxed),
+        );
+
+        ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        std::hint::black_box(run_dense_scratch_fixture(n, false));
+        let legacy = (
+            ALLOCATION_CALLS.load(Ordering::Relaxed),
+            ALLOCATED_BYTES.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "n={n}: scratch={} allocs/{} bytes; legacy={} allocs/{} bytes",
+            current.0, current.1, legacy.0, legacy.1
+        );
+        assert!(
+            current.0 < legacy.0,
+            "scratch reuse must reduce allocations"
+        );
+        assert!(current.1 < legacy.1, "scratch reuse must reduce bytes");
+    }
+}
+
 /// The interpolating backtracking line search returns a step that satisfies
 /// the Armijo sufficient-decrease test and strictly lowers the objective,
 /// using only a handful of trial evaluations (the property the FOCEI inner
@@ -871,7 +1237,8 @@ fn line_search_finds_armijo_step_quickly() {
         evals.set(evals.get() + 1);
         obj(xx)
     };
-    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial);
     let evals = evals.get();
     assert!(alpha > 0.0, "a descent step must be found");
     let c1 = 1e-4;
@@ -897,7 +1264,8 @@ fn line_search_rejects_non_descent_direction() {
     let g = [2.0 * (x[0] - 3.0)]; // = −6
     let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
     let f0 = obj(&x);
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -918,12 +1286,13 @@ fn line_search_survives_non_finite_objective() {
     let f0 = 10.0;
     // Every trial step returns NaN — must not panic, must report no step.
     let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
-    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
     assert_eq!(f_new, f0, "baseline objective is returned unchanged");
     // +inf trials behave identically (never accepted, never a panic).
     let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
-    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, 1, f0);
+    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -938,7 +1307,8 @@ fn line_search_rejects_non_finite_direction() {
     let g = [-6.0];
     let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
     let f0 = obj(&x);
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
