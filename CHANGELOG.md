@@ -36,6 +36,21 @@ section of the SDLC for the versioning policy).
   non-negative lower bound is log-packed instead, so the closed form cannot apply;
   SAEM and IMP/IMPMAP then say so in a warning that names the theta and the bound to
   change, mirroring the existing advisory for a lognormal theta with a negative one.
+- **SAEM and IMP/IMPMAP now mu-reference covariate models that read several thetas** ([#619](https://github.com/FeRx-NLME/ferx-core/issues/619)).
+  A typical value such as `CL = (TVCL + (CRCL - 90) * TH_CRCL) * exp(ETA_CL)`,
+  `CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)` or `F = inv_logit(LOGIT_F + TH_SEX*SEX + ETA_F)`
+  has no single anchor theta, so all its thetas used to sit on the eta-frozen numerical
+  M-step, where a covariate slope drifts to its bound (the fluconazole renal gradient of
+  #619 landed on 0, 480 OFV units above NONMEM). The parser now records such a value as a
+  *covariate mu-reference* and the EM estimators re-fit its thetas jointly to the
+  population of individual values every iteration — exactly (Gauss–Newton) when the
+  covariates are constant within each subject, numerically (prior + data term) when one
+  varies within a subject — the same thing NONMEM does for a MU written as a function of
+  several thetas. `mu_refs`, inner-loop centring and every FOCE/FOCEI/Laplace fit are
+  unchanged. A group that shares a theta with another eta's anchor, has negligible IIV,
+  or sits in a mixture model is declined with a warning and stays on the numerical M-step.
+  Anchored against NONMEM `METHOD=SAEM` with `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`
+  and `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`.
 - **Mu-reference detection sees through local definitions** ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).
   A typical value on its own line (`TVCL = THETA_CL * (WT/70)^0.75` then
   `CL = TVCL * exp(ETA_CL)`) and NONMEM-style explicit mu syntax

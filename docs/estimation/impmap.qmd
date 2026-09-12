@@ -121,7 +121,12 @@ NONMEM's reported IMPMAP objective.
 > since [#918](https://github.com/FeRx-NLME/ferx-core/issues/918), logit-mu-referenced
 > with the theta declared on the logit scale (`F = inv_logit(LOGIT_F + ETA_F)`) —
 > independent of the `mu_referencing` fit option, which only governs
-> inner-loop centering. Like NONMEM's EM methods, IMPMAP needs a mu-referenced
+> inner-loop centering. A typical value that reads several thetas
+> (`CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`) gets the same treatment in its
+> general form since [#619](https://github.com/FeRx-NLME/ferx-core/issues/619): the
+> group's thetas are re-fitted to the importance-weighted posterior means of the
+> individual values each iteration (see the [SAEM
+> page](saem.qmd#saem-mstep-covariate-mu-ref)). Like NONMEM's EM methods, IMPMAP needs a mu-referenced
 > parameterization: a model with random effects whose typical values are *not*
 > eligible emits a warning and may estimate those typical values poorly
 > (θ and the η mean are confounded over the importance samples). Use FOCEI for

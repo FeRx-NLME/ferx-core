@@ -889,7 +889,13 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
             continue;
         };
-        if !model.mu_refs.contains_key(eta_name) {
+        // A multi-theta typical value (#619) is mu-referenced too: SAEM moves
+        // its thetas through the covariate mu-reference group.
+        let has_group = model
+            .covariate_mu_refs
+            .iter()
+            .any(|g| &g.eta_name == eta_name);
+        if !model.mu_refs.contains_key(eta_name) && !has_group {
             names.push(param_name.as_str());
         }
     }

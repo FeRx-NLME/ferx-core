@@ -2698,6 +2698,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
             eta_map: vec![0],

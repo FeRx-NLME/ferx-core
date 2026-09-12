@@ -48,7 +48,7 @@ The inner optimizer (and the SAEM exploration-phase MH proposal) is then centred
 
 Patterns that ferx **does not** auto-detect (and therefore falls back to the plain `eta = 0` start) include:
 
-- Parameters with two or more free thetas in the product (`CL = TVCL * TVSCALE * exp(ETA_CL)`) — ambiguous anchor.
+- Parameters with two or more free thetas in the typical value (`CL = TVCL * TVSCALE * exp(ETA_CL)`, `CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`) — no single anchor. FOCE/FOCEI leave these un-centred; SAEM and IMP/IMPMAP record them as a [covariate mu-reference](model-file/individual-parameters.qmd#sec-covariate-mu-ref) and re-fit all the thetas jointly (#619).
 - Compound eta expressions inside the `exp` (`CL = TVCL * exp(ETA_CL + ETA_OCC)`).
 - Non-standard transforms the parser doesn't recognise.
 

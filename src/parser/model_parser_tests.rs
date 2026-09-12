@@ -5341,6 +5341,201 @@ fn test_detect_mu_ref_multiplicative_exp() {
     assert!(m.log_transformed());
 }
 
+// ── multi-theta (covariate) mu-referencing (#619) ─────────────────────
+
+fn detect_groups(src: &str, theta_names: &[&str], eta_names: &[&str]) -> Vec<CovariateMuRef> {
+    let tn: Vec<String> = theta_names.iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(src, ctx, StatementMode::Plain).expect("parses");
+    detect_covariate_mu_refs(&stmts, &tn, &en, en.len())
+}
+
+fn detect_plain(src: &str, theta_names: &[&str], eta_names: &[&str]) -> HashMap<String, MuRef> {
+    let tn: Vec<String> = theta_names.iter().map(|s| s.to_string()).collect();
+    let en: Vec<String> = eta_names.iter().map(|s| s.to_string()).collect();
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(src, ctx, StatementMode::Plain).expect("parses");
+    detect_mu_refs(&stmts, &tn, &en, &[])
+}
+
+#[test]
+fn covariate_mu_ref_additive_typical_value() {
+    let src = "CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)";
+    let g = detect_groups(src, &["TVCL", "TH_CRCL"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].eta_name, "ETA_CL");
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_CRCL"]);
+    assert_eq!(g[0].transform, MuTransform::Log);
+    assert_eq!(g[0].covariate_names, vec!["CRCL"]);
+    // The single-anchor scan sees two thetas and records nothing — unchanged.
+    assert!(detect_plain(src, &["TVCL", "TH_CRCL"], &["ETA_CL"]).is_empty());
+}
+
+#[test]
+fn covariate_mu_ref_power_form_keeps_its_single_anchor_too() {
+    let src = "CL = TVCL * (WT / 70.0) ^ TH_WT * exp(ETA_CL)";
+    let g = detect_groups(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_WT"]);
+    assert_eq!(g[0].covariate_names, vec!["WT"]);
+    // `collect_mul_anchors` never descended into the power, so this form always
+    // had a plain mu-ref on TVCL; it still does (byte-identical `MuRef`).
+    let plain = detect_plain(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    let m = plain.get("ETA_CL").expect("plain anchor retained");
+    assert_eq!(m.theta_name, "TVCL");
+    assert_eq!(m.transform, MuTransform::Log);
+}
+
+#[test]
+fn covariate_mu_ref_exponential_covariate_factor() {
+    let src = "CL = TVCL * exp(TH_WT * (WT - 70.0)) * exp(ETA_CL)";
+    let g = detect_groups(src, &["TVCL", "TH_WT"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_WT"]);
+    assert_eq!(g[0].transform, MuTransform::Log);
+}
+
+#[test]
+fn covariate_mu_ref_exp_of_log_sum_form() {
+    let g = detect_groups(
+        "CL = exp(log(TVCL + TH_CRCL * CRCL) + ETA_CL)",
+        &["TVCL", "TH_CRCL"],
+        &["ETA_CL"],
+    );
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].transform, MuTransform::Log);
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_CRCL"]);
+}
+
+#[test]
+fn covariate_mu_ref_logit_forms() {
+    for src in [
+        "F = inv_logit(LOGIT_F + TH_SEX * SEX + ETA_F)",
+        "F = expit(ETA_F + LOGIT_F + TH_SEX * SEX)",
+        "F = 1.0 / (1.0 + exp(-(LOGIT_F + TH_SEX * SEX + ETA_F)))",
+        "F = 1 / (1 + exp(-(LOGIT_F + TH_SEX * SEX) - ETA_F))",
+    ] {
+        let g = detect_groups(src, &["LOGIT_F", "TH_SEX"], &["ETA_F"]);
+        assert_eq!(g.len(), 1, "{src}");
+        assert_eq!(g[0].transform, MuTransform::Logit, "{src}");
+        assert_eq!(g[0].theta_names, vec!["LOGIT_F", "TH_SEX"], "{src}");
+        assert_eq!(g[0].covariate_names, vec!["SEX"], "{src}");
+    }
+}
+
+#[test]
+fn covariate_mu_ref_sees_through_a_local_typical_value() {
+    let src = "TVCL_I = TVCL + TH_CRCL * (CRCL - 90.0)\nCL = TVCL_I * exp(ETA_CL)";
+    let g = detect_groups(src, &["TVCL", "TH_CRCL"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_CRCL"]);
+    assert_eq!(g[0].covariate_names, vec!["CRCL"]);
+}
+
+#[test]
+fn covariate_mu_ref_accepts_the_iiv_plus_iov_exp_factor() {
+    // eta 0 is the BSV eta, eta 1 plays the kappa (n_bsv_eta = 1).
+    let tn: Vec<String> = vec!["TVCL".into(), "TH_CRCL".into()];
+    let en: Vec<String> = vec!["ETA_CL".into(), "KAPPA_CL".into()];
+    let ctx = ParseCtx::new(&tn, &en, &[]);
+    let stmts = parse_block_statements(
+        "CL = (TVCL + TH_CRCL * CRCL) * exp(ETA_CL + KAPPA_CL)",
+        ctx,
+        StatementMode::Plain,
+    )
+    .unwrap();
+    let g = detect_covariate_mu_refs(&stmts, &tn, &en, 1);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].eta_name, "ETA_CL");
+    // A kappa-only typical value is not a between-subject mean: nothing recorded.
+    let stmts = parse_block_statements(
+        "CL = (TVCL + TH_CRCL * CRCL) * exp(KAPPA_CL)",
+        ParseCtx::new(&tn, &en, &[]),
+        StatementMode::Plain,
+    )
+    .unwrap();
+    assert!(detect_covariate_mu_refs(&stmts, &tn, &en, 1).is_empty());
+}
+
+#[test]
+fn covariate_mu_ref_rejects_what_it_cannot_evaluate_per_subject() {
+    let tn = ["TVCL", "TH_X"];
+    let en = ["ETA_CL", "ETA_V"];
+    for (src, why) in [
+        (
+            "CL = TVCL * (WT / 70.0) ^ 0.75 * exp(ETA_CL)",
+            "single theta: plain mu-ref territory",
+        ),
+        (
+            "CL = (TVCL + TH_X * TIME) * exp(ETA_CL)",
+            "TIME makes the mu vary within a subject",
+        ),
+        (
+            "CL = (TVCL + TH_X * exp(ETA_V)) * exp(ETA_CL)",
+            "a second eta inside the typical value",
+        ),
+        (
+            "CL = TVCL * exp(ETA_CL + TH_X * WT)",
+            "the exp factor is not a bare eta",
+        ),
+        (
+            "CL = (TVCL + TH_X * WT) * exp(ETA_CL) * exp(ETA_V)",
+            "two eta factors",
+        ),
+        (
+            "CL = TVCL + TH_X * WT + ETA_CL",
+            "additive link is never recorded",
+        ),
+        (
+            "if (SEX == 1) { TV = TVCL } else { TV = TH_X }\nCL = TV * exp(ETA_CL)",
+            "a conditionally assigned local cannot be inlined",
+        ),
+    ] {
+        assert!(detect_groups(src, &tn, &en).is_empty(), "{why}: {src}");
+    }
+}
+
+#[test]
+fn covariate_mu_ref_last_assignment_on_an_eta_wins() {
+    let src = "CL = (TVCL + TH_X * WT) * exp(ETA_CL)\nCL = (TVCL + TH_X * CRCL) * exp(ETA_CL)";
+    let g = detect_groups(src, &["TVCL", "TH_X"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].covariate_names, vec!["CRCL"]);
+}
+
+#[test]
+fn covariate_mu_ref_reaches_the_compiled_model() {
+    let src = r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let m = parse_model_string(src).expect("parses");
+    assert_eq!(m.covariate_mu_refs.len(), 1);
+    assert_eq!(m.covariate_mu_refs[0].eta_name, "ETA_CL");
+    assert_eq!(m.covariate_mu_refs[0].theta_names, vec!["TVCL", "TH_CRCL"]);
+    assert!(!m.mu_refs.contains_key("ETA_CL"));
+    assert_eq!(
+        m.mu_refs.get("ETA_V").map(|r| r.theta_name.as_str()),
+        Some("TVV")
+    );
+}
+
 #[test]
 fn test_detect_mu_ref_exp_of_log_sum() {
     // Canonical mu-reference form: exp(log(THETA) + ETA)
