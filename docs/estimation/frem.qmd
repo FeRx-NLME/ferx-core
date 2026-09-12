@@ -55,6 +55,7 @@ let result = prepare_frem(
     None,  // default output model path
     None,  // default output data path
     None,  // missing value indicator (default: -99)
+    None,  // no prior fit: keep the base model's declared inits
 )?;
 
 // Pass e.g. &["WT".into()] instead of &[] to FREM only a subset of the
@@ -72,13 +73,19 @@ library(ferx)
 
 # Covariates (and their continuous/categorical kind) come from the model's
 # [covariates] block; omit `covariates` to use all of them.
-frem <- ferx_to_frem(
-  model = "warfarin.ferx",
-  data  = "warfarin_cov.csv"
+frem <- ferx_model_to_frem(
+  model      = "warfarin.ferx",
+  data       = "warfarin_cov.csv",
+  output_dir = file.path(tempdir(), "frem")  # default: next to the model file
 )
+# `output_dir` needs ferx-r from `main` (after 0.3.0). Release 0.3.0 creates the
+# directory and then writes next to the model anyway, unless `output_model` and
+# `output_data` are both given.
 
 # Or filter to a subset of the declared covariates:
-# frem <- ferx_to_frem("warfarin.ferx", "warfarin_cov.csv", covariates = "WT")
+# frem <- ferx_model_to_frem("warfarin.ferx", "warfarin_cov.csv",
+#                            covariates = "WT",
+#                            output_dir = file.path(tempdir(), "frem"))
 
 fit <- ferx_fit(frem, method = "saem")   # frem is a ferx_model
 ```
