@@ -3371,6 +3371,53 @@ impl MuRef {
     }
 }
 
+/// A mu-reference whose typical value is a function of **several** thetas and
+/// subject covariates (#619) — the shape [`MuRef`] cannot hold because there is
+/// no single anchor theta:
+///
+/// ```text
+/// CL = (TVCL_NR + (CRCL - 90) * THETA_CRCL) * exp(ETA_CL)    # additive covariate
+/// CL = TVCL * (WT / 70) ^ THETA_WT * exp(ETA_CL)              # estimated exponent
+/// F  = inv_logit(LOGIT_F + THETA_SEX * SEX + ETA_F)           # logit-scale covariate
+/// ```
+///
+/// The eta still enters additively on the mu scale, `P_i = g⁻¹(g(A_i(θ)) + η_i)`
+/// with `A_i` the eta-free typical value evaluated at subject `i`'s covariates,
+/// so the EM M-step for the group's thetas is well-posed: hold
+/// `φ_i = g(A_i(θ)) + η_i` fixed and re-fit `θ` to the population of `φ_i`
+/// (NONMEM's `MU_k = LOG(THETA(1) + (CRCL-90)*THETA(2))`). SAEM and IMP/IMPMAP
+/// consume this; every other estimator ignores it, and [`CompiledModel::mu_refs`]
+/// is unchanged by its presence (an eta may appear in both when the typical
+/// value also matches a single-anchor pattern — the single-anchor entry keeps
+/// serving the inner-loop centring and reporting consumers exactly as before).
+#[derive(Debug, Clone)]
+pub struct CovariateMuRef {
+    /// The BSV eta this typical value carries.
+    pub eta_name: String,
+    /// Every theta the typical value reads, in declaration order. At least two —
+    /// a single-theta typical value is a plain [`MuRef`].
+    pub theta_names: Vec<String>,
+    /// Which link relates the typical value to the individual parameter:
+    /// [`MuTransform::Log`] for `A * exp(η)` / `exp(log(A) + η)`,
+    /// [`MuTransform::Logit`] for `inv_logit(A + η)`. Never `Identity` or
+    /// `LogitProbability` — those forms are not recorded.
+    pub transform: MuTransform,
+    /// Data covariates the typical value reads (names as written).
+    pub covariate_names: Vec<String>,
+    /// The subset of [`Self::theta_names`] the rest of the model also reads.
+    ///
+    /// Empty is the ordinary case and the precondition for the exact M-step
+    /// engine: freezing `φ_i` freezes the individual parameter, so the data term
+    /// is constant in the group's thetas *only* when those thetas reach the
+    /// likelihood through this typical value alone. A theta listed here is still
+    /// estimated by the group — it just forces the prior-plus-data engine, which
+    /// keeps the term it is live in.
+    pub shared_thetas: Vec<String>,
+    /// The eta-free typical value `A(θ, covariates)`, with every local
+    /// `[individual_parameters]` definition it referenced already inlined.
+    pub(crate) typical: crate::parser::model_parser::Expression,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Non-Gaussian endpoint types  (Phase 1: TTE / survival)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3960,6 +4007,10 @@ pub struct CompiledModel {
     pub mu_refs: HashMap<String, MuRef>,
     /// Same as `mu_refs` but for IOV kappa parameters (kappa_name → MuRef).
     pub kappa_mu_refs: HashMap<String, MuRef>,
+    /// Multi-theta (covariate) mu-references, one per eta (#619). Populated by
+    /// the parser alongside `mu_refs`; consumed by the SAEM / IMP / IMPMAP
+    /// M-steps only. Empty when no typical value reads two or more thetas.
+    pub covariate_mu_refs: Vec<CovariateMuRef>,
     /// Computes covariate-adjusted typical values per subject for AD.
     /// Returns one value per `[individual_parameters]` assignment (in
     /// declaration order), evaluated with eta = 0. Covariates and theta are

@@ -537,7 +537,7 @@ fn saem_non_mu_referenced_warning_lists_individual_params_with_unmapped_eta() {
     );
 
     let warning =
-        saem_non_mu_referenced_individual_params_warning(&model).expect("expected warning");
+        saem_non_mu_referenced_individual_params_warning(&model, true).expect("expected warning");
     assert!(warning.contains("not mu-referenced: V."));
     assert!(!warning.contains("not mu-referenced: CL"));
     assert!(!warning.contains("KA"));
@@ -564,7 +564,48 @@ fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
         },
     );
 
-    assert!(saem_non_mu_referenced_individual_params_warning(&model).is_none());
+    assert!(saem_non_mu_referenced_individual_params_warning(&model, true).is_none());
+}
+
+/// A covariate mu-reference group (#619) mu-references its eta — but only in a
+/// run that builds one. `run_saem` builds none under `mu_referencing = false`,
+/// and none for a mixture, and those are exactly the runs where the warning has
+/// to survive: reading the group off the model alone would silence it in the
+/// case it exists for (#621).
+#[test]
+fn saem_non_mu_referenced_warning_returns_when_the_run_builds_no_covariate_group() {
+    let src = r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let model = crate::parser::model_parser::parse_model_string(src).expect("model parses");
+    assert_eq!(model.covariate_mu_refs.len(), 1, "CL carries a group");
+    assert!(
+        saem_non_mu_referenced_individual_params_warning(&model, true).is_none(),
+        "a run that builds the group does mu-reference CL"
+    );
+    let w = saem_non_mu_referenced_individual_params_warning(&model, false)
+        .expect("with no group built, nothing mu-references CL");
+    assert!(w.contains("CL"), "{w}");
+    assert!(
+        !w.contains(" V"),
+        "V keeps its own single-anchor mu-ref: {w}"
+    );
 }
 
 // ── kappa shrinkage ──────────────────────────────────────────────────────

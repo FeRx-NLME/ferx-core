@@ -1165,6 +1165,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: Some(Box::new(|_t, _c| vec![0.2, 10.0, 1.5])),
             pk_indices: vec![0, 1, 4],

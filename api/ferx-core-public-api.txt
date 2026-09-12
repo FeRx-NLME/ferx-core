@@ -2549,6 +2549,7 @@ pub ferx_core::types::CompiledModel::analytic_readout: core::option::Option<ferx
 pub ferx_core::types::CompiledModel::analytical_init: alloc::vec::Vec<ferx_core::AnalyticalInit>
 pub ferx_core::types::CompiledModel::bloq_method: ferx_core::BloqMethod
 pub ferx_core::types::CompiledModel::covariate_model: core::option::Option<ferx_core::CovariateModelSpec>
+pub ferx_core::types::CompiledModel::covariate_mu_refs: alloc::vec::Vec<ferx_core::CovariateMuRef>
 pub ferx_core::types::CompiledModel::covariate_nns: alloc::vec::Vec<ferx_core::nn::CovariateNn>
 pub ferx_core::types::CompiledModel::default_params: ferx_core::ModelParameters
 pub ferx_core::types::CompiledModel::derived_exprs: alloc::vec::Vec<ferx_core::DerivedExprSpec>
@@ -2655,6 +2656,12 @@ pub ferx_core::types::CovariateModelSpec::generated_thetas: alloc::vec::Vec<allo
 pub ferx_core::types::CovariateModelSpec::relations: alloc::vec::Vec<ferx_core::CovariateRelation>
 impl ferx_core::CovariateModelSpec
 pub fn ferx_core::CovariateModelSpec::unresolved(&self) -> alloc::vec::Vec<&ferx_core::CovariateRelation>
+pub struct ferx_core::types::CovariateMuRef
+pub ferx_core::types::CovariateMuRef::covariate_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::CovariateMuRef::eta_name: alloc::string::String
+pub ferx_core::types::CovariateMuRef::shared_thetas: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::CovariateMuRef::theta_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::CovariateMuRef::transform: ferx_core::MuTransform
 pub struct ferx_core::types::CovariateRelation
 pub ferx_core::types::CovariateRelation::center: core::option::Option<ferx_core::CovariateStat>
 pub ferx_core::types::CovariateRelation::covariate: alloc::string::String
@@ -3915,6 +3922,7 @@ pub ferx_core::CompiledModel::analytic_readout: core::option::Option<ferx_core::
 pub ferx_core::CompiledModel::analytical_init: alloc::vec::Vec<ferx_core::AnalyticalInit>
 pub ferx_core::CompiledModel::bloq_method: ferx_core::BloqMethod
 pub ferx_core::CompiledModel::covariate_model: core::option::Option<ferx_core::CovariateModelSpec>
+pub ferx_core::CompiledModel::covariate_mu_refs: alloc::vec::Vec<ferx_core::CovariateMuRef>
 pub ferx_core::CompiledModel::covariate_nns: alloc::vec::Vec<ferx_core::nn::CovariateNn>
 pub ferx_core::CompiledModel::default_params: ferx_core::ModelParameters
 pub ferx_core::CompiledModel::derived_exprs: alloc::vec::Vec<ferx_core::DerivedExprSpec>
@@ -4030,6 +4038,12 @@ pub ferx_core::CovariateModelSpec::generated_thetas: alloc::vec::Vec<alloc::stri
 pub ferx_core::CovariateModelSpec::relations: alloc::vec::Vec<ferx_core::CovariateRelation>
 impl ferx_core::CovariateModelSpec
 pub fn ferx_core::CovariateModelSpec::unresolved(&self) -> alloc::vec::Vec<&ferx_core::CovariateRelation>
+pub struct ferx_core::CovariateMuRef
+pub ferx_core::CovariateMuRef::covariate_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::CovariateMuRef::eta_name: alloc::string::String
+pub ferx_core::CovariateMuRef::shared_thetas: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::CovariateMuRef::theta_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::CovariateMuRef::transform: ferx_core::MuTransform
 pub struct ferx_core::CovariateRelation
 pub ferx_core::CovariateRelation::center: core::option::Option<ferx_core::CovariateStat>
 pub ferx_core::CovariateRelation::covariate: alloc::string::String

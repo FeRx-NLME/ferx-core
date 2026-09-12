@@ -868,8 +868,16 @@ pub fn fit(
     }
 }
 
+/// `covariate_groups_active` says whether the run about to start will actually
+/// build covariate mu-reference groups (#619). It is *not* a property of the
+/// model: `run_saem` builds none under `mu_referencing = false` and none for a
+/// mixture (the class draw would have to enter the group's prior term, which has
+/// not been derived). Reading the group off the model alone would silence this
+/// warning in exactly the two cases where nothing mu-references the parameter —
+/// and `mu_referencing = false` is the case the warning exists for (#621).
 pub(crate) fn saem_non_mu_referenced_individual_params_warning(
     model: &CompiledModel,
+    covariate_groups_active: bool,
 ) -> Option<String> {
     let mut names = Vec::new();
     for (param_name, &eta_idx) in model.indiv_param_names.iter().zip(model.eta_map.iter()) {
@@ -889,7 +897,15 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
             continue;
         };
-        if !model.mu_refs.contains_key(eta_name) {
+        // A multi-theta typical value (#619) is mu-referenced too: SAEM moves
+        // its thetas through the covariate mu-reference group — but only when
+        // the run builds one.
+        let has_group = covariate_groups_active
+            && model
+                .covariate_mu_refs
+                .iter()
+                .any(|g| &g.eta_name == eta_name);
+        if !model.mu_refs.contains_key(eta_name) && !has_group {
             names.push(param_name.as_str());
         }
     }
@@ -959,7 +975,10 @@ fn fit_inner(
     // matters most (#621). This is assembled before the startup banner so verbose
     // runs show it before SAEM begins.
     if chain.iter().any(|&m| m == EstimationMethod::Saem) {
-        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
+        // The same two gates `run_saem` applies before resolving groups.
+        let cov_groups_active = options.mu_referencing && model.mixture.is_none();
+        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model, cov_groups_active)
+        {
             pre_run_warnings.push(if n_stages > 1 {
                 format!("[SAEM] {w}")
             } else {

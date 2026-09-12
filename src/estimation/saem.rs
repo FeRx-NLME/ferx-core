@@ -6,6 +6,7 @@
 /// Two-phase step-size schedule (Monolix convention):
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
+use crate::estimation::covariate_mu_ref::GroupStepInput;
 use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
 };
@@ -2202,6 +2203,44 @@ pub fn run_saem(
     // All of this is conditional on `mu_referencing`: with it off every θ goes
     // through the numerical M-step by construction, so telling the user to switch
     // estimator to get a closed-form shift they turned off is noise (#996 review).
+    // Multi-theta (covariate) mu-references (#619). A group supersedes the
+    // single-anchor pair on its own eta, and its thetas leave the packing
+    // advisories (the group step moves them whatever their packing). Not run
+    // under a mixture: the class draw would have to enter the group's prior
+    // term and that has not been derived. Same `mu_referencing` gate as the
+    // closed-form shift — with it off every theta is numerical by design.
+    let (cov_mu_groups, cov_mu_notes) = if saem_mix.is_none() && options.mu_referencing {
+        crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
+            model,
+            population,
+            &mu_ref_pairs,
+            &init_params.theta_fixed,
+            &init_params.omega.matrix,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    for n in &cov_mu_notes {
+        warnings.push(format!("SAEM: {n}"));
+    }
+    let cov_group_etas: Vec<usize> = cov_mu_groups.iter().map(|g| g.eta_idx).collect();
+    let cov_group_thetas: Vec<usize> = cov_mu_groups
+        .iter()
+        .flat_map(|g| g.theta_idx.iter().copied())
+        .collect();
+    let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
+        .into_iter()
+        .filter(|(_t, e)| !cov_group_etas.contains(e))
+        .collect();
+    let dropped_identity: Vec<usize> = dropped_identity
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
+    let dropped_log_packed_logit: Vec<usize> = dropped_log_packed_logit
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
+
     let mut mix_switched_skipped: Vec<usize> = Vec::new();
     let mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if saem_mix.is_some() && options.mu_referencing {
         get_mixture_mu_ref_pairs(model)
@@ -2282,7 +2321,7 @@ pub fn run_saem(
             // M-step for every log-mu-ref θ (#996).
             !mix_mu_ref_pairs.is_empty()
         } else {
-            !mu_ref_pairs.is_empty()
+            !mu_ref_pairs.is_empty() || !cov_mu_groups.is_empty()
         };
 
     // A scalar residual statistic is exact for this narrow subset of models.
@@ -2415,7 +2454,11 @@ pub fn run_saem(
         } else if saem_mix.is_some() {
             class_mu_ref_thetas.clone()
         } else {
-            mu_ref_pairs.iter().map(|&(t, _e)| t).collect()
+            mu_ref_pairs
+                .iter()
+                .map(|&(t, _e)| t)
+                .chain(cov_group_thetas.iter().copied())
+                .collect()
         };
         let theta_is_mu_ref_anchor =
             crate::estimation::impmap::theta_is_mu_ref_anchor_mask(model, &class_mu_ref_thetas);
@@ -3190,6 +3233,100 @@ pub fn run_saem(
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
                     temp_theta_upper[theta_idx] = log_theta[theta_idx];
                     n_pinned += 1;
+                }
+                // ---- Covariate mu-reference groups (#619): φ-frozen M-step ----
+                // Exact (Gauss–Newton on the prior term) when the group's
+                // covariates are time-constant, prior + data (BOBYQA) when one
+                // varies within a subject. The result is blended with the same
+                // SA step `gamma` as the shift above, then each subject's eta is
+                // re-centred by the realised change in its own mu so that
+                // `φ_i = g(A_i(θ)) + η_i` is unchanged — the per-subject twin of
+                // the `e[eta_idx] -= delta` above.
+                if !cov_mu_groups.is_empty() {
+                    let unpack_all = |lt: &[f64]| -> Vec<f64> {
+                        (0..n_theta)
+                            .map(|i| {
+                                if theta_packs_log_mask[i] {
+                                    lt[i].exp()
+                                } else {
+                                    lt[i]
+                                }
+                            })
+                            .collect()
+                    };
+                    let pack_one = |i: usize, v: f64| -> f64 {
+                        if theta_packs_log_mask[i] {
+                            v.max(1e-10).ln()
+                        } else {
+                            v
+                        }
+                    };
+                    let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
+                    for group in &cov_mu_groups {
+                        let theta_now = unpack_all(&log_theta);
+                        let mu_old = group.mus(&theta_now, population);
+                        let solved = {
+                            let input = GroupStepInput {
+                                theta: &theta_now,
+                                theta_lower: &init_params.theta_lower,
+                                theta_upper: &init_params.theta_upper,
+                                theta_fixed: &init_params.theta_fixed,
+                                theta_packs_log: &theta_packs_log_mask,
+                                omega: &state.omega_mat,
+                                etas: &state.etas,
+                            };
+                            if group.needs_data_term {
+                                let k = group.eta_idx;
+                                let etas_now = &state.etas;
+                                let data = |th: &[f64], shift: &[f64]| -> f64 {
+                                    let shifted: Vec<Vec<f64>> = etas_now
+                                        .iter()
+                                        .zip(shift.iter())
+                                        .map(|(e, s)| {
+                                            let mut e2 = e.clone();
+                                            if k < e2.len() {
+                                                e2[k] += s;
+                                            }
+                                            e2
+                                        })
+                                        .collect();
+                                    match kappas_for_mstep {
+                                        Some(kaps) => obs_nll_sum_iov(
+                                            model, population, th, &sigma_now, &shifted, kaps,
+                                        ),
+                                        None => {
+                                            obs_nll_sum(model, population, th, &sigma_now, &shifted)
+                                        }
+                                    }
+                                };
+                                group.solve_numerical(population, &input, mstep_maxiter, &data)
+                            } else {
+                                group.solve_exact(population, &input)
+                            }
+                        };
+                        let Some(theta_star) = solved else {
+                            continue;
+                        };
+                        for &t in &group.theta_idx {
+                            if init_params.theta_fixed.get(t).copied().unwrap_or(false) {
+                                continue;
+                            }
+                            let target = pack_one(t, theta_star[t]);
+                            log_theta[t] = (log_theta[t] + gamma * (target - log_theta[t]))
+                                .clamp(log_theta_lower[t], log_theta_upper[t]);
+                            temp_theta_lower[t] = log_theta[t];
+                            temp_theta_upper[t] = log_theta[t];
+                            n_pinned += 1;
+                        }
+                        let theta_new = unpack_all(&log_theta);
+                        let mu_new = group.mus(&theta_new, population);
+                        for (i, e) in state.etas.iter_mut().enumerate() {
+                            let d = mu_new[i] - mu_old[i];
+                            if d.is_finite() && group.eta_idx < e.len() {
+                                e[group.eta_idx] -= d;
+                            }
+                        }
+                    }
                 }
                 // Each pinned mu-ref dim avoids 2 obs_nll_sum calls per NLopt
                 // gradient request, capped at `mstep_maxiter` requests. FIXed
@@ -4516,6 +4653,169 @@ mod tests {
             "no packing advisory with mu_referencing off, got {:?}",
             res.warnings
         );
+    }
+
+    /// Eight subjects with CRCL 40..140, CL generated from the additive renal
+    /// model (`CL = 5 + (CRCL-90)*0.05`, no IIV in the data) so a covariate
+    /// group has real between-subject structure to fit in a handful of
+    /// iterations. `V = 50`.
+    fn covmuref_csv(with_v_eta: bool) -> String {
+        let mut s = String::from("ID,TIME,DV,AMT,EVID,CMT,CRCL\n");
+        for (i, crcl) in [40.0_f64, 55.0, 70.0, 85.0, 95.0, 110.0, 125.0, 140.0]
+            .iter()
+            .enumerate()
+        {
+            let id = i + 1;
+            let cl = 5.0 + (crcl - 90.0) * 0.05;
+            let v = if with_v_eta {
+                50.0 * (0.1 * ((id as f64) - 4.5) / 4.5).exp()
+            } else {
+                50.0
+            };
+            s.push_str(&format!("{id},0,0,100,1,1,{crcl}\n"));
+            for (ti, t) in [1.0_f64, 4.0, 8.0, 16.0, 24.0].iter().enumerate() {
+                let c = 100.0 / v * (-(cl / v) * t).exp();
+                let dv = c * (1.0 + 0.03 * ((id + ti) as f64).sin());
+                s.push_str(&format!("{id},{t},{dv:.6},0,0,1,{crcl}\n"));
+            }
+        }
+        s
+    }
+
+    fn covmuref_pop(with_v_eta: bool) -> Population {
+        use std::io::Write;
+        let csv = covmuref_csv(with_v_eta);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::io::datareader::read_nonmem_csv(f.path(), Some(&["CRCL"]), None).unwrap()
+    }
+
+    /// The #619 additive form with the covariate group as the **only**
+    /// eta-bearing parameter (`V` carries no eta), so a closed-form channel
+    /// exists if and only if the group is active.
+    const COVMUREF_ONLY_MODEL: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0, 5.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// #619: with the covariate group active, SAEM has a closed-form channel
+    /// (the saved-eval count is `Some(>0)`), the parameter is not reported as
+    /// un-mu-referenced, and no group note fires. Without the group this model
+    /// has no mu-referenced parameter at all, so the count would be `None` —
+    /// that is the discriminating signature, as in the #918 test.
+    #[test]
+    fn saem_covariate_mu_ref_group_drives_the_closed_form_channel() {
+        let model =
+            crate::parser::model_parser::parse_model_string(COVMUREF_ONLY_MODEL).expect("parses");
+        assert_eq!(model.covariate_mu_refs.len(), 1);
+        assert!(
+            model.mu_refs.is_empty(),
+            "no single-anchor pair in this model"
+        );
+        let pop = covmuref_pop(false);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 6;
+        opts.saem_n_convergence = 3;
+        opts.saem_seed = Some(619);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            res.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
+            "the group step must pin its thetas out of the numerical M-step: {:?}",
+            res.saem_mu_ref_m_step_evals_saved
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("not mu-referenced") && w.contains("CL")),
+            "CL is mu-referenced through the group, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("covariate mu-reference on")),
+            "no group should be dropped, got {:?}",
+            res.warnings
+        );
+        // The renal slope moved off its start toward the data-generating 0.05.
+        let slope = res.theta[1];
+        assert!(
+            slope > 0.02,
+            "TH_CRCL must move from its 0.02 start: {slope}"
+        );
+    }
+
+    /// `mu_referencing = false` turns the group off with the rest of the
+    /// closed-form channel; the count is then `None` and no group note fires.
+    #[test]
+    fn saem_mu_referencing_off_disables_the_covariate_group() {
+        let model =
+            crate::parser::model_parser::parse_model_string(COVMUREF_ONLY_MODEL).expect("parses");
+        let pop = covmuref_pop(false);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(619);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert_eq!(res.saem_mu_ref_m_step_evals_saved, None);
+    }
+
+    /// A group whose theta is also another eta's single anchor is declined
+    /// with a note naming both, and the fit proceeds on the numerical M-step.
+    #[test]
+    fn saem_covariate_group_sharing_an_anchor_is_declined_with_a_note() {
+        let src = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = (TVCL * 10.0 + TH_CRCL * CRCL) * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = covmuref_pop(true);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 3;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(619);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let note = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("covariate mu-reference on ETA_V"))
+            .unwrap_or_else(|| panic!("expected the #619 note, got {:?}", res.warnings));
+        assert!(note.contains("TVCL") && note.contains("ETA_CL"), "{note}");
     }
 
     #[test]
