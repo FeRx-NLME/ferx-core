@@ -1194,7 +1194,7 @@ fn dense_bfgs_scratch_allocation_bench() {
     for n in [2, 4, 8] {
         ALLOCATION_CALLS.store(0, Ordering::Relaxed);
         ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-        std::hint::black_box(run_dense_scratch_fixture(n, true));
+        std::hint::black_box(run_dense_scratch_fixture(n, false));
         let current = (
             ALLOCATION_CALLS.load(Ordering::Relaxed),
             ALLOCATED_BYTES.load(Ordering::Relaxed),
@@ -1202,7 +1202,7 @@ fn dense_bfgs_scratch_allocation_bench() {
 
         ALLOCATION_CALLS.store(0, Ordering::Relaxed);
         ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-        std::hint::black_box(run_dense_scratch_fixture(n, false));
+        std::hint::black_box(run_dense_scratch_fixture(n, true));
         let legacy = (
             ALLOCATION_CALLS.load(Ordering::Relaxed),
             ALLOCATED_BYTES.load(Ordering::Relaxed),
