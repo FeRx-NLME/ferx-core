@@ -132,15 +132,20 @@ A relative path is resolved against the **model file's** directory, like
 `[data] path`, so a model and the fit it updates from can sit together in a run
 directory.
 
-The source fit is read **once, when the model is parsed** — not once per
-estimation stage. Two things follow that are worth knowing:
+The source fit is read **when the model is parsed**, not once per estimation
+stage. Two things follow that are worth knowing:
 
 - a `from_fit` that cannot be honoured (missing file, wrong format, nothing to
   import) fails at parse time, so `ferx check` refuses the model and the error
   names the path rather than surfacing halfway through a fit;
 - the prior the optimizer minimised, the prior the covariance step used and the
-  prior the report prints are guaranteed to be the same one, even if the source
-  file changes while the fit is running.
+  prior the report prints are the same one, even if the source file changes while
+  the fit is running.
+
+(A model that needs data-derived bindings — a symbolic `[covariate_model]`
+centring statistic, or a `theta NAME[COL]` level block — is re-parsed once the
+dataset is known, and reads the source fit again on that pass. Both reads happen
+before any estimation, so the guarantee above still holds.)
 
 ### Which file, and from where
 
@@ -176,23 +181,27 @@ Running the parent from one directory and the update from another gives
 
 Imported: θ, Ω diagonals, Σ, and κ (Ω_IOV) diagonals.
 
-Skipped, each reported in the fit's warnings so a missing prior is visible rather
-than merely absent:
+Skipped **and reported in the fit's warnings**, so a prior you expected is
+visible by name rather than merely absent:
 
 - a parameter with no standard error in the source — a `FIX`ed one, or a run
   whose covariance step did not execute. Without an SE there is no spread;
 - a parameter that is `FIX`ed in **this** model, which a prior could never move;
 - a `block_omega` / `block_sigma` element or a `[mixture]` override, which v1
-  does not support;
+  does not support.
+
+Skipped **silently**, because both are what you asked for:
+
 - a parameter that already carries an inline `prior(...)` here. **The inline one
   wins**, so you can tighten or loosen one imported prior without giving up the
-  rest.
+  rest — and the result is listed in the fit's prior table either way;
+- a source parameter this model simply does not have. A published model is
+  usually larger than the one being updated, so one warning per absent parameter
+  would bury the ones that matter.
 
-A source parameter this model simply does not have is skipped silently — a
-published model is usually larger than the one being updated. But an import that
-lands **nothing at all** is a hard error, for the same reason an unresolvable
-typed prior is: the alternative is an unpenalized fit that looks exactly like a
-penalized one.
+An import that lands **nothing at all** is a hard error, for the same reason an
+unresolvable typed prior is: the alternative is an unpenalized fit that looks
+exactly like a penalized one.
 
 Matching is on **name and family**, not name alone. θ names and η names are
 separate namespaces, so `theta CL` and `omega CL` can both exist in one model;

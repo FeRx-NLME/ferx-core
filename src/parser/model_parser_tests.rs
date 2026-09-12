@@ -22879,6 +22879,22 @@ fn a_malformed_priors_line_is_an_error() {
     assert!(err.contains("more than once"), "{err}");
 }
 
+/// A `[priors]` block that declares nothing is an error.
+///
+/// The same failure the strict unknown-key rule exists to prevent, reached from
+/// the other side: the model reads as regularized and fits unpenalized with
+/// nothing saying so. `[fit_options]` may be empty because every key has a
+/// default; this block has one key and no default.
+#[test]
+fn an_empty_priors_block_is_an_error() {
+    for block in ["", "  # only a comment", "\n"] {
+        let err = parse_full_model(&from_fit_model(block))
+            .map(|_| ())
+            .expect_err(&format!("`{block:?}` must be rejected"));
+        assert!(err.contains("declares nothing"), "{block:?}: {err}");
+    }
+}
+
 /// `[priors]` is a registered block name, so it is neither rejected as unknown
 /// nor silently dropped — the failure mode #1040 exists to prevent.
 #[test]

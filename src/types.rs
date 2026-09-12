@@ -3897,11 +3897,16 @@ pub struct CompiledModel {
     /// and resolves against the process's working directory.
     ///
     /// **Consumed by the parser.** Every parse entry point calls
-    /// `parser::model_parser::expand_prior_from_fit`, which reads the source fit
-    /// **once**, appends the imported priors to [`Self::priors`], records what it
-    /// declined to import in [`Self::parse_warnings`], and leaves this field
-    /// `None`. So a model that came from a file or a string has already been
-    /// expanded, and a `Some` here means the expansion has not run.
+    /// `parser::model_parser::expand_prior_from_fit`, which reads the source fit,
+    /// appends the imported priors to [`Self::priors`], records what it declined
+    /// to import in [`Self::parse_warnings`], and leaves this field `None`. So a
+    /// model that came from a file or a string has already been expanded, and a
+    /// `Some` here means the expansion has not run.
+    ///
+    /// Once per *parse*, not once per fit — and a model needing data-derived
+    /// bindings (`api::covariate_stats`, `api::levels`) is parsed twice, so it
+    /// reads the file twice. Both reads precede any estimation, which is what
+    /// the guarantee below is about.
     ///
     /// The read deliberately does *not* live in the estimation path. It used to,
     /// and that was wrong twice over: `build_prior_set` turns a failure into an

@@ -864,6 +864,76 @@ fn an_inline_prior_overrides_the_imported_one() {
     assert!((th.prior_value - 0.25).abs() < 1e-12, "{th:?}");
 }
 
+/// …and the override is matched on **family as well as name**, so a typed prior
+/// on `theta CL` does not suppress the import of `omega CL`.
+///
+/// The test above cannot see this: its typed prior and the import it displaces
+/// are the same parameter, so a name-only predicate and a name-and-family one
+/// agree. The gap is one this feature's own fix opened — before the family
+/// travelled with a prior, a typed prior in a colliding model was refused as
+/// ambiguous and the fit stopped; now it resolves, so a name-only override
+/// predicate silently drops the *other* family's import and the fit proceeds
+/// looking exactly as though it had not.
+#[test]
+fn an_inline_prior_overrides_only_its_own_family() {
+    let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    f.model.default_params.theta_names = vec!["CL".into()];
+    f.model.default_params.omega = OmegaMatrix::from_diagonal(&[0.1], vec!["CL".into()]);
+    // Typed on the **θ** named CL.
+    f.model.priors.push(ParameterPrior {
+        name: "CL".into(),
+        value: 0.25,
+        spread: PriorSpread::Rse(0.2),
+        kind: Some(crate::types::ParameterKind::Theta),
+    });
+
+    // The source carries both a θ `CL` and an Ω `CL`.
+    let mut src = source_fit();
+    src.theta_names = vec!["CL".into()];
+    src.eta_names = vec!["CL".into()];
+    src.sigma_names = vec!["UNRELATED".into()];
+
+    let (f, _dir) = with_from_fit(f, &src);
+    let s = f.set().summarize(&f.packed());
+
+    // Both priors are in force: the typed θ one, and the imported Ω one.
+    assert_eq!(s.len(), 2, "{s:?}");
+    // The typed prior won on the θ — centre 0.25, not the source's 0.15.
+    let theta = s.iter().find(|p| (p.estimate - 0.2).abs() < 1e-12).unwrap();
+    assert!((theta.prior_value - 0.25).abs() < 1e-12, "{theta:?}");
+    // …and the Ω import survived it, centred on the source's variance of 0.09.
+    let omega = s.iter().find(|p| (p.estimate - 0.1).abs() < 1e-12).unwrap();
+    assert!((omega.prior_value - 0.09).abs() < 1e-12, "{omega:?}");
+}
+
+/// A source estimate whose name and family match **two** coordinates is skipped
+/// with a note, not silently.
+///
+/// Unreachable through the parser today, so it is driven through
+/// `coordinate_names` directly. It exists because the alternative — folding it
+/// into the "absent from this model" arm, which is silent by design — would turn
+/// a future packed-layout change into a *quietly* dropped prior.
+#[test]
+fn a_source_estimate_matching_two_coordinates_is_noted_not_dropped() {
+    let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    // Two η under one name: same family, same name, two packed coordinates.
+    f.model.default_params.omega =
+        OmegaMatrix::from_diagonal(&[0.1, 0.2], vec!["ETA_CL".into(), "ETA_CL".into()]);
+    f.model.default_params.omega_fixed = vec![false; 2];
+    f.model.omega_init_as_sd = vec![false, false];
+
+    let (f, _dir) = with_from_fit(f, &source_fit());
+    // θ and σ still import; the ambiguous Ω does not.
+    assert_eq!(f.set().summarize(&f.packed()).len(), 2);
+    assert!(
+        f.notes()
+            .iter()
+            .any(|n| n.contains("ETA_CL") && n.contains("2 packed coordinates")),
+        "{:?}",
+        f.notes()
+    );
+}
+
 /// A FIXed target parameter cannot be moved by a prior, so it is skipped with a
 /// note rather than failing the fit the way a typed prior on a FIXed parameter
 /// does. The asymmetry is the point: an import is a bulk operation.

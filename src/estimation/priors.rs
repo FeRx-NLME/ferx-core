@@ -504,16 +504,37 @@ fn import_from_fit(
             .iter()
             .filter(|c| c.kind == est.kind && c.name.eq_ignore_ascii_case(&est.name))
             .collect();
-        // Not in this model at all. Silent, and the only silent skip: a source
-        // model that is bigger than the one being updated is the normal case,
-        // and one note per absent parameter would bury the ones that matter.
-        // The "nothing landed" guard below is what catches a wholesale mismatch.
-        let [info] = matches.as_slice() else {
-            continue;
+        let info = match matches.as_slice() {
+            [one] => *one,
+            // Not in this model at all. Silent, and the **only** silent skip
+            // that is not a deliberate user choice: a source model bigger than
+            // the one being updated is the normal case, and one note per absent
+            // parameter would bury the ones that matter. The "nothing landed"
+            // guard below is what catches a wholesale mismatch.
+            [] => continue,
+            // Two coordinates of the same family under one name. Unreachable
+            // today — the `[mixture]` overrides that could share a name are
+            // suffixed `_MIX{n}` — but folding it into the `[]` arm would make
+            // a future layout change *silently* drop the prior, which is the one
+            // outcome this feature must never produce. A note, not an error:
+            // this is still a bulk import over a model the user did not write
+            // for it.
+            _ => {
+                notes.push(format!(
+                    "{} {}: the name resolves to {} packed coordinates in this \
+                     model, so which one the source estimate refers to is \
+                     undecidable.",
+                    est.kind.keyword(),
+                    est.name,
+                    matches.len()
+                ));
+                continue;
+            }
         };
-        // Ordered first so the `[mixture]`/`block_sigma` tail of the coordinate
-        // table — whose `kind` is a placeholder (see `coordinate_table`) — is
-        // never matched on kind.
+        // The `[mixture]` / `block_sigma` tail of the coordinate table carries a
+        // placeholder `kind` (see `coordinate_table`), so it *can* survive the
+        // match above; this is what stops it, and every other out-of-scope
+        // coordinate, from being imported onto.
         if let Some(reason) = info.rejection.as_deref() {
             notes.push(format!("{} {}: {reason}", est.kind.keyword(), est.name));
             continue;
@@ -521,11 +542,17 @@ fn import_from_fit(
         // An inline `prior(...)` on the same parameter wins, so one imported
         // prior can be overridden without giving up the rest. Silent: the user
         // wrote the override on purpose, and it is visible in `prior_summary`.
-        if model
-            .priors
-            .iter()
-            .any(|p| p.name.eq_ignore_ascii_case(&info.name))
-        {
+        //
+        // Matched on **family as well as name**, like everything else here. A
+        // model may carry `theta CL` and `omega CL`, and before the family was
+        // consulted a typed prior on one of them suppressed the import of the
+        // other — and did so silently, which is exactly the failure this feature
+        // is built to avoid. A typed prior that names no family suppresses by
+        // name alone, conservatively: it cannot say which it meant, and in a
+        // colliding model it will refuse to resolve anyway.
+        if model.priors.iter().any(|p| {
+            p.name.eq_ignore_ascii_case(&info.name) && p.kind.is_none_or(|k| k == info.kind)
+        }) {
             continue;
         }
         if fixed.get(info.coord).copied().unwrap_or(false) {

@@ -3142,11 +3142,19 @@ pub fn parse_full_model_with(
     // `[data] path` above, only the raw value is read here;
     // `parse_full_model_file` resolves it relative to the model file's directory
     // afterwards, since this function only ever sees the model's text.
-    model.prior_from_fit = blocks
-        .get("priors")
-        .map(|lines| parse_priors_block(lines))
+    //
+    // Keyed off `block_lines` rather than `blocks`, because `extract_blocks`
+    // only records a block in `unnamed` once it has a *content* line: a bare
+    // `[priors]` header, or one holding nothing but comments, is absent from
+    // `blocks` entirely and would be skipped without a word. That is the same
+    // reads-as-regularized-fits-unpenalized failure the strict unknown-key rule
+    // inside `parse_priors_block` exists to prevent, so the empty case has to
+    // reach it.
+    model.prior_from_fit = extracted
+        .block_lines
+        .contains_key("priors")
+        .then(|| parse_priors_block(blocks.get("priors").map_or(&[][..], |v| v)))
         .transpose()?
-        .flatten()
         .map(|raw| resolve_against(&raw, bindings.model_dir.as_deref()));
     // Read the source fit and turn it into ordinary priors **here**, once. The
     // read used to live in `PriorSet::build`, which runs per estimation stage
@@ -7557,7 +7565,7 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
 /// for block *names* for the same reason it is wrong here: a typo'd
 /// `from_fit_file =` would parse cleanly, import nothing, and produce an
 /// unpenalized fit that looks exactly like a penalized one.
-fn parse_priors_block(lines: &[String]) -> Result<Option<String>, String> {
+fn parse_priors_block(lines: &[String]) -> Result<String, String> {
     let mut from_fit: Option<String> = None;
     for line in lines {
         let Some((key, value)) = line.split_once('=') else {
@@ -7586,7 +7594,16 @@ fn parse_priors_block(lines: &[String]) -> Result<Option<String>, String> {
         }
         from_fit = Some(value.to_string());
     }
-    Ok(from_fit)
+    // A block that declares nothing is the same failure the strict unknown-key
+    // rule above exists to prevent, arrived at from the other side: the model
+    // reads as regularized, fits unpenalized, and nothing says so. `[fit_options]`
+    // can be empty harmlessly because every key has a default; `[priors]` has
+    // exactly one key and no default.
+    from_fit.ok_or_else(|| {
+        "[priors]: the block declares nothing. Write `from_fit = <path to a \
+         previous fit>`, or delete the block."
+            .to_string()
+    })
 }
 
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
