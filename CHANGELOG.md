@@ -99,6 +99,11 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **Laplace and AGQ gradient callbacks now reuse the anchor and quadrature grid computed for
+  their matching objective evaluation**, instead of rebuilding both per subject; objective-only
+  quadrature sweeps also reuse one node-coordinate buffer rather than allocating at every node.
+  Optimizer choice and numerical results are unchanged (#1370).
+
 - **The post-fit per-subject diagnostics pass (IPRED / PRED / IWRES / CWRES,
   per-subject OFV) and the post-fit analytic-sensitivity sweep now run in
   parallel over subjects** on the pool the fit already uses, instead of one
