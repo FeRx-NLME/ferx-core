@@ -566,6 +566,24 @@ For a **single-endpoint** `[error_model]` ("first" and "second" above) these rol
 
 > **Migration note** (pre-issue-#56 models): `sigma NAME ~ value` was previously interpreted as a standard deviation. The new default is **variance**, so a pre-#56 value `v` becomes either `v² (variance)` or `v (sd)`. The `examples/` directory uses the `(sd)` form to preserve the prior initial values verbatim.
 
+## Priors
+
+Any `theta`, `omega`, `sigma` or `kappa` declaration may carry a trailing
+`prior(...)`, which adds a penalty to the objective and turns the fit into
+penalized maximum likelihood (MAP) — the simple alternative to NONMEM's
+`$PRIOR`:
+
+```
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)  prior(0.15, rse = 25%)
+  omega ETA_CL ~ 0.09           prior(0.09, rse = 40%)
+```
+
+The central value and the RSE are always on the scale the parameter was declared
+on — a variance for a bare `omega X ~ v`, an SD under `(sd)`. See
+[Parameter priors](../estimation/priors.qmd) for the full rules, what the fit
+report shows, and which estimation methods apply them.
+
 ## Complete Examples
 
 Diagonal omega (no correlations):

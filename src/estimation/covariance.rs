@@ -1142,6 +1142,28 @@ pub(crate) fn compute_covariance(
         }
     }
 
+    // ── Parameter-prior curvature (#254) ─────────────────────────────────────
+    //
+    // The reported SE is the curvature of the objective that was *minimised*, and
+    // under a prior that objective is `OFV_data + Σ((x−m)/s)²`. Leaving the prior
+    // out here would report the unpenalized curvature — wrong in exactly the
+    // regime the feature exists for, since a sparse fit's whole reason for
+    // carrying a prior is that the data alone does not identify the direction,
+    // and that is also where the unpenalized Hessian goes flat (rejected just
+    // below as "zero diagonal — flat objective") or non-PD.
+    //
+    // Added here rather than inside `cov_ofv` for two reasons: the penalty's
+    // second derivative is the exact constant `2/s²` (no stencil, no extra
+    // objective evaluations, no FD noise), and adding it post-assembly covers the
+    // analytic R-matrix route and the FD stencil route with one line instead of
+    // one each. It lands before the ill-conditioning diagnosis on purpose — a
+    // coordinate the prior identifies must read as curved, not as flat.
+    //
+    // Name it in the SE report, not just here: these are penalized-ML / MAP
+    // standard errors, not posterior SDs.
+    let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
+    cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
+
     // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate
     // cause labels — post-hoc checks on `hess` would always read 0 (finite) because
     // non-finite FD results are never stored (only the zero initialisation remains).
@@ -1486,9 +1508,30 @@ pub(crate) fn scale_routed_covariance_method(
     n: usize,
     requested: CovarianceMethod,
     explicitly_set: bool,
+    has_priors: bool,
 ) -> (CovarianceMethod, Option<String>) {
     if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
         return (requested, None);
+    }
+    // #254: `S` is a sum of per-*subject* score cross-products, and a parameter
+    // prior has no subject decomposition — it contributes one score for the whole
+    // population, not N of them — so `S` cannot carry the prior's information at
+    // all. Auto-routing a priored fit onto it would silently report unpenalized
+    // standard errors for a penalized fit, which is the one thing the covariance
+    // wiring exists to prevent. Stay on `R` (which does carry the prior) and say
+    // why it will be slow, rather than being quietly wrong and fast.
+    if has_priors {
+        let stencil = n * (n + 1) / 2;
+        return (
+            requested,
+            Some(format!(
+                "covariance_method = r with {n} free parameters and parameter priors \
+                 declared: the R matrix is a finite-difference Hessian needing {stencil} \
+                 re-converged objective evaluations. The usual large-problem fallback \
+                 (`covariance_method = s`) cannot represent a prior, so it was not used. \
+                 Set `covariance = false` if this does not finish."
+            )),
+        );
     }
     let stencil = n * (n + 1) / 2;
     if explicitly_set {
@@ -1546,6 +1589,7 @@ pub(crate) fn run_covariance_step_inner(
         model.free_packed_dim(),
         options.covariance_method,
         options.covariance_method_set,
+        !model.priors.is_empty(),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -1643,7 +1687,7 @@ mod tests {
         ] {
             for explicit in [false, true] {
                 let (routed, warning) =
-                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit);
+                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit, false);
                 assert_eq!(routed, method);
                 assert!(
                     warning.is_none(),
@@ -1656,7 +1700,8 @@ mod tests {
     #[test]
     fn a_defaulted_hessian_routes_to_the_cross_product_at_scale() {
         let n = COV_HESSIAN_MAX_DIM + 1;
-        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, false);
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, false);
         assert_eq!(routed, CovarianceMethod::CrossProduct);
         let warning = warning.expect("the substitution must be reported");
         assert!(warning.contains("score cross-product"), "{warning}");
@@ -1671,7 +1716,8 @@ mod tests {
     #[test]
     fn an_explicit_hessian_is_honoured_at_scale_but_warned_about() {
         let n = COV_HESSIAN_MAX_DIM + 1;
-        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, true);
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, true, false);
         assert_eq!(
             routed,
             CovarianceMethod::Hessian,
@@ -1681,12 +1727,65 @@ mod tests {
         assert!(warning.contains("covariance_method = r"), "{warning}");
     }
 
+    /// A priored fit at scale stays on `R` instead of being auto-routed to the
+    /// cross-product (#254).
+    ///
+    /// `S` is a sum of per-*subject* scores and a prior has no subject
+    /// decomposition, so the usual large-problem fallback would silently report
+    /// unpenalized standard errors for a penalized fit. The straddle is the
+    /// pair: identical `n` and identical `explicitly_set`, differing only in
+    /// `has_priors`, so the two arms land on *different* methods. Without both
+    /// sides this passes on an implementation that never routes at all.
+    #[test]
+    fn a_priored_fit_stays_on_the_hessian_at_scale() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, true);
+        assert_eq!(
+            routed,
+            CovarianceMethod::Hessian,
+            "a prior must keep the covariance step on R"
+        );
+        let warning = warning.expect("staying on the slow estimator must be reported");
+        // The message has to say *why* the usual fallback was skipped, or the
+        // user reads it as the plain large-problem warning and switches to `s`
+        // by hand — which is the outcome this branch exists to prevent.
+        assert!(warning.contains("parameter priors"), "{warning}");
+        assert!(warning.contains("cannot represent a prior"), "{warning}");
+        // And the cost, as in the other two arms.
+        assert!(
+            warning.contains(&(n * (n + 1) / 2).to_string()),
+            "message must name the stencil size: {warning}"
+        );
+
+        // The straddle: same n, same `explicitly_set`, no prior — routed away.
+        let (unpriored, _) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, false);
+        assert_eq!(
+            unpriored,
+            CovarianceMethod::CrossProduct,
+            "without a prior the same inputs must still route to S"
+        );
+
+        // Below the threshold the prior changes nothing: the guard is about
+        // scale, and a small priored fit is not warned at all.
+        let (small, small_warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM,
+            CovarianceMethod::Hessian,
+            false,
+            true,
+        );
+        assert_eq!(small, CovarianceMethod::Hessian);
+        assert!(small_warning.is_none(), "{small_warning:?}");
+    }
+
     #[test]
     fn a_non_hessian_request_is_never_rerouted() {
         // `s` and `rsr` already cost one pass; the guard has nothing to say.
         for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
             let (routed, warning) =
-                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false);
+                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false, false);
             assert_eq!(routed, method);
             assert!(warning.is_none());
         }

@@ -360,7 +360,7 @@ fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
 /// downstream block consumes them (issue #357) — promoting *every* such name
 /// would slot throwaway intermediates into the PK array (silently hijacking the
 /// reserved F/lagtime slots, aliasing the CL slot in `pk_indices`, or
-/// exhausting the 16-slot layout). See `parse_full_model`.
+/// exhausting the `MAX_PK_PARAMS`-slot layout). See `parse_full_model`.
 ///
 /// Motivating case: a PK parameter written only inside symmetric `if`/`else`
 /// branches (the natural NONMEM-style `IF (cond) CL = ...` / `IF (!cond) CL =
@@ -1550,6 +1550,7 @@ pub fn parse_full_model_with(
         vector_theta_decls,
         mut level_block_decls,
         unbound_level_blocks,
+        declared_priors,
     ) = parse_parameters(param_lines, level_bindings)?;
     // Install the θ level table for the remainder of this parse so a
     // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
@@ -1738,7 +1739,7 @@ pub fn parse_full_model_with(
     // Promoting *every* all-branch name (the naive fix) would slot throwaway
     // intermediates into the PK array — silently hijacking the reserved
     // F/lagtime slots, aliasing the CL slot in pk_indices, or exhausting the
-    // 16-slot layout. So a branch-only helper used purely to compute another
+    // MAX_PK_PARAMS-slot layout. So a branch-only helper used purely to compute another
     // param stays branch-local. The ParseCtx still receives the full set (via
     // assigned_vars_in_order) so such helpers parse as Variable, not Covariate.
     let indiv_text = indiv_lines.join("\n");
@@ -2945,6 +2946,7 @@ pub fn parse_full_model_with(
         .collect();
 
     let model = CompiledModel {
+        priors: declared_priors,
         name,
         covariate_model,
         pk_model,
@@ -5152,7 +5154,7 @@ fn apply_covariate_model_block(
         .get("parameters")
         .ok_or("Missing [parameters] block")?
         .clone();
-    let (thetas, _, _, _, _, eta_names, kappa_info, _, _, _) =
+    let (thetas, _, _, _, _, eta_names, kappa_info, _, _, _, _) =
         parse_parameters(&param_lines, &bindings.levels)?;
     let mut eta_kappa_names: std::collections::HashSet<String> = eta_names.into_iter().collect();
     eta_kappa_names.extend(kappa_info.names_ordered.iter().cloned());
@@ -10700,12 +10702,13 @@ fn collect_indiv_param_reads(
 /// (#993). Unlike its `EveryDose` siblings these are inert until a dose codes
 /// `RATE=-2`/`-1`, so nothing is rejected here — see [`DoseAttrConsumption`].
 ///
-/// `slot_map` is parallel to `indiv_var_names` by position but only as a **prefix**:
-/// the `__ferx_pktime_` desugaring appends names after the slot map was built. `get(i)`
-/// is therefore the correct lookup (and matches [`check_dose_attr_double_use`]) — a
-/// real dose attribute is always a user name, hence inside the prefix, while the
-/// synthetic tail is never one. Empty for analytical models, whose indexed
-/// `D{n}`/`R{n}` are recognised by name alone.
+/// `slot_map` is `ode_slot_map`. It is empty for analytical models, whose indexed
+/// `D{n}`/`R{n}` are recognised by name alone, and full-length on the ODE layout:
+/// every name there, readout synthetics included, is already in `indiv_var_names`
+/// when `ode_param_slots` runs, and the `__ferx_pktime_` desugaring that appends names
+/// later only fires for an analytical `pk(...)` mapping. `get(i)` remains the lookup
+/// (and matches [`check_dose_attr_double_use`]); a real dose attribute is always a
+/// user name, never a synthetic one.
 fn record_coded_rate_reads(
     model: &mut CompiledModel,
     indiv_var_names: &[String],
@@ -11986,8 +11989,9 @@ fn build_ode_spec(
         });
 
     // Build the init_fn closure from the extracted `init(state) = expr`
-    // directives. It mirrors the RHS variable binding: individual parameters
-    // by declaration order (PkParams.values slots), plus state names bound to
+    // directives. It mirrors the RHS variable binding: each individual parameter
+    // read from its `indiv_param_slots` slot in `PkParams.values` (name-based, not
+    // declaration position), plus state names bound to
     // 0.0 (no drug present at init time). Returns the full n_states vector so
     // the caller can both seed the integrator and re-seed after a reset.
     let init_fn: Option<Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>> = if init_specs.is_empty() {
@@ -13159,11 +13163,12 @@ fn parse_parameters(
         Vec<BlockOmegaSpec>,
         Vec<SigmaSpec>,
         Vec<BlockSigmaSpec>,
-        Vec<String>,          // BSV eta names in declaration order
-        ParsedKappas,         // IOV kappa specs (diagonal and/or block)
-        Vec<VectorThetaDecl>, // #1064 θ level blocks
-        Vec<LevelBlockDecl>,  // #1064 a level block declarations
-        Vec<String>,          // #1064 level blocks still awaiting data
+        Vec<String>,                       // BSV eta names in declaration order
+        ParsedKappas,                      // IOV kappa specs (diagonal and/or block)
+        Vec<VectorThetaDecl>,              // #1064 θ level blocks
+        Vec<LevelBlockDecl>,               // #1064 a level block declarations
+        Vec<String>,                       // #1064 level blocks still awaiting data
+        Vec<crate::types::ParameterPrior>, // #254 inline `prior(...)` declarations
     ),
     String,
 > {
@@ -13180,6 +13185,9 @@ fn parse_parameters(
     let mut block_kappas: Vec<BlockKappaSpec> = Vec::new();
     let mut kappa_names_ordered: Vec<String> = Vec::new();
     let mut kappa_weights_ordered: Vec<Option<String>> = Vec::new();
+    // Per-parameter priors declared with an inline `prior(...)` tail (#254), in
+    // declaration order.
+    let mut priors: Vec<crate::types::ParameterPrior> = Vec::new();
 
     // theta NAME(init)  |  theta NAME(init, FIX)
     // theta NAME(init, lower, upper)  |  theta NAME(init, lower, upper, FIX)
@@ -13289,10 +13297,20 @@ fn parse_parameters(
         // silently dropped, which is the specific failure mode this feature
         // exists to remove. A weight left on any other declaration is rejected
         // below rather than ignored, for the same reason.
+        //
+        // #254: a `prior(...)` tail is peeled first, for the same reason and
+        // one more — `weight =` takes everything to its right as an expression,
+        // so on `kappa K ~ 0.1 weight = NARM prior(0.1, rse = 30%)` the weight
+        // would otherwise swallow the prior and the model would fit unpenalized.
+        let (line, prior_decl) = split_prior_modifier(line, "parameters")?;
         let (line, weight_expr) =
-            split_weight_modifier(line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
+            split_weight_modifier(&line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
         let line = &line;
         let mut weight_consumed = false;
+        // Name the prior attaches to, filled in by whichever declaration arm
+        // matched. `None` at the bottom of the loop with a `prior_decl` present
+        // means the prior had no home — an error, never a silent drop.
+        let mut prior_target: Option<String> = None;
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
             let block = match caps.get(2) {
@@ -13312,14 +13330,29 @@ fn parse_parameters(
                 .unwrap_or(1e9);
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
             match block {
-                None => thetas.push(ThetaSpec {
-                    name,
-                    init,
-                    lower,
-                    upper,
-                    fixed,
-                }),
+                None => {
+                    prior_target = Some(name.clone());
+                    thetas.push(ThetaSpec {
+                        name,
+                        init,
+                        lower,
+                        upper,
+                        fixed,
+                    })
+                }
                 Some(spec) => {
+                    // #254: a level block is many θ sharing one declaration, so
+                    // one `prior(...)` would have to mean "the same prior on
+                    // every level" — a useful ridge, but a different feature
+                    // from a per-parameter prior and untested here. Reject
+                    // rather than silently priding only the first level.
+                    if prior_decl.is_some() {
+                        return Err(format!(
+                            "[parameters] prior on `{name}`: priors on a θ level block \
+                             (`theta {name}[...]`) are not supported. Declare the levels \
+                             individually to prior them."
+                        ));
+                    }
                     if vector_thetas.iter().any(|d| d.name == name) {
                         return Err(format!("theta {name}: declared twice"));
                     }
@@ -13516,6 +13549,7 @@ fn parse_parameters(
             let variance = if init_as_sd { raw * raw } else { raw };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             eta_names_ordered.push(name.clone());
+            prior_target = Some(name.clone());
             omegas.push(OmegaSpec {
                 name,
                 variance,
@@ -13545,6 +13579,7 @@ fn parse_parameters(
             }
             let value = if init_as_sd { raw } else { raw.sqrt() };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
+            prior_target = Some(name.clone());
             sigmas.push(SigmaSpec {
                 name,
                 value,
@@ -13572,12 +13607,34 @@ fn parse_parameters(
             kappa_names_ordered.push(name.clone());
             kappa_weights_ordered.push(weight_expr.clone());
             weight_consumed = true;
+            prior_target = Some(name.clone());
             kappas.push(KappaSpec {
                 name,
                 variance,
                 fixed,
                 init_as_sd,
             });
+        }
+        // #254: attach the peeled prior to whichever declaration matched. A
+        // prior with no target is an error — the alternative is a model file
+        // that reads as regularized and fits as if it were not.
+        if let Some((value, spread)) = prior_decl {
+            match prior_target {
+                Some(name) => priors.push(crate::types::ParameterPrior {
+                    name,
+                    value,
+                    spread,
+                }),
+                None => {
+                    return Err(format!(
+                        "[parameters] `prior(...)` is only supported on a `theta`, `omega`, \
+                         `sigma` or `kappa` declaration. It has no meaning on `{}`. A \
+                         `block_omega` / `block_sigma` / `block_kappa` element cannot carry \
+                         one: its packed coordinates are Cholesky entries, not variances.",
+                        line.trim()
+                    ))
+                }
+            }
         }
         if let Some(w) = &weight_expr {
             if !weight_consumed {
@@ -13631,6 +13688,7 @@ fn parse_parameters(
         vector_thetas,
         level_block_decls,
         unbound_level_blocks,
+        priors,
     ))
 }
 
@@ -14633,6 +14691,247 @@ fn split_weight_modifier(
         ));
     }
     Ok((stmt.to_string(), Some(expr.to_string())))
+}
+
+/// Whether the word immediately before byte `i` is a `[parameters]`
+/// declaration keyword — i.e. `i` sits in the declaration's *name* slot rather
+/// than in a trailing modifier (#254).
+///
+/// `prior` is a legal parameter name (the declaration regexes all take `\w+`),
+/// so `omega PRIOR ~ 0.1` and `theta prior(0.1, 0, 10)` are valid models that
+/// predate the modifier and must keep their old meaning. A `prior(...)`
+/// modifier only ever follows a *complete* declaration, so the word before it
+/// is a `)`, a number or a `weight =` expression — never one of these
+/// keywords. The `block_*` forms are deliberately absent: their names live
+/// inside the parenthesised list, which the caller already skips on depth.
+fn preceded_by_declaration_keyword(body: &str, i: usize) -> bool {
+    let bytes = body.as_bytes();
+    let mut end = i;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    // No whitespace before `i` means no separate preceding word; the caller's
+    // left-boundary test has already ruled out an identifier char abutting it.
+    if end == i {
+        return false;
+    }
+    let mut start = end;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    matches!(
+        body[start..end].to_ascii_lowercase().as_str(),
+        "theta" | "omega" | "sigma" | "kappa"
+    )
+}
+
+/// Peel a trailing `prior(...)` modifier off a `[parameters]` declaration
+/// (#254), returning the declaration without it plus the parsed prior.
+///
+/// Like [`split_weight_modifier`], this runs **before** the four declaration
+/// regexes because every one of them is unanchored: a modifier left on the line
+/// would sit past the end of a successful match and be silently dropped, which
+/// for a prior means returning an unpenalized fit that looks regularized. It
+/// runs before `split_weight_modifier` too, so that on a weighted kappa
+/// (`kappa K ~ 0.1 weight = NARM prior(0.1, rse = 30%)`) the weight's
+/// right-hand-side expression does not swallow the prior.
+///
+/// The keyword is matched only at bracket depth zero, so a `prior` appearing
+/// inside a bracketed list is left alone.
+fn split_prior_modifier(
+    body: &str,
+    block: &str,
+) -> Result<(String, Option<(f64, crate::types::PriorSpread)>), String> {
+    const KW: &[u8] = b"prior";
+    let bytes = body.as_bytes();
+    let mut depth: i32 = 0;
+    let mut found: Option<usize> = None;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => {
+                depth += 1;
+                continue;
+            }
+            b')' | b']' => {
+                depth -= 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth != 0 || i + KW.len() > bytes.len() {
+            continue;
+        }
+        if !bytes[i..i + KW.len()].eq_ignore_ascii_case(KW) {
+            continue;
+        }
+        // Whole-word on the left, so `MY_prior` is a name and not the modifier.
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        if i > 0 && is_ident(bytes[i - 1]) {
+            continue;
+        }
+        // A declaration's *name* slot is not the modifier. `prior` is a legal
+        // parameter name, so `omega PRIOR ~ 0.1` and `theta prior(0.1, 0, 10)`
+        // are ordinary declarations that predate this feature; the modifier is
+        // always a tail *after* a complete declaration and so never sits in the
+        // token right after `theta` / `omega` / `sigma` / `kappa`. Tested
+        // before the call-shape check below, so the `~` form is skipped rather
+        // than reported as a malformed call.
+        if preceded_by_declaration_keyword(body, i) {
+            continue;
+        }
+        // The modifier is a call, so what follows the keyword must be `(`.
+        // `priors` / `prior_x` fail here on the identifier char, and a bare
+        // `prior` with no argument list is reported below rather than ignored.
+        let open = skip_ascii_ws(body, i + KW.len());
+        if bytes.get(open) != Some(&b'(') {
+            if bytes.get(i + KW.len()).copied().is_some_and(is_ident) {
+                continue;
+            }
+            return Err(format!(
+                "[{block}] `prior` must be written as a call, e.g. \
+                 `prior(0.15, rse = 25%)`: `{}`",
+                body.trim()
+            ));
+        }
+        found = Some(i);
+        break;
+    }
+    let Some(i) = found else {
+        return Ok((body.to_string(), None));
+    };
+    let open = skip_ascii_ws(body, i + KW.len());
+    let close = matching_paren(body, open).ok_or_else(|| {
+        format!(
+            "[{block}] unbalanced parentheses in `prior(...)`: `{}`",
+            body.trim()
+        )
+    })?;
+    let trailing = body[close + 1..].trim();
+    if !trailing.is_empty() {
+        return Err(format!(
+            "[{block}] `prior(...)` must be the last thing on the declaration; \
+             found `{trailing}` after it in `{}`",
+            body.trim()
+        ));
+    }
+    let stmt = body[..i].trim();
+    if stmt.is_empty() {
+        return Err(format!(
+            "[{block}] `prior(...)` must follow a parameter declaration on the same line: `{}`",
+            body.trim()
+        ));
+    }
+    let spec = parse_prior_call(&body[open + 1..close], block, stmt)?;
+    Ok((stmt.to_string(), Some(spec)))
+}
+
+/// Index of the `)` matching the `(` at `open`, or `None` if unbalanced.
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse the inside of a `prior(...)` call: a central value followed by exactly
+/// one of `rse = …` or `sd = …`.
+///
+/// # RSE units
+///
+/// `rse = 25%` and `rse = 0.25` both mean 25%. A bare number **greater than 1**
+/// is rejected rather than guessed at: `rse = 25` is overwhelmingly a percent
+/// written without its sign, and silently reading it as 2500% would produce a
+/// prior so flat it is indistinguishable from none — a failure the user would
+/// never see, because the fit still converges.
+fn parse_prior_call(
+    inner: &str,
+    block: &str,
+    stmt: &str,
+) -> Result<(f64, crate::types::PriorSpread), String> {
+    let ctx = || format!("[{block}] prior on `{}`", stmt.trim());
+    let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "{}: expected `prior(<value>, rse = <r>%)` or `prior(<value>, sd = <s>)`, \
+             got `prior({})`",
+            ctx(),
+            inner.trim()
+        ));
+    }
+
+    // The central value, with `value =` optional so both spellings read the same.
+    let value_txt = match parts[0].split_once('=') {
+        Some((k, v)) if k.trim().eq_ignore_ascii_case("value") => v.trim(),
+        Some(_) => {
+            return Err(format!(
+                "{}: the first argument is the prior's central value; \
+                 write it bare (`prior(0.15, …)`) or as `value = 0.15`",
+                ctx()
+            ))
+        }
+        None => parts[0],
+    };
+    let value: f64 = value_txt
+        .parse()
+        .map_err(|_| format!("{}: `{value_txt}` is not a number", ctx()))?;
+    if !value.is_finite() {
+        return Err(format!("{}: central value must be finite", ctx()));
+    }
+
+    let (key, raw) = parts[1].split_once('=').ok_or_else(|| {
+        format!(
+            "{}: the second argument must be `rse = <r>%` or `sd = <s>`, got `{}`",
+            ctx(),
+            parts[1]
+        )
+    })?;
+    let (key, raw) = (key.trim(), raw.trim());
+    let spread = if key.eq_ignore_ascii_case("rse") {
+        let (num_txt, is_percent) = match raw.strip_suffix('%') {
+            Some(n) => (n.trim(), true),
+            None => (raw, false),
+        };
+        let num: f64 = num_txt
+            .parse()
+            .map_err(|_| format!("{}: `{raw}` is not a number", ctx()))?;
+        if !is_percent && num > 1.0 {
+            return Err(format!(
+                "{}: `rse = {num}` is ambiguous — write `{num}%` for a percent \
+                 or a fraction below 1 (e.g. `{}`) instead.",
+                ctx(),
+                num / 100.0
+            ));
+        }
+        if !(num > 0.0) || !num.is_finite() {
+            return Err(format!("{}: `rse` must be > 0, got {num}", ctx()));
+        }
+        crate::types::PriorSpread::Rse(if is_percent { num / 100.0 } else { num })
+    } else if key.eq_ignore_ascii_case("sd") {
+        let num: f64 = raw
+            .parse()
+            .map_err(|_| format!("{}: `{raw}` is not a number", ctx()))?;
+        if !(num > 0.0) || !num.is_finite() {
+            return Err(format!("{}: `sd` must be > 0, got {num}", ctx()));
+        }
+        crate::types::PriorSpread::Sd(num)
+    } else {
+        return Err(format!(
+            "{}: unknown prior argument `{key}`; expected `rse` or `sd`",
+            ctx()
+        ));
+    };
+    Ok((value, spread))
 }
 
 /// Does `s[i..]` begin with the keyword `kw`, terminated by a non-identifier
@@ -15721,13 +16020,56 @@ fn build_ruv_magnitude(
 
 // --- Individual parameter function builder ---
 
+/// What one `pk(role=VALUE)` entry binds its slot to, reduced to just enough to
+/// tell two spellings of the same slot apart (#1048).
+///
+/// `Time` is its own variant rather than a `Var`: the `pk(...=TIME)` desugaring
+/// names its synthetic individual parameter after the *role key*, so `v=TIME`
+/// and `v1=TIME` resolve to two different variable slots holding the identical
+/// per-event value. Comparing them as `Var` would report a conflict the model
+/// file does not contain.
+#[derive(Clone, Copy, PartialEq)]
+enum PkSlotBinding {
+    /// An `[individual_parameters]` variable, by its evaluator slot.
+    Var(usize),
+    /// A numeric literal (`ka=1.0`).
+    Const(f64),
+    /// The `TIME` built-in, whichever synthetic parameter carries it.
+    Time,
+}
+
+/// Render a `pk(...)` mapped value the way the model file spells it. A `TIME`
+/// binding was rewritten upstream to a synthetic `__ferx_pktime_*` parameter
+/// (#486); that internal name must never reach a diagnostic.
+fn pk_mapped_value_display(value: &str) -> &str {
+    if value.starts_with(PKTIME_SYNTH_PREFIX) {
+        "TIME"
+    } else {
+        value
+    }
+}
+
+/// Noun for a PK slot, for the conflicting-alias diagnostic (#1048). Only the
+/// three slots reachable under two role spellings can produce that error; the
+/// fallback exists so a future alias pair cannot make the message nonsense.
+fn pk_slot_noun(slot: usize) -> &'static str {
+    match slot {
+        crate::types::PK_IDX_V => "the central volume",
+        crate::types::PK_IDX_Q => "the inter-compartmental clearance",
+        crate::types::PK_IDX_LAGTIME => "the absorption lag time",
+        _ => "the same PK parameter",
+    }
+}
+
 /// Build the PK parameter function from a parsed `[individual_parameters]`
 /// statement list. The block may contain plain assignments, inline `if (...) ... else ...`
 /// expressions, or full `if (...) { ... } else { ... }` statements.
 ///
 /// `var_names` is the deduplicated list of all variables ever assigned in the
-/// block (in first-occurrence order). For analytical PK models the assignment
-/// order doubles as the slot ordering for `PkParams.values`.
+/// block (in first-occurrence order); that order is the evaluator's var-slot
+/// order only. The `PkParams.values` slot comes from `pk_param_map` and its
+/// spare-slot extensions (analytical) or from `ode_slot_map` (ODE and
+/// compartment-free), never from this order.
 /// Build the `pk_param_fn` closure used by every fit / simulate / predict
 /// call site. When the `nn` feature is on and the model has any
 /// `[covariate_nn]` blocks, `covariate_nns` carries each mapper plus the
@@ -15841,6 +16183,18 @@ fn build_pk_param_fn(
     pk_entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
     let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
+    // #1048: three role keys are pairs of spellings for one slot (`v`/`v1`,
+    // `q`/`q2`, `lagtime`/`alag`), but `pk_param_map` is keyed by the *role
+    // string* — so `pk one_cpt_iv(cl=CL, v=VA, v1=VB)` parses clean, pushes two
+    // writes to `PK_IDX_V`, and the last one silently wins. Sorting above made
+    // the winner deterministic, not correct. Worse, the loser is a *mapped*
+    // name, so the #315 "computed but never used" census counts it as used and
+    // the one guard that would have spoken is disarmed by the very act that
+    // creates the bug. Resolve each role key to its slot once and reject a
+    // second key that lands on the same slot with a different binding; keys
+    // that agree (`lagtime=X, alag=X`) are merely redundant and stay legal, so
+    // the `analytical_role_binding` tie-break still has a case to tie-break.
+    let mut slot_seen: HashMap<usize, (&str, &str, PkSlotBinding)> = HashMap::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -15858,8 +16212,17 @@ fn build_pk_param_fn(
         // `__ferx_pktime_*` individual parameter upstream in `parse_full_model` (#486),
         // so `var_name` is that synthetic name here (resolved via `var_idx` below), never
         // a literal `TIME`.
-        if let Some(var_slot) = var_slot {
-            pk_assignment_mapping.push((pk_slot, var_slot));
+        let binding = if let Some(var_slot) = var_slot {
+            // The TIME desugaring names its synthetic parameter after the *role
+            // key*, so `pk(v=TIME, v1=TIME)` arrives here as two different names
+            // for one value. Collapse them to a single binding so the pair reads
+            // as redundant rather than conflicting, and so no diagnostic ever
+            // quotes the internal `__ferx_pktime_*` spelling.
+            if var_name.starts_with(PKTIME_SYNTH_PREFIX) {
+                PkSlotBinding::Time
+            } else {
+                PkSlotBinding::Var(var_slot)
+            }
         } else if let Ok(c) = var_name.parse::<f64>() {
             // A numeric literal binds the slot to a constant — but `f64::from_str`
             // also accepts `inf`/`nan`/`infinity`, which are never a meaningful PK
@@ -15872,7 +16235,7 @@ fn build_pk_param_fn(
                      variable"
                 ));
             }
-            pk_const_mapping.push((pk_slot, c));
+            PkSlotBinding::Const(c)
         } else {
             return Err(format!(
                 "[structural_model] parameter `{pk_name}` references variable `{var_name}`, \
@@ -15880,6 +16243,52 @@ fn build_pk_param_fn(
                  Define it, e.g. `{var_name} = ...`.",
                 var_names.join(", ")
             ));
+        };
+        if let Some(&(prev_key, prev_val, prev_binding)) = slot_seen.get(&pk_slot) {
+            if prev_binding != binding {
+                // Name the mapping that would actually have reached the engine,
+                // so the message says which number the user was getting. The
+                // closure below writes `pk_assignment_mapping` first and
+                // `pk_const_mapping` after it, so a constant beats a variable
+                // whatever the keys are; between two of a kind the entries
+                // arrive in ascending key order and the later one wins.
+                let const_wins = matches!(binding, PkSlotBinding::Const(_))
+                    != matches!(prev_binding, PkSlotBinding::Const(_));
+                let current_wins = if const_wins {
+                    matches!(binding, PkSlotBinding::Const(_))
+                } else {
+                    true
+                };
+                let cur = (pk_name.as_str(), pk_mapped_value_display(var_name));
+                let prev = (prev_key, pk_mapped_value_display(prev_val));
+                let ((win_k, win_v), (_, lose_v)) = if current_wins {
+                    (cur, prev)
+                } else {
+                    (prev, cur)
+                };
+                return Err(format!(
+                    "[structural_model]: `{}={}` and `{}={}` are two spellings of the same \
+                     parameter ({}) bound to different values — only `{win_k}={win_v}` would be \
+                     applied and `{lose_v}` silently discarded. Use one spelling.",
+                    prev.0,
+                    prev.1,
+                    cur.0,
+                    cur.1,
+                    pk_slot_noun(pk_slot)
+                ));
+            }
+            // Same binding under both spellings: redundant, not wrong. Skip the
+            // duplicate so the hot closure writes the slot once.
+            continue;
+        }
+        slot_seen.insert(pk_slot, (pk_name.as_str(), var_name.as_str(), binding));
+        match (var_slot, binding) {
+            // `Var` and `Time` both come from a resolved individual parameter
+            // (the TIME desugaring declares its synthetic one), so the slot write
+            // is the same for either.
+            (Some(var_slot), _) => pk_assignment_mapping.push((pk_slot, var_slot)),
+            (None, PkSlotBinding::Const(c)) => pk_const_mapping.push((pk_slot, c)),
+            (None, _) => unreachable!("only a literal binding resolves no variable slot"),
         }
     }
     let is_analytical_pk = !pk_param_map.is_empty();

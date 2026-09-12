@@ -82,8 +82,9 @@ This will:
    $\kappa_{i,o} \sim N(0, \Omega_{\text{IOV}})$ is **also** drawn for each
    occasion $o$ (grouped by the `iov_column`), so the simulated data reproduces
    the between-occasion variability the model parameterizes — matching NONMEM
-   `$SIM`. (The post-fit NPDE/NPD diagnostics are a separate path that still
-   holds kappas at zero; see [fit options](fit-options.qmd#simulation-based-diagnostics-npde-npd).)
+   `$SIM`. The post-fit NPDE/NPD diagnostics are a separate code path that
+   draws its own per-occasion kappas the same way; see
+   [fit options](fit-options.qmd#simulation-based-diagnostics-npde-npd).
 2. Individual parameters are computed using the `[individual_parameters]` equations
 3. Predictions are generated using the structural model
 4. Residual error is added: $DV = IPRED + \epsilon$, where $\epsilon \sim N(0, V)$

@@ -36,6 +36,22 @@ fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
     }
 }
 
+/// The **data** −2 log L of a completed fit — what `sir::run_sir_core` takes as
+/// its `ofv_hat` (#254).
+///
+/// `FitResult::ofv` is the *penalized* total once a `prior(...)` is declared, so
+/// handing it to `run_sir_core` — which adds the penalty itself — counts the
+/// penalty twice. Today that cancels, because `dofv` only ever enters normalized
+/// log-weights, but the contract is what the next reader will rely on.
+///
+/// `ofv - ofv_prior` rather than the `ofv_data` field, because both are
+/// `#[serde(default)]`: a `FitResult` deserialized from a pre-#254 YAML carries
+/// `ofv_data = 0.0`, whereas `ofv_prior = 0.0` is the truth there. One spelling
+/// is therefore correct for an old fit and a new one alike.
+fn data_ofv(fit: &FitResult) -> f64 {
+    fit.ofv - fit.ofv_prior
+}
+
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
 /// of `fit` with the `sir_*` fields populated. Proposal-conditioning
 /// diagnostics (rank deficiency / bound-driven shrinkage, #1021) are appended
@@ -243,7 +259,13 @@ fn run_sir_scoped(
 
     // --- Run SIR (identical to the inline path in fit()) ------------------
     let sir = crate::estimation::sir::run_sir_core(
-        model_ref, pop_ref, &params, &eta_hats, cov, fit.ofv, options,
+        model_ref,
+        pop_ref,
+        &params,
+        &eta_hats,
+        cov,
+        data_ofv(fit),
+        options,
     )?;
 
     // --- Build the augmented FitResult ------------------------------------
@@ -724,5 +746,37 @@ mod tests {
             "expected 'no model supplied' error, got: {}",
             err
         );
+    }
+
+    /// `run_sir_core` adds the prior penalty to the `ofv_hat` it is handed
+    /// (#254), so what `run_sir` passes has to be the **data** OFV.
+    ///
+    /// Both spellings that look right are wrong on one of these two inputs, and
+    /// each is a distinct mutation: returning `fit.ofv` (the bug this replaced)
+    /// reddens the priored case only, and returning `fit.ofv_data` reddens the
+    /// legacy case only — `ofv_data` is `#[serde(default)]`, so a `FitResult`
+    /// deserialized from a pre-#254 YAML carries `0.0` there.
+    #[test]
+    fn data_ofv_strips_the_prior_penalty_and_survives_a_legacy_fit() {
+        // A priored fit: ofv is the penalized total, ofv_data the data half.
+        let mut fit = FitResult {
+            ofv: 110.0,
+            ofv_prior: 10.0,
+            ofv_data: 100.0,
+            ..crate::types::test_helpers::empty_fit_result()
+        };
+        assert_eq!(data_ofv(&fit), 100.0);
+        assert_ne!(
+            data_ofv(&fit),
+            fit.ofv,
+            "passing the penalized total would double-count the penalty"
+        );
+
+        // A pre-#254 fit read back from YAML: neither new field was serialized,
+        // so both default to 0.0 and the whole objective is the data half.
+        fit.ofv = 100.0;
+        fit.ofv_prior = 0.0;
+        fit.ofv_data = 0.0;
+        assert_eq!(data_ofv(&fit), 100.0);
     }
 }

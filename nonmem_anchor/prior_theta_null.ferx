@@ -1,0 +1,37 @@
+# #254 parameter-prior anchor — ferx side, STEP 1 (the null control).
+#
+# The exact twin of `prior_theta_null.ctl`: the same one-compartment oral model,
+# the same log-scale parameterisation, the same numbers, evaluated at the same
+# fixed point (`maxiter = 0`).
+#
+# `LCL` is declared with a NEGATIVE lower bound on purpose. That makes ferx pack
+# it as the identity, so the prior added in the priored twin is a plain normal on
+# LCL — which is exactly what NONMEM's `$PRIOR NWPRI` puts on `THETA(1)` there.
+# Same coordinate, same family, same mean, same SD: nothing about the comparison
+# depends on ferx's packing conventions.
+
+[parameters]
+  theta LCL(-2.0000, -100.0, 100.0)
+  theta LV(2.0450, -100.0, 100.0)
+  theta LKA(-0.3212, -100.0, 100.0)
+
+  omega ETA_CL ~ 0.0455
+  omega ETA_V  ~ 0.0145
+
+  sigma PROP_ERR ~ 0.01055
+
+[individual_parameters]
+  CL = exp(LCL + ETA_CL)
+  V  = exp(LV + ETA_V)
+  KA = exp(LKA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false

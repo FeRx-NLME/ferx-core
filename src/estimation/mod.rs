@@ -18,6 +18,7 @@ pub(crate) mod nn_reg;
 pub(crate) mod nn_theta_gradient;
 pub mod outer_optimizer;
 pub mod parameterization;
+pub(crate) mod priors;
 pub mod run_covariance;
 pub mod run_sir;
 pub mod saem;

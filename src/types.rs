@@ -367,11 +367,13 @@ impl DoseEvent {
 ///   7: V3      (peripheral volume 2, 3-cmt only)
 ///   8: LAGTIME (dose/absorption lagtime, default 0.0; equivalent to NONMEM ALAG)
 ///
-/// Slots 0–8 are the named PK parameters above. Slots 9.. are spare capacity
-/// for ODE models, whose `[individual_parameters]` may declare additional
-/// "structural" parameters (rate constants, Emax/EC50, baselines, …) beyond the
-/// named PK slots. `ode_param_slots` routes canonical names to slots 0–8 and
-/// structural names to the remaining free slots, while keeping slots
+/// Slots 0–8 are the named PK parameters above. Slots 9–12 hold the analytic
+/// transit / inverse-Gaussian parameters (`PK_IDX_N`, `PK_IDX_MTT`,
+/// `PK_IDX_MAT`, `PK_IDX_CV2`); for an ODE model they, like every higher slot,
+/// are spare capacity for additional "structural" parameters (rate constants,
+/// Emax/EC50, baselines, …). `ode_param_slots` routes any name
+/// `PkParams::name_to_index` recognises to its fixed slot and structural names
+/// to the lowest remaining free slots, while keeping slots
 /// `PK_IDX_F` and `PK_IDX_LAGTIME` reserved so an undeclared F/lagtime keeps its
 /// default rather than being aliased by a structural parameter (issue #122).
 /// The headroom here therefore bounds how many structural parameters an ODE
@@ -2037,6 +2039,83 @@ pub struct ResidualCorrelation {
     pub rho: f64,
 }
 
+/// Spread of a user-declared parameter prior (#254).
+///
+/// Exactly one form is given per prior. `Rse` is the ergonomic one the feature
+/// exists for — a number read straight off a published parameter table — and
+/// `Sd` is the escape hatch for a θ that can be negative, where a *relative*
+/// standard error is meaningless.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum PriorSpread {
+    /// Relative standard error as a **fraction**. `rse = 25%` in the model file
+    /// arrives here as `0.25`; the parser is what normalizes the two spellings,
+    /// so nothing downstream has to know which one was written.
+    Rse(f64),
+    /// Absolute standard deviation, on the same scale the parameter was
+    /// declared on.
+    Sd(f64),
+}
+
+/// A prior declared on one parameter, for penalized-ML / MAP estimation (#254).
+///
+/// Written inline next to the parameter it constrains:
+///
+/// ```text
+/// [parameters]
+///   theta TVCL(0.2, 0.001, 10.0)  prior(0.15, rse = 25%)
+///   omega ETA_CL ~ 0.09           prior(0.09, rse = 40%)
+/// ```
+///
+/// **`value` is on the scale the parameter was declared on** — a variance for a
+/// bare `omega X ~ v`, an SD under `(sd)` — and so is a [`PriorSpread::Sd`].
+/// That single rule is the whole user-facing convention: the RSE comes off the
+/// same row of the same table as the value, and no conversion is ever asked for.
+///
+/// What the prior *becomes* — a normal on θ, a lognormal on θ, a lognormal on a
+/// variance — is decided by how the parameter packs, not by this struct.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ParameterPrior {
+    /// Name of the theta, omega/eta, sigma or kappa this prior applies to, as
+    /// declared in `[parameters]`.
+    pub name: String,
+    /// Prior central value, on the declared scale.
+    pub value: f64,
+    /// Prior spread.
+    pub spread: PriorSpread,
+}
+
+/// One priored parameter's line in the fit report (#254).
+///
+/// Named `shift_in_prior_sds` rather than `shift` because the informative
+/// number is the standardized one: "CL landed 1.8 prior SDs above the prior"
+/// says whether the data and the prior disagree, where a raw difference only
+/// says the parameter moved.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PriorSummary {
+    /// Parameter name as declared.
+    pub name: String,
+    /// Prior central value, on the scale the parameter was declared on.
+    pub prior_value: f64,
+    /// Final estimate, on that same declared scale.
+    pub estimate: f64,
+    /// `(x̂ − m) / s` in packed space — how far the estimate sits from the prior
+    /// mean in prior standard deviations. Signed.
+    pub shift_in_prior_sds: f64,
+    /// This parameter's contribution to [`FitResult::ofv_prior`] (the square of
+    /// `shift_in_prior_sds`).
+    pub penalty: f64,
+    /// Realised prior family: `"lognormal"` for a log-packed coordinate,
+    /// `"normal"` for an identity-packed one. Reported because it is decided by
+    /// the parameter's declared lower bound, not by the prior declaration — so
+    /// widening a θ's bounds to allow negative values moves its prior from
+    /// lognormal to normal, and this field is where that becomes visible.
+    pub family: String,
+    /// Lower end of the implied 95% prior interval, on the declared scale.
+    pub prior_lower_95: f64,
+    /// Upper end of the implied 95% prior interval, on the declared scale.
+    pub prior_upper_95: f64,
+}
+
 /// Full set of model parameters
 #[derive(Debug, Clone)]
 pub struct ModelParameters {
@@ -3663,23 +3742,38 @@ pub struct CompiledModel {
     pub eta_names: Vec<String>,
     /// IOV kappa names (length == n_kappa). Empty when no IOV.
     pub kappa_names: Vec<String>,
-    /// Names of the individual parameters declared at the top level of the
-    /// `[individual_parameters]` block, in declaration order. Parallel to
-    /// `pk_indices`; for analytical models the i-th name is the variable
-    /// whose value lands in `PkParams.values[pk_indices[i]]`. For ODE
-    /// models the i-th name is written sequentially into slot `i` by
-    /// `pk_param_fn`. Used by the FFI to label per-subject EBE individual
-    /// parameter values (e.g. `CL`, `V`, `Ka`).
+    /// Names of the individual parameters assigned in `[individual_parameters]`,
+    /// in first-assignment order: every top-level assignment, plus a name
+    /// assigned on every branch of an `if`/`else` when `[odes]`,
+    /// `[structural_model]`, `[scaling]` or `[derived]` reads it (#357). The
+    /// parser-synthesized `__ferx_ro_*` / `__ferx_pktime_*` parameters follow.
+    /// Parallel to `pk_indices` on both engines: read the i-th name's value from
+    /// `PkParams.values[pk_indices[i]]`, never from slot `i`. On an analytical
+    /// model that read is valid only for the names described below: a
+    /// placeholder entry cannot yet be told apart from a genuine `CL` entry
+    /// (#1356). Used by the FFI to label per-subject EBE individual parameter
+    /// values (e.g. `CL`, `V`, `Ka`).
     ///
-    /// Bound: `pk_param_fn` writes at most `MAX_PK_PARAMS` slots (the size
-    /// of the fixed `PkParams.values` array). For analytical models the
-    /// parser already routes assignments through that fixed slot table, so
-    /// excess names are not possible. For ODE models with more than
-    /// `MAX_PK_PARAMS` top-level `[individual_parameters]` assignments,
-    /// names beyond index `MAX_PK_PARAMS - 1` will appear in this list but
-    /// `pk_param_fn` won't store their values — downstream consumers will
-    /// read either zero or NaN for those slots. In practice no PK model
-    /// approaches this limit.
+    /// Where `pk_indices[i]` comes from differs by engine:
+    /// - **ODE and compartment-free models** route every name through
+    ///   `ode_param_slots`: a canonical PK name (`CL`, `V`, `KA`, `F`,
+    ///   `LAGTIME`, …, per `PkParams::name_to_index`) takes its fixed PK slot,
+    ///   and every other name takes the lowest free slot that is not one of the
+    ///   engine-reserved F/lagtime slots. A model declaring `V, KA, KE` in that
+    ///   order therefore stores them at slots `1, 4, 0`, not `0, 1, 2`.
+    /// - **Analytical models** give `pk_indices[i]` a real slot only when the
+    ///   name is bound on the `[structural_model]` line (its canonical PK slot)
+    ///   or referenced by a readout (#650, a spare slot). Every other name gets
+    ///   a placeholder `0`, which aliases the `CL` slot rather than holding that
+    ///   name's value; a name that differs from a bound name only in case (`v`
+    ///   next to `V`) instead gets that bound name's slot (#1356). Most such names (e.g. an intermediate `TVCL`) are
+    ///   never written to `PkParams`; a modeled-dose `D{n}`/`R{n}` is written,
+    ///   to a spare slot above `PK_IDX_LAGTIME`, but still cannot be read back
+    ///   through `pk_indices`.
+    ///
+    /// Bound: an ODE or compartment-free model whose names do not all fit the
+    /// `MAX_PK_PARAMS`-slot layout is rejected at parse time by
+    /// `ode_param_slots`, so on that layout every entry has a real slot.
     pub indiv_param_names: Vec<String>,
     /// Symbolic partial derivatives of every top-level `[individual_parameters]`
     /// assignment w.r.t. each θ and η axis, precomputed at parse time. Outer
@@ -3734,6 +3828,20 @@ pub struct CompiledModel {
     /// the source text plus an evaluator for the effective SD at a typical arm
     /// size (`γ/√W`), which is the number a reader actually needs.
     pub kappa_weights: Vec<Option<KappaWeight>>,
+    /// Per-parameter priors declared with an inline `prior(value, rse = …)`
+    /// (#254). Empty for an ordinary maximum-likelihood fit, in which case every
+    /// objective is bit-identical to one computed before this field existed.
+    ///
+    /// This rides the **model**, not [`FitOptions`], because a prior changes the
+    /// estimates: a caller who parses a `.ferx` file and then hands `fit()` a
+    /// `FitOptions::default()` must not silently get an unpenalized fit back.
+    /// (The covariate-NN regularizer makes the opposite choice — `nn_l2` is a
+    /// `[fit_options]` key — because there the penalty is a *tuning* knob a
+    /// caller legitimately sweeps.)
+    ///
+    /// Resolved against the packed layout by the internal `PriorSet` once per
+    /// estimation stage.
+    pub priors: Vec<ParameterPrior>,
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
@@ -3756,6 +3864,12 @@ pub struct CompiledModel {
     /// value to the correct PK slot. Note: the index here is the
     /// assignment/tv index, *not* the eta index — see `eta_map` for the
     /// latter (they diverge when some params are eta-free).
+    ///
+    /// Also parallel to `indiv_param_names`; see that field for how each
+    /// engine assigns the slot. On an analytical model a name that is neither
+    /// bound on the `[structural_model]` line nor referenced by a readout gets a
+    /// placeholder `0`, which aliases `PK_IDX_CL`, or the slot of a bound name
+    /// it matches case-insensitively (#1356).
     pub pk_indices: Vec<usize>,
     /// Per-tv eta index: `eta_map[i]` is the eta index referenced by the
     /// i-th `[individual_parameters]` assignment, or -1 if the assignment
@@ -4458,21 +4572,38 @@ impl CompiledModel {
     /// aware slow paths.
     ///
     /// Checks both routes by which lagtime can be wired in:
-    ///   1. Analytical PK: `pk_indices` contains `PK_IDX_LAGTIME` when the
-    ///      `[structural_model]` line includes `lagtime=` / `alag=`.
-    ///   2. ODE: the LAGTIME/ALAG slot is populated by name in
-    ///      `build_pk_param_fn`'s ODE branch (sequential pk_indices do not
-    ///      reflect this), so we fall back to scanning `indiv_param_names`.
+    ///   1. `pk_indices` contains `PK_IDX_LAGTIME` whenever a parameter is
+    ///      routed to the lag slot: on the analytical engine by a `lagtime=` /
+    ///      `alag=` binding on the `[structural_model]` line, on the ODE (and
+    ///      compartment-free) layout by `ode_param_slots` sending a bare
+    ///      `LAGTIME`/`ALAG` name to its canonical slot. Two analytical
+    ///      exceptions write the lag slot without `pk_indices` recording it: a
+    ///      variable bound to two roles (e.g. `f=X, lagtime=X`) records only one
+    ///      of them, chosen by `HashMap` iteration order (#1359); and a
+    ///      `lagtime=` binding to a name assigned only inside an `if` without
+    ///      `else` is not in `indiv_param_names` at all.
+    ///   2. On the ODE engine, a compartment-indexed `ALAGn`/`LAGTIMEn` (#369)
+    ///      is not a canonical PK name, so `ode_param_slots` gives it an ordinary
+    ///      structural slot that `pk_indices` cannot identify; it is found by
+    ///      scanning `indiv_param_names`. (On the analytical engine an unbound
+    ///      `ALAGn` is rejected at parse time, and one bound via `lagtime=` /
+    ///      `alag=` is covered by route 1.) The scan also matches a bare `LAGTIME`/`ALAG`
+    ///      on every engine: redundant with route 1 on the ODE and
+    ///      compartment-free layout, and on the analytical engine a false
+    ///      positive for a `LAGTIME` declared without a `[structural_model]`
+    ///      binding — that value never reaches `PK_IDX_LAGTIME` and no lag is
+    ///      applied, yet the model is taken off the lag-free fast paths (the
+    ///      explicit sensitivity kernels and the cached event schedule).
     pub fn has_lagtime(&self) -> bool {
         if self.pk_indices.contains(&PK_IDX_LAGTIME) {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
             let u = n.to_uppercase();
-            // Bare `lagtime`/`alag` apply on any engine. A compartment-indexed
-            // `ALAGn`/`LAGTIMEn` (issue #369) only routes lag on the ODE engine
-            // — the analytical path has a single fixed dose route, where such a
-            // name lands in an unused spare slot — so gate it on `ode_spec`.
+            // A compartment-indexed `ALAGn`/`LAGTIMEn` (issue #369) only routes lag
+            // on the ODE engine, so gate it on `ode_spec`. The analytical engine has
+            // a single dose route: an unbound `ALAGn` is rejected at parse time, and
+            // a bound one already put `PK_IDX_LAGTIME` into `pk_indices` above.
             u == "LAGTIME"
                 || u == "ALAG"
                 || (self.ode_spec.is_some()
@@ -4558,11 +4689,15 @@ impl CompiledModel {
     }
 
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
-    /// either engine). Mirrors [`Self::has_lagtime`]: the analytical route puts
-    /// [`PK_IDX_F`] in `pk_indices` (from `f=` on the `[structural_model]`
-    /// line), while both engines may instead name it `F` (any case) in
-    /// `[individual_parameters]`; a compartment-indexed `Fn` routes on the ODE
-    /// engine only. Used with [`Subject::has_rate_defined_infusion`] to skip the
+    /// either engine). Mirrors [`Self::has_lagtime`]: [`PK_IDX_F`] is in
+    /// `pk_indices` when `f=` binds it on the analytical `[structural_model]`
+    /// line, or when an ODE / compartment-free model declares a bare `F`
+    /// (`ode_param_slots` routes the canonical name to that slot); the same two
+    /// analytical exceptions as for the lag slot apply to `f=`. The name scan
+    /// below adds a compartment-indexed `Fn`, which routes on the ODE engine
+    /// only. It also matches a bare `F` on every engine: redundant on the ODE
+    /// layout, and on the analytical engine a false positive for an `F` declared
+    /// without an `f=` binding, which is never applied. Used with [`Subject::has_rate_defined_infusion`] to skip the
     /// event-driven [`crate::pk::event_driven::EventSchedule`] cache when `F`
     /// could reshape an infusion window across the inner search (#419).
     pub fn has_bioavailability(&self) -> bool {
@@ -5863,7 +5998,33 @@ pub struct FitResult {
     /// Full sequence of methods executed, in order. Always has at least one entry.
     pub method_chain: Vec<EstimationMethod>,
     pub converged: bool,
+    /// The objective that was minimised. Equal to `ofv_data + ofv_prior`, so for
+    /// a model with no `prior(...)` declarations (#254) it is the plain −2 log L
+    /// it has always been.
     pub ofv: f64,
+    /// The data half of [`Self::ofv`] — the −2 log L with no prior penalty.
+    ///
+    /// This is what [`Self::aic`] and [`Self::bic`] are computed from, and what
+    /// should be compared against an unpriored fit of the same model.
+    #[serde(default)]
+    pub ofv_data: f64,
+    /// The prior half of [`Self::ofv`]: `Σ ((x̂ − m)/s)²` over the priored
+    /// coordinates (#254). Exactly `0.0` when no prior is declared.
+    ///
+    /// Normalisation constants are omitted here just as they are on the data
+    /// side (ferx's −2 log L drops `N·log(2π)`), so this is not absolutely
+    /// comparable to a NONMEM `$PRIOR` objective — compare ΔOFV against a null
+    /// twin instead.
+    #[serde(default)]
+    pub ofv_prior: f64,
+    /// Per-parameter prior report (#254): where the prior sat, where the
+    /// estimate landed, and how far apart they are in prior SDs. Empty when no
+    /// prior is declared.
+    ///
+    /// When this is non-empty the standard errors in `se_*` are the curvature of
+    /// the **penalized** objective — MAP / penalized-ML SEs, not posterior SDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_summary: Vec<PriorSummary>,
     pub aic: f64,
     pub bic: f64,
     pub theta: Vec<f64>,

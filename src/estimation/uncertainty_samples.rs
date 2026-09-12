@@ -368,6 +368,9 @@ mod tests {
     /// are filled with sensible defaults.
     fn fit_with_cov(template: &ModelParameters, cov: DMatrix<f64>) -> FitResult {
         FitResult {
+            ofv_data: 0.0,
+            ofv_prior: 0.0,
+            prior_summary: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             se_residual_correlations: None,
             covariate_relations: Vec::new(),

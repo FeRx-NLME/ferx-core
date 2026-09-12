@@ -19,6 +19,10 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-parameter priors for penalized maximum-likelihood (MAP) estimation**, declared inline as `prior(value, rse = 25%)` on any `theta`, `omega`, `sigma` or `kappa` — the simple alternative to NONMEM `$PRIOR`, with no separate prior problem and no matrices. The fit reports the data and prior halves of the OFV separately plus a per-parameter shift-toward-prior summary; AIC/BIC stay on the data half, and the prior's curvature reaches the reported standard errors and the SIR intervals. Applies to `foce`, `focei`, `laplace`, `gn` and `gn_hybrid`; a chain whose last estimating stage cannot apply priors, and an `S`-based covariance estimator (`covariance_method = s` or `rsr`, neither of which can represent one), are refused rather than run unpenalized. The θ prior is anchored against NONMEM `$PRIOR NWPRI` (#254).
+
 ### Changed
 
 - **`method = laplace`'s analytic `½·log|H|` gradient term now sweeps only the random-effect
@@ -57,6 +61,8 @@ section of the SDLC for the versioning policy).
 ### Fixed
 
 - The FREM docs (`docs/estimation/frem.qmd`, `docs/examples/frem.qmd`) now call the R function by its current name, `ferx_model_to_frem()` (formerly `ferx_to_frem()`), pass `output_dir` so the generated files are not written next to the model, and show `prepare_frem()` with its eighth `fit_init` argument.
+- **NPDE/NPD now sample the occasion `kappa`.** The post-fit NPDE/NPD diagnostics built their Monte-Carlo reference distribution with every `kappa` held at zero, so for an IOV model the reference carried no between-occasion variability and the scores came back over-dispersed — a well-specified IOV model looked mis-specified. The reference now draws one independent `kappa ~ N(0, Omega_IOV)` per occasion, matching what `simulate()` already did. Anchored row-by-row against NONMEM `$TABLE ... NPDE NPD ESAMPLE=` (worst `|dNPD|` 0.226, `|dNPDE|` 0.280 across 540 observations). Non-IOV models are unaffected and their scores are unchanged (#734).
+- A `pk(...)` call that maps **both** spellings of one PK slot — `v=`/`v1=` (central volume), `q=`/`q2=` (inter-compartmental clearance), `lagtime=`/`alag=` (absorption lag) — to *different* values is now a parse error instead of silently applying one and discarding the other. `pk one_cpt_iv(cl=CL, v=VA, v1=VB)` previously parsed, fit, and returned predictions off by the ratio of the two volumes with no warning at all: the discarded parameter *is* mapped, so the "computed but never used" census counted it as used. Both spellings bound to the same value stays legal (#1048).
 - Fixed the IOV inner loop discarding a converged-in-all-but-name BFGS solution for a far worse Nelder–Mead restart from the cold seed, which made every cold-started evaluation of a `kappa` model (the reported final OFV, `outer_maxiter = 0` re-evaluations, `.fitrx` reloads) score some subjects thousands of −2LL units above the value the optimizer had minimised — 9 300 on a `[covariate_nn]` + IOV busulfan fit (#1327).
 - Fixed ODE-accumulated survival hazards that read `TAD`, which could reject valid multi-dose subjects with a misleading finite objective (#1261).
 - `floor(x)`, `ceil(x)` and `round(x)` now differentiate to `0` rather than to `x`'s own derivative. An `[individual_parameters]` or `[odes]` expression that rounds — a dose-band lookup, an occasion index derived from `TIME` — was feeding a wrong analytic gradient to the estimator while its value path was correct (#1332).

@@ -23,7 +23,7 @@ pub struct CompiledModel {
     pub eta_names: Vec<String>,
     pub default_params: ModelParameters,
     pub tv_fn: Option<...>,          // Typical values function for analytical PK
-    pub pk_indices: Vec<usize>,      // Maps eta index -> PK parameter index
+    pub pk_indices: Vec<usize>,      // Individual parameter (declaration order) -> PK slot
     pub ode_spec: Option<OdeSpec>,   // ODE specification (if ODE model)
 }
 ```

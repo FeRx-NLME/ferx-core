@@ -2828,6 +2828,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             has_conditional_eta_params: false,
             name: "frem_rb_iscale_test".into(),

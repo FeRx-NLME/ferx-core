@@ -192,6 +192,7 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        priors: Vec::new(),
         covariate_model: None,
         name: "warfarin".into(),
         pk_model: PkModel::OneCptOral,
@@ -332,6 +333,7 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        priors: Vec::new(),
         covariate_model: None,
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
@@ -467,6 +469,7 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        priors: Vec::new(),
         covariate_model: None,
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
@@ -678,6 +681,7 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        priors: Vec::new(),
         covariate_model: None,
         name: "mm_oral".into(),
         pk_model: PkModel::OneCptOral,
