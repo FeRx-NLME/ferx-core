@@ -4409,6 +4409,115 @@ mod tests {
         );
     }
 
+    /// SAEM twin of the IMP test of the same name (#918): a logit mu-ref whose
+    /// theta is log-packed takes no closed-form pair and the advisory names it.
+    /// `TVCL` (log-packed lognormal) still takes the closed form, which is why
+    /// the saved-eval count is non-zero here.
+    #[test]
+    fn saem_log_packed_logit_mu_ref_routes_to_numerical_mstep() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  F  = inv_logit(LOGIT_F + ETA_F)
+  CL = TVCL * exp(ETA_CL) * F
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("packed on the log scale"))
+            .unwrap_or_else(|| {
+                panic!("expected the #918 packing advisory, got {:?}", res.warnings)
+            });
+        assert!(
+            hit.contains("LOGIT_F"),
+            "LOGIT_F named in the advisory: {hit}"
+        );
+        assert!(
+            !hit.contains("TVCL"),
+            "TVCL is a log-packed lognormal, not listed: {hit}"
+        );
+        assert!(
+            res.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
+            "TVCL still takes the closed form: {:?}",
+            res.saem_mu_ref_m_step_evals_saved
+        );
+        // The θ is un-explained by the "NO associated ETA" advisory: it carries
+        // one, and the packing advisory above already says why it is numerical.
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("NO associated ETA") && w.contains("LOGIT_F")),
+            "LOGIT_F must not also be reported as having no ETA, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// With `mu_referencing = false` no closed-form shift runs at all, so the
+    /// packing advisory is noise and must stay silent (same gate as #996).
+    #[test]
+    fn saem_mu_referencing_off_suppresses_the_log_packed_logit_advisory() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  F  = inv_logit(LOGIT_F + ETA_F)
+  CL = TVCL * exp(ETA_CL) * F
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the log scale")),
+            "no packing advisory with mu_referencing off, got {:?}",
+            res.warnings
+        );
+    }
+
     #[test]
     fn saem_mixture_without_shared_mu_ref_stays_on_numerical_mstep() {
         // Only the class-switched CL is mu-ref-shaped; V carries no ETA. SAEM
@@ -5190,6 +5299,53 @@ DV ~ additive(EPS)
         );
         assert!(get_mu_ref_pairs(&m, &[0.001]).is_empty());
         assert!(get_mu_ref_pairs(&m, &[-1.0]).is_empty());
+    }
+
+    /// The dropped-for-packing lists behind the advisories: a lognormal anchor
+    /// on an identity-packed theta lands in `identity_packed_log` (#996), a
+    /// logit anchor on a log-packed theta in `log_packed_logit` (#918), and the
+    /// eligible pairs are exactly the complement. Additive / probability-scale
+    /// anchors appear in neither list — no bound change makes them eligible.
+    #[test]
+    fn classify_mu_ref_pairs_splits_eligible_from_packing_mismatches() {
+        let m = model_with_mu_refs(
+            &["CL", "V", "LOGIT_F", "LOGIT_G", "ADD", "PF"],
+            &["ETA_CL", "ETA_V", "ETA_F", "ETA_G", "ETA_ADD", "ETA_PF"],
+            &[
+                ("ETA_CL", "CL", MuTransform::Log),
+                ("ETA_V", "V", MuTransform::Log),
+                ("ETA_F", "LOGIT_F", MuTransform::Logit),
+                ("ETA_G", "LOGIT_G", MuTransform::Logit),
+                ("ETA_ADD", "ADD", MuTransform::Identity),
+                ("ETA_PF", "PF", MuTransform::LogitProbability),
+            ],
+        );
+        // CL log-packed (ok), V identity-packed (dropped), LOGIT_F identity-packed
+        // (ok), LOGIT_G log-packed (dropped), ADD / PF never eligible.
+        let lowers = [0.001, -5.0, -10.0, 0.0, -1.0, 0.001];
+        let split = classify_mu_ref_pairs(&m, &lowers);
+        let mut eligible = split.eligible.clone();
+        eligible.sort();
+        assert_eq!(eligible, vec![(0, 0), (2, 2)]);
+        assert_eq!(split.identity_packed_log, vec![1]);
+        assert_eq!(split.log_packed_logit, vec![3]);
+        assert_eq!(get_mu_ref_pairs(&m, &lowers), split.eligible);
+    }
+
+    /// Two etas anchored to one theta must not list that theta twice.
+    #[test]
+    fn classify_mu_ref_pairs_dedups_dropped_thetas() {
+        let m = model_with_mu_refs(
+            &["TVP"],
+            &["ETA_A", "ETA_B"],
+            &[
+                ("ETA_A", "TVP", MuTransform::Log),
+                ("ETA_B", "TVP", MuTransform::Log),
+            ],
+        );
+        let split = classify_mu_ref_pairs(&m, &[-1.0]);
+        assert!(split.eligible.is_empty());
+        assert_eq!(split.identity_packed_log, vec![0]);
     }
 
     // ---- Regression tests for the three SAEM correctness bugs ----

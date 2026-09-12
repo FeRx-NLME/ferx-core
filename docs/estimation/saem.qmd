@@ -133,6 +133,8 @@ What decides eligibility is therefore not the link but whether the **packed** th
 
 The two excluded forms are still mu-referenced (they still centre the inner/E-step search); they just take the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
 
+The packing rule cuts both ways, and a mismatch is reported rather than silently routed: a lognormal theta declared with a *negative* lower bound is packed on the identity scale, and a logit-scale theta declared with a *non-negative* lower bound (`theta LOGIT_F(0.5, 0.0, 5.0)`) is packed on the log scale. Neither packed value is the mu, so the closed form does not apply; SAEM and IMP/IMPMAP estimate such a theta through the numerical M-step and emit an advisory naming it, with the bound to change. The advisory is suppressed under `mu_referencing = false`, where no closed-form shift runs at all.
+
 NLopt still runs for any remaining thetas (non-mu-referenced); the closed-form-updated thetas are pinned at their new values for the NLopt call.
 
 #### Scalar residual-error update
@@ -234,8 +236,9 @@ ETA" would be false for them:
   M-step never moves them — they do not enter the residual/eta likelihood, and
   the mixing M-step overwrites them from the class responsibilities — and a
   mixing expression is *forbidden* from depending on an eta in the first place.
-- **`MIXNUM`-switched class typical values**, and log-mu-referenced thetas
-  dropped to the identity scale by a negative lower bound. These carry an eta in
+- **`MIXNUM`-switched class typical values**, log-mu-referenced thetas
+  dropped to the identity scale by a negative lower bound, and logit-mu-referenced
+  thetas pushed onto the log scale by a non-negative one. These carry an eta in
   the model text and are on the numerical M-step for a reason SAEM already
   states in its own warning; repeating "add an ETA" on top of that would be both
   false and contradictory.

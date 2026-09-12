@@ -32,7 +32,10 @@ section of the SDLC for the versioning policy).
   the logit scale (negative lower bound), SAEM and IMP/IMPMAP now also update it with
   the closed-form EM step `theta += gamma * mean(eta)` instead of the numeric M-step —
   which is what fixes the biased bioavailability / fraction estimates reported for
-  models with IIV on the residual error.
+  models with IIV on the residual error. A logit-scale theta declared with a
+  non-negative lower bound is log-packed instead, so the closed form cannot apply;
+  SAEM and IMP/IMPMAP then say so in a warning that names the theta and the bound to
+  change, mirroring the existing advisory for a lognormal theta with a negative one.
 - **Mu-reference detection sees through local definitions** ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).
   A typical value on its own line (`TVCL = THETA_CL * (WT/70)^0.75` then
   `CL = TVCL * exp(ETA_CL)`) and NONMEM-style explicit mu syntax

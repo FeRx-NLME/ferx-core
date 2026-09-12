@@ -2341,6 +2341,11 @@ pub ferx_core::types::KappaTreatment::Marginalized
 pub ferx_core::types::KappaTreatment::NotApplicable
 pub enum ferx_core::types::LinkFn
 pub ferx_core::types::LinkFn::Logit
+pub enum ferx_core::types::MuTransform
+pub ferx_core::types::MuTransform::Identity
+pub ferx_core::types::MuTransform::Log
+pub ferx_core::types::MuTransform::Logit
+pub ferx_core::types::MuTransform::LogitProbability
 pub enum ferx_core::types::ObsRecord
 pub ferx_core::types::ObsRecord::Count
 pub ferx_core::types::ObsRecord::Count::cmt: usize
@@ -3122,8 +3127,10 @@ pub ferx_core::types::ModelParameters::theta_upper: alloc::vec::Vec<f64>
 impl ferx_core::ModelParameters
 pub fn ferx_core::ModelParameters::has_any_fixed(&self) -> bool
 pub struct ferx_core::types::MuRef
-pub ferx_core::types::MuRef::log_transformed: bool
 pub ferx_core::types::MuRef::theta_name: alloc::string::String
+pub ferx_core::types::MuRef::transform: ferx_core::MuTransform
+impl ferx_core::MuRef
+pub fn ferx_core::MuRef::log_transformed(&self) -> bool
 pub struct ferx_core::types::NeuralNetworkInfo
 pub ferx_core::types::NeuralNetworkInfo::hidden_activation: alloc::string::String
 pub ferx_core::types::NeuralNetworkInfo::input_center: alloc::vec::Vec<f64>
@@ -3623,6 +3630,11 @@ pub enum ferx_core::MatchMethod
 pub ferx_core::MatchMethod::Nearest
 pub ferx_core::MatchMethod::Optimal
 pub ferx_core::MatchMethod::Rank
+pub enum ferx_core::MuTransform
+pub ferx_core::MuTransform::Identity
+pub ferx_core::MuTransform::Log
+pub ferx_core::MuTransform::Logit
+pub ferx_core::MuTransform::LogitProbability
 pub enum ferx_core::NcaInit
 pub ferx_core::NcaInit::Ebe
 pub ferx_core::NcaInit::Nca
@@ -4558,8 +4570,10 @@ pub ferx_core::MonitorSpec::name: alloc::string::String
 impl ferx_core::sim::adaptive::MonitorSpec
 pub fn ferx_core::sim::adaptive::MonitorSpec::new(name: impl core::convert::Into<alloc::string::String>, cmt: usize, mode: ferx_core::sim::adaptive::ObserveMode) -> Self
 pub struct ferx_core::MuRef
-pub ferx_core::MuRef::log_transformed: bool
 pub ferx_core::MuRef::theta_name: alloc::string::String
+pub ferx_core::MuRef::transform: ferx_core::MuTransform
+impl ferx_core::MuRef
+pub fn ferx_core::MuRef::log_transformed(&self) -> bool
 pub struct ferx_core::NeuralNetworkInfo
 pub ferx_core::NeuralNetworkInfo::hidden_activation: alloc::string::String
 pub ferx_core::NeuralNetworkInfo::input_center: alloc::vec::Vec<f64>

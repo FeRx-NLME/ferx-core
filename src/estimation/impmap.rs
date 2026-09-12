@@ -2847,6 +2847,72 @@ mod tests {
         );
     }
 
+    /// Mirror image of the identity-packed case for a *logit* mu-ref (#918):
+    /// `inv_logit(LOGIT_F + ETA_F)` has mu scale θ, but a non-negative lower
+    /// bound makes `LOGIT_F` log-packed, so the closed-form shift does not apply.
+    /// The θ must route to the weighted M-step with the packing advisory naming
+    /// it, while the ordinary log-packed lognormal `TVCL` stays unlisted.
+    #[test]
+    fn imp_log_packed_logit_mu_ref_routes_to_weighted_mstep() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  F  = inv_logit(LOGIT_F + ETA_F)
+  CL = TVCL * exp(ETA_CL) * F
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        assert_eq!(
+            model.mu_refs.get("ETA_F").map(|m| m.transform),
+            Some(crate::types::MuTransform::Logit),
+            "fixture must be detected as a logit mu-ref"
+        );
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Imp;
+        opts.imp_iterations = 2;
+        opts.imp_samples = 40;
+        opts.imp_auto = false;
+        opts.imp_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("packed on the log scale"))
+            .unwrap_or_else(|| {
+                panic!("expected the #918 packing advisory, got {:?}", res.warnings)
+            });
+        assert!(
+            hit.contains("LOGIT_F"),
+            "LOGIT_F named in the advisory: {hit}"
+        );
+        assert!(
+            !hit.contains("TVCL"),
+            "TVCL is a log-packed lognormal, not listed: {hit}"
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the identity scale")),
+            "no identity-pack advisory for this model, got {:?}",
+            res.warnings
+        );
+    }
+
     #[test]
     fn impmap_mixture_flags_class_anchors_when_the_shift_is_disabled() {
         // With `mu_referencing = false` the class thetas are estimated by the

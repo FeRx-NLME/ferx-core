@@ -198,8 +198,83 @@ fn logit_mu_ref_drives_the_saem_closed_form_m_step() {
         !result
             .warnings
             .iter()
-            .any(|w| w.contains("not mu-referenced")),
+            .any(|w| w.contains("packed on the log scale")),
+        "a negative lower bound keeps the theta identity-packed; no packing advisory expected, \
+         got {:?}",
+        result.warnings
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("individual parameter(s) not mu-referenced")),
         "no parameter should be flagged as non-mu-referenced, got {:?}",
+        result.warnings
+    );
+}
+
+/// `LOGIT_ONLY_MODEL` with the logit-scale theta declared with a **non-negative**
+/// lower bound. ferx then packs it as `log θ`, which is not its mu scale, so the
+/// closed form cannot apply — the mirror image of the #996 identity-packed
+/// lognormal case.
+fn log_packed_logit_model() -> &'static str {
+    // `LOGIT_FR1` starts on the positive side so the declaration is admissible.
+    Box::leak(
+        LOGIT_ONLY_MODEL
+            .replace(
+                "theta LOGIT_FR1(-0.405465, -10.0, 10.0)",
+                "theta LOGIT_FR1(0.405465, 0.0, 10.0)",
+            )
+            .into_boxed_str(),
+    )
+}
+
+/// A logit mu-ref whose theta is log-packed must fall through to the numerical
+/// M-step *and say so*: no closed-form branch runs (nothing saved) and the
+/// #918 packing advisory names the theta. The control is the test above, where
+/// the same model with a negative lower bound takes the closed form.
+#[test]
+fn saem_log_packed_logit_theta_routes_to_numerical_mstep_with_advisory() {
+    let model = parse_full_model(log_packed_logit_model())
+        .expect("fixture must parse")
+        .model;
+    let pop = read_nonmem_csv(Path::new("data/logit_fraction_oral.csv"), None, None)
+        .expect("fixture data must load");
+    let opts = FitOptions {
+        method: EstimationMethod::Saem,
+        saem_n_exploration: 2,
+        saem_n_convergence: 1,
+        run_covariance_step: false,
+        verbose: false,
+        saem_seed: Some(918),
+        ..FitOptions::default()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short SAEM must run");
+    assert_eq!(
+        result.saem_mu_ref_m_step_evals_saved.unwrap_or(0),
+        0,
+        "a log-packed logit theta has no closed-form pair, so nothing is saved"
+    );
+    let hit = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("packed on the log scale"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the #918 packing advisory, got {:?}",
+                result.warnings
+            )
+        });
+    assert!(
+        hit.contains("LOGIT_FR1"),
+        "advisory must name the theta: {hit}"
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("individual parameter(s) not mu-referenced")),
+        "the parameter is still mu-referenced (detection is independent of packing), got {:?}",
         result.warnings
     );
 }
