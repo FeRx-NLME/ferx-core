@@ -96,6 +96,11 @@ pub const MAX_AGQ_NODES: usize = 21;
 /// hours; past that a fit is not slow, it is wrong to have started.
 pub const MAX_AGQ_GRID: usize = 100_000;
 
+/// Maximum estimated memory retained between the objective and gradient halves of one
+/// optimizer callback. Larger evaluations still use the same objective and gradient, but
+/// recompute the subject-local grid instead of keeping every subject's grid alive at once.
+const MAX_PREPARED_GRID_BYTES: usize = 128 * 1024 * 1024;
+
 /// The sentinel a non-finite likelihood collapses to, matching `individual_nll`'s own
 /// convention so a diverged node sorts as "impossible" rather than poisoning the sum.
 const NLL_SENTINEL: f64 = 1e20;
@@ -292,6 +297,77 @@ enum PreparedSubject {
 pub(crate) struct PopulationEvaluation {
     pub(crate) nll: f64,
     prepared: Vec<Option<PreparedSubject>>,
+}
+
+fn prepared_subject_bytes(
+    d: usize,
+    n_nodes: usize,
+    n_obs: usize,
+    n_theta: usize,
+    retain_base_jet: bool,
+) -> usize {
+    use std::mem::size_of;
+
+    let grid_len = grid_size(n_nodes, d);
+    // `bs` owns one Vec header and `d` f64 values per node; `softmax` owns one f64.
+    let grid = grid_len.saturating_mul(
+        size_of::<Vec<f64>>()
+            .saturating_add(d.saturating_mul(size_of::<f64>()))
+            .saturating_add(size_of::<f64>()),
+    );
+    // Retained H, the stack's joint precision and prior SD, and the stacked mode.
+    let matrices_and_modes = 2usize
+        .saturating_mul(d)
+        .saturating_mul(d)
+        .saturating_add(2usize.saturating_mul(d))
+        .saturating_mul(size_of::<f64>());
+    let base_jet = if retain_base_jet {
+        // Each ordinary gradient-path ObsSens owns four populated derivative vectors:
+        // dη, dη², dθ, and dηdθ. Its other four Vec fields are empty but their headers
+        // remain inline in ObsSens.
+        let derivatives = d
+            .saturating_add(d.saturating_mul(d))
+            .saturating_add(n_theta)
+            .saturating_add(d.saturating_mul(n_theta));
+        size_of::<Vec<crate::sens::provider::ObsSens>>().saturating_add(
+            n_obs.saturating_mul(
+                size_of::<crate::sens::provider::ObsSens>()
+                    .saturating_add(derivatives.saturating_mul(size_of::<f64>())),
+            ),
+        )
+    } else {
+        0
+    };
+    grid.saturating_add(matrices_and_modes)
+        .saturating_add(base_jet)
+}
+
+fn retain_population_gradient_work(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+) -> bool {
+    let mut total = 0usize;
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let n_occ = kappas.get(i).map_or(0, Vec::len);
+        let d = model
+            .n_eta
+            .saturating_add(n_occ.saturating_mul(model.n_kappa));
+        total = total.saturating_add(prepared_subject_bytes(
+            d,
+            n_nodes,
+            subject.observations.len(),
+            params.theta.len(),
+            matches!(anchor, HessianAnchor::Exact) && n_occ == 0 && analytic_score_supported(model),
+        ));
+        if total > MAX_PREPARED_GRID_BYTES {
+            return false;
+        }
+    }
+    true
 }
 
 impl Stack {
@@ -955,6 +1031,8 @@ pub(crate) fn agq_population_evaluate(
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let retain_gradient_work =
+        retain_population_gradient_work(model, population, params, kappas, n_nodes, anchor);
 
     let per_subject: Vec<(f64, Option<PreparedSubject>)> = population
         .subjects
@@ -973,7 +1051,7 @@ pub(crate) fn agq_population_evaluate(
                 &nodes,
                 &log_weights,
                 anchor,
-                true,
+                retain_gradient_work,
             );
             let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
             (nll, prepared)
@@ -2904,13 +2982,17 @@ mod tests {
     #[test]
     fn retained_objective_work_reproduces_objective_and_gradient() {
         use crate::estimation::inner_optimizer::find_ebe;
-        use crate::estimation::parameterization::{compute_bounds, pack_params};
+        use crate::estimation::parameterization::{compute_bounds, pack_params, unpack_params};
         use crate::types::{EstimationMethod, FitOptions, Population};
 
         let model = parse_model_string(M3_MODEL).unwrap();
-        let params = &model.default_params;
+        let template = &model.default_params;
+        let x = pack_params(template);
+        // The optimizer callback evaluates both objective and gradient from unpacked `x`.
+        // Mirror that path: pack(default) can move a log-transformed value by one ULP.
+        let params = unpack_params(&x, template);
         let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
-        let ebe = find_ebe(&model, &subject, params, 200, 1e-11, None, None, 0);
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
         assert!(ebe.converged, "fixture EBE must converge");
         let population = Population {
             subjects: vec![subject],
@@ -2930,7 +3012,7 @@ mod tests {
         let evaluation = agq_population_evaluate(
             &model,
             &population,
-            params,
+            &params,
             &eta_hats,
             &kappas,
             3,
@@ -2939,7 +3021,7 @@ mod tests {
         let terms_only = agq_population_nll(
             &model,
             &population,
-            params,
+            &params,
             &eta_hats,
             &kappas,
             3,
@@ -2948,12 +3030,11 @@ mod tests {
         assert!(evaluation.prepared.iter().all(Option::is_some));
         assert_eq!(evaluation.nll.to_bits(), terms_only.to_bits());
 
-        let x = pack_params(params);
-        let bounds = compute_bounds(params);
+        let bounds = compute_bounds(template);
         let uncached = population_gradient_mixed(
             &model,
             &population,
-            params,
+            template,
             &x,
             &eta_hats,
             &kappas,
@@ -2966,7 +3047,7 @@ mod tests {
         let cached = population_gradient_mixed(
             &model,
             &population,
-            params,
+            template,
             &x,
             &eta_hats,
             &kappas,
@@ -2977,9 +3058,46 @@ mod tests {
         )
         .expect("cached gradient");
         assert_eq!(cached.len(), uncached.len());
-        for (cached, uncached) in cached.iter().zip(&uncached) {
-            assert_eq!(cached.to_bits(), uncached.to_bits());
+        for (i, (cached, uncached)) in cached.iter().zip(&uncached).enumerate() {
+            assert_eq!(
+                cached.to_bits(),
+                uncached.to_bits(),
+                "packed gradient coordinate {i}: cached={cached:e}, uncached={uncached:e}"
+            );
         }
+    }
+
+    #[test]
+    fn prepared_grid_budget_rejects_population_wide_growth() {
+        use crate::types::Population;
+
+        let per_subject = prepared_subject_bytes(5, 9, 0, 0, false);
+        assert_eq!(
+            per_subject,
+            59_049 * (std::mem::size_of::<Vec<f64>>() + 6 * 8) + 60 * 8
+        );
+        assert!(per_subject * 1_000 > MAX_PREPARED_GRID_BYTES);
+        assert!(prepared_subject_bytes(3, 3, 20, 6, true) < MAX_PREPARED_GRID_BYTES);
+
+        let model = parse_model_string(M3_MODEL).unwrap();
+        let subject = score_subject(&model, &model.default_params.theta, &[0.5, 1.0]);
+        let population = Population {
+            subjects: vec![subject; 5_000],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let kappas = vec![Vec::new(); population.subjects.len()];
+        assert!(!retain_population_gradient_work(
+            &model,
+            &population,
+            &model.default_params,
+            &kappas,
+            9,
+            HessianAnchor::GaussNewton,
+        ));
     }
 
     /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`
