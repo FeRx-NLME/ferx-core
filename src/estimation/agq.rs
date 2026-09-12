@@ -1400,9 +1400,21 @@ fn grid_response_correction(
     // `phi_grid` re-sweep for every coordinate (all-or-nothing, matching the anchor).
     // Hoisted once for the whole sweep — see `node_nll_gradient`.
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    let err_keys = model.error_spec.obs_keys(subject);
     let node_grads: Option<Vec<Vec<f64>>> = bs
         .iter()
-        .map(|b| node_nll_gradient(model, subject, params, stack, b, schedule, mult.as_deref()))
+        .map(|b| {
+            node_nll_gradient(
+                model,
+                subject,
+                params,
+                stack,
+                b,
+                schedule,
+                mult.as_deref(),
+                err_keys.as_ref(),
+            )
+        })
         .collect();
 
     // Assemble `dH/dx` (or `dH̃/dx`) in closed form instead of rebuilding the anchor at
@@ -1868,6 +1880,7 @@ fn node_nll_gradient(
     b: &[f64],
     schedule: Option<&pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
 ) -> Option<Vec<f64>> {
     if stack.is_iov() {
         let iov = params.omega_iov.as_ref()?;
@@ -1896,6 +1909,8 @@ fn node_nll_gradient(
             &params.residual_correlations,
             schedule,
             mult,
+            err_keys,
+            &mut Vec::new(),
         )
     }
 }
@@ -2469,6 +2484,7 @@ mod tests {
         )
         .expect("base mode response");
         let mult = model.ruv_obs_mult(&subject, &params.theta);
+        let err_keys = model.error_spec.obs_keys(&subject);
         let node_grads: Vec<Vec<f64>> = bs
             .iter()
             .map(|b| {
@@ -2480,6 +2496,7 @@ mod tests {
                     b,
                     schedule.as_ref(),
                     mult.as_deref(),
+                    err_keys.as_ref(),
                 )
                 .expect("node gradient")
             })
@@ -2814,6 +2831,7 @@ mod tests {
                 )
                 .expect("mode response");
                 let mult = model.ruv_obs_mult(&subject, &params.theta);
+                let err_keys = model.error_spec.obs_keys(&subject);
                 let node_grads: Vec<Vec<f64>> = bs
                     .iter()
                     .map(|b| {
@@ -2825,6 +2843,7 @@ mod tests {
                             b,
                             schedule.as_ref(),
                             mult.as_deref(),
+                            err_keys.as_ref(),
                         )
                         .expect("node gradient")
                     })

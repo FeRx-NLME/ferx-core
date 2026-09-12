@@ -861,6 +861,17 @@ pub fn find_ebe(
     // every inner step (and every line-search trial) — instead of re-walking
     // every magnitude expression on each of those calls (#486 review).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    // #658: per-observation residual endpoint keys — η-independent, same hoist as
+    // `mult` (a `Selected` error spec's `obs_keys` allocates a fresh `Vec<usize>`,
+    // so this avoids re-allocating it on every inner BFGS step).
+    let err_keys = model.error_spec.obs_keys(subject);
+    // Per-subject `ObsGrad` buffer, reused across every inner BFGS step the same
+    // way `pk_scratch_cell` is: `analytic_eta_nll_gradient_with_schedule` takes its
+    // previous contents as a reuse hint and stores the fresh result back, so the
+    // light sensitivity provider's closed-form path overwrites its `ObsGrad`s'
+    // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
+    // observation on every call.
+    let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
@@ -917,6 +928,8 @@ pub fn find_ebe(
             &params.residual_correlations,
             schedule.as_ref(),
             mult.as_deref(),
+            err_keys.as_ref(),
+            &mut obs_grad_recycle.borrow_mut(),
         ) {
             Some(g) => {
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2178,6 +2191,8 @@ pub(crate) fn analytic_eta_nll_gradient(
     // one-off caller like this can just compute it inline (unlike `find_ebe`'s
     // per-BFGS-step closure, which hoists it — see `analytic_eta_nll_gradient_with_schedule`).
     let mult = model.ruv_obs_mult(subject, theta);
+    // #658: per-observation residual endpoint keys — η-independent, same hoist as `mult`.
+    let err_keys = model.error_spec.obs_keys(subject);
     analytic_eta_nll_gradient_with_schedule(
         model,
         subject,
@@ -2189,6 +2204,8 @@ pub(crate) fn analytic_eta_nll_gradient(
         &model.residual_correlations,
         None,
         mult.as_deref(),
+        err_keys.as_ref(),
+        &mut Vec::new(),
     )
 }
 
@@ -2201,6 +2218,21 @@ pub(crate) fn analytic_eta_nll_gradient(
 /// closure (`find_ebe`'s `agrad`) can compute it **once** outside the loop instead
 /// of re-walking every magnitude expression on every inner iteration (#486 review).
 /// `None` when no magnitude is active.
+///
+/// `err_keys` is the subject's per-observation residual endpoint dispatch keys
+/// (#658, [`ErrorSpec::obs_keys`](crate::types::ErrorSpec::obs_keys)) — likewise
+/// η-independent and caller-supplied for the same reason as `mult`: for a
+/// `Selected` (covariate-selector) error spec, `obs_keys` allocates a fresh
+/// `Vec<usize>`, so recomputing it inside this per-BFGS-step function would
+/// re-allocate on every inner iteration instead of once per subject.
+///
+/// `obs_grad_recycle` is a per-subject scratch slot, owned by the caller and
+/// reused across every inner BFGS step: this function hands its previous
+/// contents in as [`subject_eta_grad_with_schedule`]'s reuse hint, then stores
+/// the freshly computed `Vec<ObsGrad>` back before returning, so the next call
+/// for the same subject can overwrite its `ObsGrad`s in place instead of
+/// allocating a fresh one per observation (mirrors the `pk_scratch_cell`
+/// pattern `find_ebe` already uses for `EventPkParams`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     model: &CompiledModel,
@@ -2212,6 +2244,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     residual_correlations: &[crate::types::ResidualCorrelation],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
+    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
 ) -> Option<Vec<f64>> {
     // The inner NLL is `½(η'Ω⁻¹η + log|Ω| + data_gauss + 2·data_nonGaussian)`, so its
     // η-gradient is a plain **sum** of term gradients. Assemble the non-Gaussian block
@@ -2250,12 +2284,14 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
+    let hint = std::mem::take(obs_grad_recycle);
     let sens = crate::sens::provider::subject_eta_grad_with_schedule(
         model,
         subject,
         theta,
         eta,
         cached_schedule,
+        hint,
     )?;
     // Fold the non-Gaussian block into whichever Gaussian branch runs below.
     #[cfg(feature = "markov")]
@@ -2273,17 +2309,20 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
     if !residual_correlations.is_empty() {
-        return dense_residual_inner_gradient(
+        let result = dense_residual_inner_gradient(
             model,
             subject,
-            theta,
             eta,
             omega,
             sigma,
             residual_correlations,
             &sens,
+            mult,
+            err_keys,
         )
         .map(add_nongaussian);
+        *obs_grad_recycle = sens;
+        return result;
     }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
@@ -2303,8 +2342,6 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     };
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
     // FREM covariate pseudo-observations: the objective scores these rows against the
     // dedicated `EPSCOV` variance, not `error_spec.variance_at(f)`. The provider has
     // already corrected their `f` and `∂f/∂η` (`apply_frem_pseudo_obs_grad`); this is the
@@ -2353,7 +2390,9 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior[k];
     }
-    Some(add_nongaussian(grad))
+    let result = Some(add_nongaussian(grad));
+    *obs_grad_recycle = sens;
+    result
 }
 
 /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual
@@ -2377,12 +2416,13 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 fn dense_residual_inner_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
     residual_correlations: &[crate::types::ResidualCorrelation],
     sens: &[crate::sens::provider::ObsGrad],
+    mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
     let n_eta = model.n_eta;
@@ -2394,11 +2434,7 @@ fn dense_residual_inner_gradient(
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
     let corr = residual_correlations;
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-    // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
-    let r = match ruv_mult.as_deref() {
+    let r = match mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,
             &ipreds,
@@ -2444,7 +2480,7 @@ fn dense_residual_inner_gradient(
         &subject.obs_l2,
         sigma,
         corr,
-        ruv_mult.as_deref(),
+        mult,
     );
     let mut grad = vec![0.0f64; n_eta];
     for k in 0..n_eta {

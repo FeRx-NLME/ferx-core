@@ -1204,6 +1204,31 @@ fn lognormal_param_derivatives(
     }
 }
 
+/// Light η-only counterpart of [`lognormal_param_derivatives`]: just `∂p_i/∂η_k
+/// = pk_i·sel_ik`, for the same closed-form log-normal fallback. Used by
+/// [`subject_eta_grad_impl`]'s inner-loop path, which — like the compiled-program
+/// branch just above it (`param_eta_derivatives_from_prog`) — consumes only
+/// `dp_deta`. The full [`lognormal_param_derivatives`] additionally computes
+/// `dp_dtheta`, `d2p_deta2`, `d2p_detadtheta` (and the `tv_theta_jacobian` FD
+/// those need), all θ/second-order work the inner η-gradient never reads; calling
+/// it here would silently reintroduce the very θ-axis/Hessian cost the "light
+/// provider" comment on `subject_eta_grad` says this path avoids.
+fn lognormal_eta_derivatives_only(
+    model: &CompiledModel,
+    pk: &crate::types::PkParams,
+) -> Vec<Vec<f64>> {
+    let n_eta = model.n_eta;
+    let ni = model.pk_indices.len();
+    let mut dp_deta = vec![vec![0.0; n_eta]; ni];
+    for (i, &slot) in model.pk_indices.iter().enumerate() {
+        let pk_val = pk.values[slot];
+        for k in 0..n_eta {
+            dp_deta[i][k] = pk_val * model.sel_flat[i * n_eta + k];
+        }
+    }
+    dp_deta
+}
+
 /// Resolve the exact `(∂p/∂(θ,η)` full [`ParamDerivs`], `slots)` pair for a subject:
 /// evaluate the compiled `[individual_parameters]` program over `Dual2` seeded on
 /// `(θ, η)` when it covers the required PK slots, else fall back to the closed-form
@@ -4613,7 +4638,7 @@ pub fn subject_eta_grad(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
-    subject_eta_grad_with_schedule(model, subject, theta, eta, None)
+    subject_eta_grad_with_schedule(model, subject, theta, eta, None, Vec::new())
 }
 
 /// As [`subject_eta_grad`], but threading a per-subject cached `EventSchedule` (built
@@ -4626,12 +4651,13 @@ pub(crate) fn subject_eta_grad_with_schedule(
     theta: &[f64],
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    hint: Vec<ObsGrad>,
 ) -> Option<Vec<ObsGrad>> {
     let mut r = if !sens_profile_enabled() {
-        subject_eta_grad_impl(model, subject, theta, eta, cached_schedule)
+        subject_eta_grad_impl(model, subject, theta, eta, cached_schedule, hint)
     } else {
         let t0 = std::time::Instant::now();
-        let r = subject_eta_grad_impl(model, subject, theta, eta, cached_schedule);
+        let r = subject_eta_grad_impl(model, subject, theta, eta, cached_schedule, hint);
         PROFILE_ETA_NANOS.fetch_add(
             t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -4691,6 +4717,7 @@ fn subject_eta_grad_impl(
     theta: &[f64],
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    hint: Vec<ObsGrad>,
 ) -> Option<Vec<ObsGrad>> {
     // Transit subject the closed form can't serve → its ODE `transit()` equivalent, which
     // takes the ODE-provider branch below (that branch ignores the analytical
@@ -4817,8 +4844,8 @@ fn subject_eta_grad_impl(
             {
                 return None;
             }
-            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
-            (pd.dp_deta, model.pk_indices.clone())
+            let dp_deta = lognormal_eta_derivatives_only(model, &pk);
+            (dp_deta, model.pk_indices.clone())
         }
     };
     let seed_dim = seed_dim_from_slots(&slots);
@@ -4834,7 +4861,7 @@ fn subject_eta_grad_impl(
         1, 2, 3, 4, 5, 6, 7, 8, 9;
         |N| Some(run_obs_grad::<N>(
             &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
-            two_cpt_ig, subject, &dp_deta, n_eta, readout,
+            two_cpt_ig, subject, &dp_deta, n_eta, readout, hint,
         ))
     )?;
     // Analytic `[initial_conditions]` impulse (#524): η-gradient only, layered on
@@ -4912,6 +4939,7 @@ fn run_obs_grad<const N: usize>(
     dp_deta: &[Vec<f64>],
     n_eta: usize,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    mut out: Vec<ObsGrad>,
 ) -> Vec<ObsGrad> {
     let seeded = SeededPkDuals::<Dual1<N>>::seed(seed_dim, pk);
     let flags = PkClassFlags {
@@ -4931,7 +4959,11 @@ fn run_obs_grad<const N: usize>(
     let mut ro_state: Vec<Dual1<N>> = Vec::new();
     let mut ro_vars: Vec<Dual1<N>> = Vec::new();
     let mut ro_stack: Vec<Dual1<N>> = Vec::new();
-    let mut out = Vec::with_capacity(subject.obs_times.len());
+    // `out` is reused across every inner BFGS step for this subject (`find_ebe`'s
+    // scratch, threaded through `subject_eta_grad_with_schedule`): `n_obs`/`n_eta`
+    // are subject-static, so after the first call every `ObsGrad` slot already has
+    // the right `df_deta` capacity and this loop overwrites in place instead of
+    // allocating a fresh `Vec<f64>` per observation per call.
     for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
         let reset_floor = reset_floor_at(subject, t_obs);
         let fd = superpose_doses(&seeded, flags, subject, t_obs, reset_floor);
@@ -4963,16 +4995,41 @@ fn run_obs_grad<const N: usize>(
         );
         let (fval, g) = (y.value, y.grad);
 
-        let mut df_deta = vec![0.0; n_eta];
+        if obs_i >= out.len() {
+            out.push(ObsGrad {
+                f: 0.0,
+                df_deta: Vec::new(),
+            });
+        }
+        let slot = &mut out[obs_i];
+        slot.f = fval;
+        reset_zeroed(&mut slot.df_deta, n_eta);
         for i in 0..N {
             let gi = g[i];
             for k in 0..n_eta {
-                df_deta[k] += gi * dp_deta[i][k];
+                slot.df_deta[k] += gi * dp_deta[i][k];
             }
         }
-        out.push(ObsGrad { f: fval, df_deta });
     }
+    // Guard against a stale, longer buffer from a previous call (never happens in
+    // production — `n_obs` is subject-static across a `find_ebe` call — but keeps
+    // this correct for any caller that reuses `out` across different subjects).
+    out.truncate(subject.obs_times.len());
     out
+}
+
+/// Resize `v` to exactly `n` elements, all zero, reusing its existing heap
+/// allocation when `v` already has capacity (or exactly `n` elements) instead of
+/// allocating fresh. The reuse counterpart of `vec![0.0; n]` for a buffer
+/// threaded across repeated calls (see [`run_obs_grad`]).
+#[inline]
+fn reset_zeroed(v: &mut Vec<f64>, n: usize) {
+    if v.len() == n {
+        v.iter_mut().for_each(|x| *x = 0.0);
+    } else {
+        v.clear();
+        v.resize(n, 0.0);
+    }
 }
 
 /// Compute per-observation analytic sensitivities, or `None` if this
