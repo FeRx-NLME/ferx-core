@@ -2767,7 +2767,14 @@ fn inner_minimize_with_grad(
             enable_stall,
         )
     } else {
-        dense_bfgs_core(
+        // D2 (perf-stack #1345/#1217 §6): the allocation-light scratch variant,
+        // proven bit-identical to `dense_bfgs_core` by
+        // `dense_bfgs_core_scratch_matches_dense_bfgs_core`. Same dense-BFGS
+        // algorithm, same `n < INNER_LBFGS_MIN_DIM` dispatch as before — this
+        // changes only where the per-iteration operands live, not which
+        // optimizer runs or its convergence path.
+        let mut scratch = BfgsScratch::new(n);
+        dense_bfgs_core_scratch(
             obj,
             grad,
             x,
@@ -2777,6 +2784,7 @@ fn inner_minimize_with_grad(
             precond,
             stop_precond,
             enable_stall,
+            &mut scratch,
         )
     }
 }
@@ -2878,10 +2886,14 @@ fn lbfgs_core(
     false
 }
 
-/// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
-/// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
-/// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
+/// Dense (`n×n` inverse-Hessian) BFGS driver. Superseded in production by the
+/// allocation-light [`dense_bfgs_core_scratch`] (D2, perf-stack #1345/#1217
+/// §6); kept as the parity reference for
+/// `dense_bfgs_core_scratch_matches_dense_bfgs_core` and for the
+/// solver-scaling benchmark, so `#[allow(dead_code)]` — it has no production
+/// caller. `grad` supplies the gradient (FD or analytic).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn dense_bfgs_core(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
@@ -2998,8 +3010,14 @@ fn dense_bfgs_core(
     false
 }
 
-/// Nelder-Mead simplex minimization (fallback)
-fn nelder_mead_minimize(
+/// Nelder-Mead simplex minimization (fallback). Superseded in production by
+/// the allocation-light [`nelder_mead_minimize_scratch`] (D2, perf-stack
+/// #1345/#1217 §6, extended to NM); kept as the parity reference for
+/// `nelder_mead_minimize_scratch_matches_reference`, so
+/// `#[allow(dead_code)]` — the callable production name `nelder_mead_minimize`
+/// below is now the scratch-backed wrapper, not this function.
+#[allow(dead_code)]
+fn nelder_mead_minimize_reference(
     obj: &dyn Fn(&[f64]) -> f64,
     x: &mut [f64],
     n: usize,
@@ -3114,6 +3132,188 @@ fn nelder_mead_minimize(
         .unwrap();
     x.copy_from_slice(&simplex[best]);
     false
+}
+
+// ---------------------------------------------------------------------------
+// D2 continued (perf-stack #1345/#1217 §6): Nelder-Mead's per-iteration
+// allocations (`indices`, `centroid`, `reflected`, and conditionally
+// `expanded`/`contracted`/`best_point`) get the same scratch-buffer treatment
+// as the dense-BFGS path above. `simplex`/`fvals` stay local — like BFGS's
+// `h_inv`, they're already allocated once per call, not per iteration, so
+// they aren't part of the win this stage targets. Arithmetic is unchanged
+// from `nelder_mead_minimize_reference`; only allocation moves. Wired into
+// production as `nelder_mead_minimize` itself (a thin scratch-owning
+// wrapper), so every existing call site — the `InnerOptimizer::NelderMead`
+// dispatch branch and all five fallback/runaway-guard call sites in
+// `find_ebe`/`find_ebe_iov`/`argmin_inner_fallback` — picks this up with no
+// signature change.
+// ---------------------------------------------------------------------------
+
+/// Reusable scratch for [`nelder_mead_minimize_scratch`], sized once by `n`.
+struct NelderMeadScratch {
+    indices: Vec<usize>,
+    centroid: Vec<f64>,
+    reflected: Vec<f64>,
+    expanded: Vec<f64>,
+    contracted: Vec<f64>,
+    best_point: Vec<f64>,
+}
+
+impl NelderMeadScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            indices: vec![0; n + 1],
+            centroid: vec![0.0; n],
+            reflected: vec![0.0; n],
+            expanded: vec![0.0; n],
+            contracted: vec![0.0; n],
+            best_point: vec![0.0; n],
+        }
+    }
+}
+
+/// Allocation-light twin of [`nelder_mead_minimize_reference`] — identical
+/// algorithm and arithmetic, differing only in where the per-iteration
+/// operands live (element-wise `copy_from_slice` into a reused buffer instead
+/// of a fresh `Vec` moved into place, so the values placed into `simplex` are
+/// unchanged).
+fn nelder_mead_minimize_scratch(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    scratch: &mut NelderMeadScratch,
+) -> bool {
+    let alpha = 1.0;
+    let gamma = 2.0;
+    let rho = 0.5;
+    let sigma = 0.5;
+
+    let mut simplex: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
+    simplex.push(x.to_vec());
+    for i in 0..n {
+        let mut point = x.to_vec();
+        let delta = if point[i].abs() > 1e-8 {
+            0.05 * point[i].abs()
+        } else {
+            0.00025
+        };
+        point[i] += delta;
+        simplex.push(point);
+    }
+
+    let mut fvals: Vec<f64> = simplex.iter().map(|p| obj(p)).collect();
+
+    for _iter in 0..max_iter {
+        for (i, idx) in scratch.indices.iter_mut().enumerate() {
+            *idx = i;
+        }
+        // NaN-safe: a non-finite objective (e.g. an ODE prediction that blew
+        // up at a simplex vertex) sorts as worst rather than panicking on the
+        // `None` that `partial_cmp` returns for NaN. See issue #97.
+        scratch.indices.sort_by(|&a, &b| {
+            fvals[a]
+                .partial_cmp(&fvals[b])
+                .unwrap_or(std::cmp::Ordering::Greater)
+        });
+
+        let best = scratch.indices[0];
+        let worst = scratch.indices[n];
+        let second_worst = scratch.indices[n - 1];
+
+        let frange = fvals[worst] - fvals[best];
+        if frange < tol {
+            x.copy_from_slice(&simplex[best]);
+            return true;
+        }
+
+        scratch.centroid.fill(0.0);
+        for &idx in &scratch.indices[..n] {
+            for j in 0..n {
+                scratch.centroid[j] += simplex[idx][j];
+            }
+        }
+        for j in 0..n {
+            scratch.centroid[j] /= n as f64;
+        }
+
+        // Reflection
+        for j in 0..n {
+            scratch.reflected[j] =
+                scratch.centroid[j] + alpha * (scratch.centroid[j] - simplex[worst][j]);
+        }
+        let fr = obj(&scratch.reflected);
+
+        if fr < fvals[second_worst] && fr >= fvals[best] {
+            simplex[worst].copy_from_slice(&scratch.reflected);
+            fvals[worst] = fr;
+            continue;
+        }
+
+        if fr < fvals[best] {
+            for j in 0..n {
+                scratch.expanded[j] =
+                    scratch.centroid[j] + gamma * (scratch.reflected[j] - scratch.centroid[j]);
+            }
+            let fe = obj(&scratch.expanded);
+            if fe < fr {
+                simplex[worst].copy_from_slice(&scratch.expanded);
+                fvals[worst] = fe;
+            } else {
+                simplex[worst].copy_from_slice(&scratch.reflected);
+                fvals[worst] = fr;
+            }
+            continue;
+        }
+
+        for j in 0..n {
+            scratch.contracted[j] =
+                scratch.centroid[j] + rho * (simplex[worst][j] - scratch.centroid[j]);
+        }
+        let fc = obj(&scratch.contracted);
+        if fc < fvals[worst] {
+            simplex[worst].copy_from_slice(&scratch.contracted);
+            fvals[worst] = fc;
+            continue;
+        }
+
+        scratch.best_point.copy_from_slice(&simplex[best]);
+        for i in 0..=n {
+            if i != best {
+                for j in 0..n {
+                    simplex[i][j] =
+                        scratch.best_point[j] + sigma * (simplex[i][j] - scratch.best_point[j]);
+                }
+                fvals[i] = obj(&simplex[i]);
+            }
+        }
+    }
+
+    // NaN-safe min: a non-finite vertex objective must not panic here either.
+    let best = fvals
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater))
+        .map(|(i, _)| i)
+        .unwrap();
+    x.copy_from_slice(&simplex[best]);
+    false
+}
+
+/// Nelder-Mead simplex minimization (fallback). Production entry point: owns
+/// its [`NelderMeadScratch`] (sized once per call, not per iteration) and
+/// delegates to [`nelder_mead_minimize_scratch`]. Every existing caller keeps
+/// this exact name/signature, so no call site changed.
+fn nelder_mead_minimize(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    let mut scratch = NelderMeadScratch::new(n);
+    nelder_mead_minimize_scratch(obj, x, n, max_iter, tol, &mut scratch)
 }
 
 /// Maximum trial steps in the backtracking line search before it gives up.
@@ -3282,6 +3482,255 @@ fn backtracking_line_search(
         // and returns ±inf/NaN) carries no interpolation information, so fall
         // back to plain halving — this also keeps `alpha` finite, so the clamp
         // bounds below can never become NaN.
+        let denom = 2.0 * (f_new - f0 - dg * alpha);
+        let alpha_quad = if f_new.is_finite() && denom > 0.0 {
+            -dg * alpha * alpha / denom
+        } else {
+            0.5 * alpha
+        };
+        alpha = alpha_quad.clamp(0.1 * alpha, 0.5 * alpha);
+        if alpha < 1e-16 {
+            break;
+        }
+    }
+    (0.0, f0)
+}
+
+// ---------------------------------------------------------------------------
+// D2 (perf-stack #1345/#1217 §6): allocation-light dense BFGS. Wired into
+// production via `inner_minimize_with_grad`'s dense-BFGS branch — same
+// dense-vs-L-BFGS-vs-Nelder-Mead dispatch as before (`inner_use_lbfgs`,
+// `inner_optimizer_mode`), so no default optimizer choice or convergence
+// path changes; only where the per-iteration operands live does. Gated on
+// its own micro-benchmark before this wiring landed — see
+// `inner_dense_bfgs_allocation_bench` (measured 1.2–2.1x at the realistic
+// n_eta = 2–8 range) and `dense_bfgs_core_scratch_matches_dense_bfgs_core`
+// in `inner_optimizer_tests.rs`. Every buffer below is sized once by the
+// caller (`BfgsScratch::new(n)`) and reused across iterations instead of
+// being freshly allocated each iteration as `dense_bfgs_core` does. The
+// arithmetic is written to match `dense_bfgs_core`'s operation order
+// term-for-term (pre-scale-then-outer-product, same left-to-right matrix
+// product grouping) so the two are bit-identical, not just numerically
+// close — proven by the parity test, not assumed.
+// ---------------------------------------------------------------------------
+
+/// Reusable scratch for [`dense_bfgs_core_scratch`]: every `Vec`/`DVector`/
+/// `DMatrix` the dense BFGS iteration allocates fresh in `dense_bfgs_core`,
+/// sized once by `n` and reused across iterations (and, by the caller,
+/// across solver calls). `eye` is invariant (always the `n×n` identity) so
+/// it is built once here and never rewritten.
+struct BfgsScratch {
+    g_vec: DVector<f64>,
+    d_vec: DVector<f64>,
+    rho_s: DVector<f64>,
+    rho_y: DVector<f64>,
+    s_vec: DVector<f64>,
+    y_vec: DVector<f64>,
+    eye: DMatrix<f64>,
+    s_yt: DMatrix<f64>,
+    y_st: DMatrix<f64>,
+    s_st: DMatrix<f64>,
+    tmp_a: DMatrix<f64>,
+    tmp_b: DMatrix<f64>,
+    tmp_c: DMatrix<f64>,
+    x_new: Vec<f64>,
+}
+
+impl BfgsScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            g_vec: DVector::zeros(n),
+            d_vec: DVector::zeros(n),
+            rho_s: DVector::zeros(n),
+            rho_y: DVector::zeros(n),
+            s_vec: DVector::zeros(n),
+            y_vec: DVector::zeros(n),
+            eye: DMatrix::identity(n, n),
+            s_yt: DMatrix::zeros(n, n),
+            y_st: DMatrix::zeros(n, n),
+            s_st: DMatrix::zeros(n, n),
+            tmp_a: DMatrix::zeros(n, n),
+            tmp_b: DMatrix::zeros(n, n),
+            tmp_c: DMatrix::zeros(n, n),
+            x_new: vec![0.0; n],
+        }
+    }
+
+    /// In-place equivalent of `init_h_inv(n, precond)`, writing into an
+    /// existing buffer instead of allocating a new one.
+    fn reset_h_inv(h_inv: &mut DMatrix<f64>, precond: Option<&[f64]>) {
+        match precond {
+            Some(p) => {
+                h_inv.fill(0.0);
+                for (i, &pi) in p.iter().enumerate() {
+                    h_inv[(i, i)] = pi;
+                }
+            }
+            None => h_inv.fill_with_identity(),
+        }
+    }
+}
+
+/// Allocation-light twin of [`dense_bfgs_core`] — identical algorithm and
+/// operation order, differing only in where the per-iteration operands
+/// live. Called from `inner_minimize_with_grad`'s dense-BFGS branch; see the
+/// module comment above.
+#[allow(clippy::too_many_arguments)]
+fn dense_bfgs_core_scratch(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
+    enable_stall: bool,
+    scratch: &mut BfgsScratch,
+) -> bool {
+    let mut h_inv = init_h_inv(n, precond);
+    let mut g = grad(x);
+    let mut f_cur = obj(x);
+    let mut first_step = true;
+    let mut stall = 0u32;
+    let mut best_gnorm = f64::INFINITY;
+
+    for _iter in 0..max_iter {
+        let gnorm = grad_norm_metric(&g, stop_precond);
+        let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if gnorm < best_gnorm {
+            best_gnorm = gnorm;
+        }
+
+        if precond.is_none() && first_step && gnorm > 1.0 {
+            h_inv *= 1.0 / gnorm;
+            first_step = false;
+        }
+        if gnorm < tol {
+            return true;
+        }
+
+        scratch.g_vec.as_mut_slice().copy_from_slice(&g);
+        scratch.d_vec.gemm(-1.0, &h_inv, &scratch.g_vec, 0.0);
+
+        let dg: f64 = scratch
+            .d_vec
+            .iter()
+            .zip(g.iter())
+            .map(|(di, gi)| di * gi)
+            .sum();
+        if dg >= 0.0 {
+            BfgsScratch::reset_h_inv(&mut h_inv, precond);
+            scratch.d_vec.gemm(-1.0, &h_inv, &scratch.g_vec, 0.0);
+            let (alpha, f_new) = backtracking_line_search_scratch(
+                obj,
+                x,
+                scratch.d_vec.as_slice(),
+                &g,
+                n,
+                f_cur,
+                &mut scratch.x_new,
+            );
+            if alpha == 0.0 {
+                return false;
+            }
+            for i in 0..n {
+                x[i] += alpha * scratch.d_vec[i];
+            }
+            let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+            let stalled = enable_stall && obj_flat && !gnorm_improving;
+            f_cur = f_new;
+            if stalled {
+                return true;
+            }
+            g = grad(x);
+            continue;
+        }
+
+        let (alpha, f_new) = backtracking_line_search_scratch(
+            obj,
+            x,
+            scratch.d_vec.as_slice(),
+            &g,
+            n,
+            f_cur,
+            &mut scratch.x_new,
+        );
+        if alpha == 0.0 {
+            return false;
+        }
+
+        for i in 0..n {
+            scratch.s_vec[i] = alpha * scratch.d_vec[i];
+            x[i] += scratch.s_vec[i];
+        }
+        let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+        let stalled = enable_stall && obj_flat && !gnorm_improving;
+        f_cur = f_new;
+        if stalled {
+            return true;
+        }
+
+        let g_new = grad(x);
+        for i in 0..n {
+            scratch.y_vec[i] = g_new[i] - g[i];
+        }
+
+        let sy = scratch.s_vec.dot(&scratch.y_vec);
+        if sy > 1e-12 {
+            let rho = 1.0 / sy;
+            // Pre-scale-then-outer-product, matching `rho * &s_vec * y_vec.transpose()`'s
+            // left-to-right grouping term-for-term (see module comment).
+            scratch.rho_s.copy_from(&scratch.s_vec);
+            scratch.rho_s *= rho;
+            scratch.rho_y.copy_from(&scratch.y_vec);
+            scratch.rho_y *= rho;
+            scratch.s_yt.ger(1.0, &scratch.rho_s, &scratch.y_vec, 0.0);
+            scratch.y_st.ger(1.0, &scratch.rho_y, &scratch.s_vec, 0.0);
+            scratch.s_st.ger(1.0, &scratch.rho_s, &scratch.s_vec, 0.0);
+
+            scratch.tmp_a.copy_from(&scratch.eye);
+            scratch.tmp_a -= &scratch.s_yt;
+            scratch.tmp_b.copy_from(&scratch.eye);
+            scratch.tmp_b -= &scratch.y_st;
+
+            scratch.tmp_c.gemm(1.0, &scratch.tmp_a, &h_inv, 0.0);
+            h_inv.gemm(1.0, &scratch.tmp_c, &scratch.tmp_b, 0.0);
+            h_inv += &scratch.s_st;
+        }
+
+        g = g_new;
+    }
+
+    false
+}
+
+/// Allocation-light twin of [`backtracking_line_search`], writing trial
+/// points into a caller-supplied buffer instead of allocating one per call.
+fn backtracking_line_search_scratch(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    d: &[f64],
+    g: &[f64],
+    n: usize,
+    f0: f64,
+    x_new: &mut [f64],
+) -> (f64, f64) {
+    let c1 = 1e-4;
+    let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
+    if !(dg < 0.0) || !dg.is_finite() {
+        return (0.0, f0);
+    }
+
+    let mut alpha = 1.0;
+    for _ in 0..MAX_LINE_SEARCH_TRIALS {
+        for i in 0..n {
+            x_new[i] = x[i] + alpha * d[i];
+        }
+        let f_new = obj(x_new);
+        if f_new.is_finite() && f_new <= f0 + c1 * alpha * dg {
+            return (alpha, f_new);
+        }
         let denom = 2.0 * (f_new - f0 - dg * alpha);
         let alpha_quad = if f_new.is_finite() && denom > 0.0 {
             -dg * alpha * alpha / denom

@@ -853,6 +853,318 @@ fn inner_solver_scaling_bench() {
     }
 }
 
+/// D2 (perf-stack #1345/#1217 §6): [`dense_bfgs_core_scratch`] must return the
+/// exact same iterate, objective path, and convergence flag as
+/// [`dense_bfgs_core`] — this is the "operand location changed, arithmetic did
+/// not" claim from the handoff, proven rather than assumed. Bit-identical is
+/// the exact contract (see `inner_restarts_bit_identical_on_wellidentified_subject`
+/// for the same convention): the two solvers are pure and deterministic, so
+/// `assert_eq!` on the returned `f64`s is the right bar, not a tolerance.
+///
+/// Two objectives at each `n`: an ill-conditioned quadratic (exercises the
+/// ordinary BFGS-update branch many times) and a generalized Rosenbrock
+/// (nonlinear, curved enough to also exercise the `dg >= 0` cold-restart
+/// branch and repeated backtracking) — both closed forms so the comparison
+/// isolates the solver, not a prediction path.
+#[test]
+fn dense_bfgs_core_scratch_matches_dense_bfgs_core() {
+    for &n in &[2usize, 3, 5, 8] {
+        // Quadratic: f(x) = ½ Σ_i (x_i − x_{i-1})² + ½ x_0² − Σ_i x_i.
+        let quad_obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.5 * x[0] * x[0];
+            for i in 1..n {
+                let d = x[i] - x[i - 1];
+                f += 0.5 * d * d;
+            }
+            f - x.iter().sum::<f64>()
+        };
+        let quad_grad = move |x: &[f64]| -> Vec<f64> {
+            let mut g = vec![0.0; n];
+            for i in 0..n {
+                let mut v = 2.0 * x[i];
+                if i > 0 {
+                    v -= x[i - 1];
+                }
+                if i + 1 < n {
+                    v -= x[i + 1];
+                }
+                g[i] = v - 1.0;
+            }
+            g
+        };
+
+        // Generalized Rosenbrock: f(x) = Σ_{i=0}^{n-2} [100(x_{i+1} − x_i²)² + (1 − x_i)²].
+        let rosen_obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.0;
+            for i in 0..n - 1 {
+                let t1 = x[i + 1] - x[i] * x[i];
+                let t2 = 1.0 - x[i];
+                f += 100.0 * t1 * t1 + t2 * t2;
+            }
+            f
+        };
+        let rosen_grad = move |x: &[f64]| -> Vec<f64> {
+            let mut g = vec![0.0; n];
+            for i in 0..n - 1 {
+                let t1 = x[i + 1] - x[i] * x[i];
+                g[i] += -400.0 * x[i] * t1 - 2.0 * (1.0 - x[i]);
+                g[i + 1] += 200.0 * t1;
+            }
+            g
+        };
+
+        #[allow(clippy::type_complexity)]
+        let cases: [(
+            &str,
+            &dyn Fn(&[f64]) -> f64,
+            &dyn Fn(&[f64]) -> Vec<f64>,
+            Vec<f64>,
+        ); 2] = [
+            (
+                "quadratic",
+                &quad_obj as &dyn Fn(&[f64]) -> f64,
+                &quad_grad as &dyn Fn(&[f64]) -> Vec<f64>,
+                vec![0.0; n],
+            ),
+            (
+                "rosenbrock",
+                &rosen_obj as &dyn Fn(&[f64]) -> f64,
+                &rosen_grad as &dyn Fn(&[f64]) -> Vec<f64>,
+                vec![-1.2; n],
+            ),
+        ];
+        for (label, obj, grad, x0) in cases {
+            let mut x_ref = x0.clone();
+            let ok_ref = dense_bfgs_core(&obj, &grad, &mut x_ref, n, 500, 1e-10, None, None, false);
+
+            let mut x_scratch = x0.clone();
+            let mut scratch = BfgsScratch::new(n);
+            let ok_scratch = dense_bfgs_core_scratch(
+                &obj,
+                &grad,
+                &mut x_scratch,
+                n,
+                500,
+                1e-10,
+                None,
+                None,
+                false,
+                &mut scratch,
+            );
+
+            assert_eq!(
+                ok_scratch, ok_ref,
+                "{label} n={n}: convergence flag must match"
+            );
+            for k in 0..n {
+                assert_eq!(
+                    x_scratch[k], x_ref[k],
+                    "{label} n={n}: x[{k}] must be bit-identical, scratch {} vs dense {}",
+                    x_scratch[k], x_ref[k]
+                );
+            }
+            assert_eq!(
+                obj(&x_scratch),
+                obj(&x_ref),
+                "{label} n={n}: objective at the returned iterate must be bit-identical"
+            );
+        }
+    }
+}
+
+/// D2's own gating step (perf-stack #1345/#1217 §6): measure the allocation
+/// overhead of [`dense_bfgs_core`] against [`dense_bfgs_core_scratch`] at the
+/// realistic `n_eta` range before deciding whether Stage 2 (wiring the
+/// scratch variant into `find_ebe`'s hot path) is worth building. Same shape
+/// as [`inner_solver_scaling_bench`], swept at `n = 2, 4, 8` instead of that
+/// bench's `n ≥ 4` scaling range.
+#[test]
+#[ignore = "bench: cargo test --release ... -- --ignored --nocapture inner_dense_bfgs_allocation_bench"]
+fn inner_dense_bfgs_allocation_bench() {
+    use std::time::Instant;
+    eprintln!("dense BFGS allocation overhead (analytic-gradient Laplacian quadratic):");
+    for &n in &[2usize, 4, 8] {
+        let obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.5 * x[0] * x[0];
+            for i in 1..n {
+                let d = x[i] - x[i - 1];
+                f += 0.5 * d * d;
+            }
+            f - x.iter().sum::<f64>()
+        };
+        let grad = move |x: &[f64]| -> Vec<f64> {
+            let mut g = vec![0.0; n];
+            for i in 0..n {
+                let mut v = 2.0 * x[i];
+                if i > 0 {
+                    v -= x[i - 1];
+                }
+                if i + 1 < n {
+                    v -= x[i + 1];
+                }
+                g[i] = v - 1.0;
+            }
+            g
+        };
+        let runs = 2000;
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            let mut x = vec![0.0; n];
+            std::hint::black_box(dense_bfgs_core(
+                &obj, &grad, &mut x, n, 2000, 1e-8, None, None, false,
+            ));
+        }
+        let t_current = t0.elapsed().as_secs_f64() * 1e6 / runs as f64;
+
+        // Scratch allocated once, outside the timed loop — the realistic
+        // per-`find_ebe`-call cost this stage is trying to measure, not the
+        // scratch's own one-time construction.
+        let mut scratch = BfgsScratch::new(n);
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            let mut x = vec![0.0; n];
+            std::hint::black_box(dense_bfgs_core_scratch(
+                &obj,
+                &grad,
+                &mut x,
+                n,
+                2000,
+                1e-8,
+                None,
+                None,
+                false,
+                &mut scratch,
+            ));
+        }
+        let t_scratch = t0.elapsed().as_secs_f64() * 1e6 / runs as f64;
+
+        eprintln!(
+            "  n={n:4}  current={t_current:8.3} us  scratch={t_scratch:8.3} us  current/scratch={:.2}x",
+            t_current / t_scratch
+        );
+    }
+}
+
+/// D2, extended to Nelder-Mead (perf-stack #1345/#1217 §6):
+/// [`nelder_mead_minimize_scratch`] must return the exact same iterate,
+/// objective path, and convergence flag as
+/// [`nelder_mead_minimize_reference`] — same bit-identical bar and rationale
+/// as `dense_bfgs_core_scratch_matches_dense_bfgs_core`. NM is derivative-free
+/// and deterministic (no RNG), so `assert_eq!` on the returned `f64`s is the
+/// right bar here too. Same two fixtures — quadratic exercises the ordinary
+/// reflect/expand path, Rosenbrock's curvature also exercises contraction and
+/// the shrink branch.
+#[test]
+fn nelder_mead_minimize_scratch_matches_reference() {
+    for &n in &[2usize, 3, 5, 8] {
+        let quad_obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.5 * x[0] * x[0];
+            for i in 1..n {
+                let d = x[i] - x[i - 1];
+                f += 0.5 * d * d;
+            }
+            f - x.iter().sum::<f64>()
+        };
+        let rosen_obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.0;
+            for i in 0..n - 1 {
+                let t1 = x[i + 1] - x[i] * x[i];
+                let t2 = 1.0 - x[i];
+                f += 100.0 * t1 * t1 + t2 * t2;
+            }
+            f
+        };
+
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, &dyn Fn(&[f64]) -> f64, Vec<f64>); 2] = [
+            (
+                "quadratic",
+                &quad_obj as &dyn Fn(&[f64]) -> f64,
+                vec![0.3; n],
+            ),
+            (
+                "rosenbrock",
+                &rosen_obj as &dyn Fn(&[f64]) -> f64,
+                vec![-1.2; n],
+            ),
+        ];
+        for (label, obj, x0) in cases {
+            let mut x_ref = x0.clone();
+            let ok_ref = nelder_mead_minimize_reference(&obj, &mut x_ref, n, 2000, 1e-10);
+
+            let mut x_scratch = x0.clone();
+            let mut scratch = NelderMeadScratch::new(n);
+            let ok_scratch =
+                nelder_mead_minimize_scratch(&obj, &mut x_scratch, n, 2000, 1e-10, &mut scratch);
+
+            assert_eq!(
+                ok_scratch, ok_ref,
+                "{label} n={n}: convergence flag must match"
+            );
+            for k in 0..n {
+                assert_eq!(
+                    x_scratch[k], x_ref[k],
+                    "{label} n={n}: x[{k}] must be bit-identical, scratch {} vs reference {}",
+                    x_scratch[k], x_ref[k]
+                );
+            }
+            assert_eq!(
+                obj(&x_scratch),
+                obj(&x_ref),
+                "{label} n={n}: objective at the returned iterate must be bit-identical"
+            );
+        }
+    }
+}
+
+/// D2's gating step, extended to Nelder-Mead (perf-stack #1345/#1217 §6):
+/// measure the allocation overhead of [`nelder_mead_minimize_reference`]
+/// against [`nelder_mead_minimize_scratch`] at `n = 2, 4, 8`, mirroring
+/// [`inner_dense_bfgs_allocation_bench`].
+#[test]
+#[ignore = "bench: cargo test --release ... -- --ignored --nocapture inner_nelder_mead_allocation_bench"]
+fn inner_nelder_mead_allocation_bench() {
+    use std::time::Instant;
+    eprintln!("Nelder-Mead allocation overhead (quadratic):");
+    for &n in &[2usize, 4, 8] {
+        let obj = move |x: &[f64]| -> f64 {
+            let mut f = 0.5 * x[0] * x[0];
+            for i in 1..n {
+                let d = x[i] - x[i - 1];
+                f += 0.5 * d * d;
+            }
+            f - x.iter().sum::<f64>()
+        };
+        let runs = 2000;
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            let mut x = vec![0.3; n];
+            std::hint::black_box(nelder_mead_minimize_reference(&obj, &mut x, n, 2000, 1e-8));
+        }
+        let t_current = t0.elapsed().as_secs_f64() * 1e6 / runs as f64;
+
+        let mut scratch = NelderMeadScratch::new(n);
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            let mut x = vec![0.3; n];
+            std::hint::black_box(nelder_mead_minimize_scratch(
+                &obj,
+                &mut x,
+                n,
+                2000,
+                1e-8,
+                &mut scratch,
+            ));
+        }
+        let t_scratch = t0.elapsed().as_secs_f64() * 1e6 / runs as f64;
+
+        eprintln!(
+            "  n={n:4}  current={t_current:8.3} us  scratch={t_scratch:8.3} us  current/scratch={:.2}x",
+            t_current / t_scratch
+        );
+    }
+}
+
 /// The interpolating backtracking line search returns a step that satisfies
 /// the Armijo sufficient-decrease test and strictly lowers the objective,
 /// using only a handful of trial evaluations (the property the FOCEI inner
