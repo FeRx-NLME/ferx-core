@@ -42,29 +42,14 @@ use std::path::Path;
 
 /// Which parameter family a source estimate belongs to.
 ///
-/// Carried so the caller can match a source estimate to a target coordinate on
-/// *name and kind*. Name alone is not enough: a source θ called `CL` and a
-/// target Ω called `CL` are both legal, and importing the θ's natural value as
-/// an Ω variance prior would be silently wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EstimateKind {
-    Theta,
-    Omega,
-    Sigma,
-    Kappa,
-}
-
-impl EstimateKind {
-    /// The `[parameters]` keyword this family is declared with, for diagnostics.
-    pub(crate) fn keyword(self) -> &'static str {
-        match self {
-            EstimateKind::Theta => "theta",
-            EstimateKind::Omega => "omega",
-            EstimateKind::Sigma => "sigma",
-            EstimateKind::Kappa => "kappa",
-        }
-    }
-}
+/// The same type the resolved prior carries ([`crate::types::ParameterKind`]),
+/// deliberately rather than a private twin: it is matched against a target
+/// coordinate's family here and then travels on the `ParameterPrior` into the
+/// packed resolution, so a second spelling would be two enums that have to agree
+/// about what "Omega" means. Name alone is not enough at either end — a source θ
+/// called `CL` and a target Ω called `CL` are both legal, and importing the θ's
+/// natural value as an Ω variance prior would be silently wrong.
+pub(crate) use crate::types::ParameterKind as EstimateKind;
 
 /// One parameter's estimate and standard error, as read from a previous fit.
 #[derive(Debug, Clone)]

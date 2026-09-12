@@ -129,10 +129,20 @@ typed off the source run's own output — no new convention, and the report read
 the same for an imported prior as for a typed one.
 
 A relative path is resolved against the **model file's** directory, like
-`[data] path`, so a run directory holding a model and the fit it updates from
-works from any working directory.
+`[data] path`, so a model and the fit it updates from can sit together in a run
+directory.
 
-### Which file
+The source fit is read **once, when the model is parsed** — not once per
+estimation stage. Two things follow that are worth knowing:
+
+- a `from_fit` that cannot be honoured (missing file, wrong format, nothing to
+  import) fails at parse time, so `ferx check` refuses the model and the error
+  names the path rather than surfacing halfway through a fit;
+- the prior the optimizer minimised, the prior the covariance step used and the
+  prior the report prints are guaranteed to be the same one, even if the source
+  file changes while the fit is running.
+
+### Which file, and from where
 
 | File | Written by | Precision |
 |---|---|---|
@@ -144,6 +154,23 @@ The YAML is the one every run writes, so it is the default answer. It is
 formatted to six decimal places, which matters only when a parameter is smaller
 than about `1e-4` — an Ω variance near a boundary, an additive σ in small units.
 Use `.json` or `.fitrx` when it is.
+
+::: {.callout-important}
+## Run the parent from the directory the update lives in
+
+The CLI writes `{model}-fit.yaml` into the **working directory**, while
+`from_fit` resolves against the **model file's** directory. Those are the same
+place only when you run from where the models are:
+
+```bash
+cd my-run
+ferx parent.ferx --data ../data/study.csv   # writes ./parent-fit.yaml
+ferx update.ferx --data ../data/local.csv   # reads  ./parent-fit.yaml
+```
+
+Running the parent from one directory and the update from another gives
+`failed to read …: No such file or directory`, naming the path it looked for.
+:::
 
 ### What is imported, and what is skipped
 
@@ -166,6 +193,10 @@ published model is usually larger than the one being updated. But an import that
 lands **nothing at all** is a hard error, for the same reason an unresolvable
 typed prior is: the alternative is an unpenalized fit that looks exactly like a
 penalized one.
+
+Matching is on **name and family**, not name alone. θ names and η names are
+separate namespaces, so `theta CL` and `omega CL` can both exist in one model;
+a source θ called `CL` lands on the θ and never on the Ω.
 
 ### Scales are converted for you
 

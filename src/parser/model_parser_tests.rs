@@ -4978,6 +4978,19 @@ fn test_parse_all_example_ferx_files() {
                 continue;
             }
         }
+        // A `[priors] from_fit` model reads the previous run it updates from
+        // *while parsing* (#254 phase 2), so it is the one example that is not
+        // self-contained: parsing it requires that run's output to be sitting
+        // beside it, which a checked-out tree does not have. Skipping it here is
+        // not a coverage gap — `the_update_example_names_a_file_the_documented_commands_produce`
+        // (tests/parameter_priors.rs) stages the parent fit in a temp directory
+        // and parses this same file for real, which is the stronger check.
+        {
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            if block_at_line_start(&src, "priors") {
+                continue;
+            }
+        }
         seen += 1;
         if let Err(e) = parse_full_model_file(&path) {
             panic!("failed to parse {}: {}", path.display(), e);
@@ -22757,29 +22770,70 @@ fn from_fit_model(block: &str) -> String {
     format!("{}\n[priors]\n{block}\n", priored_model(PRIOR_BASE_PARAMS))
 }
 
-/// The block parses, and the path arrives **verbatim** — resolution against the
-/// model file's directory happens in `parse_full_model_file`, which only the
-/// file entry points reach.
+/// A minimal `{model}-fit.yaml` naming [`PRIOR_BASE_PARAMS`]'s parameters, so a
+/// `from_fit` in these tests has something real to read.
+///
+/// The source fit is read **during** the parse (#254 phase 2), so these are no
+/// longer pure grammar tests: a `[priors]` block that names a file which is not
+/// there fails to parse, which is the whole point of moving the read here.
+fn parent_fit_yaml() -> &'static str {
+    "theta:\n  TVCL:\n    estimate: 0.150000\n    se: 0.030000\n  \
+     TVV:\n    estimate: 9.800000\n    se: 0.980000\n\n\
+     omega:\n  ETA_CL:\n    variance: 0.090000\n    se: 0.036000\n\n\
+     sigma:  # error model: proportional\n  \
+     PROP_ERR:\n    estimate: 0.200000\n    se: 0.020000\n"
+}
+
+/// Write [`parent_fit_yaml`] as `parent-fit.yaml` in a fresh temp directory.
+fn parent_fit_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("parent-fit.yaml"), parent_fit_yaml()).unwrap();
+    dir
+}
+
+/// Every spelling of the path reaches the same file, and the block is
+/// **consumed**: the priors land on `model.priors` and `prior_from_fit` is left
+/// `None`, because the parser is the only thing that reads the source fit.
 #[test]
-fn priors_block_carries_the_from_fit_path_verbatim() {
+fn priors_block_reads_the_from_fit_path_in_every_spelling() {
+    let dir = parent_fit_dir();
+    let path = dir.path().join("parent-fit.yaml");
+    let p = path.display();
     for line in [
-        "  from_fit = parent-fit.yaml",
-        "  from_fit = \"parent-fit.yaml\"",
-        "  from_fit = 'parent-fit.yaml'",
-        "  FROM_FIT = parent-fit.yaml",
+        format!("  from_fit = {p}"),
+        format!("  from_fit = \"{p}\""),
+        format!("  from_fit = '{p}'"),
+        format!("  FROM_FIT = {p}"),
     ] {
-        let model = parse_full_model(&from_fit_model(line))
+        let model = parse_full_model(&from_fit_model(&line))
             .unwrap_or_else(|e| panic!("`{line}` should parse: {e}"))
             .model;
-        assert_eq!(
-            model.prior_from_fit.as_deref(),
-            Some("parent-fit.yaml"),
-            "{line}"
+        assert!(
+            model.prior_from_fit.is_none(),
+            "`{line}`: the path must be consumed by the expansion"
         );
-        // The block adds no inline prior — the two channels stay separate until
-        // `PriorSet::build` merges them.
-        assert!(model.priors.is_empty(), "{line}");
+        assert_eq!(model.priors.len(), 4, "`{line}`: {:?}", model.priors);
+        // …and each imported prior knows which family it is on, which is what
+        // lets it resolve in a model that reuses a name across two.
+        assert!(
+            model.priors.iter().all(|p| p.kind.is_some()),
+            "`{line}`: {:?}",
+            model.priors
+        );
     }
+}
+
+/// A `[priors]` block naming a file that is not there fails **at parse time**.
+///
+/// This is the behaviour the read was moved into the parser for: `ferx check`
+/// refuses the model, and no downstream entry point can be handed a model whose
+/// priors quietly failed to materialise.
+#[test]
+fn a_from_fit_that_cannot_be_read_fails_the_parse() {
+    let err = parse_full_model(&from_fit_model("  from_fit = /no/such/parent-fit.yaml"))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("/no/such/parent-fit.yaml"), "{err}");
 }
 
 /// No `[priors]` block leaves the field `None`, so an unpriored model reads no
@@ -22837,31 +22891,29 @@ fn priors_is_a_known_block_name() {
 /// fit it updates from works from any working directory.
 #[test]
 fn a_relative_from_fit_resolves_against_the_model_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = parent_fit_dir();
     let model_path = dir.path().join("update.ferx");
     std::fs::write(&model_path, from_fit_model("  from_fit = parent-fit.yaml")).unwrap();
 
+    // The bare name resolves against the model file, so the parse finds the
+    // parent fit sitting beside it and imports.
     let model = parse_model_file(&model_path).unwrap();
-    assert_eq!(
-        model.prior_from_fit.as_deref(),
-        Some(
-            dir.path()
-                .join("parent-fit.yaml")
-                .to_string_lossy()
-                .as_ref()
-        )
-    );
+    assert_eq!(model.priors.len(), 4, "{:?}", model.priors);
 
-    // An absolute path is left alone.
-    let abs = dir.path().join("elsewhere.yaml");
-    std::fs::write(
-        &model_path,
-        from_fit_model(&format!("  from_fit = {}", abs.display())),
-    )
-    .unwrap();
-    let model = parse_model_file(&model_path).unwrap();
-    assert_eq!(
-        model.prior_from_fit.as_deref(),
-        Some(abs.to_string_lossy().as_ref())
-    );
+    // The straddle: the identical text parsed from a *string* has no directory
+    // to resolve against, so the bare name is looked for in the working
+    // directory and is not found. Without this the test passes on an
+    // implementation that ignores `model_dir` entirely.
+    let err = parse_full_model(&std::fs::read_to_string(&model_path).unwrap())
+        .map(|_| ())
+        .expect_err("a bare name has nothing to resolve against from a string");
+    assert!(err.contains("parent-fit.yaml"), "{err}");
+
+    // An absolute path is left alone — it reaches the same file from either
+    // entry point.
+    let abs = dir.path().join("parent-fit.yaml");
+    let abs_src = from_fit_model(&format!("  from_fit = {}", abs.display()));
+    std::fs::write(&model_path, &abs_src).unwrap();
+    assert_eq!(parse_model_file(&model_path).unwrap().priors.len(), 4);
+    assert_eq!(parse_full_model(&abs_src).unwrap().model.priors.len(), 4);
 }

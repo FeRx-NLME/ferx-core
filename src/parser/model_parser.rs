@@ -1416,21 +1416,44 @@ pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
 pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
-    let mut parsed = parse_full_model(&content)?;
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    // `[priors] from_fit` (#254 phase 2) is resolved **inside** the parse, not
+    // after it: the import is expanded during parsing (it is the only place the
+    // fit file is read), so the base directory has to be in scope by then. A
+    // model and the previous fit it updates from travel together in a run
+    // directory, and the user runs `ferx` from wherever they happen to be.
+    let mut parsed = parse_full_model_with(
+        &content,
+        &ParseBindings {
+            model_dir: dir.map(|d| d.to_path_buf()),
+            ..ParseBindings::default()
+        },
+    )?;
     // A relative `[data] path` is relative to the model file's own directory
     // (mirrors NONMEM's `$DATA` resolution against the control stream), not
-    // the process's current working directory.
+    // the process's current working directory. Still resolved afterwards —
+    // nothing reads it during the parse.
     if let Some(data_path) = &parsed.data_path {
         parsed.data_path = Some(resolve_against(data_path, dir));
     }
-    // `[priors] from_fit` (#254 phase 2) resolves the same way, for the same
-    // reason: a model and the previous fit it updates from travel together in a
-    // run directory, and the user runs `ferx` from wherever they happen to be.
-    if let Some(from_fit) = &parsed.model.prior_from_fit {
-        parsed.model.prior_from_fit = Some(resolve_against(from_fit, dir));
-    }
     Ok(parsed)
+}
+
+/// Read `model.prior_from_fit` and turn it into ordinary
+/// [`crate::types::ParameterPrior`]s on `model.priors` (#254 phase 2).
+///
+/// Every parse entry point calls this, so a model that came from
+/// [`parse_model_file`] / [`parse_model_string`] is already expanded and calling
+/// it again is a no-op. It is public for the other producer of a
+/// `CompiledModel` — a caller that builds one field by field (ferx-r) and sets
+/// `prior_from_fit` itself has nothing to read the fit file for it, and
+/// `PriorSet::build` refuses an unexpanded model rather than fitting it
+/// unpenalized.
+///
+/// A relative path resolves against the process's working directory; resolve it
+/// yourself first if it should be relative to something else.
+pub fn expand_prior_from_fit(model: &mut CompiledModel) -> Result<(), String> {
+    crate::estimation::priors::expand_prior_from_fit(model)
 }
 
 /// Join a model-file-relative path onto `dir`, leaving an absolute one alone.
@@ -1487,6 +1510,7 @@ pub fn parse_full_model_bound(
         &ParseBindings {
             levels: level_bindings.clone(),
             covariate_stats: CovariateStatBindings::new(),
+            ..ParseBindings::default()
         },
     )
 }
@@ -1503,6 +1527,18 @@ pub struct ParseBindings {
     pub levels: LevelBindings,
     /// Covariate summary statistics, for symbolic `center = median` and friends.
     pub covariate_stats: CovariateStatBindings,
+    /// Directory a relative `[priors] from_fit` path resolves against (#254
+    /// phase 2), normally the model file's own.
+    ///
+    /// This one is not data-derived like the two above, but it travels the same
+    /// way and for the same reason: the import is expanded *during* the parse —
+    /// it is the only place the fit file is read — so the base directory has to
+    /// be in scope by then. Resolving it afterwards, the way `[data] path` is,
+    /// would mean expanding against the wrong directory and then re-expanding.
+    ///
+    /// `None` (the default, and what every string entry point supplies) resolves
+    /// against the process's working directory.
+    pub model_dir: Option<std::path::PathBuf>,
 }
 
 /// [`parse_full_model`] with every data-derived binding supplied.
@@ -3110,7 +3146,15 @@ pub fn parse_full_model_with(
         .get("priors")
         .map(|lines| parse_priors_block(lines))
         .transpose()?
-        .flatten();
+        .flatten()
+        .map(|raw| resolve_against(&raw, bindings.model_dir.as_deref()));
+    // Read the source fit and turn it into ordinary priors **here**, once. The
+    // read used to live in `PriorSet::build`, which runs per estimation stage
+    // and whose caller swallows errors into an empty set — so a source fit that
+    // moved between the fit and `run_covariance` silently un-penalized the
+    // standard errors. Doing it at parse time also closes the window in which
+    // the file could change mid-fit. See `estimation::priors::expand_prior_from_fit`.
+    crate::estimation::priors::expand_prior_from_fit(&mut model)?;
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
@@ -13388,7 +13432,7 @@ fn parse_parameters(
         // Name the prior attaches to, filled in by whichever declaration arm
         // matched. `None` at the bottom of the loop with a `prior_decl` present
         // means the prior had no home — an error, never a silent drop.
-        let mut prior_target: Option<String> = None;
+        let mut prior_target: Option<(String, crate::types::ParameterKind)> = None;
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
             let block = match caps.get(2) {
@@ -13409,7 +13453,7 @@ fn parse_parameters(
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
             match block {
                 None => {
-                    prior_target = Some(name.clone());
+                    prior_target = Some((name.clone(), crate::types::ParameterKind::Theta));
                     thetas.push(ThetaSpec {
                         name,
                         init,
@@ -13627,7 +13671,7 @@ fn parse_parameters(
             let variance = if init_as_sd { raw * raw } else { raw };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             eta_names_ordered.push(name.clone());
-            prior_target = Some(name.clone());
+            prior_target = Some((name.clone(), crate::types::ParameterKind::Omega));
             omegas.push(OmegaSpec {
                 name,
                 variance,
@@ -13657,7 +13701,7 @@ fn parse_parameters(
             }
             let value = if init_as_sd { raw } else { raw.sqrt() };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
-            prior_target = Some(name.clone());
+            prior_target = Some((name.clone(), crate::types::ParameterKind::Sigma));
             sigmas.push(SigmaSpec {
                 name,
                 value,
@@ -13685,7 +13729,7 @@ fn parse_parameters(
             kappa_names_ordered.push(name.clone());
             kappa_weights_ordered.push(weight_expr.clone());
             weight_consumed = true;
-            prior_target = Some(name.clone());
+            prior_target = Some((name.clone(), crate::types::ParameterKind::Kappa));
             kappas.push(KappaSpec {
                 name,
                 variance,
@@ -13698,10 +13742,13 @@ fn parse_parameters(
         // that reads as regularized and fits as if it were not.
         if let Some((value, spread)) = prior_decl {
             match prior_target {
-                Some(name) => priors.push(crate::types::ParameterPrior {
+                Some((name, kind)) => priors.push(crate::types::ParameterPrior {
                     name,
                     value,
                     spread,
+                    // Which declaration the tail was peeled off, so a model that
+                    // reuses one name across two families still resolves.
+                    kind: Some(kind),
                 }),
                 None => {
                     return Err(format!(

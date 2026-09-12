@@ -8,15 +8,17 @@
 # `prior(estimate, rse = SE/estimate)`.
 #
 # Run the parent model first — it must do its covariance step, since the import
-# reads the standard errors:
+# reads the standard errors. **Run both from this directory**, because the CLI
+# writes `{model}-fit.yaml` into the working directory while `from_fit` below
+# resolves against the model file's own directory; running from the repo root
+# would write `./warfarin-fit.yaml` and look for `./examples/warfarin-fit.yaml`:
 #
-#   cargo run --release -p ferx-cli -- examples/warfarin.ferx \
-#       --data data/warfarin.csv
+#   cd examples
+#   cargo run --release -p ferx-cli -- warfarin.ferx --data ../data/warfarin.csv
 #
-# …which writes `warfarin-fit.yaml` next to the model. Then run this one:
+# …which writes `warfarin-fit.yaml` here, next to this model. Then:
 #
-#   cargo run --release -p ferx-cli -- examples/warfarin_update.ferx \
-#       --data data/warfarin.csv
+#   cargo run --release -p ferx-cli -- warfarin_update.ferx --data ../data/warfarin.csv
 #
 # In a real update the second `--data` would be the small local dataset — a
 # handful of TDM subjects, a paediatric cohort — and the prior is what keeps the

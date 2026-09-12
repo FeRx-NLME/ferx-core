@@ -2056,6 +2056,34 @@ pub enum PriorSpread {
     Sd(f64),
 }
 
+/// Which `[parameters]` family a prior is declared on (#254).
+///
+/// θ names and η names are separate namespaces, so a model may legally carry
+/// `theta CL(…)` and `omega CL ~ 0.09` at once. Resolving a prior by name alone
+/// cannot tell those apart, and both producers of a prior know which one was
+/// meant — the parser saw the declaration the `prior(...)` was attached to, and
+/// `[priors] from_fit` matched the source estimate on family as well as name. So
+/// the family travels with the prior rather than being re-derived from a string.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterKind {
+    Theta,
+    Omega,
+    Sigma,
+    Kappa,
+}
+
+impl ParameterKind {
+    /// The `[parameters]` keyword this family is declared with, for diagnostics.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ParameterKind::Theta => "theta",
+            ParameterKind::Omega => "omega",
+            ParameterKind::Sigma => "sigma",
+            ParameterKind::Kappa => "kappa",
+        }
+    }
+}
+
 /// A prior declared on one parameter, for penalized-ML / MAP estimation (#254).
 ///
 /// Written inline next to the parameter it constrains:
@@ -2082,6 +2110,15 @@ pub struct ParameterPrior {
     pub value: f64,
     /// Prior spread.
     pub spread: PriorSpread,
+    /// Which family [`Self::name`] refers to, when the producer knew.
+    ///
+    /// `None` means "resolve by name alone", which is unambiguous for every
+    /// model that does not reuse one name across two families and is what a
+    /// caller building a prior by hand can always fall back to. `Some` is what
+    /// the parser and `[priors] from_fit` supply, and it is the only thing that
+    /// can resolve `theta CL` against `omega CL` in the same model.
+    #[serde(default)]
+    pub kind: Option<ParameterKind>,
 }
 
 /// One priored parameter's line in the fit report (#254).
@@ -3859,8 +3896,25 @@ pub struct CompiledModel {
     /// path` resolves; a model parsed from a string in memory has no directory
     /// and resolves against the process's working directory.
     ///
-    /// Expanded into prior terms by the internal `PriorSet`, alongside
-    /// [`Self::priors`], once per estimation stage.
+    /// **Consumed by the parser.** Every parse entry point calls
+    /// `parser::model_parser::expand_prior_from_fit`, which reads the source fit
+    /// **once**, appends the imported priors to [`Self::priors`], records what it
+    /// declined to import in [`Self::parse_warnings`], and leaves this field
+    /// `None`. So a model that came from a file or a string has already been
+    /// expanded, and a `Some` here means the expansion has not run.
+    ///
+    /// The read deliberately does *not* live in the estimation path. It used to,
+    /// and that was wrong twice over: `build_prior_set` turns a failure into an
+    /// *empty* prior set, and `run_covariance` / `run_sir` never call the
+    /// validation that would have caught it — so a source fit that moved between
+    /// the fit and the post-fit step silently un-penalized the standard errors.
+    /// Reading per stage also left a window in which the file could change
+    /// mid-fit, so the prior the optimizer minimised and the prior the report
+    /// printed need not have been the same one.
+    ///
+    /// A caller that assembles a `CompiledModel` field by field and sets this
+    /// must call `expand_prior_from_fit` itself; an unexpanded model is refused
+    /// rather than fit unpenalized.
     pub prior_from_fit: Option<String>,
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.

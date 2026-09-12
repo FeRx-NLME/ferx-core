@@ -23,6 +23,13 @@ const TAU_40: f64 = 0.385_253_170_159_926_7;
 /// touches only the packed layout and the `*_init_as_sd` flags.
 struct Fixture {
     model: CompiledModel,
+    /// Error from expanding `[priors] from_fit`, replayed by [`Self::build`].
+    ///
+    /// The expansion runs eagerly in [`with_from_fit`] because that is where
+    /// production runs it — the parser, once, before anything resolves a
+    /// coordinate — but the tests that exist to pin its *rejections* want the
+    /// error from `build()`, where the rest of the rejections come from.
+    expand_err: Option<String>,
 }
 
 impl Fixture {
@@ -51,14 +58,22 @@ impl Fixture {
         };
         model.omega_init_as_sd = vec![false];
         model.sigma_init_as_sd = vec![false];
-        Self { model }
+        Self {
+            model,
+            expand_err: None,
+        }
     }
 
+    /// A typed `prior(...)` that names no family, the way a hand-built
+    /// `ParameterPrior` may. Every fixture here has one parameter per family, so
+    /// the name resolves on its own; the family-qualified form is exercised by
+    /// `a_name_shared_by_a_theta_and_an_omega_still_resolves`.
     fn with_prior(mut self, name: &str, value: f64, spread: PriorSpread) -> Self {
         self.model.priors.push(ParameterPrior {
             name: name.into(),
             value,
             spread,
+            kind: None,
         });
         self
     }
@@ -93,7 +108,15 @@ impl Fixture {
     }
 
     fn build(&self) -> Result<PriorSet, String> {
+        if let Some(e) = &self.expand_err {
+            return Err(e.clone());
+        }
         PriorSet::build(&self.model, &self.model.default_params)
+    }
+
+    /// What `[priors] from_fit` declined to import, as the parser recorded it.
+    fn notes(&self) -> &[String] {
+        &self.model.parse_warnings
     }
 
     fn set(&self) -> PriorSet {
@@ -647,6 +670,9 @@ fn with_from_fit(f: Fixture, source: &crate::types::FitResult) -> (Fixture, temp
     crate::io::output::write_estimates_yaml(source, path.to_str().unwrap()).unwrap();
     let mut f = f;
     f.model.prior_from_fit = Some(path.to_string_lossy().into_owned());
+    // Expand here, exactly where the parser does it — once, before anything
+    // resolves a coordinate. `Fixture::build` replays any error.
+    f.expand_err = super::expand_prior_from_fit(&mut f.model).err();
     (f, dir)
 }
 
@@ -849,11 +875,11 @@ fn a_fixed_target_parameter_is_skipped_with_a_note() {
     let set = f.set();
     assert_eq!(set.summarize(&f.packed()).len(), 2);
     assert!(
-        set.notes()
+        f.notes()
             .iter()
             .any(|n| n.contains("TVCL") && n.contains("FIX")),
         "{:?}",
-        set.notes()
+        f.notes()
     );
 
     // The typed form on the same parameter is still a hard error — the two
@@ -875,11 +901,11 @@ fn a_source_parameter_without_a_standard_error_is_skipped() {
     let set = f.set();
     assert_eq!(set.summarize(&f.packed()).len(), 2);
     assert!(
-        set.notes()
+        f.notes()
             .iter()
             .any(|n| n.contains("TVCL") && n.contains("standard error")),
         "{:?}",
-        set.notes()
+        f.notes()
     );
 }
 
@@ -907,6 +933,111 @@ fn a_name_that_matches_a_different_family_is_not_imported() {
     ok.sigma_names = vec!["ALSO_ELSE".into()];
     let (g, _d2) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &ok);
     assert_eq!(g.set().summarize(&g.packed()).len(), 1);
+}
+
+/// A model may legally carry a θ and an Ω under the **same** name, and a prior
+/// must still land on the one it was declared for.
+///
+/// θ names and η names are separate namespaces, so `theta CL(…)` alongside
+/// `omega CL ~ 0.09` parses. Before the kind travelled with the prior, the
+/// resolution was by name alone: a prior meant for the θ found two coordinates
+/// and the fit was refused as "ambiguous", even though both the parser (which
+/// saw which declaration the `prior(...)` was attached to) and the importer
+/// (which matched on name *and* family) knew perfectly well which one was meant.
+#[test]
+fn a_name_shared_by_a_theta_and_an_omega_still_resolves() {
+    let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    f.model.default_params.theta_names = vec!["CL".into()];
+    f.model.default_params.omega = OmegaMatrix::from_diagonal(&[0.1], vec!["CL".into()]);
+
+    // Imported: the source's θ `CL` must reach the θ, not collide with the Ω.
+    let mut src = source_fit();
+    src.theta_names = vec!["CL".into()];
+    src.eta_names = vec!["UNRELATED".into()];
+    src.sigma_names = vec!["ALSO_UNRELATED".into()];
+    let (imported, _dir) = with_from_fit(f, &src);
+    let s = imported.set().summarize(&imported.packed());
+    assert_eq!(s.len(), 1, "{s:?}");
+    // θ̂ = 0.2 against the source's 0.15 — the *θ* numbers. Landing on the Ω
+    // would report a centre of 0.15 as a variance against Ω̂ = 0.1, a different
+    // shift, so the value is what distinguishes the two coordinates.
+    assert_eq!(s[0].family, "lognormal");
+    assert!((s[0].estimate - 0.2).abs() < 1e-12, "{s:?}");
+
+    // Typed: the same collision, declared by hand on the Ω this time.
+    let mut g = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    g.model.default_params.theta_names = vec!["CL".into()];
+    g.model.default_params.omega = OmegaMatrix::from_diagonal(&[0.1], vec!["CL".into()]);
+    g.model.priors.push(ParameterPrior {
+        name: "CL".into(),
+        value: 0.09,
+        spread: PriorSpread::Rse(0.4),
+        kind: Some(crate::types::ParameterKind::Omega),
+    });
+    let s = g.set().summarize(&g.packed());
+    assert_eq!(s.len(), 1, "{s:?}");
+    // Ω̂ = 0.1 on the variance scale, not θ̂ = 0.2.
+    assert!((s[0].estimate - 0.1).abs() < 1e-12, "{s:?}");
+
+    // …and a prior that names the collision *without* saying which family is
+    // still refused, because nothing can decide it. That is the only case the
+    // old "ambiguous" error was ever right about.
+    let mut h = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    h.model.default_params.theta_names = vec!["CL".into()];
+    h.model.default_params.omega = OmegaMatrix::from_diagonal(&[0.1], vec!["CL".into()]);
+    h.model.priors.push(ParameterPrior {
+        name: "CL".into(),
+        value: 0.09,
+        spread: PriorSpread::Rse(0.4),
+        kind: None,
+    });
+    let err = h
+        .build()
+        .expect_err("an unqualified collision has no answer");
+    assert!(err.contains("resolves to 2 packed coordinates"), "{err}");
+}
+
+/// …and the **parser** is what supplies the family for a typed `prior(...)`.
+///
+/// The test above builds its `ParameterPrior` by hand, so it pins the
+/// resolution and not the thing that feeds it: blanking the parser's
+/// `kind: Some(kind)` left that test — and the whole suite — green (measured).
+/// This one goes through the real grammar, on a model whose θ and η share a
+/// name, so the prior can only land if the peeled tail remembered which
+/// declaration it came off.
+#[test]
+fn the_parser_records_which_declaration_a_typed_prior_came_off() {
+    let src = "[parameters]\n  \
+               theta CL(0.2, 0.001, 10.0) prior(0.15, rse = 40%)\n  \
+               omega CL ~ 0.1\n  \
+               sigma PROP_ERR ~ 0.04\n\n\
+               [individual_parameters]\n  \
+               CLI = CL * exp(CL_ETA)\n  \
+               V = 10.0\n\n\
+               [structural_model]\n  \
+               pk one_cpt_iv(cl=CLI, v=V)\n\n\
+               [error_model]\n  \
+               DV ~ proportional(PROP_ERR)\n";
+    // The η is declared `omega CL`, so `CL` names both a θ and an η.
+    let src = src.replace("CL_ETA", "CL");
+    let model = crate::parser::model_parser::parse_model_string(&src)
+        .unwrap_or_else(|e| panic!("the collision model must parse: {e}"));
+
+    assert_eq!(model.priors.len(), 1);
+    assert_eq!(
+        model.priors[0].kind,
+        Some(crate::types::ParameterKind::Theta),
+        "the tail was peeled off the `theta` line"
+    );
+
+    // And it resolves, onto the θ. Without the recorded family this is the
+    // "resolves to 2 packed coordinates" error.
+    let set = PriorSet::build(&model, &model.default_params)
+        .unwrap_or_else(|e| panic!("a θ-qualified prior must resolve: {e}"));
+    let s = set.summarize(&pack_params(&model.default_params));
+    assert_eq!(s.len(), 1, "{s:?}");
+    // θ̂ = 0.2 (the θ), not 0.1 (the Ω variance).
+    assert!((s[0].estimate - 0.2).abs() < 1e-12, "{s:?}");
 }
 
 /// An import that lands nothing leaves an unpenalized fit that looks exactly
@@ -1003,9 +1134,48 @@ fn a_kappa_prior_is_imported_onto_the_iov_coordinate() {
 fn a_missing_from_fit_file_is_an_error_naming_the_path() {
     let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
     f.model.prior_from_fit = Some("/no/such/parent-fit.yaml".into());
-    let err = f.build().unwrap_err();
+    let err = super::expand_prior_from_fit(&mut f.model).unwrap_err();
     assert!(err.contains("[priors] from_fit"), "{err}");
     assert!(err.contains("/no/such/parent-fit.yaml"), "{err}");
+    // The path is put back, so a caller that swallows the error still cannot
+    // reach an unpenalized fit: `PriorSet::build` refuses an unexpanded model.
+    assert!(f.model.prior_from_fit.is_some());
+    assert!(f.build().unwrap_err().contains("has not been expanded"));
+}
+
+/// A `CompiledModel` built by hand, with `prior_from_fit` set and never
+/// expanded, must be refused rather than fit unpenalized.
+///
+/// The file read is the parser's job now, and `build_prior_set` turns any build
+/// error into an *empty* set — so without this guard a hand-built model, or one
+/// whose expansion a caller swallowed, would fit with the priors silently
+/// absent. That is the one failure mode indistinguishable from success.
+#[test]
+fn an_unexpanded_from_fit_is_refused_rather_than_dropped() {
+    let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    // A file that exists and is perfectly readable — the point is that nothing
+    // has read it, not that it is unreadable.
+    let (g, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &source_fit());
+    f.model.prior_from_fit = g.model.prior_from_fit.clone().or_else(|| {
+        // `with_from_fit` consumed it; rebuild the same path from the temp dir.
+        Some(
+            _dir.path()
+                .join("parent-fit.yaml")
+                .to_string_lossy()
+                .into_owned(),
+        )
+    });
+    let err = f.build().unwrap_err();
+    assert!(err.contains("has not been expanded"), "{err}");
+    assert!(err.contains("expand_prior_from_fit"), "{err}");
+
+    // The straddle: expanding it makes the very same model build.
+    super::expand_prior_from_fit(&mut f.model).unwrap();
+    assert!(
+        f.model.prior_from_fit.is_none(),
+        "the path must be consumed"
+    );
+    assert_eq!(f.set().summarize(&f.packed()).len(), 3);
 }
 
 /// No `[priors]` block and no inline prior is the pre-#254 path, bit for bit.
@@ -1013,5 +1183,5 @@ fn a_missing_from_fit_file_is_an_error_naming_the_path() {
 fn no_prior_declaration_reads_no_file_and_stays_inactive() {
     let f = Fixture::new(0.2, 0.001, 0.1, 0.25);
     assert!(!f.set().is_active());
-    assert!(f.set().notes().is_empty());
+    assert!(f.notes().is_empty());
 }

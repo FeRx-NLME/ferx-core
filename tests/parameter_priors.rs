@@ -394,11 +394,11 @@ fn source_fit_yaml(cl: f64) -> String {
     )
 }
 
-/// The warfarin model with a `[priors] from_fit` block pointing at `path`, and
-/// no inline prior at all — so everything penalizing this fit came from the
-/// import.
-fn warfarin_from_fit(path: &std::path::Path) -> ferx_core::types::CompiledModel {
-    let src = format!(
+/// The warfarin model source with a `[priors] from_fit` block pointing at
+/// `path`, and no inline prior at all — so everything penalizing this fit came
+/// from the import.
+fn warfarin_from_fit_src(path: &std::path::Path) -> String {
+    format!(
         "[parameters]\n{BASE_PARAMS}\
          [priors]\n  from_fit = \"{}\"\n\n\
          [individual_parameters]\n\
@@ -410,8 +410,13 @@ fn warfarin_from_fit(path: &std::path::Path) -> ferx_core::types::CompiledModel 
          [error_model]\n\
          \x20 DV ~ proportional(PROP_ERR)\n",
         path.display()
-    );
-    parse_model_string(&src).expect("model must parse")
+    )
+}
+
+/// …parsed. The import is expanded **by the parser**, so a `from_fit` that
+/// cannot be honoured fails here rather than at `fit()`.
+fn warfarin_from_fit(path: &std::path::Path) -> ferx_core::types::CompiledModel {
+    parse_model_string(&warfarin_from_fit_src(path)).expect("model must parse")
 }
 
 /// Write `source_fit_yaml(cl)` into `dir` and return its path.
@@ -531,20 +536,24 @@ fn a_relative_from_fit_works_end_to_end_from_a_model_file() {
     assert_eq!(fit.prior_summary.len(), 6);
 
     // The straddle: the same model text parsed from a *string* has no directory
-    // to resolve against, so the bare name does not exist and the fit is refused.
-    // Without it this test passes on an implementation that resolves against the
-    // working directory and happens to find nothing either way.
-    let from_string = parse_model_string(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
-    let err = fit_model(&from_string, &warfarin_population(), &short_focei())
+    // to resolve against, so the bare name does not exist and the parse is
+    // refused. Without it this test passes on an implementation that resolves
+    // against the working directory and happens to find nothing either way.
+    let err = parse_model_string(&std::fs::read_to_string(&model_path).unwrap())
+        .map(|_| ())
         .expect_err("a bare name has nothing to resolve against from a string");
     assert!(err.contains("from_fit"), "{err}");
 }
 
-/// A `from_fit` that lands nothing must stop the fit, for the same reason an
+/// A `from_fit` that lands nothing must stop the run, for the same reason an
 /// unresolvable typed prior does: the alternative is an unpenalized fit that is
 /// indistinguishable from a penalized one.
+///
+/// It stops it at **parse** time, because that is where the source fit is read
+/// (once) — so `ferx check` refuses the model too, and no post-fit entry point
+/// can be handed a model whose priors quietly failed to materialise.
 #[test]
-fn fit_refuses_a_from_fit_that_lands_nothing() {
+fn a_from_fit_that_lands_nothing_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unrelated-fit.yaml");
     std::fs::write(
@@ -552,25 +561,118 @@ fn fit_refuses_a_from_fit_that_lands_nothing() {
         "theta:\n  SOMETHING_ELSE:\n    estimate: 1.000000\n    se: 0.100000\n",
     )
     .unwrap();
-    let err = fit_model(
-        &warfarin_from_fit(&path),
-        &warfarin_population(),
-        &short_focei(),
-    )
-    .expect_err("an import that lands nothing must be refused");
+    let err = parse_model_string(&warfarin_from_fit_src(&path))
+        .map(|_| ())
+        .expect_err("an import that lands nothing must be refused");
     assert!(err.contains("no prior could be imported"), "{err}");
 }
 
 /// A missing `from_fit` file is refused at the same gate, naming the path.
 #[test]
-fn fit_refuses_a_missing_from_fit_file() {
-    let err = fit_model(
-        &warfarin_from_fit(std::path::Path::new("/no/such/parent-fit.yaml")),
-        &warfarin_population(),
-        &short_focei(),
-    )
+fn a_missing_from_fit_file_is_refused() {
+    let err = parse_model_string(&warfarin_from_fit_src(std::path::Path::new(
+        "/no/such/parent-fit.yaml",
+    )))
+    .map(|_| ())
     .expect_err("a missing from_fit file must be refused");
     assert!(err.contains("/no/such/parent-fit.yaml"), "{err}");
+}
+
+/// A `CompiledModel` assembled by hand with an unexpanded `from_fit` is refused
+/// by `fit()` rather than fit unpenalized.
+///
+/// The parser is the only thing that reads the source fit now, so a model that
+/// never went through it has no priors — and `build_prior_set` turns a build
+/// error into an *empty* set, which is exactly how an unpenalized fit would have
+/// passed for a penalized one. This is the guard that stops that, checked at the
+/// public boundary rather than only in the unit tests.
+#[test]
+fn fit_refuses_a_model_whose_from_fit_was_never_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_source_fit(dir.path(), 0.13);
+
+    // Parse a model with no `[priors]` block, then bolt the path on afterwards —
+    // which is what a caller constructing a `CompiledModel` field by field does.
+    let mut model = warfarin_with(BASE_PARAMS);
+    model.prior_from_fit = Some(path.to_string_lossy().into_owned());
+    let err = fit_model(&model, &warfarin_population(), &short_focei())
+        .expect_err("an unexpanded from_fit must not fit unpenalized");
+    assert!(err.contains("has not been expanded"), "{err}");
+
+    // The straddle: expanding it makes the very same model fit, with the priors
+    // in force — so the guard rejects the unexpanded state, not the feature.
+    ferx_core::parser::model_parser::expand_prior_from_fit(&mut model)
+        .expect("the file is right there");
+    let fit = fit_model(&model, &warfarin_population(), &short_focei()).expect("fit should run");
+    assert_eq!(fit.prior_summary.len(), 6);
+}
+
+/// `examples/warfarin_update.ferx` resolves against the file the documented
+/// commands actually produce.
+///
+/// The example is a two-command flow across two different mechanisms, and they
+/// disagreed on the first attempt: the CLI writes `{model}-fit.yaml` into the
+/// **working directory** (`main.rs`, from the model path's file stem), while
+/// `from_fit` resolves against the **model file's** directory. Run from the repo
+/// root, the parent wrote `./warfarin-fit.yaml` and the update looked for
+/// `./examples/warfarin-fit.yaml`.
+///
+/// Two things are asserted, because either alone permits the mismatch:
+///
+/// - the example names its parent by a **bare filename**, so "the file sits next
+///   to the model" is what the model file claims;
+/// - the parent example is a **sibling** of the update example, so the directory
+///   the documented `cd` names is the one the CLI will write into.
+///
+/// Together they are the invariant that makes `cd examples` the right
+/// instruction, and they are what a future edit to either file has to keep.
+#[test]
+fn the_update_example_names_a_file_the_documented_commands_produce() {
+    let update = Path::new("examples/warfarin_update.ferx");
+    let src = std::fs::read_to_string(update).expect("the example must exist");
+
+    let from_fit = src
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("from_fit"))
+        .and_then(|r| r.split_once('='))
+        .map(|(_, v)| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .expect("the example must declare `from_fit`");
+
+    assert_eq!(
+        Path::new(&from_fit).parent(),
+        Some(Path::new("")),
+        "`from_fit = {from_fit}` must be a bare filename: it resolves against the \
+         model file's directory, while the CLI writes into the working directory, \
+         so any directory component makes the two disagree"
+    );
+
+    // The CLI names the output from the *parent* model's file stem.
+    let parent = update.with_file_name("warfarin.ferx");
+    assert!(
+        parent.exists(),
+        "the parent example must sit beside the update example, or the documented \
+         `cd examples` is not where the CLI would write the fit"
+    );
+    assert_eq!(
+        from_fit,
+        format!("{}-fit.yaml", parent.file_stem().unwrap().to_string_lossy()),
+        "the example reads a different file from the one `ferx {}` writes",
+        parent.display()
+    );
+
+    // …and the resolution really lands there. Stage the two files the way the
+    // documented commands leave them and parse the update for real, so this is
+    // not only a string comparison.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(update, dir.path().join("warfarin_update.ferx")).unwrap();
+    std::fs::write(dir.path().join(&from_fit), source_fit_yaml(0.13)).unwrap();
+    let model =
+        ferx_core::parser::model_parser::parse_model_file(&dir.path().join("warfarin_update.ferx"))
+            .expect("the example must parse with its parent fit beside it");
+    assert!(
+        !model.priors.is_empty(),
+        "the example's from_fit resolved but imported nothing"
+    );
 }
 
 /// Parameters the import skipped are reported in `warnings`.

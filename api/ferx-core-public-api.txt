@@ -1295,6 +1295,7 @@ pub struct ferx_core::parser::model_parser::OdeRhsProgram
 pub struct ferx_core::parser::model_parser::ParseBindings
 pub ferx_core::parser::model_parser::ParseBindings::covariate_stats: ferx_core::parser::covariate_model::CovariateStatBindings
 pub ferx_core::parser::model_parser::ParseBindings::levels: ferx_core::parser::model_parser::LevelBindings
+pub ferx_core::parser::model_parser::ParseBindings::model_dir: core::option::Option<std::path::PathBuf>
 pub struct ferx_core::parser::model_parser::RuvMagDerivProgram
 pub struct ferx_core::parser::model_parser::ScaleDerivProgram
 pub struct ferx_core::parser::model_parser::ThetaBlocks
@@ -1309,6 +1310,7 @@ pub const ferx_core::parser::model_parser::NN_WEIGHT_DIRECT_REFERENCE_MARKER: &s
 pub const ferx_core::parser::model_parser::ODE_INIT_REJECTED_BUILTINS: &[&str]
 pub const ferx_core::parser::model_parser::ODE_INIT_SCOPE_BUILTINS: &[&str]
 pub fn ferx_core::parser::model_parser::apply_fit_option(opts: &mut ferx_core::FitOptions, key: &str, value: &str) -> core::result::Result<bool, alloc::string::String>
+pub fn ferx_core::parser::model_parser::expand_prior_from_fit(model: &mut ferx_core::CompiledModel) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::parser::model_parser::known_block_names() -> alloc::vec::Vec<&'static str>
 pub fn ferx_core::parser::model_parser::parse_full_model(content: &str) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_full_model_bound(content: &str, level_bindings: &ferx_core::parser::model_parser::LevelBindings) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
@@ -2367,6 +2369,13 @@ pub ferx_core::types::Optimizer::TrustRegion
 impl ferx_core::Optimizer
 pub fn ferx_core::Optimizer::label(self) -> &'static str
 pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel, interaction: bool) -> ferx_core::Optimizer
+pub enum ferx_core::types::ParameterKind
+pub ferx_core::types::ParameterKind::Kappa
+pub ferx_core::types::ParameterKind::Omega
+pub ferx_core::types::ParameterKind::Sigma
+pub ferx_core::types::ParameterKind::Theta
+impl ferx_core::ParameterKind
+pub fn ferx_core::ParameterKind::keyword(self) -> &'static str
 pub enum ferx_core::types::ParameterScaling
 pub ferx_core::types::ParameterScaling::Abs
 pub ferx_core::types::ParameterScaling::Auto
@@ -3141,6 +3150,7 @@ pub fn ferx_core::OmegaMatrix::from_diagonal(variances: &[f64], names: alloc::ve
 pub fn ferx_core::OmegaMatrix::from_matrix(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool) -> Self
 pub fn ferx_core::OmegaMatrix::from_matrix_with_mask(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool, free_mask: nalgebra::base::alias::DMatrix<bool>) -> Self
 pub struct ferx_core::types::ParameterPrior
+pub ferx_core::types::ParameterPrior::kind: core::option::Option<ferx_core::ParameterKind>
 pub ferx_core::types::ParameterPrior::name: alloc::string::String
 pub ferx_core::types::ParameterPrior::spread: ferx_core::PriorSpread
 pub ferx_core::types::ParameterPrior::value: f64
@@ -3648,6 +3658,13 @@ pub ferx_core::Optimizer::TrustRegion
 impl ferx_core::Optimizer
 pub fn ferx_core::Optimizer::label(self) -> &'static str
 pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel, interaction: bool) -> ferx_core::Optimizer
+pub enum ferx_core::ParameterKind
+pub ferx_core::ParameterKind::Kappa
+pub ferx_core::ParameterKind::Omega
+pub ferx_core::ParameterKind::Sigma
+pub ferx_core::ParameterKind::Theta
+impl ferx_core::ParameterKind
+pub fn ferx_core::ParameterKind::keyword(self) -> &'static str
 pub enum ferx_core::ParameterScaling
 pub ferx_core::ParameterScaling::Abs
 pub ferx_core::ParameterScaling::Auto
@@ -4573,6 +4590,7 @@ pub fn ferx_core::OmegaMatrix::from_diagonal(variances: &[f64], names: alloc::ve
 pub fn ferx_core::OmegaMatrix::from_matrix(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool) -> Self
 pub fn ferx_core::OmegaMatrix::from_matrix_with_mask(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool, free_mask: nalgebra::base::alias::DMatrix<bool>) -> Self
 pub struct ferx_core::ParameterPrior
+pub ferx_core::ParameterPrior::kind: core::option::Option<ferx_core::ParameterKind>
 pub ferx_core::ParameterPrior::name: alloc::string::String
 pub ferx_core::ParameterPrior::spread: ferx_core::PriorSpread
 pub ferx_core::ParameterPrior::value: f64
