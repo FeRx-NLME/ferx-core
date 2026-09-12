@@ -73,6 +73,21 @@ impl Fixture {
         self
     }
 
+    /// Give the model a one-κ diagonal Ω_IOV of variance `kappa_var`.
+    ///
+    /// The κ segment is packed *after* Σ, so a prior that resolves onto it is
+    /// also the only check that the coordinate walk reaches past the Σ block
+    /// with its indices intact.
+    fn with_iov(mut self, kappa_var: f64) -> Self {
+        self.model.default_params.omega_iov = Some(OmegaMatrix::from_diagonal(
+            &[kappa_var],
+            vec!["KAPPA_CL".into()],
+        ));
+        self.model.default_params.kappa_fixed = vec![false];
+        self.model.kappa_init_as_sd = vec![false];
+        self
+    }
+
     fn params(&self) -> &ModelParameters {
         &self.model.default_params
     }
@@ -930,6 +945,56 @@ fn an_import_that_lands_nothing_is_an_error() {
     let err = f3.build().expect_err("no usable spread anywhere");
     assert!(err.contains("every candidate was skipped"), "{err}");
     assert!(err.contains("theta TVCL"), "{err}");
+}
+
+/// κ (Ω_IOV) imports too, and onto the right coordinate.
+///
+/// This is the one family every other test here reaches only through the Ω arm
+/// they share in the conversion table, so a green suite without it says nothing
+/// about κ: the κ segment is packed **after** Σ, so an index that stops at the Σ
+/// block, or a `push_omega_coords` call handed the wrong `EstimateKind`, would
+/// leave κ unimported or imported as an Ω with nothing to say so. The assertion
+/// is the packed coordinate the penalty lands on, not merely that a prior
+/// appeared.
+#[test]
+fn a_kappa_prior_is_imported_onto_the_iov_coordinate() {
+    let mut src = source_fit();
+    src.omega_iov = Some(nalgebra::DMatrix::from_row_slice(1, 1, &[0.04]));
+    src.kappa_names = vec!["KAPPA_CL".into()];
+    src.kappa_fixed = vec![false];
+    src.kappa_init_as_sd = vec![false];
+    src.se_kappa = Some(vec![0.016]); // RSE 40% on the variance
+
+    // κ̂ = 0.09 against a prior centred on the source's variance of 0.04.
+    let (f, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25).with_iov(0.09), &src);
+    let set = f.set();
+    let s = set.summarize(&f.packed());
+    assert_eq!(s.len(), 4, "θ, Ω, Σ and κ must all import: {s:?}");
+    let kappa = s.iter().find(|p| p.name == "KAPPA_CL").unwrap();
+    assert!((kappa.prior_value - 0.04).abs() < 1e-12, "{kappa:?}");
+    // Lognormal on the variance, exactly as for a variance-declared Ω: the
+    // packed coordinate is ln(SD) = ½·ln(v), the mean is ½·ln(0.04), and the
+    // packed SD is TAU_40/2 — so the two halves cancel and z is the same
+    // `ln(v̂/v₀)/TAU_40` the Ω test pins.
+    // z = ln(0.09/0.04) / TAU_40 = 0.8109302162 / 0.3852531702 = 2.1049280811
+    let z = (0.09f64 / 0.04).ln() / TAU_40;
+    assert!((kappa.shift_in_prior_sds - z).abs() < 1e-12, "{kappa:?}");
+    assert!(
+        (kappa.shift_in_prior_sds - 2.104_928_081).abs() < 1e-8,
+        "{kappa:?}"
+    );
+
+    // And it landed on the κ coordinate, not on the Ω one: the packed layout is
+    // [θ, Ω, Σ, κ], so only index 3 may move the penalty. Perturbing each
+    // coordinate in turn is what distinguishes "a κ prior" from "an Ω prior that
+    // happens to have κ's numbers".
+    let mut packed = f.packed();
+    let base = set.penalty(&packed);
+    packed[3] += 0.1;
+    assert!(
+        (set.penalty(&packed) - base).abs() > 1e-6,
+        "the κ prior must respond to the κ coordinate"
+    );
 }
 
 /// A missing `from_fit` file stops the fit at the same gate a malformed typed
