@@ -2030,6 +2030,17 @@ fn fit_inner(
     let packed_final = crate::estimation::parameterization::pack_params(&result.params);
     let ofv_prior = prior_set.penalty(&packed_final);
     let prior_summary = prior_set.summarize(&packed_final);
+    // `[priors] from_fit` candidates that were *not* imported (#254 phase 2).
+    // The ones that were need no announcement — `prior_summary` above lists every
+    // priored parameter — but a skip means the user asked for a prior on that
+    // parameter and did not get one, which is only visible by its absence.
+    if !prior_set.notes().is_empty() {
+        result.warnings.push(format!(
+            "[priors] from_fit: {} parameter(s) not imported:\n  - {}",
+            prior_set.notes().len(),
+            prior_set.notes().join("\n  - ")
+        ));
+    }
     let ofv_data = result.ofv;
     let ofv = ofv_data + ofv_prior;
     let aic = ofv_data + 2.0 * n_params as f64;

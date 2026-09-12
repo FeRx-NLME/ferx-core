@@ -368,6 +368,246 @@ fn a_prior_moves_the_estimates_and_not_only_the_report() {
     );
 }
 
+// ── `[priors] from_fit` — the model-updating import (#254 phase 2) ──────────
+
+/// A minimal `{model}-fit.yaml` for the warfarin parameter names, with `TVCL`
+/// at `cl` and a 1% relative standard error on every parameter.
+///
+/// Hand-written rather than produced by a first `fit()`: the shape is what
+/// `write_estimates_yaml` emits (pinned against the writer by the Tier-1
+/// round-trip), and writing it here keeps this test at Tier 2 — no convergence
+/// loop, and no dependence on a covariance step that a two-iteration fit does
+/// not run.
+fn source_fit_yaml(cl: f64) -> String {
+    format!(
+        "model:\n  converged: true\n\n\
+         theta:\n\
+         \x20 TVCL:\n    estimate: {cl:.6}\n    se: {:.6}\n\
+         \x20 TVV:\n    estimate: 8.000000\n    se: 0.080000\n\
+         \x20 TVKA:\n    estimate: 1.000000\n    se: 0.010000\n\n\
+         omega:\n\
+         \x20 ETA_CL:\n    variance: 0.090000\n    cv_pct: 30.00\n    se: 0.000900\n\
+         \x20 ETA_V:\n    variance: 0.040000\n    cv_pct: 20.00\n    se: 0.000400\n\n\
+         sigma:  # error model: proportional\n\
+         \x20 PROP_ERR:\n    estimate: 0.100000\n    variance: 0.010000\n    type: proportional\n    se: 0.001000\n",
+        cl * 0.01
+    )
+}
+
+/// The warfarin model with a `[priors] from_fit` block pointing at `path`, and
+/// no inline prior at all — so everything penalizing this fit came from the
+/// import.
+fn warfarin_from_fit(path: &std::path::Path) -> ferx_core::types::CompiledModel {
+    let src = format!(
+        "[parameters]\n{BASE_PARAMS}\
+         [priors]\n  from_fit = \"{}\"\n\n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV  * exp(ETA_V)\n\
+         \x20 KA = TVKA\n\n\
+         [structural_model]\n\
+         \x20 pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n",
+        path.display()
+    );
+    parse_model_string(&src).expect("model must parse")
+}
+
+/// Write `source_fit_yaml(cl)` into `dir` and return its path.
+fn write_source_fit(dir: &std::path::Path, cl: f64) -> std::path::PathBuf {
+    let path = dir.join("parent-fit.yaml");
+    std::fs::write(&path, source_fit_yaml(cl)).unwrap();
+    path
+}
+
+/// An imported prior must reach the **optimizer**, not only the report — the
+/// `from_fit` counterpart of `a_prior_moves_the_estimates_and_not_only_the_report`
+/// above, and for the same reason: `ofv_prior` and `prior_summary` are
+/// recomputed in `fit()` at the final estimate, so they read non-zero whether or
+/// not the objective ever saw the penalty.
+///
+/// Two source fits differing only in `TVCL`, each with a 1% RSE that makes the
+/// prior far stronger than the data. The estimates must separate, and in the
+/// right order.
+#[test]
+fn an_imported_prior_moves_the_estimates() {
+    let pop = warfarin_population();
+    let dir = tempfile::tempdir().unwrap();
+    let low_path = dir.path().join("low-fit.yaml");
+    std::fs::write(&low_path, source_fit_yaml(0.065)).unwrap();
+    let high_path = dir.path().join("high-fit.yaml");
+    std::fs::write(&high_path, source_fit_yaml(0.26)).unwrap();
+
+    let low = fit_model(&warfarin_from_fit(&low_path), &pop, &short_focei())
+        .expect("low-prior fit should run");
+    let high = fit_model(&warfarin_from_fit(&high_path), &pop, &short_focei())
+        .expect("high-prior fit should run");
+
+    // Every priorable parameter was imported: 3 θ, 2 Ω, 1 σ.
+    assert_eq!(low.prior_summary.len(), 6, "{:?}", low.prior_summary);
+    assert!(low.ofv_prior > 0.0);
+    // The penalty is in the objective, not only the report.
+    assert!((low.ofv - (low.ofv_data + low.ofv_prior)).abs() < 1e-8);
+
+    let i = low.theta_names.iter().position(|n| n == "TVCL").unwrap();
+    let (cl_low, cl_high) = (low.theta[i], high.theta[i]);
+    assert!(
+        cl_low < cl_high,
+        "the lower imported prior must pull TVCL below the higher one: {cl_low} vs {cl_high}"
+    );
+    assert!(
+        (cl_high - cl_low) / cl_low > 0.1,
+        "the two imported priors must pull the estimate materially apart: {cl_low} vs {cl_high}"
+    );
+}
+
+/// The prior centre lands on the source estimate, on this model's declared
+/// scale — a variance for `omega ETA_CL ~ 0.09`, and `σ²` for
+/// `sigma PROP_ERR ~ 0.01` (the source reports σ as an SD of 0.1).
+///
+/// Reads the whole conversion table off one fit, so a scale flipped on any one
+/// family shows up here rather than as a slightly-off estimate.
+#[test]
+fn an_imported_prior_reports_the_source_estimate_on_the_declared_scale() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_source_fit(dir.path(), 0.13);
+    let fit = fit_model(
+        &warfarin_from_fit(&path),
+        &warfarin_population(),
+        &short_focei(),
+    )
+    .expect("fit should run");
+
+    let centre = |name: &str| {
+        fit.prior_summary
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no prior on {name}: {:?}", fit.prior_summary))
+            .prior_value
+    };
+    assert!((centre("TVCL") - 0.13).abs() < 1e-9);
+    assert!((centre("TVV") - 8.0).abs() < 1e-9);
+    assert!(
+        (centre("ETA_CL") - 0.09).abs() < 1e-9,
+        "{}",
+        centre("ETA_CL")
+    );
+    // σ: the source's SD of 0.1, squared onto the declared variance scale.
+    assert!(
+        (centre("PROP_ERR") - 0.01).abs() < 1e-9,
+        "{}",
+        centre("PROP_ERR")
+    );
+}
+
+/// A relative `from_fit` resolves against the model file, end to end through
+/// `parse_model_file` — the path a user actually takes, where the model and the
+/// fit it updates from sit together in a run directory.
+#[test]
+fn a_relative_from_fit_works_end_to_end_from_a_model_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write_source_fit(dir.path(), 0.13);
+    let model_path = dir.path().join("update.ferx");
+    // The block names the file by its bare name, with no directory at all.
+    let src = format!(
+        "[parameters]\n{BASE_PARAMS}\
+         [priors]\n  from_fit = parent-fit.yaml\n\n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV  * exp(ETA_V)\n\
+         \x20 KA = TVKA\n\n\
+         [structural_model]\n\
+         \x20 pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n"
+    );
+    std::fs::write(&model_path, src).unwrap();
+
+    let model = ferx_core::parser::model_parser::parse_model_file(&model_path)
+        .expect("model file must parse");
+    let fit = fit_model(&model, &warfarin_population(), &short_focei())
+        .expect("a model-file-relative from_fit must resolve");
+    assert_eq!(fit.prior_summary.len(), 6);
+
+    // The straddle: the same model text parsed from a *string* has no directory
+    // to resolve against, so the bare name does not exist and the fit is refused.
+    // Without it this test passes on an implementation that resolves against the
+    // working directory and happens to find nothing either way.
+    let from_string = parse_model_string(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+    let err = fit_model(&from_string, &warfarin_population(), &short_focei())
+        .expect_err("a bare name has nothing to resolve against from a string");
+    assert!(err.contains("from_fit"), "{err}");
+}
+
+/// A `from_fit` that lands nothing must stop the fit, for the same reason an
+/// unresolvable typed prior does: the alternative is an unpenalized fit that is
+/// indistinguishable from a penalized one.
+#[test]
+fn fit_refuses_a_from_fit_that_lands_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unrelated-fit.yaml");
+    std::fs::write(
+        &path,
+        "theta:\n  SOMETHING_ELSE:\n    estimate: 1.000000\n    se: 0.100000\n",
+    )
+    .unwrap();
+    let err = fit_model(
+        &warfarin_from_fit(&path),
+        &warfarin_population(),
+        &short_focei(),
+    )
+    .expect_err("an import that lands nothing must be refused");
+    assert!(err.contains("no prior could be imported"), "{err}");
+}
+
+/// A missing `from_fit` file is refused at the same gate, naming the path.
+#[test]
+fn fit_refuses_a_missing_from_fit_file() {
+    let err = fit_model(
+        &warfarin_from_fit(std::path::Path::new("/no/such/parent-fit.yaml")),
+        &warfarin_population(),
+        &short_focei(),
+    )
+    .expect_err("a missing from_fit file must be refused");
+    assert!(err.contains("/no/such/parent-fit.yaml"), "{err}");
+}
+
+/// Parameters the import skipped are reported in `warnings`.
+///
+/// A skip is only visible as an absence otherwise: the fit converges, the
+/// remaining priors look fine, and nothing says the one the user cared about was
+/// dropped.
+#[test]
+fn skipped_imports_are_reported_in_the_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial-fit.yaml");
+    // TVKA carries no standard error, so it cannot supply a prior spread.
+    std::fs::write(
+        &path,
+        source_fit_yaml(0.13).replace(
+            " TVKA:\n    estimate: 1.000000\n    se: 0.010000",
+            " TVKA:\n    estimate: 1.000000\n    se: ~",
+        ),
+    )
+    .unwrap();
+    let fit = fit_model(
+        &warfarin_from_fit(&path),
+        &warfarin_population(),
+        &short_focei(),
+    )
+    .expect("the remaining five imports must still land");
+
+    assert_eq!(fit.prior_summary.len(), 5, "{:?}", fit.prior_summary);
+    assert!(
+        fit.warnings
+            .iter()
+            .any(|w| w.contains("from_fit") && w.contains("TVKA")),
+        "{:?}",
+        fit.warnings
+    );
+}
+
 // ── Tier 3: behaviour that needs a converged fit ─────────────────────────────
 
 /// The two halves of the issue's acceptance criteria, asserted **together** as
@@ -857,4 +1097,126 @@ fn the_prior_penalty_matches_nonmem_nwpri() {
         "the anchor fixture must exercise a non-zero penalty, got {}",
         r_prior.ofv_prior
     );
+}
+
+/// The issue's model-updating acceptance criterion, end to end and in one call
+/// (#254 phase 2): fit a parent model, write the run's own `{model}-fit.yaml`,
+/// and refit on **sparse** data with a second model that names that file as its
+/// prior.
+///
+/// The oracle is the parent fit's own estimates, and the whole test is the
+/// three-way comparison — parent, sparse-with-prior, sparse-without-prior:
+///
+/// - the sparse **control** (no prior) has to drift away from the parent, or
+///   nothing below tests anything: a prior is only observable where the data
+///   alone would land somewhere else;
+/// - the sparse **update** has to sit closer to the parent than the control
+///   does, on the parameter the control drifted on.
+///
+/// Refitting the *same* data with a prior centred on its own MLE cannot be this
+/// test: the likelihood and the prior are then maximised in the same place and
+/// an engine that ignores priors entirely passes.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_sparse_fit_can_be_updated_from_a_parent_runs_written_estimates() {
+    let full = warfarin_population();
+    let mut parent_opts = FitOptions::default();
+    // The import reads standard errors, so the parent run must do its
+    // covariance step. That is what makes this Tier 3 rather than Tier 2.
+    parent_opts.run_covariance_step = true;
+
+    let parent = fit_model(&warfarin_with(BASE_PARAMS), &full, &parent_opts).expect("parent fit");
+    assert!(
+        parent.se_theta.is_some(),
+        "the parent run must report standard errors for the import to read"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let fit_yaml = dir.path().join("parent-fit.yaml");
+    ferx_core::io::output::write_estimates_yaml(&parent, fit_yaml.to_str().unwrap())
+        .expect("parent estimates must write");
+
+    // The local dataset: two subjects out of ten, whose concentrations run 60%
+    // high. The scaling is what makes the fixture non-degenerate — warfarin is
+    // informative enough that two untouched subjects already reproduce the
+    // parent's θ to ~2% (measured), leaving the prior nothing to pull back. A
+    // uniform ×1.6 on DV moves the local MLE's `TVV` by construction, which is
+    // exactly the situation the feature exists for: a small local dataset that
+    // disagrees with the published model.
+    let mut sparse = warfarin_population();
+    sparse.subjects.truncate(2);
+    for s in sparse.subjects.iter_mut() {
+        for dv in s.observations.iter_mut() {
+            *dv *= 1.6;
+        }
+    }
+
+    let update_src = format!(
+        "[parameters]\n{BASE_PARAMS}\
+         [priors]\n  from_fit = \"{}\"\n\n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV  * exp(ETA_V)\n\
+         \x20 KA = TVKA\n\n\
+         [structural_model]\n\
+         \x20 pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n",
+        fit_yaml.display()
+    );
+    let updated = parse_model_string(&update_src).expect("the update model must parse");
+
+    let mut opts = FitOptions::default();
+    opts.run_covariance_step = false;
+    let child = fit_model(&updated, &sparse, &opts).expect("update fit");
+    let control =
+        fit_model(&warfarin_with(BASE_PARAMS), &sparse, &opts).expect("sparse control fit");
+
+    assert_eq!(child.prior_summary.len(), 6, "{:?}", child.prior_summary);
+
+    let rel = |a: f64, b: f64| ((a - b) / b).abs();
+    let idx = |name: &str| parent.theta_names.iter().position(|n| n == name).unwrap();
+
+    // Non-degeneracy first: the sparse control must actually drift, or the
+    // closeness assertion below is satisfied by any engine at all. Realised
+    // drift is recorded in the failure message so a dataset change that quietly
+    // makes the fixture degenerate says so.
+    let drifted: Vec<&str> = ["TVCL", "TVV", "TVKA"]
+        .into_iter()
+        .filter(|n| rel(control.theta[idx(n)], parent.theta[idx(n)]) > 0.10)
+        .collect();
+    assert!(
+        !drifted.is_empty(),
+        "degenerate fixture: two subjects already reproduce the parent, so there is \
+         nothing for the prior to pull back — control {:?}, parent {:?}",
+        control.theta,
+        parent.theta
+    );
+
+    // …and on every parameter the control drifted on, the prior pulled the
+    // update back toward the parent.
+    for name in drifted {
+        let i = idx(name);
+        let (d_child, d_control) = (
+            rel(child.theta[i], parent.theta[i]),
+            rel(control.theta[i], parent.theta[i]),
+        );
+        assert!(
+            // Measured: TVCL child 5.2% vs control 36.5% off the parent, TVV
+            // 5.0% vs 38.0% — a factor of ~7 either way. The bound asks only for
+            // a factor of 2, so it fails on a prior that is applied weakly as
+            // well as on one that is not applied at all.
+            d_child < d_control * 0.5,
+            "{name}: the imported prior must pull the sparse fit back toward the parent — \
+             parent {}, updated {} ({:.1}% off), control {} ({:.1}% off)",
+            parent.theta[i],
+            child.theta[i],
+            d_child * 100.0,
+            control.theta[i],
+            d_control * 100.0
+        );
+    }
 }

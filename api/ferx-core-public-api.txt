@@ -2573,6 +2573,7 @@ pub ferx_core::types::CompiledModel::pk_idx_f64: alloc::vec::Vec<f64>
 pub ferx_core::types::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::types::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::types::CompiledModel::pk_param_fn: ferx_core::PkParamFn
+pub ferx_core::types::CompiledModel::prior_from_fit: core::option::Option<alloc::string::String>
 pub ferx_core::types::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::types::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
@@ -3923,6 +3924,7 @@ pub ferx_core::CompiledModel::pk_idx_f64: alloc::vec::Vec<f64>
 pub ferx_core::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::CompiledModel::pk_param_fn: ferx_core::PkParamFn
+pub ferx_core::CompiledModel::prior_from_fit: core::option::Option<alloc::string::String>
 pub ferx_core::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>

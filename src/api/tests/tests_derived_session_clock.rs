@@ -22,6 +22,7 @@ use std::collections::HashMap;
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "test_session".into(),
         pk_model: PkModel::OneCptIv,

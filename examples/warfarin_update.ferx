@@ -1,0 +1,70 @@
+# Warfarin 1-cpt oral, updated from a previous ferx run (#254).
+#
+# The one-call model-updating pattern. Instead of transcribing a parameter table
+# into `prior(...)` declarations by hand (see `warfarin_prior.ferx` for that
+# form), `[priors] from_fit` reads a previous run's own output and builds the
+# priors from it: every parameter that run reports with a usable standard error,
+# and whose name and family match a `[parameters]` declaration below, becomes
+# `prior(estimate, rse = SE/estimate)`.
+#
+# Run the parent model first — it must do its covariance step, since the import
+# reads the standard errors:
+#
+#   cargo run --release -p ferx-cli -- examples/warfarin.ferx \
+#       --data data/warfarin.csv
+#
+# …which writes `warfarin-fit.yaml` next to the model. Then run this one:
+#
+#   cargo run --release -p ferx-cli -- examples/warfarin_update.ferx \
+#       --data data/warfarin.csv
+#
+# In a real update the second `--data` would be the small local dataset — a
+# handful of TDM subjects, a paediatric cohort — and the prior is what keeps the
+# IIV terms off their boundaries and the structural parameters from drifting.
+#
+# The report reads exactly as it does for a hand-written prior: the OFV split
+# into its data and prior halves, and per priored parameter how far the estimate
+# landed from the prior in prior SDs.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[priors]
+  # A relative path resolves against *this file's* directory, like `[data] path`,
+  # so the model and the fit it updates from travel together.
+  #
+  # `.fitrx` (`--output run.fitrx`) and `.json` (`--output-format json`) are read
+  # too, and carry full precision; the `.yaml` every run writes is formatted to
+  # six decimals, which only matters for a parameter below about 1e-4.
+  from_fit = "warfarin-fit.yaml"
+
+  # An inline `prior(...)` on a parameter would override the imported one, and
+  # the rest of the import still lands. Anything that cannot be imported — no
+  # standard error in the source, FIXed here, a `block_omega` element — is
+  # skipped and reported in the run's warnings.
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  # Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid).
+  # A final stage that cannot apply them is refused rather than run unpenalized.
+  method     = focei
+  maxiter    = 300
+  covariance = true

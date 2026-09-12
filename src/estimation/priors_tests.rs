@@ -615,3 +615,338 @@ fn a_prior_on_an_independent_diagonal_of_a_mixed_omega_is_accepted() {
         .expect_err("a prior on a block member must still be rejected");
     assert!(err.contains("block_omega"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// `[priors] from_fit` — the model-updating import (#254 phase 2)
+// ---------------------------------------------------------------------------
+
+/// Write a source fit to a temp `.yaml` and point `f` at it.
+///
+/// The file is `.yaml` rather than `.json` deliberately: it is the one every
+/// plain `ferx model.ferx --data …` run writes, so it is what a user actually
+/// has to hand, and it is the lossiest of the three readers. A suite that only
+/// exercised `.json` would leave the default path unpinned.
+fn with_from_fit(f: Fixture, source: &crate::types::FitResult) -> (Fixture, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("parent-fit.yaml");
+    crate::io::output::write_estimates_yaml(source, path.to_str().unwrap()).unwrap();
+    let mut f = f;
+    f.model.prior_from_fit = Some(path.to_string_lossy().into_owned());
+    (f, dir)
+}
+
+/// A source fit whose parameter names line up with [`Fixture`]'s single
+/// θ / η / σ, with round numbers chosen so every conversion below can be
+/// hand-computed.
+///
+/// TVCL 0.15 ± 0.03 (RSE 20%), ETA_CL variance 0.09 ± 0.036 (RSE 40%),
+/// PROP_ERR SD 0.2 ± 0.02 (RSE 10%).
+fn source_fit() -> crate::types::FitResult {
+    let mut r = crate::types::test_helpers::minimal_fit_result();
+    r.theta = vec![0.15];
+    r.theta_names = vec!["TVCL".into()];
+    r.theta_fixed = vec![false];
+    r.se_theta = Some(vec![0.03]);
+    r.eta_names = vec!["ETA_CL".into()];
+    r.omega = nalgebra::DMatrix::from_row_slice(1, 1, &[0.09]);
+    r.omega_fixed = vec![false];
+    r.omega_init_as_sd = vec![false];
+    r.se_omega = Some(vec![0.036]);
+    r.sigma = vec![0.2];
+    r.sigma_names = vec!["PROP_ERR".into()];
+    r.sigma_fixed = vec![false];
+    r.sigma_init_as_sd = vec![false];
+    r.se_sigma = Some(vec![0.02]);
+    r
+}
+
+/// The whole feature in one assertion: an imported prior is the prior the user
+/// would have typed off the source run's parameter table.
+///
+/// Catches a wrong scale on any of the three families at once, because the
+/// penalty is compared against a *typed* `prior(...)` on the same fixture rather
+/// than against a number recomputed by the import's own arithmetic.
+#[test]
+fn an_imported_prior_equals_the_prior_the_user_would_have_typed() {
+    // θ̂ = 0.2 against a prior at 0.15 (RSE 20%); Ω̂ = 0.1 against 0.09 (RSE 40%);
+    // σ̂ = 0.25 against a variance of 0.04 (RSE 20%, doubled from the source's
+    // 10% on the SD). Every estimate is off its prior, so all three penalties
+    // are non-zero and a dropped term changes the total.
+    let (imported, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &source_fit());
+    let typed = Fixture::new(0.2, 0.001, 0.1, 0.25)
+        .with_prior("TVCL", 0.15, PriorSpread::Rse(0.2))
+        .with_prior("ETA_CL", 0.09, PriorSpread::Rse(0.4))
+        .with_prior("PROP_ERR", 0.04, PriorSpread::Rse(0.2));
+
+    let got = imported.set().penalty(&imported.packed());
+    let want = typed.set().penalty(&typed.packed());
+    assert!(
+        got > 0.0,
+        "fixture is degenerate: every estimate sits on its prior"
+    );
+    assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+    assert_eq!(imported.set().summarize(&imported.packed()).len(), 3);
+}
+
+/// σ is the one family whose source scale (SD) differs from its default declared
+/// scale (variance), so it is where a missing delta-method step hides.
+///
+/// `PROP_ERR` is reported as an SD of 0.2 ± 0.02. Declared as a variance the
+/// prior centre is 0.2² = 0.04 and the relative SE **doubles** to 20% (the
+/// relative SE of `xᵖ` is `|p|` times that of `x`); declared `(sd)` it stays
+/// 0.2 ± 10%. The pair is what makes a dropped factor of two visible rather than
+/// plausible.
+#[test]
+fn sigma_converts_from_the_source_sd_onto_the_declared_scale() {
+    let src = source_fit();
+
+    // Declared as a variance (the default).
+    let (var, _d1) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.2), &src);
+    let as_var = var.set().summarize(&var.packed());
+    let sigma = as_var
+        .iter()
+        .find(|s| s.name == "PROP_ERR")
+        .unwrap()
+        .clone();
+    // σ̂ = 0.2 is exactly the prior centre on either scale, so the penalty is 0
+    // and the informative number is the reported centre: 0.04, a variance.
+    assert!((sigma.prior_value - 0.04).abs() < 1e-12, "{sigma:?}");
+    assert_eq!(sigma.penalty, 0.0);
+
+    // Declared `(sd)` — same source file, same parameter, centre now 0.2.
+    let (sd, _d2) = with_from_fit(
+        Fixture::new(0.2, 0.001, 0.1, 0.2).sigma_declared_as_sd(),
+        &src,
+    );
+    let as_sd = sd.set().summarize(&sd.packed());
+    let sigma_sd = as_sd.iter().find(|s| s.name == "PROP_ERR").unwrap().clone();
+    assert!((sigma_sd.prior_value - 0.2).abs() < 1e-12, "{sigma_sd:?}");
+
+    // …and the two spreads agree to first order. The lognormal CV→log-SD map is
+    // not linear, so they are close rather than equal, and that is the
+    // documented consequence of the user naming a scale. A dropped factor of two
+    // would put them ~2x apart, which is what this bound excludes. Compared
+    // through the reported 95% upper limit on a common scale (variance), so the
+    // check runs on what the code produced rather than on algebra restated here.
+    // Realised difference 7.3e-5; bound set ~4x above it.
+    let hi_var = sigma.prior_upper_95;
+    let hi_sd = sigma_sd.prior_upper_95 * sigma_sd.prior_upper_95;
+    assert!((hi_var - hi_sd).abs() < 3e-4, "{hi_var} vs {hi_sd}");
+    // The straddle: the two intervals really are on the scales claimed, so the
+    // agreement above is not two copies of the same number.
+    assert!(hi_var < 0.1 && hi_sd < 0.1, "{hi_var} {hi_sd}");
+    assert!(sigma_sd.prior_upper_95 > 0.2, "{sigma_sd:?}");
+}
+
+/// Ω is reported as a variance whatever the *source* declared, so the source's
+/// own `(sd)` spelling must be invisible here.
+///
+/// This is the trap the reader's module docs name: guessing the source scale
+/// from `omega_init_as_sd` would be a factor of two on exactly the fits where a
+/// published model was written `(sd)`, and would still look plausible.
+#[test]
+fn omega_declared_as_sd_in_the_source_is_invisible() {
+    let mut as_sd = source_fit();
+    // Same fit, same numbers, only the source model's *declaration* differs.
+    as_sd.omega_init_as_sd = vec![true];
+    as_sd.sigma_init_as_sd = vec![true];
+
+    let (a, _d1) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &source_fit());
+    let (b, _d2) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &as_sd);
+    let pen = a.set().penalty(&a.packed());
+    assert!(pen > 0.0, "fixture is degenerate");
+    assert_eq!(pen, b.set().penalty(&b.packed()));
+}
+
+/// The target model's `(sd)` declaration, by contrast, *is* read: the centre
+/// becomes `sqrt(variance)` and the relative SE halves.
+#[test]
+fn omega_converts_onto_the_targets_declared_scale() {
+    let (f, _dir) = with_from_fit(
+        Fixture::new(0.2, 0.001, 0.1, 0.25).omega_declared_as_sd(),
+        &source_fit(),
+    );
+    let s = f.set().summarize(&f.packed());
+    let omega = s.iter().find(|s| s.name == "ETA_CL").unwrap();
+    // Source variance 0.09 → declared SD 0.3.
+    assert!((omega.prior_value - 0.3).abs() < 1e-12, "{omega:?}");
+    // Source RSE on the variance is 0.036/0.09 = 40%; on the SD it is 20%, so
+    // the packed SD is `sqrt(ln(1 + 0.2²))` = 0.198_042, not `TAU_40`.
+    let expect_s = (1.0f64 + 0.2 * 0.2).ln().sqrt();
+    // Ω̂ = 0.1 → packed ln(sqrt(0.1)); prior mean ln(0.3).
+    let z = (0.1f64.sqrt() / 0.3).ln() / expect_s;
+    assert!((omega.shift_in_prior_sds - z).abs() < 1e-12, "{omega:?}");
+    // The straddle, hand-computed: ln(sqrt(0.1)/0.3) = 0.052_680_2, over
+    // `expect_s` = 0.198_042_9 → 0.266_005. An un-halved RSE would divide by
+    // `TAU_40` = 0.385_253_2 instead and give 0.136_743, so the two cannot both
+    // satisfy this bound.
+    assert!(
+        (omega.shift_in_prior_sds - 0.266_005).abs() < 1e-5,
+        "{omega:?}"
+    );
+}
+
+/// A θ that may be negative has no meaningful *relative* standard error, so its
+/// prior must come in as the absolute SE the source reported.
+///
+/// Under `Rse` the spread would be `sqrt(ln(1 + (se/|θ̂|)²))` on a log scale the
+/// parameter is not even packed on — and at θ̂ near zero it would explode.
+#[test]
+fn an_identity_packed_theta_imports_its_absolute_standard_error() {
+    let mut src = source_fit();
+    src.theta = vec![-0.4];
+    src.se_theta = Some(vec![0.2]);
+    let (f, _dir) = with_from_fit(Fixture::new(-0.2, -5.0, 0.1, 0.25), &src);
+    let s = f.set().summarize(&f.packed());
+    let th = s.iter().find(|s| s.name == "TVCL").unwrap();
+    assert_eq!(th.family, "normal");
+    assert!((th.prior_value - (-0.4)).abs() < 1e-12, "{th:?}");
+    // θ̂ = −0.2 against a prior at −0.4 with SD 0.2 → exactly one prior SD out.
+    assert!((th.shift_in_prior_sds - 1.0).abs() < 1e-9, "{th:?}");
+}
+
+/// An inline `prior(...)` on the same parameter wins over the imported one, so a
+/// user can override one without giving up the rest of the import.
+///
+/// The differential is what makes this observable: without the override the
+/// import supplies 0.15 ± 20%, so a test asserting only "three priors resolved"
+/// would pass whichever won.
+#[test]
+fn an_inline_prior_overrides_the_imported_one() {
+    let (f, _dir) = with_from_fit(
+        Fixture::new(0.2, 0.001, 0.1, 0.25).with_prior("TVCL", 0.25, PriorSpread::Rse(0.2)),
+        &source_fit(),
+    );
+    let s = f.set().summarize(&f.packed());
+    assert_eq!(s.len(), 3, "the other two imports must still land: {s:?}");
+    let th = s.iter().find(|s| s.name == "TVCL").unwrap();
+    assert!((th.prior_value - 0.25).abs() < 1e-12, "{th:?}");
+}
+
+/// A FIXed target parameter cannot be moved by a prior, so it is skipped with a
+/// note rather than failing the fit the way a typed prior on a FIXed parameter
+/// does. The asymmetry is the point: an import is a bulk operation.
+#[test]
+fn a_fixed_target_parameter_is_skipped_with_a_note() {
+    let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    f.model.default_params.theta_fixed = vec![true];
+    let (f, _dir) = with_from_fit(f, &source_fit());
+    let set = f.set();
+    assert_eq!(set.summarize(&f.packed()).len(), 2);
+    assert!(
+        set.notes()
+            .iter()
+            .any(|n| n.contains("TVCL") && n.contains("FIX")),
+        "{:?}",
+        set.notes()
+    );
+
+    // The typed form on the same parameter is still a hard error — the two
+    // behaviours must not collapse into one.
+    let mut typed =
+        Fixture::new(0.2, 0.001, 0.1, 0.25).with_prior("TVCL", 0.15, PriorSpread::Rse(0.2));
+    typed.model.default_params.theta_fixed = vec![true];
+    assert!(typed.build().unwrap_err().contains("FIX"));
+}
+
+/// A source parameter with no standard error carries no prior spread, so it is
+/// skipped — and the note says why, because "my prior did nothing" is otherwise
+/// only visible as an absence.
+#[test]
+fn a_source_parameter_without_a_standard_error_is_skipped() {
+    let mut src = source_fit();
+    src.se_theta = Some(vec![0.0]);
+    let (f, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &src);
+    let set = f.set();
+    assert_eq!(set.summarize(&f.packed()).len(), 2);
+    assert!(
+        set.notes()
+            .iter()
+            .any(|n| n.contains("TVCL") && n.contains("standard error")),
+        "{:?}",
+        set.notes()
+    );
+}
+
+/// Matching is on **name and family**. A source θ called `ETA_CL` must not
+/// become a prior on this model's Ω called `ETA_CL`: the numbers are on
+/// unrelated scales and the result would be silently wrong rather than absent.
+#[test]
+fn a_name_that_matches_a_different_family_is_not_imported() {
+    let mut src = source_fit();
+    src.theta_names = vec!["ETA_CL".into()];
+    // Rename the real Ω/σ rows so the only candidate is the mis-familied θ.
+    src.eta_names = vec!["SOMETHING_ELSE".into()];
+    src.sigma_names = vec!["ALSO_ELSE".into()];
+
+    let (f, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &src);
+    let err = f
+        .build()
+        .expect_err("a θ named after an Ω must not be imported as one");
+    assert!(err.contains("no prior could be imported"), "{err}");
+
+    // The straddle: with the family put back, the very same name *does* import.
+    let mut ok = source_fit();
+    ok.theta_names = vec!["UNRELATED".into()];
+    ok.eta_names = vec!["ETA_CL".into()];
+    ok.sigma_names = vec!["ALSO_ELSE".into()];
+    let (g, _d2) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &ok);
+    assert_eq!(g.set().summarize(&g.packed()).len(), 1);
+}
+
+/// An import that lands nothing leaves an unpenalized fit that looks exactly
+/// like a penalized one from the outside — the same failure mode phase 1 hard-
+/// errors on for a typed prior that cannot be applied.
+#[test]
+fn an_import_that_lands_nothing_is_an_error() {
+    let mut src = source_fit();
+    src.theta_names = vec!["NOT_IN_THIS_MODEL".into()];
+    src.eta_names = vec!["NOR_THIS".into()];
+    src.sigma_names = vec!["NOR_THAT".into()];
+    let (f, _dir) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &src);
+    let err = f
+        .build()
+        .expect_err("an empty import must not pass silently");
+    assert!(err.contains("no prior could be imported"), "{err}");
+    assert!(err.contains("name and family"), "{err}");
+
+    // Unconditional: a typed prior alongside it does not excuse the import. The
+    // fit would be penalized — just not by the thing the user asked for — and a
+    // wrong path is otherwise invisible.
+    let f2 = Fixture::new(0.2, 0.001, 0.1, 0.25).with_prior("TVCL", 0.15, PriorSpread::Rse(0.2));
+    let (f2, _d2) = with_from_fit(f2, &src);
+    assert!(f2
+        .build()
+        .expect_err("a typed prior must not excuse an empty import")
+        .contains("no prior could be imported"));
+
+    // …and every candidate being *skipped* reports the reasons rather than the
+    // bare "no name matched", so the user is told which gate each one hit.
+    let mut all_skipped = source_fit();
+    all_skipped.se_theta = Some(vec![0.0]);
+    all_skipped.se_omega = Some(vec![0.0]);
+    all_skipped.se_sigma = Some(vec![0.0]);
+    let (f3, _d3) = with_from_fit(Fixture::new(0.2, 0.001, 0.1, 0.25), &all_skipped);
+    let err = f3.build().expect_err("no usable spread anywhere");
+    assert!(err.contains("every candidate was skipped"), "{err}");
+    assert!(err.contains("theta TVCL"), "{err}");
+}
+
+/// A missing `from_fit` file stops the fit at the same gate a malformed typed
+/// prior does, naming the path.
+#[test]
+fn a_missing_from_fit_file_is_an_error_naming_the_path() {
+    let mut f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    f.model.prior_from_fit = Some("/no/such/parent-fit.yaml".into());
+    let err = f.build().unwrap_err();
+    assert!(err.contains("[priors] from_fit"), "{err}");
+    assert!(err.contains("/no/such/parent-fit.yaml"), "{err}");
+}
+
+/// No `[priors]` block and no inline prior is the pre-#254 path, bit for bit.
+#[test]
+fn no_prior_declaration_reads_no_file_and_stays_inactive() {
+    let f = Fixture::new(0.2, 0.001, 0.1, 0.25);
+    assert!(!f.set().is_active());
+    assert!(f.set().notes().is_empty());
+}

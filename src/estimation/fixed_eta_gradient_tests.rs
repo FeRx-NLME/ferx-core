@@ -151,6 +151,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "iov_grad_test".into(),
         pk_model: PkModel::OneCptIv,

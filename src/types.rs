@@ -3842,6 +3842,26 @@ pub struct CompiledModel {
     /// Resolved against the packed layout by the internal `PriorSet` once per
     /// estimation stage.
     pub priors: Vec<ParameterPrior>,
+    /// `[priors] from_fit = "…"` — the previous fit to import a prior from
+    /// (#254 phase 2), as the path was written.
+    ///
+    /// This is the model-updating path: a published or previously-run model
+    /// becomes the prior for a fit on new, sparse data, without the user
+    /// transcribing a parameter table. Every free parameter the source fit
+    /// reports with a usable standard error and whose name and family match a
+    /// parameter of *this* model becomes `prior(estimate, rse = SE/estimate)` on
+    /// this model's declared scale. An inline [`Self::priors`] entry on the same
+    /// parameter wins, so one imported prior can be overridden without dropping
+    /// the rest.
+    ///
+    /// A relative path is resolved against the **model file's** directory
+    /// (`parse_model_file` / `parse_full_model_file`), matching how `[data]
+    /// path` resolves; a model parsed from a string in memory has no directory
+    /// and resolves against the process's working directory.
+    ///
+    /// Expanded into prior terms by the internal `PriorSet`, alongside
+    /// [`Self::priors`], once per estimation stage.
+    pub prior_from_fit: Option<String>,
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,

@@ -14,6 +14,7 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "test".into(),
         pk_model: PkModel::OneCptOral,
@@ -144,6 +145,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "tv_cov_iv".into(),
         pk_model: PkModel::OneCptIv,

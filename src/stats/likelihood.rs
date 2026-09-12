@@ -2654,6 +2654,7 @@ mod tests {
     fn make_model() -> CompiledModel {
         CompiledModel {
             priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "test".into(),
             pk_model: PkModel::OneCptIv,

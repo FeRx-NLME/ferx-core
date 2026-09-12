@@ -1402,10 +1402,14 @@ fn record_theta_reference(idx: usize) {
 pub const NN_WEIGHT_DIRECT_REFERENCE_MARKER: &str = "W_NN_WEIGHT_DIRECT_REFERENCE";
 
 /// Parse a model file (.ferx) and return a CompiledModel.
+///
+/// Goes through [`parse_full_model_file`] rather than [`parse_model_string`] so
+/// the relative-path rewrites that need the model file's directory —
+/// `[data] path` and `[priors] from_fit` — apply here too. A caller that only
+/// wants the `CompiledModel` still gets a `from_fit` resolved against the model,
+/// not against the process's working directory.
 pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
-    parse_model_string(&content)
+    Ok(parse_full_model_file(path)?.model)
 }
 
 /// Parse a full model file including simulation spec, initial values, and fit options.
@@ -1413,18 +1417,29 @@ pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
     let mut parsed = parse_full_model(&content)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     // A relative `[data] path` is relative to the model file's own directory
     // (mirrors NONMEM's `$DATA` resolution against the control stream), not
     // the process's current working directory.
     if let Some(data_path) = &parsed.data_path {
-        let p = std::path::Path::new(data_path);
-        if p.is_relative() {
-            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                parsed.data_path = Some(dir.join(p).to_string_lossy().into_owned());
-            }
-        }
+        parsed.data_path = Some(resolve_against(data_path, dir));
+    }
+    // `[priors] from_fit` (#254 phase 2) resolves the same way, for the same
+    // reason: a model and the previous fit it updates from travel together in a
+    // run directory, and the user runs `ferx` from wherever they happen to be.
+    if let Some(from_fit) = &parsed.model.prior_from_fit {
+        parsed.model.prior_from_fit = Some(resolve_against(from_fit, dir));
     }
     Ok(parsed)
+}
+
+/// Join a model-file-relative path onto `dir`, leaving an absolute one alone.
+fn resolve_against(raw: &str, dir: Option<&Path>) -> String {
+    let p = std::path::Path::new(raw);
+    match dir.filter(|_| p.is_relative()) {
+        Some(dir) => dir.join(p).to_string_lossy().into_owned(),
+        None => raw.to_string(),
+    }
 }
 
 /// Parse a model string and return a CompiledModel (backward compatible).
@@ -2947,6 +2962,9 @@ pub fn parse_full_model_with(
 
     let model = CompiledModel {
         priors: declared_priors,
+        // `[priors] from_fit` is read further down, once `extract_blocks` output
+        // is in scope, and assigned onto `model` there.
+        prior_from_fit: None,
         name,
         covariate_model,
         pk_model,
@@ -3084,6 +3102,15 @@ pub fn parse_full_model_with(
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+    // `[priors] from_fit` (#254 phase 2, the model-updating import). Like
+    // `[data] path` above, only the raw value is read here;
+    // `parse_full_model_file` resolves it relative to the model file's directory
+    // afterwards, since this function only ever sees the model's text.
+    model.prior_from_fit = blocks
+        .get("priors")
+        .map(|lines| parse_priors_block(lines))
+        .transpose()?
+        .flatten();
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
@@ -7466,6 +7493,56 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
     }
     let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
     Ok((path, column_map))
+}
+
+/// Parse the `[priors]` block (#254 phase 2).
+///
+/// One key in v1:
+///
+/// ```text
+/// [priors]
+///   from_fit = "parent-model-fit.yaml"
+/// ```
+///
+/// Returns the path exactly as written — resolution against the model file's
+/// directory happens in [`parse_full_model_file`], the same split `[data] path`
+/// uses, because this function only ever sees the model's *text*.
+///
+/// An unknown key is an error rather than a silent skip. `[data_selection]`
+/// above does skip unknown keys, and that is the behaviour #1040 went and fixed
+/// for block *names* for the same reason it is wrong here: a typo'd
+/// `from_fit_file =` would parse cleanly, import nothing, and produce an
+/// unpenalized fit that looks exactly like a penalized one.
+fn parse_priors_block(lines: &[String]) -> Result<Option<String>, String> {
+    let mut from_fit: Option<String> = None;
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "[priors]: `{}` is not a `key = value` line. The only key is \
+                 `from_fit = <path to a previous fit>`.",
+                line.trim()
+            ));
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if key != "from_fit" {
+            return Err(format!(
+                "[priors]: unknown key `{key}`. The only key is `from_fit = \
+                 <path to a previous fit>`; a prior on an individual parameter \
+                 is written inline in `[parameters]` as `prior(value, rse = …)`."
+            ));
+        }
+        if value.is_empty() {
+            return Err("[priors]: empty `from_fit` — write `from_fit = <path to a \
+                 previous fit>` (`.fitrx`, `.json` or `{model}-fit.yaml`)."
+                .to_string());
+        }
+        if from_fit.is_some() {
+            return Err("[priors]: `from_fit` declared more than once.".to_string());
+        }
+        from_fit = Some(value.to_string());
+    }
+    Ok(from_fit)
 }
 
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
@@ -12258,6 +12335,7 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("odes", BlockForm::Unnamed, None),
     ("output", BlockForm::Unnamed, None),
     ("parameters", BlockForm::Unnamed, None),
+    ("priors", BlockForm::Unnamed, None),
     ("scaling", BlockForm::Unnamed, None),
     ("simulation", BlockForm::Unnamed, None),
     ("structural_model", BlockForm::Unnamed, None),

@@ -1001,6 +1001,7 @@ fn make_model() -> CompiledModel {
     };
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "outer_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -1305,6 +1306,7 @@ fn test_outer_ad_gradient_block_omega() {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "block_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -1787,6 +1789,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         frem_config: None,
         residual_error_eta: None,

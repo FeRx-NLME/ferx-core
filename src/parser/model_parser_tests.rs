@@ -22749,3 +22749,119 @@ fn an_identifier_containing_prior_is_not_the_modifier() {
     assert!(model.priors.is_empty());
     assert!(model.theta_names.iter().any(|n| n == "MY_prior"));
 }
+
+// ── `[priors] from_fit` (#254 phase 2) ──────────────────────────────────────
+
+/// [`priored_model`] with a `[priors]` block appended.
+fn from_fit_model(block: &str) -> String {
+    format!("{}\n[priors]\n{block}\n", priored_model(PRIOR_BASE_PARAMS))
+}
+
+/// The block parses, and the path arrives **verbatim** — resolution against the
+/// model file's directory happens in `parse_full_model_file`, which only the
+/// file entry points reach.
+#[test]
+fn priors_block_carries_the_from_fit_path_verbatim() {
+    for line in [
+        "  from_fit = parent-fit.yaml",
+        "  from_fit = \"parent-fit.yaml\"",
+        "  from_fit = 'parent-fit.yaml'",
+        "  FROM_FIT = parent-fit.yaml",
+    ] {
+        let model = parse_full_model(&from_fit_model(line))
+            .unwrap_or_else(|e| panic!("`{line}` should parse: {e}"))
+            .model;
+        assert_eq!(
+            model.prior_from_fit.as_deref(),
+            Some("parent-fit.yaml"),
+            "{line}"
+        );
+        // The block adds no inline prior — the two channels stay separate until
+        // `PriorSet::build` merges them.
+        assert!(model.priors.is_empty(), "{line}");
+    }
+}
+
+/// No `[priors]` block leaves the field `None`, so an unpriored model reads no
+/// file and takes the pre-#254 path.
+#[test]
+fn no_priors_block_leaves_from_fit_unset() {
+    let model = parse_full_model(&priored_model(PRIOR_BASE_PARAMS))
+        .unwrap_or_else(|e| panic!("should parse: {e}"))
+        .model;
+    assert!(model.prior_from_fit.is_none());
+}
+
+/// A misspelled key is an error, not a skip.
+///
+/// `[data_selection]` skips unknown keys and `[fit_options]` is lenient in
+/// places, so "unknown key is ignored" is the house style this deliberately
+/// departs from: a typo'd `from_fit_file =` would parse cleanly, import nothing,
+/// and produce an unpenalized fit indistinguishable from a penalized one.
+#[test]
+fn an_unknown_priors_key_is_an_error() {
+    let err = parse_full_model(&from_fit_model("  from_fit_file = parent-fit.yaml"))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("unknown key"), "{err}");
+    assert!(err.contains("from_fit"), "{err}");
+}
+
+#[test]
+fn a_malformed_priors_line_is_an_error() {
+    let err = parse_full_model(&from_fit_model("  parent-fit.yaml"))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("key = value"), "{err}");
+
+    let err = parse_full_model(&from_fit_model("  from_fit ="))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("empty `from_fit`"), "{err}");
+
+    let err = parse_full_model(&from_fit_model("  from_fit = a.yaml\n  from_fit = b.yaml"))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(err.contains("more than once"), "{err}");
+}
+
+/// `[priors]` is a registered block name, so it is neither rejected as unknown
+/// nor silently dropped — the failure mode #1040 exists to prevent.
+#[test]
+fn priors_is_a_known_block_name() {
+    assert!(known_block_names().contains(&"priors"));
+}
+
+/// A relative `from_fit` resolves against the **model file's** directory, the
+/// same rule `[data] path` follows, so a run directory holding a model and the
+/// fit it updates from works from any working directory.
+#[test]
+fn a_relative_from_fit_resolves_against_the_model_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_path = dir.path().join("update.ferx");
+    std::fs::write(&model_path, from_fit_model("  from_fit = parent-fit.yaml")).unwrap();
+
+    let model = parse_model_file(&model_path).unwrap();
+    assert_eq!(
+        model.prior_from_fit.as_deref(),
+        Some(
+            dir.path()
+                .join("parent-fit.yaml")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+
+    // An absolute path is left alone.
+    let abs = dir.path().join("elsewhere.yaml");
+    std::fs::write(
+        &model_path,
+        from_fit_model(&format!("  from_fit = {}", abs.display())),
+    )
+    .unwrap();
+    let model = parse_model_file(&model_path).unwrap();
+    assert_eq!(
+        model.prior_from_fit.as_deref(),
+        Some(abs.to_string_lossy().as_ref())
+    );
+}

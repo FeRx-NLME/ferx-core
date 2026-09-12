@@ -111,6 +111,83 @@ zero. On a log-estimated parameter `sd` is read as the relative spread it implie
 (`sd = 0.03` on a value of `0.15` is `rse = 20%`), so the two spellings never
 disagree.
 
+## Model updating: a prior from a previous fit
+
+Transcribing a whole parameter table by hand is the part of model updating that
+goes wrong. `[priors] from_fit` reads a previous ferx run and builds the priors
+from it:
+
+```
+[priors]
+  from_fit = "parent-model-fit.yaml"
+```
+
+Every parameter the source run reports with a usable standard error, and whose
+name and family match a `[parameters]` declaration in *this* model, gets
+`prior(estimate, rse = SE/estimate)`. That is exactly the prior you would have
+typed off the source run's own output — no new convention, and the report reads
+the same for an imported prior as for a typed one.
+
+A relative path is resolved against the **model file's** directory, like
+`[data] path`, so a run directory holding a model and the fit it updates from
+works from any working directory.
+
+### Which file
+
+| File | Written by | Precision |
+|---|---|---|
+| `{model}-fit.yaml` | every run | 6 decimals |
+| `{model}-fit.json` | `--output-format json` | exact |
+| `run.fitrx` | `--output run.fitrx` | exact |
+
+The YAML is the one every run writes, so it is the default answer. It is
+formatted to six decimal places, which matters only when a parameter is smaller
+than about `1e-4` — an Ω variance near a boundary, an additive σ in small units.
+Use `.json` or `.fitrx` when it is.
+
+### What is imported, and what is skipped
+
+Imported: θ, Ω diagonals, Σ, and κ (Ω_IOV) diagonals.
+
+Skipped, each reported in the fit's warnings so a missing prior is visible rather
+than merely absent:
+
+- a parameter with no standard error in the source — a `FIX`ed one, or a run
+  whose covariance step did not execute. Without an SE there is no spread;
+- a parameter that is `FIX`ed in **this** model, which a prior could never move;
+- a `block_omega` / `block_sigma` element or a `[mixture]` override, which v1
+  does not support;
+- a parameter that already carries an inline `prior(...)` here. **The inline one
+  wins**, so you can tighten or loosen one imported prior without giving up the
+  rest.
+
+A source parameter this model simply does not have is skipped silently — a
+published model is usually larger than the one being updated. But an import that
+lands **nothing at all** is a hard error, for the same reason an unresolvable
+typed prior is: the alternative is an unpenalized fit that looks exactly like a
+penalized one.
+
+### Scales are converted for you
+
+A fit report always states Ω and κ as **variances** and Σ as an **SD**, whatever
+the source model declared them as — so a source written `(sd)` imports
+identically to one written on the variance scale. What decides the prior is
+**this** model's declaration, and the relative SE is carried across with it:
+
+| Source reports | Declared here as | Prior centre | Prior RSE |
+|---|---|---|---|
+| Ω variance `v` | `omega X ~ v` | `v` | `SE/v` |
+| Ω variance `v` | `omega X ~ s (sd)` | `√v` | `SE/(2v)` |
+| Σ SD `s` | `sigma X ~ v` | `s²` | `2·SE/s` |
+| Σ SD `s` | `sigma X ~ s (sd)` | `s` | `SE/s` |
+
+(The factors of two are the delta method: the relative SE of `xᵖ` is `|p|` times
+the relative SE of `x`.)
+
+A θ estimated on the identity scale — one whose declared lower bound is negative
+— imports its **absolute** SE instead, since a relative one is meaningless where
+the estimate may be zero.
+
 ## Reading the output
 
 ```
