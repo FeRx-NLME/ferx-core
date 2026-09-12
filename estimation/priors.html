@@ -1,0 +1,1920 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Stabilize sparse-data fits with per-parameter priors: penalized maximum likelihood (MAP) estimation in the ferx NLME engine, the simple alternative to NONMEM $PRIOR.">
+
+<title>Parameter priors in ferx – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Parameter priors in ferx">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Parameter priors in ferx">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/estimation/priors.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/priors.html">Parameter Priors (penalized ML / MAP)</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/priors.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Parameter Priors (penalized ML / MAP)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../tools/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/ruvsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Residual-error search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/iivsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variability-structure search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/iovsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-occasion variability search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/amd.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Automatic model development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/global-search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Global model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#parameter-priors-penalized-ml-map" id="toc-parameter-priors-penalized-ml-map" class="nav-link active" data-scroll-target="#parameter-priors-penalized-ml-map">Parameter Priors (penalized ML / MAP)</a>
+  <ul>
+  <li><a href="#when-to-reach-for-one" id="toc-when-to-reach-for-one" class="nav-link" data-scroll-target="#when-to-reach-for-one">When to reach for one</a></li>
+  <li><a href="#what-a-prior-does-to-the-objective" id="toc-what-a-prior-does-to-the-objective" class="nav-link" data-scroll-target="#what-a-prior-does-to-the-objective">What a prior does to the objective</a></li>
+  <li><a href="#which-scale-the-prior-lives-on" id="toc-which-scale-the-prior-lives-on" class="nav-link" data-scroll-target="#which-scale-the-prior-lives-on">Which scale the prior lives on</a>
+  <ul class="collapse">
+  <li><a href="#the-trap-a-θs-prior-family-follows-its-bounds" id="toc-the-trap-a-θs-prior-family-follows-its-bounds" class="nav-link" data-scroll-target="#the-trap-a-θs-prior-family-follows-its-bounds">The trap: a θ’s prior family follows its bounds</a></li>
+  </ul></li>
+  <li><a href="#declaring-a-prior" id="toc-declaring-a-prior" class="nav-link" data-scroll-target="#declaring-a-prior">Declaring a prior</a></li>
+  <li><a href="#model-updating-a-prior-from-a-previous-fit" id="toc-model-updating-a-prior-from-a-previous-fit" class="nav-link" data-scroll-target="#model-updating-a-prior-from-a-previous-fit">Model updating: a prior from a previous fit</a>
+  <ul class="collapse">
+  <li><a href="#which-file-and-from-where" id="toc-which-file-and-from-where" class="nav-link" data-scroll-target="#which-file-and-from-where">Which file, and from where</a></li>
+  <li><a href="#what-is-imported-and-what-is-skipped" id="toc-what-is-imported-and-what-is-skipped" class="nav-link" data-scroll-target="#what-is-imported-and-what-is-skipped">What is imported, and what is skipped</a></li>
+  <li><a href="#scales-are-converted-for-you" id="toc-scales-are-converted-for-you" class="nav-link" data-scroll-target="#scales-are-converted-for-you">Scales are converted for you</a></li>
+  </ul></li>
+  <li><a href="#reading-the-output" id="toc-reading-the-output" class="nav-link" data-scroll-target="#reading-the-output">Reading the output</a>
+  <ul class="collapse">
+  <li><a href="#standard-errors-are-map-standard-errors" id="toc-standard-errors-are-map-standard-errors" class="nav-link" data-scroll-target="#standard-errors-are-map-standard-errors">Standard errors are MAP standard errors</a></li>
+  </ul></li>
+  <li><a href="#where-it-applies" id="toc-where-it-applies" class="nav-link" data-scroll-target="#where-it-applies">Where it applies</a>
+  <ul class="collapse">
+  <li><a href="#covariance-estimators" id="toc-covariance-estimators" class="nav-link" data-scroll-target="#covariance-estimators">Covariance estimators</a></li>
+  </ul></li>
+  <li><a href="#not-supported-in-v1" id="toc-not-supported-in-v1" class="nav-link" data-scroll-target="#not-supported-in-v1">Not supported in v1</a></li>
+  <li><a href="#comparison-with-nonmem-prior" id="toc-comparison-with-nonmem-prior" class="nav-link" data-scroll-target="#comparison-with-nonmem-prior">Comparison with NONMEM <code>$PRIOR</code></a>
+  <ul class="collapse">
+  <li><a href="#the-θ-prior-is-anchored-against-nwpri" id="toc-the-θ-prior-is-anchored-against-nwpri" class="nav-link" data-scroll-target="#the-θ-prior-is-anchored-against-nwpri">The θ prior is anchored against NWPRI</a></li>
+  </ul></li>
+  <li><a href="#references" id="toc-references" class="nav-link" data-scroll-target="#references">References</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/priors.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/priors.html">Parameter Priors (penalized ML / MAP)</a></li></ol></nav></header>
+
+
+
+
+
+<section id="parameter-priors-penalized-ml-map" class="level1">
+<h1>Parameter Priors (penalized ML / MAP)</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: experimental</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>A <strong>prior</strong> pins a parameter near a value you already believe, and lets the data move it only as far as the data can pay for. Declare one next to the parameter:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode toml code-with-copy"><code class="sourceCode toml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[parameters]</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">theta</span> <span class="dt">TVCL</span><span class="er">(</span><span class="dt">0.2</span><span class="er">,</span> <span class="dt">0.001</span><span class="er">,</span> <span class="dt">10.0</span><span class="er">)</span>  <span class="dt">prior</span><span class="er">(</span><span class="dt">0.15</span><span class="er">,</span> <span class="dt">rse</span> <span class="op">=</span> <span class="dv">25</span><span class="er">%)</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">theta</span> <span class="dt">TVV</span><span class="er">(</span><span class="dt">10.0</span><span class="er">,</span> <span class="dt">0.1</span><span class="er">,</span> <span class="dt">500.0</span><span class="er">)</span>   <span class="dt">prior</span><span class="er">(</span><span class="dt">9.8</span><span class="er">,</span>  <span class="dt">rse</span> <span class="op">=</span> <span class="dv">12</span><span class="er">%)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">omega</span> <span class="dt">ETA_CL</span> <span class="er">~</span> <span class="dt">0.09</span>           <span class="dt">prior</span><span class="er">(</span><span class="dt">0.09</span><span class="er">,</span> <span class="dt">rse</span> <span class="op">=</span> <span class="dv">40</span><span class="er">%)</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>That is the entire user-facing surface: <strong>a central value and a relative uncertainty</strong>, both read off the same row of a published parameter table. There is no separate prior problem, no precision or covariance matrix, no inverse-Wishart, and no degrees-of-freedom indexing to keep aligned by hand (compare <a href="#comparison-with-nonmem-prior">NONMEM <code>$PRIOR</code></a>).</p>
+<section id="when-to-reach-for-one" class="level2">
+<h2 class="anchored" data-anchor-id="when-to-reach-for-one">When to reach for one</h2>
+<p>Sparse clinical data — rare disease, pediatrics, TDM-led fits. The likelihood is weakly informative, IIV terms collapse onto boundaries, and structural parameters drift. A prior taken from a published popPK model stabilizes the fit and lets a small local dataset borrow strength from what is already known.</p>
+<p>The same mechanism is <strong>model updating</strong>: take a literature model as the prior, refit on local sparse data, and get a regularized estimate. That is the MAP-Bayesian updating behind much of model-informed precision dosing.</p>
+</section>
+<section id="what-a-prior-does-to-the-objective" class="level2">
+<h2 class="anchored" data-anchor-id="what-a-prior-does-to-the-objective">What a prior does to the objective</h2>
+<p>The penalty is added to the objective the optimizer minimises:</p>
+<p><span class="math display">\[
+\mathrm{OFV}_{\text{total}} \;=\; \mathrm{OFV}_{\text{data}} \;+\; \sum_k \left(\frac{x_k - m_k}{s_k}\right)^2
+\]</span></p>
+<p>where <span class="math inline">\(x_k\)</span> is the parameter on the scale ferx estimates it, <span class="math inline">\(m_k\)</span> is the prior centre on that same scale, and <span class="math inline">\(s_k\)</span> comes from the RSE.</p>
+<p>Two consequences worth knowing before you read a result:</p>
+<ul>
+<li><strong><code>ofv</code> is the penalized total.</strong> The fit report splits it into <code>ofv_data</code> and <code>ofv_prior</code> so you can see how much of the objective the prior is responsible for. Normalisation constants are dropped on both halves (ferx’s −2 log L already omits <span class="math inline">\(N\log 2\pi\)</span>), so a priored ferx OFV is not absolutely comparable to a priored NONMEM objective — compare a <strong>ΔOFV against a null twin</strong> instead.</li>
+<li><strong>AIC and BIC are computed from <code>ofv_data</code>.</strong> A penalized objective is not a log-likelihood, and an information criterion built from one would silently reward a tighter prior.</li>
+</ul>
+</section>
+<section id="which-scale-the-prior-lives-on" class="level2">
+<h2 class="anchored" data-anchor-id="which-scale-the-prior-lives-on">Which scale the prior lives on</h2>
+<p><strong>The prior’s central value and its spread are always on the scale the parameter was declared on.</strong> If you wrote a variance, the prior is a variance; if you wrote <code>(sd)</code>, both are standard deviations. Nothing is ever converted by hand.</p>
+<p>What the prior <em>becomes</em> internally follows from how ferx estimates the parameter:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Declaration</th>
+<th>Estimated as</th>
+<th>Prior family</th>
+<th>From <code>prior(v, rse = r)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>theta X(init, lower ≥ 0, …)</code></td>
+<td><span class="math inline">\(\ln\theta\)</span></td>
+<td>lognormal on <span class="math inline">\(\theta\)</span></td>
+<td><span class="math inline">\(m=\ln v\)</span>, <span class="math inline">\(s=\sqrt{\ln(1+r^2)}\)</span></td>
+</tr>
+<tr class="even">
+<td><code>theta X(init, lower &lt; 0, …)</code></td>
+<td><span class="math inline">\(\theta\)</span></td>
+<td>normal on <span class="math inline">\(\theta\)</span></td>
+<td><span class="math inline">\(m=v\)</span>, <span class="math inline">\(s=\lvert v\rvert\,r\)</span></td>
+</tr>
+<tr class="odd">
+<td><code>omega E ~ var</code></td>
+<td><span class="math inline">\(\ln(\mathrm{SD})\)</span></td>
+<td>lognormal on the variance</td>
+<td><span class="math inline">\(m=\tfrac12\ln v\)</span>, <span class="math inline">\(s=\tfrac12\sqrt{\ln(1+r^2)}\)</span></td>
+</tr>
+<tr class="even">
+<td><code>omega E ~ sd (sd)</code></td>
+<td><span class="math inline">\(\ln(\mathrm{SD})\)</span></td>
+<td>lognormal on the SD</td>
+<td><span class="math inline">\(m=\ln v\)</span>, <span class="math inline">\(s=\sqrt{\ln(1+r^2)}\)</span></td>
+</tr>
+<tr class="odd">
+<td><code>sigma S ~ var</code> / <code>(sd)</code></td>
+<td><span class="math inline">\(\ln(\mathrm{SD})\)</span></td>
+<td>as omega</td>
+<td>as omega</td>
+</tr>
+<tr class="even">
+<td><code>kappa K ~ var</code> / <code>(sd)</code></td>
+<td><span class="math inline">\(\ln(\mathrm{SD})\)</span></td>
+<td>as omega</td>
+<td>as omega</td>
+</tr>
+</tbody>
+</table>
+<p>Working on the log-variance scale for <span class="math inline">\(\Omega\)</span> keeps the prior positive and symmetric and avoids any matrix algebra.</p>
+<section id="the-trap-a-θs-prior-family-follows-its-bounds" class="level3">
+<h3 class="anchored" data-anchor-id="the-trap-a-θs-prior-family-follows-its-bounds">The trap: a θ’s prior family follows its bounds</h3>
+<p>A θ declared with a <strong>non-negative</strong> lower bound is estimated as <span class="math inline">\(\ln\theta\)</span>, so its prior is lognormal. Widen the bound to allow negative values and ferx estimates <span class="math inline">\(\theta\)</span> directly, which makes the same <code>prior(...)</code> declaration a <strong>normal</strong> prior instead. Nothing in the declaration changes; the family does.</p>
+<p>This is visible rather than hidden: the fit report prints the realised family and the implied 95% prior interval for every priored parameter, so check that column rather than inferring the family from the model file.</p>
+</section>
+</section>
+<section id="declaring-a-prior" class="level2">
+<h2 class="anchored" data-anchor-id="declaring-a-prior">Declaring a prior</h2>
+<pre><code>prior(&lt;value&gt;, rse = &lt;r&gt;%)      # relative uncertainty, as a percent
+prior(&lt;value&gt;, rse = &lt;r&gt;)       # …or as a fraction below 1
+prior(&lt;value&gt;, sd  = &lt;s&gt;)       # absolute SD, on the declared scale</code></pre>
+<p><code>value =</code> may be written explicitly (<code>prior(value = 0.15, rse = 25%)</code>). Exactly one of <code>rse</code> / <code>sd</code> is required.</p>
+<p><strong>RSE units are validated, not guessed.</strong> <code>rse = 25%</code> and <code>rse = 0.25</code> both mean 25%. A bare number greater than 1 is a hard error: <code>rse = 25</code> is overwhelmingly a percent written without its sign, and reading it as 2500% would produce a prior so flat the fit is indistinguishable from an unpriored one — a mistake you would never see, because the fit still converges.</p>
+<p>Use <code>sd =</code> when a relative uncertainty is meaningless: a θ that can be negative (a covariate exponent, a drug-effect slope) whose prior centre sits at or near zero. On a log-estimated parameter <code>sd</code> is read as the relative spread it implies (<code>sd = 0.03</code> on a value of <code>0.15</code> is <code>rse = 20%</code>), so the two spellings never disagree.</p>
+</section>
+<section id="model-updating-a-prior-from-a-previous-fit" class="level2">
+<h2 class="anchored" data-anchor-id="model-updating-a-prior-from-a-previous-fit">Model updating: a prior from a previous fit</h2>
+<p>Transcribing a whole parameter table by hand is the part of model updating that goes wrong. <code>[priors] from_fit</code> reads a previous ferx run and builds the priors from it:</p>
+<pre><code>[priors]
+  from_fit = "parent-model-fit.yaml"</code></pre>
+<p>Every parameter the source run reports with a usable standard error, and whose name and family match a <code>[parameters]</code> declaration in <em>this</em> model, gets <code>prior(estimate, rse = SE/estimate)</code>. That is exactly the prior you would have typed off the source run’s own output — no new convention, and the report reads the same for an imported prior as for a typed one.</p>
+<p>A relative path is resolved against the <strong>model file’s</strong> directory, like <code>[data] path</code>, so a model and the fit it updates from can sit together in a run directory.</p>
+<p>The source fit is read <strong>when the model is parsed</strong>, not once per estimation stage. Two things follow that are worth knowing:</p>
+<ul>
+<li>a <code>from_fit</code> that cannot be honoured (missing file, wrong format, nothing to import) fails at parse time, so <code>ferx check</code> refuses the model and the error names the path rather than surfacing halfway through a fit;</li>
+<li>the prior the optimizer minimised, the prior the covariance step used and the prior the report prints are the same one, even if the source file changes while the fit is running.</li>
+</ul>
+<p>(A model that needs data-derived bindings — a symbolic <code>[covariate_model]</code> centring statistic, or a <code>theta NAME[COL]</code> level block — is re-parsed once the dataset is known, and reads the source fit again on that pass. Both reads happen before any estimation, so the guarantee above still holds.)</p>
+<section id="which-file-and-from-where" class="level3">
+<h3 class="anchored" data-anchor-id="which-file-and-from-where">Which file, and from where</h3>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>File</th>
+<th>Written by</th>
+<th>Precision</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>{model}-fit.yaml</code></td>
+<td>every run</td>
+<td>6 decimals</td>
+</tr>
+<tr class="even">
+<td><code>{model}-fit.json</code></td>
+<td><code>--output-format json</code></td>
+<td>exact</td>
+</tr>
+<tr class="odd">
+<td><code>run.fitrx</code></td>
+<td><code>--output run.fitrx</code></td>
+<td>exact</td>
+</tr>
+</tbody>
+</table>
+<p>The YAML is the one every run writes, so it is the default answer. It is formatted to six decimal places, which matters only when a parameter is smaller than about <code>1e-4</code> — an Ω variance near a boundary, an additive σ in small units. Use <code>.json</code> or <code>.fitrx</code> when it is.</p>
+<div class="callout callout-style-default callout-important callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Important</span>Run the parent from the directory the update lives in
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The CLI writes <code>{model}-fit.yaml</code> into the <strong>working directory</strong>, while <code>from_fit</code> resolves against the <strong>model file’s</strong> directory. Those are the same place only when you run from where the models are:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> my-run</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> parent.ferx <span class="at">--data</span> ../data/study.csv   <span class="co"># writes ./parent-fit.yaml</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> update.ferx <span class="at">--data</span> ../data/local.csv   <span class="co"># reads  ./parent-fit.yaml</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Running the parent from one directory and the update from another gives <code>failed to read …: No such file or directory</code>, naming the path it looked for.</p>
+</div>
+</div>
+</section>
+<section id="what-is-imported-and-what-is-skipped" class="level3">
+<h3 class="anchored" data-anchor-id="what-is-imported-and-what-is-skipped">What is imported, and what is skipped</h3>
+<p>Imported: θ, Ω diagonals, Σ, and κ (Ω_IOV) diagonals.</p>
+<p>Skipped <strong>and reported in the fit’s warnings</strong>, so a prior you expected is visible by name rather than merely absent:</p>
+<ul>
+<li>a parameter with no standard error in the source — a <code>FIX</code>ed one, or a run whose covariance step did not execute. Without an SE there is no spread;</li>
+<li>a parameter that is <code>FIX</code>ed in <strong>this</strong> model, which a prior could never move;</li>
+<li>a <code>block_omega</code> / <code>block_sigma</code> element or a <code>[mixture]</code> override, which v1 does not support.</li>
+</ul>
+<p>Skipped <strong>silently</strong>, because both are what you asked for:</p>
+<ul>
+<li>a parameter that already carries an inline <code>prior(...)</code> here. <strong>The inline one wins</strong>, so you can tighten or loosen one imported prior without giving up the rest — and the result is listed in the fit’s prior table either way;</li>
+<li>a source parameter this model simply does not have. A published model is usually larger than the one being updated, so one warning per absent parameter would bury the ones that matter.</li>
+</ul>
+<p>An import that lands <strong>nothing at all</strong> is a hard error, for the same reason an unresolvable typed prior is: the alternative is an unpenalized fit that looks exactly like a penalized one.</p>
+<p>Matching is on <strong>name and family</strong>, not name alone. θ names and η names are separate namespaces, so <code>theta CL</code> and <code>omega CL</code> can both exist in one model; a source θ called <code>CL</code> lands on the θ and never on the Ω.</p>
+</section>
+<section id="scales-are-converted-for-you" class="level3">
+<h3 class="anchored" data-anchor-id="scales-are-converted-for-you">Scales are converted for you</h3>
+<p>A fit report always states Ω and κ as <strong>variances</strong> and Σ as an <strong>SD</strong>, whatever the source model declared them as — so a source written <code>(sd)</code> imports identically to one written on the variance scale. What decides the prior is <strong>this</strong> model’s declaration, and the relative SE is carried across with it:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Source reports</th>
+<th>Declared here as</th>
+<th>Prior centre</th>
+<th>Prior RSE</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Ω variance <code>v</code></td>
+<td><code>omega X ~ v</code></td>
+<td><code>v</code></td>
+<td><code>SE/v</code></td>
+</tr>
+<tr class="even">
+<td>Ω variance <code>v</code></td>
+<td><code>omega X ~ s (sd)</code></td>
+<td><code>√v</code></td>
+<td><code>SE/(2v)</code></td>
+</tr>
+<tr class="odd">
+<td>Σ SD <code>s</code></td>
+<td><code>sigma X ~ v</code></td>
+<td><code>s²</code></td>
+<td><code>2·SE/s</code></td>
+</tr>
+<tr class="even">
+<td>Σ SD <code>s</code></td>
+<td><code>sigma X ~ s (sd)</code></td>
+<td><code>s</code></td>
+<td><code>SE/s</code></td>
+</tr>
+</tbody>
+</table>
+<p>(The factors of two are the delta method: the relative SE of <code>xᵖ</code> is <code>|p|</code> times the relative SE of <code>x</code>.)</p>
+<p>A θ estimated on the identity scale — one whose declared lower bound is negative — imports its <strong>absolute</strong> SE instead, since a relative one is meaningless where the estimate may be zero.</p>
+</section>
+</section>
+<section id="reading-the-output" class="level2">
+<h2 class="anchored" data-anchor-id="reading-the-output">Reading the output</h2>
+<pre><code>--- Objective Function ---
+OFV:  1584.2213
+    data:  1583.9501
+    prior: 0.2712
+AIC:  1595.9501
+BIC:  1612.1530
+
+--- Parameter Priors (penalized ML / MAP) ---
+  PARAMETER               PRIOR     ESTIMATE    SHIFT    PENALTY  PRIOR 95%
+  TVCL                  0.15000      0.13195    -0.52      0.271  [0.0926, 0.2430] (lognormal)
+  SHIFT is (estimate − prior) in prior SDs. Standard errors above are the curvature of
+  the penalized objective — MAP standard errors, not posterior SDs.</code></pre>
+<p><code>SHIFT</code> is the column that earns its place. A raw difference only says the estimate moved; the standardized one says whether the data and the prior actually <strong>disagree</strong> — which is the question a MAP fit is asked. A shift beyond about ±2 means the data is fighting the prior, and is worth investigating before the result is used.</p>
+<p>The same values are written to the fit YAML under <code>objective_function</code> (as <code>ofv_data</code> / <code>ofv_prior</code>) and <code>parameter_priors</code>.</p>
+<section id="standard-errors-are-map-standard-errors" class="level3">
+<h3 class="anchored" data-anchor-id="standard-errors-are-map-standard-errors">Standard errors are MAP standard errors</h3>
+<p>The reported SEs are the curvature of the <strong>penalized</strong> objective, not posterior standard deviations. This is deliberate and it is the only defensible choice: a sparse fit carries a prior precisely because the data alone does not identify the direction, and that is exactly where the unpenalized Hessian goes flat or non-positive-definite. Reporting the data-only curvature would give a standard error for a quantity the data cannot estimate.</p>
+<p>It also means a tighter prior gives a smaller SE, mechanically. Do not read a narrow MAP interval as evidence the data was informative — read <code>SHIFT</code> and <code>ofv_prior</code> for that.</p>
+</section>
+</section>
+<section id="where-it-applies" class="level2">
+<h2 class="anchored" data-anchor-id="where-it-applies">Where it applies</h2>
+<p>Priors are applied by the <strong>FOCE family</strong>: <code>foce</code>, <code>focei</code>, <code>laplace</code>, <code>gn</code>, <code>gn_hybrid</code>. They enter the objective, the gradient, and the covariance step’s Hessian.</p>
+<p>If the last <strong>estimating</strong> stage of a chain does not apply priors, the fit is <strong>refused</strong> rather than run unpenalized. An unapplied prior is invisible in the output — the fit converges, the estimates look reasonable, and nothing says the prior was dropped — so a silent fallback would be worse than no feature. Chaining is fine as long as that stage qualifies: <code>method = [saem, focei]</code> works, because the FOCEI stage is the one whose estimates are reported.</p>
+<p>“Last estimating” is deliberate: a trailing <strong>evaluation-only</strong> stage (<code>imp</code> with <code>imp_eval_only</code>, <code>laplace</code> with <code>agq_eval_only</code>) only scores the preceding stage’s parameters, so it neither applies a prior nor undoes one. <code>method = [focei, imp]</code> with <code>imp_eval_only = true</code> is accepted — FOCEI applied the prior — while <code>[saem, laplace]</code> with <code>agq_eval_only = true</code> is refused, because Laplace there is only evaluating SAEM’s unpriored estimates.</p>
+<section id="covariance-estimators" class="level3">
+<h3 class="anchored" data-anchor-id="covariance-estimators">Covariance estimators</h3>
+<p><code>covariance_method = r</code> (the default) is the only estimator accepted under a prior; it is the one whose Hessian carries the prior’s curvature, so its <code>R⁻¹</code> is the penalized (MAP) covariance.</p>
+<p>Both estimators built on <code>S</code> are <strong>refused</strong>. <code>S</code> is a sum of per-subject score cross-products, and a prior contributes one score for the whole population rather than one per subject, so nothing assembled from <code>S</code> can represent it:</p>
+<ul>
+<li><code>covariance_method = s</code> is <code>S⁻¹</code>, the unpenalized information outright;</li>
+<li><code>covariance_method = rsr</code> is the <code>R⁻¹ S R⁻¹</code> sandwich, which wraps a prior-free <code>S</code> in two prior-shrunk <code>R⁻¹</code> factors. The result is neither the penalized estimator nor the unpenalized one — it under-states the standard error on every priored coordinate — so it is rejected rather than reported with a caveat.</li>
+</ul>
+<p>For the same reason, a large-parameter fit that would normally be auto-routed from <code>r</code> to <code>s</code> stays on <code>r</code> when a prior is declared, and says so.</p>
+<p>Under SIR (<code>sir = true</code>), the importance weights score the penalized objective, so the resampled intervals reflect the prior rather than drifting back toward the unpenalized MLE.</p>
+</section>
+</section>
+<section id="not-supported-in-v1" class="level2">
+<h2 class="anchored" data-anchor-id="not-supported-in-v1">Not supported in v1</h2>
+<p>Each of these is an <strong>error</strong>, never a silently ignored declaration:</p>
+<ul>
+<li>a prior on a <code>block_omega</code> / <code>block_sigma</code> / <code>block_kappa</code> element — those are estimated as Cholesky entries rather than as variances, and a correlated block needs the inverse-Wishart machinery this feature exists to avoid. Declare the diagonal variances separately to prior them;</li>
+<li>a prior on a <code>FIX</code>ed parameter (it could never move it, so it is a typo);</li>
+<li>a prior on a θ level block (<code>theta PLACEBO[STUDY, TIME](…)</code>) — one declaration standing for many parameters would make one prior mean “the same prior on every level”, which is a useful ridge but a different feature;</li>
+<li>a prior on a per-class <code>[mixture]</code> Ω/Σ override.</li>
+</ul>
+<p>Also out of scope by design: joint priors across parameters (no precision matrices anywhere), and full Bayesian inference — this is MAP / penalized ML, and <code>method = bayes</code> carries its own priors.</p>
+</section>
+<section id="comparison-with-nonmem-prior" class="level2">
+<h2 class="anchored" data-anchor-id="comparison-with-nonmem-prior">Comparison with NONMEM <code>$PRIOR</code></h2>
+<p>NONMEM’s <code>$PRIOR NWPRI</code> works, and is a known source of friction: a separate prior problem, a variance block for the thetas, an inverse-Wishart on <span class="math inline">\(\Omega\)</span> via a prior matrix plus degrees of freedom, and all the matrix indexing kept aligned by hand.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th>NONMEM <code>$PRIOR NWPRI</code></th>
+<th>ferx <code>prior(...)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Where it is written</td>
+<td>a second <code>$PROBLEM</code></td>
+<td>inline, next to the parameter</td>
+</tr>
+<tr class="even">
+<td>θ prior</td>
+<td><code>$THETAP</code> + <code>$THETAPV</code> (a variance-covariance matrix)</td>
+<td><code>prior(value, rse = …)</code></td>
+</tr>
+<tr class="odd">
+<td>Ω prior</td>
+<td>inverse-Wishart: <code>$OMEGAP</code> + <code>$OMEGAPD</code> degrees of freedom</td>
+<td><code>prior(value, rse = …)</code> on the declared variance</td>
+</tr>
+<tr class="even">
+<td>Correlated priors</td>
+<td>supported (full matrices)</td>
+<td>not in v1</td>
+</tr>
+<tr class="odd">
+<td>Scale conversions</td>
+<td>yours</td>
+<td>internal</td>
+</tr>
+</tbody>
+</table>
+<p>The θ side is directly equivalent — a normal prior, differing only in whether it sits on <span class="math inline">\(\theta\)</span> or <span class="math inline">\(\ln\theta\)</span>, which in ferx follows the declared bounds. The <span class="math inline">\(\Omega\)</span> side is genuinely a different prior: lognormal on the variance rather than inverse-Wishart. For a diagonal <span class="math inline">\(\Omega\)</span> the two are close in practice and neither is more “correct”; they differ in tail behaviour and in how a very small variance is penalized.</p>
+<section id="the-θ-prior-is-anchored-against-nwpri" class="level3">
+<h3 class="anchored" data-anchor-id="the-θ-prior-is-anchored-against-nwpri">The θ prior is anchored against NWPRI</h3>
+<p>Not just equivalent on paper. With both engines writing the model on the log scale and evaluating at the same fixed point, ferx’s penalty reproduces NONMEM’s:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th></th>
+<th>NONMEM 7.5.1</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>null (no prior)</td>
+<td>177.82632978040530</td>
+<td>177.826330</td>
+</tr>
+<tr class="even">
+<td>prior centred on θ</td>
+<td>177.826 (== null)</td>
+<td>—</td>
+</tr>
+<tr class="odd">
+<td>prior offset from θ</td>
+<td>177.94393305151641</td>
+<td>177.943933</td>
+</tr>
+<tr class="even">
+<td><strong>prior contribution</strong></td>
+<td><strong>0.11760327111</strong></td>
+<td><strong>0.117603</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The centred run — prior mean placed exactly on the parameter — reproducing the null is what establishes that NWPRI drops the prior’s normalisation constant just as ferx does, so these are comparable absolutely and not only as a difference. Control streams and the measured <code>.lst</code> files live in <code>nonmem_anchor/</code>; the comparison runs as a test (<code>the_prior_penalty_matches_nonmem_nwpri</code>).</p>
+<p>The <strong>Ω</strong> prior has no NWPRI counterpart to difference against, since NONMEM’s is an inverse-Wishart. It is pinned instead by closed-form unit tests, including a differential pair that catches the variance-vs-SD scale.</p>
+</section>
+</section>
+<section id="references" class="level2">
+<h2 class="anchored" data-anchor-id="references">References</h2>
+<ul>
+<li>Gisleskog PO, Karlsson MO, Beal SL. <em>Use of prior information to stabilize a population data analysis.</em> J Pharmacokinet Pharmacodyn 29(5):473–505, 2002. The canonical frequentist-prior reference, and exactly the sparse-data clinical use case above.</li>
+<li>NONMEM 7 guides, <code>$PRIOR</code> (<code>NWPRI</code>, <code>TNPRI</code>).</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/priors.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>
