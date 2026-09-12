@@ -96,11 +96,6 @@ pub const MAX_AGQ_NODES: usize = 21;
 /// hours; past that a fit is not slow, it is wrong to have started.
 pub const MAX_AGQ_GRID: usize = 100_000;
 
-/// Maximum estimated memory retained between the objective and gradient halves of one
-/// optimizer callback. Larger evaluations still use the same objective and gradient, but
-/// recompute the subject-local grid instead of keeping every subject's grid alive at once.
-const MAX_PREPARED_GRID_BYTES: usize = 128 * 1024 * 1024;
-
 /// The sentinel a non-finite likelihood collapses to, matching `individual_nll`'s own
 /// convention so a diverged node sorts as "impossible" rather than poisoning the sum.
 const NLL_SENTINEL: f64 = 1e20;
@@ -293,81 +288,10 @@ enum PreparedSubject {
     },
 }
 
-/// AGQ population objective and optional preparation for its matching gradient.
+/// AGQ population objective and matching gradient computed from the same subject-local grids.
 pub(crate) struct PopulationEvaluation {
     pub(crate) nll: f64,
-    prepared: Vec<Option<PreparedSubject>>,
-}
-
-fn prepared_subject_bytes(
-    d: usize,
-    n_nodes: usize,
-    n_obs: usize,
-    n_theta: usize,
-    retain_base_jet: bool,
-) -> usize {
-    use std::mem::size_of;
-
-    let grid_len = grid_size(n_nodes, d);
-    // `bs` owns one Vec header and `d` f64 values per node; `softmax` owns one f64.
-    let grid = grid_len.saturating_mul(
-        size_of::<Vec<f64>>()
-            .saturating_add(d.saturating_mul(size_of::<f64>()))
-            .saturating_add(size_of::<f64>()),
-    );
-    // Retained H, the stack's joint precision and prior SD, and the stacked mode.
-    let matrices_and_modes = 2usize
-        .saturating_mul(d)
-        .saturating_mul(d)
-        .saturating_add(2usize.saturating_mul(d))
-        .saturating_mul(size_of::<f64>());
-    let base_jet = if retain_base_jet {
-        // Each ordinary gradient-path ObsSens owns four populated derivative vectors:
-        // dη, dη², dθ, and dηdθ. Its other four Vec fields are empty but their headers
-        // remain inline in ObsSens.
-        let derivatives = d
-            .saturating_add(d.saturating_mul(d))
-            .saturating_add(n_theta)
-            .saturating_add(d.saturating_mul(n_theta));
-        size_of::<Vec<crate::sens::provider::ObsSens>>().saturating_add(
-            n_obs.saturating_mul(
-                size_of::<crate::sens::provider::ObsSens>()
-                    .saturating_add(derivatives.saturating_mul(size_of::<f64>())),
-            ),
-        )
-    } else {
-        0
-    };
-    grid.saturating_add(matrices_and_modes)
-        .saturating_add(base_jet)
-}
-
-fn retain_population_gradient_work(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    kappas: &[Vec<nalgebra::DVector<f64>>],
-    n_nodes: usize,
-    anchor: HessianAnchor,
-) -> bool {
-    let mut total = 0usize;
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let n_occ = kappas.get(i).map_or(0, Vec::len);
-        let d = model
-            .n_eta
-            .saturating_add(n_occ.saturating_mul(model.n_kappa));
-        total = total.saturating_add(prepared_subject_bytes(
-            d,
-            n_nodes,
-            subject.observations.len(),
-            params.theta.len(),
-            matches!(anchor, HessianAnchor::Exact) && n_occ == 0 && analytic_score_supported(model),
-        ));
-        if total > MAX_PREPARED_GRID_BYTES {
-            return false;
-        }
-    }
-    true
+    gradient: Option<Vec<f64>>,
 }
 
 impl Stack {
@@ -1017,24 +941,28 @@ pub fn agq_population_nll(
     per_subject.iter().sum()
 }
 
-/// Evaluate the AGQ population objective and optionally retain the exact
-/// subject-local work needed by a gradient requested in the same callback.
+/// Evaluate the AGQ population objective and its matching gradient in one subject pass.
+/// Each worker consumes and drops a subject's retained grid before taking another subject;
+/// only the small per-subject objective and packed score survive for ordered reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_population_evaluate(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
     eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
+    bounds: &crate::estimation::parameterization::PackedBounds,
+    options: &crate::types::FitOptions,
     n_nodes: usize,
     anchor: HessianAnchor,
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let retain_gradient_work =
-        retain_population_gradient_work(model, population, params, kappas, n_nodes, anchor);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
-    let per_subject: Vec<(f64, Option<PreparedSubject>)> = population
+    let per_subject: Vec<(f64, Option<Vec<f64>>)> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -1051,18 +979,25 @@ pub(crate) fn agq_population_evaluate(
                 &nodes,
                 &log_weights,
                 anchor,
-                retain_gradient_work,
+                true,
             );
             let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
-            (nll, prepared)
+            let score =
+                context.score_with_prepared(subject, eta_hats[i].as_slice(), subj_kappas, prepared);
+            (nll, score)
         })
         .collect();
     let nll = per_subject.iter().map(|(nll, _)| nll).sum();
-    let prepared = per_subject
-        .into_iter()
-        .map(|(_, prepared)| prepared)
-        .collect();
-    PopulationEvaluation { nll, prepared }
+    let gradient = per_subject.iter().try_fold(
+        vec![0.0; x.len()],
+        |mut result, (_, score)| -> Option<Vec<f64>> {
+            for (out, g) in result.iter_mut().zip(score.as_ref()?) {
+                *out += 2.0 * g;
+            }
+            Some(result)
+        },
+    );
+    PopulationEvaluation { nll, gradient }
 }
 
 /// Assemble the stacked mode `b̂ = [η̂, κ̂₁ … κ̂_K]` from what the shared inner loop already
@@ -2577,38 +2512,25 @@ pub(crate) fn population_gradient_mixed(
     bounds: &crate::estimation::parameterization::PackedBounds,
     options: &crate::types::FitOptions,
     force_fd: bool,
-    prepared: Option<PopulationEvaluation>,
+    evaluation: Option<PopulationEvaluation>,
 ) -> Option<Vec<f64>> {
+    if let Some(evaluation) = evaluation {
+        return evaluation.gradient;
+    }
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
-    let scores: Vec<_> = if let Some(evaluation) = prepared {
-        evaluation
-            .prepared
-            .into_par_iter()
-            .enumerate()
-            .map(|(i, prepared)| {
-                context.score_with_prepared(
-                    &population.subjects[i],
-                    eta_hats[i].as_slice(),
-                    kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    prepared,
-                )
-            })
-            .collect()
-    } else {
-        population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map(|(i, subject)| {
-                context.score_with_prepared(
-                    subject,
-                    eta_hats[i].as_slice(),
-                    kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    None,
-                )
-            })
-            .collect()
-    };
+    let scores: Vec<_> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            context.score_with_prepared(
+                subject,
+                eta_hats[i].as_slice(),
+                kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                None,
+            )
+        })
+        .collect();
     let mut result = vec![0.0; x.len()];
     for score in scores {
         for (out, g) in result.iter_mut().zip(score?) {
@@ -2980,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_objective_work_reproduces_objective_and_gradient() {
+    fn fused_objective_work_reproduces_objective_and_gradient() {
         use crate::estimation::inner_optimizer::find_ebe;
         use crate::estimation::parameterization::{compute_bounds, pack_params, unpack_params};
         use crate::types::{EstimationMethod, FitOptions, Population};
@@ -3004,100 +2926,70 @@ mod tests {
         };
         let eta_hats = vec![ebe.eta];
         let kappas = vec![Vec::new()];
-        let options = FitOptions {
-            method: EstimationMethod::FoceI,
-            n_agq: 3,
-            ..FitOptions::default()
-        };
-        let evaluation = agq_population_evaluate(
-            &model,
-            &population,
-            &params,
-            &eta_hats,
-            &kappas,
-            3,
-            HessianAnchor::GaussNewton,
-        );
-        let terms_only = agq_population_nll(
-            &model,
-            &population,
-            &params,
-            &eta_hats,
-            &kappas,
-            3,
-            HessianAnchor::GaussNewton,
-        );
-        assert!(evaluation.prepared.iter().all(Option::is_some));
-        assert_eq!(evaluation.nll.to_bits(), terms_only.to_bits());
-
         let bounds = compute_bounds(template);
-        let uncached = population_gradient_mixed(
-            &model,
-            &population,
-            template,
-            &x,
-            &eta_hats,
-            &kappas,
-            &bounds,
-            &options,
-            false,
-            None,
-        )
-        .expect("uncached gradient");
-        let cached = population_gradient_mixed(
-            &model,
-            &population,
-            template,
-            &x,
-            &eta_hats,
-            &kappas,
-            &bounds,
-            &options,
-            false,
-            Some(evaluation),
-        )
-        .expect("cached gradient");
-        assert_eq!(cached.len(), uncached.len());
-        for (i, (cached, uncached)) in cached.iter().zip(&uncached).enumerate() {
-            assert_eq!(
-                cached.to_bits(),
-                uncached.to_bits(),
-                "packed gradient coordinate {i}: cached={cached:e}, uncached={uncached:e}"
+        for (method, anchor) in [
+            (EstimationMethod::FoceI, HessianAnchor::GaussNewton),
+            (EstimationMethod::Laplace, HessianAnchor::Exact),
+        ] {
+            let options = FitOptions {
+                method,
+                n_agq: 3,
+                ..FitOptions::default()
+            };
+            let evaluation = agq_population_evaluate(
+                &model,
+                &population,
+                &params,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                3,
+                anchor,
             );
+            let terms_only =
+                agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
+            assert!(evaluation.gradient.is_some());
+            assert_eq!(evaluation.nll.to_bits(), terms_only.to_bits());
+
+            let uncached = population_gradient_mixed(
+                &model,
+                &population,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                false,
+                None,
+            )
+            .expect("uncached gradient");
+            let fused = population_gradient_mixed(
+                &model,
+                &population,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                false,
+                Some(evaluation),
+            )
+            .expect("fused gradient");
+            assert_eq!(fused.len(), uncached.len());
+            for (i, (fused, uncached)) in fused.iter().zip(&uncached).enumerate() {
+                assert_eq!(
+                    fused.to_bits(),
+                    uncached.to_bits(),
+                    "{anchor:?} packed gradient coordinate {i}: \
+                     fused={fused:e}, uncached={uncached:e}"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn prepared_grid_budget_rejects_population_wide_growth() {
-        use crate::types::Population;
-
-        let per_subject = prepared_subject_bytes(5, 9, 0, 0, false);
-        assert_eq!(
-            per_subject,
-            59_049 * (std::mem::size_of::<Vec<f64>>() + 6 * 8) + 60 * 8
-        );
-        assert!(per_subject * 1_000 > MAX_PREPARED_GRID_BYTES);
-        assert!(prepared_subject_bytes(3, 3, 20, 6, true) < MAX_PREPARED_GRID_BYTES);
-
-        let model = parse_model_string(M3_MODEL).unwrap();
-        let subject = score_subject(&model, &model.default_params.theta, &[0.5, 1.0]);
-        let population = Population {
-            subjects: vec![subject; 5_000],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
-        let kappas = vec![Vec::new(); population.subjects.len()];
-        assert!(!retain_population_gradient_work(
-            &model,
-            &population,
-            &model.default_params,
-            &kappas,
-            9,
-            HessianAnchor::GaussNewton,
-        ));
     }
 
     /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`

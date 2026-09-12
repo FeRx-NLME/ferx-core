@@ -850,7 +850,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _) =
-        run_inner_loop_and_nll_prepared(model, population, params, options, prev_etas, mu_k, false);
+        run_inner_loop_and_nll_prepared(model, population, params, options, prev_etas, mu_k, None);
     (etas, h_matrices, stats, kappas, nll)
 }
 
@@ -862,7 +862,7 @@ fn run_inner_loop_and_nll_prepared(
     options: &FitOptions,
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
-    retain_agq_gradient_work: bool,
+    agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -884,13 +884,17 @@ fn run_inner_loop_and_nll_prepared(
             options.inner_restarts,
         );
         let n_nodes = options.agq_nodes().expect("AGQ branch");
-        let evaluation = retain_agq_gradient_work.then(|| {
+        let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| {
             crate::estimation::agq::agq_population_evaluate(
                 model,
                 population,
                 params,
+                template,
+                x,
                 &etas,
                 &kappas,
+                bounds,
+                options,
                 n_nodes,
                 options.hessian_anchor(),
             )
@@ -1955,11 +1959,11 @@ fn optimize_nlopt_once(
         // MIXEST-class EBEs stand in for the warm-start / trace. The full `MixtureEval`
         // is kept in `mixeval` for the analytic gradient below.
         let mut mixeval: Option<crate::estimation::mixture::MixtureEval> = None;
-        let retain_agq_gradient_work = grad.is_some()
+        let fuse_agq_gradient = grad.is_some()
             && options.agq_nodes().is_some()
             && !reconverge_this_eval(options, state.n_grad_evals)
             && crate::estimation::agq::analytic_gradient_available(model);
-        let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_prepared) = if params.mixture.is_some() {
+        let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
                 .then_some(state.cached_etas_by_class.as_slice());
             let mut m =
@@ -2008,7 +2012,7 @@ fn optimize_nlopt_once(
                 options,
                 Some(&state.cached_etas),
                 Some(&mu_k),
-                retain_agq_gradient_work,
+                fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
             );
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
@@ -2116,7 +2120,7 @@ fn optimize_nlopt_once(
                         )
                     })
                 } else {
-                    population_gradient_with_agq_preparation(
+                    population_gradient_with_agq_evaluation(
                         &x,
                         n_subj,
                         init_params,
@@ -2128,7 +2132,7 @@ fn optimize_nlopt_once(
                         &bounds,
                         options,
                         &mut state.n_grad_evals,
-                        agq_prepared,
+                        agq_evaluation,
                     )
                 };
                 // Splice in the NN penalty gradient (computed above, in the same
@@ -3617,7 +3621,7 @@ pub(super) fn population_gradient(
     options: &FitOptions,
     grad_eval_idx: &mut usize,
 ) -> Vec<f64> {
-    population_gradient_with_agq_preparation(
+    population_gradient_with_agq_evaluation(
         x,
         n_subj,
         init_params,
@@ -3634,7 +3638,7 @@ pub(super) fn population_gradient(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn population_gradient_with_agq_preparation(
+fn population_gradient_with_agq_evaluation(
     x: &[f64],
     n_subj: usize,
     init_params: &ModelParameters,
@@ -3646,7 +3650,7 @@ fn population_gradient_with_agq_preparation(
     bounds: &PackedBounds,
     options: &FitOptions,
     grad_eval_idx: &mut usize,
-    agq_prepared: Option<crate::estimation::agq::PopulationEvaluation>,
+    agq_evaluation: Option<crate::estimation::agq::PopulationEvaluation>,
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
@@ -3678,7 +3682,7 @@ fn population_gradient_with_agq_preparation(
             bounds,
             options,
             reconverge,
-            agq_prepared,
+            agq_evaluation,
         ) {
             return g;
         }
