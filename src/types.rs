@@ -592,7 +592,6 @@ impl DoseAttr {
     /// ODE-only) and on the compartment existing. `alag` and `lagtime` both map
     /// to [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
     pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
-        let lower = name.to_ascii_lowercase();
         // The prefixes are mutually exclusive — no name starts with two of them,
         // and none is a prefix of another (`lagtime`/`alag`/`f`/`d`/`r` all differ
         // in their first byte except the two lag aliases, which are disjoint) — so
@@ -604,7 +603,11 @@ impl DoseAttr {
             ("d", DoseAttr::Duration),
             ("r", DoseAttr::Rate),
         ] {
-            if let Some(suffix) = lower.strip_prefix(prefix) {
+            let Some(head) = name.get(..prefix.len()) else {
+                continue;
+            };
+            if head.eq_ignore_ascii_case(prefix) {
+                let suffix = &name[prefix.len()..];
                 // The suffix must be a pure positive integer; `f_bio`, `cl`, etc.
                 // (non-numeric or empty suffixes) are not attributes.
                 if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
@@ -4784,8 +4787,7 @@ impl CompiledModel {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
-            let u = n.to_uppercase();
-            u == "F"
+            n.eq_ignore_ascii_case("F")
                 || (self.ode_spec.is_some()
                     && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::F, _))))
         })

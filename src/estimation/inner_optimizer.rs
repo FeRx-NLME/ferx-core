@@ -1,9 +1,10 @@
 use crate::pk;
-#[cfg(test)]
-use crate::stats::likelihood::individual_nll_iov;
 use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov_with_scratch, iov_occasion_groups,
+    individual_nll_into_prepared_with_schedule, individual_nll_iov_with_scratch,
+    iov_occasion_groups,
 };
+#[cfg(test)]
+use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
@@ -872,11 +873,24 @@ pub fn find_ebe(
     // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
+    let pred_recycle = RefCell::new(Vec::<f64>::new());
+    // `obj`'s own scratch.
+    let eta_work = RefCell::new(DVector::zeros(n_eta));
+    let prior_work = RefCell::new(DVector::zeros(n_eta));
+    // `agrad`'s scratch for its analytic-gradient call, kept separate from `obj`'s above.
+    // The `match analytic_eta_nll_gradient_with_schedule(...) { ... }` below has its
+    // scrutinee's `&mut …borrow_mut()` temporaries live for the *whole* match — including
+    // the `None` arm, which calls `gradient_fd(&obj, ..)` and so re-enters `obj` while
+    // those borrows are still outstanding. Sharing one RefCell pair between `obj` and
+    // `agrad` would panic there with "already borrowed"; separate cells keep the fallback
+    // re-entrant.
+    let grad_eta_work = RefCell::new(DVector::zeros(n_eta));
+    let grad_prior_work = RefCell::new(DVector::zeros(n_eta));
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
-        individual_nll_into_with_schedule(
+        individual_nll_into_prepared_with_schedule(
             model,
             subject,
             &params.theta,
@@ -890,6 +904,11 @@ pub fn find_ebe(
             &params.residual_correlations,
             &mut scratch,
             schedule.as_ref(),
+            err_keys.as_ref(),
+            mult.as_deref(),
+            &mut pred_recycle.borrow_mut(),
+            &mut eta_work.borrow_mut(),
+            &mut prior_work.borrow_mut(),
         )
     };
 
@@ -930,6 +949,8 @@ pub fn find_ebe(
             mult.as_deref(),
             err_keys.as_ref(),
             &mut obs_grad_recycle.borrow_mut(),
+            &mut grad_eta_work.borrow_mut(),
+            &mut grad_prior_work.borrow_mut(),
         ) {
             Some(g) => {
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2206,6 +2227,8 @@ pub(crate) fn analytic_eta_nll_gradient(
         mult.as_deref(),
         err_keys.as_ref(),
         &mut Vec::new(),
+        &mut DVector::zeros(model.n_eta),
+        &mut DVector::zeros(model.n_eta),
     )
 }
 
@@ -2246,6 +2269,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     mult: Option<&[Vec<f64>]>,
     err_keys: &[usize],
     obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
 ) -> Option<Vec<f64>> {
     // The inner NLL is `½(η'Ω⁻¹η + log|Ω| + data_gauss + 2·data_nonGaussian)`, so its
     // η-gradient is a plain **sum** of term gradients. Assemble the non-Gaussian block
@@ -2269,10 +2294,11 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // model for the provider to evaluate. The gradient is prior + non-Gaussian; return it
     // directly rather than asking a provider that has nothing to compute.
     if subject.obs_times.is_empty() {
-        let eta_v = nalgebra::DVector::from_column_slice(eta);
+        eta_work.as_mut_slice().copy_from_slice(eta);
+        prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
         // `mut` is only exercised by the markov CTMM fold below.
         #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
-        let mut grad: Vec<f64> = (&omega.inv * &eta_v).as_slice().to_vec();
+        let mut grad: Vec<f64> = prior_work.as_slice().to_vec();
         #[cfg(feature = "markov")]
         if let Some(g) = &ctmm_grad {
             for (acc, gi) in grad.iter_mut().zip(g.iter()) {
@@ -2319,6 +2345,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             &sens,
             mult,
             err_keys,
+            eta_work,
+            prior_work,
         )
         .map(add_nongaussian);
         *obs_grad_recycle = sens;
@@ -2385,10 +2413,10 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         grad[r] += ruv_grad;
     }
     // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
-    let eta_v = nalgebra::DVector::from_column_slice(eta);
-    let prior = &omega.inv * &eta_v;
+    eta_work.as_mut_slice().copy_from_slice(eta);
+    prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
     for (k, g) in grad.iter_mut().enumerate() {
-        *g += prior[k];
+        *g += prior_work[k];
     }
     let result = Some(add_nongaussian(grad));
     *obs_grad_recycle = sens;
@@ -2423,14 +2451,16 @@ fn dense_residual_inner_gradient(
     sens: &[crate::sens::provider::ObsGrad],
     mult: Option<&[Vec<f64>]>,
     err_keys: &[usize],
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
     let n_eta = model.n_eta;
-    let eta_v = DVector::from_column_slice(eta);
-    let prior = &omega.inv * &eta_v;
+    eta_work.as_mut_slice().copy_from_slice(eta);
+    prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
     let n_obs = sens.len();
     if n_obs == 0 {
-        return Some(prior.as_slice().to_vec());
+        return Some(prior_work.as_slice().to_vec());
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
     let corr = residual_correlations;
@@ -2506,7 +2536,7 @@ fn dense_residual_inner_gradient(
         }
         // sᵀ ∂R/∂η_k s.
         let quad = s.dot(&(&dr_k * &s));
-        grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior[k];
+        grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior_work[k];
     }
     Some(grad)
 }

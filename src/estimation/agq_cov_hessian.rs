@@ -672,11 +672,15 @@ pub(crate) struct NodeJet {
 /// pins the mode case against #436 so a future mode-only assumption in `prepare` fails loudly.
 ///
 /// [`subject_cov_hessian_parts`]: super::sens_cov_hessian::subject_cov_hessian_parts
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn node_jet(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     b: &[f64],
+    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
 ) -> Option<NodeJet> {
     use crate::estimation::inner_optimizer::analytic_eta_nll_gradient_with_schedule;
     use crate::estimation::sens_cov_hessian::{
@@ -718,7 +722,9 @@ pub(crate) fn node_jet(
             None,
             core.mult.as_deref(),
             err_keys.as_ref(),
-            &mut Vec::new(),
+            obs_grad_recycle,
+            eta_work,
+            prior_work,
         )?
     };
     let parts = subject_cov_hessian_parts(model, subject, params, &sens, &prep, b);
@@ -847,6 +853,11 @@ pub(crate) fn subject_agq_cov_hessian(
     let node_scale = anchor.node_scale();
     let mut u: Vec<Vec<f64>> = Vec::with_capacity(grid.len());
     let mut node_acc = DMatrix::<f64>::zeros(dim, dim);
+    // Reused across every grid node instead of allocated fresh per `node_jet` call — this
+    // loop runs once per quadrature node, same hoist as `agq::node_nll_gradient`.
+    let mut obs_grad_recycle = Vec::new();
+    let mut eta_work = DVector::zeros(n_eta);
+    let mut prior_work = DVector::zeros(n_eta);
 
     for (j, z) in grid.iter().enumerate() {
         if pi[j] == 0.0 {
@@ -859,7 +870,15 @@ pub(crate) fn subject_agq_cov_hessian(
             .iter()
             .copied()
             .collect();
-        let jet = node_jet(model, subject, params, &b_j)?;
+        let jet = node_jet(
+            model,
+            subject,
+            params,
+            &b_j,
+            &mut obs_grad_recycle,
+            &mut eta_work,
+            &mut prior_work,
+        )?;
 
         let beta: Vec<DVector<f64>> = (0..dim)
             .map(|zeta| node_displacement(&b_hat_d[zeta], &m_d[zeta], &zv))

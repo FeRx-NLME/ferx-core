@@ -1246,12 +1246,12 @@ pub fn predict_iov(
 /// IOV predictions with caller-owned per-event parameter storage. Every event
 /// is still evaluated at its current theta, eta, kappa, covariates and time;
 /// only allocation capacity is reused, never numerical values.
-pub(crate) fn predict_iov_with_scratch(
+pub(crate) fn predict_iov_with_scratch<K: AsRef<[f64]>>(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta_bsv: &[f64],
-    kappas: &[Vec<f64>],
+    kappas: &[K],
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
     use std::collections::HashMap;
@@ -1294,7 +1294,7 @@ pub(crate) fn predict_iov_with_scratch(
         let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
         c.extend_from_slice(eta_bsv);
         match occ_to_k.get(&occ_id) {
-            Some(&k) if k < kappas.len() => c.extend_from_slice(&kappas[k]),
+            Some(&k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
             _ => c.extend(std::iter::repeat(0.0).take(n_kappa)),
         }
         c
@@ -2349,6 +2349,19 @@ pub fn compute_predictions_with_states(
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.
 pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
+    compute_predictions_recycle(pk_model, subject, pk_params, Vec::new())
+}
+
+/// Allocation-reusing counterpart of [`compute_predictions`] for repeated
+/// evaluations of the same subject. The ordinary static superposition path
+/// overwrites `out` in place; event-driven fallbacks retain their established
+/// owned-vector implementation.
+fn compute_predictions_recycle(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_params: &PkParams,
+    mut out: Vec<f64>,
+) -> Vec<f64> {
     // Defensive guard (#324/#394): modeled-RATE doses (RATE=-2 -> D{cmt}) must be
     // resolved to a concrete (`Fixed`) rate/duration *before* reaching this closed
     // form. The analytical dispatch paths do exactly that (`api::model_preds` and
@@ -2398,11 +2411,14 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
             &pk_pk_only,
         );
     }
-    subject
-        .obs_times
-        .iter()
-        .map(|&t| predict_concentration(pk_model, &subject.doses, t, pk_params))
-        .collect()
+    out.clear();
+    out.extend(
+        subject
+            .obs_times
+            .iter()
+            .map(|&t| predict_concentration(pk_model, &subject.doses, t, pk_params)),
+    );
+    out
 }
 
 /// True when any dose targets a compartment the **dose-superposition** dispatch
@@ -2647,6 +2663,29 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
+    compute_predictions_with_tv_recycle_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        scratch,
+        schedule,
+        Vec::new(),
+    )
+}
+
+/// Inner-loop counterpart of [`compute_predictions_with_tv_into_with_schedule`]
+/// that reuses the returned observation vector on allocation-sensitive repeated
+/// evaluations of one subject.
+pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut EventPkParams,
+    schedule: Option<&event_driven::EventSchedule>,
+    mut recycled: Vec<f64>,
+) -> Vec<f64> {
     // #905: on an analytical model, a subject with no Gaussian observation feeds the
     // PK predictor nothing — every hazard left here is closed-form and no
     // binary/CTMM linear predictor reads a concentration (see
@@ -2662,7 +2701,9 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // subject is gated — correctly, it feeds the predictor nothing like any other
     // no-Gaussian-obs subject.
     if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
-        return vec![f64::NAN; subject.obs_times.len()];
+        recycled.clear();
+        recycled.resize(subject.obs_times.len(), f64::NAN);
+        return recycled;
     }
     // A `one_cpt_transit` subject that the closed form can't serve (TIME switch / TV
     // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
@@ -2678,7 +2719,9 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         // prediction. These zeros are never read: `apply_analytic_readout` builds
         // an empty `state[]` for such a model (no `central = conc × V` step) and
         // overwrites every entry with the readout's value.
-        vec![0.0; subject.obs_times.len()]
+        recycled.clear();
+        recycled.resize(subject.obs_times.len(), 0.0);
+        recycled
     } else if let Some(ref ode) = model.ode_spec {
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
@@ -2775,7 +2818,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
         let resolved =
             crate::dosing::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
-        compute_predictions(model.pk_model, &resolved, &pk)
+        compute_predictions_recycle(model.pk_model, &resolved, &pk, recycled)
     };
 
     // Analytical initial-compartment amounts (issue #521): layer the closed-form

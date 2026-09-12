@@ -24,7 +24,8 @@
 //!    term for term. This is not an approximation of an approximation; it is an identity,
 //!    and `tests::one_node_agq_equals_laplace` pins it.
 //! 2. **No Gaussian-residual assumption.** `l_i` is evaluated through
-//!    [`individual_nll_into_with_schedule`], the model's *actual* likelihood — so
+//!    [`crate::stats::likelihood::individual_nll_into_with_schedule`], the model's *actual*
+//!    likelihood — so
 //!    time-to-event and categorical endpoints are integrated as faithfully as Gaussian
 //!    ones. That is what FOCE/FOCEI structurally cannot do, and why AGQ exists here.
 //!
@@ -72,15 +73,16 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 use std::f64::consts::PI;
+use std::sync::OnceLock;
 
 use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::sens::provider::SubjectSens;
-use crate::stats::likelihood::individual_nll_into_with_schedule;
+use crate::stats::likelihood::individual_nll_into_prepared_with_schedule;
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
@@ -88,6 +90,15 @@ use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Su
 /// the extreme nodes to round-off, and the marginal accuracy gain is nil for any realistic
 /// NLME integrand.
 pub const MAX_AGQ_NODES: usize = 21;
+
+static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
+    [const { OnceLock::new() }; MAX_AGQ_NODES];
+
+fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64]) {
+    assert!((1..=MAX_AGQ_NODES).contains(&n));
+    let (nodes, weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| gauss_hermite(n));
+    (nodes, weights)
+}
 
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
 /// [`crate::api::check_model_options`]. The tensor rule costs one full likelihood
@@ -347,12 +358,12 @@ impl Stack {
     }
 
     /// Split `b` back into `(η, [κ₁ … κ_K])`.
-    fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<Vec<f64>>) {
+    fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<&'a [f64]>) {
         let eta = &b[..self.n_eta];
         let kappas = (0..self.n_occ)
             .map(|k| {
                 let s = self.n_eta + k * self.n_kappa;
-                b[s..s + self.n_kappa].to_vec()
+                &b[s..s + self.n_kappa]
             })
             .collect();
         (eta, kappas)
@@ -370,8 +381,50 @@ impl Stack {
         scratch: &mut pk::EventPkParams,
         schedule: Option<&pk::event_driven::EventSchedule>,
     ) -> f64 {
+        // Low-call-count sites (FD sweeps, single-node scoring): hoist nothing, just
+        // allocate scratch for this one call and dispatch through the shared branch.
+        let err_keys = (!self.is_iov()).then(|| model.error_spec.obs_keys(subject));
+        let ruv_mult = (!self.is_iov())
+            .then(|| model.ruv_obs_mult(subject, &params.theta))
+            .flatten();
+        self.nll_at_with_recycle(
+            model,
+            subject,
+            params,
+            b,
+            scratch,
+            schedule,
+            err_keys.as_deref(),
+            ruv_mult.as_deref(),
+            &mut Vec::new(),
+            &mut DVector::zeros(self.n_eta),
+            &mut DVector::zeros(self.n_eta),
+        )
+    }
+
+    /// Same dispatch as [`Stack::nll_at`], but takes the `err_keys`/`ruv_mult`/scratch as
+    /// caller-hoisted arguments instead of computing or allocating them per call. The hot
+    /// per-node sweep in [`agq_nodes_and_terms`] hoists these once for the whole grid (the
+    /// same hoist `node_nll_gradient` gets); routing both call shapes through this one
+    /// IOV/non-IOV branch keeps a single copy of the dispatch instead of two that must be
+    /// kept in sync.
+    #[allow(clippy::too_many_arguments)]
+    fn nll_at_with_recycle(
+        &self,
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        b: &[f64],
+        scratch: &mut pk::EventPkParams,
+        schedule: Option<&pk::event_driven::EventSchedule>,
+        err_keys: Option<&[usize]>,
+        ruv_mult: Option<&[Vec<f64>]>,
+        pred_recycle: &mut Vec<f64>,
+        eta_work: &mut DVector<f64>,
+        prior_work: &mut DVector<f64>,
+    ) -> f64 {
         if !self.is_iov() {
-            return individual_nll_into_with_schedule(
+            return individual_nll_into_prepared_with_schedule(
                 model,
                 subject,
                 &params.theta,
@@ -383,10 +436,15 @@ impl Stack {
                 &params.residual_correlations,
                 scratch,
                 schedule,
+                err_keys.expect("non-IOV error keys"),
+                ruv_mult,
+                pred_recycle,
+                eta_work,
+                prior_work,
             );
         }
         let (eta, kappas) = self.split(b);
-        crate::stats::likelihood::individual_nll_iov(
+        crate::stats::likelihood::individual_nll_iov_with_scratch(
             model,
             subject,
             &params.theta,
@@ -395,6 +453,7 @@ impl Stack {
             &params.omega,
             params.omega_iov.as_ref(),
             &params.sigma.values,
+            scratch,
         )
     }
 }
@@ -716,14 +775,13 @@ fn agq_subject_evaluate(
     }
 }
 
-/// Sweep the tensor grid once, returning each node's `η_j` and its log-term
-/// `t_j = Σ_k log w_{j,k} + ‖z_j‖² − nll(η_j)`.
+/// Sweep the tensor grid once, returning every log-term and, when `retain_nodes`
+/// is true, each node's `η_j`.
 ///
 /// The single place the grid is materialised. The objective ([`agq_subject_nll`]) reduces
 /// the terms with `logsumexp`; the gradient ([`agq_subject_packed_gradient`]) additionally
-/// needs the `η_j` themselves and turns the same terms into softmax weights. Sharing one
-/// sweep is what guarantees the gradient is differentiating the objective that was actually
-/// evaluated, rather than a grid that drifted from it.
+/// needs the `η_j` themselves and turns the same terms into softmax weights. Objective-only
+/// callers leave them unmaterialized, avoiding one heap allocation per quadrature point.
 #[allow(clippy::too_many_arguments)]
 fn agq_nodes_and_terms(
     model: &CompiledModel,
@@ -751,6 +809,13 @@ fn agq_nodes_and_terms(
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
     let mut b = vec![0.0f64; d];
+    let err_keys = (!stack.is_iov()).then(|| model.error_spec.obs_keys(subject));
+    let ruv_mult = (!stack.is_iov())
+        .then(|| model.ruv_obs_mult(subject, &params.theta))
+        .flatten();
+    let mut pred_recycle = Vec::new();
+    let mut eta_work = DVector::zeros(stack.n_eta);
+    let mut prior_work = DVector::zeros(stack.n_eta);
 
     loop {
         let mut log_w = 0.0;
@@ -768,7 +833,19 @@ fn agq_nodes_and_terms(
             b[k] = b_hat[k] + step[k];
         }
 
-        let nll = stack.nll_at(model, subject, params, &b, scratch, schedule);
+        let nll = stack.nll_at_with_recycle(
+            model,
+            subject,
+            params,
+            &b,
+            scratch,
+            schedule,
+            err_keys.as_deref(),
+            ruv_mult.as_deref(),
+            &mut pred_recycle,
+            &mut eta_work,
+            &mut prior_work,
+        );
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
@@ -916,7 +993,7 @@ pub fn agq_population_nll(
     n_nodes: usize,
     anchor: HessianAnchor,
 ) -> f64 {
-    let (nodes, weights) = gauss_hermite(n_nodes);
+    let (nodes, weights) = cached_gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let per_subject: Vec<f64> = population
         .subjects
@@ -932,7 +1009,7 @@ pub fn agq_population_nll(
                 params,
                 &stack,
                 &b_hat,
-                &nodes,
+                nodes,
                 &log_weights,
                 anchor,
             )
@@ -1541,9 +1618,14 @@ fn grid_response_correction(
     // the whole per-node likelihood cost of the correction, paid once instead of `2·n_free`
     // times. `None` if any node is out of the inner provider's scope; the loop then takes the
     // `phi_grid` re-sweep for every coordinate (all-or-nothing, matching the anchor).
-    // Hoisted once for the whole sweep — see `node_nll_gradient`.
+    // Hoisted once for the whole sweep — see `node_nll_gradient`. The scratch buffers below
+    // are reused across every node instead of allocated fresh per call, the same hoist
+    // `mult`/`err_keys` already get (this loop runs up to `MAX_AGQ_GRID` times per subject).
     let mult = model.ruv_obs_mult(subject, &params.theta);
     let err_keys = model.error_spec.obs_keys(subject);
+    let mut obs_grad_recycle = Vec::new();
+    let mut eta_work = DVector::zeros(model.n_eta);
+    let mut prior_work = DVector::zeros(model.n_eta);
     let node_grads: Option<Vec<Vec<f64>>> = bs
         .iter()
         .map(|b| {
@@ -1556,6 +1638,9 @@ fn grid_response_correction(
                 schedule,
                 mult.as_deref(),
                 err_keys.as_ref(),
+                &mut obs_grad_recycle,
+                &mut eta_work,
+                &mut prior_work,
             )
         })
         .collect();
@@ -2015,6 +2100,7 @@ fn grid_z_at(j: usize, nodes: &[f64], d: usize, out: &mut [f64]) {
 /// `analytic_eta_nll_gradient` rebuilds the `EventSchedule` and recomputes the residual-magnitude
 /// multiplier on every call, which is per-call setup the inner BFGS loop already learned to
 /// hoist (#449 re-review #6); paying it per node made the sweep several times its own cost.
+#[allow(clippy::too_many_arguments)]
 fn node_nll_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -2024,6 +2110,9 @@ fn node_nll_gradient(
     schedule: Option<&pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
     err_keys: &[usize],
+    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
 ) -> Option<Vec<f64>> {
     if stack.is_iov() {
         let iov = params.omega_iov.as_ref()?;
@@ -2053,7 +2142,9 @@ fn node_nll_gradient(
             schedule,
             mult,
             err_keys,
-            &mut Vec::new(),
+            obs_grad_recycle,
+            eta_work,
+            prior_work,
         )
     }
 }
@@ -2351,7 +2442,7 @@ impl<'a> SubjectScoreContext<'a> {
         bounds: &'a crate::estimation::parameterization::PackedBounds,
         force_fd: bool,
     ) -> Self {
-        let (nodes, weights) = gauss_hermite(options.agq_nodes().expect("quadrature stage"));
+        let (nodes, weights) = cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
         Self {
             model,
             template,
@@ -2359,7 +2450,7 @@ impl<'a> SubjectScoreContext<'a> {
             options,
             bounds,
             params: crate::estimation::parameterization::unpack_params(x, template),
-            nodes,
+            nodes: nodes.to_vec(),
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
@@ -2722,6 +2813,9 @@ mod tests {
         .expect("base mode response");
         let mult = model.ruv_obs_mult(&subject, &params.theta);
         let err_keys = model.error_spec.obs_keys(&subject);
+        let mut obs_grad_recycle = Vec::new();
+        let mut eta_work = DVector::zeros(model.n_eta);
+        let mut prior_work = DVector::zeros(model.n_eta);
         let node_grads: Vec<Vec<f64>> = bs
             .iter()
             .map(|b| {
@@ -2734,6 +2828,9 @@ mod tests {
                     schedule.as_ref(),
                     mult.as_deref(),
                     err_keys.as_ref(),
+                    &mut obs_grad_recycle,
+                    &mut eta_work,
+                    &mut prior_work,
                 )
                 .expect("node gradient")
             })
@@ -3161,6 +3258,9 @@ mod tests {
                 .expect("mode response");
                 let mult = model.ruv_obs_mult(&subject, &params.theta);
                 let err_keys = model.error_spec.obs_keys(&subject);
+                let mut obs_grad_recycle = Vec::new();
+                let mut eta_work = DVector::zeros(model.n_eta);
+                let mut prior_work = DVector::zeros(model.n_eta);
                 let node_grads: Vec<Vec<f64>> = bs
                     .iter()
                     .map(|b| {
@@ -3173,6 +3273,9 @@ mod tests {
                             schedule.as_ref(),
                             mult.as_deref(),
                             err_keys.as_ref(),
+                            &mut obs_grad_recycle,
+                            &mut eta_work,
+                            &mut prior_work,
                         )
                         .expect("node gradient")
                     })
@@ -3782,6 +3885,17 @@ mod tests {
         for (got, want) in w.iter().zip([sp / 6.0, 2.0 * sp / 3.0, sp / 6.0]) {
             assert!((got - want).abs() < 1e-12, "weight {got} != {want}");
         }
+    }
+
+    #[test]
+    fn cached_gauss_hermite_reuses_the_exact_rule_storage() {
+        let (nodes_a, weights_a) = cached_gauss_hermite(3);
+        let (nodes_b, weights_b) = cached_gauss_hermite(3);
+        assert!(std::ptr::eq(nodes_a.as_ptr(), nodes_b.as_ptr()));
+        assert!(std::ptr::eq(weights_a.as_ptr(), weights_b.as_ptr()));
+        let (expected_nodes, expected_weights) = gauss_hermite(3);
+        assert_eq!(nodes_a, expected_nodes);
+        assert_eq!(weights_a, expected_weights);
     }
 
     /// Weights sum to `√π = ∫ e^{−x²} dx`, and the rule is exact for polynomials up to

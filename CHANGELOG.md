@@ -102,6 +102,10 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **FOCE, FOCEI, Laplace, and AGQ now reuse prediction and prior-matrix storage across
+  repeated conditional-likelihood evaluations.** AGQ also caches invariant Hermite rules;
+  IOV quadrature borrows occasion effects and uses the covariance inverses already cached in
+  the model parameters instead of copying and refactorizing them at every node (#1374).
 
 - **ODE AutoSwitch now reuses accepted RK45 stages to detect stiffness without extra
   right-hand-side evaluations and carries its verdict history across dose and covariate
