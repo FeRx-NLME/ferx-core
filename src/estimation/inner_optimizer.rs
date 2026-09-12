@@ -448,6 +448,34 @@ impl GradientTimings {
 
 pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 
+/// Inner-optimizer iteration tally, split by optimizer kind.
+///
+/// The two kinds are **not** interchangeable as a cost proxy, which is why they are
+/// counted separately rather than into one scalar: a BFGS/L-BFGS iteration costs one
+/// gradient (analytic, or `~2·n_eta+1` predictions under the FD fallback) plus a
+/// backtracking line search, while a Nelder–Mead iteration costs 1–2 bare objective
+/// evaluations against a budget of `max_iter * 5`. Summed blind, a subject that falls
+/// back can out-"iterate" a subject whose main solve did far more work.
+///
+/// [`EbeResult::n_iters`] publishes only the sum; the split is reported per fit by
+/// [`profile_report`] under `FERX_PROFILE=1`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InnerIterCounts {
+    /// Iterations of the main BFGS/L-BFGS solve and of any `inner_restarts` seed,
+    /// each of which re-enters [`inner_minimize_with_grad`].
+    pub(crate) bfgs: u64,
+    /// Nelder–Mead iterations: the BFGS→NM fallback (one or two runs, see
+    /// [`argmin_inner_fallback`]), the runaway-EBE-guard recovery, or the whole main
+    /// solve when `inner_optimizer = nelder_mead`.
+    pub(crate) nelder_mead: u64,
+}
+
+impl InnerIterCounts {
+    pub(crate) fn total(&self) -> u64 {
+        self.bfgs + self.nelder_mead
+    }
+}
+
 /// Result of inner optimization for a single subject
 pub struct EbeResult {
     pub eta: DVector<f64>,
@@ -464,6 +492,16 @@ pub struct EbeResult {
     /// `kappas[k]` corresponds to the k-th unique occasion (same order as
     /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
+    /// Total optimizer iterations spent on this subject: the main BFGS/L-BFGS/Nelder-Mead
+    /// solve plus any fallback/restart/runaway-guard Nelder-Mead runs, and — under
+    /// `find_ebe_multistart` — every MCETA start, not only the winning one. 0 for a
+    /// `hard_reject` (no optimizer ran).
+    ///
+    /// This is a raw count of heterogeneous iterations, **not** a time proxy: a BFGS
+    /// iteration (one gradient plus a line search) and a Nelder–Mead one (1–2 bare
+    /// objective evaluations) are not comparable, so run with `FERX_PROFILE=1` for the
+    /// split plus a fit-wide total ([`profile_report`]).
+    pub n_iters: u64,
     /// True when the subject was hard-rejected at its inner start (a pathological
     /// ODE+IOV warm-start NLL — see `reject_ode_iov_inner_start`). The returned
     /// `eta`/`h_matrix` are then a degenerate placeholder (off-mode η, zero H), so the
@@ -484,6 +522,16 @@ pub struct InnerLoopStats {
     /// NLL). Any non-zero count forces the outer EBE guard to reject the trial,
     /// regardless of `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
     pub n_start_rejected: usize,
+    /// Sum of [`EbeResult::n_iters`] across all subjects, for this call's inner loop.
+    ///
+    /// Scope: only the inner loops that build an `InnerLoopStats` populate this —
+    /// `run_inner_loop_warm_map` (and hence `run_inner_loop_warm`), the mixture
+    /// E-step, and IMPMAP's multi-start sweep. Callers that invoke `find_ebe`
+    /// directly and discard the `EbeResult` (AGQ, the covariance step, importance
+    /// sampling, the VI ELBO bound) contribute nothing here, so a zero does not mean
+    /// no inner work was done. `FERX_PROFILE=1` counts *every* solve
+    /// ([`profile_report`]).
+    pub total_inner_iters: u64,
 }
 
 /// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
@@ -517,6 +565,7 @@ fn argmin_inner_fallback(
     n: usize,
     max_iter: usize,
     tol: f64,
+    iters: &mut InnerIterCounts,
 ) -> (Vec<f64>, bool) {
     let partial_f = obj(partial);
     let partial_usable = partial_f.is_finite();
@@ -526,7 +575,7 @@ fn argmin_inner_fallback(
     } else {
         cold_seed.to_vec()
     };
-    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
+    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol, iters);
     let f_nm = obj(&eta_nm);
     // Keep the partial unless NM is *strictly* better. Written as a positive comparison so a
     // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
@@ -550,7 +599,7 @@ fn argmin_inner_fallback(
         return (partial.to_vec(), nm_ok);
     }
     let mut polished = partial.to_vec();
-    let polished_ok = nelder_mead_minimize(obj, &mut polished, n, max_iter * 5, tol);
+    let polished_ok = nelder_mead_minimize(obj, &mut polished, n, max_iter * 5, tol, iters);
     let f_polished = obj(&polished);
     if f_polished.is_finite() && f_polished <= partial_f {
         (polished, polished_ok)
@@ -935,6 +984,7 @@ pub fn find_ebe(
             }
         }
     };
+    let mut n_iters = InnerIterCounts::default();
     let result = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -945,6 +995,7 @@ pub fn find_ebe(
         precond.as_deref(),
         stop_precond,
         enable_stall,
+        &mut n_iters,
     );
 
     // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
@@ -964,7 +1015,8 @@ pub fn find_ebe(
         let partial = eta.clone();
         let cold = vec![0.0; n_eta];
         if enable_stall {
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+            let (best, ok) =
+                argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol, &mut n_iters);
             eta = best;
             (ok, true)
         } else if model.frem_config.is_some() {
@@ -974,7 +1026,8 @@ pub fn find_ebe(
             // prior-release behaviour for the exact path.
             let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
             eta = if warm { partial } else { cold };
-            let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
+            let nm_ok =
+                nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol, &mut n_iters);
             (nm_ok, true)
         } else {
             // Non-FREM exact objective (#378): a BFGS "failure" is often a *near-stationary*
@@ -987,7 +1040,8 @@ pub fn find_ebe(
             // ODE↔analytical marginal-OFV divergence in #378. Keep the lower-objective of
             // {partial, NM} instead, so a good partial is never traded for a worse NM basin —
             // the same guard the ODE path already uses (#555).
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+            let (best, ok) =
+                argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol, &mut n_iters);
             eta = best;
             (ok, true)
         }
@@ -1058,6 +1112,7 @@ pub fn find_ebe(
                         precond.as_deref(),
                         stop_precond,
                         enable_stall,
+                        &mut n_iters,
                     );
                     if cand.iter().all(|v| v.is_finite()) {
                         let cand_nll = obj(&cand);
@@ -1114,7 +1169,7 @@ pub fn find_ebe(
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_eta as f64;
     if ebe_prior_maha(&eta, &params.omega) > runaway_limit {
         let mut cold = vec![0.0; n_eta];
-        let nm_ok = nelder_mead_minimize(&obj, &mut cold, n_eta, max_iter * 5, tol);
+        let nm_ok = nelder_mead_minimize(&obj, &mut cold, n_eta, max_iter * 5, tol, &mut n_iters);
         if cold.iter().all(|v| v.is_finite()) {
             let cold_nll = obj(&cold);
             if cold_nll < nll {
@@ -1175,6 +1230,7 @@ pub fn find_ebe(
         }
     };
 
+    record_inner_iters(&n_iters);
     EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
@@ -1184,6 +1240,7 @@ pub fn find_ebe(
         nll,
         kappas: Vec::new(),
         hard_reject: false,
+        n_iters: n_iters.total(),
     }
 }
 
@@ -1341,9 +1398,11 @@ fn find_ebe_iov(
             nll: start_nll,
             kappas: kappas_vec,
             hard_reject: true,
+            n_iters: 0,
         };
     }
 
+    let mut n_iters = InnerIterCounts::default();
     let bfgs_converged = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -1354,6 +1413,7 @@ fn find_ebe_iov(
         None,
         None,
         enable_stall,
+        &mut n_iters,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -1377,7 +1437,8 @@ fn find_ebe_iov(
         if skip_ode_iov_nm_fallback(model) {
             (false, false)
         } else {
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
+            let (best, ok) =
+                argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol, &mut n_iters);
             x = best;
             (ok, true)
         }
@@ -1405,7 +1466,7 @@ fn find_ebe_iov(
     {
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
-        let ok = nelder_mead_minimize(&obj, &mut cold, n_flat, max_iter * 5, tol);
+        let ok = nelder_mead_minimize(&obj, &mut cold, n_flat, max_iter * 5, tol, &mut n_iters);
         if cold.iter().all(|v| v.is_finite()) && obj(&cold) < obj(&x) {
             x = cold;
             bfgs_converged = false;
@@ -1466,6 +1527,7 @@ fn find_ebe_iov(
         }
     };
 
+    record_inner_iters(&n_iters);
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
@@ -1473,6 +1535,7 @@ fn find_ebe_iov(
         used_fallback,
         grad_norm: 0.0,
         nll,
+        n_iters: n_iters.total(),
         kappas: kappas_vec,
         hard_reject: false,
     }
@@ -1690,6 +1753,32 @@ pub static PROFILE_INNER_ANALYTIC_GRAD: std::sync::atomic::AtomicU64 =
 pub static PROFILE_INNER_FD_FALLBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Fit-wide inner-optimizer iteration totals, split by optimizer kind (see
+/// [`InnerIterCounts`]). Process-global for the same reason [`PROFILE_INNER_SOLVES`]
+/// is: [`InnerLoopStats::total_inner_iters`] is rebuilt per outer evaluation and
+/// dropped once the EBE guard has read it, so a per-call struct cannot answer "how
+/// many optimizer iterations did this *fit* spend". These accumulate across every
+/// [`find_ebe`] call, including the AGQ / covariance / importance-sampling callers
+/// that discard their `EbeResult`.
+pub(crate) static PROFILE_INNER_BFGS_ITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROFILE_INNER_NM_ITERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Fold one subject's [`InnerIterCounts`] into the fit-wide totals.
+///
+/// Deliberately *not* behind [`inner_profile_enabled`], unlike the counters above:
+/// this is two relaxed adds per subject **solve** (not per iteration), which is
+/// nothing beside the solve itself, and being unconditional makes the totals
+/// assertable from a unit test — a gated counter cannot be, since `FERX_PROFILE` is
+/// read once into a `OnceLock` that another test in the same binary may have already
+/// initialised.
+fn record_inner_iters(c: &InnerIterCounts) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PROFILE_INNER_BFGS_ITERS.fetch_add(c.bfgs, Relaxed);
+    PROFILE_INNER_NM_ITERS.fetch_add(c.nelder_mead, Relaxed);
+}
+
 fn inner_profile_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
@@ -1720,6 +1809,8 @@ pub fn profile_report() {
     let solves = PROFILE_INNER_SOLVES.load(Relaxed);
     let ana = PROFILE_INNER_ANALYTIC_GRAD.load(Relaxed);
     let fd = PROFILE_INNER_FD_FALLBACK.load(Relaxed);
+    let bfgs_iters = PROFILE_INNER_BFGS_ITERS.load(Relaxed);
+    let nm_iters = PROFILE_INNER_NM_ITERS.load(Relaxed);
     if solves > 0 {
         let tot = (ana + fd).max(1);
         eprintln!(
@@ -1728,6 +1819,16 @@ pub fn profile_report() {
             ana,
             fd,
             100.0 * fd as f64 / tot as f64
+        );
+        // Reported separately rather than as one total: a Nelder-Mead iteration is a
+        // different unit of work from a BFGS one (see `InnerIterCounts`), so the split
+        // is what says whether the inner loop's cost sits in the main solve or in the
+        // fallback path.
+        eprintln!(
+            "[profile] inner iterations: {} BFGS/L-BFGS, {} Nelder-Mead ({:.1} per solve)",
+            bfgs_iters,
+            nm_iters,
+            (bfgs_iters + nm_iters) as f64 / solves as f64
         );
     }
 }
@@ -2747,12 +2848,13 @@ fn inner_minimize_with_grad(
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
+    iters: &mut InnerIterCounts,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) {
-        return nelder_mead_minimize(obj, x, n, max_iter, tol);
+        return nelder_mead_minimize(obj, x, n, max_iter, tol, iters);
     }
     if inner_use_lbfgs(n) {
         lbfgs_core(
@@ -2765,6 +2867,7 @@ fn inner_minimize_with_grad(
             precond,
             stop_precond,
             enable_stall,
+            iters,
         )
     } else {
         dense_bfgs_core(
@@ -2777,6 +2880,7 @@ fn inner_minimize_with_grad(
             precond,
             stop_precond,
             enable_stall,
+            iters,
         )
     }
 }
@@ -2794,6 +2898,7 @@ fn lbfgs_core(
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
+    iters: &mut InnerIterCounts,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -2808,6 +2913,7 @@ fn lbfgs_core(
     let mut best_gnorm = f64::INFINITY;
 
     for _iter in 0..max_iter {
+        iters.bfgs += 1;
         // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
         // L2 norm would be dominated by the sharp covariate pseudo-obs dims and
         // never fall below `tol` (issue #406), so the preconditioned (≈ Newton-
@@ -2892,6 +2998,7 @@ fn dense_bfgs_core(
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
+    iters: &mut InnerIterCounts,
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
@@ -2907,6 +3014,7 @@ fn dense_bfgs_core(
     let mut best_gnorm = f64::INFINITY;
 
     for _iter in 0..max_iter {
+        iters.bfgs += 1;
         // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
         // on the raw L2 norm so the converged EBE is independent of the `precond`
         // H0 that accelerates the search.
@@ -3005,6 +3113,7 @@ fn nelder_mead_minimize(
     n: usize,
     max_iter: usize,
     tol: f64,
+    iters: &mut InnerIterCounts,
 ) -> bool {
     let alpha = 1.0;
     let gamma = 2.0;
@@ -3027,6 +3136,7 @@ fn nelder_mead_minimize(
     let mut fvals: Vec<f64> = simplex.iter().map(|p| obj(p)).collect();
 
     for _iter in 0..max_iter {
+        iters.nelder_mead += 1;
         let mut indices: Vec<usize> = (0..=n).collect();
         // NaN-safe: a non-finite objective (e.g. an ODE prediction that blew
         // up at a simplex vertex) sorts as worst rather than panicking on the
@@ -3472,6 +3582,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         // No `min_obs` filter: a hard reject forces trial rejection even for a single
         // short-record subject, which the `n_unconverged` filter would otherwise drop.
         n_start_rejected: results.iter().filter(|(r, _)| r.hard_reject).count(),
+        total_inner_iters: results.iter().map(|(r, _)| r.n_iters).sum(),
     };
     let mut eta_hats = Vec::with_capacity(results.len());
     let mut h_matrices = Vec::with_capacity(results.len());

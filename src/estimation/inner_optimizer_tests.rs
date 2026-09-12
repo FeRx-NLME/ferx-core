@@ -843,9 +843,14 @@ fn inner_solver_scaling_bench() {
             }
             t0.elapsed().as_secs_f64() * 1e3 / runs as f64
         };
-        let t_dense =
-            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
-        let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+        let t_dense = time_it(&|x| {
+            let mut iters = InnerIterCounts::default();
+            dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false, &mut iters)
+        });
+        let t_lbfgs = time_it(&|x| {
+            let mut iters = InnerIterCounts::default();
+            lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false, &mut iters)
+        });
         eprintln!(
             "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
             t_dense / t_lbfgs
@@ -952,7 +957,10 @@ fn dense_bfgs_converges_on_quadratic() {
         |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
     let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
     let mut x = vec![0.0, 0.0];
-    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, false);
+    let mut iters = InnerIterCounts::default();
+    let ok = dense_bfgs_core(
+        &obj, &grad, &mut x, 2, 200, 1e-10, None, None, false, &mut iters,
+    );
     assert!(ok, "BFGS should report convergence");
     assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
     assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -1043,6 +1051,7 @@ fn test_ebe_result_converged_flag() {
         nll: 1.5,
         kappas: Vec::new(),
         hard_reject: false,
+        n_iters: 0,
     };
     assert!(r.converged);
     assert!(!r.used_fallback);
@@ -1064,6 +1073,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             nll: 1.0,
             kappas: Vec::new(),
             hard_reject: false,
+            n_iters: 0,
         },
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
@@ -1074,6 +1084,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             nll: 2.0,
             kappas: Vec::new(),
             hard_reject: false,
+            n_iters: 0,
         },
     ];
     // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
@@ -1105,6 +1116,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         nll: 1.0,
         kappas: Vec::new(),
         hard_reject,
+        n_iters: 0,
     };
     // One hard-rejected subject with a single observation, one normal subject.
     let results = [make(true), make(false)];
@@ -1290,7 +1302,8 @@ fn test_nelder_mead_nan_objective_does_not_panic() {
     let mut x = vec![-1.0, -1.0];
     // The contract under test is "does not panic"; the return flag and
     // final point are secondary. Coordinates must stay finite.
-    let _converged = nelder_mead_minimize(&obj, &mut x, 2, 200, 1e-8);
+    let mut iters = InnerIterCounts::default();
+    let _converged = nelder_mead_minimize(&obj, &mut x, 2, 200, 1e-8, &mut iters);
     assert!(
         x.iter().all(|v| v.is_finite()),
         "Nelder-Mead must leave the point finite, got {x:?}"
@@ -1404,6 +1417,161 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
             on.eta[k], off.eta[k]
         );
     }
+}
+
+/// One-compartment oral subject with a mode well away from η = 0, shared by the
+/// iteration-accounting tests below: the solve has to do real optimizer work for a
+/// count to mean anything.
+fn one_cpt_oral_iter_fixture() -> (crate::types::CompiledModel, crate::types::Subject) {
+    use crate::types::{DoseEvent, Subject};
+    use std::collections::HashMap;
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+    )
+    .expect("parse one_cpt_oral model");
+
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 12.0, 10.0, 6.0, 3.0, 1.5],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 6],
+        occasions: Vec::new(),
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+
+    (model, subject)
+}
+
+/// `EbeResult::n_iters` must track actual optimizer work, not a constant: a cold-started
+/// search takes at least one iteration, and a warm start from the already-converged mode
+/// must take fewer iterations to re-certify than the cold start needed to find it. A
+/// mutation that left `n_iters` at 0 (never incremented) or hardcoded it to `max_iter`
+/// would leave one of these two assertions unable to distinguish the cases.
+#[test]
+fn find_ebe_n_iters_tracks_actual_optimizer_work() {
+    let (model, subject) = one_cpt_oral_iter_fixture();
+    let params = &model.default_params;
+    let cold = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
+    assert!(
+        cold.n_iters > 0,
+        "a cold-started solve must take at least one optimizer iteration, got {}",
+        cold.n_iters
+    );
+
+    let warm_eta: Vec<f64> = cold.eta.iter().copied().collect();
+    let warm = find_ebe(
+        &model,
+        &subject,
+        params,
+        100,
+        1e-8,
+        Some(&warm_eta),
+        None,
+        0,
+    );
+    assert!(
+        warm.n_iters < cold.n_iters,
+        "warm-started re-solve from the converged mode must take fewer iterations than \
+         the cold-started search that found it (cold={}, warm={})",
+        cold.n_iters,
+        warm.n_iters
+    );
+}
+
+/// A Nelder-Mead iteration and a BFGS iteration are different units of work — one costs
+/// 1-2 bare objective evaluations, the other a gradient plus a line search — so
+/// [`InnerIterCounts`] must keep them apart even when a single accumulator threads
+/// through both, which is exactly what `find_ebe`'s BFGS→NM fallback does. Asserted on
+/// each field separately: a mutation that increments the wrong field leaves `total()`
+/// unchanged and is invisible to any assertion on the sum alone.
+#[test]
+fn inner_iter_counts_keep_bfgs_and_nelder_mead_apart() {
+    // f(x) = (x0−1)² + 4(x1+2)², minimiser (1, −2) — the same well-conditioned quadratic
+    // `dense_bfgs_converges_on_quadratic` uses, so both optimizers reach it and neither
+    // count is zero for want of a solvable problem.
+    let obj =
+        |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
+    let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
+
+    let mut iters = InnerIterCounts::default();
+    let mut x = vec![0.0, 0.0];
+    dense_bfgs_core(
+        &obj, &grad, &mut x, 2, 200, 1e-10, None, None, false, &mut iters,
+    );
+    let after_bfgs = iters;
+    assert!(
+        after_bfgs.bfgs > 0,
+        "a BFGS solve must report BFGS iterations"
+    );
+    assert_eq!(
+        after_bfgs.nelder_mead, 0,
+        "a BFGS solve must not report Nelder-Mead work"
+    );
+
+    let mut y = vec![0.0, 0.0];
+    nelder_mead_minimize(&obj, &mut y, 2, 200, 1e-10, &mut iters);
+    assert_eq!(
+        iters.bfgs, after_bfgs.bfgs,
+        "a Nelder-Mead run must leave the BFGS tally untouched"
+    );
+    assert!(
+        iters.nelder_mead > 0,
+        "a Nelder-Mead run must report Nelder-Mead iterations"
+    );
+    assert_eq!(
+        iters.total(),
+        iters.bfgs + iters.nelder_mead,
+        "`total()` is the sum of the two kinds"
+    );
+}
+
+/// The per-call [`InnerLoopStats::total_inner_iters`] is rebuilt on every outer evaluation
+/// and dropped once the EBE guard has read it, so it cannot answer "how many optimizer
+/// iterations did this *fit* spend" — the question the instrumentation exists for. The
+/// process-global [`PROFILE_INNER_BFGS_ITERS`] / [`PROFILE_INNER_NM_ITERS`] pair is what
+/// accumulates across a fit (and across the callers that discard their `EbeResult`), so
+/// every `find_ebe` must feed them.
+///
+/// The counters are monotonic and shared with every other test in this binary, so the
+/// assertion is a *lower* bound — other threads can only inflate the delta, never shrink
+/// it. Deleting the `record_inner_iters` call makes the delta zero when this test runs on
+/// its own (`cargo test find_ebe_feeds_the_fit_wide_profile_counters`), which is how that
+/// mutation is caught; in a full parallel run the check degrades to weaker but never
+/// wrong.
+#[test]
+fn find_ebe_feeds_the_fit_wide_profile_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (model, subject) = one_cpt_oral_iter_fixture();
+    let params = &model.default_params;
+
+    let before = PROFILE_INNER_BFGS_ITERS.load(Relaxed) + PROFILE_INNER_NM_ITERS.load(Relaxed);
+    let r = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
+    let after = PROFILE_INNER_BFGS_ITERS.load(Relaxed) + PROFILE_INNER_NM_ITERS.load(Relaxed);
+
+    assert!(
+        r.n_iters > 0,
+        "fixture must do optimizer work for this to test anything"
+    );
+    assert!(
+        after - before >= r.n_iters,
+        "the fit-wide counters must have received this solve's {} iterations (delta {})",
+        r.n_iters,
+        after - before
+    );
 }
 
 /// `ebe_prior_maha` is the runaway guard's detector: the squared Mahalanobis distance

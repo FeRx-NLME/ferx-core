@@ -284,6 +284,12 @@ fn find_ebe_multistart(
     let Some(l_omega) = omega_chol else {
         return best;
     };
+    // `n_iters` is the one field that must survive a losing start: every MCETA start is
+    // work the fit actually paid for, but `best = candidate` below replaces the result
+    // wholesale, so without this the reported total is one start's count out of
+    // `mceta + 1` — an `mceta`-fold undercount on exactly the multimodal subjects
+    // multi-start exists for.
+    let mut spent = best.n_iters;
     let n_eta = l_omega.nrows();
     let mut rng = StdRng::seed_from_u64(subj_seed);
     for _start in 0..mceta {
@@ -304,10 +310,12 @@ fn find_ebe_multistart(
             mu,
             inner_restarts,
         );
+        spent += candidate.n_iters;
         if candidate.nll < best.nll {
             best = candidate;
         }
     }
+    best.n_iters = spent;
     best
 }
 
@@ -370,6 +378,7 @@ fn run_map_multistart(
         n_unconverged: results.iter().filter(|r| !r.converged).count(),
         n_fallback: results.iter().filter(|r| r.used_fallback).count(),
         n_start_rejected: results.iter().filter(|r| r.hard_reject).count(),
+        total_inner_iters: results.iter().map(|r| r.n_iters).sum(),
     };
     let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
     let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
@@ -3359,6 +3368,60 @@ mod tests {
             "MCETA restarts must not return a worse mode: {} vs {}",
             multi.nll,
             baseline.nll
+        );
+    }
+
+    /// Every MCETA start is optimizer work the fit paid for, so `find_ebe_multistart`
+    /// must report the sum over all `mceta + 1` starts — not the winner's count alone.
+    /// Reconstructing the starts from the same `subj_seed` (`StdRng` is deterministic,
+    /// and the draw is the same `L_Ω · z`) pins the *exact* total, so the wholesale
+    /// `best = candidate` copy — which reported one start out of five — fails here
+    /// rather than merely reading low.
+    #[test]
+    fn find_ebe_multistart_n_iters_counts_every_start() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        let chol = params.omega.matrix.clone().cholesky().unwrap().l();
+        let (mceta, seed) = (4usize, 7u64);
+
+        // Baseline (cold) start, then each random start, run independently.
+        let baseline = find_ebe(&model, subject, params, 50, 1e-4, None, None, 0);
+        let mut expected = baseline.n_iters;
+        let mut rng = StdRng::seed_from_u64(seed);
+        for _ in 0..mceta {
+            let z: Vec<f64> = (0..chol.nrows())
+                .map(|_| StandardNormal.sample(&mut rng))
+                .collect();
+            let eta_start = &chol * DVector::from_vec(z);
+            let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
+            expected +=
+                find_ebe(&model, subject, params, 50, 1e-4, Some(&eta_slice), None, 0).n_iters;
+        }
+        assert!(
+            expected > baseline.n_iters,
+            "sanity: the extra starts must do work of their own, else this test cannot \
+             tell the sum from the winner (baseline={}, total={expected})",
+            baseline.n_iters
+        );
+
+        let multi = find_ebe_multistart(
+            &model,
+            subject,
+            params,
+            50,
+            1e-4,
+            None,
+            None,
+            0,
+            mceta,
+            Some(&chol),
+            seed,
+        );
+        assert_eq!(
+            multi.n_iters, expected,
+            "multi-start must report every start's iterations, not only the winner's"
         );
     }
 

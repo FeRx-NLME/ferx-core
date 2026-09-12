@@ -140,6 +140,7 @@ pub fn mixture_ofv(
     let mut converged: Vec<Vec<bool>> = vec![vec![true; n]; k];
     let mut fallback: Vec<Vec<bool>> = vec![vec![false; n]; k];
     let mut hard_reject: Vec<Vec<bool>> = vec![vec![false; n]; k];
+    let mut total_inner_iters: u64 = 0;
 
     for cls in 0..k {
         // MIXNUM = cls+1 for the whole class solve (serial → thread-local safe).
@@ -203,6 +204,7 @@ pub fn mixture_ofv(
             converged[cls][i] = ebe.converged;
             fallback[cls][i] = ebe.used_fallback;
             hard_reject[cls][i] = ebe.hard_reject;
+            total_inner_iters += ebe.n_iters;
             etas_c.push(ebe.eta);
             hmats_c.push(ebe.h_matrix);
             kappas_c.push(ebe.kappas);
@@ -264,6 +266,7 @@ pub fn mixture_ofv(
             n_unconverged,
             n_fallback,
             n_start_rejected,
+            total_inner_iters,
         },
     }
 }
