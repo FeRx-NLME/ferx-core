@@ -4,6 +4,26 @@ use crate::types::{
 };
 use std::collections::HashMap;
 
+/// Serializes the tests below that write `EBE_WARM_START`.
+///
+/// That flag is a *process-global* `AtomicBool` — fit-scoped, set once per `fit()` by
+/// `api::fit` — not per-test state, and Rust's harness runs tests in this binary on
+/// concurrent threads. Without a lock, one test's `set_ebe_warm_start(true)` is visible
+/// to another mid-run and flips `argmin_inner_fallback` onto its warm branch, which runs
+/// one Nelder-Mead pass instead of two; an exact-count assertion then fails perhaps once
+/// in a hundred runs. Every test that sets the flag takes this guard first and restores
+/// the `false` default before dropping it.
+///
+/// Poisoning is deliberately ignored: a poisoned lock here means some *other* test
+/// panicked, which is already its own failure, and propagating it would turn one red
+/// test into several.
+fn lock_ebe_warm_start() -> std::sync::MutexGuard<'static, ()> {
+    static EBE_WARM_START_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EBE_WARM_START_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn iov_joint_warm_start_preserves_kappas() {
     let mu = [0.5, -0.25];
@@ -1270,6 +1290,7 @@ fn repro555_ode_exprscale_ebe_finds_global_min() {
 /// f=-10; shallow well at x=+2, f=-1).
 #[test]
 fn argmin_inner_fallback_keeps_better_basin() {
+    let _warm_start_guard = lock_ebe_warm_start();
     let obj = |x: &[f64]| -> f64 {
         let v = x[0];
         if v < 0.0 {
@@ -1279,7 +1300,7 @@ fn argmin_inner_fallback_keeps_better_basin() {
         }
     };
     set_ebe_warm_start(false);
-    let mut iters = 0u64;
+    let mut iters = InnerIterCounts::default();
 
     // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
     // keeps the lower-objective partial rather than overwriting with the shallow NM
@@ -2959,6 +2980,7 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
 /// fallback reads, and defaults to `false` (matching `FitOptions::default`).
 #[test]
 fn ebe_warm_start_flag_round_trips() {
+    let _warm_start_guard = lock_ebe_warm_start();
     assert!(!ebe_warm_start_enabled(), "default must be off");
     set_ebe_warm_start(true);
     assert!(ebe_warm_start_enabled());
@@ -3469,6 +3491,7 @@ fn power_exponent_inner_eta_gradient_matches_fd() {
 /// kept. Verified by mutation: restoring the unconditional-NM arm turns this red.
 #[test]
 fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
+    let _warm_start_guard = lock_ebe_warm_start();
     use crate::parser::model_parser::parse_model_string;
     let model = parse_model_string(
         r#"
@@ -3594,6 +3617,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
 /// restart's flag turns the first half red.
 #[test]
 fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
+    let _warm_start_guard = lock_ebe_warm_start();
     let obj = |x: &[f64]| -> f64 {
         let v = x[0];
         if v < 0.0 {
@@ -3605,7 +3629,7 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     set_ebe_warm_start(false);
     let partial = [-1.5];
     let f_partial = obj(&partial);
-    let mut iters = 0u64;
+    let mut iters = InnerIterCounts::default();
 
     // Tiny budget: the cold restart converges in the shallow well, the partial wins, the
     // polish cannot certify it.
@@ -3642,6 +3666,7 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
 /// `iters` — is caught by an unequal total rather than merely a "iters > 0" pass.
 #[test]
 fn argmin_inner_fallback_iters_sum_both_nm_runs_when_polishing() {
+    let _warm_start_guard = lock_ebe_warm_start();
     let obj = |x: &[f64]| -> f64 {
         let v = x[0];
         if v < 0.0 {
@@ -3659,7 +3684,7 @@ fn argmin_inner_fallback_iters_sum_both_nm_runs_when_polishing() {
     // Independently reproduce both internal NM runs `argmin_inner_fallback` makes on this
     // (non-warm, partial-wins) path: the cold restart, then the certifying polish from the
     // partial — same start points, same `max_iter * 5` budget, same objective.
-    let mut expected_iters = 0u64;
+    let mut expected_iters = InnerIterCounts::default();
     let mut cold_restart = cold_seed;
     nelder_mead_minimize(
         &obj,
@@ -3671,9 +3696,16 @@ fn argmin_inner_fallback_iters_sum_both_nm_runs_when_polishing() {
     );
     let mut polish = partial;
     nelder_mead_minimize(&obj, &mut polish, 1, max_iter * 5, tol, &mut expected_iters);
-    assert!(expected_iters > 0, "sanity: NM must take at least one step");
+    assert!(
+        expected_iters.nelder_mead > 0,
+        "sanity: NM must take at least one step"
+    );
+    assert_eq!(
+        expected_iters.bfgs, 0,
+        "sanity: this path runs Nelder-Mead only"
+    );
 
-    let mut fallback_iters = 0u64;
+    let mut fallback_iters = InnerIterCounts::default();
     let _ = argmin_inner_fallback(
         &obj,
         &partial,

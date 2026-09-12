@@ -844,11 +844,11 @@ fn inner_solver_scaling_bench() {
             t0.elapsed().as_secs_f64() * 1e3 / runs as f64
         };
         let t_dense = time_it(&|x| {
-            let mut iters = 0u64;
+            let mut iters = InnerIterCounts::default();
             dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false, &mut iters)
         });
         let t_lbfgs = time_it(&|x| {
-            let mut iters = 0u64;
+            let mut iters = InnerIterCounts::default();
             lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false, &mut iters)
         });
         eprintln!(
@@ -957,7 +957,7 @@ fn dense_bfgs_converges_on_quadratic() {
         |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
     let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
     let mut x = vec![0.0, 0.0];
-    let mut iters = 0u64;
+    let mut iters = InnerIterCounts::default();
     let ok = dense_bfgs_core(
         &obj, &grad, &mut x, 2, 200, 1e-10, None, None, false, &mut iters,
     );
@@ -1302,7 +1302,7 @@ fn test_nelder_mead_nan_objective_does_not_panic() {
     let mut x = vec![-1.0, -1.0];
     // The contract under test is "does not panic"; the return flag and
     // final point are secondary. Coordinates must stay finite.
-    let mut iters = 0u64;
+    let mut iters = InnerIterCounts::default();
     let _converged = nelder_mead_minimize(&obj, &mut x, 2, 200, 1e-8, &mut iters);
     assert!(
         x.iter().all(|v| v.is_finite()),
@@ -1419,13 +1419,10 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
     }
 }
 
-/// `EbeResult::n_iters` must track actual optimizer work, not a constant: a cold-started
-/// search takes at least one iteration, and a warm start from the already-converged mode
-/// must take fewer iterations to re-certify than the cold start needed to find it. A
-/// mutation that left `n_iters` at 0 (never incremented) or hardcoded it to `max_iter`
-/// would leave one of these two assertions unable to distinguish the cases.
-#[test]
-fn find_ebe_n_iters_tracks_actual_optimizer_work() {
+/// One-compartment oral subject with a mode well away from η = 0, shared by the
+/// iteration-accounting tests below: the solve has to do real optimizer work for a
+/// count to mean anything.
+fn one_cpt_oral_iter_fixture() -> (crate::types::CompiledModel, crate::types::Subject) {
     use crate::types::{DoseEvent, Subject};
     use std::collections::HashMap;
     let model = crate::parser::model_parser::parse_model_string(
@@ -1456,6 +1453,17 @@ fn find_ebe_n_iters_tracks_actual_optimizer_work() {
         obs_records: vec![],
     };
 
+    (model, subject)
+}
+
+/// `EbeResult::n_iters` must track actual optimizer work, not a constant: a cold-started
+/// search takes at least one iteration, and a warm start from the already-converged mode
+/// must take fewer iterations to re-certify than the cold start needed to find it. A
+/// mutation that left `n_iters` at 0 (never incremented) or hardcoded it to `max_iter`
+/// would leave one of these two assertions unable to distinguish the cases.
+#[test]
+fn find_ebe_n_iters_tracks_actual_optimizer_work() {
+    let (model, subject) = one_cpt_oral_iter_fixture();
     let params = &model.default_params;
     let cold = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
     assert!(
@@ -1481,6 +1489,88 @@ fn find_ebe_n_iters_tracks_actual_optimizer_work() {
          the cold-started search that found it (cold={}, warm={})",
         cold.n_iters,
         warm.n_iters
+    );
+}
+
+/// A Nelder-Mead iteration and a BFGS iteration are different units of work — one costs
+/// 1-2 bare objective evaluations, the other a gradient plus a line search — so
+/// [`InnerIterCounts`] must keep them apart even when a single accumulator threads
+/// through both, which is exactly what `find_ebe`'s BFGS→NM fallback does. Asserted on
+/// each field separately: a mutation that increments the wrong field leaves `total()`
+/// unchanged and is invisible to any assertion on the sum alone.
+#[test]
+fn inner_iter_counts_keep_bfgs_and_nelder_mead_apart() {
+    // f(x) = (x0−1)² + 4(x1+2)², minimiser (1, −2) — the same well-conditioned quadratic
+    // `dense_bfgs_converges_on_quadratic` uses, so both optimizers reach it and neither
+    // count is zero for want of a solvable problem.
+    let obj =
+        |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
+    let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
+
+    let mut iters = InnerIterCounts::default();
+    let mut x = vec![0.0, 0.0];
+    dense_bfgs_core(
+        &obj, &grad, &mut x, 2, 200, 1e-10, None, None, false, &mut iters,
+    );
+    let after_bfgs = iters;
+    assert!(
+        after_bfgs.bfgs > 0,
+        "a BFGS solve must report BFGS iterations"
+    );
+    assert_eq!(
+        after_bfgs.nelder_mead, 0,
+        "a BFGS solve must not report Nelder-Mead work"
+    );
+
+    let mut y = vec![0.0, 0.0];
+    nelder_mead_minimize(&obj, &mut y, 2, 200, 1e-10, &mut iters);
+    assert_eq!(
+        iters.bfgs, after_bfgs.bfgs,
+        "a Nelder-Mead run must leave the BFGS tally untouched"
+    );
+    assert!(
+        iters.nelder_mead > 0,
+        "a Nelder-Mead run must report Nelder-Mead iterations"
+    );
+    assert_eq!(
+        iters.total(),
+        iters.bfgs + iters.nelder_mead,
+        "`total()` is the sum of the two kinds"
+    );
+}
+
+/// The per-call [`InnerLoopStats::total_inner_iters`] is rebuilt on every outer evaluation
+/// and dropped once the EBE guard has read it, so it cannot answer "how many optimizer
+/// iterations did this *fit* spend" — the question the instrumentation exists for. The
+/// process-global [`PROFILE_INNER_BFGS_ITERS`] / [`PROFILE_INNER_NM_ITERS`] pair is what
+/// accumulates across a fit (and across the callers that discard their `EbeResult`), so
+/// every `find_ebe` must feed them.
+///
+/// The counters are monotonic and shared with every other test in this binary, so the
+/// assertion is a *lower* bound — other threads can only inflate the delta, never shrink
+/// it. Deleting the `record_inner_iters` call makes the delta zero when this test runs on
+/// its own (`cargo test find_ebe_feeds_the_fit_wide_profile_counters`), which is how that
+/// mutation is caught; in a full parallel run the check degrades to weaker but never
+/// wrong.
+#[test]
+fn find_ebe_feeds_the_fit_wide_profile_counters() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (model, subject) = one_cpt_oral_iter_fixture();
+    let params = &model.default_params;
+
+    let before = PROFILE_INNER_BFGS_ITERS.load(Relaxed) + PROFILE_INNER_NM_ITERS.load(Relaxed);
+    let r = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
+    let after = PROFILE_INNER_BFGS_ITERS.load(Relaxed) + PROFILE_INNER_NM_ITERS.load(Relaxed);
+
+    assert!(
+        r.n_iters > 0,
+        "fixture must do optimizer work for this to test anything"
+    );
+    assert!(
+        after - before >= r.n_iters,
+        "the fit-wide counters must have received this solve's {} iterations (delta {})",
+        r.n_iters,
+        after - before
     );
 }
 

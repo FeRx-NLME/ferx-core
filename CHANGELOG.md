@@ -22,9 +22,14 @@ section of the SDLC for the versioning policy).
 ### Added
 
 - `EbeResult` now carries `n_iters`, the optimizer iterations spent on that subject's inner solve
-  (main BFGS/L-BFGS/Nelder-Mead plus any fallback/restart/runaway-guard Nelder-Mead runs), and
-  `InnerLoopStats` sums it across subjects as `total_inner_iters` — pure measurement, to profile
-  where inner-loop time goes before optimizing it further (#1345).
+  (main BFGS/L-BFGS/Nelder-Mead plus any fallback/restart/runaway-guard Nelder-Mead runs, and every
+  MCETA multi-start rather than only the winning one), and `InnerLoopStats` sums it across subjects
+  as `total_inner_iters` — pure measurement, to profile where inner-loop time goes before optimizing
+  it further (#1345).
+- `FERX_PROFILE=1` now reports fit-wide inner-optimizer iteration totals, split into BFGS/L-BFGS and
+  Nelder-Mead: the two are different units of work, and unlike the per-evaluation `InnerLoopStats`
+  the totals accumulate across a whole fit, including the AGQ / covariance / importance-sampling
+  callers that discard their `EbeResult` (#1345).
 
 ### Changed
 
