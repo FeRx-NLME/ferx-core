@@ -2403,8 +2403,9 @@ fn lognormal_eta_derivatives_only_matches_full_dp_deta() {
 
 /// The closed-form light provider's per-subject `ObsGrad` scratch (`hint`) must
 /// never leak stale content into the result: handing back a corrupted,
-/// differently-sized hint must reproduce exactly what a fresh `Vec::new()` call
-/// returns. Catches a reuse-in-place bug that forgets to overwrite a slot,
+/// hint must reproduce exactly what a fresh `Vec::new()` call returns. Exercises
+/// both a differently-sized hint and the same-sized buffer used by ordinary BFGS
+/// iterations. Catches a reuse-in-place bug that forgets to overwrite a slot,
 /// forgets to re-zero `df_deta` before accumulating into it, or mishandles a
 /// hint longer than the subject's current observation count.
 #[test]
@@ -2438,6 +2439,29 @@ fn subject_eta_grad_with_schedule_hint_reuse_is_bit_identical() {
 
     assert_eq!(fresh.len(), reused.len());
     for (a, b) in fresh.iter().zip(reused.iter()) {
+        assert_eq!(a.f, b.f);
+        assert_eq!(a.df_deta, b.df_deta);
+    }
+
+    // The steady-state reuse path keeps every `df_deta` at exactly `n_eta`, so
+    // poison that same-length buffer and evaluate at a different eta. This
+    // specifically exercises `reset_zeroed`'s in-place zeroing branch and makes
+    // stale accumulation visible even when the prediction itself has changed.
+    let eta_next = [-0.20_f64, 0.25];
+    let fresh_next =
+        subject_eta_grad_with_schedule(&model, &subject, &theta, &eta_next, None, Vec::new())
+            .expect("closed-form light provider in scope");
+    let mut same_len_hint = reused;
+    for o in &mut same_len_hint {
+        o.f = -999.0;
+        o.df_deta.fill(-999.0);
+    }
+    let reused_next =
+        subject_eta_grad_with_schedule(&model, &subject, &theta, &eta_next, None, same_len_hint)
+            .expect("closed-form light provider in scope");
+
+    assert_eq!(fresh_next.len(), reused_next.len());
+    for (a, b) in fresh_next.iter().zip(reused_next.iter()) {
         assert_eq!(a.f, b.f);
         assert_eq!(a.df_deta, b.df_deta);
     }
