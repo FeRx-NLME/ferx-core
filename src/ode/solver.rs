@@ -1275,10 +1275,15 @@ fn integrate_dense_g<T: PkNum>(
             if switching {
                 accepted_since_probe += 1;
             }
-            if switching && switches < MAX_AUTO_SWITCHES_PER_SEGMENT {
-                let stage_escalation = method == OdeMethod::EXPLICIT_FALLBACK
-                    && stiffness_indicator
-                        .is_some_and(|indicator| auto_state.observe_rk45(indicator));
+            let stage_escalation = switching
+                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
+                && method == OdeMethod::EXPLICIT_FALLBACK
+                && stiffness_indicator.is_some_and(|indicator| auto_state.observe_rk45(indicator));
+            // A verdict ratified by the step that reaches `tf` belongs to the next interval:
+            // there is no remaining span for a replacement stepper to integrate here. Leave
+            // it in `auto_state` so `integrate_resolved_g_inner` can consume it at the next
+            // non-zero segment instead of reporting a switch that never took a step.
+            if switching && t < tf - 1e-15 && switches < MAX_AUTO_SWITCHES_PER_SEGMENT {
                 let periodic_probe = accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL;
                 let verdict = if stage_escalation {
                     Some(super::stiffness::stiff_method_for(opts))
@@ -2094,8 +2099,17 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // A zero-length span returns `u0` at every requested time without stepping, so there is
     // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these
     // wherever two events share a time.
-    let method = if (t_span.1 - t_span.0).abs() < 1e-15 {
+    let nonzero_span = (t_span.1 - t_span.0).abs() >= 1e-15;
+    let method = if !nonzero_span {
         OdeMethod::EXPLICIT_FALLBACK
+    } else if opts.method == OdeMethod::Auto
+        && opts.auto_switch
+        && auto_state.rk_stiff >= RK45_STIFFNESS_RATIFY
+    {
+        // A stage verdict may have been ratified by the final accepted step of the previous
+        // event interval. The entry Jacobian is only a backstop and must not override that
+        // accumulated, dimensionless evidence before a stiff stepper gets a chance to run.
+        super::stiffness::stiff_method_for(opts)
     } else {
         super::stiffness::resolve_method(rhs, u0, params, t_span.0, opts)
     };
@@ -3900,6 +3914,64 @@ mod tests {
             dup_at.unwrap(),
             calls.len(),
         );
+    }
+
+    #[test]
+    fn terminal_stage_verdict_starts_next_event_interval_stiff() {
+        let rhs = |u: &[f64], _: &[f64], _: f64, du: &mut [f64]| {
+            du[0] = -10.0 * u[0];
+        };
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Auto,
+            auto_switch: true,
+            min_dt: 0.33,
+            abstol: 1e-6,
+            ..Default::default()
+        };
+        let mut state = OdeAutoSwitchState::default();
+        let mut stats = OdeSolverStats::default();
+        let mut u = vec![1e-12];
+
+        for i in 0..15 {
+            let start = i as f64 * 0.33;
+            let end = (i + 1) as f64 * 0.33;
+            let (sol, _) = solve_ode_dense_with_auto_state(
+                &rhs,
+                &u,
+                (start, end),
+                &[],
+                &[end],
+                &[],
+                &opts,
+                Some(&mut stats),
+                &mut state,
+            );
+            u.clone_from(&sol.last().unwrap().u);
+        }
+
+        assert_eq!(stats.accepted_steps, 15);
+        assert_eq!(stats.auto_switched_segments, 0);
+        assert_eq!(stats.auto_stiff_segments, 0);
+        assert_eq!(stats.min_step_clamped_steps, 0);
+        assert_eq!(state.rk_stiff, RK45_STIFFNESS_RATIFY);
+
+        let start = 15.0 * 0.33;
+        let end = 16.0 * 0.33;
+        let _ = solve_ode_dense_with_auto_state(
+            &rhs,
+            &u,
+            (start, end),
+            &[],
+            &[end],
+            &[],
+            &opts,
+            Some(&mut stats),
+            &mut state,
+        );
+
+        assert_eq!(stats.accepted_steps, 16);
+        assert_eq!(stats.auto_stiff_segments, 1);
+        assert_eq!(state.rk_stiff, 0);
     }
 
     fn rk45_indicator(rate: f64, dt: f64) -> f64 {
