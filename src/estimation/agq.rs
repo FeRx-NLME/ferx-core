@@ -24,7 +24,8 @@
 //!    term for term. This is not an approximation of an approximation; it is an identity,
 //!    and `tests::one_node_agq_equals_laplace` pins it.
 //! 2. **No Gaussian-residual assumption.** `l_i` is evaluated through
-//!    [`individual_nll_into_with_schedule`], the model's *actual* likelihood — so
+//!    [`crate::stats::likelihood::individual_nll_into_with_schedule`], the model's *actual*
+//!    likelihood — so
 //!    time-to-event and categorical endpoints are integrated as faithfully as Gaussian
 //!    ones. That is what FOCE/FOCEI structurally cannot do, and why AGQ exists here.
 //!
