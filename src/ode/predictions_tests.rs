@@ -824,6 +824,7 @@ fn integrate_segment_zero_length_is_a_noop() {
     let mut u = vec![10.0];
     let mut predictions = vec![f64::NAN; subject.obs_times.len()];
     let obs_map = obs_index_map(&subject.obs_times);
+    let mut auto_state = crate::ode::solver::OdeAutoSwitchState::default();
 
     integrate_segment(
         &ode,
@@ -841,6 +842,7 @@ fn integrate_segment_zero_length_is_a_noop() {
         &obs_map,
         &mut predictions,
         None,
+        &mut auto_state,
         &[],
     );
 
@@ -864,6 +866,7 @@ fn integrate_segment_advances_state_and_records_obs() {
     let mut u = vec![10.0];
     let mut predictions = vec![f64::NAN; subject.obs_times.len()];
     let obs_map = obs_index_map(&subject.obs_times);
+    let mut auto_state = crate::ode::solver::OdeAutoSwitchState::default();
 
     integrate_segment(
         &ode,
@@ -881,6 +884,7 @@ fn integrate_segment_advances_state_and_records_obs() {
         &obs_map,
         &mut predictions,
         None,
+        &mut auto_state,
         &[],
     );
 
@@ -4095,6 +4099,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
     let mut u = vec![100.0]; // pre-loaded with the bolus amount
     let mut predictions = vec![f64::NAN; subject.obs_times.len()];
     let obs_map = obs_index_map(&subject.obs_times);
+    let mut auto_state = crate::ode::solver::OdeAutoSwitchState::default();
 
     integrate_segment(
         &ode,
@@ -4112,6 +4117,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
         &obs_map,
         &mut predictions,
         None,
+        &mut auto_state,
         &[],
     );
 
