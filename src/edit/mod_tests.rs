@@ -1718,6 +1718,9 @@ fn fit_with(
         omega[(i, i)] = *v;
     }
     crate::types::FitResult {
+        ofv_data: 0.0,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         theta: theta.to_vec(),
         theta_names: theta_names.iter().map(|s| s.to_string()).collect(),
         eta_names: eta_names.iter().map(|s| s.to_string()).collect(),

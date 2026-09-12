@@ -2918,56 +2918,14 @@ fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
 #[test]
 fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
     // `lagtime=` and `alag=` are two spellings of the SAME slot, so a `pk(...)`
-    // call may legally carry both. Two cases, both of which the remediation clause
-    // has to get right on its own — the role lookup cannot just take the first map
-    // entry that routes to the lag slot.
-    //
-    // (a) Two different parameters on the one slot. Whichever is read, the message
-    //     must quote *that* parameter's own spelling.
-    let two = |readout: &str| {
-        format!(
-            "
-[parameters]
-  theta TVCL(5.0, 0.0, 1e15)
-  theta TVV(50.0, 0.0, 1e15)
-  theta TVKA(1.5, 0.0, 1e15)
-  theta TVLAG(0.3, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS1 ~ 0.1 (sd)
-
-[individual_parameters]
-  CL    = TVCL * exp(ETA_CL)
-  V     = TVV
-  KA    = TVKA
-  TLAGA = TVLAG
-  TLAGB = TVLAG
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAGA, alag=TLAGB)
-
-[scaling]
-  obs_scale = 2.0 * {readout}
-
-[error_model]
-  DV ~ proportional(EPS1)
-"
-        )
-    };
-    for (readout, want) in [
-        ("TLAGA", "remove the `lagtime=TLAGA` mapping"),
-        ("TLAGB", "remove the `alag=TLAGB` mapping"),
-    ] {
-        let err = expect_parse_err(&two(readout));
-        assert!(
-            err.contains(want),
-            "reading `{readout}` must quote its own mapping, got: {err}"
-        );
-    }
-
-    // (b) One parameter under both spellings. Both `analytical_dose_attr_slot_map`
-    //     and `build_pk_param_fn` iterate ascending and let the last write win, so
-    //     `lagtime=` is the mapping that actually reaches the slot — quoting
-    //     `alag=` would name one whose removal changes nothing.
+    // call may legally carry both — as long as they bind the same parameter.
+    // Two *different* parameters on the one slot is the #1048 conflict, rejected
+    // before this check runs (see `pk_alias_spellings_on_one_slot_conflict`), so
+    // the only configuration the remediation clause still has to disambiguate is
+    // one parameter under both spellings: `analytical_dose_attr_slot_map` and
+    // `build_pk_param_fn` both iterate ascending and let the last write win, so
+    // `lagtime=` is the mapping that actually reaches the slot — quoting `alag=`
+    // would name one whose removal changes nothing.
     let both = analytical_dose_attr_src(
         "lagtime=X, alag=X",
         "X = TVLAG",
@@ -2978,6 +2936,10 @@ fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
         err.contains("remove the `lagtime=X` mapping"),
         "must quote the binding mapping, not the shadowed alias, got: {err}"
     );
+    // …and the per-spelling half of the property — an `alag=` user is told to
+    // remove `alag=`, not `lagtime=` — is covered by
+    // `analytical_lag_mapping_read_in_scaling_is_rejected`, which runs each
+    // spelling on its own.
 }
 
 #[test]
@@ -5513,7 +5475,7 @@ fn test_parse_diagonal_omega() {
         "omega ETA_CL ~ 0.07".to_string(),
         "omega ETA_V  ~ 0.02".to_string(),
     ];
-    let (_, omegas, block_omegas, _, _, _, _, _, _, _) =
+    let (_, omegas, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 2);
     assert_eq!(block_omegas.len(), 0);
@@ -5524,7 +5486,7 @@ fn test_parse_diagonal_omega() {
 #[test]
 fn test_parse_block_omega() {
     let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string()];
-    let (_, omegas, block_omegas, _, _, _, _, _, _, _) =
+    let (_, omegas, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 0);
     assert_eq!(block_omegas.len(), 1);
@@ -5542,7 +5504,7 @@ fn test_parse_block_omega_multiline() {
         "0.02, 0.04".to_string(),
         "]".to_string(),
     ];
-    let (_, omegas, block_omegas, _, _, eta_names, _, _, _, _) =
+    let (_, omegas, block_omegas, _, _, eta_names, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 0);
     assert_eq!(block_omegas.len(), 1);
@@ -5559,7 +5521,7 @@ fn test_parse_block_omega_multiline_fix() {
         "block_omega (ETA_CL, ETA_V) = [0.09,".to_string(),
         "0.02, 0.04] FIX".to_string(),
     ];
-    let (_, _, block_omegas, _, _, _, _, _, _, _) =
+    let (_, _, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas.len(), 1);
     assert!(block_omegas[0].fixed);
@@ -5575,7 +5537,7 @@ fn test_parse_block_omega_multiline_fix_own_line() {
         "]".to_string(),
         "FIX".to_string(),
     ];
-    let (_, _, block_omegas, _, _, _, _, _, _, _) =
+    let (_, _, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas.len(), 1);
     assert!(block_omegas[0].fixed);
@@ -5588,7 +5550,7 @@ fn test_parse_block_kappa_multiline() {
         "0.05, 0.01, 0.03".to_string(),
         "]".to_string(),
     ];
-    let (_, _, _, _, _, _, kappas, _, _, _) =
+    let (_, _, _, _, _, _, kappas, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(kappas.block.len(), 1);
     assert_eq!(kappas.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
@@ -5605,7 +5567,7 @@ fn test_parse_block_kappa_multiline_fix_own_line() {
         "]".to_string(),
         "FIX".to_string(),
     ];
-    let (_, _, _, _, _, _, kappas, _, _, _) =
+    let (_, _, _, _, _, _, kappas, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(kappas.block.len(), 1);
     assert!(kappas.block[0].fixed);
@@ -5650,7 +5612,7 @@ fn test_parse_block_omega_3x3() {
     let lines = vec![
         "block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.01, 0.04, 0.005, 0.002, 0.16]".to_string(),
     ];
-    let (_, _, block_omegas, _, _, _, _, _, _, _) =
+    let (_, _, block_omegas, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(block_omegas[0].names.len(), 3);
     assert_eq!(block_omegas[0].lower_triangle.len(), 6); // 3*(3+1)/2
@@ -5671,7 +5633,7 @@ fn test_parse_mixed_diagonal_and_block() {
         "omega ETA_KA ~ 0.40".to_string(),
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
     ];
-    let (_, omegas, block_omegas, _, _, eta_names, _, _, _, _) =
+    let (_, omegas, block_omegas, _, _, eta_names, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 1);
     assert_eq!(block_omegas.len(), 1);
@@ -5685,7 +5647,7 @@ fn test_declaration_order_block_before_diagonal() {
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
         "omega ETA_KA ~ 0.40".to_string(),
     ];
-    let (_, _, _, _, _, eta_names, _, _, _, _) =
+    let (_, _, _, _, _, eta_names, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     // block_omega declared first, so ETA_CL, ETA_V come before ETA_KA
     assert_eq!(eta_names, vec!["ETA_CL", "ETA_V", "ETA_KA"]);
@@ -5782,7 +5744,7 @@ fn test_build_omega_matrix_mixed() {
 #[test]
 fn test_parse_theta_fix_without_bounds() {
     let lines = vec!["theta TVCL(0.1, FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
@@ -5792,7 +5754,7 @@ fn test_parse_theta_fix_without_bounds() {
 #[test]
 fn test_parse_theta_fix_with_bounds() {
     let lines = vec!["theta TVCL(0.1, 0.01, 1.0, FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(thetas[0].fixed);
     assert!((thetas[0].lower - 0.01).abs() < 1e-12);
@@ -5803,7 +5765,7 @@ fn test_parse_theta_fix_with_bounds() {
 fn test_parse_theta_fix_no_comma_inside_parens() {
     // theta NAME(init FIX) — no comma before FIX
     let lines = vec!["theta TVCL(0.75 FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
@@ -5814,7 +5776,7 @@ fn test_parse_theta_fix_no_comma_inside_parens() {
 fn test_parse_theta_fix_after_paren() {
     // theta NAME(init) FIX — FIX outside closing paren
     let lines = vec!["theta TVCL(0.75) FIX".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
@@ -5825,7 +5787,7 @@ fn test_parse_theta_fix_after_paren() {
 fn test_parse_theta_fix_after_paren_with_bounds() {
     // theta NAME(init, lower, upper) FIX — bounds + FIX outside paren
     let lines = vec!["theta TVKA(1.0, 0.01, 10.0) FIX".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
@@ -5838,7 +5800,7 @@ fn test_parse_theta_fix_after_paren_with_bounds() {
 fn test_parse_theta_lower_bound_only() {
     // theta NAME(init, lower) — upper defaults to 1e9
     let lines = vec!["theta TVCL(1.0, 0.01)".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(!thetas[0].fixed);
@@ -5851,7 +5813,7 @@ fn test_parse_theta_lower_bound_only() {
 fn test_parse_theta_lower_bound_fix_inside() {
     // theta NAME(init, lower, FIX) — lower only + FIX inside parens
     let lines = vec!["theta TVCL(1.0, 0.01, FIX)".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
@@ -5863,7 +5825,7 @@ fn test_parse_theta_lower_bound_fix_inside() {
 fn test_parse_theta_lower_bound_fix_outside() {
     // theta NAME(init, lower) FIX — lower only + FIX after paren
     let lines = vec!["theta TVCL(1.0, 0.01) FIX".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 1);
     assert!(thetas[0].fixed);
@@ -5874,7 +5836,7 @@ fn test_parse_theta_lower_bound_fix_outside() {
 #[test]
 fn test_parse_theta_unfixed_by_default() {
     let lines = vec!["theta TVCL(0.1, 0.01, 1.0)".to_string()];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!thetas[0].fixed);
 }
@@ -5889,7 +5851,7 @@ fn test_parse_theta_allows_space_before_paren() {
         "theta TVV  ( 10 )".to_string(),
         "theta TVKA\t(0.5, FIX)".to_string(),
     ];
-    let (thetas, _, _, _, _, _, _, _, _, _) =
+    let (thetas, _, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(thetas.len(), 3);
     assert_eq!(thetas[0].name, "TVCL");
@@ -5906,7 +5868,7 @@ fn test_parse_theta_allows_space_before_paren() {
 #[test]
 fn test_parse_omega_fix() {
     let lines = vec!["omega ETA_CL ~ 0.09 FIX".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(omegas[0].fixed);
 }
@@ -5917,7 +5879,7 @@ fn test_omega_unfixed_no_annotation() {
     // group-numbering shift (annotation moved 3→4) didn't regress the
     // common case.
     let lines = vec!["omega ETA_CL ~ 0.09".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!omegas[0].fixed);
     assert!(!omegas[0].init_as_sd);
@@ -5929,7 +5891,7 @@ fn test_omega_double_fix_is_harmless() {
     // `FIX (sd) FIX` — both FIX groups fire; result must still be fixed
     // with SD squaring applied.
     let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd) FIX".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
@@ -5940,7 +5902,7 @@ fn test_omega_double_fix_is_harmless() {
 #[test]
 fn test_parse_sigma_fix() {
     let lines = vec!["sigma PROP ~ 0.05 FIX".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas[0].fixed);
 }
@@ -5948,7 +5910,7 @@ fn test_parse_sigma_fix() {
 #[test]
 fn test_parse_block_sigma_builds_sigmas_and_correlation() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0]".to_string()];
-    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _) =
+    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(sigmas.len(), 2);
     assert_eq!(sigmas[0].name, "PROP");
@@ -5969,7 +5931,7 @@ fn test_parse_block_sigma_builds_sigmas_and_correlation() {
 #[test]
 fn test_parse_block_sigma_fix_marks_sigmas_fixed() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
-    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _) =
+    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas.iter().all(|s| s.fixed));
 
@@ -6101,7 +6063,7 @@ fn test_build_residual_correlations_zero_covariance_omitted_when_fixed() {
 #[test]
 fn test_parse_block_omega_fix() {
     let lines = vec!["block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX".to_string()];
-    let (_, _, blocks, _, _, _, _, _, _, _) =
+    let (_, _, blocks, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(blocks[0].fixed);
 }
@@ -6113,7 +6075,7 @@ fn test_fix_keyword_case_insensitive() {
         "omega ETA ~ 0.05 Fix".to_string(),
         "sigma S ~ 0.02 FIX".to_string(),
     ];
-    let (thetas, omegas, _, sigmas, _, _, _, _, _, _) =
+    let (thetas, omegas, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(thetas[0].fixed);
     assert!(omegas[0].fixed);
@@ -6126,7 +6088,7 @@ fn test_fix_keyword_case_insensitive() {
 fn test_omega_default_is_variance() {
     // No annotation: value is stored verbatim as variance.
     let lines = vec!["omega ETA_CL ~ 0.07".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
     assert!(!omegas[0].init_as_sd);
@@ -6136,7 +6098,7 @@ fn test_omega_default_is_variance() {
 fn test_omega_sd_annotation_squares_value() {
     // `(sd)` → variance is the square of the raw value.
     let lines = vec!["omega ETA_CL ~ 0.265 (sd)".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.265 * 0.265;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
@@ -6150,7 +6112,7 @@ fn test_omega_variance_annotation_is_noop() {
         "omega ETA_CL ~ 0.07 (variance)".to_string(),
         "omega ETA_V  ~ 0.04 (var)".to_string(),
     ];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
     assert!(!omegas[0].init_as_sd);
@@ -6162,7 +6124,7 @@ fn test_omega_variance_annotation_is_noop() {
 fn test_omega_sd_annotation_with_fix() {
     // `(sd) FIX` — both annotations must be honored together.
     let lines = vec!["omega ETA_CL ~ 0.30 (sd) FIX".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
@@ -6174,7 +6136,7 @@ fn test_omega_sd_annotation_with_fix() {
 fn test_omega_fix_before_sd_annotation() {
     // `FIX (sd)` — FIX before the scale annotation.
     let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd)".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((omegas[0].variance - expected).abs() < 1e-12);
@@ -6186,7 +6148,7 @@ fn test_omega_fix_before_sd_annotation() {
 fn test_omega_fix_before_annotation_no_sd() {
     // `FIX` before a no-op annotation — fixed and variance-scale.
     let lines = vec!["omega ETA_CL ~ 0.09 FIX (variance)".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!((omegas[0].variance - 0.09).abs() < 1e-12);
     assert!(omegas[0].fixed);
@@ -6197,7 +6159,7 @@ fn test_omega_fix_before_annotation_no_sd() {
 fn test_sigma_fix_before_sd_annotation() {
     // `FIX (sd)` — FIX before the scale annotation for sigma.
     let lines = vec!["sigma PROP ~ 0.30 FIX (sd)".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas[0].fixed);
     assert!(sigmas[0].init_as_sd);
@@ -6208,7 +6170,7 @@ fn test_sigma_fix_before_sd_annotation() {
 fn test_sigma_fix_after_sd_annotation() {
     // `(sd) FIX` — existing form still works.
     let lines = vec!["sigma PROP ~ 0.30 (sd) FIX".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas[0].fixed);
     assert!(sigmas[0].init_as_sd);
@@ -6219,7 +6181,7 @@ fn test_sigma_unfixed_no_annotation() {
     // Baseline: plain sigma with no FIX and no annotation — confirms the
     // group-numbering shift didn't regress the common case.
     let lines = vec!["sigma PROP ~ 0.04".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!sigmas[0].fixed);
     assert!(!sigmas[0].init_as_sd);
@@ -6232,7 +6194,7 @@ fn test_sigma_default_is_variance() {
     // Since #56, the default sigma input is variance — the parser sqrt's
     // it into the internal SD representation that the likelihood uses.
     let lines = vec!["sigma PROP ~ 0.04".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     // Stored value is SD = sqrt(variance) = sqrt(0.04) = 0.2.
     assert!((sigmas[0].value - 0.2).abs() < 1e-12);
@@ -6243,7 +6205,7 @@ fn test_sigma_default_is_variance() {
 fn test_sigma_sd_annotation_stores_value_as_is() {
     // `(sd)` → the value is already on the SD scale, no transform.
     let lines = vec!["sigma PROP ~ 0.2 (sd)".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!((sigmas[0].value - 0.2).abs() < 1e-12);
     assert!(sigmas[0].init_as_sd);
@@ -6257,7 +6219,7 @@ fn test_sigma_default_and_sd_equivalent_initial_value() {
         "sigma A ~ 0.0004".to_string(),    // variance 0.0004
         "sigma B ~ 0.02 (sd)".to_string(), // SD 0.02
     ];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!((sigmas[0].value - sigmas[1].value).abs() < 1e-12);
 }
@@ -6306,7 +6268,7 @@ fn test_omega_negative_value_rejected() {
 #[test]
 fn test_kappa_sd_annotation_squares_value() {
     let lines = vec!["kappa KAPPA_CL ~ 0.25 (sd)".to_string()];
-    let (_, _, _, _, _, _, kappas, _, _, _) =
+    let (_, _, _, _, _, _, kappas, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     let k = &kappas.diagonal[0];
     let expected = 0.25 * 0.25;
@@ -6322,7 +6284,7 @@ fn test_sd_annotation_case_insensitive() {
         "omega ETA_B ~ 0.2 (Sd)".to_string(),
         "omega ETA_C ~ 0.3 (sd)".to_string(),
     ];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(omegas.iter().all(|o| o.init_as_sd));
 }
@@ -6338,7 +6300,7 @@ fn test_unknown_scale_tag_is_ignored_as_trailing_garbage() {
     // behavior; anything else is silently ignored, consistent with the
     // parser's existing FIXED-vs-FIX handling.)
     let lines = vec!["omega ETA_CL ~ 0.07 (foo)".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _) =
+    let (_, omegas, _, _, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(omegas.len(), 1);
     assert!((omegas[0].variance - 0.07).abs() < 1e-12);
@@ -6394,7 +6356,7 @@ fn test_fix_keyword_rejects_prefix_match() {
         "sigma PROP ~ 0.02 FIXED".to_string(),
         "block_omega (A, B) = [1.0, 0.0, 1.0] FIXED".to_string(),
     ];
-    let (_, omegas, blocks, sigmas, _, _, _, _, _, _) =
+    let (_, omegas, blocks, sigmas, _, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     // omega/sigma still parse (trailing `FIXED` is ignored) but must NOT
     // be marked fixed.
@@ -7812,7 +7774,7 @@ fn test_apply_fit_option_fd_hessian_step_negative_rejected() {
 #[test]
 fn test_parse_kappa_keyword() {
     let lines = vec!["kappa KAPPA_CL ~ 0.01".to_string()];
-    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(ki.diagonal.len(), 1);
     assert_eq!(ki.diagonal[0].name, "KAPPA_CL");
     assert!((ki.diagonal[0].variance - 0.01).abs() < 1e-12);
@@ -7822,7 +7784,7 @@ fn test_parse_kappa_keyword() {
 #[test]
 fn test_parse_kappa_fix() {
     let lines = vec!["kappa KAPPA_V ~ 0.05 FIX".to_string()];
-    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert!(ki.diagonal[0].fixed);
 }
 
@@ -7831,7 +7793,7 @@ fn test_kappa_unfixed_no_annotation() {
     // Baseline: plain kappa with no FIX and no annotation — confirms the
     // group-numbering shift didn't regress the common case.
     let lines = vec!["kappa KAPPA_V ~ 0.05".to_string()];
-    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert!(!ki.diagonal[0].fixed);
     assert!(!ki.diagonal[0].init_as_sd);
     assert!((ki.diagonal[0].variance - 0.05).abs() < 1e-12);
@@ -7841,7 +7803,7 @@ fn test_kappa_unfixed_no_annotation() {
 fn test_kappa_fix_before_sd_annotation() {
     // `FIX (sd)` — FIX before the scale annotation for kappa.
     let lines = vec!["kappa KAPPA_V ~ 0.30 FIX (sd)".to_string()];
-    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     let expected = 0.30 * 0.30;
     assert!((ki.diagonal[0].variance - expected).abs() < 1e-12);
     assert!(ki.diagonal[0].fixed);
@@ -7856,7 +7818,7 @@ fn test_kappa_appended_after_bsv_etas() {
         "omega ETA_CL ~ 0.09".to_string(),
         "kappa KAPPA_CL ~ 0.01".to_string(),
     ];
-    let (_, _, _, _, _, bsv_etas, ki, _, _, _) =
+    let (_, _, _, _, _, bsv_etas, ki, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(bsv_etas, vec!["ETA_CL"]);
     assert_eq!(ki.diagonal.len(), 1);
@@ -7987,7 +7949,7 @@ fn test_iov_occasion_parsed_from_fit_options_block() {
 #[test]
 fn test_parse_block_kappa_syntax() {
     let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005]".to_string()];
-    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert_eq!(ki.diagonal.len(), 0);
     assert_eq!(ki.block.len(), 1);
     assert_eq!(ki.block[0].names, vec!["KAPPA_CL", "KAPPA_V"]);
@@ -7999,7 +7961,7 @@ fn test_parse_block_kappa_syntax() {
 #[test]
 fn test_parse_block_kappa_fix() {
     let lines = vec!["block_kappa (KAPPA_CL, KAPPA_V) = [0.01, 0.002, 0.005] FIX".to_string()];
-    let (_, _, _, _, _, _, ki, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
+    let (_, _, _, _, _, _, ki, _, _, _, _) = parse_parameters(&lines, &Default::default()).unwrap();
     assert!(ki.block[0].fixed);
 }
 
@@ -10016,6 +9978,171 @@ fn test_alag_alias_in_structural_model_block() {
     assert_eq!(pk.lagtime(), 0.75);
 }
 
+/// #1048 fixture: a model whose `pk(...)` line and extra `[individual_parameters]`
+/// lines are supplied verbatim, so any pair of alias spellings can be bound to the
+/// same parameter or to two different ones.
+fn alias_model_src(indiv_extra: &str, pk_line: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{indiv_extra}
+
+[structural_model]
+  {pk_line}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+/// Evaluate a parsed model's `pk_param_fn` at its default theta and `eta = 0`.
+fn alias_model_pk(src: &str) -> crate::types::PkParams {
+    let parsed = super::parse_full_model(src).unwrap_or_else(|e| panic!("expected Ok, got: {e}"));
+    let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+    let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+    (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0)
+}
+
+#[test]
+fn pk_alias_spellings_on_one_slot_conflict() {
+    // #1048. `v`/`v1`, `q`/`q2` and `lagtime`/`alag` are two spellings of ONE
+    // `PkParams` slot, but `pk_param_map` is keyed by the role string — so both
+    // spellings could appear in one `pk(...)` call bound to different parameters.
+    // `build_pk_param_fn` then pushed two writes to the same slot and the closure
+    // applied them in order: last write won, the other parameter never reached
+    // the engine, and the prediction came out off by the ratio of the two values
+    // (measured 2× on a 1-cpt IV model with `v=VA, v1=VB`, VA=50, VB=100).
+    //
+    // Nothing caught it. The #315 "computed but never used" census counts a name
+    // that appears in the `pk(...)` line as used, so *mapping* the discarded
+    // parameter is exactly what silenced the one guard that would have spoken;
+    // and the sibling "[structural_model] does not use parameter(s)" warning
+    // asks `consumes_pk_slot`, which both spellings satisfy. Sorting the entries
+    // made the winner deterministic, not correct.
+    let cases = [
+        (
+            "  VA = TVV\n  VB = 2.0 * TVV",
+            "pk one_cpt_iv(cl=CL, v=VA, v1=VB)",
+            "the central volume",
+            "v1=VB",
+            "VA",
+        ),
+        (
+            "  V2 = TVV\n  QA = TVCL\n  QB = 2.0 * TVCL",
+            "pk two_cpt_iv(cl=CL, v=V, q=QA, q2=QB, v2=V2)",
+            "the inter-compartmental clearance",
+            "q2=QB",
+            "QA",
+        ),
+        (
+            "  LA = 0.2 * TVKA\n  LB = 0.4 * TVKA",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=LA, lagtime=LB)",
+            "the absorption lag time",
+            "lagtime=LB",
+            "LA",
+        ),
+    ];
+    for (indiv_extra, pk_line, noun, winner, loser) in cases {
+        let err = expect_parse_err(&alias_model_src(indiv_extra, pk_line));
+        assert!(
+            err.contains("two spellings of the same parameter") && err.contains(noun),
+            "`{pk_line}` must be rejected as an alias conflict naming {noun}, got: {err}"
+        );
+        // The message has to say which value the user was silently getting —
+        // entries are resolved in ascending key order and the last write wins,
+        // so the alphabetically later spelling is the one that reached the slot.
+        assert!(
+            err.contains(&format!("only `{winner}` would be applied")),
+            "`{pk_line}` must name the binding that wins the slot, got: {err}"
+        );
+        assert!(
+            err.contains(&format!("`{loser}` silently discarded")),
+            "`{pk_line}` must name the discarded value, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn pk_alias_spellings_binding_one_parameter_are_accepted() {
+    // The lenient half of #1048: both writes store the same value, so the pair is
+    // redundant rather than wrong. Keeping it legal is what leaves
+    // `analytical_role_binding` a tie to break (`lagtime=X, alag=X`), and the
+    // de-duplication that skips the second write must not drop the slot entirely.
+    let pk = alias_model_pk(&alias_model_src(
+        "  VA = 2.0 * TVV",
+        "pk one_cpt_iv(cl=CL, v=VA, v1=VA)",
+    ));
+    assert_eq!(pk.v(), 100.0, "both spellings must still write the slot");
+    // Non-degenerate: the assertion above would also pass on a slot left at some
+    // default that happens to match, so pin that the value tracks the parameter.
+    let moved = alias_model_pk(&alias_model_src(
+        "  VA = 3.0 * TVV",
+        "pk one_cpt_iv(cl=CL, v=VA, v1=VA)",
+    ));
+    assert_eq!(moved.v(), 150.0, "the slot must follow the bound parameter");
+    // And `lagtime=X, alag=X` — the pair `analytical_role_binding` tie-breaks —
+    // still parses, on the slot whose two spellings sort in the other order.
+    let lag = alias_model_pk(&alias_model_src(
+        "  LA = 0.2 * TVKA",
+        "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LA, alag=LA)",
+    ));
+    assert_eq!(lag.lagtime(), 0.2 * 1.5);
+}
+
+#[test]
+fn pk_alias_spellings_with_literal_values_follow_the_same_rule() {
+    // Literal bindings take the other arm of the resolver, and the closure writes
+    // every constant AFTER every variable — so when the two spellings disagree it
+    // is the constant that reaches the engine whatever the role keys sort to, and
+    // the message must name that one rather than the later key.
+    let err = expect_parse_err(&alias_model_src(
+        "  VA = TVV",
+        "pk one_cpt_iv(cl=CL, v1=VA, v=100.0)",
+    ));
+    assert!(
+        err.contains("only `v=100.0` would be applied") && err.contains("`VA` silently discarded"),
+        "a constant beats a variable on the same slot regardless of key order, got: {err}"
+    );
+    // Two constants that agree are redundant, not conflicting — and the
+    // comparison is on the parsed number, so `50` and `50.0` are the same value.
+    let pk = alias_model_pk(&alias_model_src("", "pk one_cpt_iv(cl=CL, v=50, v1=50.0)"));
+    assert_eq!(pk.v(), 50.0);
+}
+
+#[test]
+fn pk_alias_spellings_bound_to_time_are_not_a_conflict() {
+    // `pk(...=TIME)` is rewritten upstream to a synthetic individual parameter
+    // named after the ROLE KEY (#486), so `v=TIME, v1=TIME` arrives at the slot
+    // check as two different variable names carrying one value. Compared as plain
+    // variables that reads as a conflict the model file does not contain.
+    let pk = alias_model_pk(&alias_model_src(
+        "",
+        "pk one_cpt_iv(cl=CL, v=TIME, v1=TIME)",
+    ));
+    assert_eq!(pk.v(), 0.0, "evaluated at t = 0");
+    // A genuine conflict against a TIME binding is still rejected — and must quote
+    // the `TIME` the user wrote, never the internal `__ferx_pktime_*` name.
+    let err = expect_parse_err(&alias_model_src(
+        "  VB = TVV",
+        "pk one_cpt_iv(cl=CL, v=TIME, v1=VB)",
+    ));
+    assert!(
+        err.contains("`v=TIME`") && !err.contains("__ferx_pktime"),
+        "the diagnostic must quote `TIME`, not the synthetic parameter, got: {err}"
+    );
+}
+
 #[test]
 fn test_undefined_structural_param_errors() {
     // #261: a [structural_model] PK value that names a variable not defined
@@ -10251,14 +10378,13 @@ fn test_unknown_key_precedes_missing_required() {
 
 #[test]
 fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
-    // Regression for the ODE-with-lagtime path. For ODE models there is
-    // no [structural_model] pk= line, so pk_param_map is empty and
-    // pk_param_fn's ODE branch writes individual parameters by
-    // declaration order. LAGTIME (and ALAG) must also land at the
-    // canonical PK_IDX_LAGTIME slot so `ode_predictions` (which reads
-    // `pk_params_flat[PK_IDX_LAGTIME]`) sees it. `has_lagtime()` must
-    // likewise return true via the indiv_param_names fallback so the
-    // SS/negative-lagtime warning gating fires for ODE users.
+    // Regression for the ODE-with-lagtime path. ODE models have no
+    // [structural_model] pk= line, so pk_param_map is empty and `pk_indices`
+    // is `ode_param_slots`' name→slot map. LAGTIME (and ALAG) is a canonical
+    // name, so it lands at PK_IDX_LAGTIME, where `ode_predictions` (which
+    // reads `pk_params_flat[PK_IDX_LAGTIME]`) sees it, and `has_lagtime()`
+    // must return true so the SS/negative-lagtime warning gating fires for
+    // ODE users.
     let model_str = "
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
@@ -10282,8 +10408,16 @@ fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
   DV ~ proportional(EPS)
 ";
     let parsed = super::parse_full_model(model_str).unwrap();
-    // ODE models must report has_lagtime() via the indiv_param_names
-    // fallback even when pk_indices doesn't contain PK_IDX_LAGTIME.
+    // A bare LAGTIME is a canonical name, so `ode_param_slots` routes it to
+    // PK_IDX_LAGTIME and `pk_indices` carries the slot on the ODE layout too.
+    assert!(
+        parsed
+            .model
+            .pk_indices
+            .contains(&crate::types::PK_IDX_LAGTIME),
+        "pk_indices must carry PK_IDX_LAGTIME on the ODE layout: {:?}",
+        parsed.model.pk_indices
+    );
     assert!(
         parsed.model.has_lagtime(),
         "has_lagtime() must return true for an ODE model declaring LAGTIME"
@@ -10486,6 +10620,73 @@ fn turnover_ode_model(init_lines: &str) -> String {
 }
 
 #[test]
+fn test_ode_pk_indices_are_name_slotted_not_positional() {
+    // Pins the contract documented on `CompiledModel::indiv_param_names`: on the
+    // ODE layout `pk_indices` is `ode_param_slots`' name→slot map, so canonical
+    // names declared out of PK-slot order (V, KA, LAGTIME) and a non-canonical
+    // one (KE) are read through `pk_indices`, never slot `i`. Every value is
+    // distinct and no name sits at its own position, so a positional read
+    // cannot pass by coincidence (#1355).
+    let model_str = "
+[parameters]
+  theta TVV(20.0, 0.1, 1000.0)
+  theta TVKA(1.5)
+  theta TVKE(0.2)
+  theta TVLAG(0.7)
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  V       = TVV * exp(ETA_V)
+  KA      = TVKA
+  KE      = TVKE
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - KE * central
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = super::parse_full_model(model_str).unwrap();
+    let m = &parsed.model;
+    assert_eq!(m.indiv_param_names, vec!["V", "KA", "KE", "LAGTIME"]);
+    assert_eq!(
+        m.pk_indices,
+        vec![
+            crate::types::PK_IDX_V,
+            crate::types::PK_IDX_KA,
+            0,
+            crate::types::PK_IDX_LAGTIME
+        ],
+        "V/KA/LAGTIME take their canonical slots; KE takes the lowest free slot"
+    );
+    let eta = vec![0.0; m.n_eta];
+    let pk = (m.pk_param_fn)(
+        &m.default_params.theta,
+        &eta,
+        &std::collections::HashMap::new(),
+        0.0,
+    );
+    let expected = [20.0, 1.5, 0.2, 0.7];
+    for (i, &want) in expected.iter().enumerate() {
+        let name = &m.indiv_param_names[i];
+        assert_eq!(
+            pk.values[m.pk_indices[i]], want,
+            "{name} read through pk_indices"
+        );
+        assert_ne!(
+            pk.values[i], want,
+            "{name} must not be readable at its positional slot {i}"
+        );
+    }
+}
+
+#[test]
 fn test_init_directive_builds_init_fn() {
     let src = turnover_ode_model("  init(response) = KIN / KOUT");
     let parsed = parse_full_model(&src).unwrap();
@@ -10493,8 +10694,8 @@ fn test_init_directive_builds_init_fn() {
     assert!(ode.init_fn.is_some(), "init_fn should be populated");
 
     // Evaluate at typical values (eta = 0): KIN = 10, KOUT = 2 → 5.0.
-    // For an ODE model, individual params occupy PkParams slots in
-    // declaration order: KIN @ 0, KOUT @ 1.
+    // For an ODE model `ode_param_slots` gives non-canonical names the lowest
+    // free slots, so here KIN @ 0, KOUT @ 1.
     let mut params = [0.0; crate::types::MAX_PK_PARAMS];
     params[0] = 10.0;
     params[1] = 2.0;
@@ -12909,14 +13110,14 @@ fn test_parse_scaling_y_form_c_on_ode() {
         ),
     };
 
-    // ODE writes indiv params sequentially into pk_params_flat[0..n] in
-    // declaration order: [CL, V, KA] -> pk[0..3]. State order: [depot,
-    // central] -> state[0..2]. So y = central / V = state[1] / pk[1].
+    // ODE params are slotted by name (`ode_param_slots`): [CL, V, KA] ->
+    // pk[0], pk[1], pk[4]. State order: [depot, central] -> state[0..2].
+    // So y = central / V = state[1] / pk[1].
     let state = vec![0.0, 100.0]; // depot=0, central=100
     let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
     pk[0] = 1.0; // CL
     pk[1] = 50.0; // V
-    pk[2] = 1.0; // KA
+    pk[4] = 1.0; // KA
     let cov = HashMap::new();
     let y = out_fn(&state, &pk, &[], &[], &cov);
     assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);
@@ -22374,4 +22575,338 @@ mod unreachable_unary_fn_arms {
     fn the_differentiator_panics_rather_than_passing_the_derivative_through() {
         differentiate(&out_of_whitelist(), DiffAxis::Theta(0));
     }
+}
+
+// ── Inline `prior(...)` declarations (#254) ──────────────────────────────────
+
+/// A one-compartment IV model whose `[parameters]` block the caller supplies,
+/// so each prior test differs from the next by exactly the declaration under
+/// test.
+fn priored_model(parameters: &str) -> String {
+    format!(
+        "[parameters]\n{parameters}\n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV\n\n\
+         [structural_model]\n\
+         \x20 pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+const PRIOR_BASE_PARAMS: &str = "  theta TVCL(0.2, 0.001, 10.0)\n  \
+                                 theta TVV(10.0, 0.1, 500.0)\n  \
+                                 omega ETA_CL ~ 0.09\n  \
+                                 sigma PROP_ERR ~ 0.04\n\n";
+
+/// The tail parses on every declaration kind and lands on the right parameter,
+/// with `25%` and `0.25` meaning the same thing.
+#[test]
+fn prior_tail_parses_on_theta_omega_and_sigma() {
+    let src = priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior(0.15, rse = 25%)\n  \
+         theta TVV(10.0, 0.1, 500.0) prior(9.8, rse = 0.25)\n  \
+         omega ETA_CL ~ 0.09 prior(0.09, rse = 40%)\n  \
+         sigma PROP_ERR ~ 0.04 prior(0.04, sd = 0.01)\n\n",
+    );
+    let model = parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("priored model should parse: {e}"))
+        .model;
+
+    let names: Vec<&str> = model.priors.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["TVCL", "TVV", "ETA_CL", "PROP_ERR"]);
+    assert_eq!(model.priors[0].value, 0.15);
+    // Both spellings normalize to the same fraction, so nothing downstream has
+    // to know which was written.
+    assert_eq!(model.priors[0].spread, crate::types::PriorSpread::Rse(0.25));
+    assert_eq!(model.priors[1].spread, crate::types::PriorSpread::Rse(0.25));
+    assert_eq!(model.priors[2].spread, crate::types::PriorSpread::Rse(0.4));
+    assert_eq!(model.priors[3].spread, crate::types::PriorSpread::Sd(0.01));
+}
+
+/// A model with no `prior(...)` anywhere carries no priors — the control for
+/// every test above, without which they could all pass on a parser that
+/// attached a prior to everything.
+#[test]
+fn a_model_without_priors_declares_none() {
+    let model = parse_full_model(&priored_model(PRIOR_BASE_PARAMS))
+        .expect("base model should parse")
+        .model;
+    assert!(model.priors.is_empty());
+}
+
+/// The tail must survive next to every other modifier the declaration can
+/// carry, since it is peeled before the declaration regexes run and they are
+/// all unanchored.
+#[test]
+fn prior_tail_coexists_with_fix_and_scale_annotations() {
+    let src = priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior(0.15, rse = 25%)\n  \
+         theta TVV(10.0, 0.1, 500.0) FIX\n  \
+         omega ETA_CL ~ 0.3 (sd) prior(0.3, rse = 20%)\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    );
+    let model = parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("should parse: {e}"))
+        .model;
+    assert_eq!(model.priors.len(), 2);
+    // The `(sd)` annotation still reached the omega parser: without the peel,
+    // `omega_re` would have matched a line ending in `prior(...)` and the
+    // annotation group would have captured nothing.
+    assert_eq!(model.omega_init_as_sd, vec![true]);
+}
+
+/// `rse = 25` is neither 25% nor 0.25, and reading it as 2500% would give a
+/// prior so flat the fit is indistinguishable from an unpriored one — a
+/// mistake the user could never see. Reject it and name both spellings.
+#[test]
+fn a_bare_rse_above_one_is_rejected_as_ambiguous() {
+    let err = parse_err(&priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior(0.15, rse = 25)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    ));
+    assert!(err.contains("ambiguous"), "got: {err}");
+    assert!(err.contains("25%"), "must name the percent spelling: {err}");
+    assert!(
+        err.contains("0.25"),
+        "must name the fraction spelling: {err}"
+    );
+
+    // The straddle: a fraction at or below 1 is accepted, so the check rejects
+    // the ambiguous case rather than every bare number.
+    let ok = priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior(0.15, rse = 0.25)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    );
+    assert!(parse_full_model(&ok).is_ok());
+}
+
+/// Exactly one of `rse` / `sd` is required, and nothing else is accepted in
+/// its place.
+#[test]
+fn a_malformed_prior_call_is_rejected() {
+    let cases: [(&str, &str); 13] = [
+        ("prior(0.15)", "expected"),
+        ("prior(0.15, 0.25)", "rse"),
+        ("prior(0.15, cv = 25%)", "unknown prior argument"),
+        ("prior(0.15, rse = 25%, sd = 0.1)", "expected"),
+        ("prior(abc, rse = 25%)", "not a number"),
+        // The first argument is the central value; any other key there is a
+        // mistake rather than a second spread.
+        ("prior(mean = 0.15, rse = 25%)", "central value"),
+        // Non-finite central value — caught before it can reach the packed
+        // `ln` and become a silent NaN prior mean.
+        ("prior(inf, rse = 25%)", "must be finite"),
+        ("prior(nan, rse = 25%)", "must be finite"),
+        // Unparseable and out-of-range spreads, both spellings. A spread of 0
+        // is a point mass, not a prior, and a negative one is nonsense; either
+        // would otherwise divide the penalty by zero or flip its sign.
+        ("prior(0.15, rse = abc%)", "not a number"),
+        ("prior(0.15, rse = 0%)", "must be > 0"),
+        ("prior(0.15, rse = -5%)", "must be > 0"),
+        ("prior(0.15, sd = abc)", "not a number"),
+        ("prior(0.15, sd = 0)", "must be > 0"),
+    ];
+    for (call, needle) in cases {
+        let err = parse_err(&priored_model(&format!(
+            "  theta TVCL(0.2, 0.001, 10.0) {call}\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  \
+             sigma PROP_ERR ~ 0.04\n\n"
+        )));
+        assert!(
+            err.contains(needle),
+            "`{call}` should mention `{needle}`: {err}"
+        );
+    }
+}
+
+/// `value = 0.15` is the long spelling of the bare first argument, and means
+/// exactly the same thing.
+///
+/// Asserted as an *equality* against the bare form rather than merely parsing,
+/// because the failure mode worth catching is the two spellings resolving to
+/// different priors — which no "it parses" check can see.
+#[test]
+fn the_central_value_may_be_written_with_its_keyword() {
+    let parse_one = |call: &str| {
+        parse_full_model(&priored_model(&format!(
+            "  theta TVCL(0.2, 0.001, 10.0) {call}\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  \
+             sigma PROP_ERR ~ 0.04\n\n"
+        )))
+        .unwrap_or_else(|e| panic!("`{call}` must parse: {e}"))
+        .model
+        .priors
+        .remove(0)
+    };
+
+    let keyed = parse_one("prior(value = 0.15, rse = 25%)");
+    let bare = parse_one("prior(0.15, rse = 25%)");
+    assert_eq!(keyed.name, bare.name);
+    assert_eq!(keyed.value, bare.value);
+    assert_eq!(keyed.spread, bare.spread);
+    assert_eq!(keyed.value, 0.15);
+}
+
+/// An unterminated `prior(` is an error naming the line, not a panic and not a
+/// silently dropped tail.
+#[test]
+fn an_unbalanced_prior_call_is_rejected() {
+    let err = parse_err(&priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior(0.15, rse = 25%\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    ));
+    assert!(err.contains("prior"), "got: {err}");
+}
+
+/// A `prior(...)` on a declaration that cannot carry one must be an error, not
+/// a silently ignored tail — the failure mode the peel exists to remove.
+#[test]
+fn a_prior_on_a_block_declaration_is_rejected() {
+    let src = priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.09] prior(0.09, rse = 40%)\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("V  = TVV", "V  = TVV * exp(ETA_V)");
+    let err = parse_err(&src);
+    assert!(err.contains("only supported on"), "got: {err}");
+    assert!(err.contains("block_omega"), "got: {err}");
+}
+
+/// A θ level block is many parameters sharing one declaration, so one prior
+/// would have to mean "the same prior on every level" — a different feature.
+#[test]
+fn a_prior_on_a_theta_level_block_is_rejected() {
+    let err = parse_err(&priored_model(
+        "  theta TVCL[3](0.2, 0.001, 10.0) prior(0.15, rse = 25%)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    ));
+    assert!(err.contains("level block"), "got: {err}");
+}
+
+/// `weight = <expr>` swallows everything to its right, so a prior written after
+/// one on a kappa declaration must still be peeled first. Without the ordering
+/// the model parses cleanly and fits unpenalized.
+#[test]
+fn a_prior_after_a_kappa_weight_modifier_is_still_seen() {
+    let src = "[parameters]\n  \
+         theta TVCL(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         kappa K_CL ~ 0.04 weight = NARM prior(0.04, rse = 30%)\n  \
+         sigma PROP_ERR ~ 0.04\n\n\
+         [individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + K_CL)\n  \
+         V  = TVV\n\n\
+         [structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  \
+         DV ~ proportional(PROP_ERR)\n";
+    let model = parse_full_model(src)
+        .unwrap_or_else(|e| panic!("should parse: {e}"))
+        .model;
+    assert_eq!(model.priors.len(), 1);
+    assert_eq!(model.priors[0].name, "K_CL");
+    // Both modifiers survived: the weight went to the kappa, the prior to the
+    // prior list. Either one alone passing would hide the ordering bug.
+    assert_eq!(model.kappa_weights.len(), 1);
+    assert!(model.kappa_weights[0].is_some());
+}
+
+/// A parameter *named* `prior` is not the modifier either.
+///
+/// `prior` is a legal name (every declaration regex takes `\w+`), so these are
+/// valid models that predate #254 and must keep parsing. Both spellings are
+/// here because they fail differently: `omega PRIOR ~ 0.1` reaches the
+/// call-shape test and was reported as "`prior` must be written as a call",
+/// while `theta prior(0.1, 0, 10)` *is* a call and was peeled off as a
+/// three-argument modifier, erroring on the argument list instead. Neither is
+/// caught by the `MY_prior` test below, whose left-boundary guard fires first.
+#[test]
+fn a_parameter_named_prior_is_not_the_modifier() {
+    // `~` form: the keyword sits in the name slot with no `(` after it.
+    let omega_named_prior = priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega PRIOR ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("exp(ETA_CL)", "exp(PRIOR)");
+    let model = parse_full_model(&omega_named_prior)
+        .unwrap_or_else(|e| panic!("`omega PRIOR ~ 0.09` must parse: {e}"))
+        .model;
+    assert!(model.priors.is_empty());
+    assert!(model.eta_names.iter().any(|n| n == "PRIOR"));
+
+    // Call form: the keyword sits in the name slot *and* is followed by `(`, so
+    // only the preceding `theta` separates it from a real modifier.
+    let theta_named_prior = priored_model(
+        "  theta prior(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("CL = TVCL", "CL = prior");
+    let model = parse_full_model(&theta_named_prior)
+        .unwrap_or_else(|e| panic!("`theta prior(...)` must parse: {e}"))
+        .model;
+    assert!(model.priors.is_empty());
+    assert!(model.theta_names.iter().any(|n| n == "prior"));
+
+    // The straddle, on the *same* declarations: one token further right and the
+    // identical keyword is the modifier again. Without this a fix that simply
+    // stopped recognising `prior` anywhere would pass the two halves above.
+    let both = priored_model(
+        "  theta prior(0.2, 0.001, 10.0) prior(0.2, rse = 25%)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega PRIOR ~ 0.09 prior(0.09, rse = 40%)\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("CL = TVCL", "CL = prior")
+    .replace("exp(ETA_CL)", "exp(PRIOR)");
+    let model = parse_full_model(&both)
+        .unwrap_or_else(|e| panic!("a modifier after a same-named declaration must parse: {e}"))
+        .model;
+    let names: Vec<&str> = model.priors.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["prior", "PRIOR"]);
+
+    // And the bare-tail safety net still fires: a `prior` that is neither a name
+    // slot nor a call is an error, not a silently dropped tail.
+    let err = parse_err(&priored_model(
+        "  theta TVCL(0.2, 0.001, 10.0) prior\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    ));
+    assert!(err.contains("must be written as a call"), "got: {err}");
+}
+
+/// A name containing `prior` is not the modifier.
+#[test]
+fn an_identifier_containing_prior_is_not_the_modifier() {
+    let src = priored_model(
+        "  theta MY_prior(0.2, 0.001, 10.0)\n  \
+         theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  \
+         sigma PROP_ERR ~ 0.04\n\n",
+    )
+    .replace("CL = TVCL", "CL = MY_prior");
+    let model = parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("should parse: {e}"))
+        .model;
+    assert!(model.priors.is_empty());
+    assert!(model.theta_names.iter().any(|n| n == "MY_prior"));
 }

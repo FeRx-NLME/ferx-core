@@ -88,6 +88,11 @@ pub fn run_foce_gn(
     // curvature in the BHHH system; `ofv_clean` — the −2LL at the same point —
     // is what the trace, checkpoint, verbose lines and the reported OFV carry.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    // Parameter priors (#254), on the same contract. Their curvature is an exact
+    // constant `2/s²` diagonal, so unlike the NN smoothness term there is no
+    // Gauss–Newton approximation involved — the BHHH system sees the true
+    // Hessian of this part of the objective.
+    let priors = crate::estimation::outer_optimizer::build_prior_set(model, init_params);
 
     // BHHH Information-matrix approximation degrades as the censoring fraction
     // grows — each censored row contributes less Fisher information than its
@@ -139,7 +144,7 @@ pub fn run_foce_gn(
             &kappas,
             options.interaction,
         );
-    let mut ofv = ofv_clean + nn_reg.penalty_value(&params.theta);
+    let mut ofv = ofv_clean + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
 
     if verbose {
         eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv_clean);
@@ -179,6 +184,13 @@ pub fn run_foce_gn(
             let theta_x = unpack_params(&x, init_params).theta;
             nn_reg.add_packed_gradient(&theta_x, grad.as_mut_slice());
             nn_reg.add_packed_hessian(&theta_x, &mut |i, j, v| h_bhhh[(i, j)] += v);
+        }
+        // Parameter priors (#254): same two contributions, already in packed
+        // space. Guarded on `is_active` for the same reason — an unpriored fit
+        // must take a byte-identical path.
+        if priors.is_active() {
+            priors.add_gradient(&x, grad.as_mut_slice());
+            priors.add_hessian(&mut |i, j, v| h_bhhh[(i, j)] += v);
         }
 
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
@@ -294,7 +306,8 @@ pub fn run_foce_gn(
                 &kap_try,
                 options.interaction,
             );
-        let ofv_try = ofv_try_clean + nn_reg.penalty_value(&params_try.theta);
+        let ofv_try =
+            ofv_try_clean + nn_reg.penalty_value(&params_try.theta) + priors.penalty(&x_try);
 
         // TR ratio: actual OFV decrease vs quadratic model decrease.
         // rho < 0 or non-finite OFV → reject.
@@ -453,6 +466,7 @@ pub fn run_foce_gn(
     // penalized under covariate-NN regularization (see `FitResult::final_gradient`).
     let mut grad_final = grad_final.as_slice().to_vec();
     nn_reg.add_packed_gradient(&gn_params.theta, &mut grad_final);
+    priors.add_gradient(&x, &mut grad_final);
     let mut final_gradient: Option<Vec<f64>> = Some(grad_final);
 
     // Penalized: this is what the FOCEI polish below is ranked against.
@@ -556,7 +570,11 @@ pub fn run_foce_gn(
     // is added back before the compare — comparing clean against clean would
     // throw the regularized polish away whenever the penalty bit (a penalized
     // optimum's clean OFV is ≥ the unregularized GN optimum's by construction).
-    let polish_penalized = polish_result.ofv + nn_reg.penalty_value(&polish_result.params.theta);
+    let polish_penalized = polish_result.ofv
+        + nn_reg.penalty_value(&polish_result.params.theta)
+        + priors.penalty(&crate::estimation::parameterization::pack_params(
+            &polish_result.params,
+        ));
     if polish_penalized < gn_ofv {
         if verbose {
             eprintln!(
@@ -2069,6 +2087,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             name: "gn_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -3132,6 +3151,7 @@ mod tests {
             mixture: None,
         };
         let model = CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             name: "gn_block_omega_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -3426,6 +3446,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            priors: Vec::new(),
             covariate_model: None,
             name: "iov_gn_test".into(),
             pk_model: PkModel::OneCptIv,

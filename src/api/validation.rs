@@ -4144,6 +4144,157 @@ pub(crate) fn check_variance_init_rails(
 #[path = "tests/variance_init_rail_tests.rs"]
 mod variance_init_rail_tests;
 
+#[cfg(test)]
+#[path = "tests/parameter_prior_check_tests.rs"]
+mod parameter_prior_check_tests;
+
+/// Reject a `prior(...)` declaration that cannot be applied (#254).
+///
+/// **This is the gate**, and it has two call sites that must stay in step:
+/// `api::fit::fit_inner` runs it before any optimizer does, so a prior that
+/// survives to `build_prior_set` has already been checked against the very
+/// `ModelParameters` layout the optimizer will pack; and
+/// [`validate_model_file`] runs it so `ferx check` refuses exactly the models
+/// `fit()` refuses. It needs no dataset — the prior is resolved against the
+/// packed parameter layout alone — so it belongs with the other
+/// data-independent checks there.
+///
+/// Three classes of failure, all errors rather than warnings — an unapplied or
+/// half-applied prior is invisible in the output, because the fit still
+/// converges and still reports estimates with nothing saying the prior was
+/// dropped.
+pub(crate) fn check_parameter_priors(
+    model: &CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    if model.priors.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. The prior does not resolve — unknown name, a FIXed parameter, a block
+    //    element, a duplicate. `PriorSet::build` produces the message; this
+    //    function only decides the severity and the code.
+    if let Err(msg) = crate::estimation::priors::PriorSet::build(model, init_params) {
+        return vec![Diagnostic::error("E_PRIOR_UNRESOLVED", msg)
+            .with_block("parameters")
+            .with_suggestion(
+                "A prior must name a `theta`, `omega`, `sigma` or `kappa` declared in \
+                 `[parameters]` that is estimated (not `FIX`) and does not belong to a \
+                 `block_omega` / `block_sigma` / `block_kappa`.",
+            )];
+    }
+
+    // 2. The last stage that *estimates* cannot apply priors.
+    //
+    //    Not `chain.last()`: a trailing evaluation-only stage (`imp` under
+    //    `imp_eval_only`, `laplace` under `agq_eval_only`) consumes the preceding
+    //    stage's parameters and runs no optimizer, so it can neither apply a
+    //    prior nor undo one an earlier stage applied. Testing the literal last
+    //    stage is wrong in both directions — `[saem, laplace]` + `agq_eval_only`
+    //    would be accepted (Laplace is supported, but here it only evaluates
+    //    SAEM's estimates, so nothing ever applied the prior) and `[focei, imp]`
+    //    + `imp_eval_only` would be rejected (IMP is unsupported, but FOCEI
+    //    already applied it).
+    //
+    //    `covariance_stage` is the same predicate that decides which stage owns
+    //    the covariance step, for the same reason: one derivation, so the two
+    //    cannot disagree about which stage the reported estimates came from.
+    let Some(last) = options.covariance_stage() else {
+        return Vec::new();
+    };
+    if !applies_parameter_priors(last) {
+        return vec![Diagnostic::error(
+            "E_PRIOR_METHOD_UNSUPPORTED",
+            format!(
+                "`prior(...)` is declared on {} parameter(s), but the last estimating stage \
+                 (`{}`) does not apply parameter priors — the fit would silently return the \
+                 unpenalized maximum-likelihood estimates.",
+                model.priors.len(),
+                last.label(),
+            ),
+        )
+        .with_block("parameters")
+        .with_suggestion(
+            "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
+             Use one of those as the last estimating stage — chaining is fine, e.g. \
+             `methods = [saem, focei]` — or remove the prior declarations.",
+        )];
+    }
+
+    // 3. The requested covariance estimator cannot carry the prior.
+    //
+    //    Both rejected forms fail for the same reason: `S` is a sum over
+    //    *subjects*, and a prior has no subject decomposition — it contributes
+    //    one score for the whole population, not one per subject — so nothing
+    //    assembled from `S` can represent it. `R` is the only half that carries
+    //    the prior's curvature.
+    //
+    //    `s` is the obvious case (`S⁻¹` is simply the unpenalized information).
+    //    `rsr` is the subtler one and was missed at first: `R⁻¹ S R⁻¹` puts two
+    //    prior-shrunk `R⁻¹` factors around a prior-free `S`, so the result is
+    //    neither the penalized estimator nor the unpenalized one — it under-states
+    //    the SE on every priored coordinate by roughly the square of the shrinkage.
+    //    A wrong-by-construction robust SE is worse than no robust SE, so this is
+    //    an error and not a warning, and the `s` diagnostic below must not go on
+    //    recommending `rsr` as the safe alternative.
+    if options.run_covariance_step {
+        let method = options.covariance_method;
+        let detail = match method {
+            crate::types::CovarianceMethod::CrossProduct => Some((
+                "s",
+                "`S⁻¹` is the score cross-product alone, so the reported standard errors \
+                 would be the unpenalized ones.",
+            )),
+            crate::types::CovarianceMethod::Sandwich => Some((
+                "rsr",
+                "the `R⁻¹ S R⁻¹` sandwich wraps a prior-free `S` in two prior-shrunk `R⁻¹` \
+                 factors, so the reported standard errors are neither the penalized nor the \
+                 unpenalized ones — they are systematically too small on every priored \
+                 coordinate.",
+            )),
+            crate::types::CovarianceMethod::Hessian => None,
+        };
+        if let Some((name, why)) = detail {
+            return vec![Diagnostic::error(
+                "E_PRIOR_COV_METHOD_UNSUPPORTED",
+                format!(
+                    "`covariance_method = {name}` cannot represent a parameter prior: `S` is a \
+                     sum of per-subject scores, and a prior contributes one score for the whole \
+                     population rather than one per subject — {why}"
+                ),
+            )
+            .with_block("fit_options")
+            .with_suggestion(
+                "Use `covariance_method = r` (the default, whose Hessian carries the prior's \
+                 curvature), or set `covariance = false`.",
+            )];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Whether an estimation method's optimizer applies parameter priors (#254).
+///
+/// The FOCE family does: every outer optimizer under `foce` / `focei` /
+/// `laplace` (NLopt, built-in BFGS, trust-region) plus both Gauss–Newton
+/// variants minimise a packed objective the penalty is simply added to.
+///
+/// SAEM, IMP/IMPMAP, Bayes and VI do not, each for its own reason: SAEM's M-step
+/// is closed form and would need a conjugate MAP update rather than an added
+/// term; IMP/IMPMAP need their Monte-Carlo M-step penalized (planned, and the
+/// only one of these that is a straightforward extension); and `bayes` already
+/// carries its own Ω prior, so a second one on the same parameter is a
+/// modelling error rather than a missing feature.
+pub(crate) fn applies_parameter_priors(method: crate::types::EstimationMethod) -> bool {
+    use crate::types::EstimationMethod as M;
+    matches!(
+        method,
+        M::Foce | M::FoceI | M::Laplace | M::FoceGn | M::FoceGnHybrid
+    )
+}
+
 /// The `W_` token carried inside the message text of every start-outside-the-box
 /// *warning*, so [`crate::types::classify_warning`] can recover
 /// `WarningCode::InitOutsideBounds` from the flat string `fit()` stores.
@@ -5763,6 +5914,19 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    θ outside its declared range without a dataset, exactly as `fit()`
     //    refuses it.
     diags.extend(check_packed_start_in_box(
+        &parsed.model.default_params,
+        &parsed.fit_options,
+    ));
+
+    // 2b-quater. A `prior(...)` that cannot be applied (#254). Same inputs and
+    //    the same data-independence as the two above: a prior resolves against
+    //    the packed parameter layout, never against the dataset, so `ferx check
+    //    model.ferx` must refuse an unresolvable prior — or a method / covariance
+    //    combination that would drop it — exactly as `fit()` does. Without this
+    //    a model whose prior names a FIXed or unknown parameter reports clean and
+    //    then fails at fit time.
+    diags.extend(check_parameter_priors(
+        &parsed.model,
         &parsed.model.default_params,
         &parsed.fit_options,
     ));
