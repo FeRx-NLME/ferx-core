@@ -3414,6 +3414,7 @@ mod tests {
         };
         CompiledModel {
             priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "cl_from_cr".into(),
             pk_model: PkModel::OneCptIv,

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         frem_config: None,
         residual_error_eta: None,

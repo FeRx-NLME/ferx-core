@@ -4168,22 +4168,27 @@ pub(crate) fn check_parameter_priors(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<Diagnostic> {
-    if model.priors.is_empty() {
+    if model.priors.is_empty() && model.prior_from_fit.is_none() {
         return Vec::new();
     }
 
     // 1. The prior does not resolve — unknown name, a FIXed parameter, a block
-    //    element, a duplicate. `PriorSet::build` produces the message; this
-    //    function only decides the severity and the code.
-    if let Err(msg) = crate::estimation::priors::PriorSet::build(model, init_params) {
-        return vec![Diagnostic::error("E_PRIOR_UNRESOLVED", msg)
-            .with_block("parameters")
-            .with_suggestion(
-                "A prior must name a `theta`, `omega`, `sigma` or `kappa` declared in \
-                 `[parameters]` that is estimated (not `FIX`) and does not belong to a \
-                 `block_omega` / `block_sigma` / `block_kappa`.",
-            )];
-    }
+    //    element, a duplicate, or (#254 phase 2) a `[priors] from_fit` that is
+    //    missing, unreadable, or lands no prior at all. `PriorSet::build`
+    //    produces the message; this function only decides the severity and the
+    //    code.
+    let n_priors = match crate::estimation::priors::PriorSet::build(model, init_params) {
+        Ok(set) => set.len(),
+        Err(msg) => {
+            return vec![Diagnostic::error("E_PRIOR_UNRESOLVED", msg)
+                .with_block("parameters")
+                .with_suggestion(
+                    "A prior must name a `theta`, `omega`, `sigma` or `kappa` declared in \
+                     `[parameters]` that is estimated (not `FIX`) and does not belong to a \
+                     `block_omega` / `block_sigma` / `block_kappa`.",
+                )]
+        }
+    };
 
     // 2. The last stage that *estimates* cannot apply priors.
     //
@@ -4207,10 +4212,10 @@ pub(crate) fn check_parameter_priors(
         return vec![Diagnostic::error(
             "E_PRIOR_METHOD_UNSUPPORTED",
             format!(
-                "`prior(...)` is declared on {} parameter(s), but the last estimating stage \
+                "A prior is in force on {} parameter(s), but the last estimating stage \
                  (`{}`) does not apply parameter priors — the fit would silently return the \
                  unpenalized maximum-likelihood estimates.",
-                model.priors.len(),
+                n_priors,
                 last.label(),
             ),
         )

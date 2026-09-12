@@ -1530,6 +1530,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         has_conditional_eta_params: false,
         name: "frem_jac_test".into(),

@@ -31,6 +31,7 @@ fn tiny_model() -> CompiledModel {
     };
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "uncertainty_smoke".into(),
         pk_model: PkModel::OneCptIv,

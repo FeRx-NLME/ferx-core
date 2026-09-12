@@ -50,6 +50,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "tv_cov_sdtab_regression".into(),
         pk_model: PkModel::OneCptIv,
@@ -402,6 +403,7 @@ fn test_simulate_honours_tv_covariates() {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "tv_cov_sim_regression".into(),
         pk_model: PkModel::OneCptIv,

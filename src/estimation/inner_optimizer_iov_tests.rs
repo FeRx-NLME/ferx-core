@@ -670,6 +670,7 @@ fn make_iov_model() -> CompiledModel {
     };
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "iov_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -2991,6 +2992,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
     };
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "no_iov".into(),
         pk_model: PkModel::OneCptIv,
@@ -3146,6 +3148,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
     };
     let model = CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         frem_config: None,
         residual_error_eta: None,

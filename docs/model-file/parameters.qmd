@@ -580,8 +580,17 @@ penalized maximum likelihood (MAP) — the simple alternative to NONMEM's
 ```
 
 The central value and the RSE are always on the scale the parameter was declared
-on — a variance for a bare `omega X ~ v`, an SD under `(sd)`. See
-[Parameter priors](../estimation/priors.qmd) for the full rules, what the fit
+on — a variance for a bare `omega X ~ v`, an SD under `(sd)`.
+
+To update a model from a previous run instead of transcribing its parameter
+table, a `[priors]` block builds the priors from that run's output:
+
+```
+[priors]
+  from_fit = "parent-model-fit.yaml"
+```
+
+See [Parameter priors](../estimation/priors.qmd) for the full rules, what the fit
 report shows, and which estimation methods apply them.
 
 ## Complete Examples

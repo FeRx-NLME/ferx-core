@@ -30,6 +30,7 @@ fn make_iov_model() -> CompiledModel {
     };
     CompiledModel {
         priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "iov_test".into(),
         pk_model: PkModel::OneCptIv,

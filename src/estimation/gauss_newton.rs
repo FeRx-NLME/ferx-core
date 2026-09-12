@@ -2088,6 +2088,7 @@ mod tests {
         };
         CompiledModel {
             priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "gn_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -3152,6 +3153,7 @@ mod tests {
         };
         let model = CompiledModel {
             priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "gn_block_omega_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -3447,6 +3449,7 @@ mod tests {
         };
         CompiledModel {
             priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "iov_gn_test".into(),
             pk_model: PkModel::OneCptIv,

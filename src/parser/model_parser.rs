@@ -1402,29 +1402,67 @@ fn record_theta_reference(idx: usize) {
 pub const NN_WEIGHT_DIRECT_REFERENCE_MARKER: &str = "W_NN_WEIGHT_DIRECT_REFERENCE";
 
 /// Parse a model file (.ferx) and return a CompiledModel.
+///
+/// Goes through [`parse_full_model_file`] rather than [`parse_model_string`] so
+/// the relative-path rewrites that need the model file's directory —
+/// `[data] path` and `[priors] from_fit` — apply here too. A caller that only
+/// wants the `CompiledModel` still gets a `from_fit` resolved against the model,
+/// not against the process's working directory.
 pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
-    parse_model_string(&content)
+    Ok(parse_full_model_file(path)?.model)
 }
 
 /// Parse a full model file including simulation spec, initial values, and fit options.
 pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
-    let mut parsed = parse_full_model(&content)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    // `[priors] from_fit` (#254 phase 2) is resolved **inside** the parse, not
+    // after it: the import is expanded during parsing (it is the only place the
+    // fit file is read), so the base directory has to be in scope by then. A
+    // model and the previous fit it updates from travel together in a run
+    // directory, and the user runs `ferx` from wherever they happen to be.
+    let mut parsed = parse_full_model_with(
+        &content,
+        &ParseBindings {
+            model_dir: dir.map(|d| d.to_path_buf()),
+            ..ParseBindings::default()
+        },
+    )?;
     // A relative `[data] path` is relative to the model file's own directory
     // (mirrors NONMEM's `$DATA` resolution against the control stream), not
-    // the process's current working directory.
+    // the process's current working directory. Still resolved afterwards —
+    // nothing reads it during the parse.
     if let Some(data_path) = &parsed.data_path {
-        let p = std::path::Path::new(data_path);
-        if p.is_relative() {
-            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                parsed.data_path = Some(dir.join(p).to_string_lossy().into_owned());
-            }
-        }
+        parsed.data_path = Some(resolve_against(data_path, dir));
     }
     Ok(parsed)
+}
+
+/// Read `model.prior_from_fit` and turn it into ordinary
+/// [`crate::types::ParameterPrior`]s on `model.priors` (#254 phase 2).
+///
+/// Every parse entry point calls this, so a model that came from
+/// [`parse_model_file`] / [`parse_model_string`] is already expanded and calling
+/// it again is a no-op. It is public for the other producer of a
+/// `CompiledModel` — a caller that builds one field by field (ferx-r) and sets
+/// `prior_from_fit` itself has nothing to read the fit file for it, and
+/// `PriorSet::build` refuses an unexpanded model rather than fitting it
+/// unpenalized.
+///
+/// A relative path resolves against the process's working directory; resolve it
+/// yourself first if it should be relative to something else.
+pub fn expand_prior_from_fit(model: &mut CompiledModel) -> Result<(), String> {
+    crate::estimation::priors::expand_prior_from_fit(model)
+}
+
+/// Join a model-file-relative path onto `dir`, leaving an absolute one alone.
+fn resolve_against(raw: &str, dir: Option<&Path>) -> String {
+    let p = std::path::Path::new(raw);
+    match dir.filter(|_| p.is_relative()) {
+        Some(dir) => dir.join(p).to_string_lossy().into_owned(),
+        None => raw.to_string(),
+    }
 }
 
 /// Parse a model string and return a CompiledModel (backward compatible).
@@ -1472,6 +1510,7 @@ pub fn parse_full_model_bound(
         &ParseBindings {
             levels: level_bindings.clone(),
             covariate_stats: CovariateStatBindings::new(),
+            ..ParseBindings::default()
         },
     )
 }
@@ -1488,6 +1527,18 @@ pub struct ParseBindings {
     pub levels: LevelBindings,
     /// Covariate summary statistics, for symbolic `center = median` and friends.
     pub covariate_stats: CovariateStatBindings,
+    /// Directory a relative `[priors] from_fit` path resolves against (#254
+    /// phase 2), normally the model file's own.
+    ///
+    /// This one is not data-derived like the two above, but it travels the same
+    /// way and for the same reason: the import is expanded *during* the parse —
+    /// it is the only place the fit file is read — so the base directory has to
+    /// be in scope by then. Resolving it afterwards, the way `[data] path` is,
+    /// would mean expanding against the wrong directory and then re-expanding.
+    ///
+    /// `None` (the default, and what every string entry point supplies) resolves
+    /// against the process's working directory.
+    pub model_dir: Option<std::path::PathBuf>,
 }
 
 /// [`parse_full_model`] with every data-derived binding supplied.
@@ -2947,6 +2998,9 @@ pub fn parse_full_model_with(
 
     let model = CompiledModel {
         priors: declared_priors,
+        // `[priors] from_fit` is read further down, once `extract_blocks` output
+        // is in scope, and assigned onto `model` there.
+        prior_from_fit: None,
         name,
         covariate_model,
         pk_model,
@@ -3084,6 +3138,31 @@ pub fn parse_full_model_with(
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+    // `[priors] from_fit` (#254 phase 2, the model-updating import). Like
+    // `[data] path` above, only the raw value is read here;
+    // `parse_full_model_file` resolves it relative to the model file's directory
+    // afterwards, since this function only ever sees the model's text.
+    //
+    // Keyed off `block_lines` rather than `blocks`, because `extract_blocks`
+    // only records a block in `unnamed` once it has a *content* line: a bare
+    // `[priors]` header, or one holding nothing but comments, is absent from
+    // `blocks` entirely and would be skipped without a word. That is the same
+    // reads-as-regularized-fits-unpenalized failure the strict unknown-key rule
+    // inside `parse_priors_block` exists to prevent, so the empty case has to
+    // reach it.
+    model.prior_from_fit = extracted
+        .block_lines
+        .contains_key("priors")
+        .then(|| parse_priors_block(blocks.get("priors").map_or(&[][..], |v| v)))
+        .transpose()?
+        .map(|raw| resolve_against(&raw, bindings.model_dir.as_deref()));
+    // Read the source fit and turn it into ordinary priors **here**, once. The
+    // read used to live in `PriorSet::build`, which runs per estimation stage
+    // and whose caller swallows errors into an empty set — so a source fit that
+    // moved between the fit and `run_covariance` silently un-penalized the
+    // standard errors. Doing it at parse time also closes the window in which
+    // the file could change mid-fit. See `estimation::priors::expand_prior_from_fit`.
+    crate::estimation::priors::expand_prior_from_fit(&mut model)?;
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
@@ -7466,6 +7545,65 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
     }
     let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
     Ok((path, column_map))
+}
+
+/// Parse the `[priors]` block (#254 phase 2).
+///
+/// One key in v1:
+///
+/// ```text
+/// [priors]
+///   from_fit = "parent-model-fit.yaml"
+/// ```
+///
+/// Returns the path exactly as written — resolution against the model file's
+/// directory happens in [`parse_full_model_file`], the same split `[data] path`
+/// uses, because this function only ever sees the model's *text*.
+///
+/// An unknown key is an error rather than a silent skip. `[data_selection]`
+/// above does skip unknown keys, and that is the behaviour #1040 went and fixed
+/// for block *names* for the same reason it is wrong here: a typo'd
+/// `from_fit_file =` would parse cleanly, import nothing, and produce an
+/// unpenalized fit that looks exactly like a penalized one.
+fn parse_priors_block(lines: &[String]) -> Result<String, String> {
+    let mut from_fit: Option<String> = None;
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "[priors]: `{}` is not a `key = value` line. The only key is \
+                 `from_fit = <path to a previous fit>`.",
+                line.trim()
+            ));
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        if key != "from_fit" {
+            return Err(format!(
+                "[priors]: unknown key `{key}`. The only key is `from_fit = \
+                 <path to a previous fit>`; a prior on an individual parameter \
+                 is written inline in `[parameters]` as `prior(value, rse = …)`."
+            ));
+        }
+        if value.is_empty() {
+            return Err("[priors]: empty `from_fit` — write `from_fit = <path to a \
+                 previous fit>` (`.fitrx`, `.json` or `{model}-fit.yaml`)."
+                .to_string());
+        }
+        if from_fit.is_some() {
+            return Err("[priors]: `from_fit` declared more than once.".to_string());
+        }
+        from_fit = Some(value.to_string());
+    }
+    // A block that declares nothing is the same failure the strict unknown-key
+    // rule above exists to prevent, arrived at from the other side: the model
+    // reads as regularized, fits unpenalized, and nothing says so. `[fit_options]`
+    // can be empty harmlessly because every key has a default; `[priors]` has
+    // exactly one key and no default.
+    from_fit.ok_or_else(|| {
+        "[priors]: the block declares nothing. Write `from_fit = <path to a \
+         previous fit>`, or delete the block."
+            .to_string()
+    })
 }
 
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
@@ -12258,6 +12396,7 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("odes", BlockForm::Unnamed, None),
     ("output", BlockForm::Unnamed, None),
     ("parameters", BlockForm::Unnamed, None),
+    ("priors", BlockForm::Unnamed, None),
     ("scaling", BlockForm::Unnamed, None),
     ("simulation", BlockForm::Unnamed, None),
     ("structural_model", BlockForm::Unnamed, None),
@@ -13310,7 +13449,7 @@ fn parse_parameters(
         // Name the prior attaches to, filled in by whichever declaration arm
         // matched. `None` at the bottom of the loop with a `prior_decl` present
         // means the prior had no home — an error, never a silent drop.
-        let mut prior_target: Option<String> = None;
+        let mut prior_target: Option<(String, crate::types::ParameterKind)> = None;
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
             let block = match caps.get(2) {
@@ -13331,7 +13470,7 @@ fn parse_parameters(
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
             match block {
                 None => {
-                    prior_target = Some(name.clone());
+                    prior_target = Some((name.clone(), crate::types::ParameterKind::Theta));
                     thetas.push(ThetaSpec {
                         name,
                         init,
@@ -13549,7 +13688,7 @@ fn parse_parameters(
             let variance = if init_as_sd { raw * raw } else { raw };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             eta_names_ordered.push(name.clone());
-            prior_target = Some(name.clone());
+            prior_target = Some((name.clone(), crate::types::ParameterKind::Omega));
             omegas.push(OmegaSpec {
                 name,
                 variance,
@@ -13579,7 +13718,7 @@ fn parse_parameters(
             }
             let value = if init_as_sd { raw } else { raw.sqrt() };
             let fixed = caps.get(3).is_some() || caps.get(5).is_some();
-            prior_target = Some(name.clone());
+            prior_target = Some((name.clone(), crate::types::ParameterKind::Sigma));
             sigmas.push(SigmaSpec {
                 name,
                 value,
@@ -13607,7 +13746,7 @@ fn parse_parameters(
             kappa_names_ordered.push(name.clone());
             kappa_weights_ordered.push(weight_expr.clone());
             weight_consumed = true;
-            prior_target = Some(name.clone());
+            prior_target = Some((name.clone(), crate::types::ParameterKind::Kappa));
             kappas.push(KappaSpec {
                 name,
                 variance,
@@ -13620,10 +13759,13 @@ fn parse_parameters(
         // that reads as regularized and fits as if it were not.
         if let Some((value, spread)) = prior_decl {
             match prior_target {
-                Some(name) => priors.push(crate::types::ParameterPrior {
+                Some((name, kind)) => priors.push(crate::types::ParameterPrior {
                     name,
                     value,
                     spread,
+                    // Which declaration the tail was peeled off, so a model that
+                    // reuses one name across two families still resolves.
+                    kind: Some(kind),
                 }),
                 None => {
                     return Err(format!(

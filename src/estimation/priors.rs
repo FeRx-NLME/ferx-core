@@ -49,7 +49,8 @@
 use crate::estimation::parameterization::{
     coordinate_names, lower_tri_iter, packed_fixed_mask, packed_segments, theta_packs_log,
 };
-use crate::types::{CompiledModel, ModelParameters, PriorSpread, PriorSummary};
+use crate::io::fit_estimates::EstimateKind;
+use crate::types::{CompiledModel, ModelParameters, ParameterPrior, PriorSpread, PriorSummary};
 
 /// How a coordinate's **declared** value maps onto its packed value.
 ///
@@ -152,6 +153,20 @@ impl PriorSet {
     /// plausible-looking unpenalized fit with nothing to say the prior was
     /// dropped.
     pub(crate) fn build(model: &CompiledModel, template: &ModelParameters) -> Result<Self, String> {
+        // `[priors] from_fit` is consumed by [`expand_prior_from_fit`] at parse
+        // time, which appends the imported priors to `model.priors` and leaves
+        // this field `None`. A model that still carries a path was built by hand
+        // and never parsed, so nothing has read the file — refuse rather than
+        // fit unpenalized, which is the one outcome that looks identical to
+        // success (#254 phase 2 review).
+        if let Some(path) = model.prior_from_fit.as_deref() {
+            return Err(format!(
+                "[priors] from_fit = `{path}` has not been expanded. A `CompiledModel` \
+                 built by hand must call \
+                 `parser::model_parser::expand_prior_from_fit` before it is fit; \
+                 a model parsed from a file or a string has already done so."
+            ));
+        }
         if model.priors.is_empty() {
             return Ok(Self::default());
         }
@@ -159,29 +174,49 @@ impl PriorSet {
         let fixed = packed_fixed_mask(template);
         let mut terms: Vec<PriorTerm> = Vec::with_capacity(model.priors.len());
 
-        for prior in &model.priors {
+        for prior in model.priors.iter() {
+            // Narrow by family first when the prior carries one. θ names and η
+            // names are separate namespaces, so `theta CL` alongside `omega CL`
+            // is a legal model; without this the prior resolves to two
+            // coordinates and the fit is refused as ambiguous even though the
+            // producer knew exactly which one it meant.
             let matches: Vec<&CoordInfo> = coords
                 .iter()
-                .filter(|c| c.name.eq_ignore_ascii_case(&prior.name))
+                .filter(|c| {
+                    prior.kind.is_none_or(|k| c.kind == k)
+                        && c.name.eq_ignore_ascii_case(&prior.name)
+                })
                 .collect();
             let info = match matches.as_slice() {
                 [] => {
                     return Err(format!(
-                        "prior on `{}`: no theta, omega, sigma or kappa by that name. \
+                        "prior on `{}`: no {} by that name. \
                          A prior must name a parameter declared in `[parameters]`.",
-                        prior.name
+                        prior.name,
+                        match prior.kind {
+                            Some(k) => k.keyword(),
+                            None => "theta, omega, sigma or kappa",
+                        }
                     ))
                 }
                 [one] => *one,
-                // Two coordinates can share a name only via a `[mixture]`
-                // per-class override, which v1 rejects anyway — but resolving
-                // ambiguously would silently prior the wrong one.
+                // Only reachable for a prior that names no family: a `[mixture]`
+                // per-class override (which v1 rejects anyway), or a name a
+                // hand-built `ParameterPrior` shares across two families. Both
+                // are genuinely undecidable here — resolving either way would
+                // silently prior the wrong coordinate.
                 _ => {
                     return Err(format!(
-                        "prior on `{}`: the name resolves to {} packed coordinates; \
+                        "prior on `{}`: the name resolves to {} packed coordinates \
+                         ({}). Set `ParameterPrior::kind` to say which family is meant; \
                          priors on per-class `[mixture]` overrides are not supported.",
                         prior.name,
-                        matches.len()
+                        matches.len(),
+                        matches
+                            .iter()
+                            .map(|c| c.kind.keyword())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ))
                 }
             };
@@ -242,6 +277,11 @@ impl PriorSet {
     /// an unpriored fit bit-identical to one built before this feature existed.
     pub(crate) fn is_active(&self) -> bool {
         !self.terms.is_empty()
+    }
+
+    /// How many parameters carry a prior — typed and imported together.
+    pub(crate) fn len(&self) -> usize {
+        self.terms.len()
     }
 
     /// `Σ ((x−m)/s)²` — the prior contribution to the OFV.
@@ -370,10 +410,241 @@ fn packed_sd(
     Ok(sd)
 }
 
+/// Consume `[priors] from_fit = "<path>"` into ordinary [`ParameterPrior`]s
+/// (#254 phase 2).
+///
+/// Every free parameter the source fit reports with a usable standard error, and
+/// whose **name and family** both match a coordinate of this model, is appended
+/// to `model.priors` as `prior(estimate, rse = SE/estimate)` on *this* model's
+/// declared scale. Everything else is skipped with a note pushed onto
+/// `model.parse_warnings` — unlike a hand-written prior, which is a hard error
+/// when it cannot be applied. The asymmetry is deliberate: a typed prior names
+/// one parameter the user meant, while an import is a bulk operation over a
+/// source model that legitimately has parameters this one does not.
+///
+/// # Why this runs once, at parse time
+///
+/// The file read used to sit in [`PriorSet::build`], which every estimation
+/// stage and the covariance and SIR steps call. That was wrong twice over
+/// (review of #1363): `build_prior_set` turns a build error into an *empty* set,
+/// and `run_covariance` / `run_sir` are public entry points that do not run
+/// `check_parameter_priors` — so a source fit that had moved or become
+/// unreadable between the fit and the post-fit step made every prior silently
+/// vanish, and those APIs went on reporting unpenalized standard errors. It also
+/// left a window in which the file could change *during* a fit, so the prior the
+/// optimizer minimised and the prior the report printed need not be the same one.
+///
+/// Doing it here means the file is read exactly once, the error reaches the user
+/// through the parser's own `Result`, and `PriorSet::build` is pure — it refuses
+/// a model that still carries an unexpanded path rather than reading anything.
+///
+/// # Why matching is on name *and* kind
+///
+/// A source θ called `CL` and a target Ω called `CL` are both legal, and the
+/// numbers are on unrelated scales: importing the θ's natural value as an Ω
+/// variance prior would be silently, quietly wrong. The matched
+/// [`crate::types::ParameterKind`] is carried onto the resulting
+/// `ParameterPrior`, so the packed resolution lands on the same coordinate
+/// instead of re-deriving it from the name and finding two.
+///
+/// # Scale
+///
+/// A [`crate::types::FitResult`] reports Ω/κ as a **variance** and Σ as an
+/// **SD**, whatever the source model declared them as — so the source's own
+/// `(sd)` spelling is invisible here and is not guessed at. The target's
+/// declared scale is the only one that matters, and the two conversions are the
+/// delta method on a power: the relative SE of `xᵖ` is `|p|` times the relative
+/// SE of `x`, so variance → SD halves the RSE and SD → variance doubles it.
+pub(crate) fn expand_prior_from_fit(model: &mut CompiledModel) -> Result<(), String> {
+    let Some(path) = model.prior_from_fit.take() else {
+        return Ok(());
+    };
+    // Resolved against the model's own declarations, which is the layout every
+    // optimizer packs and the only one available before a dataset is read.
+    let template = model.default_params.clone();
+    let coords = coordinate_table(model, &template);
+    let fixed = packed_fixed_mask(&template);
+    let mut notes: Vec<String> = Vec::new();
+
+    let imported = match import_from_fit(&path, model, &coords, &fixed, &mut notes) {
+        Ok(v) => v,
+        Err(e) => {
+            // Put the path back so a caller that recovers from the error can see
+            // what was asked for, and so `PriorSet::build` still refuses.
+            model.prior_from_fit = Some(path);
+            return Err(e);
+        }
+    };
+    model.priors.extend(imported);
+    if !notes.is_empty() {
+        model.parse_warnings.push(format!(
+            "[priors] from_fit: {} parameter(s) not imported:\n  - {}",
+            notes.len(),
+            notes.join("\n  - ")
+        ));
+    }
+    Ok(())
+}
+
+/// The body of [`expand_prior_from_fit`], against an already-built coordinate
+/// table.
+fn import_from_fit(
+    path: &str,
+    model: &CompiledModel,
+    coords: &[CoordInfo],
+    fixed: &[bool],
+    notes: &mut Vec<String>,
+) -> Result<Vec<ParameterPrior>, String> {
+    let source = crate::io::fit_estimates::read_fit_estimates(std::path::Path::new(path))
+        .map_err(|e| format!("[priors] from_fit: {e}"))?;
+
+    let mut out: Vec<ParameterPrior> = Vec::new();
+    for est in &source {
+        let matches: Vec<&CoordInfo> = coords
+            .iter()
+            .filter(|c| c.kind == est.kind && c.name.eq_ignore_ascii_case(&est.name))
+            .collect();
+        let info = match matches.as_slice() {
+            [one] => *one,
+            // Not in this model at all. Silent, and the **only** silent skip
+            // that is not a deliberate user choice: a source model bigger than
+            // the one being updated is the normal case, and one note per absent
+            // parameter would bury the ones that matter. The "nothing landed"
+            // guard below is what catches a wholesale mismatch.
+            [] => continue,
+            // Two coordinates of the same family under one name. Unreachable
+            // today — the `[mixture]` overrides that could share a name are
+            // suffixed `_MIX{n}` — but folding it into the `[]` arm would make
+            // a future layout change *silently* drop the prior, which is the one
+            // outcome this feature must never produce. A note, not an error:
+            // this is still a bulk import over a model the user did not write
+            // for it.
+            _ => {
+                notes.push(format!(
+                    "{} {}: the name resolves to {} packed coordinates in this \
+                     model, so which one the source estimate refers to is \
+                     undecidable.",
+                    est.kind.keyword(),
+                    est.name,
+                    matches.len()
+                ));
+                continue;
+            }
+        };
+        // The `[mixture]` / `block_sigma` tail of the coordinate table carries a
+        // placeholder `kind` (see `coordinate_table`), so it *can* survive the
+        // match above; this is what stops it, and every other out-of-scope
+        // coordinate, from being imported onto.
+        if let Some(reason) = info.rejection.as_deref() {
+            notes.push(format!("{} {}: {reason}", est.kind.keyword(), est.name));
+            continue;
+        }
+        // An inline `prior(...)` on the same parameter wins, so one imported
+        // prior can be overridden without giving up the rest. Silent: the user
+        // wrote the override on purpose, and it is visible in `prior_summary`.
+        //
+        // Matched on **family as well as name**, like everything else here. A
+        // model may carry `theta CL` and `omega CL`, and before the family was
+        // consulted a typed prior on one of them suppressed the import of the
+        // other — and did so silently, which is exactly the failure this feature
+        // is built to avoid. A typed prior that names no family suppresses by
+        // name alone, conservatively: it cannot say which it meant, and in a
+        // colliding model it will refuse to resolve anyway.
+        if model.priors.iter().any(|p| {
+            p.name.eq_ignore_ascii_case(&info.name) && p.kind.is_none_or(|k| k == info.kind)
+        }) {
+            continue;
+        }
+        if fixed.get(info.coord).copied().unwrap_or(false) {
+            notes.push(format!(
+                "{} {}: FIXed in this model, so a prior could never move it.",
+                est.kind.keyword(),
+                est.name
+            ));
+            continue;
+        }
+        let Some(se) = est.se else {
+            notes.push(format!(
+                "{} {}: the source fit reports no standard error for it (a FIXed \
+                 parameter, or a fit whose covariance step did not run).",
+                est.kind.keyword(),
+                est.name
+            ));
+            continue;
+        };
+        if !est.value.is_finite() || (info.scale.requires_positive() && !(est.value > 0.0)) {
+            notes.push(format!(
+                "{} {}: the source estimate is {}, which is not a usable prior \
+                 centre for a parameter estimated on the log scale.",
+                est.kind.keyword(),
+                est.name,
+                est.value
+            ));
+            continue;
+        }
+
+        // Source scale → this model's declared scale. `Identity` is a θ that may
+        // be negative, where a *relative* standard error is meaningless (and
+        // undefined at zero) — carry the absolute SE instead, which is the
+        // escape hatch `PriorSpread::Sd` exists for.
+        let rel = se / est.value.abs();
+        let (value, spread) = match (est.kind, info.scale) {
+            (_, PriorScale::Identity) => (est.value, PriorSpread::Sd(se)),
+            (EstimateKind::Theta, _) => (est.value, PriorSpread::Rse(rel)),
+            // Ω / κ: the source reports a variance.
+            (EstimateKind::Omega | EstimateKind::Kappa, PriorScale::HalfLog) => {
+                (est.value, PriorSpread::Rse(rel))
+            }
+            (EstimateKind::Omega | EstimateKind::Kappa, PriorScale::Log) => {
+                (est.value.sqrt(), PriorSpread::Rse(0.5 * rel))
+            }
+            // Σ: the source reports an SD.
+            (EstimateKind::Sigma, PriorScale::Log) => (est.value, PriorSpread::Rse(rel)),
+            (EstimateKind::Sigma, PriorScale::HalfLog) => {
+                (est.value * est.value, PriorSpread::Rse(2.0 * rel))
+            }
+        };
+        out.push(ParameterPrior {
+            name: info.name.clone(),
+            value,
+            spread,
+            // The family this was matched on, carried through so the shared
+            // resolution below lands on the same coordinate rather than
+            // re-deriving it from the name and possibly finding two.
+            kind: Some(info.kind),
+        });
+    }
+
+    // An import that lands nothing leaves a fit that looks exactly like one the
+    // import shaped — the same failure mode phase 1 hard-errors on for a typed
+    // prior that cannot be applied. Unconditional, and deliberately not weakened
+    // to "…unless some typed prior landed": the user wrote `from_fit`, and a
+    // wrong path or a model whose parameter names have all been renamed is
+    // otherwise invisible.
+    if out.is_empty() {
+        let why = if notes.is_empty() {
+            format!(
+                "none of its {} parameters has a name and family matching a \
+                 `[parameters]` declaration in this model",
+                source.len()
+            )
+        } else {
+            format!("every candidate was skipped:\n  - {}", notes.join("\n  - "))
+        };
+        return Err(format!(
+            "[priors] from_fit = `{path}`: no prior could be imported — {why}."
+        ));
+    }
+    Ok(out)
+}
+
 /// What one packed coordinate is, as far as a prior is concerned.
 struct CoordInfo {
     coord: usize,
     name: String,
+    /// Which `[parameters]` family this coordinate belongs to, for matching a
+    /// `from_fit` source estimate on name *and* kind.
+    kind: EstimateKind,
     scale: PriorScale,
     /// `Some(reason)` when a prior on this coordinate is rejected in v1.
     /// Carried per coordinate rather than tested at the use site so the scope
@@ -409,6 +680,7 @@ fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<Co
         out.push(CoordInfo {
             coord: i,
             name: name_at(i),
+            kind: EstimateKind::Theta,
             scale,
             rejection: None,
         });
@@ -420,6 +692,7 @@ fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<Co
         &mut out,
         &template.omega,
         &model.omega_init_as_sd,
+        EstimateKind::Omega,
         "block_omega",
         &name_at,
     );
@@ -430,6 +703,7 @@ fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<Co
         out.push(CoordInfo {
             coord: i,
             name: name_at(i),
+            kind: EstimateKind::Sigma,
             scale: sd_or_var_scale(flag_at(&model.sigma_init_as_sd, s_i)),
             rejection: None,
         });
@@ -440,6 +714,7 @@ fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<Co
             &mut out,
             iov,
             &model.kappa_init_as_sd,
+            EstimateKind::Kappa,
             "block_kappa",
             &name_at,
         );
@@ -454,6 +729,12 @@ fn coordinate_table(model: &CompiledModel, template: &ModelParameters) -> Vec<Co
         out.push(CoordInfo {
             coord: i,
             name: name_at(i),
+            // Placeholder: every coordinate here carries a `rejection`, and both
+            // consumers test that first, so the kind is never read. Spelled as
+            // the Ω family rather than left meaningful-looking because a
+            // `[mixture]` override *is* an Ω/Σ override — but it must never be
+            // matched as one.
+            kind: EstimateKind::Omega,
             scale: PriorScale::HalfLog,
             rejection: Some(
                 "priors on a per-class `[mixture]` Ω/Σ override or a `block_sigma` \
@@ -481,6 +762,7 @@ fn push_omega_coords(
     out: &mut Vec<CoordInfo>,
     om: &crate::types::OmegaMatrix,
     init_as_sd: &[bool],
+    kind: EstimateKind,
     block_keyword: &str,
     name_at: &dyn Fn(usize) -> String,
 ) {
@@ -524,6 +806,7 @@ fn push_omega_coords(
         out.push(CoordInfo {
             coord: i,
             name: name_at(i),
+            kind,
             scale,
             rejection,
         });
