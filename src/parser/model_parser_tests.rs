@@ -2918,56 +2918,14 @@ fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
 #[test]
 fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
     // `lagtime=` and `alag=` are two spellings of the SAME slot, so a `pk(...)`
-    // call may legally carry both. Two cases, both of which the remediation clause
-    // has to get right on its own — the role lookup cannot just take the first map
-    // entry that routes to the lag slot.
-    //
-    // (a) Two different parameters on the one slot. Whichever is read, the message
-    //     must quote *that* parameter's own spelling.
-    let two = |readout: &str| {
-        format!(
-            "
-[parameters]
-  theta TVCL(5.0, 0.0, 1e15)
-  theta TVV(50.0, 0.0, 1e15)
-  theta TVKA(1.5, 0.0, 1e15)
-  theta TVLAG(0.3, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS1 ~ 0.1 (sd)
-
-[individual_parameters]
-  CL    = TVCL * exp(ETA_CL)
-  V     = TVV
-  KA    = TVKA
-  TLAGA = TVLAG
-  TLAGB = TVLAG
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAGA, alag=TLAGB)
-
-[scaling]
-  obs_scale = 2.0 * {readout}
-
-[error_model]
-  DV ~ proportional(EPS1)
-"
-        )
-    };
-    for (readout, want) in [
-        ("TLAGA", "remove the `lagtime=TLAGA` mapping"),
-        ("TLAGB", "remove the `alag=TLAGB` mapping"),
-    ] {
-        let err = expect_parse_err(&two(readout));
-        assert!(
-            err.contains(want),
-            "reading `{readout}` must quote its own mapping, got: {err}"
-        );
-    }
-
-    // (b) One parameter under both spellings. Both `analytical_dose_attr_slot_map`
-    //     and `build_pk_param_fn` iterate ascending and let the last write win, so
-    //     `lagtime=` is the mapping that actually reaches the slot — quoting
-    //     `alag=` would name one whose removal changes nothing.
+    // call may legally carry both — as long as they bind the same parameter.
+    // Two *different* parameters on the one slot is the #1048 conflict, rejected
+    // before this check runs (see `pk_alias_spellings_on_one_slot_conflict`), so
+    // the only configuration the remediation clause still has to disambiguate is
+    // one parameter under both spellings: `analytical_dose_attr_slot_map` and
+    // `build_pk_param_fn` both iterate ascending and let the last write win, so
+    // `lagtime=` is the mapping that actually reaches the slot — quoting `alag=`
+    // would name one whose removal changes nothing.
     let both = analytical_dose_attr_src(
         "lagtime=X, alag=X",
         "X = TVLAG",
@@ -2978,6 +2936,10 @@ fn analytical_lag_alias_spellings_each_name_their_own_mapping() {
         err.contains("remove the `lagtime=X` mapping"),
         "must quote the binding mapping, not the shadowed alias, got: {err}"
     );
+    // …and the per-spelling half of the property — an `alag=` user is told to
+    // remove `alag=`, not `lagtime=` — is covered by
+    // `analytical_lag_mapping_read_in_scaling_is_rejected`, which runs each
+    // spelling on its own.
 }
 
 #[test]
@@ -9980,6 +9942,171 @@ fn test_alag_alias_in_structural_model_block() {
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
     assert_eq!(pk.lagtime(), 0.75);
+}
+
+/// #1048 fixture: a model whose `pk(...)` line and extra `[individual_parameters]`
+/// lines are supplied verbatim, so any pair of alias spellings can be bound to the
+/// same parameter or to two different ones.
+fn alias_model_src(indiv_extra: &str, pk_line: &str) -> String {
+    format!(
+        "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVKA(1.5, 0.0, 1e15)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{indiv_extra}
+
+[structural_model]
+  {pk_line}
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+/// Evaluate a parsed model's `pk_param_fn` at its default theta and `eta = 0`.
+fn alias_model_pk(src: &str) -> crate::types::PkParams {
+    let parsed = super::parse_full_model(src).unwrap_or_else(|e| panic!("expected Ok, got: {e}"));
+    let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+    let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+    (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0)
+}
+
+#[test]
+fn pk_alias_spellings_on_one_slot_conflict() {
+    // #1048. `v`/`v1`, `q`/`q2` and `lagtime`/`alag` are two spellings of ONE
+    // `PkParams` slot, but `pk_param_map` is keyed by the role string — so both
+    // spellings could appear in one `pk(...)` call bound to different parameters.
+    // `build_pk_param_fn` then pushed two writes to the same slot and the closure
+    // applied them in order: last write won, the other parameter never reached
+    // the engine, and the prediction came out off by the ratio of the two values
+    // (measured 2× on a 1-cpt IV model with `v=VA, v1=VB`, VA=50, VB=100).
+    //
+    // Nothing caught it. The #315 "computed but never used" census counts a name
+    // that appears in the `pk(...)` line as used, so *mapping* the discarded
+    // parameter is exactly what silenced the one guard that would have spoken;
+    // and the sibling "[structural_model] does not use parameter(s)" warning
+    // asks `consumes_pk_slot`, which both spellings satisfy. Sorting the entries
+    // made the winner deterministic, not correct.
+    let cases = [
+        (
+            "  VA = TVV\n  VB = 2.0 * TVV",
+            "pk one_cpt_iv(cl=CL, v=VA, v1=VB)",
+            "the central volume",
+            "v1=VB",
+            "VA",
+        ),
+        (
+            "  V2 = TVV\n  QA = TVCL\n  QB = 2.0 * TVCL",
+            "pk two_cpt_iv(cl=CL, v=V, q=QA, q2=QB, v2=V2)",
+            "the inter-compartmental clearance",
+            "q2=QB",
+            "QA",
+        ),
+        (
+            "  LA = 0.2 * TVKA\n  LB = 0.4 * TVKA",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=LA, lagtime=LB)",
+            "the absorption lag time",
+            "lagtime=LB",
+            "LA",
+        ),
+    ];
+    for (indiv_extra, pk_line, noun, winner, loser) in cases {
+        let err = expect_parse_err(&alias_model_src(indiv_extra, pk_line));
+        assert!(
+            err.contains("two spellings of the same parameter") && err.contains(noun),
+            "`{pk_line}` must be rejected as an alias conflict naming {noun}, got: {err}"
+        );
+        // The message has to say which value the user was silently getting —
+        // entries are resolved in ascending key order and the last write wins,
+        // so the alphabetically later spelling is the one that reached the slot.
+        assert!(
+            err.contains(&format!("only `{winner}` would be applied")),
+            "`{pk_line}` must name the binding that wins the slot, got: {err}"
+        );
+        assert!(
+            err.contains(&format!("`{loser}` silently discarded")),
+            "`{pk_line}` must name the discarded value, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn pk_alias_spellings_binding_one_parameter_are_accepted() {
+    // The lenient half of #1048: both writes store the same value, so the pair is
+    // redundant rather than wrong. Keeping it legal is what leaves
+    // `analytical_role_binding` a tie to break (`lagtime=X, alag=X`), and the
+    // de-duplication that skips the second write must not drop the slot entirely.
+    let pk = alias_model_pk(&alias_model_src(
+        "  VA = 2.0 * TVV",
+        "pk one_cpt_iv(cl=CL, v=VA, v1=VA)",
+    ));
+    assert_eq!(pk.v(), 100.0, "both spellings must still write the slot");
+    // Non-degenerate: the assertion above would also pass on a slot left at some
+    // default that happens to match, so pin that the value tracks the parameter.
+    let moved = alias_model_pk(&alias_model_src(
+        "  VA = 3.0 * TVV",
+        "pk one_cpt_iv(cl=CL, v=VA, v1=VA)",
+    ));
+    assert_eq!(moved.v(), 150.0, "the slot must follow the bound parameter");
+    // And `lagtime=X, alag=X` — the pair `analytical_role_binding` tie-breaks —
+    // still parses, on the slot whose two spellings sort in the other order.
+    let lag = alias_model_pk(&alias_model_src(
+        "  LA = 0.2 * TVKA",
+        "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LA, alag=LA)",
+    ));
+    assert_eq!(lag.lagtime(), 0.2 * 1.5);
+}
+
+#[test]
+fn pk_alias_spellings_with_literal_values_follow_the_same_rule() {
+    // Literal bindings take the other arm of the resolver, and the closure writes
+    // every constant AFTER every variable — so when the two spellings disagree it
+    // is the constant that reaches the engine whatever the role keys sort to, and
+    // the message must name that one rather than the later key.
+    let err = expect_parse_err(&alias_model_src(
+        "  VA = TVV",
+        "pk one_cpt_iv(cl=CL, v1=VA, v=100.0)",
+    ));
+    assert!(
+        err.contains("only `v=100.0` would be applied") && err.contains("`VA` silently discarded"),
+        "a constant beats a variable on the same slot regardless of key order, got: {err}"
+    );
+    // Two constants that agree are redundant, not conflicting — and the
+    // comparison is on the parsed number, so `50` and `50.0` are the same value.
+    let pk = alias_model_pk(&alias_model_src("", "pk one_cpt_iv(cl=CL, v=50, v1=50.0)"));
+    assert_eq!(pk.v(), 50.0);
+}
+
+#[test]
+fn pk_alias_spellings_bound_to_time_are_not_a_conflict() {
+    // `pk(...=TIME)` is rewritten upstream to a synthetic individual parameter
+    // named after the ROLE KEY (#486), so `v=TIME, v1=TIME` arrives at the slot
+    // check as two different variable names carrying one value. Compared as plain
+    // variables that reads as a conflict the model file does not contain.
+    let pk = alias_model_pk(&alias_model_src(
+        "",
+        "pk one_cpt_iv(cl=CL, v=TIME, v1=TIME)",
+    ));
+    assert_eq!(pk.v(), 0.0, "evaluated at t = 0");
+    // A genuine conflict against a TIME binding is still rejected — and must quote
+    // the `TIME` the user wrote, never the internal `__ferx_pktime_*` name.
+    let err = expect_parse_err(&alias_model_src(
+        "  VB = TVV",
+        "pk one_cpt_iv(cl=CL, v=TIME, v1=VB)",
+    ));
+    assert!(
+        err.contains("`v=TIME`") && !err.contains("__ferx_pktime"),
+        "the diagnostic must quote `TIME`, not the synthetic parameter, got: {err}"
+    );
 }
 
 #[test]

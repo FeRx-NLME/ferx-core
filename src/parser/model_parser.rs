@@ -16020,6 +16020,47 @@ fn build_ruv_magnitude(
 
 // --- Individual parameter function builder ---
 
+/// What one `pk(role=VALUE)` entry binds its slot to, reduced to just enough to
+/// tell two spellings of the same slot apart (#1048).
+///
+/// `Time` is its own variant rather than a `Var`: the `pk(...=TIME)` desugaring
+/// names its synthetic individual parameter after the *role key*, so `v=TIME`
+/// and `v1=TIME` resolve to two different variable slots holding the identical
+/// per-event value. Comparing them as `Var` would report a conflict the model
+/// file does not contain.
+#[derive(Clone, Copy, PartialEq)]
+enum PkSlotBinding {
+    /// An `[individual_parameters]` variable, by its evaluator slot.
+    Var(usize),
+    /// A numeric literal (`ka=1.0`).
+    Const(f64),
+    /// The `TIME` built-in, whichever synthetic parameter carries it.
+    Time,
+}
+
+/// Render a `pk(...)` mapped value the way the model file spells it. A `TIME`
+/// binding was rewritten upstream to a synthetic `__ferx_pktime_*` parameter
+/// (#486); that internal name must never reach a diagnostic.
+fn pk_mapped_value_display(value: &str) -> &str {
+    if value.starts_with(PKTIME_SYNTH_PREFIX) {
+        "TIME"
+    } else {
+        value
+    }
+}
+
+/// Noun for a PK slot, for the conflicting-alias diagnostic (#1048). Only the
+/// three slots reachable under two role spellings can produce that error; the
+/// fallback exists so a future alias pair cannot make the message nonsense.
+fn pk_slot_noun(slot: usize) -> &'static str {
+    match slot {
+        crate::types::PK_IDX_V => "the central volume",
+        crate::types::PK_IDX_Q => "the inter-compartmental clearance",
+        crate::types::PK_IDX_LAGTIME => "the absorption lag time",
+        _ => "the same PK parameter",
+    }
+}
+
 /// Build the PK parameter function from a parsed `[individual_parameters]`
 /// statement list. The block may contain plain assignments, inline `if (...) ... else ...`
 /// expressions, or full `if (...) { ... } else { ... }` statements.
@@ -16142,6 +16183,18 @@ fn build_pk_param_fn(
     pk_entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
     let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
+    // #1048: three role keys are pairs of spellings for one slot (`v`/`v1`,
+    // `q`/`q2`, `lagtime`/`alag`), but `pk_param_map` is keyed by the *role
+    // string* — so `pk one_cpt_iv(cl=CL, v=VA, v1=VB)` parses clean, pushes two
+    // writes to `PK_IDX_V`, and the last one silently wins. Sorting above made
+    // the winner deterministic, not correct. Worse, the loser is a *mapped*
+    // name, so the #315 "computed but never used" census counts it as used and
+    // the one guard that would have spoken is disarmed by the very act that
+    // creates the bug. Resolve each role key to its slot once and reject a
+    // second key that lands on the same slot with a different binding; keys
+    // that agree (`lagtime=X, alag=X`) are merely redundant and stay legal, so
+    // the `analytical_role_binding` tie-break still has a case to tie-break.
+    let mut slot_seen: HashMap<usize, (&str, &str, PkSlotBinding)> = HashMap::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -16159,8 +16212,17 @@ fn build_pk_param_fn(
         // `__ferx_pktime_*` individual parameter upstream in `parse_full_model` (#486),
         // so `var_name` is that synthetic name here (resolved via `var_idx` below), never
         // a literal `TIME`.
-        if let Some(var_slot) = var_slot {
-            pk_assignment_mapping.push((pk_slot, var_slot));
+        let binding = if let Some(var_slot) = var_slot {
+            // The TIME desugaring names its synthetic parameter after the *role
+            // key*, so `pk(v=TIME, v1=TIME)` arrives here as two different names
+            // for one value. Collapse them to a single binding so the pair reads
+            // as redundant rather than conflicting, and so no diagnostic ever
+            // quotes the internal `__ferx_pktime_*` spelling.
+            if var_name.starts_with(PKTIME_SYNTH_PREFIX) {
+                PkSlotBinding::Time
+            } else {
+                PkSlotBinding::Var(var_slot)
+            }
         } else if let Ok(c) = var_name.parse::<f64>() {
             // A numeric literal binds the slot to a constant — but `f64::from_str`
             // also accepts `inf`/`nan`/`infinity`, which are never a meaningful PK
@@ -16173,7 +16235,7 @@ fn build_pk_param_fn(
                      variable"
                 ));
             }
-            pk_const_mapping.push((pk_slot, c));
+            PkSlotBinding::Const(c)
         } else {
             return Err(format!(
                 "[structural_model] parameter `{pk_name}` references variable `{var_name}`, \
@@ -16181,6 +16243,52 @@ fn build_pk_param_fn(
                  Define it, e.g. `{var_name} = ...`.",
                 var_names.join(", ")
             ));
+        };
+        if let Some(&(prev_key, prev_val, prev_binding)) = slot_seen.get(&pk_slot) {
+            if prev_binding != binding {
+                // Name the mapping that would actually have reached the engine,
+                // so the message says which number the user was getting. The
+                // closure below writes `pk_assignment_mapping` first and
+                // `pk_const_mapping` after it, so a constant beats a variable
+                // whatever the keys are; between two of a kind the entries
+                // arrive in ascending key order and the later one wins.
+                let const_wins = matches!(binding, PkSlotBinding::Const(_))
+                    != matches!(prev_binding, PkSlotBinding::Const(_));
+                let current_wins = if const_wins {
+                    matches!(binding, PkSlotBinding::Const(_))
+                } else {
+                    true
+                };
+                let cur = (pk_name.as_str(), pk_mapped_value_display(var_name));
+                let prev = (prev_key, pk_mapped_value_display(prev_val));
+                let ((win_k, win_v), (_, lose_v)) = if current_wins {
+                    (cur, prev)
+                } else {
+                    (prev, cur)
+                };
+                return Err(format!(
+                    "[structural_model]: `{}={}` and `{}={}` are two spellings of the same \
+                     parameter ({}) bound to different values — only `{win_k}={win_v}` would be \
+                     applied and `{lose_v}` silently discarded. Use one spelling.",
+                    prev.0,
+                    prev.1,
+                    cur.0,
+                    cur.1,
+                    pk_slot_noun(pk_slot)
+                ));
+            }
+            // Same binding under both spellings: redundant, not wrong. Skip the
+            // duplicate so the hot closure writes the slot once.
+            continue;
+        }
+        slot_seen.insert(pk_slot, (pk_name.as_str(), var_name.as_str(), binding));
+        match (var_slot, binding) {
+            // `Var` and `Time` both come from a resolved individual parameter
+            // (the TIME desugaring declares its synthetic one), so the slot write
+            // is the same for either.
+            (Some(var_slot), _) => pk_assignment_mapping.push((pk_slot, var_slot)),
+            (None, PkSlotBinding::Const(c)) => pk_const_mapping.push((pk_slot, c)),
+            (None, _) => unreachable!("only a literal binding resolves no variable slot"),
         }
     }
     let is_analytical_pk = !pk_param_map.is_empty();
