@@ -99,6 +99,11 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **ODE AutoSwitch now reuses accepted RK45 stages to detect stiffness without extra
+  right-hand-side evaluations and carries its verdict history across dose and covariate
+  event boundaries.** The dimensionless runtime signal is independent of the model's time
+  unit; the periodic Jacobian probe remains as a backstop (#1371).
+
 - **The post-fit per-subject diagnostics pass (IPRED / PRED / IWRES / CWRES,
   per-subject OFV) and the post-fit analytic-sensitivity sweep now run in
   parallel over subjects** on the pool the fit already uses, instead of one
