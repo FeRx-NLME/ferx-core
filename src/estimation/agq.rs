@@ -79,6 +79,7 @@ use std::f64::consts::PI;
 use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
+use crate::sens::provider::SubjectSens;
 use crate::stats::likelihood::individual_nll_into_with_schedule;
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
@@ -268,6 +269,29 @@ pub(crate) struct Stack {
     omega_joint_inv: DMatrix<f64>,
     /// `√diag(Ω_joint)` — each coordinate's natural scale, for finite-difference steps.
     prior_sd: Vec<f64>,
+}
+
+/// Subject-local AGQ work that an outer objective evaluation can hand directly
+/// to the gradient requested by the same optimizer callback.
+struct PreparedGrid {
+    h: DMatrix<f64>,
+    bs: Vec<Vec<f64>>,
+    softmax: Vec<f64>,
+    base_jet: Option<SubjectSens>,
+}
+
+enum PreparedSubject {
+    Grid {
+        stack: Stack,
+        b_hat: Vec<f64>,
+        grid: PreparedGrid,
+    },
+}
+
+/// AGQ population objective and matching gradient computed from the same subject-local grids.
+pub(crate) struct PopulationEvaluation {
+    pub(crate) nll: f64,
+    gradient: Option<Vec<f64>>,
 }
 
 impl Stack {
@@ -580,6 +604,32 @@ pub(crate) fn agq_subject_nll(
     log_weights: &[f64],
     anchor: HessianAnchor,
 ) -> f64 {
+    agq_subject_evaluate(
+        model,
+        subject,
+        params,
+        stack,
+        b_hat,
+        nodes,
+        log_weights,
+        anchor,
+        false,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agq_subject_evaluate(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b_hat: &[f64],
+    nodes: &[f64],
+    log_weights: &[f64],
+    anchor: HessianAnchor,
+    retain_gradient_work: bool,
+) -> (f64, Option<PreparedGrid>) {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
     let schedule = cacheable_schedule(model, subject);
@@ -588,7 +638,7 @@ pub(crate) fn agq_subject_nll(
     // conditional likelihood itself. (The formula below would agree — an empty tensor
     // product is the single empty node — but there is no Σ to factor, so short-circuit.)
     if d == 0 {
-        return stack.nll_at(
+        let nll = stack.nll_at(
             model,
             subject,
             params,
@@ -596,21 +646,37 @@ pub(crate) fn agq_subject_nll(
             &mut scratch,
             schedule.as_ref(),
         );
+        return (nll, None);
     }
 
-    let Some(h) = anchor_hessian(
-        anchor,
-        model,
-        subject,
-        params,
-        stack,
-        b_hat,
-        &mut scratch,
-        schedule.as_ref(),
-    ) else {
+    let anchor_work = if retain_gradient_work {
+        anchor_hessian_and_base_jet(
+            anchor,
+            model,
+            subject,
+            params,
+            stack,
+            b_hat,
+            &mut scratch,
+            schedule.as_ref(),
+        )
+    } else {
+        anchor_hessian(
+            anchor,
+            model,
+            subject,
+            params,
+            stack,
+            b_hat,
+            &mut scratch,
+            schedule.as_ref(),
+        )
+        .map(|h| (h, None))
+    };
+    let Some((h, base_jet)) = anchor_work else {
         // Gauss-Newton anchor out of the provider's scope (guarded up front by
         // `check_model_options`, so this is only reachable if that guard is bypassed).
-        return NLL_SENTINEL;
+        return (NLL_SENTINEL, None);
     };
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
     // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
@@ -618,10 +684,10 @@ pub(crate) fn agq_subject_nll(
     // *consistent* (any invertible scale integrates to the same limit); it only costs
     // nodes-worth of efficiency, which is the right failure mode.
     let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
-        return NLL_SENTINEL;
+        return (NLL_SENTINEL, None);
     };
 
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -632,13 +698,21 @@ pub(crate) fn agq_subject_nll(
         &proposal,
         &mut scratch,
         schedule.as_ref(),
+        retain_gradient_work,
     );
 
-    let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - logsumexp(&terms);
+    let lse = logsumexp(&terms);
+    let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - lse;
     if nll.is_finite() {
-        nll
+        let prepared = retain_gradient_work.then(|| PreparedGrid {
+            h,
+            bs,
+            softmax: terms.iter().map(|&t| (t - lse).exp()).collect(),
+            base_jet,
+        });
+        (nll, prepared)
     } else {
-        NLL_SENTINEL
+        (NLL_SENTINEL, None)
     }
 }
 
@@ -662,15 +736,21 @@ fn agq_nodes_and_terms(
     proposal: &crate::estimation::importance_sampling::Proposal,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
+    retain_nodes: bool,
 ) -> (Vec<Vec<f64>>, Vec<f64>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
-    let mut bs = Vec::with_capacity(cap);
+    let mut bs = if retain_nodes {
+        Vec::with_capacity(cap)
+    } else {
+        Vec::new()
+    };
     let mut terms = Vec::with_capacity(cap);
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
+    let mut b = vec![0.0f64; d];
 
     loop {
         let mut log_w = 0.0;
@@ -684,14 +764,18 @@ fn agq_nodes_and_terms(
         // b_j = b̂ + √2 · Σ^{1/2} · z_j — the adaptive transform, over the whole stacked
         // vector (η, and every occasion's κ under IOV).
         proposal.apply_l_sigma(&z, &mut step, std::f64::consts::SQRT_2);
-        let b: Vec<f64> = (0..d).map(|k| b_hat[k] + step[k]).collect();
+        for k in 0..d {
+            b[k] = b_hat[k] + step[k];
+        }
 
         let nll = stack.nll_at(model, subject, params, &b, scratch, schedule);
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
-        bs.push(b);
+        if retain_nodes {
+            bs.push(b.clone());
+        }
 
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
@@ -797,6 +881,7 @@ pub(crate) fn subject_grid_and_weights(
         &proposal,
         &mut scratch,
         schedule.as_ref(),
+        false,
     );
     let lse = logsumexp(&terms);
     if !lse.is_finite() {
@@ -833,7 +918,6 @@ pub fn agq_population_nll(
 ) -> f64 {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-
     let per_subject: Vec<f64> = population
         .subjects
         .par_iter()
@@ -855,6 +939,65 @@ pub fn agq_population_nll(
         })
         .collect();
     per_subject.iter().sum()
+}
+
+/// Evaluate the AGQ population objective and its matching gradient in one subject pass.
+/// Each worker consumes and drops a subject's retained grid before taking another subject;
+/// only the small per-subject objective and packed score survive for ordered reduction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_population_evaluate(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    bounds: &crate::estimation::parameterization::PackedBounds,
+    options: &crate::types::FitOptions,
+    n_nodes: usize,
+    anchor: HessianAnchor,
+) -> PopulationEvaluation {
+    let (nodes, weights) = gauss_hermite(n_nodes);
+    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
+
+    let per_subject: Vec<(f64, Option<Vec<f64>>)> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let stack = Stack::new(model, params, subj_kappas.len());
+            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+            let (nll, grid) = agq_subject_evaluate(
+                model,
+                subject,
+                params,
+                &stack,
+                &b_hat,
+                &nodes,
+                &log_weights,
+                anchor,
+                true,
+            );
+            let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
+            let score =
+                context.score_with_prepared(subject, eta_hats[i].as_slice(), subj_kappas, prepared);
+            (nll, score)
+        })
+        .collect();
+    let nll = per_subject.iter().map(|(nll, _)| nll).sum();
+    let gradient = per_subject.iter().try_fold(
+        vec![0.0; x.len()],
+        |mut result, (_, score)| -> Option<Vec<f64>> {
+            for (out, g) in result.iter_mut().zip(score.as_ref()?) {
+                *out += 2.0 * g;
+            }
+            Some(result)
+        },
+    );
+    PopulationEvaluation { nll, gradient }
 }
 
 /// Assemble the stacked mode `b̂ = [η̂, κ̂₁ … κ̂_K]` from what the shared inner loop already
@@ -2023,6 +2166,7 @@ fn phi_grid(
         &proposal,
         scratch,
         schedule,
+        false,
     );
     let lse = logsumexp(&terms);
     lse.is_finite()
@@ -2084,6 +2228,7 @@ fn agq_subject_packed_gradient(
         &proposal,
         &mut scratch,
         schedule.as_ref(),
+        true,
     );
     let lse = logsumexp(&terms);
     if !lse.is_finite() {
@@ -2095,6 +2240,47 @@ fn agq_subject_packed_gradient(
     // same values — so both differentiate the grid the objective actually evaluated.
     let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
 
+    finish_agq_subject_gradient(
+        model,
+        subject,
+        params,
+        template,
+        stack,
+        x,
+        b_hat,
+        nodes,
+        log_weights,
+        anchor,
+        &h,
+        &bs,
+        &softmax,
+        &mut scratch,
+        schedule.as_ref(),
+        base_jet,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_agq_subject_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    stack: &Stack,
+    x: &[f64],
+    b_hat: &[f64],
+    nodes: &[f64],
+    log_weights: &[f64],
+    anchor: HessianAnchor,
+    h: &DMatrix<f64>,
+    bs: &[Vec<f64>],
+    softmax: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    base_jet: Option<SubjectSens>,
+    out: &mut [f64],
+) -> Option<()> {
     for (b_j, &w) in bs.iter().zip(softmax.iter()) {
         if w == 0.0 {
             continue; // exp underflow — contributes nothing to the average
@@ -2111,15 +2297,15 @@ fn agq_subject_packed_gradient(
         template,
         stack,
         anchor,
-        &h,
+        h,
         x,
         b_hat,
         nodes,
         log_weights,
-        &bs,
-        &softmax,
-        &mut scratch,
-        schedule.as_ref(),
+        bs,
+        softmax,
+        scratch,
+        schedule,
         base_jet,
         out,
     )?;
@@ -2172,29 +2358,41 @@ impl<'a> SubjectScoreContext<'a> {
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
     ) -> Option<Vec<f64>> {
+        self.score_with_prepared(subject, eta, kappas, None)
+    }
+
+    fn score_with_prepared(
+        &self,
+        subject: &Subject,
+        eta: &[f64],
+        kappas: &[nalgebra::DVector<f64>],
+        prepared: Option<PreparedSubject>,
+    ) -> Option<Vec<f64>> {
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
         }
         if !self.force_fd {
-            let stack = Stack::new(self.model, &self.params, kappas.len());
-            let b = stack_mode(eta, kappas);
             let mut g = vec![0.0; self.x.len()];
-            if agq_subject_packed_gradient(
-                self.model,
-                subject,
-                &self.params,
-                self.template,
-                &stack,
-                self.x,
-                &b,
-                &self.nodes,
-                &self.log_weights,
-                self.options.hessian_anchor(),
-                &mut g,
-            )
-            .is_some()
-                && g.iter().all(|v| v.is_finite())
-            {
+            let analytic = if let Some(prepared) = prepared {
+                self.prepared_score(subject, prepared, &mut g)
+            } else {
+                let stack = Stack::new(self.model, &self.params, kappas.len());
+                let b = stack_mode(eta, kappas);
+                agq_subject_packed_gradient(
+                    self.model,
+                    subject,
+                    &self.params,
+                    self.template,
+                    &stack,
+                    self.x,
+                    &b,
+                    &self.nodes,
+                    &self.log_weights,
+                    self.options.hessian_anchor(),
+                    &mut g,
+                )
+            };
+            if analytic.is_some() && g.iter().all(|v| v.is_finite()) {
                 for (g, fixed) in g.iter_mut().zip(&self.fixed) {
                     if *fixed {
                         *g = 0.0;
@@ -2205,6 +2403,39 @@ impl<'a> SubjectScoreContext<'a> {
         }
         let joint_warm = stack_mode(eta, kappas);
         self.finite_difference_score(subject, &joint_warm)
+    }
+
+    fn prepared_score(
+        &self,
+        subject: &Subject,
+        prepared: PreparedSubject,
+        out: &mut [f64],
+    ) -> Option<()> {
+        match prepared {
+            PreparedSubject::Grid { stack, b_hat, grid } => {
+                let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+                let schedule = cacheable_schedule(self.model, subject);
+                finish_agq_subject_gradient(
+                    self.model,
+                    subject,
+                    &self.params,
+                    self.template,
+                    &stack,
+                    self.x,
+                    &b_hat,
+                    &self.nodes,
+                    &self.log_weights,
+                    self.options.hessian_anchor(),
+                    &grid.h,
+                    &grid.bs,
+                    &grid.softmax,
+                    &mut scratch,
+                    schedule.as_ref(),
+                    grid.base_jet,
+                    out,
+                )
+            }
+        }
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -2281,17 +2512,22 @@ pub(crate) fn population_gradient_mixed(
     bounds: &crate::estimation::parameterization::PackedBounds,
     options: &crate::types::FitOptions,
     force_fd: bool,
+    evaluation: Option<PopulationEvaluation>,
 ) -> Option<Vec<f64>> {
+    if let Some(evaluation) = evaluation {
+        return evaluation.gradient;
+    }
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
     let scores: Vec<_> = population
         .subjects
         .par_iter()
         .enumerate()
-        .map(|(i, s)| {
-            context.score(
-                s,
+        .map(|(i, subject)| {
+            context.score_with_prepared(
+                subject,
                 eta_hats[i].as_slice(),
                 kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                None,
             )
         })
         .collect();
@@ -2453,6 +2689,7 @@ mod tests {
             &proposal,
             &mut scratch2,
             schedule.as_ref(),
+            true,
         );
         let lse = logsumexp(&terms);
         let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
@@ -2664,6 +2901,97 @@ mod tests {
         subject
     }
 
+    #[test]
+    fn fused_objective_work_reproduces_objective_and_gradient() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::parameterization::{compute_bounds, pack_params, unpack_params};
+        use crate::types::{EstimationMethod, FitOptions, Population};
+
+        let model = parse_model_string(M3_MODEL).unwrap();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        // The optimizer callback evaluates both objective and gradient from unpacked `x`.
+        // Mirror that path: pack(default) can move a log-transformed value by one ULP.
+        let params = unpack_params(&x, template);
+        let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        assert!(ebe.converged, "fixture EBE must converge");
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let eta_hats = vec![ebe.eta];
+        let kappas = vec![Vec::new()];
+        let bounds = compute_bounds(template);
+        for (method, anchor) in [
+            (EstimationMethod::FoceI, HessianAnchor::GaussNewton),
+            (EstimationMethod::Laplace, HessianAnchor::Exact),
+        ] {
+            let options = FitOptions {
+                method,
+                n_agq: 3,
+                ..FitOptions::default()
+            };
+            let evaluation = agq_population_evaluate(
+                &model,
+                &population,
+                &params,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                3,
+                anchor,
+            );
+            let terms_only =
+                agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
+            assert!(evaluation.gradient.is_some());
+            assert_eq!(evaluation.nll.to_bits(), terms_only.to_bits());
+
+            let uncached = population_gradient_mixed(
+                &model,
+                &population,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                false,
+                None,
+            )
+            .expect("uncached gradient");
+            let fused = population_gradient_mixed(
+                &model,
+                &population,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                false,
+                Some(evaluation),
+            )
+            .expect("fused gradient");
+            assert_eq!(fused.len(), uncached.len());
+            for (i, (fused, uncached)) in fused.iter().zip(&uncached).enumerate() {
+                assert_eq!(
+                    fused.to_bits(),
+                    uncached.to_bits(),
+                    "{anchor:?} packed gradient coordinate {i}: \
+                     fused={fused:e}, uncached={uncached:e}"
+                );
+            }
+        }
+    }
+
     /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`
     /// that is deliberately NOT the mode, since the score is a property of `nll(b; x)`
     /// alone and must hold everywhere, not only at the EBE.
@@ -2797,6 +3125,7 @@ mod tests {
                     &proposal,
                     &mut scratch,
                     schedule.as_ref(),
+                    true,
                 );
                 let lse = logsumexp(&terms);
                 let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
