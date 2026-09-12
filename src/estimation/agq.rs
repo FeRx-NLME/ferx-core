@@ -72,15 +72,18 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 use std::f64::consts::PI;
+use std::sync::OnceLock;
 
 use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::sens::provider::SubjectSens;
-use crate::stats::likelihood::individual_nll_into_with_schedule;
+use crate::stats::likelihood::{
+    individual_nll_into_prepared_with_schedule, individual_nll_into_with_schedule,
+};
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
@@ -88,6 +91,15 @@ use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Su
 /// the extreme nodes to round-off, and the marginal accuracy gain is nil for any realistic
 /// NLME integrand.
 pub const MAX_AGQ_NODES: usize = 21;
+
+static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
+    [const { OnceLock::new() }; MAX_AGQ_NODES];
+
+fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64]) {
+    assert!((1..=MAX_AGQ_NODES).contains(&n));
+    let (nodes, weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| gauss_hermite(n));
+    (nodes, weights)
+}
 
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
 /// [`crate::api::check_model_options`]. The tensor rule costs one full likelihood
@@ -347,12 +359,12 @@ impl Stack {
     }
 
     /// Split `b` back into `(η, [κ₁ … κ_K])`.
-    fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<Vec<f64>>) {
+    fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<&'a [f64]>) {
         let eta = &b[..self.n_eta];
         let kappas = (0..self.n_occ)
             .map(|k| {
                 let s = self.n_eta + k * self.n_kappa;
-                b[s..s + self.n_kappa].to_vec()
+                &b[s..s + self.n_kappa]
             })
             .collect();
         (eta, kappas)
@@ -386,7 +398,7 @@ impl Stack {
             );
         }
         let (eta, kappas) = self.split(b);
-        crate::stats::likelihood::individual_nll_iov(
+        crate::stats::likelihood::individual_nll_iov_with_scratch(
             model,
             subject,
             &params.theta,
@@ -395,6 +407,7 @@ impl Stack {
             &params.omega,
             params.omega_iov.as_ref(),
             &params.sigma.values,
+            scratch,
         )
     }
 }
@@ -716,14 +729,13 @@ fn agq_subject_evaluate(
     }
 }
 
-/// Sweep the tensor grid once, returning each node's `η_j` and its log-term
-/// `t_j = Σ_k log w_{j,k} + ‖z_j‖² − nll(η_j)`.
+/// Sweep the tensor grid once, returning every log-term and, when `retain_nodes`
+/// is true, each node's `η_j`.
 ///
 /// The single place the grid is materialised. The objective ([`agq_subject_nll`]) reduces
 /// the terms with `logsumexp`; the gradient ([`agq_subject_packed_gradient`]) additionally
-/// needs the `η_j` themselves and turns the same terms into softmax weights. Sharing one
-/// sweep is what guarantees the gradient is differentiating the objective that was actually
-/// evaluated, rather than a grid that drifted from it.
+/// needs the `η_j` themselves and turns the same terms into softmax weights. Objective-only
+/// callers leave them unmaterialized, avoiding one heap allocation per quadrature point.
 #[allow(clippy::too_many_arguments)]
 fn agq_nodes_and_terms(
     model: &CompiledModel,
@@ -751,6 +763,11 @@ fn agq_nodes_and_terms(
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
     let mut b = vec![0.0f64; d];
+    let err_keys = (!stack.is_iov()).then(|| model.error_spec.obs_keys(subject));
+    let ruv_mult = (!stack.is_iov()).then(|| model.ruv_obs_mult(subject, &params.theta));
+    let mut pred_recycle = Vec::new();
+    let mut eta_work = DVector::zeros(stack.n_eta);
+    let mut prior_work = DVector::zeros(stack.n_eta);
 
     loop {
         let mut log_w = 0.0;
@@ -768,7 +785,45 @@ fn agq_nodes_and_terms(
             b[k] = b_hat[k] + step[k];
         }
 
-        let nll = stack.nll_at(model, subject, params, &b, scratch, schedule);
+        let nll = if stack.is_iov() {
+            let kappa_views: Vec<&[f64]> = (0..stack.n_occ)
+                .map(|occasion| {
+                    let start = stack.n_eta + occasion * stack.n_kappa;
+                    &b[start..start + stack.n_kappa]
+                })
+                .collect();
+            crate::stats::likelihood::individual_nll_iov_with_scratch(
+                model,
+                subject,
+                &params.theta,
+                &b[..stack.n_eta],
+                &kappa_views,
+                &params.omega,
+                params.omega_iov.as_ref(),
+                &params.sigma.values,
+                scratch,
+            )
+        } else {
+            individual_nll_into_prepared_with_schedule(
+                model,
+                subject,
+                &params.theta,
+                &b,
+                &params.omega,
+                &params.sigma.values,
+                &params.residual_correlations,
+                scratch,
+                schedule,
+                err_keys.as_ref().expect("non-IOV error keys").as_ref(),
+                ruv_mult
+                    .as_ref()
+                    .expect("non-IOV residual multiplier")
+                    .as_deref(),
+                &mut pred_recycle,
+                &mut eta_work,
+                &mut prior_work,
+            )
+        };
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
@@ -916,7 +971,7 @@ pub fn agq_population_nll(
     n_nodes: usize,
     anchor: HessianAnchor,
 ) -> f64 {
-    let (nodes, weights) = gauss_hermite(n_nodes);
+    let (nodes, weights) = cached_gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let per_subject: Vec<f64> = population
         .subjects
@@ -932,7 +987,7 @@ pub fn agq_population_nll(
                 params,
                 &stack,
                 &b_hat,
-                &nodes,
+                nodes,
                 &log_weights,
                 anchor,
             )
@@ -2054,6 +2109,8 @@ fn node_nll_gradient(
             mult,
             err_keys,
             &mut Vec::new(),
+            &mut nalgebra::DVector::zeros(model.n_eta),
+            &mut nalgebra::DVector::zeros(model.n_eta),
         )
     }
 }
@@ -2351,7 +2408,7 @@ impl<'a> SubjectScoreContext<'a> {
         bounds: &'a crate::estimation::parameterization::PackedBounds,
         force_fd: bool,
     ) -> Self {
-        let (nodes, weights) = gauss_hermite(options.agq_nodes().expect("quadrature stage"));
+        let (nodes, weights) = cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
         Self {
             model,
             template,
@@ -2359,7 +2416,7 @@ impl<'a> SubjectScoreContext<'a> {
             options,
             bounds,
             params: crate::estimation::parameterization::unpack_params(x, template),
-            nodes,
+            nodes: nodes.to_vec(),
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
@@ -3782,6 +3839,17 @@ mod tests {
         for (got, want) in w.iter().zip([sp / 6.0, 2.0 * sp / 3.0, sp / 6.0]) {
             assert!((got - want).abs() < 1e-12, "weight {got} != {want}");
         }
+    }
+
+    #[test]
+    fn cached_gauss_hermite_reuses_the_exact_rule_storage() {
+        let (nodes_a, weights_a) = cached_gauss_hermite(3);
+        let (nodes_b, weights_b) = cached_gauss_hermite(3);
+        assert!(std::ptr::eq(nodes_a.as_ptr(), nodes_b.as_ptr()));
+        assert!(std::ptr::eq(weights_a.as_ptr(), weights_b.as_ptr()));
+        let (expected_nodes, expected_weights) = gauss_hermite(3);
+        assert_eq!(nodes_a, expected_nodes);
+        assert_eq!(weights_a, expected_weights);
     }
 
     /// Weights sum to `√π = ∫ e^{−x²} dx`, and the rule is exact for polynomials up to

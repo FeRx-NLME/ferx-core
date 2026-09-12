@@ -158,6 +158,8 @@ mod ctmm_inner {
                 None,
                 err_keys.as_ref(),
                 &mut Vec::new(),
+                &mut nalgebra::DVector::zeros(model.n_eta),
+                &mut nalgebra::DVector::zeros(model.n_eta),
             )
             .expect("endpoint-only CTMM is in analytic scope");
 

@@ -27,28 +27,6 @@ fn model_predictions(
     pk::compute_predictions_with_tv(model, subject, theta, eta)
 }
 
-/// Caller-owned-scratch variant of [`model_predictions`] that also
-/// accepts an optional pre-built
-/// [`pk::event_driven::EventSchedule`]. Used by FOCE inner-loop callers
-/// (BFGS line search, post-convergence eval) that build the schedule
-/// once per `find_ebe` call and reuse it across many `(theta, eta)`
-/// evaluations of the same subject. SAEM and other callers pass `None`
-/// — the no-TV fast path doesn't consume the schedule, and the
-/// dispatcher falls back to building one on demand on the TV path.
-#[inline]
-fn model_predictions_into_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> Vec<f64> {
-    pk::compute_predictions_with_tv_into_with_schedule(
-        model, subject, theta, eta, scratch, schedule,
-    )
-}
-
 #[inline]
 pub(crate) fn m3_logcdf(limit: f64, f: f64, sd: f64, cens: i8) -> f64 {
     let z = if cens < 0 {
@@ -513,6 +491,49 @@ pub fn individual_nll_into_with_schedule(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
+    let err_keys = model.error_spec.obs_keys(subject);
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let mut pred_recycle = Vec::new();
+    let mut eta_work = DVector::zeros(eta.len());
+    let mut prior_work = DVector::zeros(eta.len());
+    individual_nll_into_prepared_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        residual_correlations,
+        scratch,
+        schedule,
+        err_keys.as_ref(),
+        ruv_mult.as_deref(),
+        &mut pred_recycle,
+        &mut eta_work,
+        &mut prior_work,
+    )
+}
+
+/// Inner-loop form of [`individual_nll_into_with_schedule`] with subject-static
+/// residual dispatch and magnitude inputs prepared by the caller, plus a
+/// caller-owned prediction vector reused across objective evaluations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_into_prepared_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    err_keys: &[usize],
+    ruv_mult: Option<&[Vec<f64>]>,
+    pred_recycle: &mut Vec<f64>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
+) -> f64 {
     // Ω⁻¹ and log|Ω| are pre-computed in `OmegaMatrix::from_matrix_*`.
     // Hot-path users (FOCE inner BFGS, SAEM MH) call this 100s–1000s of
     // times per subject per outer iter — recomputing Cholesky+inverse
@@ -522,12 +543,10 @@ pub fn individual_nll_into_with_schedule(
     }
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-
     // Eta prior: eta' * Omega_inv * eta
-    let eta_vec = DVector::from_column_slice(eta);
-    let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
+    eta_work.as_mut_slice().copy_from_slice(eta);
+    prior_work.gemv(1.0, omega_inv, eta_work, 0.0);
+    let eta_prior = eta_work.dot(prior_work);
 
     // #570: a joint PK-TTE subject otherwise integrates the augmented PK+CHZ system
     // twice per eval (Gaussian preds, then `ode_cumhaz_hazard` for `H`/`h`). When the
@@ -541,11 +560,27 @@ pub fn individual_nll_into_with_schedule(
     // on the no-TV fast path).
     #[cfg(feature = "survival")]
     let preds = match &joint_share {
-        Some(s) => s.preds.clone(),
-        None => model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule),
+        Some(s) => {
+            pred_recycle.clear();
+            pred_recycle.extend_from_slice(&s.preds);
+            pred_recycle
+        }
+        None => {
+            let hint = std::mem::take(pred_recycle);
+            *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+                model, subject, theta, eta, scratch, schedule, hint,
+            );
+            pred_recycle
+        }
     };
     #[cfg(not(feature = "survival"))]
-    let preds = model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule);
+    let preds = {
+        let hint = std::mem::take(pred_recycle);
+        *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+            model, subject, theta, eta, scratch, schedule, hint,
+        );
+        pred_recycle
+    };
     // For SDE models, compute per-observation EKF process-noise variance and
     // add it to the residual variance to form V_total.
     let p_obs = if model.is_sde() {
@@ -558,10 +593,6 @@ pub fn individual_nll_into_with_schedule(
     // Does not touch FREM covariate pseudo-observations (handled below before
     // this factor is applied) or the EKF process noise `p_obs`.
     let ruv_scale = model.residual_var_scale(eta);
-    // Per-observation custom residual magnitude (#484), evaluated once here (it
-    // is η-independent) and shared with the diagonal and dense paths so the EBE
-    // objective matches the outer OFV's variance.
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
     let mut data_ll = 0.0;
     let has_censored_m3 =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
@@ -575,7 +606,7 @@ pub fn individual_nll_into_with_schedule(
             residual_correlations,
             ruv_scale,
             &p_obs,
-            ruv_mult.as_deref(),
+            ruv_mult,
         ) {
             Some(term) => data_ll += term,
             None => return 1e20,
@@ -617,7 +648,7 @@ pub fn individual_nll_into_with_schedule(
                 err_keys[j],
                 f_pred,
                 sigma_values,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice),
             ) * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
@@ -915,11 +946,6 @@ fn ekf_p_obs(
         |f_pred| crate::stats::residual_error::residual_variance(error_model, f_pred, sigma_values),
     );
     p_obs
-}
-
-/// Log-determinant of Omega via Cholesky: log|Omega| = 2 * sum(log(L_ii))
-fn omega_log_det(omega: &OmegaMatrix) -> f64 {
-    chol_log_det(&omega.chol)
 }
 
 /// FOCE per-subject negative log-likelihood.
@@ -2516,12 +2542,12 @@ pub fn individual_nll_iov(
 /// Inner-loop sibling that retains per-event PK buffer capacity across trial
 /// eta/kappa values. The public convenience function keeps its original API.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn individual_nll_iov_with_scratch(
+pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-    kappas: &[Vec<f64>],
+    kappas: &[K],
     omega: &OmegaMatrix,
     omega_iov: Option<&OmegaMatrix>,
     sigma_values: &[f64],
@@ -2532,29 +2558,22 @@ pub(crate) fn individual_nll_iov_with_scratch(
     }
 
     // BSV eta prior
-    let omega_inv = match omega.matrix.clone().cholesky() {
-        Some(chol) => chol.inverse(),
-        None => return 1e20,
-    };
-    let log_det_omega = omega_log_det(omega);
+    let omega_inv = &omega.inv;
+    let log_det_omega = omega.log_det;
     let eta_vec = DVector::from_column_slice(eta);
-    let eta_prior = eta_vec.dot(&(&omega_inv * &eta_vec));
+    let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
 
     // Kappa priors and IOV log-det
     let (iov_inv, log_det_iov) = if let Some(iov) = omega_iov {
-        let inv = match iov.matrix.clone().cholesky() {
-            Some(chol) => chol.inverse(),
-            None => return 1e20,
-        };
-        (inv, omega_log_det(iov))
+        (&iov.inv, iov.log_det)
     } else {
-        (DMatrix::identity(1, 1), 0.0) // unreachable when kappas non-empty
+        return 1e20;
     };
 
     let mut kappa_prior = 0.0;
     for kap in kappas {
-        let kap_vec = DVector::from_column_slice(kap);
-        kappa_prior += kap_vec.dot(&(&iov_inv * &kap_vec));
+        let kap_vec = DVector::from_column_slice(kap.as_ref());
+        kappa_prior += kap_vec.dot(&(iov_inv * &kap_vec));
     }
     let k_occasions = kappas.len();
 
@@ -2810,6 +2829,54 @@ mod tests {
         let nonmem_ofv = 0.691_015_142_109_431_8;
         let ferx_ofv = -4.0 * upper;
         assert!((ferx_ofv - nonmem_ofv).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prepared_inner_nll_reuse_is_bit_identical() {
+        let model = make_model();
+        let subject = make_simple_subject();
+        let theta = [5.0, 50.0];
+        let eta = [0.17];
+        let omega = make_omega(0.09);
+        let sigma = [0.05];
+        let expected = individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            &theta,
+            &eta,
+            &omega,
+            &sigma,
+            &[],
+            &mut pk::EventPkParams::default(),
+            None,
+        );
+
+        let err_keys = model.error_spec.obs_keys(&subject);
+        let mult = model.ruv_obs_mult(&subject, &theta);
+        let mut event_scratch = pk::EventPkParams::default();
+        let mut predictions = vec![-999.0; subject.obs_times.len()];
+        let mut eta_work = DVector::from_element(model.n_eta, -999.0);
+        let mut prior_work = DVector::from_element(model.n_eta, -999.0);
+        let reused = individual_nll_into_prepared_with_schedule(
+            &model,
+            &subject,
+            &theta,
+            &eta,
+            &omega,
+            &sigma,
+            &[],
+            &mut event_scratch,
+            None,
+            err_keys.as_ref(),
+            mult.as_deref(),
+            &mut predictions,
+            &mut eta_work,
+            &mut prior_work,
+        );
+
+        assert_eq!(expected.to_bits(), reused.to_bits());
+        assert_eq!(predictions.len(), subject.obs_times.len());
+        assert!(predictions.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -3071,6 +3138,19 @@ mod tests {
             Some(&omega_iov),
             &sigma,
         );
+        let borrowed: Vec<&[f64]> = kappas.iter().map(Vec::as_slice).collect();
+        let reused = individual_nll_iov_with_scratch(
+            &model,
+            &subj,
+            &theta,
+            &eta,
+            &borrowed,
+            &omega,
+            Some(&omega_iov),
+            &sigma,
+            &mut pk::EventPkParams::default(),
+        );
+        assert_eq!(iov.to_bits(), reused.to_bits());
         // Kappa prior is positive → IOV NLL should differ from base
         assert!(
             (iov - base).abs() > 1e-6,

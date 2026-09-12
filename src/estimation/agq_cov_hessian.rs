@@ -719,6 +719,8 @@ pub(crate) fn node_jet(
             core.mult.as_deref(),
             err_keys.as_ref(),
             &mut Vec::new(),
+            &mut DVector::zeros(model.n_eta),
+            &mut DVector::zeros(model.n_eta),
         )?
     };
     let parts = subject_cov_hessian_parts(model, subject, params, &sens, &prep, b);
