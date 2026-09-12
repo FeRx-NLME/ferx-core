@@ -378,14 +378,15 @@ fn covariance_se_matches_nonmem_foce_block_omega() {
         SeRef {
             name: "omega_KA",
             nm: 1.60542e-1,
-            // The SE of the highest-shrinkage variance component is the single
-            // hardest covariance quantity: it sits on the flattest curvature
-            // direction, where ferx's FD R-matrix and NONMEM's MATRIX=R differ
-            // ~25% (ferx 0.120 vs NONMEM 0.160 — within ferx's own R/S spread of
-            // 0.112–0.185). Not a transform bug (audited); a flat-direction
-            // FD-Hessian limitation tracked in #432. All other SEs match within
-            // OMEGA_FOCE; this one component carries a wider band.
-            tol: 0.30,
+            // Before #1018 this component carried a 30% band: ferx reported
+            // ~0.120 against NONMEM's 0.160, a ~25% gap read as an FD
+            // flat-direction limitation (#432). It was the bug — the cross-block
+            // covariances this model does not declare were being estimated, and
+            // the extra freedom flattened ω²KA's curvature. With the structural
+            // zeros held, ferx reports 0.160862 against NONMEM's 1.60542e-1:
+            // a 0.2% difference, so this component takes the same band as the
+            // rest.
+            tol: OMEGA_FOCE,
         },
     ];
     let ferx = [
@@ -410,16 +411,18 @@ fn covariance_se_matches_nonmem_foce_block_omega() {
         );
     }
 
-    // The omega_KA band above is one-sided in practice (NONMEM-relative, 30%): it
-    // bites on a downward regression but would pass silently if ferx's SE drifted
-    // *up* toward NONMEM's 0.160. Add a two-sided absolute window around ferx's
-    // known-good 0.120 so the guard also catches ferx-internal regressions,
-    // independent of the flat-direction gap to NONMEM tracked in #432.
+    // A two-sided absolute window around the measured post-#1018 value, so a
+    // ferx-internal drift is caught even when it stays inside the relative band
+    // above. Realised on CI at the fix: 0.160862 (NONMEM 0.160542). The window
+    // is that value ±7%, wide enough for platform/profile FD-step differences
+    // and far tighter than the pre-#1018 [0.105, 0.135] it replaces — that
+    // window sat around ferx's 0.120, which this fix showed to be the bug and
+    // not the FD flat-direction gap #432 describes.
     let se_omega_ka = omega_diag_se(2);
     assert!(
-        (0.105..=0.135).contains(&se_omega_ka),
-        "SE(ω²KA) = {se_omega_ka:.6} left ferx's known-good window [0.105, 0.135] \
-         (regression independent of the #432 NONMEM gap)"
+        (0.150..=0.172).contains(&se_omega_ka),
+        "SE(ω²KA) = {se_omega_ka:.6} left ferx's known-good window [0.150, 0.172] \
+         (measured 0.160862 with the #1018 structural zeros held)"
     );
 }
 

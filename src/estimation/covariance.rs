@@ -931,18 +931,13 @@ pub(crate) fn compute_covariance(
     // after inverting the Hessian of the free block, leave their covariance
     // rows/cols at zero (→ SE = 0 downstream). `fixed_mask` came from the same
     // `pack_with_bounds` walk as `bounds`, at the top of this function.
-    // Structural-zero Ω off-diagonals (the cross-block elements of a mixed
-    // block+diagonal Ω, where `free_mask[(i,j)] == false`) are not estimated
-    // parameters — the analytical population gradient zeroes them, so their
-    // Hessian diagonal is flat. Exclude them from the free set exactly like FIX
-    // parameters; otherwise the ill-conditioning guard below rejects the entire
-    // covariance step. (Before #243 the omega-prior add-back iterated all
-    // lower-triangle entries and gave these a spurious non-zero curvature, which
-    // masked the issue for the FOCE path; FOCEI never had that mask.)
-    let structural_zero = omega_structural_zero_mask(template);
-    let free_idx: Vec<usize> = (0..n)
-        .filter(|&i| !fixed_mask[i] && !structural_zero[i])
-        .collect();
+    // It also holds the structural-zero Ω off-diagonals (the cross-block
+    // elements of a mixed block+diagonal Ω, where `free_mask[(i,j)] == false`):
+    // they are not estimated parameters and their Hessian diagonal is flat, so
+    // without the exclusion the ill-conditioning guard below rejects the entire
+    // covariance step (#243). Since #1018 the optimizer holds them through the
+    // same mask, so there is one gate, not a second structural filter here.
+    let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
 
     let f0 = base_ofv;
 

@@ -5573,6 +5573,44 @@ fn test_parse_block_kappa_multiline_fix_own_line() {
     assert!(kappas.block[0].fixed);
 }
 
+// Overlapping Ω blocks would defeat the structural-zero hold (#1018): with
+// (A,B) and (B,C) free but (A,C) declared absent, `L[C,A] = 0` still leaves
+// `Ω[C,A] = L[C,B]·L[B,A]`, so the covariance the model calls absent — and that
+// `n_parameters` and `se_omega` leave out — comes back non-zero. The parser
+// refuses the declaration instead.
+
+#[test]
+fn test_reject_eta_in_two_block_omega_declarations() {
+    let lines = vec![
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
+        "block_omega (ETA_V, ETA_KA) = [0.04, 0.01, 0.30]".to_string(),
+    ];
+    // `.err().expect(..)`, not `expect_err`: the Ok half is an 11-tuple of spec
+    // vectors that does not implement `Debug`.
+    let err = parse_parameters(&lines, &Default::default())
+        .err()
+        .expect("an eta in two block_omega declarations must be refused");
+    assert!(
+        err.contains("ETA_V") && err.contains("more than one block_omega"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_reject_eta_in_both_omega_and_block_omega() {
+    let lines = vec![
+        "omega ETA_V ~ 0.04".to_string(),
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
+    ];
+    let err = parse_parameters(&lines, &Default::default())
+        .err()
+        .expect("an eta in both omega and block_omega must be refused");
+    assert!(
+        err.contains("ETA_V") && err.contains("both omega and block_omega"),
+        "{err}"
+    );
+}
+
 #[test]
 fn test_parse_block_omega_3x3() {
     let lines = vec![

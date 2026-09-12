@@ -4866,7 +4866,7 @@ impl CompiledModel {
     /// This uses the same packed FIX and structural-zero masks as estimation,
     /// including diagonal/separate BSV and IOV blocks and mixture overrides.
     pub fn free_packed_dim(&self) -> usize {
-        crate::estimation::parameterization::packed_held_mask(&self.default_params)
+        crate::estimation::parameterization::packed_fixed_mask(&self.default_params)
             .iter()
             .filter(|held| !**held)
             .count()
