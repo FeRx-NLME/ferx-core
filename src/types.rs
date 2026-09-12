@@ -3404,6 +3404,15 @@ pub struct CovariateMuRef {
     pub transform: MuTransform,
     /// Data covariates the typical value reads (names as written).
     pub covariate_names: Vec<String>,
+    /// The subset of [`Self::theta_names`] the rest of the model also reads.
+    ///
+    /// Empty is the ordinary case and the precondition for the exact M-step
+    /// engine: freezing `φ_i` freezes the individual parameter, so the data term
+    /// is constant in the group's thetas *only* when those thetas reach the
+    /// likelihood through this typical value alone. A theta listed here is still
+    /// estimated by the group — it just forces the prior-plus-data engine, which
+    /// keeps the term it is live in.
+    pub shared_thetas: Vec<String>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
     /// `[individual_parameters]` definition it referenced already inlined.
     pub(crate) typical: crate::parser::model_parser::Expression,

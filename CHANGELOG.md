@@ -44,9 +44,9 @@ section of the SDLC for the versioning policy).
   #619 landed on 0, 480 OFV units above NONMEM). The parser now records such a value as a
   *covariate mu-reference* and the EM estimators re-fit its thetas jointly to the
   population of individual values every iteration — exactly (Gauss–Newton) when the
-  covariates are constant within each subject, numerically (prior + data term) when one
-  varies within a subject — the same thing NONMEM does for a MU written as a function of
-  several thetas. `mu_refs`, inner-loop centring and every FOCE/FOCEI/Laplace fit are
+  covariates are constant within each subject and no group theta is read elsewhere in the
+  model, numerically (prior + data term) otherwise — the same thing NONMEM does for a MU
+  written as a function of several thetas. `mu_refs`, inner-loop centring and every FOCE/FOCEI/Laplace fit are
   unchanged. A group that shares a theta with another eta's anchor, has negligible IIV,
   or sits in a mixture model is declined with a warning and stays on the numerical M-step.
   Anchored against NONMEM `METHOD=SAEM` with `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`

@@ -972,44 +972,235 @@ fn inline_local_vars(
 /// centring and reporting consumers exactly as before, while SAEM / IMP prefer
 /// the group for the M-step. Only BSV etas (`eta_idx < n_bsv_eta`) are recorded
 /// — a kappa carries no between-subject mean to fit. The last assignment on an
-/// eta wins, as in `detect_mu_refs`.
+/// eta wins, as in `detect_mu_refs`, and it wins even when it is *not* itself a
+/// group: see [`retire_superseded_group`] for why a stale group is worse than no
+/// group at all.
+///
+/// Each recorded group also carries the group thetas the rest of the model
+/// reads — see [`thetas_read_outside_the_group`]. `outside_idents` is the
+/// uppercased identifier set of every block *other* than `[parameters]` and
+/// `[individual_parameters]`, which is how a theta reaching the likelihood
+/// through `[odes]` or `[derived]` is seen from here.
 fn detect_covariate_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     n_bsv_eta: usize,
+    outside_idents: &HashSet<String>,
 ) -> Vec<CovariateMuRef> {
     let mut assign_counts: HashMap<&str, usize> = HashMap::new();
     count_all_assignments(stmts, &mut assign_counts);
     let mut inline_defs: HashMap<String, Expression> = HashMap::new();
-    let mut found: Vec<(usize, CovariateMuRef)> = Vec::new();
+    let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
     for s in stmts {
-        let Statement::Assign(name, raw_expr) = s else {
-            continue;
-        };
-        // Always classify the inlined form: the point of a group is the thetas a
-        // `TVCL = …` line hides, and the raw form of a direct write is unchanged
-        // by inlining.
-        let inlined;
-        let expr = if inline_defs.is_empty() {
-            raw_expr
-        } else {
-            inlined = inline_local_vars(raw_expr, &inline_defs, 0);
-            &inlined
-        };
-        if let Some((eta_idx, entry)) =
-            classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta)
-        {
-            found.retain(|(e, _)| *e != eta_idx);
-            found.push((eta_idx, entry));
-        }
-        if assign_counts.get(name.as_str()).copied().unwrap_or(0) == 1
-            && !expr_contains_eta(raw_expr)
-        {
-            inline_defs.insert(name.clone(), raw_expr.clone());
+        match s {
+            Statement::Assign(name, raw_expr) => {
+                // Always classify the inlined form: the point of a group is the
+                // thetas a `TVCL = …` line hides, and the raw form of a direct
+                // write is unchanged by inlining.
+                let inlined;
+                let expr = if inline_defs.is_empty() {
+                    raw_expr
+                } else {
+                    inlined = inline_local_vars(raw_expr, &inline_defs, 0);
+                    &inlined
+                };
+                let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
+                // Retire before recording, and retire whether or not this line is
+                // itself a group: an assignment that no longer classifies still
+                // supersedes the one it overwrites.
+                retire_superseded_group(&mut found, name, expr);
+                if let Some((eta_idx, entry)) = classified {
+                    found.push((eta_idx, name.clone(), entry));
+                }
+                if assign_counts.get(name.as_str()).copied().unwrap_or(0) == 1
+                    && !expr_contains_eta(raw_expr)
+                {
+                    inline_defs.insert(name.clone(), raw_expr.clone());
+                }
+            }
+            // A branch body can overwrite a typical value recorded above it, and
+            // nothing inside it may *record* one (the branch need not be taken),
+            // so an `if` only retires.
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    retire_superseded_groups_in(&mut found, body);
+                }
+                if let Some(eb) = else_body {
+                    retire_superseded_groups_in(&mut found, eb);
+                }
+            }
+            _ => {}
         }
     }
-    found.into_iter().map(|(_, e)| e).collect()
+    found
+        .into_iter()
+        .map(|(_, owner, mut entry)| {
+            entry.shared_thetas = thetas_read_outside_the_group(
+                stmts,
+                theta_names,
+                outside_idents,
+                &owner,
+                &entry.theta_names,
+            );
+            entry
+        })
+        .collect()
+}
+
+/// Drop every group an assignment to `name` supersedes.
+///
+/// A group is keyed on the eta it carries, so recording is a
+/// retain-then-push on `eta_idx` — but that only fires when the *new* line
+/// classifies, and the line that overwrites a group is usually the one that does
+/// not: `CL = (TVCL + TH_X*WT)*exp(ETA_CL)` followed by `CL = TVCL*exp(ETA_CL)`
+/// leaves the two-theta group alive, and SAEM / IMP then prefer it over the
+/// scalar [`MuRef`] the model actually evaluates — pinning `TH_X` out of the
+/// numerical M-step and updating it from a dead expression. So retirement is
+/// unconditional and keyed two ways: on the eta the new right-hand side carries
+/// (the same key recording uses) and on the assigned parameter name, which is
+/// the only handle left when the new line carries no eta at all (`CL = TVCL`).
+fn retire_superseded_group(
+    found: &mut Vec<(usize, String, CovariateMuRef)>,
+    name: &str,
+    expr: &Expression,
+) {
+    let eta = split_typical_and_eta(expr).map(|(_, e, _)| e);
+    found.retain(|(e, n, _)| Some(*e) != eta && n != name);
+}
+
+/// [`retire_superseded_group`] over a conditional body, recursively. Retires
+/// only — see the `Statement::If` arm of [`detect_covariate_mu_refs`].
+fn retire_superseded_groups_in(
+    found: &mut Vec<(usize, String, CovariateMuRef)>,
+    stmts: &[Statement],
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(name, expr) => retire_superseded_group(found, name, expr),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    retire_superseded_groups_in(found, body);
+                }
+                if let Some(eb) = else_body {
+                    retire_superseded_groups_in(found, eb);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Which of a group's thetas reach the likelihood by a route **other** than the
+/// typical value that defines the group — the fact that decides whether the
+/// exact M-step engine is admissible at all.
+///
+/// The exact engine ([`crate::estimation::covariate_mu_ref`]) drops the data
+/// term because freezing `φ_i` freezes the individual parameter, so the
+/// observation likelihood is a constant in the group's thetas. That argument
+/// holds only if those thetas reach the data *through this typical value and
+/// nothing else*. In
+///
+/// ```text
+///   CL = (TVCL + TH_X*WT) * exp(ETA_CL)
+///   V  = TVV + TH_X
+/// ```
+///
+/// `TH_X` is still live in `V` after `φ_CL` is preserved, so a step that ignores
+/// the data term is not an M-step of anything and can move `TH_X` the wrong way
+/// — while SAEM / IMP have already pinned it out of their general numerical
+/// M-step on the strength of the group. Such a group has to route to the
+/// prior-plus-data engine, which keeps the term.
+///
+/// The test is reachability, not occurrence, because an occurrence that no
+/// consumer reads changes no prediction:
+///
+/// - a name is **tainted** by θ when its right-hand side reads θ or reads an
+///   already-tainted name — statement order, `if` bodies included;
+/// - the taint **stops at the group's own parameter**. That is the whole point
+///   of mu-referencing: `CL` is held fixed by the preserved `φ_i`, so `Q = CL/2`
+///   is fixed too, and the local `TVCL = …` that exists only to build `CL`
+///   carries the thetas nowhere else;
+/// - θ is shared when another block names θ itself or names any tainted name.
+///   `[structural_model]`, `[odes]`, `[derived]`, `[scaling]`, `[error_model]`
+///   are where an individual parameter becomes a prediction, so a taint that
+///   reaches none of them reaches no observation either (a dead intermediate).
+///
+/// `outside_idents` is an identifier scan of raw block text, so it over-reports
+/// (a word in a comment, a name that collides with a theta's). That is the safe
+/// direction: a group wrongly called shared costs the slower engine, a group
+/// wrongly called exclusive returns wrong estimates.
+fn thetas_read_outside_the_group(
+    stmts: &[Statement],
+    theta_names: &[String],
+    outside_idents: &HashSet<String>,
+    owner: &str,
+    group_thetas: &[String],
+) -> Vec<String> {
+    group_thetas
+        .iter()
+        .filter(|name| {
+            if outside_idents.contains(&name.to_ascii_uppercase()) {
+                return true;
+            }
+            let Some(theta_idx) = theta_names.iter().position(|t| t == *name) else {
+                return false;
+            };
+            let mut tainted: HashSet<String> = HashSet::new();
+            spread_theta_taint(stmts, theta_idx, owner, &mut tainted);
+            tainted.iter().any(|n| outside_idents.contains(n))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Names (uppercased) whose value depends on `theta_idx`, following assignments
+/// in statement order and stopping at `owner`. See
+/// [`thetas_read_outside_the_group`] for why the taint stops there.
+fn spread_theta_taint(
+    stmts: &[Statement],
+    theta_idx: usize,
+    owner: &str,
+    tainted: &mut HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(name, expr) => {
+                if name == owner {
+                    continue;
+                }
+                let mut reads = false;
+                visit_expr_nodes(expr, &mut |n| match n {
+                    Expression::Theta(i) => reads |= *i == theta_idx,
+                    Expression::Variable(v) | Expression::Covariate(v) => {
+                        reads |= tainted.contains(&v.to_ascii_uppercase());
+                    }
+                    _ => {}
+                });
+                if reads {
+                    tainted.insert(name.to_ascii_uppercase());
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    spread_theta_taint(body, theta_idx, owner, tainted);
+                }
+                if let Some(eb) = else_body {
+                    spread_theta_taint(eb, theta_idx, owner, tainted);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One right-hand side → `(eta_idx, CovariateMuRef)` when it is a group shape
@@ -1064,6 +1255,10 @@ fn classify_covariate_mu_ref(
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
             covariate_names,
+            // Filled by `detect_covariate_mu_refs` once the whole block (and the
+            // other blocks' identifiers) are in view; a single right-hand side
+            // cannot see what else reads its thetas.
+            shared_thetas: Vec::new(),
             typical,
         },
     ))
@@ -3325,11 +3520,25 @@ pub fn parse_full_model_with(
         .collect();
     // Multi-theta typical values (#619): a separate list, never a substitute
     // for `mu_refs` — see `detect_covariate_mu_refs`.
+    // Every identifier any *other* block spells, so a theta that reaches the
+    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
+    // a `[derived]` readout) is visible to the exclusivity check. `[parameters]`
+    // is excluded because it is where the thetas are declared; the only theta a
+    // model may name there is a FIXed one in a kappa weight, which no M-step
+    // moves.
+    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, lines) in blocks.iter() {
+        if key == "parameters" || key == "individual_parameters" {
+            continue;
+        }
+        collect_referenced_identifiers(lines, &mut outside_idents);
+    }
     let covariate_mu_refs = detect_covariate_mu_refs(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         eta_names_bsv.len(),
+        &outside_idents,
     );
 
     // Build pk_indices: maps each individual parameter (by declaration order)

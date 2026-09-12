@@ -1270,7 +1270,7 @@ fn run_mcem(
                     omega: &omega_mat,
                     etas: &eta_means,
                 };
-                let solved = if group.time_varying {
+                let solved = if group.needs_data_term {
                     let k = group.eta_idx;
                     let data = |th: &[f64], shift: &[f64]| -> f64 {
                         let per_subj: Vec<f64> = population

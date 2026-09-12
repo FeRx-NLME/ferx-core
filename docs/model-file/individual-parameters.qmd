@@ -446,7 +446,13 @@ anchor is `TVCL`) keeps it alongside the covariate mu-reference for the inner-lo
 centring and reporting. FOCE/FOCEI/Laplace fits do not change. Not recorded: a value
 that reads `TIME` or `MIXNUM`, a second eta, an NN output or θ level block, or a local
 variable assigned inside an `if` — those stay on the numerical M-step, and the SAEM
-warning still names them. See the SAEM page for the
+warning still names them.
+
+A theta the rest of the model also reads (`CL = (TVCL + TH_X*WT) * exp(ETA_CL)` next
+to `V = TVV + TH_X`) is still estimated by the group, but the M-step keeps the
+observation term: preserving the individual `CL` does not pin `V`, so the data are
+not independent of `TH_X`. ferx detects this and names the theta in a fit warning;
+the only cost is a slower M-step. See the SAEM page for the
 [M-step](../estimation/saem.qmd#saem-mstep-covariate-mu-ref) and its validation
 against NONMEM.
 

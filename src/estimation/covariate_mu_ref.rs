@@ -23,18 +23,25 @@
 //!
 //! and the θ that minimises it is the M-step. Two engines, chosen per group:
 //!
-//! - **Exact** ([`CovariateMuGroup::solve_exact`]) when every covariate the
-//!   typical value reads is constant within each subject. Then `P_i = g⁻¹(φ_i)`
-//!   does not depend on θ at all, the data term is a constant, and the M-step is
-//!   a small nonlinear least-squares fit of `g(A_i(θ))` to the `φ_i` — solved by
-//!   Gauss–Newton with Levenberg–Marquardt damping. For `g(A_i) = log θ + c_i`
-//!   this reduces to the classical `log θ += mean(η)`.
-//! - **Numerical** ([`CovariateMuGroup::solve_numerical`]) when a covariate
-//!   varies within a subject. `P_i(t) = g⁻¹(φ_i + g(A_i(t;θ)) − g(A_i(t₀;θ)))`
-//!   keeps a θ-dependence through the within-subject ratio, so the data term is
-//!   kept and the sum above is minimised by a few BOBYQA iterations over the
-//!   group's thetas — still in the φ-frozen coordinates, which is what removes
-//!   the drift.
+//! - **Exact** ([`CovariateMuGroup::solve_exact`]) when the data term really is
+//!   a constant in the group's thetas, which takes *both* of: every covariate
+//!   the typical value reads is constant within each subject, **and** no free
+//!   theta of the group is read anywhere else in the model
+//!   ([`CovariateMuRef::shared_thetas`]). Then `P_i = g⁻¹(φ_i)` does not depend
+//!   on θ at all and the M-step is a small nonlinear least-squares fit of
+//!   `g(A_i(θ))` to the `φ_i` — solved by Gauss–Newton with Levenberg–Marquardt
+//!   damping. For `g(A_i) = log θ + c_i` this reduces to the classical
+//!   `log θ += mean(η)`.
+//! - **Numerical** ([`CovariateMuGroup::solve_numerical`]) otherwise. A covariate
+//!   varying within a subject leaves a θ-dependence through the within-subject
+//!   ratio `P_i(t) = g⁻¹(φ_i + g(A_i(t;θ)) − g(A_i(t₀;θ)))`; a theta shared with
+//!   another parameter (`CL = (TVCL + TH_X*WT)*exp(ETA_CL)` next to
+//!   `V = TVV + TH_X`) leaves one through that other parameter. Either way the
+//!   data term is kept and the sum above is minimised by a few BOBYQA iterations
+//!   over the group's thetas — still in the φ-frozen coordinates, which is what
+//!   removes the drift. Dropping a live data term would not be an M-step of
+//!   anything, and the group has already pinned those thetas out of the
+//!   estimator's general numerical M-step, so nothing else would maximise it.
 //!
 //! In both cases the caller re-centres each subject's eta by the realised change
 //! in its mu, `η_i −= g(A_i(θ_new)) − g(A_i(θ_old))`, so `φ_i` is unchanged by
@@ -70,9 +77,17 @@ pub(crate) struct CovariateMuGroup<'m> {
     /// Indices into `model.theta_names`, ascending.
     pub theta_idx: Vec<usize>,
     pub transform: MuTransform,
-    /// Whether any covariate the typical value reads changes within a subject.
-    /// Decides the engine: exact NLS when `false`, prior + data when `true`.
-    pub time_varying: bool,
+    /// Whether the observation term must be kept in the M-step — i.e. whether
+    /// the data still depend on the group's thetas once `φ_i` is frozen. Decides
+    /// the engine: exact NLS when `false`, prior + data when `true`. Two
+    /// independent reasons set it, and either alone is enough:
+    ///
+    /// - a covariate the typical value reads changes **within** a subject, so
+    ///   `P_i(t)` keeps a θ-dependence through the within-subject ratio;
+    /// - a free theta of the group is read **elsewhere in the model**
+    ///   ([`CovariateMuRef::shared_thetas`]), so it reaches the likelihood by a
+    ///   route `φ_i` does not pin.
+    pub needs_data_term: bool,
     spec: &'m CovariateMuRef,
 }
 
@@ -184,12 +199,38 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
                 .iter()
                 .any(|s| covariate_varies_within(s, c))
         });
+        // A theta the rest of the model also reads keeps the data term live even
+        // with every covariate subject-constant, so the exact engine — which
+        // drops that term — is not an M-step for it. Only a *free* theta matters:
+        // a FIXed one never moves, so no term can be mis-maximised in it.
+        let shared_free: Vec<&str> = spec
+            .shared_thetas
+            .iter()
+            .filter(|n| {
+                model
+                    .theta_names
+                    .iter()
+                    .position(|t| t == *n)
+                    .is_some_and(|t| !theta_fixed.get(t).copied().unwrap_or(false))
+            })
+            .map(String::as_str)
+            .collect();
+        if !shared_free.is_empty() {
+            notes.push(format!(
+                "covariate mu-reference on {} (reads {}) keeps the observation term in its \
+                 M-step: {} also appear(s) elsewhere in the model, so freezing the individual \
+                 parameter does not make the data independent of them (#619).",
+                spec.eta_name,
+                names,
+                shared_free.join(", ")
+            ));
+        }
         claimed.extend(theta_idx.iter().copied());
         groups.push(CovariateMuGroup {
             eta_idx,
             theta_idx,
             transform: spec.transform,
-            time_varying,
+            needs_data_term: time_varying || !shared_free.is_empty(),
             spec,
         });
     }

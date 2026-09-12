@@ -4359,7 +4359,7 @@ fn synthetic_readout_params_stay_out_of_user_facing_output() {
             }),
             "[{label}] a parser-internal parameter must not reach FitResult.eta_param_info"
         );
-        if let Some(w) = crate::api::saem_non_mu_referenced_individual_params_warning(&m) {
+        if let Some(w) = crate::api::saem_non_mu_referenced_individual_params_warning(&m, true) {
             assert!(
                 !w.contains("__ferx_ro_"),
                 "[{label}] the mu-referencing warning must not name a parameter the user \

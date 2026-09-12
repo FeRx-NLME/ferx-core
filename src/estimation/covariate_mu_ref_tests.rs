@@ -83,6 +83,69 @@ fn planted_etas(
         .collect()
 }
 
+/// [`ADDITIVE_MODEL`] with `TH_CRCL` also feeding bioavailability, so the
+/// observation likelihood still depends on it once `φ_CL` is preserved.
+const SHARED_THETA_MODEL: &str = r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  FR = TH_CRCL * 0.01
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0, f=FR)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// The exact engine drops the data term. That is only legitimate when the
+/// group's thetas reach the data through this typical value alone — here
+/// `TH_CRCL` also sets `FR`, so the group must keep the term instead.
+/// [`additive_group_is_detected_and_time_constant`] is the control: the same
+/// covariate model with an unshared `TH_CRCL` does take the exact engine.
+#[test]
+fn a_theta_the_rest_of_the_model_reads_keeps_the_data_term() {
+    let m = model(SHARED_THETA_MODEL);
+    assert_eq!(m.covariate_mu_refs.len(), 1);
+    assert_eq!(m.covariate_mu_refs[0].shared_thetas, vec!["TH_CRCL"]);
+
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let omega = diag_omega(&[0.2, 0.1]);
+    let free = vec![false; m.theta_names.len()];
+    let (groups, notes) = resolve_covariate_mu_groups(&m, &pop, &[], &free, &omega);
+    assert_eq!(
+        groups.len(),
+        1,
+        "the group is still estimated, just differently"
+    );
+    assert!(groups[0].needs_data_term);
+    assert!(
+        notes.iter().any(|n| n.contains("TH_CRCL")),
+        "the user is told which theta forced it: {notes:?}"
+    );
+
+    // A FIXed theta never moves, so no term can be mis-maximised in it and the
+    // exact engine stays available. Without this the check above is satisfied by
+    // routing on the mere presence of a name in `shared_thetas`.
+    let mut fixed = vec![false; m.theta_names.len()];
+    fixed[m
+        .theta_names
+        .iter()
+        .position(|t| t == "TH_CRCL")
+        .expect("TH_CRCL is declared")] = true;
+    let (groups, _) = resolve_covariate_mu_groups(&m, &pop, &[], &fixed, &omega);
+    assert_eq!(groups.len(), 1);
+    assert!(!groups[0].needs_data_term);
+}
+
 #[test]
 fn additive_group_is_detected_and_time_constant() {
     let m = model(ADDITIVE_MODEL);
@@ -101,7 +164,7 @@ fn additive_group_is_detected_and_time_constant() {
     let g = only_group(&m, &pop, &diag_omega(&[0.2, 0.1]));
     assert_eq!(g.eta_idx, 0);
     assert_eq!(g.theta_idx, vec![0, 1]);
-    assert!(!g.time_varying);
+    assert!(!g.needs_data_term);
 }
 
 #[test]
@@ -346,11 +409,11 @@ fn numerical_solver_passes_the_phi_preserving_shift_to_the_data_term() {
 }
 
 #[test]
-fn time_varying_covariate_is_detected() {
+fn time_varying_covariate_keeps_the_data_term() {
     let m = model(ADDITIVE_MODEL);
     let pop = pop_time_varying();
     let g = only_group(&m, &pop, &diag_omega(&[0.2, 0.1]));
-    assert!(g.time_varying);
+    assert!(g.needs_data_term);
 }
 
 #[test]

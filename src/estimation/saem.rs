@@ -3275,7 +3275,7 @@ pub fn run_saem(
                                 omega: &state.omega_mat,
                                 etas: &state.etas,
                             };
-                            if group.time_varying {
+                            if group.needs_data_term {
                                 let k = group.eta_idx;
                                 let etas_now = &state.etas;
                                 let data = |th: &[f64], shift: &[f64]| -> f64 {

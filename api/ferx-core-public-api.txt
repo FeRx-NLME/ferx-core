@@ -2659,6 +2659,7 @@ pub fn ferx_core::CovariateModelSpec::unresolved(&self) -> alloc::vec::Vec<&ferx
 pub struct ferx_core::types::CovariateMuRef
 pub ferx_core::types::CovariateMuRef::covariate_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CovariateMuRef::eta_name: alloc::string::String
+pub ferx_core::types::CovariateMuRef::shared_thetas: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CovariateMuRef::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CovariateMuRef::transform: ferx_core::MuTransform
 pub struct ferx_core::types::CovariateRelation
@@ -4040,6 +4041,7 @@ pub fn ferx_core::CovariateModelSpec::unresolved(&self) -> alloc::vec::Vec<&ferx
 pub struct ferx_core::CovariateMuRef
 pub ferx_core::CovariateMuRef::covariate_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CovariateMuRef::eta_name: alloc::string::String
+pub ferx_core::CovariateMuRef::shared_thetas: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CovariateMuRef::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CovariateMuRef::transform: ferx_core::MuTransform
 pub struct ferx_core::CovariateRelation
