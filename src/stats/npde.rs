@@ -122,10 +122,16 @@ pub fn compute_npde_npd(
             let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
             // IOV (#734): the per-occasion κ draw needs the subject's occasion
             // groups in the exact order `predict_iov` indexes its `kappas`
-            // argument by. A function of the subject alone, so build it once and
-            // reuse across replicates. Empty when the subject carries no
-            // occasion labels, in which case `predict_iov` falls back to κ = 0
-            // (matching the fit-time no-occasion diagnostic).
+            // argument by. A function of the subject alone, so this side builds
+            // it once instead of once per replicate. `predict_iov` still builds
+            // its own copy (plus the `occ_to_k` map) on every call — the group
+            // walk is not part of its signature — so the reference costs two
+            // builds per replicate, not one; only the second is hoistable from
+            // here. Worth plumbing through only if the walk ever shows up in a
+            // profile, since the estimation hot path pays the same duplicate.
+            // Empty when the subject carries no occasion labels, in which case
+            // `predict_iov` falls back to κ = 0 (matching the fit-time
+            // no-occasion diagnostic).
             let iov: Option<(&crate::types::OmegaMatrix, Vec<(u32, Vec<usize>)>)> = params
                 .omega_iov
                 .as_ref()
