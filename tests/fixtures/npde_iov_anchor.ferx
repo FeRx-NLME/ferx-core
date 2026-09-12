@@ -1,0 +1,28 @@
+# NPDE/NPD IOV anchor (#734): 1-cpt IV bolus, IOV on CL, three EVID=4
+# (reset + bolus) occasions per subject and three post-dose observations each.
+# Matches nonmem_anchor/npde_iov_anchor.ctl bit-for-bit (same theta/omega/
+# kappa/sigma, same data), so NONMEM's `$TABLE ... NPDE NPD ESAMPLE=` reference
+# distribution and ferx's `compute_npde_npd` are computed on the identical model
+# and dataset. The EVID=4 reset makes the occasions independent, so the only
+# thing linking the three profiles of a subject is the between-subject eta —
+# every remaining within-subject difference is the occasion kappa.
+[parameters]
+  theta TVCL(5.0, 0.01, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  iov_column = OCC

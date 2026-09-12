@@ -250,8 +250,9 @@ engine-side check and an R reproduction recipe.
 
 ### NONMEM cross-validation
 
-NONMEM has no native NPDE output; the reference pipeline is a NONMEM `$SIMULATION`
-post-processed by the `npde` R package. The same warfarin data was fit with NONMEM
+Two reference pipelines are used. The warfarin check below post-processes a
+NONMEM `$SIMULATION` with the `npde` R package; the IOV anchor further down uses
+NONMEM's own `$TABLE ... NPDE NPD ESAMPLE=` output directly. The same warfarin data was fit with NONMEM
 7.5.1 (`ADVAN2 TRANS2`, `METHOD=1 INTER`, proportional error) and the two fits
 agree, so any difference in the diagnostics is attributable to the NPDE
 computation rather than the fit:
@@ -278,17 +279,51 @@ NPDE-variance gap is Monte-Carlo noise between two independent simulation draws.
 Both engines give NPDE ≈ N(0, 1) and a mean-zero NPD, as expected under this
 well-specified model.
 
-**Limitations.** M3/BLQ censored observations need the predictive-CDF variant and
+### Limitations
+
+M3/BLQ censored observations need the predictive-CDF variant and
 are out of scope: censored rows (`CENS != 0`) are emitted as empty/`NaN` (matching
 the CWRES/IWRES convention), and a subject's NPDE is `NaN` as a whole when it has
 any censored row, since the within-subject decorrelation would otherwise mix the
 LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
 has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
-otherwise that subject's NPDE is `NaN` (NPD is still computed). For IOV (`kappa`)
-models the NPDE/NPD simulation currently holds kappas at zero, so NPDE/NPD omit
-the inter-occasion component of the predictive variance. (This is specific to the
-NPDE path; `simulate()` itself samples per-occasion kappas — see
-[Simulation](simulation.qmd#simulation-process). Aligning NPDE is a follow-up.)
+otherwise that subject's NPDE is `NaN` (NPD is still computed).
+
+### Inter-occasion variability (IOV)
+
+For an IOV (`kappa`) model the reference distribution draws one independent
+$\kappa_{i,o} \sim N(0, \Omega_{\text{IOV}})$ per occasion, exactly as
+[`simulate()`](simulation.qmd#simulation-process) does, so the predictive
+variance NPDE/NPD are scored against carries its inter-occasion component.
+Earlier versions held every kappa at zero here, which left the reference too narrow
+and the scores correspondingly over-dispersed — a well-specified IOV model
+looked mis-specified. Non-IOV models are unaffected and their scores are
+unchanged.
+
+The cross-tool check is `tests/npde_iov_nonmem_anchor.rs`: 60 subjects, three
+`EVID=4` occasions each, all parameters fixed at the simulating values on both
+sides, `ESAMPLE = nsim = 2000`. Row by row, ferx and NONMEM agree to a worst
+`|ΔNPD|` of 0.226 and `|ΔNPDE|` of 0.280 — Monte-Carlo noise between two
+independent 2000-draw empirical CDFs. Forcing $\Omega_{\text{IOV}}$ to zero (the
+old behaviour) breaks that agreement to 0.895 and 4.389.
+
+### NPDE decorrelation: ferx follows the `npde` package, not NONMEM's default
+
+NONMEM *does* emit NPDE and NPD natively — `$TABLE ID TIME DV NPDE NPD
+ESAMPLE=2000 SEED=…` — but its default decorrelation is **not** the one the
+`npde` R package (and ferx) use. Decorrelating a within-subject vector is not
+unique:
+
+| | factor of the simulated covariance | used by |
+|---|---|---|
+| symmetric square root | eigen-based, the CWRES convention | NONMEM, by default |
+| Cholesky factor | Brendel/Comets, `npde::autonpde()` | ferx, and NONMEM with `WRESCHOL` |
+
+On the anchor above, the same NONMEM run writes a **bit-identical** NPD column
+either way (NPD carries no decorrelation) while its NPDE correlates 0.868 with
+ferx's by default and 0.997 with `WRESCHOL` on. So compare NPDE against a
+`WRESCHOL` table; comparing against the default one is comparing two different
+statistics.
 
 ## Estimation Methods
 
