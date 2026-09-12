@@ -876,6 +876,11 @@ pub fn find_ebe(
     let pred_recycle = RefCell::new(Vec::<f64>::new());
     let eta_work = RefCell::new(DVector::zeros(n_eta));
     let prior_work = RefCell::new(DVector::zeros(n_eta));
+    // The analytic-gradient closure may fall back to finite differences, which
+    // re-enters `obj` while its own scratch borrows are live. Keep the two sets
+    // separate so that fallback remains re-entrant.
+    let grad_eta_work = RefCell::new(DVector::zeros(n_eta));
+    let grad_prior_work = RefCell::new(DVector::zeros(n_eta));
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
@@ -897,8 +902,8 @@ pub fn find_ebe(
             err_keys.as_ref(),
             mult.as_deref(),
             &mut pred_recycle.borrow_mut(),
-            &mut eta_work.borrow_mut(),
-            &mut prior_work.borrow_mut(),
+            &mut grad_eta_work.borrow_mut(),
+            &mut grad_prior_work.borrow_mut(),
         )
     };
 
