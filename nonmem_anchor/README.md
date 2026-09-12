@@ -92,7 +92,7 @@ respective model (see below).
 > both engines on the same matched dataset (`simulate_logit_fraction_data.py`),
 > and the slow-gated `tests/saem_logit_mu_ref.rs` pins the fraction. Re-run with
 > `nmfe75 logit_fraction_saem.ctl logit_fraction_saem.lst`; the ferx side is
-> `cargo run --release -- nonmem_anchor/logit_fraction_saem_fit.ferx --data data/logit_fraction_oral.csv`.
+> `cargo run --release -p ferx-cli -- nonmem_anchor/logit_fraction_saem_fit.ferx --data data/logit_fraction_oral.csv`.
 >
 > | Parameter | truth | NONMEM SAEM | ferx SAEM |
 > |---|---:|---:|---:|
