@@ -365,8 +365,10 @@ impl IivStructure {
         self.blocks.iter().map(Vec::len).max().unwrap_or(1)
     }
 
-    /// Whether the structure has a block *and* an η outside every block —
-    /// the mixed ω whose structural zeros FOCE / FOCEI do not honour (#1018).
+    /// Whether the structure has a block *and* an η outside every block — a
+    /// mixed ω, whose cross-block covariances every estimator now holds at 0
+    /// (ferx-core #1018; before that fix the outer optimizer estimated them,
+    /// so such a candidate was fitted as a larger block than its description).
     pub fn is_partial_block(&self) -> bool {
         !self.blocks.is_empty()
             && self
@@ -415,12 +417,6 @@ pub(crate) struct Space {
     /// The η name and initial variance a parameter's η takes when it is
     /// added: the input's own, or a fresh `ETA_<P>` at Pharmpy's 0.09.
     pub eta_of: BTreeMap<String, (String, f64)>,
-    /// The base model is estimated by FOCE / FOCEI, whose outer optimizer
-    /// estimates the full lower triangle of a mixed block + diagonal ω
-    /// (#1018): a candidate with a block beside a standalone η is then
-    /// fitted as a larger block than its description says, and the search
-    /// says so on every such candidate.
-    pub outer_full_triangle: bool,
     pub notes: Vec<String>,
 }
 
@@ -430,19 +426,7 @@ const NEW_ETA_VARIANCE: f64 = 0.09;
 impl Space {
     fn from_config(config: &SearchConfig, base: &BaseModel) -> Result<Space, String> {
         let resolved = config.resolve_space(base)?;
-        let mut space = Self::build(base.text.clone(), resolved.mfl.features(), resolved.notes)?;
-        space.outer_full_triangle =
-            base.prepared
-                .parsed
-                .fit_options
-                .method_chain()
-                .iter()
-                .any(|m| {
-                    matches!(
-                        m,
-                        ferx_core::EstimationMethod::Foce | ferx_core::EstimationMethod::FoceI
-                    )
-                });
+        let space = Self::build(base.text.clone(), resolved.mfl.features(), resolved.notes)?;
         Ok(space)
     }
 
@@ -642,7 +626,6 @@ impl Space {
             cov: cov.into_iter().collect(),
             forced_pairs,
             eta_of,
-            outer_full_triangle: false,
             notes,
         })
     }
@@ -1543,16 +1526,6 @@ impl Driver<'_> {
         }
         let step = self.next_step + 1;
         self.next_step = step;
-        if self.space.outer_full_triangle && targets.iter().any(IivStructure::is_partial_block) {
-            self.push_note(
-                "a candidate with a block beside a standalone η — a mixed block + diagonal ω — \
-                 is estimated by FOCE / FOCEI with its cross-block covariances free (#1018): \
-                 the model fitted is a larger block than the description says, and its \
-                 parameter count and BIC do not include those covariances. Read such rows with \
-                 that in mind, or estimate with saem / gn, which honour the declared structure"
-                    .into(),
-            );
-        }
         let mut candidates = Vec::with_capacity(targets.len());
         for target in &targets {
             let id = self.new_id();

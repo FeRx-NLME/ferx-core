@@ -99,11 +99,14 @@ fn full_block_kappa_src() -> String {
     )
 }
 
-/// FOCE fit capped at 4 outer iterations, or an evaluation-only run
+/// Fit capped at 4 outer iterations, or an evaluation-only run
 /// (`outer_maxiter = 0`) that reports the start as the fit sees it.
-fn capped_fit(
+#[allow(clippy::too_many_arguments)]
+fn fit_with(
     src: &str,
     data: DataSet,
+    method: EstimationMethod,
+    interaction: bool,
     optimizer: Optimizer,
     eval_only: bool,
     covariance: bool,
@@ -111,13 +114,54 @@ fn capped_fit(
     let model = parse_model_string(src).expect("model parses");
     let pop = read_nonmem_csv(Path::new(data.0), None, data.1).expect("data loads");
     let mut opts = FitOptions::default();
-    opts.method = EstimationMethod::Foce;
-    opts.interaction = false;
+    opts.method = method;
+    opts.interaction = interaction;
     opts.optimizer = optimizer;
     opts.outer_maxiter = if eval_only { 0 } else { 4 };
     opts.run_covariance_step = covariance;
     opts.verbose = false;
     fit(&model, &pop, &model.default_params, &opts).expect("capped fit runs")
+}
+
+/// The FOCE (no interaction) arm most of this file uses.
+fn capped_fit(
+    src: &str,
+    data: DataSet,
+    optimizer: Optimizer,
+    eval_only: bool,
+    covariance: bool,
+) -> FitResult {
+    fit_with(
+        src,
+        data,
+        EstimationMethod::Foce,
+        false,
+        optimizer,
+        eval_only,
+        covariance,
+    )
+}
+
+/// The four cross-block entries of a mixed block + diagonal matrix are all
+/// exactly 0. `at` reads the matrix under test (Ω or Ω_IOV), `names` are its
+/// row labels.
+fn assert_cross_zeros(
+    label: &str,
+    names: &[String],
+    at: impl Fn(usize, usize) -> f64,
+    block: (&str, &str),
+    diag: &str,
+) {
+    let (ia, ib, id) = (idx(names, block.0), idx(names, block.1), idx(names, diag));
+    for (i, j) in [(id, ia), (ia, id), (id, ib), (ib, id)] {
+        assert!(
+            at(i, j) == 0.0,
+            "{label}: [{},{}] = {:e} must be a structural zero",
+            names[i],
+            names[j],
+            at(i, j)
+        );
+    }
 }
 
 fn idx(names: &[String], name: &str) -> usize {
@@ -280,6 +324,78 @@ fn partial_block_kappa_holds_structural_zeros_and_the_full_block_does_not() {
          observe the hold; Ω_IOV = {fom}"
     );
     assert_eq!(full.n_parameters, 13);
+}
+
+/// The two gradient builders the FOCE arms above never reach, each of which lost
+/// a `free_mask` gate in #1018 and is now held by `packed_fixed_mask` alone:
+///
+/// - the FOCEI Laplace-cached builder (`interaction = true`), and
+/// - the finite-difference fallback, which every IOV model takes because the
+///   analytic dispatcher requires `kappas.is_empty()` — so `method = gn` on a
+///   `block_kappa` model is the arm that exercises it.
+#[test]
+fn focei_and_gauss_newton_builders_hold_structural_zeros() {
+    let cases: [(&str, EstimationMethod, bool, Optimizer, DataSet, &str); 4] = [
+        (
+            "focei / lbfgs",
+            EstimationMethod::FoceI,
+            true,
+            Optimizer::Lbfgs,
+            WARFARIN,
+            PARTIAL_BLOCK_SRC,
+        ),
+        (
+            "focei / trust region",
+            EstimationMethod::FoceI,
+            true,
+            Optimizer::TrustRegion,
+            WARFARIN,
+            PARTIAL_BLOCK_SRC,
+        ),
+        (
+            "gn",
+            EstimationMethod::FoceGn,
+            false,
+            Optimizer::Lbfgs,
+            WARFARIN,
+            PARTIAL_BLOCK_SRC,
+        ),
+        (
+            "gn / IOV (finite-difference fallback)",
+            EstimationMethod::FoceGn,
+            false,
+            Optimizer::Lbfgs,
+            WARFARIN_IOV,
+            PARTIAL_BLOCK_KAPPA_SRC,
+        ),
+    ];
+
+    for (label, method, interaction, optimizer, data, src) in cases {
+        let r = fit_with(src, data, method, interaction, optimizer, false, false);
+        match r.omega_iov.as_ref() {
+            Some(iov) => {
+                assert_cross_zeros(
+                    label,
+                    &r.kappa_names,
+                    |i, j| iov[(i, j)],
+                    ("KAPPA_CL", "KAPPA_V"),
+                    "KAPPA_KA",
+                );
+                assert_eq!(r.n_parameters, 11, "{label}");
+            }
+            None => {
+                assert_cross_zeros(
+                    label,
+                    &r.eta_names,
+                    |i, j| r.omega[(i, j)],
+                    ("ETA_CL", "ETA_V"),
+                    "ETA_KA",
+                );
+                assert_eq!(r.n_parameters, 8, "{label}");
+            }
+        }
+        assert!(r.ofv.is_finite(), "{label}: OFV must be finite");
+    }
 }
 
 /// After the fix `n_parameters` (8) and the covariance step agree on the free

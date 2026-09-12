@@ -162,13 +162,22 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
 
     // Omega Cholesky factor: diagonal as log, off-diagonal as-is. `lower_tri_iter`
     // yields only `(i,i)` when `diagonal`, so this one loop covers both cases.
+    // A structural zero — a cross-block off-diagonal of a mixed block + diagonal
+    // Ω, `free_mask[(i,j)] == false` — packs as exactly 0 whatever the template
+    // carries there (#1018). The model declares that covariance absent, and the
+    // three walks have to agree on what a held slot holds: `run_covariance`'s
+    // reloaded-`.fitrx` arm centres on `pack_params` while its box comes from
+    // `pack_with_bounds`, so a stale non-zero value here would put the centre
+    // outside its own pinned box.
     let l = &params.omega.chol;
     let n_eta = l.nrows();
     for (i, j) in lower_tri_iter(n_eta, params.omega.diagonal) {
         if i == j {
             v.push(l[(i, j)].max(1e-10).ln());
-        } else {
+        } else if params.omega.free_mask[(i, j)] {
             v.push(l[(i, j)]);
+        } else {
+            v.push(0.0);
         }
     }
 
@@ -183,8 +192,10 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
         for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
             if i == j {
                 v.push(l[(i, j)].max(1e-10).ln());
-            } else {
+            } else if iov.free_mask[(i, j)] {
                 v.push(l[(i, j)]);
+            } else {
+                v.push(0.0); // structural zero, as for BSV Ω above
             }
         }
     }
@@ -250,6 +261,21 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         template.omega.diagonal,
         template.omega.free_mask.clone(),
     );
+    // Holding `L[i,j] = 0` reconstructs `Ω[i,j] = 0` only while `free_mask` is a
+    // disjoint block partition — the shape the parser builds. A *chain* mask
+    // (A-B free, B-C free, A-C structural) would fill `Ω[C,A] = L[C,B]·L[B,A]`
+    // in at a slot the mask, `n_parameters` and `se_omega` all call absent, so
+    // the invariant is asserted rather than assumed (#1018 review).
+    #[cfg(debug_assertions)]
+    for (i, j) in lower_tri_iter(n_eta, template.omega.diagonal) {
+        if i != j && !template.omega.free_mask[(i, j)] {
+            debug_assert_eq!(
+                omega.matrix[(i, j)],
+                0.0,
+                "structural zero Ω[{i},{j}] reconstructed non-zero — overlapping blocks?"
+            );
+        }
+    }
 
     // Sigma
     let sigma_values: Vec<f64> = (0..n_sigma)
@@ -392,8 +418,12 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
 pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     let mut mask = Vec::with_capacity(packed_len(template));
 
-    for &f in &template.theta_fixed {
-        mask.push(f);
+    // Every segment is walked over the count `packed_len` derives it from, not
+    // over the `*_fixed` vector's own length: `ModelParameters` is public, and a
+    // hand-built one with a short `theta_fixed` would otherwise shorten the mask
+    // and silently misalign the structural-zero OR below (#1018 review).
+    for i in 0..template.theta.len() {
+        mask.push(template.theta_fixed.get(i).copied().unwrap_or(false));
     }
 
     let n_eta = template.omega.dim();
@@ -406,8 +436,8 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
         mask.push(fi || fj);
     }
 
-    for &f in &template.sigma_fixed {
-        mask.push(f);
+    for i in 0..template.sigma.values.len() {
+        mask.push(template.sigma_fixed.get(i).copied().unwrap_or(false));
     }
 
     // IOV: mirrors BSV omega mask logic, checking the diagonal flag.
@@ -423,8 +453,12 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     // Mixture overrides (#977): one packed scalar each, FIX flag carried on the
     // override. Same order as `pack_params` (Omega overrides, then Sigma).
     if let Some(ref mix) = template.mixture {
-        mask.extend_from_slice(&mix.omega_override_fixed);
-        mask.extend_from_slice(&mix.sigma_override_fixed);
+        for i in 0..mix.omega_override_addr.len() {
+            mask.push(mix.omega_override_fixed.get(i).copied().unwrap_or(false));
+        }
+        for i in 0..mix.sigma_override_addr.len() {
+            mask.push(mix.sigma_override_fixed.get(i).copied().unwrap_or(false));
+        }
     }
 
     // `block_sigma` off-diagonals (#847), appended last to mirror `pack_params`.
@@ -651,8 +685,7 @@ pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
 /// start-side `check_packed_start_in_box` (is the **start** outside the box?)
 /// walk the same three vectors and differ only in the comparison.
 pub(crate) struct PackedStart {
-    /// [`pack_params`] of the template, with structural-zero Ω / Ω_IOV entries
-    /// set to 0.
+    /// [`pack_params`] of the template.
     pub(crate) packed: Vec<f64>,
     /// [`compute_bounds`] of the template — held coordinates already pinned.
     pub(crate) bounds: PackedBounds,
@@ -674,31 +707,21 @@ pub(crate) struct PackedStart {
 ///
 /// Byte-for-byte what `(pack_params, compute_bounds, packed_fixed_mask)`
 /// produce separately — [`compute_bounds`] is now this function with two of its
-/// three results dropped, so there is no second copy of the box to drift. The
-/// one exception is a structural-zero Ω / Ω_IOV entry (#1018): its packed start
-/// is set to 0 here, where [`pack_params`] alone keeps the template's value.
-/// The two agree for every template the parser builds, where that value is 0.
+/// three results dropped, so there is no second copy of the box to drift.
 pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
-    let mut packed = pack_params(template);
+    let packed = pack_params(template);
     let fixed = packed_fixed_mask(template);
-    let structural = omega_structural_zero_mask(template);
     let mut bounds = unpinned_bounds(template);
 
     // Pin any FIX parameter or structural-zero Ω entry to its packed (log-space)
     // initial value. We build the box first, then overwrite lower=upper=packed[i]
     // for held indices. Box-before-overwrite is correct even for block Cholesky
     // off-diagonals, whose "packed" value is the raw L[i,j] (not log-transformed).
-    //
-    // A structural zero is pinned at 0, not at its packed start. The model
-    // declares that covariance absent, so a template that carries a non-zero
-    // value there — estimates copied in from a full-block fit, a hand-built
-    // `ModelParameters` — must not have that value frozen for the whole fit.
-    // For every template the parser builds the start is already 0.
+    // A structural zero is pinned at 0 because [`pack_params`] already packs it
+    // as 0 (#1018) — the zeroing lives there so that every caller that packs
+    // without building the box gets the same coordinate.
     for (i, &is_fixed) in fixed.iter().enumerate() {
         if is_fixed {
-            if structural[i] {
-                packed[i] = 0.0;
-            }
             bounds.lower[i] = packed[i];
             bounds.upper[i] = packed[i];
         }
@@ -2427,10 +2450,16 @@ mod tests {
             false,
             stale.omega.free_mask.clone(),
         );
-        // The straddle: without it a pin at the start value would also read 0.
+        // The straddle: the fixture's own Cholesky carries a non-zero L[2,0], so
+        // "packs as 0" is a property of the packing, not of the input.
         assert!(
-            pack_params(&stale)[4] != 0.0,
-            "fixture must carry a non-zero structural start at packed slot 4"
+            stale.omega.chol[(2, 0)] != 0.0,
+            "fixture must carry a non-zero structural Cholesky entry"
+        );
+        assert_eq!(
+            pack_params(&stale)[4],
+            0.0,
+            "pack_params must zero a structural slot"
         );
         let pinned = pack_with_bounds(&stale);
         assert!(
