@@ -100,6 +100,53 @@ pub(crate) const AUTO_SWITCH_PROBE_INTERVAL: usize = 25;
 /// [`STIFF_RE_LAMBDA_THRESHOLD`]: crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD
 pub(crate) const MAX_AUTO_SWITCHES_PER_SEGMENT: usize = 8;
 
+/// Dormand-Prince 5(4)'s real-axis stability boundary, used by Hairer's free
+/// stage-based stiffness estimate. The estimate is dimensionless (`h * rho`),
+/// so unlike the segment-entry Jacobian threshold it is invariant to the
+/// model's choice of time unit.
+const RK45_STIFFNESS_THRESHOLD: f64 = 3.25;
+
+/// Consecutive stiff stage estimates required before replacing RK45. Hairer's
+/// DOPRI5 detector uses the same ratification count; carrying it across event
+/// intervals is important because a typical PK interval contains fewer steps.
+const RK45_STIFFNESS_RATIFY: usize = 15;
+
+/// Non-stiff estimates required to clear a partially accumulated stiff verdict.
+const RK45_NONSTIFF_RESET: usize = 6;
+
+/// State belonging to one logical subject solve rather than one event interval.
+///
+/// Event handling must rebuild the stepper because a dose or forcing change
+/// invalidates its stages. These counters remain meaningful across that boundary:
+/// they summarize accepted RK45 steps, exactly the work the detector reads.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OdeAutoSwitchState {
+    accepted_since_probe: usize,
+    rk_stiff: usize,
+    rk_nonstiff: usize,
+}
+
+impl OdeAutoSwitchState {
+    fn observe_rk45(&mut self, indicator: f64) -> bool {
+        if !indicator.is_nan() && indicator > RK45_STIFFNESS_THRESHOLD {
+            self.rk_stiff += 1;
+            self.rk_nonstiff = 0;
+        } else {
+            self.rk_nonstiff += 1;
+            if self.rk_nonstiff >= RK45_NONSTIFF_RESET {
+                self.rk_stiff = 0;
+                self.rk_nonstiff = 0;
+            }
+        }
+        self.rk_stiff >= RK45_STIFFNESS_RATIFY
+    }
+
+    fn reset_rk45_verdict(&mut self) {
+        self.rk_stiff = 0;
+        self.rk_nonstiff = 0;
+    }
+}
+
 /// Step-shrink factor applied when the local error estimate is non-finite (NaN/∞). The
 /// trajectory is diverging, so shrink toward `min_dt` instead of falling into the
 /// I-controller's growth branch, which would otherwise enlarge the step on a NaN error.
@@ -816,6 +863,13 @@ pub(crate) trait Stepper<T: PkNum> {
     /// the step could not be formed at all (a singular Rosenbrock `W`), where even the
     /// `min_dt` force-accept must not fire because it would commit garbage.
     fn attempt_usable(&self) -> bool;
+
+    /// Dimensionless estimate of `h * rho(J)` from stages already computed by
+    /// the last attempt. Only explicit methods with a published estimator
+    /// override this; returning `None` falls back to the periodic Jacobian probe.
+    fn stiffness_indicator(&self, _dt: f64) -> Option<f64> {
+        None
+    }
 }
 
 /// Build the stepper for `method`, sized for an `n`-state system.
@@ -1016,6 +1070,21 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     fn attempt_usable(&self) -> bool {
         true
     }
+
+    fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
+        // Hairer & Wanner's DOPRI5 estimate. `u_tmp` is the stage-6 state and
+        // remains intact after k6 is evaluated; u5/k7 are the accepted endpoint.
+        // Values only keep prediction and sensitivity solves on the same path.
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for i in 0..self.n {
+            let dk = self.k7[i].val() - self.k6[i].val();
+            let du = self.u5[i].val() - self.u_tmp[i].val();
+            num += dk * dk;
+            den += du * du;
+        }
+        (den > 0.0).then(|| dt.abs() * (num / den).sqrt())
+    }
 }
 
 /// The shared adaptive driver: integrate `t_span`, saving the state at every `saveat` time and
@@ -1052,6 +1121,7 @@ fn integrate_dense_g<T: PkNum>(
     interp_at: &[f64],
     opts: &OdeSolverOptions,
     mut stats: Option<&mut OdeSolverStats>,
+    auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let n = u0.len();
     let (t0, tf) = t_span;
@@ -1088,6 +1158,9 @@ fn integrate_dense_g<T: PkNum>(
     // whether *any* stiff phase of this segment stalled.
     let mut stiff_min_step_clamps = 0usize;
     let mut method = method;
+    if method != OdeMethod::EXPLICIT_FALLBACK {
+        auto_state.reset_rk45_verdict();
+    }
     let mut stepper = make_stepper::<T>(n, method);
     stepper.set_dense_required(!interp_at.is_empty());
     let mut err_exp = stepper.err_exp();
@@ -1095,7 +1168,7 @@ fn integrate_dense_g<T: PkNum>(
     // result included (the same rule the escalation guard follows). The explicit re-solve the
     // guard runs pins its method for exactly this reason, so it cannot switch back.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
-    let mut accepted_since_probe = 0usize;
+    let mut accepted_since_probe = auto_state.accepted_since_probe;
     let mut switches = 0usize;
     // A segment that starts on a stiff method was counted as an escalation by the caller (the
     // guard needs that count before the segment runs), so a later switch must not count it
@@ -1152,6 +1225,7 @@ fn integrate_dense_g<T: PkNum>(
         }
 
         if accepted {
+            let stiffness_indicator = stepper.stiffness_indicator(dt_eff);
             // Soft sampling: read every `interp_at` time in this just-accepted step's
             // half-open span `(t, t+dt_eff]` off the method's continuous extension, *before*
             // `u` advances and the stepper recycles its stages. This only reads committed
@@ -1198,14 +1272,30 @@ fn integrate_dense_g<T: PkNum>(
             // Reads `PkNum::val` only, like every other comparison a driver makes, so the
             // `T = f64` prediction and the `T = Dual2` sensitivity solve switch at the same
             // step and the analytic gradient keeps differentiating the reported trajectory.
-            accepted_since_probe += 1;
-            if switching
+            if switching {
+                accepted_since_probe += 1;
+            }
+            let stage_escalation = switching
                 && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
-                && accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL
-            {
-                accepted_since_probe = 0;
-                let verdict = super::stiffness::resolve_method(rhs, &u, params, t, opts);
-                if verdict != method {
+                && method == OdeMethod::EXPLICIT_FALLBACK
+                && stiffness_indicator.is_some_and(|indicator| auto_state.observe_rk45(indicator));
+            // A verdict ratified by the step that reaches `tf` belongs to the next interval:
+            // there is no remaining span for a replacement stepper to integrate here. Leave
+            // it in `auto_state` so `integrate_resolved_g_inner` can consume it at the next
+            // non-zero segment instead of reporting a switch that never took a step.
+            if switching && t < tf - 1e-15 && switches < MAX_AUTO_SWITCHES_PER_SEGMENT {
+                let periodic_probe = accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL;
+                let verdict = if stage_escalation {
+                    Some(super::stiffness::stiff_method_for(opts))
+                } else if periodic_probe {
+                    Some(super::stiffness::resolve_method(rhs, &u, params, t, opts))
+                } else {
+                    None
+                };
+                if periodic_probe {
+                    accepted_since_probe = 0;
+                }
+                if let Some(verdict) = verdict.filter(|&verdict| verdict != method) {
                     method = verdict;
                     stepper = make_stepper::<T>(n, method);
                     stepper.set_dense_required(!interp_at.is_empty());
@@ -1228,6 +1318,7 @@ fn integrate_dense_g<T: PkNum>(
                     }
                     escalation_counted |= newly_escalated;
                     switches += 1;
+                    auto_state.reset_rk45_verdict();
                     // The new stepper gets the whole abort budget. `stiff_abort_after` bounds
                     // how long *a method* is allowed to grind on a segment it cannot step, and
                     // the method just changed; the clamps behind this point measured the one
@@ -1280,6 +1371,7 @@ fn integrate_dense_g<T: PkNum>(
             s.unfinished_segments += 1;
         }
     }
+    auto_state.accepted_since_probe = accepted_since_probe;
 
     // Fill any remaining saveat / interp times with the last state.
     while save_idx < saveat.len() {
@@ -1346,8 +1438,38 @@ pub(crate) fn solve_ode_dense(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPoint>, Vec<SolPoint>) {
-    let (hard, soft) =
-        integrate_resolved_g(rhs, u0, t_span, params, saveat, interp_at, opts, stats);
+    let mut auto_state = OdeAutoSwitchState::default();
+    solve_ode_dense_with_auto_state(
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        interp_at,
+        opts,
+        stats,
+        &mut auto_state,
+    )
+}
+
+/// Dense solve that carries the cheap AutoSwitch detector across event intervals
+/// belonging to the same subject. Stepper workspaces are still rebuilt because
+/// an event may invalidate their stages and Jacobian.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_ode_dense_with_auto_state(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    stats: Option<&mut OdeSolverStats>,
+    auto_state: &mut OdeAutoSwitchState,
+) -> (Vec<SolPoint>, Vec<SolPoint>) {
+    let (hard, soft) = integrate_resolved_g(
+        rhs, u0, t_span, params, saveat, interp_at, opts, stats, auto_state,
+    );
     let to_points = |v: Vec<SolPointG<f64>>| -> Vec<SolPoint> {
         v.into_iter().map(|p| SolPoint { t: p.t, u: p.u }).collect()
     };
@@ -1758,6 +1880,21 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     solve_ode_g_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
 }
 
+/// Generic solve that carries AutoSwitch detector history across the event
+/// intervals of one prediction/sensitivity walk.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_ode_g_with_auto_state<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+    auto_state: &mut OdeAutoSwitchState,
+) -> Vec<SolPointG<T>> {
+    integrate_resolved_g(rhs, u0, t_span, params, saveat, &[], opts, None, auto_state).0
+}
+
 /// [`solve_ode_g`] with dense soft-sampling — the sensitivity-carrying twin of
 /// `solve_ode_dense`. Available for every method because the interpolation comes from the
 /// `Stepper`, so an analytic-gradient consumer that needs an in-step readout (a hazard state
@@ -1773,7 +1910,18 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
-    integrate_resolved_g(rhs, u0, t_span, params, saveat, interp_at, opts, stats)
+    let mut auto_state = OdeAutoSwitchState::default();
+    integrate_resolved_g(
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        interp_at,
+        opts,
+        stats,
+        &mut auto_state,
+    )
 }
 
 thread_local! {
@@ -1885,9 +2033,12 @@ fn integrate_resolved_g<T: PkNum>(
     interp_at: &[f64],
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
+    auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     if !stats_sink_active() {
-        return integrate_resolved_g_inner(rhs, u0, t_span, params, saveat, interp_at, opts, stats);
+        return integrate_resolved_g_inner(
+            rhs, u0, t_span, params, saveat, interp_at, opts, stats, auto_state,
+        );
     }
     let mut local = OdeSolverStats::default();
     let out = integrate_resolved_g_inner(
@@ -1899,6 +2050,7 @@ fn integrate_resolved_g<T: PkNum>(
         interp_at,
         opts,
         Some(&mut local),
+        auto_state,
     );
     record_to_stats_sink(&local);
     if let Some(s) = stats {
@@ -1942,18 +2094,31 @@ fn integrate_resolved_g_inner<T: PkNum>(
     interp_at: &[f64],
     opts: &OdeSolverOptions,
     mut stats: Option<&mut OdeSolverStats>,
+    auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     // A zero-length span returns `u0` at every requested time without stepping, so there is
     // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these
     // wherever two events share a time.
-    let method = if (t_span.1 - t_span.0).abs() < 1e-15 {
+    let nonzero_span = (t_span.1 - t_span.0).abs() >= 1e-15;
+    let method = if !nonzero_span {
         OdeMethod::EXPLICIT_FALLBACK
+    } else if opts.method == OdeMethod::Auto
+        && opts.auto_switch
+        && auto_state.rk_stiff >= RK45_STIFFNESS_RATIFY
+    {
+        // A stage verdict may have been ratified by the final accepted step of the previous
+        // event interval. The entry Jacobian is only a backstop and must not override that
+        // accumulated, dimensionless evidence before a stiff stepper gets a chance to run.
+        super::stiffness::stiff_method_for(opts)
     } else {
         super::stiffness::resolve_method(rhs, u0, params, t_span.0, opts)
     };
-    let run = |method: OdeMethod, opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>| {
+    let run = |method: OdeMethod,
+               opts: &OdeSolverOptions,
+               stats: Option<&mut OdeSolverStats>,
+               auto_state: &mut OdeAutoSwitchState| {
         integrate_dense_g(
-            method, rhs, u0, t_span, params, saveat, interp_at, opts, stats,
+            method, rhs, u0, t_span, params, saveat, interp_at, opts, stats, auto_state,
         )
     };
     // The explicit re-solve the guard falls back to **pins** its method, which is also what
@@ -1969,7 +2134,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // written directly by the one and only solve.
     let may_switch = opts.method == OdeMethod::Auto && opts.auto_switch;
     if opts.method != OdeMethod::Auto || (method == OdeMethod::EXPLICIT_FALLBACK && !may_switch) {
-        return run(method, opts, stats);
+        return run(method, opts, stats, auto_state);
     }
 
     // An escalation — at the segment's start, or reached mid-segment by a re-probe — is scored
@@ -1980,7 +2145,8 @@ fn integrate_resolved_g_inner<T: PkNum>(
         auto_stiff_segments: usize::from(escalated_at_start),
         ..Default::default()
     };
-    let out = run(method, opts, Some(&mut attempt));
+    let auto_state_entry = *auto_state;
+    let out = run(method, opts, Some(&mut attempt), auto_state);
 
     // Two ways an escalation goes wrong, and the second is the one that bites. A non-finite
     // trajectory is loud. A stiff method that clamps at `min_dt` is not: the driver stops and
@@ -2071,6 +2237,9 @@ fn integrate_resolved_g_inner<T: PkNum>(
     if usable {
         return out;
     }
+    // The discarded attempt's detector votes describe a trajectory the caller
+    // will never receive. Restore the entry history before the pinned fallback.
+    *auto_state = auto_state_entry;
     // Score the explicit re-solve separately too. Returning the rejected stiff attempt is no
     // better when this one fails, and a third solve would only guess at another method, so the
     // explicit result remains the deterministic fallback — but it must not be returned as if
@@ -2089,6 +2258,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
         OdeMethod::EXPLICIT_FALLBACK,
         &pinned_explicit,
         Some(&mut fallback),
+        auto_state,
     );
     // Scored on the same two finiteness questions as the attempt, jets included (#1204 item
     // 4): an explicit re-solve that returns finite values with `NaN` jets has not repaired
@@ -3744,5 +3914,105 @@ mod tests {
             dup_at.unwrap(),
             calls.len(),
         );
+    }
+
+    #[test]
+    fn terminal_stage_verdict_starts_next_event_interval_stiff() {
+        let rhs = |u: &[f64], _: &[f64], _: f64, du: &mut [f64]| {
+            du[0] = -10.0 * u[0];
+        };
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Auto,
+            auto_switch: true,
+            min_dt: 0.33,
+            abstol: 1e-6,
+            ..Default::default()
+        };
+        let mut state = OdeAutoSwitchState::default();
+        let mut stats = OdeSolverStats::default();
+        let mut u = vec![1e-12];
+
+        for i in 0..15 {
+            let start = i as f64 * 0.33;
+            let end = (i + 1) as f64 * 0.33;
+            let (sol, _) = solve_ode_dense_with_auto_state(
+                &rhs,
+                &u,
+                (start, end),
+                &[],
+                &[end],
+                &[],
+                &opts,
+                Some(&mut stats),
+                &mut state,
+            );
+            u.clone_from(&sol.last().unwrap().u);
+        }
+
+        assert_eq!(stats.accepted_steps, 15);
+        assert_eq!(stats.auto_switched_segments, 0);
+        assert_eq!(stats.auto_stiff_segments, 0);
+        assert_eq!(stats.min_step_clamped_steps, 0);
+        assert_eq!(state.rk_stiff, RK45_STIFFNESS_RATIFY);
+
+        let start = 15.0 * 0.33;
+        let end = 16.0 * 0.33;
+        let _ = solve_ode_dense_with_auto_state(
+            &rhs,
+            &u,
+            (start, end),
+            &[],
+            &[end],
+            &[],
+            &opts,
+            Some(&mut stats),
+            &mut state,
+        );
+
+        assert_eq!(stats.accepted_steps, 16);
+        assert_eq!(stats.auto_stiff_segments, 1);
+        assert_eq!(state.rk_stiff, 0);
+    }
+
+    fn rk45_indicator(rate: f64, dt: f64) -> f64 {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = rate * u[0];
+        };
+        let opts = OdeSolverOptions::default();
+        let mut stepper = Rk45Stepper::new(1);
+        let _ = stepper.attempt(&rhs, &[1.0], &[], 0.0, dt, &opts);
+        stepper.stiffness_indicator(dt).unwrap()
+    }
+
+    #[test]
+    fn rk45_stage_stiffness_indicator_is_dimensionless() {
+        // The same decay written in hours and days has the same h*lambda and
+        // therefore the same verdict. The old fixed Jacobian-rate threshold
+        // changes by 24x under this conversion.
+        let hours = rk45_indicator(-10.0, 0.1);
+        let days = rk45_indicator(-240.0, 0.1 / 24.0);
+        assert_relative_eq!(hours, days, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn rk45_stiffness_votes_survive_event_intervals() {
+        let mut state = OdeAutoSwitchState::default();
+
+        // Think of each group as a short event-to-event solve. No one group
+        // reaches Hairer's 15-vote ratification count, but the logical subject
+        // solve does.
+        for _ in 0..5 {
+            assert!(!state.observe_rk45(RK45_STIFFNESS_THRESHOLD * 2.0));
+        }
+        for _ in 0..5 {
+            assert!(!state.observe_rk45(RK45_STIFFNESS_THRESHOLD * 2.0));
+        }
+        for _ in 0..4 {
+            assert!(!state.observe_rk45(RK45_STIFFNESS_THRESHOLD * 2.0));
+        }
+        assert!(state.observe_rk45(RK45_STIFFNESS_THRESHOLD * 2.0));
+
+        state.reset_rk45_verdict();
+        assert!(!state.observe_rk45(0.0));
     }
 }

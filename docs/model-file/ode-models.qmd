@@ -463,11 +463,13 @@ Two things, both worth knowing now that `auto` is the default. When the
 fallback completes, neither makes the answer worse than the explicit result, but both can make a
 fit slower than pinning a method by hand.
 
-*It is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
+*The starting decision is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
 hour-based convention typical of PK models, and the one the default tolerances assume. The same
 model written in days reads 24× smaller and may never trigger; written in minutes it reads 60×
 larger and can escalate wholesale — an oral model with `ka = 0.6/min` puts `λ_max` at 36 with
-nothing stiff in it anywhere.
+nothing stiff in it anywhere. Once RK45 is running, its stage-based detector uses the
+dimensionless product of step size and an estimated Jacobian rate, so that second decision is
+unchanged by an hours-to-days conversion.
 
 *It measures speed, not separation.* Stiffness is really a *ratio* — a fast mode alongside a slow
 one — and this reads only the fast end. A system whose modes are all equally fast is not stiff
@@ -576,13 +578,16 @@ segment exhausts `ode_max_steps` and comes back with a **median relative error o
 central compartment, while `rodas4` integrates it to `7e-8` in 79 steps. And it does so
 *quietly*: the segment produces **zero** minimum-step clamps and a **lower** step-rejection rate
 than the accurate cases, so neither the min-step counter nor a rejection-rate detector can see
-it. Only re-reading the Jacobian can.
+it. A stage-based stability estimate or a fresh Jacobian can.
 
-So `auto` does exactly that. Every 25 accepted steps it re-runs the probe at the state the
-segment has reached and, if the verdict has changed, **swaps the stepper in place**: the segment
-keeps everything it has integrated so far and carries on with the other method, rather than
-restarting or re-solving. On the model above this takes `auto` from 143 % median error in 10 000
-steps to `7e-8` in 90 — matching the method a user would have had to know to name in advance.
+RK45 now uses the stages of every accepted step to estimate `h·ρ(J)`, the same dimensionless
+stability signal used by the original Dormand–Prince stiffness detector. Consecutive stiff
+verdicts switch to the stiff method without another RHS evaluation. Those verdict counters
+belong to the subject solve and survive event boundaries, even though the stepper workspace is
+rebuilt because a dose or forcing change invalidates its stages. Every 25 accepted steps `auto`
+also re-runs the Jacobian probe as a backstop. If either detector changes the verdict, it
+**swaps the stepper in place**: the segment keeps everything it has integrated so far and
+carries on with the other method, rather than restarting or re-solving.
 
 A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
 comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
@@ -597,8 +602,8 @@ event-time path (TTE draws, adaptive dosing) switches on the same rule, where it
 its output *is* the answer, so a badly integrated span moves the event time rather than one
 prediction.
 
-Being a threshold test, the re-probe is also a **discontinuity** in the objective as a function
-of θ: a segment whose `|Re λ|max` sits near the threshold when the probe fires can switch at θ
+Being threshold tests, both detectors add a **discontinuity** in the objective as a function
+of θ: a segment whose stage estimate or `|Re λ|max` sits near its threshold can switch at θ
 and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
 start-of-segment probe and the escalation guard have the same property — re-probing adds up to
 eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
@@ -608,11 +613,10 @@ standard errors on a model whose `ode_solver` warning reports mid-segment switch
 with `ode_auto_switch = false`, or with a named stiff method (pinned, and so free of both the
 probe and the guard), to see whether the switching is what moved them.
 
-A benign segment stays on its stepper: a segment shorter than 25 accepted steps is never
-re-probed at all, and a longer one pays roughly one probe per 25 steps — a Jacobian build and an
-eigensolve against 25 full steps — and keeps a trajectory bit-identical to the pinned explicit
-one, because the verdict never changes. To go back to one method per segment, chosen at its
-start:
+A benign segment stays on its stepper. Its per-step stage estimate is arithmetic over values
+RK45 already computed; it pays no extra RHS calls. The periodic backstop costs roughly one
+Jacobian probe per 25 accepted steps, counted across event intervals. To go back to one method
+per segment, chosen at its start:
 
 ```
 [fit_options]

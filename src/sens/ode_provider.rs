@@ -49,7 +49,7 @@ use super::dual2::Dual2;
 use super::dual_mixed::DualMixed;
 use super::provider::{ObsGrad, ObsSens, SubjectSens};
 use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec};
-use crate::ode::solver::solve_ode_g;
+use crate::ode::solver::{solve_ode_g, solve_ode_g_with_auto_state, OdeAutoSwitchState};
 use crate::pk::absorption::PreparedInputRate;
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
@@ -4986,6 +4986,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     }
 
     let mut cur_t = tl[0].0;
+    let mut auto_state = OdeAutoSwitchState::default();
     // With an `init(...)` baseline the state is non-zero from the subject's true integration
     // start (`subject_integration_start`, the earliest *record* time). If the first timeline
     // event is later — e.g. a lagged first dose (whose event sits at `d.time + lag`) with a
@@ -5429,7 +5430,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // Single save point per segment — a stack array avoids the per-segment
             // heap allocation of `vec![t_event]` (#449 review #14).
             let saveat = [t_event];
-            let sol = solve_ode_g(&rhs, &u, (cur_t, t_event), params, &saveat, opts);
+            let sol = solve_ode_g_with_auto_state(
+                &rhs,
+                &u,
+                (cur_t, t_event),
+                params,
+                &saveat,
+                opts,
+                &mut auto_state,
+            );
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -6819,6 +6828,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // post-dose. Measured 3.79 here against production's 1003.79 — the same gradient-vs-
     // objective divergence #1226 fixes one break earlier, and it is what
     // `provider_reads_a_dose_landing_on_the_last_observation` pins.
+    let mut auto_state = OdeAutoSwitchState::default();
     for w in 0..break_times.len() {
         let t_start = break_times[w];
 
@@ -7053,7 +7063,15 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             }
         };
 
-        let sol = solve_ode_g(&rhs, &u, (t_start, t_end), params_dual, &saveat, opts);
+        let sol = solve_ode_g_with_auto_state(
+            &rhs,
+            &u,
+            (t_start, t_end),
+            params_dual,
+            &saveat,
+            opts,
+            &mut auto_state,
+        );
 
         // Capture state at the requested observation times; advance u to t_end.
         // `pt.t` is the solver's reported save time — match observations by

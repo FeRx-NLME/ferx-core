@@ -7,7 +7,10 @@
 //! infusion's end time and adding `+rate` to the corresponding compartment's
 //! derivative for the duration of the infusion via an RHS wrapper.
 
-use crate::ode::solver::{solve_ode, solve_ode_dense, OdeSolverOptions, OdeSolverStats};
+use crate::ode::solver::{
+    solve_ode, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
+    OdeSolverStats,
+};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
     assay_standard_normal, AdaptiveMonitor, AdaptiveRun, AssayNoise, ControllerCtx,
@@ -2916,6 +2919,7 @@ fn integrate_segment(
     obs_map: &HashMap<u64, Vec<usize>>,
     predictions: &mut [f64],
     stats: Option<&mut OdeSolverStats>,
+    auto_state: &mut OdeAutoSwitchState,
     // #570: soft (Hermite-interpolated) sample times within this segment — e.g. TTE
     // event/censor times — read off the *same* integration as the observations,
     // without clamping the step sequence. The returned observation predictions and
@@ -2990,7 +2994,7 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     );
-    let (sol, soft) = solve_ode_dense(
+    let (sol, soft) = solve_ode_dense_with_auto_state(
         &wrapped_rhs,
         u,
         (t_start, t_end),
@@ -2999,6 +3003,7 @@ fn integrate_segment(
         chz_times,
         &opts,
         stats,
+        auto_state,
     );
 
     // Extract predictions and update state
@@ -3519,6 +3524,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // per subject rather than one per break.
     let obs_index = RecordIndex::new(&subject.obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
+    let mut auto_state = OdeAutoSwitchState::default();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -3641,6 +3647,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 &obs_map,
                 &mut predictions,
                 stats.as_deref_mut(),
+                &mut auto_state,
                 &seg_chz,
             );
             // Place each soft sample at its global `chz_times` index (NaN slots left for
@@ -4604,6 +4611,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let obs_index = RecordIndex::new(&shadow.obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
     let mut k = 0;
+    let mut auto_state = OdeAutoSwitchState::default();
     while k < break_times.len() {
         let t_start = break_times[k];
 
@@ -5153,6 +5161,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &obs_map,
                 &mut predictions,
                 None,
+                &mut auto_state,
                 &[],
             );
 
@@ -5517,6 +5526,7 @@ fn adaptive_frozen_replay_tv(
     // Records read *at* the current break (#1226) — sorted once, hoisted, as in the driver.
     let obs_index = RecordIndex::new(&subject.obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
+    let mut auto_state = OdeAutoSwitchState::default();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -5651,6 +5661,7 @@ fn adaptive_frozen_replay_tv(
                 &obs_map,
                 &mut predictions,
                 None,
+                &mut auto_state,
                 &[],
             );
 
@@ -6141,6 +6152,7 @@ pub fn ode_predictions_event_driven(
     // Most-recent system-reset time (EVID=3/4); `NEG_INFINITY` until the
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
+    let mut auto_state = OdeAutoSwitchState::default();
 
     for (i, &(t_event, kind, idx)) in timeline.iter().enumerate() {
         // PK params for the segment [cur_t, t_event] are evaluated AT the record
@@ -6235,13 +6247,16 @@ pub fn ode_predictions_event_driven(
                 &zero_order,
             );
             let saveat = vec![t_event];
-            let sol = solve_ode(
+            let (sol, _) = solve_ode_dense_with_auto_state(
                 &wrapped_rhs,
                 &u,
                 (cur_t, t_event),
                 &ext_params_ed,
                 &saveat,
+                &[],
                 &opts,
+                None,
+                &mut auto_state,
             );
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
