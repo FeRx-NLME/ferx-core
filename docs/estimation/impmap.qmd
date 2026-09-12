@@ -130,7 +130,9 @@ NONMEM's reported IMPMAP objective.
 > parameterization: a model with random effects whose typical values are *not*
 > eligible emits a warning and may estimate those typical values poorly
 > (θ and the η mean are confounded over the importance samples). Use FOCEI for
-> such models.
+> such models. A theta that anchors **two** ETAs is not eligible either — the
+> shift has no single well-defined value for it — so it is estimated by the
+> weighted M-step alone, with an advisory naming it.
 
 ## Validation against NONMEM
 

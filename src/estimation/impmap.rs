@@ -40,8 +40,9 @@ use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
 use crate::estimation::saem::{
-    classify_mu_ref_pairs, floor_omega_diagonal, get_mixture_mu_ref_pairs, mixture_mu_ref_means,
-    MixtureMuRefPair, MuRefPairs,
+    classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal,
+    get_mixture_mu_ref_pairs, mixture_mu_ref_means, mu_ref_pairs_for_cov_groups, MixtureMuRefPairs,
+    MuRefPairs,
 };
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
@@ -692,18 +693,24 @@ fn run_mcem(
     // the mu (log-packed lognormal, identity-packed logit — see
     // `classify_mu_ref_pairs`), which is exactly what the `log_theta[t] +=
     // eta_bar[e]` shift below assumes.
+    let mu_ref_split = classify_mu_ref_pairs(model, &init_params.theta_lower);
+    // What a #619 covariate group may not collide with — every declared anchor
+    // pair, including the ones the shared-anchor rule just dropped.
+    let cov_group_conflicts = mu_ref_pairs_for_cov_groups(&mu_ref_split);
     let MuRefPairs {
         eligible: mu_ref_pairs,
         identity_packed_log,
         log_packed_logit,
-    } = classify_mu_ref_pairs(model, &init_params.theta_lower);
+        shared_theta,
+        shared_pairs: _,
+    } = mu_ref_split;
     // Multi-theta (covariate) mu-references (#619): a group supersedes the
     // single-anchor pair on its own eta, and its thetas leave the packing
     // advisories below (the group step moves them, packing or not).
     let (cov_mu_groups, cov_mu_notes) = resolve_covariate_mu_groups(
         model,
         population,
-        &mu_ref_pairs,
+        &cov_group_conflicts,
         &init_params.theta_fixed,
         &init_params.omega.matrix,
     );
@@ -760,6 +767,19 @@ fn run_mcem(
              M-step instead. Declare the logit-scale theta with a negative lower bound to use \
              the closed-form update (#918).",
             theta_name_list(&log_packed_logit)
+        ));
+    }
+    // A θ anchoring two ETAs has no single closed-form shift (see
+    // `classify_mu_ref_pairs`); both its pairs are dropped, so it is estimated by
+    // the weighted M-step alone.
+    if !shared_theta.is_empty() {
+        warnings.push(format!(
+            "{label}: typical value(s) {} are the mu-reference anchor of more than one ETA, so \
+             the closed-form mean shift has no single well-defined value for them; they are \
+             estimated by the importance-weighted M-step instead — the channel that is biased \
+             for weakly-identified parameters (#406). Give each ETA its own typical value if \
+             the closed-form update is wanted.",
+            theta_name_list(&shared_theta)
         ));
     }
     // A closed-form-eligible typical value is updated only through the
@@ -1902,19 +1922,24 @@ fn run_mcem_mixture(
         .iter()
         .flat_map(|p| p.theta_idx.iter().copied())
         .collect();
-    let mut mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if options.mu_referencing {
-        get_mixture_mu_ref_pairs(model)
+    // A θ whose packed scale is not its mu scale — an identity-packed lognormal
+    // anchor (`theta_lower < 0`), or a log-packed logit anchor (#918) — cannot
+    // take the additive shift, so `classify_mixture_mu_ref_pairs` routes it to
+    // the weighted M-step. The two dropped lists get different advisories
+    // because they name opposite bounds to change.
+    let MixtureMuRefPairs {
+        eligible: mut mix_mu_ref_pairs,
+        identity_packed_log: identity_packed,
+        log_packed_logit: log_packed_logit_mix,
+    } = if options.mu_referencing {
+        classify_mixture_mu_ref_pairs(model, &theta_packs_log_mask)
     } else {
-        Vec::new()
+        MixtureMuRefPairs {
+            eligible: Vec::new(),
+            identity_packed_log: Vec::new(),
+            log_packed_logit: Vec::new(),
+        }
     };
-    // An identity-packed θ (`theta_lower < 0`) is not on the log scale, so the
-    // additive shift is not its EM optimum — route it to the weighted M-step.
-    let identity_packed: Vec<usize> = mix_mu_ref_pairs
-        .iter()
-        .flat_map(|p| p.theta_idx.iter().copied())
-        .filter(|&t| !theta_packs_log_mask[t])
-        .collect();
-    mix_mu_ref_pairs.retain(|p| p.theta_idx.iter().all(|&t| theta_packs_log_mask[t]));
     // A η with negligible IIV carries no mean-shift information, so its typical
     // values would be frozen at their inits (#411) — same guard as `run_mcem`,
     // applied per pair (all of that η's class θ share the one ω).
@@ -1940,6 +1965,16 @@ fn run_mcem_mixture(
              shift does not apply and they are estimated by the importance-weighted M-step \
              instead (#996).",
             name_list(identity_packed)
+        ));
+    }
+    if !log_packed_logit_mix.is_empty() {
+        warnings.push(format!(
+            "{label}: typical value(s) {} are logit-mu-referenced but declared with a \
+             non-negative lower bound, so they are packed on the log scale; the closed-form \
+             mu-ref shift does not apply and they are estimated by the importance-weighted \
+             M-step instead. Declare the logit-scale theta with a negative lower bound to use \
+             the closed-form update (#918).",
+            name_list(log_packed_logit_mix)
         ));
     }
     if !weak.is_empty() {
@@ -2972,6 +3007,167 @@ mod tests {
             !hit.contains("TVV"),
             "TVV is log-packed and must not be listed: {hit}"
         );
+    }
+
+    #[test]
+    fn imp_single_population_shared_anchor_routes_to_weighted_mstep() {
+        // Two ETAs mu-referenced to the same θ: the closed form shifts a packed θ
+        // by *one* η mean and pins it, so there is no single well-defined update
+        // — both pairs are dropped and TVP is named (codex review of #1375).
+        let src = r"
+[parameters]
+  theta TVP(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVP * exp(ETA_CL)
+  V  = TVP * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Imp;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(996);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("mu-reference anchor of more than one ETA"))
+            .unwrap_or_else(|| {
+                panic!("expected the shared-anchor warning, got {:?}", res.warnings)
+            });
+        assert!(hit.contains("TVP"), "TVP named in the warning: {hit}");
+        // …and the fit still falls back cleanly: with no eligible pair left, the
+        // weighted M-step owns every θ.
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("no closed-form mu-referenced parameters found")),
+            "expected the no-closed-form fallback warning, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// The eligible twin: a mixture whose **only** mu-reference is a class-shared
+    /// logit anchor, identity-packed as the closed form wants. The class-switched
+    /// clearances carry no ETA, so the class-aware pair set is empty unless the
+    /// logit anchor is in it — which is exactly what the "no class-aware
+    /// mu-referencing was applied" fallback warning reports. Before the codex
+    /// review of #1375 the mixture pair builder filtered on `log_transformed()`
+    /// and this warning fired (#918).
+    #[test]
+    fn impmap_mixture_takes_a_class_shared_logit_anchor() {
+        let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(-0.405465, -10.0, 10.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_F ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 else TVCL2
+  V  = TVV
+  F  = inv_logit(LOGIT_F + ETA_F)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("no class-aware mu-referencing was applied")),
+            "the logit anchor is an eligible class-shared pair, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the log scale")),
+            "LOGIT_F is identity-packed; no packing advisory expected, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// A **mixture** whose class-shared anchor is logit-scale but declared with a
+    /// non-negative lower bound: log-packed, so the class-aware shift cannot run
+    /// and the #918 advisory names it. Before the codex review of #1375 a logit
+    /// anchor never reached the mixture pair set at all, so neither this warning
+    /// nor its eligible twin existed.
+    #[test]
+    fn impmap_mixture_log_packed_logit_anchor_warns() {
+        let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(0.405465, 0.0, 10.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_F ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+  F  = inv_logit(LOGIT_F + ETA_F)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("packed on the log scale"))
+            .unwrap_or_else(|| {
+                panic!("expected the #918 packing advisory, got {:?}", res.warnings)
+            });
+        assert!(hit.contains("LOGIT_F"), "LOGIT_F named: {hit}");
     }
 
     #[test]

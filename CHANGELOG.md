@@ -36,6 +36,9 @@ section of the SDLC for the versioning policy).
   non-negative lower bound is log-packed instead, so the closed form cannot apply;
   SAEM and IMP/IMPMAP then say so in a warning that names the theta and the bound to
   change, mirroring the existing advisory for a lognormal theta with a negative one.
+  In a **mixture model**, a class-shared logit anchor (`F = inv_logit(LOGIT_F + ETA_F)`,
+  the same theta in every class) takes the closed-form shift too; a `MIXNUM`-switched
+  typical value remains lognormal-only.
 - **SAEM and IMP/IMPMAP now mu-reference covariate models that read several thetas** ([#619](https://github.com/FeRx-NLME/ferx-core/issues/619)).
   A typical value such as `CL = (TVCL + (CRCL - 90) * TH_CRCL) * exp(ETA_CL)`,
   `CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)` or `F = inv_logit(LOGIT_F + TH_SEX*SEX + ETA_F)`
@@ -110,6 +113,13 @@ section of the SDLC for the versioning policy).
   automatic fallback wherever the analytic route is out of scope (#1335).
 
 ### Fixed
+
+- A typical value used as the mu-reference anchor of **more than one** random effect
+  (`F1 = inv_logit(LOGIT_F + ETA_F1)` alongside `F2 = inv_logit(LOGIT_F + ETA_F2)`, or
+  the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is now estimated by the
+  numerical / weighted M-step with a warning naming it, instead of taking one
+  closed-form shift per random effect — which moved that theta twice in a single SAEM
+  or IMP/IMPMAP iteration ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).
 
 - **A `block_omega` next to a separate diagonal `omega` now keeps the covariances between them at exactly 0, and so does a `block_kappa` next to a separate `kappa`.** Every estimator that runs the outer optimizer — FOCE, FOCEI, Laplace / AGQ, `gn` and `gn_hybrid`, with any `optimizer` including the trust region — searched the cross-block Cholesky entries anyway. So `block_omega (ETA_CL, ETA_V)` + `omega ETA_KA` estimated `Cov(ETA_KA, ETA_CL)` and `Cov(ETA_KA, ETA_V)` and returned the full 3×3 block fit — same Ω, same OFV — while `n_parameters` already counted only the declared block. SAEM and VI already held these entries, and Gauss-Newton held them on its analytic gradient path but not on the finite-difference fallback that every IOV model (and M3, an η on the residual error, a θ-dependent error magnitude) takes. Estimates, OFV and AIC/BIC of any such fit change; `n_parameters` does not. Those entries now report an SE of exactly 0 (the covariance step already excluded them; the estimate itself no longer moves), and SIR and asymptotic uncertainty draws no longer perturb them — a SIR run on such a model also sees its Student-t dimensionality shrink by the held entries, so its weights and effective sample size move. For Rust callers, `estimation::parameterization::packed_fixed_mask` now marks these structural zeros as held along with FIX coordinates, `pack_params` packs them as 0, and `compute_bounds` pins them at `[0, 0]` where it previously returned the `[-10, 10]` off-diagonal box (#1018).
 - **`iivsearch` no longer warns that a mixed-ω candidate is fitted as a larger block than its description**, because it no longer is. The note naming #1018, and the `Space::outer_full_triangle` flag behind it, are removed, and a block-stage candidate with a block beside another η now ranks on the model it declares — on the Pharmpy `moxonidine` anchor the `[CL,V]+[KA]` candidate moves from 647.73 (fitted as the full `[CL,V,KA]` block) to 655.02, within an OFV unit of NONMEM's own run of the declared model (#1018).

@@ -250,6 +250,16 @@ typical value, only the first keeps the closed-form shift — applying both woul
 move that θ twice per iteration — and the other η's θ go to the numerical /
 weighted M-step.
 
+Both links are eligible. A **class-shared** anchor may be lognormal
+(`V = TVV * exp(ETA_V)`) or logit-scale (`F = inv_logit(LOGIT_F + ETA_F)`, with
+`LOGIT_F` declared on the logit scale): the shift is link-independent, and what
+it requires is that the *packed* theta is the mu scale — log-packed for the
+lognormal form, identity-packed for the logit one, exactly as in a
+single-population fit (#918). A mismatch is reported in the same advisory the
+single-population path emits. A **`MIXNUM`-switched** anchor is lognormal only:
+the parser recognises no switched logit chain, so such a typical value is not
+mu-referenced at all and goes through the numerical / weighted M-step.
+
 What each estimator does with that anchor set differs, and the difference is
 empirical:
 

@@ -213,6 +213,93 @@ fn logit_mu_ref_drives_the_saem_closed_form_m_step() {
     );
 }
 
+/// `LOGIT_ONLY_MODEL` with **two** logit etas anchored to the same theta — the
+/// shape a user writes when two bounded quantities share one typical value
+/// (`F1 = inv_logit(LOGIT_FR + ETA_F1)`, `FX = inv_logit(LOGIT_FR + ETA_F2)`).
+/// Each eta is a valid mu-reference on its own, but the closed form shifts the
+/// packed theta by *one* eta mean and then pins it, so there is no single
+/// well-defined update: the codex review of PR #1375 caught the classifier
+/// emitting both pairs, which made `run_saem` apply `θ += γ·mean(η_1)` and then
+/// `θ += γ·mean(η_2)` in the same iteration.
+const SHARED_LOGIT_ANCHOR_MODEL: &str = r"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta LOGIT_FR(-0.405465, -10.0, 10.0)
+  theta TVKA1(2.0,  0.5,  24.0)
+  theta TVKA2(0.2,  0.01,  0.5)
+
+  omega ETA_FR1 ~ 0.25
+  omega ETA_FR2 ~ 0.25
+
+  sigma PROP_ERR ~ 0.08 (sd)
+
+[individual_parameters]
+  FR1 = inv_logit(LOGIT_FR + ETA_FR1)
+  FR2 = 1 - FR1
+  FRX = inv_logit(LOGIT_FR + ETA_FR2)
+  CL  = TVCL * FRX
+  V   = TVV
+  KA1 = TVKA1
+  KA2 = TVKA2
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Two logit etas on one theta must take the numerical M-step, not a double
+/// shift: no closed-form eval saving at all (these two are the model's only
+/// random effects) and an advisory naming the shared anchor.
+///
+/// The control is `logit_mu_ref_drives_the_saem_closed_form_m_step` above: the
+/// same fixture with a single eta on the anchor reports `saved > 0`.
+#[test]
+fn saem_two_logit_etas_on_one_theta_route_to_the_numerical_mstep() {
+    let model = parse_full_model(SHARED_LOGIT_ANCHOR_MODEL)
+        .expect("fixture must parse")
+        .model;
+    let pop = read_nonmem_csv(Path::new("data/logit_fraction_oral.csv"), None, None)
+        .expect("fixture data must load");
+    let opts = FitOptions {
+        method: EstimationMethod::Saem,
+        saem_n_exploration: 2,
+        saem_n_convergence: 1,
+        run_covariance_step: false,
+        verbose: false,
+        saem_seed: Some(918),
+        ..FitOptions::default()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short SAEM must run");
+    assert_eq!(
+        result.saem_mu_ref_m_step_evals_saved.unwrap_or(0),
+        0,
+        "a shared anchor has no closed-form pair, so no theta is pinned and nothing is saved"
+    );
+    let hit = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("mu-reference anchor of more than one ETA"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the shared-anchor advisory, got {:?}",
+                result.warnings
+            )
+        });
+    assert!(
+        hit.contains("LOGIT_FR"),
+        "advisory must name the shared anchor: {hit}"
+    );
+}
+
 /// `LOGIT_ONLY_MODEL` with the logit-scale theta declared with a **non-negative**
 /// lower bound. ferx then packs it as `log θ`, which is not its mu scale, so the
 /// closed form cannot apply — the mirror image of the #996 identity-packed
