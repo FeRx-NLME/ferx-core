@@ -7001,6 +7001,85 @@ fn single_error_model_ltbs_respects_declaration_order() {
     );
 }
 
+// ── #1022: a single-endpoint block takes exactly one plain `DV ~ ...` line ────
+//
+// `singles` collects every plain line and the binder took `.next()`, so a second
+// statement was parsed, validated and then dropped without a word. The failure
+// this hides is a model edited in place — a replacement pasted above the line it
+// replaces — which then fits against the *old* error model while reading as the
+// new one. Same "accepted but not honoured" family as #1001 above: that one is
+// about which sigma binds, this about which line.
+//
+// Scope floor: the count applies to `singles` only. A multi-endpoint block
+// legitimately carries several lines, and they route to `per_cmt` before the
+// count is reached — `test_per_cmt_error_model_parses` below is what fails if
+// the guard ever claims that surface.
+
+#[test]
+fn single_error_model_two_plain_lines_errs() {
+    // The issue's reproducer. Both sigmas are declared in argument order, so the
+    // #1001 order rule has nothing to say and the duplicate is the only defect
+    // left for the message to be about.
+    let content = sigma_order_model(
+        "  sigma S_PROP ~ 0.05 (sd)\n  sigma S_ADD ~ 1.0 (sd)",
+        "DV ~ proportional(S_PROP)\n  DV ~ additive(S_ADD)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("more than one plain `DV ~ ...` line") && err.contains("CMT=N:"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_one_plain_line_parses() {
+    // The control that makes the test above a test of *duplication* rather than
+    // of the fixture: delete the second line and the same file parses. Without
+    // it a guard that rejected this whole shape — an `additive` second sigma, a
+    // two-sigma declaration — would pass just as green.
+    let content = sigma_order_model(
+        "  sigma S_PROP ~ 0.05 (sd)\n  sigma S_ADD ~ 1.0 (sd)",
+        "DV ~ proportional(S_PROP)",
+    );
+    parse_full_model(&content).expect("one plain line is a single-endpoint error model");
+}
+
+#[test]
+fn single_error_model_duplicate_identical_lines_errs() {
+    // The same statement twice. It is the spelling where the dropped line
+    // changes nothing numerically, so an implementation deduplicating by content
+    // would let it through — but it is also the likeliest way to arrive here by
+    // copy-paste, and staying silent about it is what lets the *non*-identical
+    // case above go unnoticed.
+    let content = sigma_order_model(
+        "  sigma S_PROP ~ 0.05 (sd)",
+        "DV ~ proportional(S_PROP)\n  DV ~ proportional(S_PROP)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("more than one plain `DV ~ ...` line"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn single_error_model_ltbs_plus_plain_line_errs() {
+    // The LTBS spelling lands in the same `singles` vector and carries the
+    // `LtbsFlags` that the chosen single stamps on the model — so before #1022
+    // this shape silently decided the *scale* of the whole fit by line order:
+    // first-line `log(DV)` logged the data, first-line `DV ~` did not, and the
+    // discarded line said nothing either way.
+    let content = sigma_order_model(
+        "  sigma S_ADD ~ 0.1 (sd)\n  sigma S_PROP ~ 0.05 (sd)",
+        "log(DV) ~ additive(S_ADD)\n  DV ~ proportional(S_PROP)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("more than one plain `DV ~ ...` line"),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn test_parse_full_model_block_sigma_cross_endpoint_covariance_builds_correlation() {
     // Cross-endpoint covariances are carried by the subject-level residual

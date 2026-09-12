@@ -15592,6 +15592,19 @@ fn parse_error_model(
             .to_string());
     }
 
+    // A single-endpoint block binds exactly one line. Before #1022 the tail was
+    // dropped silently, so a model edited in place — a replacement pasted above
+    // the original, an "old" line left behind — ran the *first* line while
+    // reading as if it ran the last. Every other duplicate in this block is
+    // already rejected (per-CMT, `iiv_on_ruv`, plain-vs-CMT mixing); this is the
+    // gap.
+    if singles.len() > 1 {
+        return Err("[error_model] has more than one plain `DV ~ ...` line; a \
+                    single-endpoint error model takes exactly one (use `CMT=N:` \
+                    prefixes for per-compartment models)"
+            .to_string());
+    }
+
     if !per_cmt.is_empty() {
         let mut seen = std::collections::HashSet::new();
         for (cmt, _, _) in &per_cmt {
