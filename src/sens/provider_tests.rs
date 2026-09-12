@@ -2358,6 +2358,115 @@ fn provider_modeled_duration_inner_matches_outer() {
     }
 }
 
+const ONECPT_IV_LOGNORMAL: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The closed-form log-normal fallback's light η-only derivative
+/// (`lognormal_eta_derivatives_only`) must match the η-block of the full
+/// `lognormal_param_derivatives` bit-for-bit: it is a strict subset of the same
+/// `pk_i·sel_ik` formula, not a second implementation, and the inner EBE loop
+/// consumes only this block. Catches a mutation that silently drifts the two
+/// apart, or that reintroduces the discarded `dp_dtheta`/`d2p_deta2`/
+/// `d2p_detadtheta` computation `lognormal_eta_derivatives_only` exists to skip.
+#[test]
+fn lognormal_eta_derivatives_only_matches_full_dp_deta() {
+    let model = parse_model_string(ONECPT_IV_LOGNORMAL).expect("parse");
+    let subject = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[1.0, 4.0, 12.0],
+    );
+    let theta = [10.0_f64, 50.0];
+    let eta = [0.15_f64, -0.10];
+    let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+
+    let light = lognormal_eta_derivatives_only(&model, &pk);
+    let full = lognormal_param_derivatives(&model, &subject, &theta, &pk);
+
+    assert_eq!(light.len(), full.dp_deta.len());
+    for (l_row, f_row) in light.iter().zip(full.dp_deta.iter()) {
+        assert_eq!(l_row, f_row);
+    }
+}
+
+/// The closed-form light provider's per-subject `ObsGrad` scratch (`hint`) must
+/// never leak stale content into the result: handing back a corrupted,
+/// hint must reproduce exactly what a fresh `Vec::new()` call returns. Exercises
+/// both a differently-sized hint and the same-sized buffer used by ordinary BFGS
+/// iterations. Catches a reuse-in-place bug that forgets to overwrite a slot,
+/// forgets to re-zero `df_deta` before accumulating into it, or mishandles a
+/// hint longer than the subject's current observation count.
+#[test]
+fn subject_eta_grad_with_schedule_hint_reuse_is_bit_identical() {
+    let model = parse_model_string(ONECPT_IV_LOGNORMAL).expect("parse");
+    let subject = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[1.0, 4.0, 12.0],
+    );
+    let theta = [10.0_f64, 50.0];
+    let eta = [0.15_f64, -0.10];
+
+    let fresh = subject_eta_grad_with_schedule(&model, &subject, &theta, &eta, None, Vec::new())
+        .expect("closed-form light provider in scope");
+
+    // A corrupted, oversized hint: wrong values, wrong `df_deta` length, and one
+    // extra trailing `ObsGrad` past the subject's real observation count.
+    let mut dirty_hint = fresh.clone();
+    for o in dirty_hint.iter_mut() {
+        o.f = -999.0;
+        let n = o.df_deta.len();
+        o.df_deta = vec![-999.0; n + 3];
+    }
+    dirty_hint.push(ObsGrad {
+        f: 12345.0,
+        df_deta: vec![6789.0],
+    });
+
+    let reused = subject_eta_grad_with_schedule(&model, &subject, &theta, &eta, None, dirty_hint)
+        .expect("closed-form light provider in scope");
+
+    assert_eq!(fresh.len(), reused.len());
+    for (a, b) in fresh.iter().zip(reused.iter()) {
+        assert_eq!(a.f, b.f);
+        assert_eq!(a.df_deta, b.df_deta);
+    }
+
+    // The steady-state reuse path keeps every `df_deta` at exactly `n_eta`, so
+    // poison that same-length buffer and evaluate at a different eta. This
+    // specifically exercises `reset_zeroed`'s in-place zeroing branch and makes
+    // stale accumulation visible even when the prediction itself has changed.
+    let eta_next = [-0.20_f64, 0.25];
+    let fresh_next =
+        subject_eta_grad_with_schedule(&model, &subject, &theta, &eta_next, None, Vec::new())
+            .expect("closed-form light provider in scope");
+    let mut same_len_hint = reused;
+    for o in &mut same_len_hint {
+        o.f = -999.0;
+        o.df_deta.fill(-999.0);
+    }
+    let reused_next =
+        subject_eta_grad_with_schedule(&model, &subject, &theta, &eta_next, None, same_len_hint)
+            .expect("closed-form light provider in scope");
+
+    assert_eq!(fresh_next.len(), reused_next.len());
+    for (a, b) in fresh_next.iter().zip(reused_next.iter()) {
+        assert_eq!(a.f, b.f);
+        assert_eq!(a.df_deta, b.df_deta);
+    }
+}
+
 /// **Bit-parity cross-check vs the ODE twin.** The closed-form modeled-duration
 /// walk and the ODE `[odes]` modeled-duration walk (already analytic + NONMEM-
 /// anchored via #630/#635) are two independent implementations of the same

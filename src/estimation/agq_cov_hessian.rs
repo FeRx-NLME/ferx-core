@@ -705,6 +705,7 @@ pub(crate) fn node_jet(
         }
         g.iter().copied().collect()
     } else {
+        let err_keys = model.error_spec.obs_keys(subject);
         analytic_eta_nll_gradient_with_schedule(
             model,
             subject,
@@ -716,6 +717,8 @@ pub(crate) fn node_jet(
             // Event-walk subjects are excluded by subject_sensitivities_cov above.
             None,
             core.mult.as_deref(),
+            err_keys.as_ref(),
+            &mut Vec::new(),
         )?
     };
     let parts = subject_cov_hessian_parts(model, subject, params, &sens, &prep, b);

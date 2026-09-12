@@ -152,6 +152,13 @@ section of the SDLC for the versioning policy).
 
 - **Closed-form steady-state bolus models with estimated lag times now use analytical event sensitivities**, avoiding finite-difference fallback for the supported event-walk route (#1311).
 
+- **The closed-form inner EBE gradient no longer computes or allocates work it discards.** Three redundant-work sites in the FOCE/FOCEI/Laplace analytic sensitivity path, none changing the objective, gradient formula or optimizer trajectory:
+  - The closed-form log-normal fallback (used when a model's compiled `[individual_parameters]` program doesn't cover every required PK slot) called the full `θ`/second-order derivative builder and then read only its η-block; it now calls a light η-only counterpart that skips the θ-axis and second-order work (and the FD `tv_theta_jacobian` pass those needed) entirely.
+  - The per-observation `∂f/∂η` walk (`run_obs_grad`, run on every inner BFGS step) allocated a fresh `Vec<f64>` per observation on every call; it now reuses a per-subject scratch buffer threaded from the inner loop across BFGS iterations, since neither the observation count nor `n_eta` changes within one EBE solve.
+  - The per-observation residual endpoint keys (`ErrorSpec::obs_keys`, non-trivial only for a `Selected`/covariate-selector error spec) were recomputed every inner BFGS step; they are now hoisted once per subject, the same treatment the custom-magnitude multiplier already got. The dense-residual (`block_sigma`) branch had the equivalent problem for that multiplier itself — it never received the caller's already-computed value — and is fixed the same way.
+
+  Verified bit-for-bit unaffected: the full `cargo test --lib` suite (4453 tests) is green, and two new regression tests pin the light derivative against the full one and the scratch-buffer reuse against a corrupted hint. No wall-clock figure is claimed here — these are allocation/redundant-computation removals with an unchanged provider call count, not a change to what gets evaluated (#1373).
+
 ### Added
 - **Additive (`+`) covariate effects in `[covariate_model]` (#1313).** A trailing operator
   token makes a relation a term added to the parameter instead of a factor on it —

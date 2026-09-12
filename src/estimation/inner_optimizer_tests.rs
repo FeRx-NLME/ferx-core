@@ -145,6 +145,7 @@ mod ctmm_inner {
         let theta = &params.theta;
 
         for &eta0 in &[-0.4_f64, 0.0, 0.55] {
+            let err_keys = model.error_spec.obs_keys(&subject);
             let g = super::super::analytic_eta_nll_gradient_with_schedule(
                 &model,
                 &subject,
@@ -155,6 +156,8 @@ mod ctmm_inner {
                 &params.residual_correlations,
                 None,
                 None,
+                err_keys.as_ref(),
+                &mut Vec::new(),
             )
             .expect("endpoint-only CTMM is in analytic scope");
 
