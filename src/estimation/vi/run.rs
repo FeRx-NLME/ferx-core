@@ -177,9 +177,10 @@ fn estimates_have_settled(x: &[f64], prev_x: &[f64], phi: &[f64], prev_phi: &[f6
 /// zero-tolerance statement of it: an `x` that cannot move must never *contribute* evidence
 /// of convergence, whatever `φ` happens to be doing on a given window.
 fn param_criterion_applies(template: &ModelParameters) -> bool {
-    let fixed = crate::estimation::parameterization::packed_fixed_mask(template);
-    let structural = crate::estimation::parameterization::omega_structural_zero_mask(template);
-    fixed.iter().zip(structural.iter()).any(|(&f, &z)| !f && !z)
+    // `packed_fixed_mask` holds FIX coordinates and structural-zero Ω entries (#1018).
+    crate::estimation::parameterization::packed_fixed_mask(template)
+        .iter()
+        .any(|&held| !held)
 }
 
 /// Scale factor turning the median absolute deviation into a consistent estimator of

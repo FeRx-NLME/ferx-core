@@ -1141,7 +1141,7 @@ fn fit_inner(
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
-    let held_mask = crate::estimation::parameterization::packed_held_mask(init_params);
+    let held_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
     let n_params_pre = held_mask.iter().filter(|&&b| !b).count();
 
     // Probe NLopt algorithm availability only when global_search will actually

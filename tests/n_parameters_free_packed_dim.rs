@@ -1,11 +1,13 @@
 //! `FitResult::n_parameters` and the BIC tally on a real `fit()` (#1177).
 //!
-//! `fit()` counts `n_parameters` from `packed_held_mask` — the coordinates the
-//! outer optimizer searches — so a mixed `block_omega` + diagonal `omega`'s
-//! structural zeros are not parameters. The unit test on the tally helper
-//! never calls `fit()`, so reverting the call site to `packed_fixed_mask`
-//! (which counts the zeros) left the whole suite green. This one goes through
-//! the public entry point and asserts against `free_packed_dim()`.
+//! `fit()` counts `n_parameters` from `packed_fixed_mask` — the coordinates the
+//! outer optimizer holds, FIX and (since #1018) structural zeros — so a mixed
+//! `block_omega` + diagonal `omega`'s structural zeros are not parameters. The
+//! unit test on the tally helper never calls `fit()`, so a call site counting
+//! the zeros (the pre-#1018 FIX-only mask) left the whole suite green. This one
+//! goes through the public entry point and asserts against `free_packed_dim()`.
+//! That the optimizer actually holds those zeros is pinned separately, in
+//! `tests/block_plus_diagonal_omega_structural_zeros.rs`.
 //!
 //! Tier 2: two outer iterations, no covariance step — returns immediately.
 

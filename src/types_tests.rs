@@ -2695,12 +2695,9 @@ mod theta_block_scale_guards {
             .unwrap()
             .model;
         let p = &model.default_params;
-        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
-        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
-        let exact = fixed
+        let exact = crate::estimation::parameterization::packed_fixed_mask(p)
             .iter()
-            .zip(&structural)
-            .filter(|(f, z)| !**f && !**z)
+            .filter(|held| !**held)
             .count();
         assert_eq!(model.free_packed_dim(), exact);
         assert_eq!(exact, 7);

@@ -369,14 +369,25 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
 }
 
 /// Build a boolean mask over the packed parameter vector marking which
-/// entries are held fixed. Layout mirrors [`pack_params`]:
+/// entries are held — every coordinate the outer optimizer does **not** search
+/// over. Its complement is the free set: `CompiledModel::free_packed_dim`
+/// counts it and `fit()` reports that count as `n_parameters`. Layout mirrors
+/// [`pack_params`]:
 ///
 /// - Theta: `template.theta_fixed[i]`.
-/// - Omega Cholesky `L[i,j]` is fixed iff either `omega_fixed[i]` or
+/// - Omega Cholesky `L[i,j]` is held iff either `omega_fixed[i]` or
 ///   `omega_fixed[j]` is set. Pinning the whole row and column of a FIX-ed
 ///   eta keeps that eta uncorrelated with any other random effect (its
 ///   initial off-diagonals are zero for a diagonal declaration, or its block
 ///   off-diagonals for a FIX-ed block).
+/// - Omega / Omega_IOV Cholesky `L[i,j]` is also held when it is a
+///   **structural zero** ([`omega_structural_zero_mask`]): a mixed block +
+///   diagonal Ω declares no covariance between the two, and `pack_params`
+///   still gives that entry a coordinate. Before #1018 only the covariance
+///   step consulted it, so every optimizer estimated the covariance the model
+///   declared absent. A held `L[i,j] = 0` keeps `Ω[i,j] = 0` exactly — the
+///   Cholesky factor of a matrix that is block-diagonal under permutation has
+///   no fill-in across the blocks.
 /// - Sigma: `template.sigma_fixed[i]`.
 pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     let mut mask = Vec::with_capacity(packed_len(template));
@@ -430,24 +441,15 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
         );
     }
 
-    mask
-}
-
-/// Every packed coordinate the outer optimizer does **not** search over:
-/// [`packed_fixed_mask`] OR [`omega_structural_zero_mask`]. Its complement is
-/// the free set — `CompiledModel::free_packed_dim` counts it, and `fit()`
-/// reports that count as `n_parameters` (#1177: previously the AIC/BIC penalty
-/// counted a mixed block + diagonal Ω's structural zeros as estimated
-/// parameters).
-pub(crate) fn packed_held_mask(template: &ModelParameters) -> Vec<bool> {
-    let fixed = packed_fixed_mask(template);
+    // Structural zeros (#1018). One source for their positions — the covariance
+    // step and `n_parameters` (#1177) read the same mask through this function.
     let structural = omega_structural_zero_mask(template);
-    debug_assert_eq!(fixed.len(), structural.len());
-    fixed
-        .iter()
-        .zip(structural.iter())
-        .map(|(f, z)| *f || *z)
-        .collect()
+    debug_assert_eq!(mask.len(), structural.len());
+    for (held, zero) in mask.iter_mut().zip(structural) {
+        *held |= zero;
+    }
+
+    mask
 }
 
 /// Packed-length mask marking the **structural-zero** off-diagonal entries of a
@@ -649,11 +651,13 @@ pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
 /// start-side `check_packed_start_in_box` (is the **start** outside the box?)
 /// walk the same three vectors and differ only in the comparison.
 pub(crate) struct PackedStart {
-    /// [`pack_params`] of the template.
+    /// [`pack_params`] of the template, with structural-zero Ω / Ω_IOV entries
+    /// set to 0.
     pub(crate) packed: Vec<f64>,
-    /// [`compute_bounds`] of the template — FIX coordinates already pinned.
+    /// [`compute_bounds`] of the template — held coordinates already pinned.
     pub(crate) bounds: PackedBounds,
-    /// [`packed_fixed_mask`] of the template.
+    /// [`packed_fixed_mask`] of the template: every **held** coordinate — FIX,
+    /// and since #1018 the structural-zero Ω / Ω_IOV entries — despite the name.
     pub(crate) fixed: Vec<bool>,
 }
 
@@ -670,18 +674,31 @@ pub(crate) struct PackedStart {
 ///
 /// Byte-for-byte what `(pack_params, compute_bounds, packed_fixed_mask)`
 /// produce separately — [`compute_bounds`] is now this function with two of its
-/// three results dropped, so there is no second copy of the box to drift.
+/// three results dropped, so there is no second copy of the box to drift. The
+/// one exception is a structural-zero Ω / Ω_IOV entry (#1018): its packed start
+/// is set to 0 here, where [`pack_params`] alone keeps the template's value.
+/// The two agree for every template the parser builds, where that value is 0.
 pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
-    let packed = pack_params(template);
+    let mut packed = pack_params(template);
     let fixed = packed_fixed_mask(template);
+    let structural = omega_structural_zero_mask(template);
     let mut bounds = unpinned_bounds(template);
 
-    // Pin any FIX parameters to their packed (log-space) initial value.
-    // We build the box first, then overwrite lower=upper=packed[i] for fixed
-    // indices. Box-before-overwrite is correct even for block Cholesky
+    // Pin any FIX parameter or structural-zero Ω entry to its packed (log-space)
+    // initial value. We build the box first, then overwrite lower=upper=packed[i]
+    // for held indices. Box-before-overwrite is correct even for block Cholesky
     // off-diagonals, whose "packed" value is the raw L[i,j] (not log-transformed).
+    //
+    // A structural zero is pinned at 0, not at its packed start. The model
+    // declares that covariance absent, so a template that carries a non-zero
+    // value there — estimates copied in from a full-block fit, a hand-built
+    // `ModelParameters` — must not have that value frozen for the whole fit.
+    // For every template the parser builds the start is already 0.
     for (i, &is_fixed) in fixed.iter().enumerate() {
         if is_fixed {
+            if structural[i] {
+                packed[i] = 0.0;
+            }
             bounds.lower[i] = packed[i];
             bounds.upper[i] = packed[i];
         }
@@ -2248,11 +2265,11 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_omega_structural_zero_mask_block_plus_diagonal() {
-        // 2 theta + block+diag Ω (col-major lower-tri: (0,0)(1,0)(2,0)(1,1)(2,1)(2,2))
-        // + 1 sigma. Structural zeros are (2,0) and (2,1).
-        let template = ModelParameters {
+    /// 2 θ + the block + diagonal Ω above + 1 σ, nothing FIX. Packed layout:
+    /// θ(0,1), Ω col-major lower-tri (0,0)=2 (1,0)=3 (2,0)=4 (1,1)=5 (2,1)=6
+    /// (2,2)=7, σ=8.
+    fn block_plus_diag_template() -> ModelParameters {
+        ModelParameters {
             residual_correlations: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 2.0],
@@ -2270,7 +2287,14 @@ mod tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
             mixture: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_omega_structural_zero_mask_block_plus_diagonal() {
+        // 2 theta + block+diag Ω (col-major lower-tri: (0,0)(1,0)(2,0)(1,1)(2,1)(2,2))
+        // + 1 sigma. Structural zeros are (2,0) and (2,1).
+        let template = block_plus_diag_template();
         let mask = omega_structural_zero_mask(&template);
         assert_eq!(mask.len(), packed_len(&template)); // 2 + 6 + 1 = 9
         let n_theta = 2;
@@ -2340,6 +2364,84 @@ mod tests {
                 expected_true.contains(&i)
             );
         }
+
+        // #1018: the optimizer's hold mask carries the IOV structural zeros too.
+        let held = packed_fixed_mask(&template);
+        for (i, &h) in held.iter().enumerate() {
+            assert_eq!(h, expected_true.contains(&i), "held[{i}]");
+        }
+    }
+
+    /// #1018: a mixed block + diagonal Ω's cross-block Cholesky entries are held
+    /// by `packed_fixed_mask` — the one mask every optimizer zeroes gradients
+    /// with — and pinned to `[0, 0]` by `pack_with_bounds`, while the in-block
+    /// covariance keeps its `[-10, 10]` box. Before the fix only the covariance
+    /// step saw them, and FOCE/FOCEI estimated `Cov(KA, CL)` and `Cov(KA, V)`.
+    #[test]
+    fn test_packed_fixed_mask_holds_block_plus_diagonal_structural_zeros() {
+        let template = block_plus_diag_template();
+        // Nothing is FIX, so the held set is exactly the two structural zeros.
+        let structural = [4usize, 6];
+        let in_block_cov = 3usize;
+
+        let held = packed_fixed_mask(&template);
+        assert_eq!(held.len(), packed_len(&template));
+        for (i, &h) in held.iter().enumerate() {
+            assert_eq!(h, structural.contains(&i), "held[{i}]");
+        }
+
+        let PackedStart {
+            packed,
+            bounds,
+            fixed,
+        } = pack_with_bounds(&template);
+        assert_eq!(fixed, held);
+        for i in structural {
+            assert!(
+                packed[i] == 0.0 && bounds.lower[i] == 0.0 && bounds.upper[i] == 0.0,
+                "structural zero {i}: packed {} box [{}, {}] must be pinned at 0",
+                packed[i],
+                bounds.lower[i],
+                bounds.upper[i]
+            );
+        }
+        assert_eq!(
+            (bounds.lower[in_block_cov], bounds.upper[in_block_cov]),
+            (-10.0, 10.0),
+            "the in-block covariance stays free"
+        );
+
+        // A full block declares no structural zero: nothing held, nothing pinned.
+        let full = make_block_template();
+        assert!(packed_fixed_mask(&full).iter().all(|&h| !h));
+
+        // A template whose structural slot carries a non-zero value (estimates
+        // copied in from a full-block fit) is pinned at 0, not at that value.
+        let mut stale = block_plus_diag_template();
+        let mut m = stale.omega.matrix.clone();
+        m[(2, 0)] = 0.01;
+        m[(0, 2)] = 0.01;
+        stale.omega = OmegaMatrix::from_matrix_with_mask(
+            m,
+            stale.omega.eta_names.clone(),
+            false,
+            stale.omega.free_mask.clone(),
+        );
+        // The straddle: without it a pin at the start value would also read 0.
+        assert!(
+            pack_params(&stale)[4] != 0.0,
+            "fixture must carry a non-zero structural start at packed slot 4"
+        );
+        let pinned = pack_with_bounds(&stale);
+        assert!(
+            pinned.packed[4] == 0.0
+                && pinned.bounds.lower[4] == 0.0
+                && pinned.bounds.upper[4] == 0.0,
+            "stale structural slot: packed {} box [{}, {}] must be pinned at 0",
+            pinned.packed[4],
+            pinned.bounds.lower[4],
+            pinned.bounds.upper[4]
+        );
     }
 
     #[test]
