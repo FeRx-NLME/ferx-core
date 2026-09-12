@@ -13658,6 +13658,32 @@ fn parse_parameters(
         }
     }
 
+    // Reject an η named in two `block_omega` blocks, or in both `omega` and
+    // `block_omega`. Overlapping blocks would make the free/structural split
+    // non-transitive: with (A,B) and (B,C) free but (A,C) structural, holding
+    // `L[C,A] = 0` no longer gives `Ω[C,A] = 0` — it fills back in as
+    // `L[C,B]·L[B,A]`, at a slot the declared model, `n_parameters` and
+    // `se_omega` all treat as absent (#1018).
+    let diag_eta_set: std::collections::HashSet<&str> =
+        omegas.iter().map(|o| o.name.as_str()).collect();
+    let mut seen_block_eta: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for bo in &block_omegas {
+        for name in &bo.names {
+            if diag_eta_set.contains(name.as_str()) {
+                return Err(format!(
+                    "'{}' appears in both omega and block_omega declarations",
+                    name
+                ));
+            }
+            if !seen_block_eta.insert(name.as_str()) {
+                return Err(format!(
+                    "'{}' appears in more than one block_omega declaration",
+                    name
+                ));
+            }
+        }
+    }
+
     // Reject names that appear in both kappa and block_kappa
     let diag_name_set: std::collections::HashSet<&str> =
         kappas.iter().map(|k| k.name.as_str()).collect();

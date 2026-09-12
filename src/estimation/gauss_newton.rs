@@ -973,16 +973,14 @@ fn subject_nll_pop_grad_analytical(
     let omega_start = n_theta;
     // Single source: same column-major lower-tri order as `pack_params`.
     let omega_entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, template.omega.diagonal);
-    let free_mask = &template.omega.free_mask;
 
     for (ko, &(row, col)) in omega_entries.iter().enumerate() {
         let k = omega_start + ko;
+        // Held: FIX, or a structural zero (cross-block off-diagonal of a mixed
+        // block + diagonal Ω). `packed_fixed_mask` carries both since #1018, so
+        // this is the only gate — a second `free_mask` test here would reject
+        // exactly the same entries and hide a mutation of either.
         if fixed_mask[k] {
-            continue;
-        }
-        // Structural zero (cross-block off-diagonal in a multi-block_omega
-        // declaration): same reasoning as the Laplace path.
-        if !free_mask[(row, col)] {
             continue;
         }
         if row == col {
@@ -1439,19 +1437,14 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     // Single source: same column-major lower-tri order as `pack_params`.
     let omega_entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, template.omega.diagonal);
     let l_omega = &omega.chol;
-    let free_mask = &template.omega.free_mask;
 
     for (ko, &(row, col)) in omega_entries.iter().enumerate() {
         let k = omega_start + ko;
+        // Held: FIX, or a structural zero (the model declares L[row, col] ≡ 0,
+        // so skipping it keeps the outer optimiser from pulling the slot away
+        // from zero on the strength of an in-block-only chain rule).
+        // `packed_fixed_mask` carries both since #1018 — one gate, not two.
         if fixed_mask[k] {
-            continue;
-        }
-        // Structural zero (cross-block off-diagonal in a multi-block_omega
-        // declaration): the model declares L[row, col] ≡ 0, so its gradient
-        // is zero by construction. Skipping here prevents the outer
-        // optimiser from pulling these slots away from zero on the strength
-        // of an in-block-only chain rule.
-        if !free_mask[(row, col)] {
             continue;
         }
         // v = L[:,col]

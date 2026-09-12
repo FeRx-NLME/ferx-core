@@ -142,7 +142,7 @@ pub fn bic(result: &FitResult, kind: BicType) -> f64 {
 
 /// Tally the free packed parameters by Delattre class.
 ///
-/// `held_mask` is `packed_held_mask(template)` (FIX or structural zero) — the
+/// `held_mask` is `packed_fixed_mask(template)` (FIX or structural zero) — the
 /// same mask `fit()` counts `n_parameters` from — and is walked segment by segment in
 /// `pack_params` order: `θ`, `Ω` (Cholesky lower triangle), `σ`, `Ω_IOV`,
 /// mixture Ω overrides, mixture σ overrides, `block_sigma` correlations. Each

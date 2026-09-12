@@ -745,7 +745,7 @@ fn the_report_writes_the_table_the_models_and_the_final_model() {
 }
 
 #[test]
-fn a_partial_block_candidate_under_focei_carries_the_1018_note() {
+fn a_partial_block_candidate_carries_no_caveat_note() {
     let s = IivStructure::new(
         vec!["CL".into(), "V".into(), "KA".into()],
         vec![vec!["CL".into(), "V".into()]],
@@ -764,21 +764,18 @@ fn a_partial_block_candidate_under_focei_carries_the_1018_note() {
     );
     assert!(!two.is_partial_block());
 
+    // Every estimator honours the declared structure since ferx-core #1018, so a
+    // partial-block candidate is fitted as written and the search says nothing
+    // about it — the caveat note this test used to assert is gone with the bug.
     let script = ScriptedFitter::new(key, &[("[CL]+[KA]+[V]", 100.0), ("[CL,V]+[KA]", 90.0)]);
     let mut o = options(Algorithm::Skip);
     o.correlation_algorithm = Some(CorrelationAlgorithm::TopDownExhaustive);
-    let mut space = space(ALL);
-    space.outer_full_triangle = true;
-    let result = run(&script, space, &o);
+    let result = run(&script, space(ALL), &o);
     assert!(
-        result.notes.iter().any(|n| n.contains("#1018")),
+        !result.notes.iter().any(|n| n.contains("#1018")),
         "{:?}",
         result.notes
     );
-    // Under an estimator that honours the structure there is nothing to say.
-    let script = ScriptedFitter::new(key, &[("[CL]+[KA]+[V]", 100.0), ("[CL,V]+[KA]", 90.0)]);
-    let result = run(&script, self::space(ALL), &o);
-    assert!(!result.notes.iter().any(|n| n.contains("#1018")));
 }
 
 /// A four-η base whose `KA`/`F` η are blocked together — a block the space's
