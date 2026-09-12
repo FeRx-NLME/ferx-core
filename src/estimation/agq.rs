@@ -448,14 +448,17 @@ fn score_core_at(
     params: &ModelParameters,
     stack: &Stack,
     b_hat: &[f64],
-) -> Option<crate::estimation::sens_outer_gradient::ScoreCore> {
+) -> Option<(
+    crate::estimation::sens_outer_gradient::ScoreCore,
+    crate::sens::provider::SubjectSens,
+)> {
     // The jet is the stacked (η, κ) one under IOV, so this serves both regimes.
     let sens = if stack.is_iov() {
         crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b_hat)?
     } else {
         crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b_hat)?
     };
-    crate::estimation::sens_outer_gradient::score_core(
+    let core = crate::estimation::sens_outer_gradient::score_core(
         model,
         subject,
         params,
@@ -464,7 +467,45 @@ fn score_core_at(
         &stack.omega_joint_inv,
         b_hat,
         model.residual_error_eta,
+    )?;
+    // The jet is returned, not dropped, so the Laplace derivative sweep can use it as its base
+    // instead of recomputing this exact call (#1344 item 2). Most callers ignore it.
+    Some((core, sens))
+}
+
+/// [`anchor_hessian`] plus the base jet, for the one caller that can use it.
+///
+/// The gradient path needs both the anchor *and* — on the `Exact` arm — the base jet that built
+/// it, because `laplace_h_deriv`'s sweep would otherwise recompute the identical
+/// `subject_sensitivities(model, subject, theta, b_hat)` call as its own base. Surfacing it here
+/// removes one of the sweep's `1 + 2·n_eta` evaluations.
+///
+/// This is a second spelling of the `Exact` dispatch, not a second implementation: both arms go
+/// through [`score_core_at`], so the Hessian is the same matrix `anchor_hessian` would return,
+/// and anything that is not "`Exact`, non-IOV, in scope" falls straight through to it. A jet is
+/// offered **only** for the non-IOV `Exact` case — under IOV `score_core_at` builds the stacked
+/// `(η, κ)` jet, which is not what a `covariance_sensitivities(iov = false)` sweep wants, and
+/// `subject_h_inner_dx` declines IOV anyway.
+fn anchor_hessian_and_base_jet(
+    anchor: HessianAnchor,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    stack: &Stack,
+    b_hat: &[f64],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> Option<(DMatrix<f64>, Option<crate::sens::provider::SubjectSens>)> {
+    if matches!(anchor, HessianAnchor::Exact) && !stack.is_iov() && analytic_score_supported(model)
+    {
+        if let Some((core, jet)) = score_core_at(model, subject, params, stack, b_hat) {
+            return Some((core.h_inner, Some(jet)));
+        }
+    }
+    anchor_hessian(
+        anchor, model, subject, params, stack, b_hat, scratch, schedule,
     )
+    .map(|h| (h, None))
 }
 
 /// The Hessian that scales the quadrature grid and enters `½log|H|`, per the anchor.
@@ -506,7 +547,7 @@ fn anchor_hessian(
             // for) would otherwise pay a doomed `subject_sensitivities` + `score_core` call
             // on every evaluation before falling back.
             if analytic_score_supported(model) {
-                if let Some(core) = score_core_at(model, subject, params, stack, b_hat) {
+                if let Some((core, _jet)) = score_core_at(model, subject, params, stack, b_hat) {
                     return Some(core.h_inner);
                 }
             }
@@ -514,9 +555,11 @@ fn anchor_hessian(
                 model, subject, params, stack, b_hat, scratch, schedule,
             ))
         }
-        HessianAnchor::GaussNewton => {
-            Some(score_core_at(model, subject, params, stack, b_hat)?.htilde)
-        }
+        HessianAnchor::GaussNewton => Some(
+            score_core_at(model, subject, params, stack, b_hat)?
+                .0
+                .htilde,
+        ),
     }
 }
 
@@ -1333,6 +1376,7 @@ fn grid_response_correction(
     softmax: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
+    base_jet: Option<crate::sens::provider::SubjectSens>,
     out: &mut [f64],
 ) -> Option<()> {
     use crate::estimation::parameterization::packed_fixed_mask;
@@ -1372,7 +1416,7 @@ fn grid_response_correction(
         if let Some(gs) = node_grads.as_ref() {
             if analytic_grid_response(
                 anchor, model, subject, params, template, stack, h, x, b_hat, nodes, &db_dx, gs,
-                softmax, out,
+                softmax, base_jet, out,
             )
             .is_some()
             {
@@ -1596,6 +1640,7 @@ fn analytic_grid_response(
     db_dx: &[nalgebra::DVector<f64>],
     node_grads: &[Vec<f64>],
     softmax: &[f64],
+    base_jet: Option<crate::sens::provider::SubjectSens>,
     out: &mut [f64],
 ) -> Option<()> {
     use crate::estimation::agq_cov_hessian::regularised_anchor;
@@ -1624,6 +1669,7 @@ fn analytic_grid_response(
             x,
             b_hat,
             db_dx,
+            base_jet,
         )?,
         HessianAnchor::GaussNewton if stack.is_iov() => {
             crate::estimation::focei_htilde_dx::subject_htilde_dx_iov(
@@ -2013,7 +2059,7 @@ fn agq_subject_packed_gradient(
         );
     }
 
-    let h = anchor_hessian(
+    let (h, base_jet) = anchor_hessian_and_base_jet(
         anchor,
         model,
         subject,
@@ -2074,6 +2120,7 @@ fn agq_subject_packed_gradient(
         &softmax,
         &mut scratch,
         schedule.as_ref(),
+        base_jet,
         out,
     )?;
     Some(())
@@ -2798,6 +2845,7 @@ mod tests {
                     &db_dx,
                     &node_grads,
                     &softmax,
+                    None,
                     &mut analytic,
                 )
                 .unwrap_or_else(|| {
@@ -2915,6 +2963,7 @@ mod tests {
                 &x,
                 b_hat,
                 &db_dx,
+                None,
             )
             .is_none(),
             "the M3-censored row must decline at laplace_h_deriv's own scope gate, not at a \
@@ -2938,6 +2987,7 @@ mod tests {
                 &db_dx,
                 &node_grads,
                 &[1.0],
+                None,
                 &mut out,
             )
             .is_none(),

@@ -5060,7 +5060,7 @@ pub fn subject_sensitivities_cov(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
-    covariance_sensitivities(model, subject, theta, eta, false, ThirdOrderAxes::All)
+    covariance_sensitivities(model, subject, theta, eta, false, ThirdOrderAxes::All, None)
 }
 
 /// Covariance jet over the joint eta/kappa vector, using the closed-form or ODE IOV walk.
@@ -5070,7 +5070,7 @@ pub(crate) fn subject_sensitivities_cov_iov(
     theta: &[f64],
     b: &[f64],
 ) -> Option<SubjectSens> {
-    covariance_sensitivities(model, subject, theta, b, true, ThirdOrderAxes::All)
+    covariance_sensitivities(model, subject, theta, b, true, ThirdOrderAxes::All, None)
 }
 
 /// The same jet as [`subject_sensitivities_cov`], but sweeping **η axes only** — `1 + 2·n_eta`
@@ -5082,13 +5082,55 @@ pub(crate) fn subject_sensitivities_cov_iov(
 /// scope gate, step policy and route-switch guard is the full sweep's, because it *is* the full
 /// sweep with a narrower axis set — see [`ThirdOrderAxes`] for why that is exact rather than an
 /// approximation.
+/// `base` lets a caller that already holds the jet at `(theta, eta)` — `agq::score_core_at`
+/// computes exactly it for the anchor and discards it — hand it over, saving one of the
+/// `1 + 2·n_eta` evaluations. It must be from the same provider arm at the same point;
+/// `debug_assert_base_matches` checks that in debug builds. `None` evaluates it here.
 pub(crate) fn subject_sensitivities_cov_eta_only(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
+    base: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
-    covariance_sensitivities(model, subject, theta, eta, false, ThirdOrderAxes::EtaOnly)
+    covariance_sensitivities(
+        model,
+        subject,
+        theta,
+        eta,
+        false,
+        ThirdOrderAxes::EtaOnly,
+        base,
+    )
+}
+
+/// Assert a caller-supplied base jet really is the one this sweep would have computed.
+///
+/// Debug-only, and deliberately so: in release this is the whole point of the optimisation (one
+/// fewer provider evaluation), while in debug it pays the evaluation it saves in order to catch a
+/// caller that threaded a jet from the wrong point. The failure it guards is silent — wrong
+/// tensors rather than a `None` — which is why it is an assertion and not a comment.
+///
+/// Compares the value and both second-order blocks per observation. Not the third-order blocks:
+/// the supplied base has not had them filled yet, which is what this sweep is for.
+#[inline]
+fn debug_assert_base_matches(supplied: &SubjectSens, fresh: &SubjectSens) {
+    debug_assert_eq!(
+        supplied.obs.len(),
+        fresh.obs.len(),
+        "supplied base jet has a different observation count than a fresh evaluation"
+    );
+    for (j, (s, f)) in supplied.obs.iter().zip(fresh.obs.iter()).enumerate() {
+        debug_assert_eq!(s.f, f.f, "supplied base jet differs at obs {j}: f");
+        debug_assert_eq!(
+            s.d2f_deta2, f.d2f_deta2,
+            "supplied base jet differs at obs {j}: ∂²f/∂η²"
+        );
+        debug_assert_eq!(
+            s.d2f_deta_dtheta, f.d2f_deta_dtheta,
+            "supplied base jet differs at obs {j}: ∂²f/∂η∂θ"
+        );
+    }
 }
 
 /// Which axes [`covariance_sensitivities`] sweeps a central FD pair along.
@@ -5121,6 +5163,7 @@ fn covariance_sensitivities(
     eta: &[f64],
     iov: bool,
     axes: ThirdOrderAxes,
+    base_in: Option<SubjectSens>,
 ) -> Option<SubjectSens> {
     let model_supported = if model.ode_spec.is_some() && iov {
         crate::sens::ode_provider::ode_iov_supported(model)
@@ -5248,7 +5291,31 @@ fn covariance_sensitivities(
             subject_sensitivities(model, subject, t, b)
         }
     };
-    let mut base = evaluate(theta, eta)?;
+    // The caller may already hold this exact evaluation (#1344 item 2): `agq::score_core_at`
+    // builds the anchor from `subject_sensitivities(model, subject, theta, b_hat)`, which is the
+    // same call `evaluate` makes here, and then discards it. Accepting it removes one of the
+    // `1 + 2·n_eta` evaluations — 7 → 6 on a 3-η model.
+    //
+    // A base taken at a different point would not fail; it would return plausible, wrong
+    // tensors. So the contract is that `base_in` must be the jet at *this* `(theta, eta)` from
+    // the *same* provider arm, and `debug_assert_base_matches` checks it against a fresh
+    // evaluation in debug builds rather than trusting the call graph.
+    //
+    // `debug_assert_base_matches` is a plain function, not the `debug_assert!` macro: only its
+    // body compiles away in release, not its arguments. Calling it as
+    // `debug_assert_base_matches(&supplied, &evaluate(theta, eta)?)` would make the caller
+    // evaluate `evaluate(theta, eta)` to build that argument on *every* build, `Some(base_in)`
+    // included — silently paying back the whole evaluation #1344 item 2 exists to skip. Gate the
+    // evaluation itself on `cfg!(debug_assertions)`, not just the assertion it feeds.
+    let mut base = match base_in {
+        Some(supplied) => {
+            if cfg!(debug_assertions) {
+                debug_assert_base_matches(&supplied, &evaluate(theta, eta)?);
+            }
+            supplied
+        }
+        None => evaluate(theta, eta)?,
+    };
     let n_obs = base.obs.len();
 
     // One central pair per swept axis. Axis `c < eta_base` is `θ_c`; `c >= eta_base` is

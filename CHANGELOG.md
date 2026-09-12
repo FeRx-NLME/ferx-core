@@ -25,6 +25,24 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
+
+- **`method = laplace` no longer recomputes the sensitivity jet its grid anchor was just built
+  from.** The anchor and the `½·log|H|` derivative sweep needed the same evaluation at the same
+  point; the anchor's is now handed over instead of discarded, removing one of the sweep's
+  `1 + 2·n_eta` evaluations (7 → 6 on a 3-random-effect model). Debug builds assert the reused
+  jet against a fresh evaluation, since a mismatched one would produce wrong derivatives rather
+  than an error. Measured against the previous release on warfarin fixtures (`ci-test`,
+  `FERX_PROFILE=1`): provider calls −9.1% on all three (diagonal Ω 4180 → 3800, block Ω
+  5280 → 4800, ODE 4300 → 3910), with OFV and outer-iteration counts unchanged in every case
+  (#1344).
+
+- **SAEM's per-occasion κ sampling now runs in parallel over subjects** instead of serially
+  beside the already-parallel η phase. Bit-identical: each subject writes only its own slots and
+  draws from a generator seeded by `(seed, iteration, subject)`, so nothing depends on the order
+  subjects are visited in. Applies to IOV models only; the phase's share of a SAEM fit has not
+  been profiled, so this removes a serialisation rather than promising a speedup (#1344).
+
 - **`method = laplace`'s analytic `½·log|H|` gradient term now sweeps only the random-effect
   axes, not every structural parameter axis as well.** The assembly reads `∂³f/∂η³` and
   `∂³f/∂η²∂θ`; the θ-axis sensitivity evaluations existed to build two blocks only the
@@ -41,7 +59,6 @@ section of the SDLC for the versioning policy).
   unaffected, and `focei` is untouched (#1342).
 
 - `[covariate_nn]` models with IOV (`kappa`) now get the exact analytic FOCE/FOCEI outer gradient: the stacked `[η, κ]` sensitivity walk seeds the declared thetas, the random effects and one axis per network output, chains the weight columns in through backpropagation, and walks them in chunks — so `auto` resolves to L-BFGS instead of derivative-free BOBYQA over every weight, and `gradient:` reports analytic (#1339). This covers IOV models carrying an `[initial_conditions]` baseline, an `obs_scale` expression or an analytic Form C readout as well, and no longer caps the `obs_scale` expression's `(θ, η)` width at 24.
-- **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 - **Calling a function ferx does not have is now a parse error naming the call and listing what is available, instead of silently evaluating as the identity.** `CL = TVCL * tanh(ETA_CL)` used to parse, pass `ferx check`, fit and converge while computing `TVCL * ETA_CL`. This applies to every block that parses expressions (`[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, `[error_model]` magnitudes) and to conditions. Model files that relied on the no-op were already computing something other than what they read as, so the new errors are all true positives. Names remain case-insensitive, so `EXP(...)` / `LOG(...)` are unaffected; `present(x)` in value position now points at condition position (#1332).
 
 - **`method = laplace` now assembles its `½·log|H|` gradient term analytically by default,
