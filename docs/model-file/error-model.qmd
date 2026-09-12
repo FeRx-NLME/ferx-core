@@ -149,6 +149,34 @@ NONMEM's own minimiser terminated on this model with `ROUNDING ERRORS
 slow-gated fit in the same file asserts ferx reaches an objective no worse and
 an exponent within 0.05 of NONMEM's 1.112 (SE 0.122).
 
+## Exactly one plain `DV ~ ...` line {#one-plain-line}
+
+A single-endpoint block binds **one** statement. A second plain `DV ~ ...` line is
+an error:
+
+```
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  DV ~ additive(ADD_ERR)          # rejected
+```
+
+```
+[error_model] has more than one plain `DV ~ ...` line; a single-endpoint error
+model takes exactly one (use `CMT=N:` prefixes for per-compartment models)
+```
+
+Before [#1022](https://github.com/FeRx-NLME/ferx-core/issues/1022) the **first**
+line bound and the rest were dropped without a warning, so a model edited in place
+— a replacement pasted above the line it replaces, an old line left behind — fitted
+against the error model it no longer appeared to describe. Both files above gave
+the same objective, and nothing in the output said which line had won.
+
+The restriction is on the plain form only. A block that genuinely carries several
+statements writes them with [`CMT=N:` prefixes](#multiple-endpoints-per-cmt-error-models)
+or as an [`if/else` selector](#covariate-selected-error-models-ifelse), both of
+which bind every line. `iiv_on_ruv = ETA` is not a statement line and may accompany
+any single-endpoint model.
+
 ## Sigma order {#sigma-order}
 
 A single-endpoint `[error_model]` — one `DV ~ ...` line with no `CMT=` prefix and no `if/else` selector — consumes its sigmas **positionally**, from the order they are declared in `[parameters]`. The names written in the arguments are checked against the declared order and must match it:
