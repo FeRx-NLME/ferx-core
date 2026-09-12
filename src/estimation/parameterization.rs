@@ -261,21 +261,14 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         template.omega.diagonal,
         template.omega.free_mask.clone(),
     );
-    // Holding `L[i,j] = 0` reconstructs `Ω[i,j] = 0` only while `free_mask` is a
-    // disjoint block partition — the shape the parser builds. A *chain* mask
-    // (A-B free, B-C free, A-C structural) would fill `Ω[C,A] = L[C,B]·L[B,A]`
-    // in at a slot the mask, `n_parameters` and `se_omega` all call absent, so
-    // the invariant is asserted rather than assumed (#1018 review).
-    #[cfg(debug_assertions)]
-    for (i, j) in lower_tri_iter(n_eta, template.omega.diagonal) {
-        if i != j && !template.omega.free_mask[(i, j)] {
-            debug_assert_eq!(
-                omega.matrix[(i, j)],
-                0.0,
-                "structural zero Ω[{i},{j}] reconstructed non-zero — overlapping blocks?"
-            );
-        }
-    }
+    // NB: no assertion here that a structural slot reconstructs `Ω[i,j] == 0`.
+    // It holds for a vector this module produced, but `unpack_params` is also
+    // handed raw probes — every finite-difference stencil perturbs *all* packed
+    // coordinates, held ones included, and the covariance Hessian and VI
+    // gradient tests do exactly that. The precondition that makes the hold
+    // sound (`free_mask` is a disjoint block partition, so `L[i,j] = 0` gives
+    // `Ω[i,j] = 0`) is enforced where it belongs: the parser rejects an η
+    // declared in two `block_omega` blocks.
 
     // Sigma
     let sigma_values: Vec<f64> = (0..n_sigma)
