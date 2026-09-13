@@ -102,6 +102,19 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **FOCEI, Laplace, and `focei` with `n_agq > 1` now build each subject's `EventSchedule`
+  once per outer-loop evaluation instead of once per subject per AGQ node/gradient call.**
+  `cacheable_schedule` gates this on time-varying covariates or `EVID=3/4` resets (its
+  guard is otherwise unchanged), so a fit with only baseline covariates and no resets never
+  allocated a cacheable schedule in the first place and sees no change. Verified bit-identical
+  OFVs against `main` across every configuration tested. Measured on `ci-fast`, single Rayon
+  thread: no resolvable difference on the 24-subject/2-occasion-per-subject Schnider propofol
+  fixture (`tests/schnider_propofol_nonmem.rs`), where schedule construction is a small share
+  of per-eval cost; a synthetic 40-subject/15-occasion-per-subject stress fixture (built to
+  amplify per-subject schedule-construction cost) showed a modest, directionally consistent
+  ~3–6% wall-clock reduction across FOCEI, Laplace, and `focei`+AGQ(n=3). No claim is made
+  beyond that stress scenario (#1345).
+
 - **FOCE, FOCEI, Laplace, and AGQ now reuse prediction and prior-matrix storage across
   repeated conditional-likelihood evaluations.** AGQ also caches invariant Hermite rules;
   IOV quadrature borrows occasion effects and uses the covariance inverses already cached in

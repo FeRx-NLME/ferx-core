@@ -1915,3 +1915,120 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
         );
     }
 }
+
+/// A subject with an `EVID 3/4` reset makes `cacheable_schedule` return `Some`; a plain
+/// subject with neither a reset nor a time-varying covariate makes it return `None` (see
+/// `cacheable_schedule`'s guard). `run_inner_loop_warm_cached` must produce results
+/// bit-identical to the uncached `run_inner_loop_warm` in both cases — including when
+/// `build_schedule_cache`'s per-subject `Some`/`None` entries are mixed in the same
+/// population, which is the scenario that would expose an index misalignment between the
+/// cache and `population.subjects`.
+#[test]
+fn cached_schedule_inner_loop_matches_uncached() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("parse one_cpt_iv model");
+    let params = &model.default_params;
+
+    let obs_times = vec![1.0, 4.0, 8.0, 24.0];
+    let n = obs_times.len();
+    let no_reset_subject = Subject {
+        id: "no-reset".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: obs_times.clone(),
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 5.0, 3.0, 1.0],
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let reset_subject = Subject {
+        id: "reset".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 4.0, 8.0, 13.0, 16.0, 20.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 5.0, 3.0, 8.0, 5.0, 3.0],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: vec![12.0],
+        reset_covariates: Vec::new(),
+        cens: vec![0; 6],
+        occasions: vec![1; 6],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    assert!(!no_reset_subject.has_resets());
+    assert!(reset_subject.has_resets());
+
+    let population = Population {
+        subjects: vec![
+            no_reset_subject.clone(),
+            reset_subject.clone(),
+            no_reset_subject,
+            reset_subject,
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let schedules = build_schedule_cache(&model, &population);
+    assert!(schedules[0].is_none());
+    assert!(schedules[1].is_some());
+    assert!(schedules[2].is_none());
+    assert!(schedules[3].is_some());
+
+    let uncached = run_inner_loop_warm(&model, &population, params, 50, 1e-8, None, None, 0, 0);
+    let cached = run_inner_loop_warm_cached(
+        &model,
+        &population,
+        params,
+        50,
+        1e-8,
+        None,
+        None,
+        0,
+        0,
+        &schedules,
+    );
+
+    for i in 0..population.subjects.len() {
+        assert_eq!(
+            uncached.0[i].as_slice(),
+            cached.0[i].as_slice(),
+            "subject {i}: η̂ diverged between the cached and uncached inner loop"
+        );
+        assert_eq!(
+            uncached.1[i].as_slice(),
+            cached.1[i].as_slice(),
+            "subject {i}: Jacobian diverged between the cached and uncached inner loop"
+        );
+    }
+    assert_eq!(uncached.2.n_unconverged, cached.2.n_unconverged);
+    assert_eq!(uncached.2.n_fallback, cached.2.n_fallback);
+    assert_eq!(uncached.2.n_start_rejected, cached.2.n_start_rejected);
+}
