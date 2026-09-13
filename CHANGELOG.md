@@ -124,6 +124,8 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- `method = gn_hybrid` no longer reports a `final_gradient` belonging to the **Gauss-Newton phase** when the FOCEI polish is the result being reported. Whenever the accepted polish had no gradient of its own — reachable with a derivative-free `optimizer` such as the `auto` default on ODE/PD models, or the built-in BFGS — the merge kept the GN phase's vector, so `fit$final_gradient` described the *pre-polish* point while every estimate beside it came from after the polish. It is now the polish's gradient or nothing ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997) review).
+
 - A typical value used as the mu-reference anchor of **more than one** random effect
   (`F1 = inv_logit(LOGIT_F + ETA_F1)` alongside `F2 = inv_logit(LOGIT_F + ETA_F2)`, or
   the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is now estimated by the

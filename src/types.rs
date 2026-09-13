@@ -6514,6 +6514,13 @@ pub struct FitResult {
     /// GN. For a *derivative-free* NLopt run (BOBYQA) it is the post-fit
     /// finite-difference gradient described under [`Self::final_gradient_source`];
     /// `None` for the built-in BFGS and SAEM.
+    ///
+    /// **It is always the gradient at the estimates reported beside it.** That is
+    /// the load-bearing half of the contract, and the one a multi-stage method can
+    /// break silently: `gn_hybrid` reports the FOCEI polish's estimates whenever the
+    /// polish improves on the Gauss-Newton phase, so it reports the polish's
+    /// gradient too — and `None` when the polish computed none, rather than the GN
+    /// phase's vector from a point that is no longer the answer.
     pub final_gradient: Option<Vec<f64>>,
     /// Where [`Self::final_gradient`] came from — the one thing a consumer needs
     /// in order to read it (#997 §1).
