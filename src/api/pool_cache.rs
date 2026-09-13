@@ -3,7 +3,9 @@ use super::fit_thread_pool_builder;
 use crate::ode::solver::OdeSolverOverride;
 use std::collections::VecDeque;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 struct CachedPool {
     pool: rayon::ThreadPool,
@@ -11,7 +13,8 @@ struct CachedPool {
 }
 
 struct SharedCachedPool {
-    pool: Arc<rayon::ThreadPool>,
+    pool: OnceLock<Result<Arc<rayon::ThreadPool>, String>>,
+    threads: usize,
     ov: OdeSolverOverride,
 }
 
@@ -106,8 +109,10 @@ impl PoolCache {
 /// worker budget, so callers with identical ODE settings may use one pool
 /// concurrently instead of multiplying the process worker count.
 pub(super) struct SharedPoolCache {
-    pools: Mutex<VecDeque<SharedCachedPool>>,
+    pools: Mutex<VecDeque<Arc<SharedCachedPool>>>,
     max_cached_workers: usize,
+    #[cfg(test)]
+    build_count: AtomicUsize,
 }
 
 impl SharedPoolCache {
@@ -115,6 +120,8 @@ impl SharedPoolCache {
         Self {
             pools: Mutex::new(VecDeque::new()),
             max_cached_workers,
+            #[cfg(test)]
+            build_count: AtomicUsize::new(0),
         }
     }
 
@@ -127,54 +134,57 @@ impl SharedPoolCache {
             return Err("thread count must be positive".to_string());
         }
         ov.validate()?;
-        {
+        let entry = {
             let mut pools = self
                 .pools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(index) = pools
                 .iter()
-                .rposition(|p| p.pool.current_num_threads() == threads && p.ov.same_pool_key(&ov))
+                .rposition(|p| p.threads == threads && p.ov.same_pool_key(&ov))
             {
                 let entry = pools.remove(index).expect("matching shared pool");
-                let pool = Arc::clone(&entry.pool);
-                pools.push_back(entry);
-                return Ok(pool);
+                let entry = Arc::clone(&entry);
+                pools.push_back(Arc::clone(&entry));
+                entry
+            } else {
+                let entry = Arc::new(SharedCachedPool {
+                    pool: OnceLock::new(),
+                    threads,
+                    ov,
+                });
+                pools.push_back(Arc::clone(&entry));
+                let mut workers: usize = pools.iter().map(|p| p.threads).sum();
+                while workers > self.max_cached_workers && pools.len() > 1 {
+                    let old = pools.pop_front().expect("workers counted a shared pool");
+                    workers -= old.threads;
+                }
+                entry
             }
-        }
+        };
 
-        let built = Arc::new(build_pool(threads, ov)?);
-        let mut evicted = Vec::new();
-        {
+        // Publish the key before constructing its workers. Concurrent cold callers now wait
+        // on this key's OnceLock instead of each building a duplicate pool and discarding all
+        // but one. Unrelated keys only hold the cache mutex long enough to publish/find their
+        // own entry and can still construct concurrently.
+        let result = entry
+            .pool
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.build_count.fetch_add(1, Ordering::Relaxed);
+                build_pool(threads, ov).map(Arc::new)
+            })
+            .clone();
+        if result.is_err() {
             let mut pools = self
                 .pools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Another caller may have built the same key while this build ran.
-            // Prefer the pool it published so concurrent unpinned calls still
-            // converge on one shared budget.
-            if let Some(index) = pools
-                .iter()
-                .rposition(|p| p.pool.current_num_threads() == threads && p.ov.same_pool_key(&ov))
-            {
-                let entry = pools.remove(index).expect("matching shared pool");
-                let pool = Arc::clone(&entry.pool);
-                pools.push_back(entry);
-                return Ok(pool);
-            }
-            pools.push_back(SharedCachedPool {
-                pool: Arc::clone(&built),
-                ov,
-            });
-            let mut workers: usize = pools.iter().map(|p| p.pool.current_num_threads()).sum();
-            while workers > self.max_cached_workers && pools.len() > 1 {
-                let old = pools.pop_front().expect("workers counted a shared pool");
-                workers -= old.pool.current_num_threads();
-                evicted.push(old);
+            if let Some(index) = pools.iter().position(|p| Arc::ptr_eq(p, &entry)) {
+                pools.remove(index);
             }
         }
-        drop(evicted);
-        Ok(built)
+        result
     }
 }
 

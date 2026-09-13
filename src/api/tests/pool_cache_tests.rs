@@ -1,6 +1,7 @@
 use super::*;
 use crate::ode::solver::{effective_solver_options, OdeMethod, OdeSolverOptions};
 use std::collections::HashSet;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 fn worker(pool: &rayon::ThreadPool) -> thread::ThreadId {
@@ -131,6 +132,61 @@ fn shared_cache_reuses_one_live_pool_for_identical_unpinned_calls() {
     let first = cache.acquire(2, ov).unwrap();
     let second = cache.acquire(2, ov).unwrap();
     assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn concurrent_shared_cold_miss_constructs_one_pool() {
+    let cache = Arc::new(SharedPoolCache::new(8));
+    let barrier = Arc::new(Barrier::new(16));
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                cache.acquire(2, Default::default()).unwrap()
+            })
+        })
+        .collect();
+    let pools: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    assert!(pools.windows(2).all(|p| Arc::ptr_eq(&p[0], &p[1])));
+    assert_eq!(cache.build_count.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+#[ignore = "cold-start microbenchmark: run explicitly in an optimized build"]
+fn shared_cold_miss_benchmark() {
+    use std::time::Instant;
+
+    const CALLERS: usize = 8;
+    let start = Instant::now();
+    thread::scope(|scope| {
+        for _ in 0..CALLERS {
+            scope.spawn(|| {
+                let pool = build_pool(2, Default::default()).unwrap();
+                pool.install(|| std::hint::black_box(1usize));
+            });
+        }
+    });
+    let duplicate_builds = start.elapsed();
+
+    let cache = SharedPoolCache::new(8);
+    let start = Instant::now();
+    thread::scope(|scope| {
+        for _ in 0..CALLERS {
+            scope.spawn(|| {
+                let pool = cache.acquire(2, Default::default()).unwrap();
+                pool.install(|| std::hint::black_box(1usize));
+            });
+        }
+    });
+    let coordinated = start.elapsed();
+    eprintln!(
+        "shared cold miss ({CALLERS} callers): duplicate={duplicate_builds:?} coordinated={coordinated:?} speedup={:.2}x builds={CALLERS}->{}",
+        duplicate_builds.as_secs_f64() / coordinated.as_secs_f64(),
+        cache.build_count.load(Ordering::Relaxed),
+    );
 }
 
 #[test]
