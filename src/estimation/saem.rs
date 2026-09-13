@@ -6,6 +6,7 @@
 /// Two-phase step-size schedule (Monolix convention):
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
+use crate::estimation::covariate_mu_ref::GroupStepInput;
 use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
 };
@@ -1410,32 +1411,208 @@ fn saem_mixing_warning(cum_acc: u64, cum_prop: u64) -> Option<String> {
     }
 }
 
-/// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
+/// Build (theta_idx, eta_idx) pairs eligible for the closed-form EM M-step.
 ///
-/// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
-/// `exp(log(THETA)+ETA)`) participate in the gradient-step M-step.  For these
-/// the chain rule gives `d/d_log(theta) = -Σᵢ d/d_eta`, which matches the
-/// update applied in the SAEM loop.  Additive mu-refs (`THETA + ETA`,
-/// `log_transformed = false`) require the extra factor of `theta` from the
-/// log-space chain rule and are deliberately excluded — they fall through to
-/// the regular NLopt M-step.
-pub(crate) fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
+/// The complete-data maximiser of a mu-referenced parameter
+/// `P_i = g⁻¹(g(θ) + η_i)` is `g(θ)_new = g(θ)_old + mean_i(η_i)` — the update
+/// is *link-independent*: it holds for `g = log` (`P = θ·exp(η)`), for
+/// `g = id` (`P = θ + η`) and for `g = logit` (`P = inv_logit(θ + η)`) alike.
+/// What it requires is that the quantity SAEM actually steps — the **packed**
+/// theta — *is* `g(θ)`. `run_saem` packs a theta as `log θ` when its lower
+/// bound admits it (`theta_packs_log`) and as `θ` otherwise, so:
+///
+/// | mu transform       | mu scale   | eligible when            |
+/// |--------------------|------------|--------------------------|
+/// | `Log`              | `log θ`    | theta is **log**-packed  |
+/// | `Logit`            | `θ`        | theta is identity-packed |
+/// | `Identity`         | `θ`        | never (see below)        |
+/// | `LogitProbability` | `logit θ`  | never — no packing matches |
+///
+/// A `Logit` mu-ref (`P = inv_logit(THETA + ETA)`) declares its theta on the
+/// logit scale, so its lower bound is negative and it is identity-packed — the
+/// packed value *is* the mu (#918).
+///
+/// Additive mu-refs are left out even when identity-packed: they are the
+/// historical behaviour of this function, they are rare in practice, and the
+/// change is not needed to fix #918. `LogitProbability`
+/// (`inv_logit(logit(THETA) + ETA)`) has no packing whose scale is `logit θ`,
+/// so the closed form does not apply. Both fall through to the regular NLopt
+/// M-step, which is correct for any parameterisation, just slower.
+///
+/// `theta_lower` is the same lower-bound vector `run_saem` derives its packing
+/// mask from (`init_params.theta_lower`), not `model.default_params`, so a
+/// caller-overridden bound cannot desynchronise the two.
+#[cfg(test)]
+pub(crate) fn get_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) -> Vec<(usize, usize)> {
+    classify_mu_ref_pairs(model, theta_lower).eligible
+}
+
+/// The full eligibility split behind the test-only `get_mu_ref_pairs` wrapper: the pairs the
+/// closed-form M-step may take, plus the anchors it had to *drop* because the
+/// theta's packing does not match its mu scale. Callers surface the latter as
+/// advisories (#996 review, #918) — a user who declared `theta TVCL(1, -5, 100)`
+/// or `theta LOGIT_F(0.5, 0, 5)` gets told why that theta sits on the numerical
+/// M-step instead of the exact shift, and how to fix the declaration.
+///
+/// All dropped lists are sorted and de-duplicated. Additive and
+/// probability-scale-logit anchors are neither eligible nor "dropped": there is
+/// no bound the user could change to make the closed form apply.
+pub(crate) struct MuRefPairs {
+    /// `(theta_idx, eta_idx)` pairs whose packed scale is their mu scale, each
+    /// theta owned by exactly one eta (see `shared_theta`).
+    pub eligible: Vec<(usize, usize)>,
+    /// Lognormal anchors (`THETA*exp(ETA)`) whose theta is identity-packed
+    /// because its lower bound is negative.
+    pub identity_packed_log: Vec<usize>,
+    /// Logit-scale anchors (`inv_logit(THETA + ETA)`) whose theta is log-packed
+    /// because its lower bound is non-negative.
+    pub log_packed_logit: Vec<usize>,
+    /// Thetas anchoring **more than one** eta (`F1 = inv_logit(LOGIT_F + ETA_F1)`
+    /// and `F2 = inv_logit(LOGIT_F + ETA_F2)`, or the lognormal analogue
+    /// `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`). Excluded from `eligible`
+    /// entirely — see the note on `classify_mu_ref_pairs`.
+    pub shared_theta: Vec<usize>,
+    /// The pairs those shared thetas would have contributed. They take no
+    /// closed-form shift, but they are still declared mu-references, so
+    /// `resolve_covariate_mu_groups` must keep seeing them: a #619 covariate
+    /// group may not claim a theta another eta anchors, whether or not the
+    /// single-anchor channel ended up running (`mu_ref_pairs_for_cov_groups`).
+    pub shared_pairs: Vec<(usize, usize)>,
+}
+
+/// The anchor pairs a #619 covariate-mu-ref group must not collide with: every
+/// declared single-anchor pair, whether or not the closed form runs for it.
+///
+/// `eligible` alone is the wrong input — a theta dropped for anchoring two etas
+/// is *more* contested, not less — and so is `eligible` plus a packing-dropped
+/// theta, which the group step is free to move (it does not use the packed
+/// scale). Only the shared-anchor drop is added back.
+pub(crate) fn mu_ref_pairs_for_cov_groups(split: &MuRefPairs) -> Vec<(usize, usize)> {
+    let mut v = split.eligible.clone();
+    v.extend(split.shared_pairs.iter().copied());
+    v
+}
+
+/// True when the **packed** theta — the quantity the optimiser steps — *is* the
+/// mu scale `g(θ)`, which is the one condition the link-independent closed-form
+/// shift `g(θ) += mean(η)` needs (#918).
+///
+/// `packs_log` is `theta_packs_log(lower)`: ferx packs a theta as `log θ` when
+/// its lower bound admits it and as `θ` otherwise. So `Log` needs log-packing,
+/// `Logit` (whose theta is *already* on the logit scale) needs identity-packing,
+/// and `Identity` / `LogitProbability` never qualify — see the table on
+/// [`classify_mu_ref_pairs`]'s wrapper `get_mu_ref_pairs`.
+pub(crate) fn packed_scale_is_mu(transform: MuTransform, packs_log: bool) -> bool {
+    matches!(
+        (transform, packs_log),
+        (MuTransform::Log, true) | (MuTransform::Logit, false)
+    )
+}
+
+/// Split the model's mu-ref anchors into the closed-form-eligible pairs and the
+/// ones that have to fall back to the numerical M-step.
+///
+/// **One eta per theta.** The closed form shifts a packed theta by that eta's
+/// mean and then pins it for the numerical M-step, so a theta anchoring two etas
+/// has no well-defined single shift: applying both moves it twice, and applying
+/// only the first leaves the second eta un-recentred while pinning the theta
+/// away from its joint optimum (ω for that second eta then inflates to absorb
+/// the drift). The joint complete-data maximiser is a precision-weighted mean of
+/// the two eta means, which this function does not compute — so a shared theta
+/// and *both* its pairs are dropped, leaving the theta to the numerical M-step,
+/// which is correct for any number of anchored etas.
+///
+/// Sharing is counted over **every declared anchor**, not over the eligible
+/// ones: an ineligible anchor (`V = TVP + ETA_V`) still leaves its eta
+/// un-recentred when the shift pins the theta on behalf of an eligible one
+/// (#918 review).
+///
+/// This is deliberately stricter than [`get_mixture_mu_ref_pairs`], whose
+/// class-aware rule keeps the first eta to claim a theta (#996). Both avoid the
+/// double shift; only this one also avoids the pinned partial shift.
+pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) -> MuRefPairs {
+    let mut out = MuRefPairs {
+        eligible: Vec::new(),
+        identity_packed_log: Vec::new(),
+        log_packed_logit: Vec::new(),
+        shared_theta: Vec::new(),
+        shared_pairs: Vec::new(),
+    };
+    // Every anchor the model declares, *before* the eligibility split — the
+    // shared-theta rule below has to see the ineligible ones too. A theta
+    // anchoring one eligible and one ineligible eta is exactly the pinned
+    // partial shift this function exists to prevent: `CL = TVP*exp(ETA_CL)`
+    // (log-packed Log, eligible) next to `V = TVP + ETA_V` (Identity, never
+    // eligible) would shift and pin `TVP` by `mean(η_CL)` while `ETA_V` is
+    // never re-centred for that delta. Scanning `eligible` alone misses it
+    // (#918 review).
+    let mut declared: Vec<(usize, usize, bool)> = Vec::new();
     for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
-        if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if !mu_ref.log_transformed {
-                continue;
-            }
-            if let Some(theta_idx) = model
-                .theta_names
-                .iter()
-                .position(|n| n == &mu_ref.theta_name)
-            {
-                pairs.push((theta_idx, eta_idx));
+        let Some(mu_ref) = model.mu_refs.get(eta_name) else {
+            continue;
+        };
+        let Some(theta_idx) = model
+            .theta_names
+            .iter()
+            .position(|n| n == &mu_ref.theta_name)
+        else {
+            continue;
+        };
+        let Some(&lower) = theta_lower.get(theta_idx) else {
+            continue;
+        };
+        let packs_log = crate::estimation::parameterization::theta_packs_log(lower);
+        let eligible = packed_scale_is_mu(mu_ref.transform, packs_log);
+        if !eligible {
+            // Not eligible: name the ones a bound change could rescue.
+            match mu_ref.transform {
+                MuTransform::Log => out.identity_packed_log.push(theta_idx),
+                MuTransform::Logit => out.log_packed_logit.push(theta_idx),
+                MuTransform::Identity | MuTransform::LogitProbability => {}
             }
         }
+        declared.push((theta_idx, eta_idx, eligible));
     }
-    pairs
+    // Drop every pair on a theta claimed by more than one eta (see the doc
+    // comment): both pairs go, the theta goes to the numerical M-step.
+    let mut shared: Vec<usize> = Vec::new();
+    for (i, &(t, _, _)) in declared.iter().enumerate() {
+        if declared
+            .iter()
+            .enumerate()
+            .any(|(j, &(t2, _, _))| j != i && t2 == t)
+        {
+            shared.push(t);
+        }
+    }
+    for &(t, e, eligible) in &declared {
+        if !eligible {
+            continue;
+        }
+        if shared.contains(&t) {
+            out.shared_pairs.push((t, e));
+        } else {
+            out.eligible.push((t, e));
+        }
+    }
+    // Only name a theta whose *eligible* pair the rule actually dropped. Two
+    // ineligible anchors on one theta share nothing the closed form would have
+    // moved, and reporting them would read as a second, unrelated reason the
+    // packing advisory above has already covered.
+    out.shared_theta = shared
+        .iter()
+        .copied()
+        .filter(|t| out.shared_pairs.iter().any(|&(t2, _)| t2 == *t))
+        .collect();
+    for v in [
+        &mut out.identity_packed_log,
+        &mut out.log_packed_logit,
+        &mut out.shared_theta,
+    ] {
+        v.sort_unstable();
+        v.dedup();
+    }
+    out
 }
 
 /// A class-aware (`MIXNUM`-switched) log-mu-ref pair: one eta paired with one
@@ -1453,17 +1630,32 @@ pub(crate) struct MixtureMuRefPair {
     /// Anchor theta index per class; `theta_idx[c]` serves class `c` (0-based).
     /// Length is always the mixture's `n_classes`.
     pub theta_idx: Vec<usize>,
+    /// The link relating the anchor theta(s) to the individual parameter, which
+    /// decides the packing the closed form needs (`packed_scale_is_mu`).
+    /// `MIXNUM`-switched anchors are always [`MuTransform::Log`] — the parser
+    /// detects no other switched pattern; a class-*shared* anchor may also be
+    /// [`MuTransform::Logit`] (#918).
+    pub transform: MuTransform,
 }
 
 /// Build the class-aware log-mu-ref pairs for a mixture model (#996).
 ///
-/// Returns empty for a non-mixture model — use [`get_mu_ref_pairs`] there.
+/// Returns empty for a non-mixture model — use [`classify_mu_ref_pairs`] there.
 /// Each eta contributes at most one pair: the class-aware anchor set detected
 /// by the parser (`MixtureSpec::mu_refs`) when the typical value is
 /// `MIXNUM`-switched, otherwise the classical single-theta mu-ref broadcast
-/// across all classes. Additive (`THETA + ETA`) mu-refs are excluded for the
-/// same reason as in [`get_mu_ref_pairs`]: the closed-form shift is only valid
-/// on the log scale.
+/// across all classes.
+///
+/// The link is carried on the pair rather than filtered here: a class-shared
+/// `F = inv_logit(LOGIT_F + ETA_F)` is as eligible as the lognormal form, since
+/// the shift is link-independent and what it needs is that the packed theta *is*
+/// the mu (#918). The caller applies that check with `packed_scale_is_mu`.
+/// Additive (`THETA + ETA`) and probability-scale logit
+/// (`inv_logit(logit(THETA) + ETA)`) mu-refs are excluded for the same reason as
+/// in [`classify_mu_ref_pairs`]: no packing has their mu scale. A
+/// `MIXNUM`-switched typical value is log-only — `detect_mixture_pattern` does
+/// not recognise a switched logit chain, so such an eta has no mu-ref at all and
+/// never reaches this function.
 ///
 /// A theta is claimed by **at most one** pair. Two etas anchored to the same
 /// typical value (`CL = TVP*exp(ETA_CL)` and `V = TVP*exp(ETA_V)`) have no
@@ -1499,9 +1691,16 @@ pub(crate) fn get_mixture_mu_ref_pairs(model: &CompiledModel) -> Vec<MixtureMuRe
             else {
                 continue;
             };
-            push_pair(&mut out, MixtureMuRefPair { eta_idx, theta_idx });
+            push_pair(
+                &mut out,
+                MixtureMuRefPair {
+                    eta_idx,
+                    theta_idx,
+                    transform: MuTransform::Log,
+                },
+            );
         } else if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if !mu_ref.log_transformed {
+            if !matches!(mu_ref.transform, MuTransform::Log | MuTransform::Logit) {
                 continue;
             }
             let Some(t) = idx_of(&mu_ref.theta_name) else {
@@ -1512,9 +1711,67 @@ pub(crate) fn get_mixture_mu_ref_pairs(model: &CompiledModel) -> Vec<MixtureMuRe
                 MixtureMuRefPair {
                     eta_idx,
                     theta_idx: vec![t; k],
+                    transform: mu_ref.transform,
                 },
             );
         }
+    }
+    out
+}
+
+/// The packing split of [`get_mixture_mu_ref_pairs`], the mixture twin of
+/// [`MuRefPairs`]: the pairs whose every class theta is packed on its mu scale,
+/// and the thetas dropped because it is not.
+pub(crate) struct MixtureMuRefPairs {
+    /// Pairs the class-aware closed-form shift may take.
+    pub eligible: Vec<MixtureMuRefPair>,
+    /// Lognormal class anchors packed on the identity scale (#996).
+    pub identity_packed_log: Vec<usize>,
+    /// Logit-scale class anchors packed on the log scale (#918).
+    pub log_packed_logit: Vec<usize>,
+}
+
+/// Apply the packing eligibility rule to a mixture model's mu-ref pairs.
+///
+/// Shared by `run_saem` and `run_mcem` so the two cannot disagree about which
+/// class anchors the closed form owns — the same reason `classify_mu_ref_pairs`
+/// is shared by their single-population paths. Each caller adds only what is
+/// genuinely its own: SAEM additionally drops `MIXNUM`-switched anchors (its
+/// hard class draw biases the per-class mean, #996), IMP/IMPMAP additionally
+/// drops pairs whose eta has negligible IIV (#411).
+///
+/// `theta_packs_log_mask[t]` is `theta_packs_log(theta_lower[t])` — the same
+/// per-theta packing the caller's `log_theta` vector was built with.
+pub(crate) fn classify_mixture_mu_ref_pairs(
+    model: &CompiledModel,
+    theta_packs_log_mask: &[bool],
+) -> MixtureMuRefPairs {
+    let mut out = MixtureMuRefPairs {
+        eligible: Vec::new(),
+        identity_packed_log: Vec::new(),
+        log_packed_logit: Vec::new(),
+    };
+    for p in get_mixture_mu_ref_pairs(model) {
+        let mismatched: Vec<usize> = p
+            .theta_idx
+            .iter()
+            .copied()
+            .filter(|&t| !packed_scale_is_mu(p.transform, theta_packs_log_mask[t]))
+            .collect();
+        if mismatched.is_empty() {
+            out.eligible.push(p);
+            continue;
+        }
+        // Name only the thetas whose own bound is the problem: the advisory
+        // tells the user which declaration to change.
+        match p.transform {
+            MuTransform::Logit => out.log_packed_logit.extend(mismatched),
+            _ => out.identity_packed_log.extend(mismatched),
+        }
+    }
+    for v in [&mut out.identity_packed_log, &mut out.log_packed_logit] {
+        v.sort_unstable();
+        v.dedup();
     }
     out
 }
@@ -2036,10 +2293,22 @@ pub fn run_saem(
     };
 
     // Mu-referencing pairs for the closed-form M-step: (theta_idx, eta_idx).
-    // Only log-mu-ref pairs are returned (`get_mu_ref_pairs` filters out
-    // additive ones), since the closed-form `log_theta += γ · mean(η)` only
-    // applies to log-mu-referenced thetas.
-    let mu_ref_pairs: Vec<(usize, usize)> = get_mu_ref_pairs(model);
+    // Only pairs whose *packed* scale equals their mu scale are eligible
+    // (`classify_mu_ref_pairs`), since the closed form steps the packed theta by
+    // `γ · mean(η)` directly: log-packed for `THETA*exp(ETA)`, identity-packed
+    // for `inv_logit(THETA + ETA)` (#918). The thetas it drops for a packing
+    // mismatch are kept so the advisories below can name them.
+    let mu_ref_split = classify_mu_ref_pairs(model, &init_params.theta_lower);
+    // What a #619 covariate group may not collide with — every declared anchor
+    // pair, including the ones the shared-anchor rule just dropped.
+    let cov_group_conflicts = mu_ref_pairs_for_cov_groups(&mu_ref_split);
+    let MuRefPairs {
+        eligible: mu_ref_pairs,
+        identity_packed_log: dropped_identity,
+        log_packed_logit: dropped_log_packed_logit,
+        shared_theta: dropped_shared_theta,
+        shared_pairs: _,
+    } = mu_ref_split;
     // Mixture: a MIXNUM-switched typical value pairs one η with several class
     // thetas, so the *pooled* `log_theta += γ·mean(η)` update above (one theta
     // per η) does not apply. It is well-posed per class though — SAEM draws a
@@ -2101,26 +2370,6 @@ pub fn run_saem(
         .as_ref()
         .map(|m| m.class_sigma_overrides())
         .unwrap_or_default();
-    // #996 open question, confirmed: an identity-packed θ (`theta_lower < 0`,
-    // see `theta_packs_log`) reaches the closed-form loop today and would be
-    // updated as `θ += mean(η)` instead of `θ *= exp(mean(η))` — the shift is
-    // only the EM optimum on the log scale. Such a θ is dropped from the
-    // closed-form channel and estimated by the numerical M-step instead.
-    let identity_packed = |pairs: &[(usize, usize)]| -> Vec<usize> {
-        let mut v: Vec<usize> = pairs
-            .iter()
-            .filter(|&&(t, _e)| !theta_packs_log_mask[t])
-            .map(|&(t, _e)| t)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    let dropped_identity = identity_packed(&mu_ref_pairs);
-    let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
-        .into_iter()
-        .filter(|&(t, _e)| theta_packs_log_mask[t])
-        .collect();
 
     // Class-aware mu-ref pairs for a mixture (#996). Empty for a non-mixture
     // model, which uses `mu_ref_pairs` above.
@@ -2150,22 +2399,65 @@ pub fn run_saem(
     // All of this is conditional on `mu_referencing`: with it off every θ goes
     // through the numerical M-step by construction, so telling the user to switch
     // estimator to get a closed-form shift they turned off is noise (#996 review).
-    let mut mix_switched_skipped: Vec<usize> = Vec::new();
-    let mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if saem_mix.is_some() && options.mu_referencing {
-        get_mixture_mu_ref_pairs(model)
-            .into_iter()
-            .filter(|p| p.theta_idx.iter().all(|&t| theta_packs_log_mask[t]))
-            .filter(|p| {
-                let shared = p.theta_idx.windows(2).all(|w| w[0] == w[1]);
-                if !shared {
-                    mix_switched_skipped.extend(p.theta_idx.iter().copied());
-                }
-                shared
-            })
-            .collect()
+    // Multi-theta (covariate) mu-references (#619). A group supersedes the
+    // single-anchor pair on its own eta, and its thetas leave the packing
+    // advisories (the group step moves them whatever their packing). Not run
+    // under a mixture: the class draw would have to enter the group's prior
+    // term and that has not been derived. Same `mu_referencing` gate as the
+    // closed-form shift — with it off every theta is numerical by design.
+    let (cov_mu_groups, cov_mu_notes) = if saem_mix.is_none() && options.mu_referencing {
+        crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
+            model,
+            population,
+            &cov_group_conflicts,
+            &init_params.theta_fixed,
+            &init_params.omega.matrix,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    for n in &cov_mu_notes {
+        warnings.push(format!("SAEM: {n}"));
+    }
+    let cov_group_etas: Vec<usize> = cov_mu_groups.iter().map(|g| g.eta_idx).collect();
+    let cov_group_thetas: Vec<usize> = cov_mu_groups
+        .iter()
+        .flat_map(|g| g.theta_idx.iter().copied())
+        .collect();
+    let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
+        .into_iter()
+        .filter(|(_t, e)| !cov_group_etas.contains(e))
+        .collect();
+    let dropped_identity: Vec<usize> = dropped_identity
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
+    let dropped_log_packed_logit: Vec<usize> = dropped_log_packed_logit
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
+
+    let mut mix_switched_skipped: Vec<usize> = Vec::new();
+    let mix_split = if saem_mix.is_some() && options.mu_referencing {
+        classify_mixture_mu_ref_pairs(model, &theta_packs_log_mask)
+    } else {
+        MixtureMuRefPairs {
+            eligible: Vec::new(),
+            identity_packed_log: Vec::new(),
+            log_packed_logit: Vec::new(),
+        }
+    };
+    let mix_mu_ref_pairs: Vec<MixtureMuRefPair> = mix_split
+        .eligible
+        .into_iter()
+        .filter(|p| {
+            let shared = p.theta_idx.windows(2).all(|w| w[0] == w[1]);
+            if !shared {
+                mix_switched_skipped.extend(p.theta_idx.iter().copied());
+            }
+            shared
+        })
+        .collect();
     if !mix_switched_skipped.is_empty() {
         mix_switched_skipped.sort_unstable();
         mix_switched_skipped.dedup();
@@ -2182,14 +2474,17 @@ pub fn run_saem(
         ));
     }
     let mut dropped_identity = dropped_identity;
-    if saem_mix.is_some() && options.mu_referencing {
-        for p in get_mixture_mu_ref_pairs(model) {
-            if p.theta_idx.iter().any(|&t| !theta_packs_log_mask[t]) {
-                dropped_identity.extend(p.theta_idx.iter().copied());
-            }
+    let mut dropped_log_packed_logit = dropped_log_packed_logit;
+    {
+        // A class anchor whose packing does not match its mu scale joins whichever
+        // advisory names the bound the user would have to change — identity-packed
+        // lognormal (#996), or log-packed logit (#918).
+        dropped_identity.extend(mix_split.identity_packed_log);
+        dropped_log_packed_logit.extend(mix_split.log_packed_logit);
+        for v in [&mut dropped_identity, &mut dropped_log_packed_logit] {
+            v.sort_unstable();
+            v.dedup();
         }
-        dropped_identity.sort_unstable();
-        dropped_identity.dedup();
     }
     // Same gate: the identity-packing advisory is about a closed-form update that
     // does not run at all under `mu_referencing = false` (#996 review).
@@ -2207,6 +2502,37 @@ pub fn run_saem(
             names.join(", ")
         ));
     }
+    // Mirror image for a logit-scale theta (#918): `inv_logit(THETA + ETA)` has
+    // mu scale θ, but a non-negative lower bound makes it log-packed.
+    if !dropped_log_packed_logit.is_empty() && options.mu_referencing {
+        let names: Vec<&str> = dropped_log_packed_logit
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        warnings.push(format!(
+            "SAEM: typical value(s) {} are logit-mu-referenced but declared with a \
+             non-negative lower bound, so they are packed on the log scale; the closed-form \
+             `θ += γ·mean(η)` update does not apply and they are estimated by the numerical \
+             M-step instead. Declare the logit-scale theta with a negative lower bound to use \
+             the closed-form update (#918).",
+            names.join(", ")
+        ));
+    }
+    // A theta anchoring two etas has no single closed-form shift (see
+    // `classify_mu_ref_pairs`); it and both its pairs go to the numerical M-step.
+    if !dropped_shared_theta.is_empty() && options.mu_referencing {
+        let names: Vec<&str> = dropped_shared_theta
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        warnings.push(format!(
+            "SAEM: typical value(s) {} are the mu-reference anchor of more than one ETA, so the \
+             closed-form mean shift has no single well-defined value for them; they are \
+             estimated by the numerical M-step instead. Give each ETA its own typical value if \
+             the closed-form update is wanted.",
+            names.join(", ")
+        ));
+    }
 
     let use_closed_form_mstep = options.mu_referencing
         && if saem_mix.is_some() {
@@ -2214,7 +2540,7 @@ pub fn run_saem(
             // M-step for every log-mu-ref θ (#996).
             !mix_mu_ref_pairs.is_empty()
         } else {
-            !mu_ref_pairs.is_empty()
+            !mu_ref_pairs.is_empty() || !cov_mu_groups.is_empty()
         };
 
     // A scalar residual statistic is exact for this narrow subset of models.
@@ -2285,15 +2611,23 @@ pub fn run_saem(
     } else {
         &[]
     };
+    let logit_messaged: &[usize] = if options.mu_referencing {
+        &dropped_log_packed_logit
+    } else {
+        &[]
+    };
     already_explained.extend(
         mix_switched_skipped
             .iter()
             .chain(identity_messaged.iter())
+            .chain(logit_messaged.iter())
             .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
     );
     let thetas_without_eta: Vec<String> = crate::estimation::impmap::non_fixed_thetas_without_eta(
         model,
         &init_params.theta_fixed,
+        // Resolved groups, not parsed ones: a dropped group anchors nothing.
+        &cov_group_thetas,
         &class_mu_ref_thetas,
     )
     .into_iter()
@@ -2341,10 +2675,20 @@ pub fn run_saem(
         } else if saem_mix.is_some() {
             class_mu_ref_thetas.clone()
         } else {
-            mu_ref_pairs.iter().map(|&(t, _e)| t).collect()
+            mu_ref_pairs
+                .iter()
+                .map(|&(t, _e)| t)
+                .chain(cov_group_thetas.iter().copied())
+                .collect()
         };
-        let theta_is_mu_ref_anchor =
-            crate::estimation::impmap::theta_is_mu_ref_anchor_mask(model, &class_mu_ref_thetas);
+        // `cov_group_thetas` is the *resolved* group list, so a group the
+        // resolver dropped (weak IIV, a conflicting anchor, all-FIXed) leaves
+        // its thetas counted as numerically estimated — which they are.
+        let theta_is_mu_ref_anchor = crate::estimation::impmap::theta_is_mu_ref_anchor_mask(
+            model,
+            &cov_group_thetas,
+            &class_mu_ref_thetas,
+        );
         damps_numerical_mstep(
             saem_mix.is_some(),
             n_theta,
@@ -2414,6 +2758,14 @@ pub fn run_saem(
     // step resets every `adapt_interval`.
     let mut cum_mh_acc: u64 = 0;
     let mut cum_mh_prop: u64 = 0;
+
+    // Iterations on which each #619 group's solve returned `None` — its
+    // typical value was not finite for some subject at the current θ. SAEM
+    // leaves those thetas to the numerical M-step (it pins only after a
+    // successful solve), so this is not the IMP freeze; it is still worth
+    // reporting, because the estimate then did not come from the group the
+    // user configured (#918 review).
+    let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
     // Main loop
     for k in 1..=n_iter {
@@ -3067,13 +3419,20 @@ pub fn run_saem(
             // expected to settle rather than find its basin.
             let mstep_maxiter = if k <= k1 { 3 } else { 5 };
             if use_closed_form_mstep && saem_mix.is_none() {
-                // Closed-form EM M-step for log-mu-referenced thetas.
+                // Closed-form EM M-step for mu-referenced thetas.
                 //
-                // Model: log(P_i) = log(TVP) + η_i, η_i ~ N(0, ω²).
-                // The complete-data log-likelihood is maximised at
-                //     log(TVP)_new = log(TVP)_old + mean_i(η_i)
+                // Model: g(P_i) = g(TVP) + η_i, η_i ~ N(0, ω²), where g is the
+                // mu-scale link — `log` for `P = TVP·exp(η)`, `logit` for
+                // `P = inv_logit(θ + η)`. Given the sampled individual
+                // parameters, the data term does not involve TVP at all, so
+                // the complete-data log-likelihood is maximised at
+                //     g(TVP)_new = g(TVP)_old + mean_i(η_i)
                 // and SAEM applies the stochastic-approximation step size γ:
-                //     log(TVP)_new = log(TVP)_old + γ · mean_i(η_i)
+                //     g(TVP)_new = g(TVP)_old + γ · mean_i(η_i)
+                // `log_theta[j]` *is* g(TVP) for every pair in `mu_ref_pairs`
+                // (that is what `classify_mu_ref_pairs` screens for), so the shift
+                // below is applied to the packed value directly, whichever link
+                // the parameter uses.
                 // After the update, η_i is re-centred by `mean(η)` so the
                 // sufficient statistic for ω is taken from zero-mean residuals
                 // (ω is updated from `s2` *after* the next MH step, but
@@ -3100,7 +3459,7 @@ pub fn run_saem(
                     // not by `gamma * mean_eta` directly: when the update is
                     // clamped at a bound the realised delta is smaller, and
                     // shifting etas by the unclamped quantity would break
-                    // log(P_i) = log(TVP) + η_i until the next MH refresh.
+                    // g(P_i) = g(TVP) + η_i until the next MH refresh.
                     let delta = log_theta[theta_idx] - log_theta_before;
                     for e in state.etas.iter_mut() {
                         e[eta_idx] -= delta;
@@ -3109,6 +3468,105 @@ pub fn run_saem(
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
                     temp_theta_upper[theta_idx] = log_theta[theta_idx];
                     n_pinned += 1;
+                }
+                // ---- Covariate mu-reference groups (#619): φ-frozen M-step ----
+                // Exact (Gauss–Newton on the prior term) when the group's
+                // covariates are time-constant, prior + data (BOBYQA) when one
+                // varies within a subject. The result is blended with the same
+                // SA step `gamma` as the shift above, then each subject's eta is
+                // re-centred by the realised change in its own mu so that
+                // `φ_i = g(A_i(θ)) + η_i` is unchanged — the per-subject twin of
+                // the `e[eta_idx] -= delta` above.
+                if !cov_mu_groups.is_empty() {
+                    let unpack_all = |lt: &[f64]| -> Vec<f64> {
+                        (0..n_theta)
+                            .map(|i| {
+                                if theta_packs_log_mask[i] {
+                                    lt[i].exp()
+                                } else {
+                                    lt[i]
+                                }
+                            })
+                            .collect()
+                    };
+                    let pack_one = |i: usize, v: f64| -> f64 {
+                        if theta_packs_log_mask[i] {
+                            v.max(1e-10).ln()
+                        } else {
+                            v
+                        }
+                    };
+                    let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
+                    for (gi, group) in cov_mu_groups.iter().enumerate() {
+                        let theta_now = unpack_all(&log_theta);
+                        let mu_old = group.mus(&theta_now, population);
+                        let solved = {
+                            let input = GroupStepInput {
+                                theta: &theta_now,
+                                theta_lower: &init_params.theta_lower,
+                                theta_upper: &init_params.theta_upper,
+                                theta_fixed: &init_params.theta_fixed,
+                                theta_packs_log: &theta_packs_log_mask,
+                                omega: &state.omega_mat,
+                                etas: &state.etas,
+                            };
+                            if group.needs_data_term {
+                                let k = group.eta_idx;
+                                let etas_now = &state.etas;
+                                let data = |th: &[f64], shift: &[f64]| -> f64 {
+                                    let shifted: Vec<Vec<f64>> = etas_now
+                                        .iter()
+                                        .zip(shift.iter())
+                                        .map(|(e, s)| {
+                                            let mut e2 = e.clone();
+                                            if k < e2.len() {
+                                                e2[k] += s;
+                                            }
+                                            e2
+                                        })
+                                        .collect();
+                                    match kappas_for_mstep {
+                                        Some(kaps) => obs_nll_sum_iov(
+                                            model, population, th, &sigma_now, &shifted, kaps,
+                                        ),
+                                        None => {
+                                            obs_nll_sum(model, population, th, &sigma_now, &shifted)
+                                        }
+                                    }
+                                };
+                                group.solve_numerical(population, &input, mstep_maxiter, &data)
+                            } else {
+                                group.solve_exact(population, &input)
+                            }
+                        };
+                        // Pinning happens below, inside this `Some` arm, so a
+                        // skipped group leaves its thetas free for
+                        // `theta_sigma_mstep_light` — no freeze, but the run is
+                        // no longer the one the group describes.
+                        let Some(theta_star) = solved else {
+                            cov_group_skipped[gi] += 1;
+                            continue;
+                        };
+                        for &t in &group.theta_idx {
+                            if init_params.theta_fixed.get(t).copied().unwrap_or(false) {
+                                continue;
+                            }
+                            let target = pack_one(t, theta_star[t]);
+                            log_theta[t] = (log_theta[t] + gamma * (target - log_theta[t]))
+                                .clamp(log_theta_lower[t], log_theta_upper[t]);
+                            temp_theta_lower[t] = log_theta[t];
+                            temp_theta_upper[t] = log_theta[t];
+                            n_pinned += 1;
+                        }
+                        let theta_new = unpack_all(&log_theta);
+                        let mu_new = group.mus(&theta_new, population);
+                        for (i, e) in state.etas.iter_mut().enumerate() {
+                            let d = mu_new[i] - mu_old[i];
+                            if d.is_finite() && group.eta_idx < e.len() {
+                                e[group.eta_idx] -= d;
+                            }
+                        }
+                    }
                 }
                 // Each pinned mu-ref dim avoids 2 obs_nll_sum calls per NLopt
                 // gradient request, capped at `mstep_maxiter` requests. FIXed
@@ -3605,6 +4063,34 @@ pub fn run_saem(
     // "0% acceptance" failure).
     if let Some(w) = saem_mixing_warning(cum_mh_acc, cum_mh_prop) {
         warnings.push(w);
+    }
+
+    // #918 review: a #619 group whose solve kept returning `None` never ran.
+    for (gi, &skipped) in cov_group_skipped.iter().enumerate() {
+        if skipped == 0 {
+            continue;
+        }
+        let group = &cov_mu_groups[gi];
+        let names: Vec<&str> = group
+            .theta_idx
+            .iter()
+            .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
+            .collect();
+        warnings.push(format!(
+            "SAEM: the covariate mu-reference on {} had no admissible step on {} of {} \
+             iteration(s) — its typical value was not finite for at least one subject at the \
+             current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
+             fell back to the numerical M-step on those iterations, which is the channel #619 \
+             exists to avoid; consider bounding the covariate slope.",
+            model
+                .eta_names
+                .get(group.eta_idx)
+                .map(String::as_str)
+                .unwrap_or("?"),
+            skipped,
+            n_iter,
+            names.join(", ")
+        ));
     }
 
     // #895: warn when a free RUV-scaled residual σ ended pinned against the
@@ -4328,6 +4814,386 @@ mod tests {
         );
     }
 
+    /// SAEM twin of the IMP test of the same name (#918): a logit mu-ref whose
+    /// theta is log-packed takes no closed-form pair and the advisory names it.
+    /// `TVCL` (log-packed lognormal) still takes the closed form, which is why
+    /// the saved-eval count is non-zero here.
+    #[test]
+    fn saem_log_packed_logit_mu_ref_routes_to_numerical_mstep() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  F  = inv_logit(LOGIT_F + ETA_F)
+  CL = TVCL * exp(ETA_CL) * F
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("packed on the log scale"))
+            .unwrap_or_else(|| {
+                panic!("expected the #918 packing advisory, got {:?}", res.warnings)
+            });
+        assert!(
+            hit.contains("LOGIT_F"),
+            "LOGIT_F named in the advisory: {hit}"
+        );
+        assert!(
+            !hit.contains("TVCL"),
+            "TVCL is a log-packed lognormal, not listed: {hit}"
+        );
+        assert!(
+            res.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
+            "TVCL still takes the closed form: {:?}",
+            res.saem_mu_ref_m_step_evals_saved
+        );
+        // The θ is un-explained by the "NO associated ETA" advisory: it carries
+        // one, and the packing advisory above already says why it is numerical.
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("NO associated ETA") && w.contains("LOGIT_F")),
+            "LOGIT_F must not also be reported as having no ETA, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// With `mu_referencing = false` no closed-form shift runs at all, so the
+    /// packing advisory is noise and must stay silent (same gate as #996).
+    #[test]
+    fn saem_mu_referencing_off_suppresses_the_log_packed_logit_advisory() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  F  = inv_logit(LOGIT_F + ETA_F)
+  CL = TVCL * exp(ETA_CL) * F
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the log scale")),
+            "no packing advisory with mu_referencing off, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// Eight subjects with CRCL 40..140, CL generated from the additive renal
+    /// model (`CL = 5 + (CRCL-90)*0.05`, no IIV in the data) so a covariate
+    /// group has real between-subject structure to fit in a handful of
+    /// iterations. `V = 50`.
+    fn covmuref_csv(with_v_eta: bool) -> String {
+        let mut s = String::from("ID,TIME,DV,AMT,EVID,CMT,CRCL\n");
+        for (i, crcl) in [40.0_f64, 55.0, 70.0, 85.0, 95.0, 110.0, 125.0, 140.0]
+            .iter()
+            .enumerate()
+        {
+            let id = i + 1;
+            let cl = 5.0 + (crcl - 90.0) * 0.05;
+            let v = if with_v_eta {
+                50.0 * (0.1 * ((id as f64) - 4.5) / 4.5).exp()
+            } else {
+                50.0
+            };
+            s.push_str(&format!("{id},0,0,100,1,1,{crcl}\n"));
+            for (ti, t) in [1.0_f64, 4.0, 8.0, 16.0, 24.0].iter().enumerate() {
+                let c = 100.0 / v * (-(cl / v) * t).exp();
+                let dv = c * (1.0 + 0.03 * ((id + ti) as f64).sin());
+                s.push_str(&format!("{id},{t},{dv:.6},0,0,1,{crcl}\n"));
+            }
+        }
+        s
+    }
+
+    fn covmuref_pop(with_v_eta: bool) -> Population {
+        use std::io::Write;
+        let csv = covmuref_csv(with_v_eta);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::io::datareader::read_nonmem_csv(f.path(), Some(&["CRCL"]), None).unwrap()
+    }
+
+    /// The #619 additive form with the covariate group as the **only**
+    /// eta-bearing parameter (`V` carries no eta), so a closed-form channel
+    /// exists if and only if the group is active.
+    const COVMUREF_ONLY_MODEL: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0, 5.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// #619: with the covariate group active, SAEM has a closed-form channel
+    /// (the saved-eval count is `Some(>0)`), the parameter is not reported as
+    /// un-mu-referenced, and no group note fires. Without the group this model
+    /// has no mu-referenced parameter at all, so the count would be `None` —
+    /// that is the discriminating signature, as in the #918 test.
+    #[test]
+    fn saem_covariate_mu_ref_group_drives_the_closed_form_channel() {
+        let model =
+            crate::parser::model_parser::parse_model_string(COVMUREF_ONLY_MODEL).expect("parses");
+        assert_eq!(model.covariate_mu_refs.len(), 1);
+        assert!(
+            model.mu_refs.is_empty(),
+            "no single-anchor pair in this model"
+        );
+        let pop = covmuref_pop(false);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 6;
+        opts.saem_n_convergence = 3;
+        opts.saem_seed = Some(619);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            res.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
+            "the group step must pin its thetas out of the numerical M-step: {:?}",
+            res.saem_mu_ref_m_step_evals_saved
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("not mu-referenced") && w.contains("CL")),
+            "CL is mu-referenced through the group, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("covariate mu-reference on")),
+            "no group should be dropped, got {:?}",
+            res.warnings
+        );
+        // The renal slope moved off its start toward the data-generating 0.05.
+        let slope = res.theta[1];
+        assert!(
+            slope > 0.02,
+            "TH_CRCL must move from its 0.02 start: {slope}"
+        );
+    }
+
+    /// [`COVMUREF_ONLY_MODEL`] started where the additive typical value is
+    /// negative for the lowest-CRCL subject (`4 − 50·0.2 = −6`), so both group
+    /// engines return `None`.
+    const COVMUREF_INADMISSIBLE_START: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.2, 0.0, 5.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// SAEM pins a group's thetas only *after* a successful solve, so an
+    /// inadmissible start costs no freeze — but it silently reverts the group
+    /// to the numerical M-step, which is the channel #619 exists to avoid. The
+    /// fit must say so (#918 review).
+    ///
+    /// The straddle is [`saem_covariate_mu_ref_group_drives_the_closed_form_channel`],
+    /// the same model from an admissible start, which asserts this warning does
+    /// *not* fire — so a fix that always warned would fail there.
+    #[test]
+    fn saem_reports_a_covariate_group_that_never_stepped() {
+        let model = crate::parser::model_parser::parse_model_string(COVMUREF_INADMISSIBLE_START)
+            .expect("parses");
+        let pop = covmuref_pop(false);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("had no admissible step"))
+            .unwrap_or_else(|| panic!("expected the skipped-step report, got {:?}", res.warnings));
+        assert!(
+            hit.contains("ETA_CL") && hit.contains("TH_CRCL"),
+            "the report names the eta and the thetas: {hit}"
+        );
+    }
+
+    /// `mu_referencing = false` turns the group off with the rest of the
+    /// closed-form channel; the count is then `None` and no group note fires.
+    #[test]
+    fn saem_mu_referencing_off_disables_the_covariate_group() {
+        let model =
+            crate::parser::model_parser::parse_model_string(COVMUREF_ONLY_MODEL).expect("parses");
+        let pop = covmuref_pop(false);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(619);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert_eq!(res.saem_mu_ref_m_step_evals_saved, None);
+    }
+
+    /// A group whose theta is also another eta's single anchor is declined
+    /// with a note naming both, and the fit proceeds on the numerical M-step.
+    #[test]
+    fn saem_covariate_group_sharing_an_anchor_is_declined_with_a_note() {
+        let src = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = (TVCL * 10.0 + TH_CRCL * CRCL) * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = covmuref_pop(true);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 3;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(619);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let note = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("covariate mu-reference on ETA_V"))
+            .unwrap_or_else(|| panic!("expected the #619 note, got {:?}", res.warnings));
+        assert!(note.contains("TVCL") && note.contains("ETA_CL"), "{note}");
+    }
+
+    #[test]
+    fn saem_mixture_takes_a_class_shared_logit_anchor() {
+        // SAEM's mixture path takes the class-**shared** anchors, and a logit one
+        // qualifies exactly like a lognormal one once its theta is identity-packed
+        // (#918). `saem_mu_ref_m_step_evals_saved` counts the θ the closed form
+        // pinned, so it is `Some(> 0)` only if LOGIT_F is in the pair set — the
+        // control being `saem_mixture_without_shared_mu_ref_stays_on_numerical_mstep`
+        // below, whose identical fixture has no shared anchor and reports `None`.
+        let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta LOGIT_F(-0.405465, -10.0, 10.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_F ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 else TVCL2
+  V  = TVV
+  F  = inv_logit(LOGIT_F + ETA_F)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let saved = res
+            .saem_mu_ref_m_step_evals_saved
+            .expect("the class-shared logit anchor must drive the closed-form M-step");
+        assert!(saved > 0, "expected pinned-θ eval savings, got {saved}");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the log scale")),
+            "LOGIT_F is identity-packed; no packing advisory expected, got {:?}",
+            res.warnings
+        );
+    }
+
     #[test]
     fn saem_mixture_without_shared_mu_ref_stays_on_numerical_mstep() {
         // Only the class-switched CL is mu-ref-shaped; V carries no ETA. SAEM
@@ -4545,7 +5411,7 @@ mod tests {
         let pop = mix996_pop(2);
         let mut params = model.default_params.clone();
         params.sigma_fixed[0] = false;
-        let pairs = get_mu_ref_pairs(&model);
+        let pairs = get_mu_ref_pairs(&model, &model.default_params.theta_lower);
 
         assert_eq!(
             scalar_residual_mstep_model(&model, &pop, &params, 0, false, true, &pairs),
@@ -4558,7 +5424,8 @@ mod tests {
         let unanchored = noeta_model("TVV");
         let mut unanchored_params = unanchored.default_params.clone();
         unanchored_params.sigma_fixed[0] = false;
-        let unanchored_pairs = get_mu_ref_pairs(&unanchored);
+        let unanchored_pairs =
+            get_mu_ref_pairs(&unanchored, &unanchored.default_params.theta_lower);
         assert_eq!(
             scalar_residual_mstep_model(
                 &unanchored,
@@ -4719,7 +5586,7 @@ DV ~ additive(EPS)
     fn model_with_mu_refs(
         theta_names: &[&str],
         eta_names: &[&str],
-        mu_refs: &[(&str, &str, bool)],
+        mu_refs: &[(&str, &str, MuTransform)],
     ) -> CompiledModel {
         let mut m = analytical_model(GradientMethod::Auto);
         m.theta_names = theta_names.iter().map(|s| (*s).to_string()).collect();
@@ -4728,12 +5595,12 @@ DV ~ additive(EPS)
         m.n_eta = eta_names.len();
         m.mu_refs = mu_refs
             .iter()
-            .map(|(eta, theta, log_t)| {
+            .map(|(eta, theta, transform)| {
                 (
                     (*eta).to_string(),
                     MuRef {
                         theta_name: (*theta).to_string(),
-                        log_transformed: *log_t,
+                        transform: *transform,
                     },
                 )
             })
@@ -4748,7 +5615,7 @@ DV ~ additive(EPS)
     fn model_with_mixture_mu_refs(
         theta_names: &[&str],
         eta_names: &[&str],
-        mu_refs: &[(&str, &str, bool)],
+        mu_refs: &[(&str, &str, MuTransform)],
         n_classes: usize,
         class_refs: &[(&str, Vec<&str>)],
     ) -> CompiledModel {
@@ -4773,7 +5640,11 @@ DV ~ additive(EPS)
 
     #[test]
     fn mixture_mu_ref_pairs_empty_for_non_mixture() {
-        let m = model_with_mu_refs(&["TVCL"], &["ETA_CL"], &[("ETA_CL", "TVCL", true)]);
+        let m = model_with_mu_refs(
+            &["TVCL"],
+            &["ETA_CL"],
+            &[("ETA_CL", "TVCL", MuTransform::Log)],
+        );
         assert!(get_mixture_mu_ref_pairs(&m).is_empty());
     }
 
@@ -4790,7 +5661,8 @@ DV ~ additive(EPS)
             get_mixture_mu_ref_pairs(&m),
             vec![MixtureMuRefPair {
                 eta_idx: 0,
-                theta_idx: vec![0, 1]
+                theta_idx: vec![0, 1],
+                transform: MuTransform::Log,
             }]
         );
     }
@@ -4802,7 +5674,7 @@ DV ~ additive(EPS)
         let m = model_with_mixture_mu_refs(
             &["TVCL1", "TVCL2", "TVV"],
             &["ETA_CL", "ETA_V"],
-            &[("ETA_V", "TVV", true)],
+            &[("ETA_V", "TVV", MuTransform::Log)],
             3,
             &[("ETA_CL", vec!["TVCL1", "TVCL2", "TVCL2"])],
         );
@@ -4811,14 +5683,117 @@ DV ~ additive(EPS)
             vec![
                 MixtureMuRefPair {
                     eta_idx: 0,
-                    theta_idx: vec![0, 1, 1]
+                    theta_idx: vec![0, 1, 1],
+                    transform: MuTransform::Log,
                 },
                 MixtureMuRefPair {
                     eta_idx: 1,
-                    theta_idx: vec![2, 2, 2]
+                    theta_idx: vec![2, 2, 2],
+                    transform: MuTransform::Log,
                 },
             ]
         );
+    }
+
+    /// A class-**shared** logit mu-ref inside a mixture model is a pair like any
+    /// other: the shift is link-independent, and the packing check that decides
+    /// whether it may run lives in the caller (`packed_scale_is_mu`), not here.
+    /// Before the codex review of #1375 this builder filtered on
+    /// `log_transformed()`, so `F = inv_logit(LOGIT_F + ETA_F)` silently dropped
+    /// out of the closed form in every mixture fit (#918).
+    #[test]
+    fn mixture_mu_ref_pairs_include_a_class_shared_logit_anchor() {
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2", "LOGIT_F"],
+            &["ETA_CL", "ETA_F"],
+            &[("ETA_F", "LOGIT_F", MuTransform::Logit)],
+            2,
+            &[("ETA_CL", vec!["TVCL1", "TVCL2"])],
+        );
+        assert_eq!(
+            get_mixture_mu_ref_pairs(&m),
+            vec![
+                MixtureMuRefPair {
+                    eta_idx: 0,
+                    theta_idx: vec![0, 1],
+                    transform: MuTransform::Log,
+                },
+                MixtureMuRefPair {
+                    eta_idx: 1,
+                    theta_idx: vec![2, 2],
+                    transform: MuTransform::Logit,
+                },
+            ]
+        );
+    }
+
+    /// The packing gate both mixture estimators filter on. Same model, three
+    /// packings: a logit anchor is eligible **only** identity-packed and a log
+    /// anchor **only** log-packed, and each mismatch lands in the list whose
+    /// advisory names the bound to change.
+    ///
+    /// This is the mutation target for the filter itself: written against
+    /// `theta_packs_log_mask[t]` alone (the pre-review code), the logit row is
+    /// classified backwards — the eligible case reads as a packing mismatch.
+    #[test]
+    fn classify_mixture_mu_ref_pairs_gates_each_transform_on_its_own_packing() {
+        // theta 0 = LOGIT_F (logit anchor), theta 1 = TVV (log anchor).
+        let m = model_with_mixture_mu_refs(
+            &["LOGIT_F", "TVV"],
+            &["ETA_F", "ETA_V"],
+            &[
+                ("ETA_F", "LOGIT_F", MuTransform::Logit),
+                ("ETA_V", "TVV", MuTransform::Log),
+            ],
+            2,
+            &[],
+        );
+        // Both declared the way the closed form wants: logit identity-packed,
+        // lognormal log-packed.
+        let split = classify_mixture_mu_ref_pairs(&m, &[false, true]);
+        assert_eq!(
+            split.eligible.iter().map(|p| p.eta_idx).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(split.identity_packed_log.is_empty());
+        assert!(split.log_packed_logit.is_empty());
+
+        // Both declared the wrong way round: each drops, into its own list.
+        let split = classify_mixture_mu_ref_pairs(&m, &[true, false]);
+        assert!(split.eligible.is_empty());
+        assert_eq!(split.log_packed_logit, vec![0]);
+        assert_eq!(split.identity_packed_log, vec![1]);
+    }
+
+    /// A `MIXNUM`-switched pair is dropped whole when any one of its class
+    /// thetas is mis-packed — the shift moves them together — but only the
+    /// offending theta is named, since the others' bounds are already right.
+    #[test]
+    fn classify_mixture_mu_ref_pairs_drops_a_pair_on_one_mispacked_class_theta() {
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2"],
+            &["ETA_CL"],
+            &[],
+            2,
+            &[("ETA_CL", vec!["TVCL1", "TVCL2"])],
+        );
+        let split = classify_mixture_mu_ref_pairs(&m, &[true, false]);
+        assert!(split.eligible.is_empty());
+        assert_eq!(split.identity_packed_log, vec![1]);
+    }
+
+    /// The two forms a mixture anchor can never take, for the same reason as in
+    /// the single-population classifier: no packing has their mu scale.
+    #[test]
+    fn mixture_mu_ref_pairs_exclude_probability_scale_logit() {
+        let m = model_with_mixture_mu_refs(
+            &["TVF"],
+            &["ETA_F"],
+            &[("ETA_F", "TVF", MuTransform::LogitProbability)],
+            2,
+            &[],
+        );
+        assert!(get_mixture_mu_ref_pairs(&m).is_empty());
     }
 
     #[test]
@@ -4830,7 +5805,10 @@ DV ~ additive(EPS)
         let m = model_with_mixture_mu_refs(
             &["TVCL", "TVV"],
             &["ETA_CL", "ETA_V"],
-            &[("ETA_CL", "TVCL", true), ("ETA_V", "TVCL", true)],
+            &[
+                ("ETA_CL", "TVCL", MuTransform::Log),
+                ("ETA_V", "TVCL", MuTransform::Log),
+            ],
             2,
             &[],
         );
@@ -4839,7 +5817,8 @@ DV ~ additive(EPS)
             pairs,
             vec![MixtureMuRefPair {
                 eta_idx: 0,
-                theta_idx: vec![0, 0]
+                theta_idx: vec![0, 0],
+                transform: MuTransform::Log,
             }]
         );
         // Every theta is claimed at most once across the whole pair set.
@@ -4871,7 +5850,8 @@ DV ~ additive(EPS)
             get_mixture_mu_ref_pairs(&m),
             vec![MixtureMuRefPair {
                 eta_idx: 0,
-                theta_idx: vec![0, 1]
+                theta_idx: vec![0, 1],
+                transform: MuTransform::Log,
             }]
         );
     }
@@ -4881,8 +5861,8 @@ DV ~ additive(EPS)
         let m = model_with_mixture_mu_refs(
             &["TVCL1", "TVCL2", "TVV"],
             &["ETA_CL", "ETA_V"],
-            // additive: excluded, like the single-population `get_mu_ref_pairs`
-            &[("ETA_V", "TVV", false)],
+            // additive: excluded, like the single-population `classify_mu_ref_pairs`
+            &[("ETA_V", "TVV", MuTransform::Identity)],
             2,
             &[("ETA_CL", vec!["TVCL1", "MISSING"])],
         );
@@ -5003,10 +5983,15 @@ DV ~ additive(EPS)
         assert_eq!(omega[(1, 1)], 1e-6);
     }
 
+    /// Lower bounds that make every theta log-packed (the usual PK case).
+    fn positive_lowers(n: usize) -> Vec<f64> {
+        vec![0.001; n]
+    }
+
     #[test]
     fn get_mu_ref_pairs_empty_when_no_mu_refs() {
         let m = analytical_model(GradientMethod::Auto);
-        assert!(get_mu_ref_pairs(&m).is_empty());
+        assert!(get_mu_ref_pairs(&m, &positive_lowers(m.theta_names.len())).is_empty());
     }
 
     #[test]
@@ -5014,9 +5999,12 @@ DV ~ additive(EPS)
         let m = model_with_mu_refs(
             &["CL", "V"],
             &["ETA_CL", "ETA_V"],
-            &[("ETA_CL", "CL", true), ("ETA_V", "V", true)],
+            &[
+                ("ETA_CL", "CL", MuTransform::Log),
+                ("ETA_V", "V", MuTransform::Log),
+            ],
         );
-        let mut pairs = get_mu_ref_pairs(&m);
+        let mut pairs = get_mu_ref_pairs(&m, &positive_lowers(2));
         pairs.sort();
         assert_eq!(pairs, vec![(0, 0), (1, 1)]);
     }
@@ -5029,16 +6017,279 @@ DV ~ additive(EPS)
         let m = model_with_mu_refs(
             &["CL", "V"],
             &["ETA_CL", "ETA_V"],
-            &[("ETA_CL", "CL", true), ("ETA_V", "V", false)],
+            &[
+                ("ETA_CL", "CL", MuTransform::Log),
+                ("ETA_V", "V", MuTransform::Identity),
+            ],
         );
-        assert_eq!(get_mu_ref_pairs(&m), vec![(0, 0)]);
+        assert_eq!(get_mu_ref_pairs(&m, &positive_lowers(2)), vec![(0, 0)]);
     }
 
     #[test]
     fn get_mu_ref_pairs_skips_orphaned_theta() {
         // mu_ref points at a theta name that doesn't exist — silently skipped.
-        let m = model_with_mu_refs(&["CL"], &["ETA_CL"], &[("ETA_CL", "MISSING", true)]);
-        assert!(get_mu_ref_pairs(&m).is_empty());
+        let m = model_with_mu_refs(
+            &["CL"],
+            &["ETA_CL"],
+            &[("ETA_CL", "MISSING", MuTransform::Log)],
+        );
+        assert!(get_mu_ref_pairs(&m, &positive_lowers(1)).is_empty());
+    }
+
+    /// #918: `F = inv_logit(LOGIT_F + ETA_F)` declares its theta on the logit
+    /// scale (lower bound < 0 → identity-packed), so the packed value *is* the
+    /// mu and the closed-form `packed += γ·mean(η)` update applies.
+    #[test]
+    fn get_mu_ref_pairs_includes_identity_packed_logit() {
+        let m = model_with_mu_refs(
+            &["LOGIT_F"],
+            &["ETA_F"],
+            &[("ETA_F", "LOGIT_F", MuTransform::Logit)],
+        );
+        assert_eq!(get_mu_ref_pairs(&m, &[-10.0]), vec![(0, 0)]);
+    }
+
+    /// A logit mu-ref whose theta happens to be log-packed (lower bound ≥ 0)
+    /// has packed scale `log θ` but mu scale `θ` — the closed form does not
+    /// apply, so it must fall through to the NLopt M-step.
+    #[test]
+    fn get_mu_ref_pairs_excludes_log_packed_logit() {
+        let m = model_with_mu_refs(
+            &["LOGIT_F"],
+            &["ETA_F"],
+            &[("ETA_F", "LOGIT_F", MuTransform::Logit)],
+        );
+        assert!(get_mu_ref_pairs(&m, &[0.0]).is_empty());
+    }
+
+    /// Mirror image: a lognormal mu-ref on an identity-packed theta (negative
+    /// lower bound) has mu scale `log θ` but packed scale `θ` — also excluded.
+    #[test]
+    fn get_mu_ref_pairs_excludes_identity_packed_lognormal() {
+        let m = model_with_mu_refs(&["CL"], &["ETA_CL"], &[("ETA_CL", "CL", MuTransform::Log)]);
+        assert!(get_mu_ref_pairs(&m, &[-1.0]).is_empty());
+    }
+
+    /// `inv_logit(logit(THETA) + ETA)` puts THETA on the probability scale, so
+    /// the mu is `logit(θ)` — a scale no packing produces. Never eligible.
+    #[test]
+    fn get_mu_ref_pairs_excludes_probability_scale_logit() {
+        let m = model_with_mu_refs(
+            &["F"],
+            &["ETA_F"],
+            &[("ETA_F", "F", MuTransform::LogitProbability)],
+        );
+        assert!(get_mu_ref_pairs(&m, &[0.001]).is_empty());
+        assert!(get_mu_ref_pairs(&m, &[-1.0]).is_empty());
+    }
+
+    /// The dropped-for-packing lists behind the advisories: a lognormal anchor
+    /// on an identity-packed theta lands in `identity_packed_log` (#996), a
+    /// logit anchor on a log-packed theta in `log_packed_logit` (#918), and the
+    /// eligible pairs are exactly the complement. Additive / probability-scale
+    /// anchors appear in neither list — no bound change makes them eligible.
+    #[test]
+    fn classify_mu_ref_pairs_splits_eligible_from_packing_mismatches() {
+        let m = model_with_mu_refs(
+            &["CL", "V", "LOGIT_F", "LOGIT_G", "ADD", "PF"],
+            &["ETA_CL", "ETA_V", "ETA_F", "ETA_G", "ETA_ADD", "ETA_PF"],
+            &[
+                ("ETA_CL", "CL", MuTransform::Log),
+                ("ETA_V", "V", MuTransform::Log),
+                ("ETA_F", "LOGIT_F", MuTransform::Logit),
+                ("ETA_G", "LOGIT_G", MuTransform::Logit),
+                ("ETA_ADD", "ADD", MuTransform::Identity),
+                ("ETA_PF", "PF", MuTransform::LogitProbability),
+            ],
+        );
+        // CL log-packed (ok), V identity-packed (dropped), LOGIT_F identity-packed
+        // (ok), LOGIT_G log-packed (dropped), ADD / PF never eligible.
+        let lowers = [0.001, -5.0, -10.0, 0.0, -1.0, 0.001];
+        let split = classify_mu_ref_pairs(&m, &lowers);
+        let mut eligible = split.eligible.clone();
+        eligible.sort();
+        assert_eq!(eligible, vec![(0, 0), (2, 2)]);
+        assert_eq!(split.identity_packed_log, vec![1]);
+        assert_eq!(split.log_packed_logit, vec![3]);
+        assert_eq!(get_mu_ref_pairs(&m, &lowers), split.eligible);
+    }
+
+    /// Two etas anchored to one theta must not list that theta twice.
+    #[test]
+    fn classify_mu_ref_pairs_dedups_dropped_thetas() {
+        let m = model_with_mu_refs(
+            &["TVP"],
+            &["ETA_A", "ETA_B"],
+            &[
+                ("ETA_A", "TVP", MuTransform::Log),
+                ("ETA_B", "TVP", MuTransform::Log),
+            ],
+        );
+        let split = classify_mu_ref_pairs(&m, &[-1.0]);
+        assert!(split.eligible.is_empty());
+        assert_eq!(split.identity_packed_log, vec![0]);
+    }
+
+    /// Two logit etas anchored to one theta: the closed form shifts a packed
+    /// theta by *one* eta mean and pins it, so keeping either pair would move
+    /// `LOGIT_F` by a quantity that is not the joint maximiser and leave the
+    /// other eta un-recentred. Both pairs are dropped and the theta is named.
+    ///
+    /// Without the `shared_theta` filter this returns *two* eligible pairs on
+    /// theta 0, and `run_saem`/`run_mcem` apply `θ += mean(η_1)` followed by
+    /// `θ += mean(η_2)` in the same iteration (codex review of #1375).
+    #[test]
+    fn classify_mu_ref_pairs_drops_a_theta_anchoring_two_logit_etas() {
+        let m = model_with_mu_refs(
+            &["LOGIT_F"],
+            &["ETA_F1", "ETA_F2"],
+            &[
+                ("ETA_F1", "LOGIT_F", MuTransform::Logit),
+                ("ETA_F2", "LOGIT_F", MuTransform::Logit),
+            ],
+        );
+        // Identity-packed, so packing is *not* what makes these ineligible.
+        let split = classify_mu_ref_pairs(&m, &[-10.0]);
+        assert!(
+            split.eligible.is_empty(),
+            "a shared anchor has no single closed-form shift, got {:?}",
+            split.eligible
+        );
+        assert_eq!(split.shared_theta, vec![0]);
+        assert!(split.log_packed_logit.is_empty());
+    }
+
+    /// The shared-anchor drop must not open a door for a #619 covariate group.
+    /// `resolve_covariate_mu_groups` declines a group whose theta another eta
+    /// anchors; feeding it `eligible` alone would hide exactly the thetas that
+    /// are *most* contested, so the dropped pairs are handed back through
+    /// `mu_ref_pairs_for_cov_groups`.
+    #[test]
+    fn mu_ref_pairs_for_cov_groups_keeps_the_shared_anchor_pairs() {
+        let m = model_with_mu_refs(
+            &["TVP"],
+            &["ETA_A", "ETA_B"],
+            &[
+                ("ETA_A", "TVP", MuTransform::Log),
+                ("ETA_B", "TVP", MuTransform::Log),
+            ],
+        );
+        let split = classify_mu_ref_pairs(&m, &positive_lowers(1));
+        assert!(split.eligible.is_empty(), "shared anchor takes no shift");
+        assert_eq!(mu_ref_pairs_for_cov_groups(&split), vec![(0, 0), (0, 1)]);
+    }
+
+    /// …while a theta dropped for a *packing* mismatch is not a conflict: the
+    /// group step does not work in the packed scale, so it may move it.
+    #[test]
+    fn mu_ref_pairs_for_cov_groups_omits_a_packing_dropped_theta() {
+        let m = model_with_mu_refs(
+            &["TVCL"],
+            &["ETA_CL"],
+            &[("ETA_CL", "TVCL", MuTransform::Log)],
+        );
+        let split = classify_mu_ref_pairs(&m, &[-1.0]);
+        assert_eq!(split.identity_packed_log, vec![0]);
+        assert!(mu_ref_pairs_for_cov_groups(&split).is_empty());
+    }
+
+    /// The lognormal spelling of the same hazard (`CL = TVP*exp(ETA_CL)`,
+    /// `V = TVP*exp(ETA_V)`), and the control that an *unshared* theta in the
+    /// same model keeps its pair — so the filter drops the shared anchor, not
+    /// the model.
+    #[test]
+    fn classify_mu_ref_pairs_drops_a_shared_log_anchor_but_keeps_the_others() {
+        let m = model_with_mu_refs(
+            &["TVP", "TVV"],
+            &["ETA_CL", "ETA_V", "ETA_OTHER"],
+            &[
+                ("ETA_CL", "TVP", MuTransform::Log),
+                ("ETA_V", "TVP", MuTransform::Log),
+                ("ETA_OTHER", "TVV", MuTransform::Log),
+            ],
+        );
+        let split = classify_mu_ref_pairs(&m, &positive_lowers(2));
+        assert_eq!(split.eligible, vec![(1, 2)]);
+        assert_eq!(split.shared_theta, vec![0]);
+        assert!(split.identity_packed_log.is_empty());
+    }
+
+    /// The shared-anchor rule counts sharing over **every declared anchor**,
+    /// not just the eligible ones (#918 review).
+    ///
+    /// `CL = TVP*exp(ETA_CL)` is log-packed `Log`, so eligible; `V = TVP +
+    /// ETA_V` is `Identity`, which is never eligible whatever the packing.
+    /// Scanning `eligible` alone sees `TVP` claimed once, shifts it by
+    /// `mean(η_CL)` and pins it, while `ETA_V` is never re-centred for that
+    /// delta — the pinned partial shift the rule exists to prevent.
+    /// `ETA_OTHER` on `TVV` is the straddle: an unshared anchor in the same
+    /// model must keep its pair, so a fix that widened the drop instead of the
+    /// detection fails here.
+    #[test]
+    fn classify_mu_ref_pairs_drops_an_anchor_shared_with_an_ineligible_eta() {
+        let m = model_with_mu_refs(
+            &["TVP", "TVV"],
+            &["ETA_CL", "ETA_V", "ETA_OTHER"],
+            &[
+                ("ETA_CL", "TVP", MuTransform::Log),
+                ("ETA_V", "TVP", MuTransform::Identity),
+                ("ETA_OTHER", "TVV", MuTransform::Log),
+            ],
+        );
+        let split = classify_mu_ref_pairs(&m, &positive_lowers(2));
+        assert_eq!(
+            split.eligible,
+            vec![(1, 2)],
+            "only the unshared anchor keeps its closed-form shift"
+        );
+        assert_eq!(split.shared_pairs, vec![(0, 0)]);
+        assert_eq!(split.shared_theta, vec![0]);
+        // `Identity` is not a packing problem, so it earns no packing advisory.
+        assert!(split.identity_packed_log.is_empty());
+        assert!(split.log_packed_logit.is_empty());
+        // The dropped pair still counts as a conflict for a #619 group.
+        assert_eq!(mu_ref_pairs_for_cov_groups(&split), vec![(1, 2), (0, 0)]);
+    }
+
+    /// …but two *ineligible* anchors on one theta share nothing the closed
+    /// form would have moved, so they are not named as a shared-anchor drop —
+    /// the packing advisory already explains them, and a second, unrelated
+    /// message would send the user after the wrong fix.
+    #[test]
+    fn classify_mu_ref_pairs_does_not_name_a_theta_only_ineligible_etas_share() {
+        let m = model_with_mu_refs(
+            &["TVP"],
+            &["ETA_A", "ETA_B"],
+            &[
+                ("ETA_A", "TVP", MuTransform::Log),
+                ("ETA_B", "TVP", MuTransform::Log),
+            ],
+        );
+        // Identity-packed, so *both* anchors are ineligible for packing
+        // reasons before sharing is even considered.
+        let split = classify_mu_ref_pairs(&m, &[-1.0]);
+        assert!(split.eligible.is_empty());
+        assert!(split.shared_pairs.is_empty());
+        assert!(split.shared_theta.is_empty());
+        assert_eq!(split.identity_packed_log, vec![0]);
+    }
+
+    /// `packed_scale_is_mu` is the one condition the link-independent shift
+    /// needs; the table is the contract every caller (single-population and
+    /// mixture) filters on.
+    #[test]
+    fn packed_scale_is_mu_matches_the_packing_table() {
+        assert!(packed_scale_is_mu(MuTransform::Log, true));
+        assert!(!packed_scale_is_mu(MuTransform::Log, false));
+        assert!(packed_scale_is_mu(MuTransform::Logit, false));
+        assert!(!packed_scale_is_mu(MuTransform::Logit, true));
+        for packs_log in [true, false] {
+            assert!(!packed_scale_is_mu(MuTransform::Identity, packs_log));
+            assert!(!packed_scale_is_mu(
+                MuTransform::LogitProbability,
+                packs_log
+            ));
+        }
     }
 
     // ---- Regression tests for the three SAEM correctness bugs ----
@@ -5205,9 +6456,12 @@ DV ~ additive(EPS)
         let m = model_with_mu_refs(
             &["CL", "V"],
             &["ETA_CL", "ETA_V"],
-            &[("ETA_CL", "CL", true), ("ETA_V", "V", true)],
+            &[
+                ("ETA_CL", "CL", MuTransform::Log),
+                ("ETA_V", "V", MuTransform::Log),
+            ],
         );
-        let pairs = get_mu_ref_pairs(&m);
+        let pairs = get_mu_ref_pairs(&m, &positive_lowers(2));
         assert_eq!(pairs.len(), 2);
         // The closed-form branch is taken iff `options.mu_referencing` AND
         // `!pairs.is_empty()`.  Both conditions are tested via the public API

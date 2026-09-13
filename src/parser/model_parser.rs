@@ -583,41 +583,33 @@ fn detect_mu_refs(
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
     let mut result = HashMap::new();
+    // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
+    // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
+    // `CL = TVCL * exp(ETA_CL)`) hide the anchor theta behind a local variable, so the
+    // raw expression matches no pattern. Inlining eta-free local definitions makes
+    // those forms algebraically identical to the direct ones (#918). Detection is
+    // attempted on the raw expression *first* so every form recognised before this
+    // fallback existed keeps producing exactly the same `MuRef`.
+    let mut assign_counts: HashMap<&str, usize> = HashMap::new();
+    count_all_assignments(stmts, &mut assign_counts);
+    // Definitions are accumulated in statement order *and resolved where they
+    // sit* ([`record_inline_def`]), so a line can only be rewritten with values
+    // that are already in scope — a forward reference reads a covariate (or
+    // zero) at eval time and must not be "resolved" into a definition that
+    // comes later, not even through a chain.
+    let mut inline_defs: HashMap<String, Expression> = HashMap::new();
+
     for s in stmts {
-        if let Statement::Assign(_, expr) = s {
-            if let Some((eta_idx, anchor, log_transformed)) = detect_pattern(expr) {
-                if eta_idx >= eta_names.len() {
-                    continue;
-                }
-                let name = match anchor {
-                    MuRefAnchor::Theta(ti) => {
-                        if ti >= theta_names.len() {
-                            continue;
-                        }
-                        theta_names[ti].clone()
-                    }
-                    MuRefAnchor::NnOutput { nn_idx, output_idx } => {
-                        // Defensive: indices should be valid by construction
-                        // (parse_atom built them against the same nn_specs),
-                        // but skip silently rather than panic if anything's
-                        // out of sync.
-                        let Some((nn_name, outputs)) = nn_specs.get(nn_idx) else {
-                            continue;
-                        };
-                        let Some(out_name) = outputs.get(output_idx) else {
-                            continue;
-                        };
-                        format!("{nn_name}.{out_name}")
-                    }
-                };
-                result.insert(
-                    eta_names[eta_idx].clone(),
-                    MuRef {
-                        theta_name: name,
-                        log_transformed,
-                    },
-                );
+        if let Statement::Assign(name, raw_expr) = s {
+            let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
+            if found.is_none() && !inline_defs.is_empty() {
+                let inlined = inline_local_vars(raw_expr, &inline_defs);
+                found = classify_mu_ref(&inlined, theta_names, eta_names, nn_specs);
             }
+            if let Some((eta_idx, mu_ref)) = found {
+                result.insert(eta_names[eta_idx].clone(), mu_ref);
+            }
+            record_inline_def(&mut inline_defs, &assign_counts, name, raw_expr);
         }
     }
     result
@@ -823,6 +815,706 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
     }
 }
 
+/// Match one `[individual_parameters]` right-hand side against every
+/// mu-referencing form, returning `(eta_idx, MuRef)` for the first that fits.
+///
+/// Logit forms are tried before the product/additive ones: `inv_logit(THETA + ETA)`
+/// is neither a product nor a bare sum, so `detect_pattern` cannot see it (#918).
+fn classify_mu_ref(
+    expr: &Expression,
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> Option<(usize, MuRef)> {
+    if let Some((eta_idx, theta_idx, prob_scale)) = detect_logit_pattern(expr) {
+        if eta_idx < eta_names.len() && theta_idx < theta_names.len() {
+            return Some((
+                eta_idx,
+                MuRef {
+                    theta_name: theta_names[theta_idx].clone(),
+                    transform: if prob_scale {
+                        MuTransform::LogitProbability
+                    } else {
+                        MuTransform::Logit
+                    },
+                },
+            ));
+        }
+    }
+
+    let (eta_idx, anchor, log_transformed) = detect_pattern(expr)?;
+    if eta_idx >= eta_names.len() {
+        return None;
+    }
+    let theta_name = match anchor {
+        MuRefAnchor::Theta(ti) => theta_names.get(ti)?.clone(),
+        MuRefAnchor::NnOutput { nn_idx, output_idx } => {
+            // Defensive: indices should be valid by construction (parse_atom
+            // built them against the same nn_specs), but skip silently rather
+            // than panic if anything's out of sync.
+            let (nn_name, outputs) = nn_specs.get(nn_idx)?;
+            let out_name = outputs.get(output_idx)?;
+            format!("{nn_name}.{out_name}")
+        }
+    };
+    Some((
+        eta_idx,
+        MuRef {
+            theta_name,
+            transform: if log_transformed {
+                MuTransform::Log
+            } else {
+                MuTransform::Identity
+            },
+        },
+    ))
+}
+
+/// Count assignments per variable name across top-level statements *and* every
+/// `if` branch, so a name that is conditionally reassigned is never inlined.
+fn count_all_assignments<'a>(stmts: &'a [Statement], out: &mut HashMap<&'a str, usize>) {
+    for s in stmts {
+        match s {
+            Statement::Assign(name, _) => *out.entry(name.as_str()).or_insert(0) += 1,
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    count_all_assignments(body, out);
+                }
+                if let Some(eb) = else_body {
+                    count_all_assignments(eb, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when `expr` references any ETA anywhere in its tree.
+fn expr_contains_eta(expr: &Expression) -> bool {
+    match expr {
+        Expression::Eta(_) => true,
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            expr_contains_eta(l) || expr_contains_eta(r)
+        }
+        Expression::UnaryFn(_, a) => expr_contains_eta(a),
+        Expression::Conditional(_, t, f) => expr_contains_eta(t) || expr_contains_eta(f),
+        _ => false,
+    }
+}
+
+/// Substitute `defs` into every named reference in `expr`. Names with no
+/// definition (genuine covariates, forward references) are left untouched.
+///
+/// The substitution is **one level deep, and deliberately so**: `defs` only
+/// ever holds definitions that [`record_inline_def`] already resolved against
+/// the scope *at their own statement*, so a stored body needs no further
+/// expansion, and expanding it anyway is the #918-review defect — it would
+/// resolve a name against a definition that comes *later* in the block. See
+/// [`record_inline_def`].
+///
+/// Both `Variable` and `Covariate` nodes are substituted: `parse_atom` emits
+/// `Variable` for a name already assigned earlier in the block and `Covariate`
+/// otherwise, but a caller that builds statements without the surrounding
+/// `defined_vars` context (unit tests, the `[odes]` harness) yields `Covariate`
+/// for the same name. `defs` only ever holds names assigned earlier in this
+/// block, and such an assignment shadows any same-named covariate at eval time,
+/// so treating the two node kinds alike is consistent either way.
+fn inline_local_vars(expr: &Expression, defs: &HashMap<String, Expression>) -> Expression {
+    match expr {
+        Expression::Variable(name) | Expression::Covariate(name) => match defs.get(name) {
+            Some(def) => def.clone(),
+            None => expr.clone(),
+        },
+        Expression::BinOp(l, op, r) => Expression::BinOp(
+            Box::new(inline_local_vars(l, defs)),
+            *op,
+            Box::new(inline_local_vars(r, defs)),
+        ),
+        Expression::Power(b, e) => Expression::Power(
+            Box::new(inline_local_vars(b, defs)),
+            Box::new(inline_local_vars(e, defs)),
+        ),
+        Expression::UnaryFn(name, a) => {
+            Expression::UnaryFn(name.clone(), Box::new(inline_local_vars(a, defs)))
+        }
+        _ => expr.clone(),
+    }
+}
+
+/// Record `name = raw_expr` as a substitution available to the lines *below*
+/// it, with the definitions already in scope resolved into it right here.
+///
+/// Eligible as a substitution at all when the name is assigned exactly once in
+/// the whole block (so no `if` branch overrides it) and its right-hand side is
+/// eta-free (an eta-bearing definition is an individual parameter, not a
+/// typical value).
+///
+/// **Resolving at the definition, not at the use, is the correctness
+/// condition.** Storing the raw body and expanding it recursively at each use
+/// site reads the map as it stands *there*, which can contain names defined
+/// after the definition was written:
+///
+/// ```text
+///   A   = FOO          # FOO is unknown here, so this reads the data covariate
+///   FOO = THETA_X
+///   CL  = A * exp(ETA_CL)
+/// ```
+///
+/// Use-site expansion walks `A → FOO → THETA_X` and records a mu-reference on
+/// `THETA_X`, a theta `CL` never reads — SAEM would then shift and pin it and
+/// re-centre `ETA_CL` by that delta. Resolving `A` when it is *recorded* freezes
+/// it as `Covariate("FOO")`, which is what the model actually evaluates (#918
+/// review). Chains that are genuinely in scope still collapse, in one step: `B =
+/// A` stores `A`'s already-resolved body.
+fn record_inline_def(
+    inline_defs: &mut HashMap<String, Expression>,
+    assign_counts: &HashMap<&str, usize>,
+    name: &str,
+    raw_expr: &Expression,
+) {
+    if assign_counts.get(name).copied().unwrap_or(0) != 1 || expr_contains_eta(raw_expr) {
+        return;
+    }
+    let resolved = inline_local_vars(raw_expr, inline_defs);
+    inline_defs.insert(name.to_string(), resolved);
+}
+
+// ── Multi-theta (covariate) mu-referencing (#619) ────────────────────────────
+
+/// Scan `[individual_parameters]` for typical values that read **two or more**
+/// thetas — the covariate models [`detect_mu_refs`] cannot anchor to one theta
+/// (#619): `(TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`, `TVCL * (WT/70)^TH_WT *
+/// exp(ETA_CL)`, `inv_logit(LOGIT_F + TH_SEX*SEX + ETA_F)`.
+///
+/// Same statement walk and local-definition inlining as [`detect_mu_refs`]. The
+/// two scans run side by side and never edit each other's result: a typical
+/// value that also matches a single-anchor pattern (the power form, whose
+/// `collect_mul_anchors` sees only `TVCL`) keeps its `MuRef` for the inner-loop
+/// centring and reporting consumers exactly as before, while SAEM / IMP prefer
+/// the group for the M-step. Only BSV etas (`eta_idx < n_bsv_eta`) are recorded
+/// — a kappa carries no between-subject mean to fit. The last assignment on an
+/// eta wins, as in `detect_mu_refs`, and it wins even when it is *not* itself a
+/// group: see [`retire_superseded_group`] for why a stale group is worse than no
+/// group at all.
+///
+/// Each recorded group also carries the group thetas the rest of the model
+/// reads — see [`thetas_read_outside_the_group`]. `outside_idents` is the
+/// uppercased identifier set of every block *other* than `[parameters]` and
+/// `[individual_parameters]`, which is how a theta reaching the likelihood
+/// through `[odes]` or `[derived]` is seen from here.
+fn detect_covariate_mu_refs(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+    outside_idents: &HashSet<String>,
+) -> Vec<CovariateMuRef> {
+    let mut assign_counts: HashMap<&str, usize> = HashMap::new();
+    count_all_assignments(stmts, &mut assign_counts);
+    let mut inline_defs: HashMap<String, Expression> = HashMap::new();
+    let mut found: Vec<(usize, String, CovariateMuRef)> = Vec::new();
+    for s in stmts {
+        match s {
+            Statement::Assign(name, raw_expr) => {
+                // Always classify the inlined form: the point of a group is the
+                // thetas a `TVCL = …` line hides, and the raw form of a direct
+                // write is unchanged by inlining.
+                let inlined;
+                let expr = if inline_defs.is_empty() {
+                    raw_expr
+                } else {
+                    inlined = inline_local_vars(raw_expr, &inline_defs);
+                    &inlined
+                };
+                let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
+                // Retire before recording, and retire whether or not this line is
+                // itself a group: an assignment that no longer classifies still
+                // supersedes the one it overwrites.
+                retire_superseded_group(&mut found, name, expr);
+                if let Some((eta_idx, entry)) = classified {
+                    found.push((eta_idx, name.clone(), entry));
+                }
+                record_inline_def(&mut inline_defs, &assign_counts, name, raw_expr);
+            }
+            // A branch body can overwrite a typical value recorded above it, and
+            // nothing inside it may *record* one (the branch need not be taken),
+            // so an `if` only retires.
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    retire_superseded_groups_in(&mut found, body);
+                }
+                if let Some(eb) = else_body {
+                    retire_superseded_groups_in(&mut found, eb);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+        .into_iter()
+        .map(|(eta_idx, owner, mut entry)| {
+            entry.shared_thetas = thetas_read_outside_the_group(
+                stmts,
+                theta_names,
+                outside_idents,
+                &owner,
+                &entry.theta_names,
+            );
+            entry.eta_shared = eta_read_outside_the_group(stmts, &owner, eta_idx);
+            entry
+        })
+        .collect()
+}
+
+/// Drop every group an assignment to `name` supersedes.
+///
+/// A group is keyed on the eta it carries, so recording is a
+/// retain-then-push on `eta_idx` — but that only fires when the *new* line
+/// classifies, and the line that overwrites a group is usually the one that does
+/// not: `CL = (TVCL + TH_X*WT)*exp(ETA_CL)` followed by `CL = TVCL*exp(ETA_CL)`
+/// leaves the two-theta group alive, and SAEM / IMP then prefer it over the
+/// scalar [`MuRef`] the model actually evaluates — pinning `TH_X` out of the
+/// numerical M-step and updating it from a dead expression. So retirement is
+/// unconditional and keyed two ways: on the eta the new right-hand side carries
+/// (the same key recording uses) and on the assigned parameter name, which is
+/// the only handle left when the new line carries no eta at all (`CL = TVCL`).
+fn retire_superseded_group(
+    found: &mut Vec<(usize, String, CovariateMuRef)>,
+    name: &str,
+    expr: &Expression,
+) {
+    let eta = split_typical_and_eta(expr).map(|(_, e, _)| e);
+    found.retain(|(e, n, _)| Some(*e) != eta && n != name);
+}
+
+/// [`retire_superseded_group`] over a conditional body, recursively. Retires
+/// only — see the `Statement::If` arm of [`detect_covariate_mu_refs`].
+fn retire_superseded_groups_in(
+    found: &mut Vec<(usize, String, CovariateMuRef)>,
+    stmts: &[Statement],
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(name, expr) => retire_superseded_group(found, name, expr),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    retire_superseded_groups_in(found, body);
+                }
+                if let Some(eb) = else_body {
+                    retire_superseded_groups_in(found, eb);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Which of a group's thetas reach the likelihood by a route **other** than the
+/// typical value that defines the group — the fact that decides whether the
+/// exact M-step engine is admissible at all.
+///
+/// The exact engine ([`crate::estimation::covariate_mu_ref`]) drops the data
+/// term because freezing `φ_i` freezes the individual parameter, so the
+/// observation likelihood is a constant in the group's thetas. That argument
+/// holds only if those thetas reach the data *through this typical value and
+/// nothing else*. In
+///
+/// ```text
+///   CL = (TVCL + TH_X*WT) * exp(ETA_CL)
+///   V  = TVV + TH_X
+/// ```
+///
+/// `TH_X` is still live in `V` after `φ_CL` is preserved, so a step that ignores
+/// the data term is not an M-step of anything and can move `TH_X` the wrong way
+/// — while SAEM / IMP have already pinned it out of their general numerical
+/// M-step on the strength of the group. Such a group has to route to the
+/// prior-plus-data engine, which keeps the term.
+///
+/// The test is reachability, not occurrence, because an occurrence that no
+/// consumer reads changes no prediction:
+///
+/// - a name is **tainted** by θ when its right-hand side reads θ or reads an
+///   already-tainted name — statement order, `if` bodies included;
+/// - the taint **stops at the group's own parameter**. That is the whole point
+///   of mu-referencing: `CL` is held fixed by the preserved `φ_i`, so `Q = CL/2`
+///   is fixed too, and the local `TVCL = …` that exists only to build `CL`
+///   carries the thetas nowhere else;
+/// - θ is shared when another block names θ itself or names any tainted name.
+///   `[structural_model]`, `[odes]`, `[derived]`, `[scaling]`, `[error_model]`
+///   are where an individual parameter becomes a prediction, so a taint that
+///   reaches none of them reaches no observation either (a dead intermediate).
+///
+/// `outside_idents` is an identifier scan of raw block text, so it over-reports
+/// (a word in a comment, a name that collides with a theta's). That is the safe
+/// direction: a group wrongly called shared costs the slower engine, a group
+/// wrongly called exclusive returns wrong estimates.
+fn thetas_read_outside_the_group(
+    stmts: &[Statement],
+    theta_names: &[String],
+    outside_idents: &HashSet<String>,
+    owner: &str,
+    group_thetas: &[String],
+) -> Vec<String> {
+    group_thetas
+        .iter()
+        .filter(|name| {
+            if outside_idents.contains(&name.to_ascii_uppercase()) {
+                return true;
+            }
+            let Some(theta_idx) = theta_names.iter().position(|t| t == *name) else {
+                return false;
+            };
+            let mut tainted: HashSet<String> = HashSet::new();
+            spread_theta_taint(stmts, theta_idx, owner, &mut tainted);
+            tainted.iter().any(|n| outside_idents.contains(n))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether an assignment **other than** the group's own typical value reads the
+/// group's eta — the eta-side twin of [`thetas_read_outside_the_group`], and
+/// the second precondition the exact M-step engine needs.
+///
+/// The exact engine drops the observation term on the argument that freezing
+/// `φ_i` freezes the individual parameter. That argument needs the eta to be
+/// exclusive to this typical value, not just the thetas: the step re-centres
+/// each subject by `η_ik −= Δ_i`, so in
+///
+/// ```text
+///   CL = (TVCL + TH_X*(CRCL-90)) * exp(ETA_CL)
+///   V  = TVV * exp(0.5*ETA_CL)
+/// ```
+///
+/// the re-centring moves `V`'s prediction while `φ_CL` stays put, and the data
+/// term is *not* constant in `TVCL`/`TH_X`. [`retire_superseded_group`] does not
+/// catch this: it is keyed on [`split_typical_and_eta`], which returns `None`
+/// for any shape it does not recognise, so the `V` line above retires nothing
+/// and the group survives (#918 review).
+///
+/// Occurrence, not reachability — unlike the theta side, which can stop the
+/// taint at the group's own parameter. An `ETA_CL` written into a second
+/// right-hand side is a second latent-variable use by construction; there is no
+/// `φ` freezing it. The group is not dropped, only routed to the prior-plus-data
+/// engine, which evaluates the data term *with* the shift applied and is
+/// therefore correct for any number of uses.
+fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) -> bool {
+    stmts.iter().any(|s| match s {
+        Statement::Assign(name, expr) => {
+            if name == owner {
+                return false;
+            }
+            let mut reads = false;
+            visit_expr_nodes(expr, &mut |n| {
+                if let Expression::Eta(i) = n {
+                    reads |= *i == eta_idx;
+                }
+            });
+            reads
+        }
+        Statement::If {
+            branches,
+            else_body,
+        } => {
+            branches
+                .iter()
+                .any(|(_, body)| eta_read_outside_the_group(body, owner, eta_idx))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|eb| eta_read_outside_the_group(eb, owner, eta_idx))
+        }
+        _ => false,
+    })
+}
+
+/// Names (uppercased) whose value depends on `theta_idx`, following assignments
+/// in statement order and stopping at `owner`. See
+/// [`thetas_read_outside_the_group`] for why the taint stops there.
+fn spread_theta_taint(
+    stmts: &[Statement],
+    theta_idx: usize,
+    owner: &str,
+    tainted: &mut HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(name, expr) => {
+                if name == owner {
+                    continue;
+                }
+                let mut reads = false;
+                visit_expr_nodes(expr, &mut |n| match n {
+                    Expression::Theta(i) => reads |= *i == theta_idx,
+                    Expression::Variable(v) | Expression::Covariate(v) => {
+                        reads |= tainted.contains(&v.to_ascii_uppercase());
+                    }
+                    _ => {}
+                });
+                if reads {
+                    tainted.insert(name.to_ascii_uppercase());
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    spread_theta_taint(body, theta_idx, owner, tainted);
+                }
+                if let Some(eb) = else_body {
+                    spread_theta_taint(eb, theta_idx, owner, tainted);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One right-hand side → `(eta_idx, CovariateMuRef)` when it is a group shape
+/// (see [`split_typical_and_eta`]) whose typical value reads at least two
+/// thetas and nothing but thetas, literals and data covariates.
+///
+/// Rejected outright, rather than approximated: a typical value that reads
+/// `TIME` (the mu would vary within the subject), `MIXNUM` (the class is
+/// re-drawn every iteration), an NN output or a θ level block (no closed
+/// per-subject evaluation), a second eta, or a local variable the inliner could
+/// not resolve (assigned conditionally or later — reading it here would give
+/// 0.0, not its value).
+fn classify_covariate_mu_ref(
+    expr: &Expression,
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv_eta: usize,
+) -> Option<(usize, CovariateMuRef)> {
+    let (typical, eta_idx, transform) = split_typical_and_eta(expr)?;
+    if eta_idx >= n_bsv_eta || eta_idx >= eta_names.len() {
+        return None;
+    }
+    let mut theta_idx: Vec<usize> = Vec::new();
+    let mut covariate_names: Vec<String> = Vec::new();
+    let mut ok = true;
+    visit_expr_nodes(&typical, &mut |n| match n {
+        Expression::Theta(i) => {
+            if !theta_idx.contains(i) {
+                theta_idx.push(*i);
+            }
+        }
+        Expression::Covariate(c) => {
+            if !covariate_names.contains(c) {
+                covariate_names.push(c.clone());
+            }
+        }
+        Expression::Literal(_)
+        | Expression::BinOp(..)
+        | Expression::UnaryFn(..)
+        | Expression::Power(..)
+        | Expression::Conditional(..) => {}
+        _ => ok = false,
+    });
+    if !ok || theta_idx.len() < 2 || theta_idx.iter().any(|&i| i >= theta_names.len()) {
+        return None;
+    }
+    theta_idx.sort_unstable();
+    Some((
+        eta_idx,
+        CovariateMuRef {
+            eta_name: eta_names[eta_idx].clone(),
+            theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
+            transform,
+            covariate_names,
+            // Both filled by `detect_covariate_mu_refs` once the whole block
+            // (and the other blocks' identifiers) are in view; a single
+            // right-hand side cannot see what else reads its thetas or its eta.
+            shared_thetas: Vec::new(),
+            eta_shared: false,
+            typical,
+        },
+    ))
+}
+
+/// Split a right-hand side into `(A, eta_idx, link)` for the three shapes a
+/// covariate mu-reference can take:
+///
+/// - `A * exp(ETA)` (any factor order, constants included in `A`) → `Log`;
+///   the exp factor must be exactly `exp(ETA)` or `exp(ETA + KAPPA)`;
+/// - `exp(log(A) + ETA)` → `Log`;
+/// - `inv_logit(A + ETA)`, `1/(1 + exp(-(A + ETA)))`, `1/(1 + exp(-A - ETA))` → `Logit`.
+///
+/// `A` is returned as written (thetas, covariates, literals unchecked here —
+/// [`classify_covariate_mu_ref`] does that); it never contains the eta.
+fn split_typical_and_eta(expr: &Expression) -> Option<(Expression, usize, MuTransform)> {
+    match expr {
+        Expression::UnaryFn(name, inner) if name == "exp" => {
+            let Expression::BinOp(l, BinOp::Add, r) = inner.as_ref() else {
+                return None;
+            };
+            for (a, b) in [(l, r), (r, l)] {
+                if let (Expression::UnaryFn(f, arg), Expression::Eta(e)) = (a.as_ref(), b.as_ref())
+                {
+                    if (f == "log" || f == "ln") && !expr_contains_eta(arg) {
+                        return Some((arg.as_ref().clone(), *e, MuTransform::Log));
+                    }
+                }
+            }
+            None
+        }
+        Expression::UnaryFn(name, inner) if name == "inv_logit" || name == "expit" => {
+            split_sum_eta(inner).map(|(a, e)| (a, e, MuTransform::Logit))
+        }
+        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(num) => {
+            let Expression::BinOp(l, BinOp::Add, r) = den.as_ref() else {
+                return None;
+            };
+            for (one, other) in [(l, r), (r, l)] {
+                if !is_literal_one(one) {
+                    continue;
+                }
+                let Expression::UnaryFn(f, arg) = other.as_ref() else {
+                    continue;
+                };
+                if f != "exp" {
+                    continue;
+                }
+                // Unary minus desugars to `0 - x`.
+                let Expression::BinOp(lhs, BinOp::Sub, rhs) = arg.as_ref() else {
+                    return None;
+                };
+                if is_literal_zero(lhs) {
+                    return split_sum_eta(rhs).map(|(a, e)| (a, e, MuTransform::Logit));
+                } else if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.as_ref() {
+                    if is_literal_zero(zero) {
+                        return typical_plus_eta(a, rhs).map(|(a, e)| (a, e, MuTransform::Logit));
+                    }
+                }
+                return None;
+            }
+            None
+        }
+        _ => {
+            let mut factors: Vec<&Expression> = Vec::new();
+            flatten_mul(expr, &mut factors);
+            let mut eta_factor: Option<(usize, usize)> = None;
+            for (i, f) in factors.iter().enumerate() {
+                let Expression::UnaryFn(name, arg) = f else {
+                    continue;
+                };
+                if name != "exp" || !expr_contains_eta(arg) {
+                    continue;
+                }
+                // A second eta-bearing factor, or an exp whose argument is not a
+                // bare eta (`exp(ETA + THETA*COV)`): not this shape.
+                if eta_factor.is_some() {
+                    return None;
+                }
+                eta_factor = Some((i, bare_eta_exp_arg(arg)?));
+            }
+            let (pos, eta_idx) = eta_factor?;
+            let mut rest = factors
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != pos)
+                .map(|(_, f)| (*f).clone());
+            let mut a = rest.next()?;
+            for f in rest {
+                a = Expression::BinOp(Box::new(a), BinOp::Mul, Box::new(f));
+            }
+            if expr_contains_eta(&a) {
+                return None;
+            }
+            Some((a, eta_idx, MuTransform::Log))
+        }
+    }
+}
+
+/// A sum chain (`a + b + c`, any association) with exactly one bare-eta term:
+/// returns the remaining terms re-summed in source order and the eta index.
+fn split_sum_eta(expr: &Expression) -> Option<(Expression, usize)> {
+    let mut terms: Vec<&Expression> = Vec::new();
+    flatten_add(expr, &mut terms);
+    let mut eta_term: Option<(usize, usize)> = None;
+    for (i, t) in terms.iter().enumerate() {
+        if let Expression::Eta(e) = t {
+            if eta_term.is_some() {
+                return None;
+            }
+            eta_term = Some((i, *e));
+        }
+    }
+    let (pos, eta_idx) = eta_term?;
+    let mut rest = terms
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != pos)
+        .map(|(_, t)| (*t).clone());
+    let mut a = rest.next()?;
+    for t in rest {
+        a = Expression::BinOp(Box::new(a), BinOp::Add, Box::new(t));
+    }
+    if expr_contains_eta(&a) {
+        return None;
+    }
+    Some((a, eta_idx))
+}
+
+/// Flatten an `Add` chain into its terms, in source order.
+fn flatten_add<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
+    if let Expression::BinOp(l, BinOp::Add, r) = expr {
+        flatten_add(l, out);
+        flatten_add(r, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// `a + b` where exactly one side is a bare eta and the other is eta-free.
+fn typical_plus_eta(a: &Expression, b: &Expression) -> Option<(Expression, usize)> {
+    match (a, b) {
+        (typical, Expression::Eta(e)) | (Expression::Eta(e), typical)
+            if !expr_contains_eta(typical) =>
+        {
+            Some((typical.clone(), *e))
+        }
+        _ => None,
+    }
+}
+
+/// The eta index of an `exp(...)` argument that is exactly `ETA` or
+/// `ETA + KAPPA` (the IIV+IOV product form); `None` for anything else.
+fn bare_eta_exp_arg(arg: &Expression) -> Option<usize> {
+    match arg {
+        Expression::Eta(j) => Some(*j),
+        Expression::BinOp(l, BinOp::Add, r) => match (l.as_ref(), r.as_ref()) {
+            (Expression::Eta(a), Expression::Eta(b)) => Some(*a.min(b)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Flatten a `Mul` chain into its factors, in source order.
+fn flatten_mul<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
+    if let Expression::BinOp(l, BinOp::Mul, r) = expr {
+        flatten_mul(l, out);
+        flatten_mul(r, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// True when `expr` is the literal `0` (how the parser spells unary minus).
+fn is_literal_zero(expr: &Expression) -> bool {
+    matches!(expr, Expression::Literal(v) if *v == 0.0)
+}
+
 /// Intermediate result from classifying a single expression.
 #[derive(Debug, Clone, PartialEq)]
 struct ExprClass {
@@ -1001,39 +1693,93 @@ fn plain_theta_eta(a: &Expression, b: &Expression) -> Option<(usize, usize)> {
     None
 }
 
+/// Match `a + b` as a logit-scale mu-sum, returning `(eta_idx, theta_idx, prob_scale)`.
+///
+/// `prob_scale` is `true` for `logit(THETA) + ETA` (THETA on the probability
+/// scale) and `false` for `THETA + ETA` (THETA already on the logit scale).
+fn logit_mu_sum(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> {
+    // Form 1: THETA + ETA  (THETA on logit scale)
+    if let Some((ei, ti)) = plain_theta_eta(a, b) {
+        return Some((ei, ti, false));
+    }
+    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
+    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
+        if fn_name == "logit" {
+            if let Expression::Theta(ti) = inner_arg.as_ref() {
+                return Some((*ei, *ti, true));
+            }
+        }
+    }
+    None
+}
+
+/// Match a logit-scale mu-sum in either operand order.
+fn logit_mu_sum_either(a: &Expression, b: &Expression) -> Option<(usize, usize, bool)> {
+    logit_mu_sum(a, b).or_else(|| logit_mu_sum(b, a))
+}
+
+/// True when `expr` is the literal `1` (as written, or as any exactly-1.0 constant).
+fn is_literal_one(expr: &Expression) -> bool {
+    matches!(expr, Expression::Literal(v) if *v == 1.0)
+}
+
+/// Match the *negation* of a logit mu-sum, i.e. the `exp` argument in
+/// `1 / (1 + exp(-(MU + ETA)))`. The parser desugars unary minus to `0 - x`,
+/// so both `-(MU + ETA)` and `-MU - ETA` are recognised.
+fn negated_logit_mu_sum(expr: &Expression) -> Option<(usize, usize, bool)> {
+    if let Expression::BinOp(lhs, BinOp::Sub, rhs) = expr {
+        // `-(MU + ETA)`  →  `0 - (MU + ETA)`
+        if matches!(lhs.as_ref(), Expression::Literal(v) if *v == 0.0) {
+            if let Expression::BinOp(a, BinOp::Add, b) = rhs.as_ref() {
+                return logit_mu_sum_either(a, b);
+            }
+        }
+        // `-MU - ETA`  →  `(0 - MU) - ETA`
+        if let Expression::BinOp(zero, BinOp::Sub, a) = lhs.as_ref() {
+            if matches!(zero.as_ref(), Expression::Literal(v) if *v == 0.0) {
+                return logit_mu_sum_either(a, rhs);
+            }
+        }
+    }
+    None
+}
+
 /// Detect logit-normal parameterisation patterns.
 /// Returns `Some((eta_idx, theta_idx, prob_scale))` where `prob_scale` is
 /// `true` for `inv_logit(logit(THETA) + ETA)` and `false` for `inv_logit(THETA + ETA)`.
 ///
 /// Recognised forms:
-///   - `inv_logit(THETA + ETA)`          — THETA on the logit scale
-///   - `inv_logit(logit(THETA) + ETA)`   — THETA on the probability scale (0,1)
+///   - `inv_logit(THETA + ETA)`             — THETA on the logit scale
+///   - `inv_logit(logit(THETA) + ETA)`      — THETA on the probability scale (0,1)
+///   - `1 / (1 + exp(-(THETA + ETA)))`      — the same two forms written out
+///   - `1 / (1 + exp(-THETA - ETA))`          algebraically (#918)
 fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
-    if let Expression::UnaryFn(name, inner) = expr {
-        if name == "inv_logit" || name == "expit" {
+    match expr {
+        Expression::UnaryFn(name, inner) if name == "inv_logit" || name == "expit" => {
             if let Expression::BinOp(lhs, BinOp::Add, rhs) = inner.as_ref() {
-                let try_logit_theta_eta = |a: &Expression,
-                                           b: &Expression|
-                 -> Option<(usize, usize, bool)> {
-                    // Form 1: THETA + ETA  (THETA on logit scale)
-                    if let Some((ei, ti)) = plain_theta_eta(a, b) {
-                        return Some((ei, ti, false));
-                    }
-                    // Form 2: logit(THETA) + ETA  (THETA on probability scale)
-                    if let (Expression::UnaryFn(fn_name, inner_arg), Expression::Eta(ei)) = (a, b) {
-                        if fn_name == "logit" {
-                            if let Expression::Theta(ti) = inner_arg.as_ref() {
-                                return Some((*ei, *ti, true));
-                            }
-                        }
-                    }
-                    None
-                };
-                return try_logit_theta_eta(lhs, rhs).or_else(|| try_logit_theta_eta(rhs, lhs));
+                return logit_mu_sum_either(lhs, rhs);
             }
+            None
         }
+        // `1 / (1 + exp(-(MU + ETA)))` — inv_logit written out by hand.
+        Expression::BinOp(num, BinOp::Div, den) if is_literal_one(num) => {
+            let Expression::BinOp(l, BinOp::Add, r) = den.as_ref() else {
+                return None;
+            };
+            for (one, other) in [(l, r), (r, l)] {
+                if !is_literal_one(one) {
+                    continue;
+                }
+                if let Expression::UnaryFn(fn_name, arg) = other.as_ref() {
+                    if fn_name == "exp" {
+                        return negated_logit_mu_sum(arg);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    None
 }
 
 /// Per-theta Delattre class for the mixed BIC (#1177): `true` when theta `i`
@@ -2849,6 +3595,28 @@ pub fn parse_full_model_with(
         .into_iter()
         .filter(|(k, _)| kappa_set.contains(k))
         .collect();
+    // Multi-theta typical values (#619): a separate list, never a substitute
+    // for `mu_refs` — see `detect_covariate_mu_refs`.
+    // Every identifier any *other* block spells, so a theta that reaches the
+    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
+    // a `[derived]` readout) is visible to the exclusivity check. `[parameters]`
+    // is excluded because it is where the thetas are declared; the only theta a
+    // model may name there is a FIXed one in a kappa weight, which no M-step
+    // moves.
+    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, lines) in blocks.iter() {
+        if key == "parameters" || key == "individual_parameters" {
+            continue;
+        }
+        collect_referenced_identifiers(lines, &mut outside_idents);
+    }
+    let covariate_mu_refs = detect_covariate_mu_refs(
+        &indiv_stmts,
+        &theta_names,
+        &all_eta_names,
+        eta_names_bsv.len(),
+        &outside_idents,
+    );
 
     // Build pk_indices: maps each individual parameter (by declaration order)
     // to its PK parameter index. Needed for AD to place values in correct slots.
@@ -3042,6 +3810,7 @@ pub fn parse_full_model_with(
         bloq_method: BloqMethod::Drop,
         mu_refs,
         kappa_mu_refs,
+        covariate_mu_refs,
         referenced_covariates,
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(), // populated below
@@ -19189,6 +19958,20 @@ fn eval_expression(
 ) -> f64 {
     let env = MapEnv { covariates, vars };
     eval_expr(expr, theta, eta, &env, nn_outputs)
+}
+
+/// Evaluate an eta-free typical value `A(θ, covariates)` — a
+/// [`CovariateMuRef`]'s `typical` — at one subject's covariate snapshot (#619).
+/// Local variables were inlined at detection time, so the variable environment
+/// is empty; a stray name would read as `0.0`, which is why detection rejects
+/// them rather than letting one through.
+pub(crate) fn eval_typical_value(
+    expr: &Expression,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> f64 {
+    let vars: HashMap<String, f64> = HashMap::new();
+    eval_expression(expr, theta, &[], covariates, &vars, &[])
 }
 
 #[inline]

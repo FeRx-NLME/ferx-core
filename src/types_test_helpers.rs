@@ -55,6 +55,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         // Analytical models populate tv_fn; ODE models leave it None.
         tv_fn: if with_ode {
@@ -176,6 +177,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],

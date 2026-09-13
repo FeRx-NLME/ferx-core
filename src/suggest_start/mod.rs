@@ -258,7 +258,7 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     }
 
     // For EBE sweeps, only include lognormal-parameterised thetas
-    // (mu_ref.log_transformed = true, i.e. THETA * exp(ETA) form).
+    // (mu_ref.log_transformed() = true, i.e. THETA * exp(ETA) form).
     // Logit thetas are excluded from the EBE sweep: the eta can compensate
     // for a wrong TV on the logit scale, creating spurious rRMSE minima.
     // Covariate thetas (no mu_ref at all) are also excluded.
@@ -270,13 +270,13 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     let lognormal_theta_names: std::collections::HashSet<&str> = model
         .mu_refs
         .values()
-        .filter(|mr| mr.log_transformed)
+        .filter(|mr| mr.log_transformed())
         .map(|mr| mr.theta_name.as_str())
         .collect();
     let logit_theta_names: std::collections::HashSet<&str> = model
         .mu_refs
         .values()
-        .filter(|mr| !mr.log_transformed)
+        .filter(|mr| !mr.log_transformed())
         .map(|mr| mr.theta_name.as_str())
         .collect();
 

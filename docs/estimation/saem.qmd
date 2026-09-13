@@ -114,15 +114,52 @@ $$
 
 #### Closed-form EM update for mu-referenced thetas {#saem-mstep-closed-form}
 
-When `mu_referencing = true` (the default), ferx detects lognormal parameters from the `[individual_parameters]` block and applies the **closed-form EM update** for those thetas instead of running NLopt:
+When `mu_referencing = true` (the default), ferx detects mu-referenced parameters from the `[individual_parameters]` block and applies the **closed-form EM update** for those thetas instead of running NLopt:
 
 $$
-\log \theta_j \leftarrow \log \theta_j + \gamma_k \cdot \overline{\eta_j}
+g(\theta_j) \leftarrow g(\theta_j) + \gamma_k \cdot \overline{\eta_j}
 $$
 
-where $\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}$ is the empirical mean of the post-MH random effects for the eta paired with $\theta_j$. For a log-mu-referenced model where $\log P_i = \log \theta + \eta_i$ with $\eta_i \sim N(0, \omega^2)$, this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size $\gamma_k$. After the update the etas are re-centred by the same shift so they remain deviations from the new $\log \theta_j$.
+where $\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}$ is the empirical mean of the post-MH random effects for the eta paired with $\theta_j$, and $g$ is the mu-scale link. For a mu-referenced model where $P_i = g^{-1}(g(\theta) + \eta_i)$ with $\eta_i \sim N(0, \omega^2)$, this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size $\gamma_k$ — and it is *link-independent*: the same shift is the maximiser for $g = \log$, $g = \mathrm{id}$ and $g = \mathrm{logit}$ alike. After the update the etas are re-centred by the same shift so they remain deviations from the new $g(\theta_j)$.
+
+What decides eligibility is therefore not the link but whether the **packed** theta — the quantity the optimiser actually steps — *is* $g(\theta)$. ferx packs a theta as $\log \theta$ when its lower bound is non-negative and as $\theta$ otherwise, so:
+
+| Form | mu scale $g(\theta)$ | Closed-form EM update |
+|------|----------------------|------------------------|
+| `P = THETA * exp(ETA)`, `exp(log(THETA) + ETA)` | $\log \theta$ | yes (theta is log-packed) |
+| `P = inv_logit(THETA + ETA)` | $\theta$ | yes — a logit-scale theta has a negative lower bound, so it is packed as-is (#918) |
+| `P = inv_logit(logit(THETA) + ETA)` | $\mathrm{logit}\,\theta$ | no — no packing has that scale |
+| `P = THETA + ETA` | $\theta$ | no — routed to NLopt |
+
+The two excluded forms are still mu-referenced (they still centre the inner/E-step search); they just take the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
+
+The packing rule cuts both ways, and a mismatch is reported rather than silently routed: a lognormal theta declared with a *negative* lower bound is packed on the identity scale, and a logit-scale theta declared with a *non-negative* lower bound (`theta LOGIT_F(0.5, 0.0, 5.0)`) is packed on the log scale. Neither packed value is the mu, so the closed form does not apply; SAEM and IMP/IMPMAP estimate such a theta through the numerical M-step and emit an advisory naming it, with the bound to change. Under `mu_referencing = false` **SAEM** runs no closed-form shift at all and suppresses the advisory; single-population IMP/IMPMAP is different — its shift is EM-mandatory, so it runs (and advises) independently of that option, as [the IMP/IMPMAP page](impmap.qmd) describes.
+
+A theta that anchors **more than one** eta (`F1 = inv_logit(LOGIT_F + ETA_F1)` *and* `F2 = inv_logit(LOGIT_F + ETA_F2)`, or the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is also routed to the numerical M-step with an advisory: the closed form shifts a packed theta by one eta mean and pins it, and no single such shift is the joint maximiser. Give each eta its own typical value to get the closed-form update.
 
 NLopt still runs for any remaining thetas (non-mu-referenced); the closed-form-updated thetas are pinned at their new values for the NLopt call.
+
+#### Covariate mu-references: typical values that read several thetas {#saem-mstep-covariate-mu-ref}
+
+A typical value that reads **two or more** thetas has no single anchor:
+
+```
+CL = (TVCL + (CRCL - 90) * TH_CRCL) * exp(ETA_CL)   # additive covariate
+CL = TVCL * (WT / 70) ^ TH_WT * exp(ETA_CL)           # estimated exponent
+F  = inv_logit(LOGIT_F + TH_SEX * SEX + ETA_F)        # logit-scale covariate
+```
+
+Before [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) every theta in such a value sat on the numerical M-step, which holds each subject's sampled η fixed. That is the wrong coordinate system for a covariate slope: once the MH sampler has let η absorb the covariate-correlated part of the between-subject variation, the slope sees almost no gradient, and the two drift together — on the fluconazole model of #619 the renal gradient reached its bound at 0.
+
+ferx now records such a value as a **covariate mu-reference** (all its thetas, one eta) and gives it the mu-referencing M-step in its general form. Holding each subject's $\phi_i = g(A_i(\theta)) + \eta_i$ fixed, the group's thetas are re-fitted to the population of individual values:
+
+$$
+\hat\theta = \arg\min_\theta \; \sum_i \tfrac12\,(\phi_i - g(A_i(\theta)))^\top \Omega^{-1} (\phi_i - g(A_i(\theta))) \;+\; \sum_i -\log p(y_i \mid \phi_i, \theta)
+$$
+
+with $A_i$ the eta-free typical value at subject $i$'s covariates and $g$ the link (`log` or the logit-scale identity). The data term drops out — and the step is an exact nonlinear least-squares fit (Gauss–Newton) — when three things hold: every covariate the value reads is **constant within each subject**, no estimated theta of the group is read **anywhere else in the model**, and no *other* individual parameter reads the group's **eta**. Otherwise the term stays live and the sum is minimised numerically (BOBYQA), still in the $\phi$-frozen coordinates. A covariate that **varies within a subject** leaves a $\theta$-dependence through the within-subject ratio $A_i(t)/A_i(t_0)$; a theta the model reuses — `CL = (TVCL + TH_X*WT) * exp(ETA_CL)` alongside `V = TVV + TH_X` — leaves one through that other parameter, since preserving $\phi_{CL}$ pins `CL` but not `V`; an eta the model reuses — the same `CL` alongside `V = TVV * exp(0.5*ETA_CL)` — leaves one through the re-centring, which holds $\phi_{CL}$ fixed but moves `V`. ferx detects both kinds of reuse and says so in a fit warning naming the theta or the eta. The new estimate is blended with the same SA step $\gamma_k$ as the single-anchor shift, and each η is re-centred by the change in its own mu so $\phi_i$ is unchanged. This is NONMEM's `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` — a MU that is nonlinear in THETA — done automatically.
+
+A covariate mu-reference is used by SAEM and IMP/IMPMAP only; `mu_refs` (inner-loop centring, `suggest_start`, reporting) is unchanged, so FOCE/FOCEI/Laplace fits are byte-identical with and without one. It is declined — with a warning naming the thetas, which then stay on the numerical M-step as before — when one of its thetas is also another eta's single anchor, when the eta's initial IIV is below `1e-3`, when every theta of the group is `FIX`ed, under a mixture model, and under `mu_referencing = false`. A group step also stands down for one iteration when the typical value is not finite for some subject at the current θ — an additive form such as `TVCL + (CRCL-90)*TH_CRCL` can go ≤ 0 for a low-covariate subject — and the fit reports how many iterations that happened on, since the thetas were then moved by the numerical M-step (or, under IMP/IMPMAP, left to it) rather than by the group. A value that reads `TIME`, `MIXNUM`, a second eta, or a local variable that is assigned conditionally is not recorded at all.
 
 #### Scalar residual-error update
 
@@ -159,13 +196,16 @@ can bias the estimate outright.
 ## Non-mu-referenced parameters slow SAEM convergence
 
 Whenever the estimation chain runs SAEM, ferx warns if any individual parameter's
-random effect is **not** mu-referenced — for example `CL = TVCL + ETA_CL` (or any
-non-loglinear form) instead of `CL = TVCL * exp(ETA_CL)`. Such parameters cannot use
-the closed-form EM update above and fall back to the slower NLopt M-step, which can
-strongly slow convergence. The warning fires independently of the `mu_referencing`
+random effect is **not** mu-referenced — for example `CL = TVCL + ETA_CL` instead
+of `CL = TVCL * exp(ETA_CL)`. Such parameters cannot use the closed-form EM update
+above and fall back to the slower NLopt M-step, which can strongly slow convergence.
+(A typical value that reads several thetas, such as an additive covariate model, is
+*not* in this class since #619 — see [covariate
+mu-references](#saem-mstep-covariate-mu-ref).) The warning fires independently of the `mu_referencing`
 fit option: turning the option off does not remove the risk — it removes the
 mu-centering that mitigates it — so the diagnostic is most warranted in exactly that
-case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`) where the model allows.
+case. Prefer log-mu-referenced forms (`P = TV * exp(ETA)`), or, for a parameter
+bounded to $(0,1)$, the logit-scale form `P = inv_logit(LOGIT_P + ETA_P)`.
 :::
 
 ::: {.callout-important}
@@ -222,8 +262,9 @@ ETA" would be false for them:
   M-step never moves them — they do not enter the residual/eta likelihood, and
   the mixing M-step overwrites them from the class responsibilities — and a
   mixing expression is *forbidden* from depending on an eta in the first place.
-- **`MIXNUM`-switched class typical values**, and log-mu-referenced thetas
-  dropped to the identity scale by a negative lower bound. These carry an eta in
+- **`MIXNUM`-switched class typical values**, log-mu-referenced thetas
+  dropped to the identity scale by a negative lower bound, and logit-mu-referenced
+  thetas pushed onto the log scale by a non-negative one. These carry an eta in
   the model text and are on the numerical M-step for a reason SAEM already
   states in its own warning; repeating "add an ETA" on top of that would be both
   false and contradictory.
@@ -424,6 +465,68 @@ read from the `.phi` file — `PHI(k) − log θ_k` is the η conditional mean,
 (ferx `conddist_nsamp = 2000`. Comparison scripts:
 `tests/reference/saem_conddist/bench_saemix_conddist.R`,
 `tests/reference/saem_conddist/parse_nm_conddist.R`.)
+
+### Validation of the logit closed-form M-step (#918)
+
+Parallel dual first-order absorption (fast `KA1` / slow `KA2`) with the pathway
+fraction carrying logit-scale IIV — `FR1 = 1/(1 + exp(-(LOGIT_FR1 + ETA_FR1)))`.
+60 subjects × 16 samples, simulated from the model itself
+(`nonmem_anchor/simulate_logit_fraction_data.py`); the NONMEM side writes the
+same relationship with explicit mu syntax (`MU_3 = THETA(3)`,
+`nonmem_anchor/logit_fraction_saem.ctl`, `METHOD=SAEM`). Both start at
+`FR1 = 0.4`, the mirror image of the truth.
+
+| Quantity | truth | ferx SAEM (before #918) | ferx SAEM | NONMEM SAEM |
+|---|---:|---:|---:|---:|
+| `LOGIT_FR1` | 0.4055 | 0.2462 | 0.3793 | 0.4219 |
+| `FR1` = `inv_logit(LOGIT_FR1)` | 0.600 | 0.561 | 0.594 | 0.604 |
+| `ω²(ETA_FR1)` (logit scale) | 0.25 | 0.326 | 0.186 | 0.183 |
+| `CL` | 5.0 | 5.35 | 5.31 | 5.29 |
+| `V` | 50.0 | 51.4 | 54.6 | 55.7 |
+
+Before the fix the fraction's typical value went through the numeric M-step and
+stalled short of the truth, with `ω²(ETA_FR1)` inflating to absorb the bias — the
+same θ / η-mean confounding the closed-form step exists to remove. The
+slow-gated `tests/saem_logit_mu_ref.rs` pins the comparison.
+
+### Validation of the covariate mu-reference M-step (#619)
+
+Two matched fixtures, 60 subjects × 7 samples each, simulated from the model under
+test (`nonmem_anchor/simulate_covmuref_data.py`; covariates constant within each
+subject, so the exact Gauss–Newton engine runs). The NONMEM side is `METHOD=SAEM`
+with the mu written out: the *nonlinear* `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`
+for the additive renal gradient, the linear `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`
+for the allometric exponent (`nonmem_anchor/covmuref_{additive,power}_saem.ctl`).
+Both engines start at the same values, deliberately away from the truth.
+
+| Quantity | truth | start | ferx SAEM (before #619) | ferx SAEM | NONMEM SAEM |
+|---|---:|---:|---:|---:|---:|
+| **additive:** `TVCL` | 5.0 | 4.0 | 3.990 | 4.921 | 4.917 |
+| `TH_CRCL` | 0.05 | 0.02 | **0.0198** | 0.04179 | 0.04178 |
+| `TVV` | 50 | 40 | 48.09 | 48.09 | 48.09 |
+| `ω²(ETA_CL)` | 0.09 | 0.1 | 0.083 | 0.0403 | 0.0401 |
+| `ω²(ETA_V)` | 0.04 | 0.1 | 0.0360 | 0.0358 | 0.0360 |
+| **power:** `TVCL` | 5.0 | 4.0 | 4.919 | 4.787 | 4.788 |
+| `TH_WT` | 0.75 | 0.3 | **0.332** | 0.9221 | 0.9213 |
+| `TVV` | 50 | 40 | 49.51 | 49.50 | 49.52 |
+| `ω²(ETA_CL)` | 0.09 | 0.1 | 0.0975 | 0.0701 | 0.0697 |
+| `ω²(ETA_V)` | 0.04 | 0.1 | 0.0459 | 0.0460 | 0.0459 |
+
+Before #619 the covariate theta never left its start in either shape — the
+eta-frozen numerical M-step has no leverage on it once the sampled η have absorbed the
+covariate structure, and the `TVCL`/`TH_CRCL` pair reported a correlation of 1.00 with
+RSEs in the tens of thousands of percent. With the group step ferx and NONMEM agree to
+three or four figures on every parameter (`TH_CRCL` to 8e-6), including the shape
+NONMEM handles most efficiently. `tests/saem_covariate_mu_ref.rs` (slow-gated) pins
+both comparisons and an IMP twin.
+
+The **time-varying** engine has no NONMEM SAEM comparator (NONMEM's MU must be
+constant within a subject). On the fluconazole model that motivated #619
+(`CL = (TVCL_NR + (CKDCRCYS-90)*THETA_CLCKD) * exp(ETA_CL)`, CKDCRCYS changing within
+27 of 31 subjects, SAEM seed 123) the renal gradient moves from a frozen 1.96 (start
+2.0) to 1.18 and `TVCL_NR` from 153.9 (start 150) to 109.0, against NONMEM FOCE's 1.41
+and 122; the remaining distance to NONMEM's OFV on that dataset predates this change
+and is tracked with the FOCEI comparison of the same model.
 
 ## Inter-Occasion Variability (IOV)
 

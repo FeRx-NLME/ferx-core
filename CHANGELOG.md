@@ -24,6 +24,48 @@ section of the SDLC for the versioning policy).
 - **Per-parameter priors for penalized maximum-likelihood (MAP) estimation**, declared inline as `prior(value, rse = 25%)` on any `theta`, `omega`, `sigma` or `kappa` — the simple alternative to NONMEM `$PRIOR`, with no separate prior problem and no matrices. The fit reports the data and prior halves of the OFV separately plus a per-parameter shift-toward-prior summary; AIC/BIC stay on the data half, and the prior's curvature reaches the reported standard errors and the SIR intervals. Applies to `foce`, `focei`, `laplace`, `gn` and `gn_hybrid`; a chain whose last estimating stage cannot apply priors, and an `S`-based covariance estimator (`covariance_method = s` or `rsr`, neither of which can represent one), are refused rather than run unpenalized. The θ prior is anchored against NONMEM `$PRIOR NWPRI` (#254).
 - **`[priors] from_fit = "<previous fit>"`** — build the priors for a model update from a previous ferx run in one line, instead of transcribing a parameter table by hand. Every θ, Ω diagonal, Σ and κ the source run reports with a usable standard error, and whose name and family match a `[parameters]` declaration in the new model, becomes `prior(estimate, rse = SE/estimate)` on the new model's declared scale — variance-vs-`(sd)` conversions included. Reads `{model}-fit.yaml`, `{model}-fit.json` or a `.fitrx` bundle; a relative path resolves against the model file's directory, like `[data] path`, and the file is read once when the model is parsed, so a bad path is refused by `ferx check` rather than surfacing mid-fit. Matching is on name **and** family, so a model carrying both `theta CL` and `omega CL` imports each onto the right one. An inline `prior(...)` on the same parameter wins, parameters that cannot be imported are listed in the fit's warnings, and an import that lands nothing at all is refused rather than run unpenalized. See `examples/warfarin_update.ferx` (#254).
 - `ParameterPrior::kind` records which `[parameters]` family a prior was declared on, so a `prior(...)` still resolves in a model that reuses one name across two families (`theta CL` alongside `omega CL`) instead of being refused as ambiguous (#254).
+- **Logit-normal parameters are now mu-referenced** ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).
+  A bounded `(0,1)` individual parameter written as `F = inv_logit(LOGIT_F + ETA_F)`,
+  `F = inv_logit(logit(TVF) + ETA_F)`, or the hand-written `F = 1/(1 + exp(-(LOGIT_F + ETA_F)))`
+  is recognised as a mu-reference, so it no longer triggers the SAEM
+  "individual parameter(s) not mu-referenced" warning. When the theta is declared on
+  the logit scale (negative lower bound), SAEM and IMP/IMPMAP now also update it with
+  the closed-form EM step `theta += gamma * mean(eta)` instead of the numeric M-step —
+  which is what fixes the biased bioavailability / fraction estimates reported for
+  models with IIV on the residual error. A logit-scale theta declared with a
+  non-negative lower bound is log-packed instead, so the closed form cannot apply;
+  SAEM and IMP/IMPMAP then say so in a warning that names the theta and the bound to
+  change, mirroring the existing advisory for a lognormal theta with a negative one.
+  In a **mixture model**, a class-shared logit anchor (`F = inv_logit(LOGIT_F + ETA_F)`,
+  the same theta in every class) takes the closed-form shift too; a `MIXNUM`-switched
+  typical value remains lognormal-only.
+- **SAEM and IMP/IMPMAP now mu-reference covariate models that read several thetas** ([#619](https://github.com/FeRx-NLME/ferx-core/issues/619)).
+  A typical value such as `CL = (TVCL + (CRCL - 90) * TH_CRCL) * exp(ETA_CL)`,
+  `CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)` or `F = inv_logit(LOGIT_F + TH_SEX*SEX + ETA_F)`
+  has no single anchor theta, so all its thetas used to sit on the eta-frozen numerical
+  M-step, where a covariate slope drifts to its bound (the fluconazole renal gradient of
+  #619 landed on 0, 480 OFV units above NONMEM). The parser now records such a value as a
+  *covariate mu-reference* and the EM estimators re-fit its thetas jointly to the
+  population of individual values every iteration — exactly (Gauss–Newton) when the
+  covariates are constant within each subject, no group theta is read elsewhere in the
+  model and no other individual parameter reads the group's eta, numerically (prior +
+  data term) otherwise — the same thing NONMEM does for a MU
+  written as a function of several thetas. `mu_refs`, inner-loop centring and every FOCE/FOCEI/Laplace fit are
+  unchanged. A group that shares a theta with another eta's anchor, has negligible IIV,
+  is entirely `FIX`ed, or sits in a mixture model is declined with a warning and stays on
+  the numerical M-step — and the "individual parameter not mu-referenced" advisory now
+  fires for those declined groups, where it is true. A group whose typical value is not
+  finite for some subject at the current θ (an additive form can go ≤ 0 for a
+  low-covariate subject) stands down for that iteration, with a fit warning counting the
+  iterations; under IMP/IMPMAP its thetas are no longer left frozen at their initial
+  values when that happens.
+  Anchored against NONMEM `METHOD=SAEM` with `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`
+  and `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`.
+- **Mu-reference detection sees through local definitions** ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).
+  A typical value on its own line (`TVCL = THETA_CL * (WT/70)^0.75` then
+  `CL = TVCL * exp(ETA_CL)`) and NONMEM-style explicit mu syntax
+  (`MU_1 = log(TVCL)` then `CL = exp(MU_1 + ETA_CL)`) are now detected, provided the
+  intermediate is assigned exactly once and carries no ETA.
 
 ### Changed
 
@@ -78,6 +120,13 @@ section of the SDLC for the versioning policy).
   automatic fallback wherever the analytic route is out of scope (#1335).
 
 ### Fixed
+
+- A typical value used as the mu-reference anchor of **more than one** random effect
+  (`F1 = inv_logit(LOGIT_F + ETA_F1)` alongside `F2 = inv_logit(LOGIT_F + ETA_F2)`, or
+  the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is now estimated by the
+  numerical / weighted M-step with a warning naming it, instead of taking one
+  closed-form shift per random effect — which moved that theta twice in a single SAEM
+  or IMP/IMPMAP iteration ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).
 
 - **A `block_omega` next to a separate diagonal `omega` now keeps the covariances between them at exactly 0, and so does a `block_kappa` next to a separate `kappa`.** Every estimator that runs the outer optimizer — FOCE, FOCEI, Laplace / AGQ, `gn` and `gn_hybrid`, with any `optimizer` including the trust region — searched the cross-block Cholesky entries anyway. So `block_omega (ETA_CL, ETA_V)` + `omega ETA_KA` estimated `Cov(ETA_KA, ETA_CL)` and `Cov(ETA_KA, ETA_V)` and returned the full 3×3 block fit — same Ω, same OFV — while `n_parameters` already counted only the declared block. SAEM and VI already held these entries, and Gauss-Newton held them on its analytic gradient path but not on the finite-difference fallback that every IOV model (and M3, an η on the residual error, a θ-dependent error magnitude) takes. Estimates, OFV and AIC/BIC of any such fit change; `n_parameters` does not. Those entries now report an SE of exactly 0 (the covariance step already excluded them; the estimate itself no longer moves), and SIR and asymptotic uncertainty draws no longer perturb them — a SIR run on such a model also sees its Student-t dimensionality shrink by the held entries, so its weights and effective sample size move. For Rust callers, `estimation::parameterization::packed_fixed_mask` now marks these structural zeros as held along with FIX coordinates, `pack_params` packs them as 0, and `compute_bounds` pins them at `[0, 0]` where it previously returned the `[-10, 10]` off-diagonal box (#1018).
 - **`iivsearch` no longer warns that a mixed-ω candidate is fitted as a larger block than its description**, because it no longer is. The note naming #1018, and the `Space::outer_full_triangle` flag behind it, are removed, and a block-stage candidate with a block beside another η now ranks on the model it declares — on the Pharmpy `moxonidine` anchor the `[CL,V]+[KA]` candidate moves from 647.73 (fitted as the full `[CL,V,KA]` block) to 655.02, within an OFV unit of NONMEM's own run of the declared model (#1018).

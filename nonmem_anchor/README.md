@@ -30,6 +30,9 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **`SS=1` dose × a model-time-reading `[odes]` RHS** | a steady-state dose on a right-hand side that reads the `TAD` built-in — [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) (`ADVAN13 TOL=9`, `MAXEVAL=0 METHOD=0 POSTHOC`, every `$THETA` `FIX`, `$OMEGA 0 FIX`, `$TABLE FORMAT=,1PE20.13`). The steady-state run-in handed the compiled RHS a parameter array two slots short, so `TAD` read `NaN` for the whole run-in and `0.0*TAD` was `NaN` too — merely *mentioning* the built-in broke an ordinary `SS=1` model. **NONMEM has no `TAD` built-in in `$DES`**, so the cycle clock is written by hand as `TADX = MOD(T + 120.0, 12.0)`; that is exactly `TAD` here because the pulses sit at multiples of 12 and 120 is one too. It raises NONMEM's `WARNING 68` (`MOD` outside a simulation block), which concerns gradients and is inert at `MAXEVAL=0`. Three statements make the anchor trustworthy and none of them is ferx-against-ferx: the `TAD` train **converges** (`train_tad_n21` vs `train_tad`, 3.5e-7 over a doubling) while its absolute-clock twin does **not** (`train_tabs_n21` vs `train_tabs`, 0.294) — which is why only `TAD` is anchored and `TAFD`/`T`/`TIME` are a separate question; NONMEM's own SS routine reproduces NONMEM's own 41-dose train to **1.28e-9**; and a **closed form outside both engines** (`A* = D·Φ(II)/(1−Φ(II))`, `Φ(s) = exp(−k(s + c·s²/2))`) reproduces NONMEM to 7.7e-9 and ferx to **3.0e-10** — so NONMEM's uniform 8e-9 offset is its own `TOL=9`/print floor, not ferx drift, and the closed form is the *tighter* reference. ferx **`NaN` at every observation** before the fix, `8.8902009677` against NONMEM's `8.8902010334` after (7.4e-9), asserted separately on the objective engine (`ode_predictions_event_driven`) and the states engine (`ode_dense_solve_states`) — two engines here, not two callers, because the model-time reroute (#1124) sends them to different walkers than the autonomous twin. `ss_tabs*` is committed as the **parity guard** for the absolute-clock half: ferx and NONMEM agree to 1.5e-9 on a value that is *not* a steady state, and a change to the run-in must not move it silently | `ss_tad.ctl`, `train_tad.ctl`, `train_tad_n21.ctl`, `ss_tabs.ctl`, `train_tabs.ctl`, `train_tabs_n21.ctl` (6) | `ss_tad_fit.ferx`, `ss_tabs_fit.ferx` |
 | **Covariate thetas × the EBE warm start** | a two-compartment oral model carrying three covariate thetas, fitted to convergence — [#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290) (`ADVAN4 TRANS4`, `$EST METHOD=1 INTERACTION MAXEVAL=9999`, `$COV MATRIX=R`). Unlike the rest of this table this is an **estimation** anchor, not a prediction one: the question is where the optimizer lands, so nothing is fixed and both engines start from the same initial estimates. ferx stalled on evaluation 1 at the initial point's **-1026.350403** with every theta unchanged; after the fix it reaches **-1195.304253** on its default optimizer and **-1199.429664** on the built-in BFGS, against NONMEM's MINIMIZATION SUCCESSFUL **-1199.4297842339142** — 1.2e-4 OFV, and thetas agreeing to ~4 significant figures (`4.94250/4.94183`, `48.5638/48.5627`, `0.729/0.7296`, `0.5549/0.5549`, `0.5810/0.5774`). The residual **4.13** between ferx's default (NLopt L-BFGS) and the optimum is *not* the stall and is tracked separately: that path stops on `FtolReached` against a warm-started objective reading -1178.09 at a point whose cold-start value is -1195.30. The dataset is `data/two_cpt_oral_cov.csv` with observation `CMT` recoded 1 → 2, since ferx's `two_cpt_oral` reads `CMT=1` observations from the central compartment while `ADVAN4` numbers the depot 1 | `covmodel_stall.ctl` | `examples/two_cpt_oral_covmodel.ferx` |
 | **Additive (`+`) covariate effects** | a `[covariate_model]` relation *added* to a parameter instead of multiplied into it — [#1313](https://github.com/FeRx-NLME/ferx-core/issues/1313) (`ADVAN4 TRANS4`, `$EST METHOD=1 INTERACTION MAXEVAL=0 POSTHOC`, `$TABLE FORMAT=s1PE23.16`, on `covmodel_stall.csv`). Two arms: **lin** is the additive combination alone (`CL = THETA(1)*EXP(ETA(1)) + THETA(6)*(WT-70)`), **mixed** carries a multiplicative *and* an additive relation on the same `CL`, which is the placement rule the block gains with the operator — `TVCL*f*EXP(ETA) + t` is neither `TVCL*f*(EXP(ETA) + t)` nor `(TVCL*EXP(ETA) + t)*f`, so NONMEM's own spelling settles it. Non-degeneracy is in the data: `WT` 45.0 .. 93.7 about a centre of 70 and `CRCL` 46.5 .. 150.0 about 100, so **both** terms take both signs and move `CL` by up to 25 % of `TVCL`; zeroing the slope makes the same comparison miss by 39 % / 43 %. `PRED` matches to **3.08e-15** / **2.65e-15** relative (print precision). **The objective is compared as a difference against each arm's `*_null.ctl` twin** (the same stream with the additive slope `0 FIX`), because ferx and NONMEM disagree by **16.02** on this dataset *with no covariate model at all* — measured, not assumed: `additive_cov_lin_null.ctl` **is** that model, and ferx holds its own value to 1e-9 across `inner_tol` 1e-10 .. 1e-14 and `inner_restarts` 0 .. 8, so it is not an inner-EBE tolerance. The offset is stable in the slope (16.0246 at 0, 16.0247 at 0.04), so the difference cancels it: ΔOFV agrees to **1.13e-4** on −4.0855 (lin) and **3.15e-4** on +1.0076 (mixed). The baseline offset itself is pre-existing and belongs to the FOCEI-vs-NONMEM work (#864), not to #1313 | `additive_cov_lin.ctl`, `additive_cov_lin_null.ctl`, `additive_cov_mixed.ctl`, `additive_cov_mixed_null.ctl` (4) | *(in `tests/additive_covariate_nonmem_anchor.rs`)* |
+| **Logit-normal mu-referencing** | `FR1 = 1/(1+exp(-(LOGIT_FR1 + ETA_FR1)))` under SAEM — [#918](https://github.com/FeRx-NLME/ferx-core/issues/918) (NONMEM's explicit `MU_3 = THETA(3)`, `METHOD=SAEM`) | `logit_fraction_saem.ctl` | `logit_fraction_saem_fit.ferx` |
+| **Covariate mu-referencing, additive** | `CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)` under SAEM — [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) (NONMEM's *nonlinear* `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`, `METHOD=SAEM`; data `data/covmuref_additive.csv` from `simulate_covmuref_data.py`, CRCL constant per subject) | `covmuref_additive_saem.ctl` | `covmuref_additive_saem_fit.ferx` |
+| **Covariate mu-referencing, power** | `CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)` under SAEM — [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) (NONMEM's linear `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`; data `data/covmuref_power.csv`) | `covmuref_power_saem.ctl` | `covmuref_power_saem_fit.ferx` |
 
 The **`TIME`-readout** control runs on its own tiny `scaling_time_readout.csv`
 (one subject, 100 mg IV bolus, seven samples over 24 h) — see
@@ -82,6 +85,43 @@ respective model (see below).
 > dataset, simulated from the biphasic model itself (`simulate_biphasic_ig_data.py`),
 > so NONMEM also **recovers** the truths. Re-run with
 > `nmfe75 freijer_biphasic_ig.ctl freijer_biphasic_ig.lst`.
+
+> **Logit mu-referencing run status — DONE (#918).** The licensed NONMEM run
+> landed (`results/logit_fraction_saem.{ext,lst}`, NONMEM 7.5.1,
+> `METHOD=SAEM INTERACTION NBURN=2000 NITER=1000 ISAMPLE=10 SEED=918` followed by
+> `METHOD=IMP EONLY=1`). Unlike the OFV-at-optimum anchors above, this one
+> compares **estimates**: the model is fitted from the same starting values by
+> both engines on the same matched dataset (`simulate_logit_fraction_data.py`),
+> and the slow-gated `tests/saem_logit_mu_ref.rs` pins the fraction. Re-run with
+> `nmfe75 logit_fraction_saem.ctl logit_fraction_saem.lst`; the ferx side is
+> `cargo run --release -p ferx-cli -- nonmem_anchor/logit_fraction_saem_fit.ferx --data data/logit_fraction_oral.csv`.
+>
+> | Parameter | truth | NONMEM SAEM | ferx SAEM |
+> |---|---:|---:|---:|
+> | `CL` (L/h) | 5.0 | 5.291 | 5.308 |
+> | `V` (L) | 50.0 | 55.72 | 54.57 |
+> | `FR1` (fast fraction) | 0.600 | 0.604 | 0.594 |
+> | `LOGIT_FR1` | 0.4055 | 0.4219 | 0.3793 |
+> | `KA1` (1/h) | 2.0 | 2.056 | 2.057 |
+> | `KA2` (1/h) | 0.2 | 0.2225 | 0.2356 |
+> | ω²(CL), ω²(V) | 0.09, 0.09 | 0.0902, 0.1157 | 0.0881, 0.1198 |
+> | ω²(logit FR1) | 0.25 | 0.1828 | 0.1861 |
+> | σ proportional (SD) | 0.08 | 0.0809 | 0.0823 |
+>
+> Note the design: 60 subjects × 16 samples, dose split between a fast and a slow
+> first-order pathway, so the fraction is identified by the **shape** of the curve
+> rather than by exposure magnitude (a bioavailability `F` would be confounded
+> with `CL`/`V` in oral-only data). Both engines start at `FR1 = 0.4`.
+>
+> **`.lst` truncation.** This NONMEM 7.5.1 build aborts while printing the final
+> report section of the SAEM+IMP chain — after both estimation stages finish and
+> after every output file is written. The committed `.lst` therefore ends at
+> `#TERM` and carries no "FINAL PARAMETER ESTIMATE" block; read the estimates from
+> `results/logit_fraction_saem.ext` instead (the last `-1000000000` row of each
+> `TABLE NO.` block — table 1 is SAEM, table 2 the IMP objective, `#OBJV`
+> equivalent −3698.448). The abort is not the fit failing: the two runs performed
+> while preparing this anchor (with and without `$COVARIANCE`) produced
+> bit-identical `.ext` trajectories. The table above is what `.ext` reports.
 
 ## The dataset
 
