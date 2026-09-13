@@ -2622,6 +2622,8 @@ pub fn ferx_core::CompiledModel::has_ruv_exponent(&self) -> bool
 pub fn ferx_core::CompiledModel::has_theta_dependent_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_tte(&self) -> bool
 pub fn ferx_core::CompiledModel::has_weighted_kappa(&self) -> bool
+pub fn ferx_core::CompiledModel::indiv_param_value_map(&self, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, mixture_class: core::option::Option<usize>) -> std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub fn ferx_core::CompiledModel::indiv_param_values(&self, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, mixture_class: core::option::Option<usize>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::CompiledModel::is_algebraic(&self) -> bool
 pub fn ferx_core::CompiledModel::is_ode_based(&self) -> bool
 pub fn ferx_core::CompiledModel::is_sde(&self) -> bool
@@ -3995,6 +3997,8 @@ pub fn ferx_core::CompiledModel::has_ruv_exponent(&self) -> bool
 pub fn ferx_core::CompiledModel::has_theta_dependent_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_tte(&self) -> bool
 pub fn ferx_core::CompiledModel::has_weighted_kappa(&self) -> bool
+pub fn ferx_core::CompiledModel::indiv_param_value_map(&self, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, mixture_class: core::option::Option<usize>) -> std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub fn ferx_core::CompiledModel::indiv_param_values(&self, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, mixture_class: core::option::Option<usize>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::CompiledModel::is_algebraic(&self) -> bool
 pub fn ferx_core::CompiledModel::is_ode_based(&self) -> bool
 pub fn ferx_core::CompiledModel::is_sde(&self) -> bool
