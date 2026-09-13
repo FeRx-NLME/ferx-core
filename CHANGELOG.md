@@ -121,6 +121,25 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A fit whose objective is not a usable number is no longer reported as converged.**
+  `fit()` could return `converged: true` alongside `ofv: NaN` — measured on a population
+  carrying one subject whose timeline could not be ordered, where the `NaN` spreads to the
+  whole population's objective. `converged` is now `false` whenever the reported objective is
+  `NaN`, infinite, or the clamped divergence sentinel, with a new `W_NONFINITE_OBJECTIVE`
+  warning (severity `Critical`, category `convergence`) naming which of the three it is and
+  what to look for. `is_finite()` alone was never enough: a *repelled* fit comes back at a
+  finite `~1e20` sentinel, so the same cutoff the multi-start ranking uses is applied here.
+  The rule is enforced at every place a `(converged, ofv)` pair is published — `fit()` and
+  each estimator's own result, so a tool driving an optimizer directly gets the same verdict —
+  and the parameter estimates, per-subject diagnostics and other warnings are still returned,
+  because they are what a user needs to find the offending record. The one exemption is
+  `method = vi` under the default `vi_final_ofv = none`, which reports `ofv: NaN` deliberately
+  because the ELBO is not a −2 log L; `vi_final_ofv = laplace` is gated like everything else
+  ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
+- The IMP / IMPMAP / SAEM divergence verdict (#528) now *says why*: those methods already
+  refused to call a runaway converged, but demoted the flag silently, so a caller saw
+  `converged: false` with nothing in `warnings` distinguishing it from any other failure
+  ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
 - A typical value used as the mu-reference anchor of **more than one** random effect
   (`F1 = inv_logit(LOGIT_F + ETA_F1)` alongside `F2 = inv_logit(LOGIT_F + ETA_F2)`, or
   the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is now estimated by the
