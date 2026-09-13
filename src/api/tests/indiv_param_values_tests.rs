@@ -437,6 +437,13 @@ fn derived_expression_reading_an_unbound_intermediate_uses_its_own_value() {
 /// analytical TTE model whose `LAMBDA` is not bound on the `[structural_model]` line, so
 /// the slot read returned `DUMMY_CL` (1.0) for it (#1356). It needs no contrived
 /// fixture — it is what a user running this example actually saw.
+///
+/// Feature-gated because the example carries an `[event_model]` block, which the parser
+/// refuses outright without `survival` ("requires building ferx-core with `--features
+/// survival`") — a *parse* error, so the gate has to be on the test, not inside it. The
+/// engine under test is the plain analytical one; the `Tests + coverage (TTE/CTMM
+/// endpoints)` job is where this arm runs.
+#[cfg(feature = "survival")]
 #[test]
 fn bundled_tte_exponential_example_reports_lambda_not_dummy_cl() {
     let src = std::fs::read_to_string(concat!(
