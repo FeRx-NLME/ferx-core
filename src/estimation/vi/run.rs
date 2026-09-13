@@ -1116,6 +1116,7 @@ pub fn run_vi(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        final_gradient_source: None,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,

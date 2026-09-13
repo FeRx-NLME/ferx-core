@@ -176,7 +176,75 @@ ferx rescales the gradient by a single scalar on that opening step, so it stays 
 
 If the fit nevertheless ends up still on its initial estimates, ferx re-runs it once from the same start with the rescale **held on until the fit escapes** — a fit that never moved has no curvature worth protecting. The second attempt is reported only if it both left the initial estimates *and* reached a lower OFV; if it stalled as well, the first attempt stands (together with its "did not converge" warning), so a fit reported as non-convergent is never one that quietly picked up a lower objective at a point it never reached. A fit that was descending normally never triggers any of this and follows exactly the trajectory it always did.
 
-A fit that nonetheless fails to leave its initial estimates is reported with `converged = false` and a "did not converge" warning — never as a converged fit whose estimates and standard errors happen to be the starting values. If you see this, the usual remedies are better initial estimates, a different `optimizer`, or `parameter_scaling` (see [`fit_options`](../model-file/fit-options.qmd)).
+A fit that nonetheless fails to leave its initial estimates **through this path** is reported with `converged = false` and a "did not converge" warning — never as a converged fit whose estimates and standard errors happen to be the starting values. If you see this, the usual remedies are better initial estimates, a different `optimizer`, or `parameter_scaling` (see [`fit_options`](../model-file/fit-options.qmd)).
+
+That guarantee covers the case where the optimizer itself reports failure. It does not cover a
+derivative-free optimizer that reports *success* at the start — BOBYQA can meet its own `outer_xtol`
+without having travelled anywhere, and then `converged = true` is a statement about the step size, not
+about the objective. Since #997 every fit that ends with no free THETA, OMEGA or SIGMA coordinate moved
+carries a [`stalled_at_init`](../warnings.qmd#codes-identifiability) warning regardless of what the
+optimizer concluded. The check is deliberately all-or-nothing — it fires only when *nothing* moved. A
+per-parameter version would be worse than useless: an initial estimate close to the truth is one a good
+optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
+
+### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
+
+`converged` reports that an optimizer's stopping rule was met. For the gradient-based optimizers the
+result also carries `final_gradient`, so the claim can be checked independently: at a genuine interior
+optimum it is ≈ 0. A derivative-free run has no gradient to report — which is the wrong way round,
+because a derivative-free run is where a premature stop is most likely and where a bad answer is hardest
+to see. On the stiff binding model in #997 a BOBYQA fit stopped 1.54 OFV above the L-BFGS optimum on the
+same model and data, and reported `converged = true` with nothing to check it against; widening the
+parameter box a thousandfold returned a bit-identical objective to six decimals, because it had never
+travelled far enough for a bound to matter.
+
+So when the optimizer supplies no gradient, ferx computes one after the fit:
+
+| field | meaning |
+|-------|---------|
+| `final_gradient` | ∇ of the objective the fit minimised, at the reported estimates, in packed space (log-THETA, Cholesky-OMEGA, log-SIGMA) |
+| `final_gradient_source` | `"optimizer"` — the optimizer's own, evaluated during the fit; or `"finite_difference"` — computed afterwards purely for reporting |
+
+The finite-difference version is a central difference of the same (penalized) objective, with the EBEs
+re-solved at every perturbed point, so it is the gradient of the marginal objective rather than a
+fixed-EBE approximation to it. It costs `2 × n_free` objective evaluations — one gradient's worth, the
+same as a single step of the optimizers that report one for free — and it never steers anything: the
+estimates are bit-identical whether it runs or not. Set `report_final_gradient = false` in
+`[fit_options]` to skip it when that cost is not worth paying.
+
+Both kinds are read the same way, but they do not prove the same thing. An `"optimizer"` gradient near
+zero is a stationarity claim the optimizer itself acted on. A `"finite_difference"` gradient near zero is
+an independent check on a run that had no gradient at all — and a large one says the fit stopped
+somewhere the objective was still moving, whatever `converged` says.
+
+#### What it reads on a fit that is right, and one that is not {#what-the-reporting-gradient-reads}
+
+Measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv` under `method = focei`,
+`maxiter = 300`, fitting the same model from the same start with the two optimizers:
+
+| optimizer | `converged` | OFV | `final_gradient_source` | ‖∇‖∞ |
+|---|---|---|---|---|
+| `nlopt_lbfgs` | `true` | **−286.0042** | `optimizer` | 2.29e−4 |
+| `bobyqa` | `true` | −285.9866 | `finite_difference` | **2.47e0** |
+
+Both report success. BOBYQA stops 0.018 OFV short with a gradient four orders of magnitude larger,
+and before #997 that second column was the only difference visible in the fit object — the optimizer's
+own gradient being absent for exactly the arm that needed it.
+
+The two numbers above come from different stencils, so to check that the comparison is fair the
+*same* finite-difference stencil was also run at the L-BFGS solution: it reads **3.04e−4** there,
+against the optimizer's own 2.29e−4. So the reporting gradient does go to zero at a genuine optimum
+on this model; the 2.47 is BOBYQA's, not the stencil's. The step is `h = 1e-4·(1+|x|)` per packed
+coordinate, which sits in the flat part of the step-size curve — sweeping `h` over `1e-4 … 1e-2` moves
+the BOBYQA reading by less than 0.1 %, while `h = 1e-1` inflates both arms to ~3.5e1 on truncation
+error alone.
+
+One caveat on reading the magnitude: it is the gradient in **packed** space (log-THETA,
+Cholesky-OMEGA, log-SIGMA) and it is not normalised, so there is no universal threshold. It is a
+comparative quantity — against a second fit of the same model, or against the optimizer gradient of a
+gradient-based arm — not a pass/fail test. A weakly-identified direction can carry a sizeable
+∂OFV/∂x across a genuinely flat objective, which is the same reason ferx does not use a gradient norm
+as its convergence criterion (see [Leaving the initial estimates](#leaving-the-initial-estimates)).
 
 ---
 

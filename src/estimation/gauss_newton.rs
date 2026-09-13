@@ -468,6 +468,9 @@ pub fn run_foce_gn(
     nn_reg.add_packed_gradient(&gn_params.theta, &mut grad_final);
     priors.add_gradient(&x, &mut grad_final);
     let mut final_gradient: Option<Vec<f64>> = Some(grad_final);
+    // Set only when a FOCEI polish stage replaced `final_gradient` with its own
+    // (see the merge below); `None` leaves the GN gradient's "optimizer" label.
+    let mut polished_gradient_source: Option<String> = None;
 
     // Penalized: this is what the FOCEI polish below is ranked against.
     let gn_ofv = ofv;
@@ -523,6 +526,7 @@ pub fn run_foce_gn(
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
+            final_gradient_source: final_gradient.as_ref().map(|_| "optimizer".to_string()),
             final_gradient,
             sir_fallback_proposal,
             impmap_trace: None,
@@ -588,7 +592,15 @@ pub fn run_foce_gn(
         final_h_mats = polish_result.h_matrices;
         final_kappas = polish_result.kappas;
         converged = polish_result.converged || converged;
-        final_gradient = polish_result.final_gradient.or(final_gradient);
+        // Keep the polish stage's own source label with its gradient — the
+        // FOCEI polish is an ordinary NLopt run, so under a derivative-free
+        // `optimizer` its gradient is the #997 §1 post-fit FD one, not an
+        // optimizer gradient. When the polish supplied none, the GN gradient
+        // (and its "optimizer" label, applied at the literal below) stands.
+        if polish_result.final_gradient.is_some() {
+            final_gradient = polish_result.final_gradient;
+            polished_gradient_source = polish_result.final_gradient_source;
+        }
     } else {
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
@@ -647,6 +659,8 @@ pub fn run_foce_gn(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        final_gradient_source: polished_gradient_source
+            .or_else(|| final_gradient.as_ref().map(|_| "optimizer".to_string())),
         final_gradient,
         sir_fallback_proposal,
         impmap_trace: None,

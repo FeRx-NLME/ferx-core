@@ -9060,6 +9060,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "stagnation_guard" => opts.stagnation_guard = parse_bool("stagnation_guard")?,
         "ebe_warm_start" => opts.ebe_warm_start = parse_bool("ebe_warm_start")?,
+        "report_final_gradient" => {
+            opts.report_final_gradient = parse_bool("report_final_gradient")?
+        }
         "inits_from_nca" => {
             use crate::suggest_start::NcaInit;
             opts.inits_from_nca = match value.to_lowercase().as_str() {

@@ -5790,6 +5790,21 @@ pub enum WarningCode {
     /// candidates, under a failure line reading "estimate pinned to a declared
     /// bound: … *starts at* …".
     InitOutsideBounds,
+    /// The fit never left its initial estimates: **no** free θ, Ω or σ coordinate
+    /// moved, so the reported OFV is the OFV *of the initial values* and says
+    /// nothing about the model (#751's signature, surfaced as a warning by #997 §2).
+    ///
+    /// Distinct from [`WarningCode::Convergence`], which reports that the
+    /// optimizer's own stopping rule was not met: a stall at the start is most
+    /// often accompanied by `converged = true`, since a fit that never moved has
+    /// a perfectly flat objective trace to plateau on.
+    ///
+    /// Read from [`crate::stalled_at_init`], which prefers the optimizer's own
+    /// scaled-space escape verdict ([`FitResult::left_init`]) and falls back to a
+    /// natural-scale comparison against the initial estimates. It fires only when
+    /// *nothing* moved — a well-chosen start that the optimizer correctly leaves
+    /// in place on one parameter while moving another is not a stall.
+    StalledAtInit,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
@@ -5873,6 +5888,7 @@ impl WarningCode {
             WarningCode::BoundaryEstimate => "boundary_estimate",
             WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
             WarningCode::InitOutsideBounds => "init_outside_bounds",
+            WarningCode::StalledAtInit => "stalled_at_init",
             WarningCode::InflatedRse => "inflated_rse",
             WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
@@ -5994,6 +6010,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `reject_on_boundary`. A near-miss phrasing there would silently drop
         // bootstrap replicates.
         (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
+    } else if lower.contains("w_stalled_at_init") {
+        // #997 §2: the fit never left its initial estimates. Matched on its `W_`
+        // token and placed with the other token arms, ahead of every prose one.
+        // The message quotes the *initial* values of the parameters that did not
+        // move, and the prose arms below claim on substrings like "did not
+        // converge" and "initial" — but the category here is deliberately not
+        // `Convergence`: a stalled fit usually reports `converged = true`, and a
+        // consumer branching on `convergence` would read the opposite of what
+        // happened.
+        (WarningSeverity::Warning, WarningCode::StalledAtInit)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -6485,8 +6511,33 @@ pub struct FitResult {
     /// (unpenalized) `ofv` is not ≈ 0 at that point by design. `Some` only for
     /// NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at least one
     /// gradient-requesting iteration improved the OFV, and for trust-region and
-    /// GN; `None` for BOBYQA (derivative-free), built-in BFGS, and SAEM.
+    /// GN. For a *derivative-free* NLopt run (BOBYQA) it is the post-fit
+    /// finite-difference gradient described under [`Self::final_gradient_source`];
+    /// `None` for the built-in BFGS and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// Where [`Self::final_gradient`] came from — the one thing a consumer needs
+    /// in order to read it (#997 §1).
+    ///
+    /// - `"optimizer"` — the optimizer's own gradient, evaluated during the fit
+    ///   at the best-OFV point. Free: it had to be computed anyway.
+    /// - `"finite_difference"` — a central-difference gradient of the same
+    ///   (penalized) objective, computed **after** the fit at the reported
+    ///   estimates purely so a derivative-free run has something to check
+    ///   `converged` against. Costs `2·n_free` extra objective evaluations —
+    ///   one gradient's worth — and is gated by
+    ///   [`FitOptions::report_final_gradient`]. The EBEs are re-solved
+    ///   (warm-started) inside the stencil, so it is the gradient of the
+    ///   marginal objective, not a fixed-EBE approximation to it.
+    ///
+    /// `None` exactly when `final_gradient` is `None`.
+    ///
+    /// The distinction matters because the two differ in *what they prove*: an
+    /// optimizer gradient near zero is a stationarity claim the optimizer itself
+    /// acted on, whereas an FD gradient near zero is an independent check on a
+    /// run that had no gradient at all — which is the case (BOBYQA converging to
+    /// a worse optimum and reporting `converged = true`) #997 was filed about.
+    #[serde(default)]
+    pub final_gradient_source: Option<String>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
@@ -6971,6 +7022,21 @@ pub struct FitOptions {
     /// Inner-loop (EBE) optimizer. `Auto` keeps the size-based default; any other
     /// value pins the inner solver with no dimension-based switching.
     pub inner_optimizer: InnerOptimizer,
+    /// Compute a finite-difference gradient at the reported estimates when the
+    /// outer optimizer supplied none of its own — i.e. for a derivative-free
+    /// NLopt run (BOBYQA). Default `true` (#997 §1).
+    ///
+    /// This is a *reporting* quantity: it is computed once, after the fit, and
+    /// never steers the optimizer. It exists because `converged = true` from a
+    /// derivative-free run is otherwise unfalsifiable — there is nothing in the
+    /// result to distinguish "the objective stopped moving" from "the optimizer
+    /// stopped moving". Cost is `2·n_free` objective evaluations, the same as a
+    /// single gradient step of the optimizers that report one for free.
+    ///
+    /// Set `false` to skip it when that cost is not worth paying (a large ODE
+    /// model whose every objective evaluation is seconds). The fit is otherwise
+    /// bit-identical either way — nothing downstream reads `final_gradient`.
+    pub report_final_gradient: bool,
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -7637,6 +7703,7 @@ impl Default for FitOptions {
             // (#490) behind these defaults and how to pin an optimizer explicitly.
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
+            report_final_gradient: true,
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -8653,6 +8720,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "ebe_warm_start",
+        "report_final_gradient",
         "inits_from_nca",
         "frem_predictions",
         "frem_sigma",

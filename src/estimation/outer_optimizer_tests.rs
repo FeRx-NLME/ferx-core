@@ -3460,3 +3460,526 @@ fn write_checkpoint_is_a_noop_before_the_first_eval() {
     crate::io::checkpoint::abandon();
     crate::io::checkpoint::remove(&path);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  #997 §1 — a gradient at the solution for derivative-free fits
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `reporting_fd_gradient` on an unpenalized model must reproduce
+/// [`reconverged_fd_gradient`] **exactly**.
+///
+/// The two share `central_diff_packed`, so this is not a test of the stencil —
+/// it is a test of the *objective inside it*. `reconverged_fd_gradient` is the
+/// established definition (`2 · pop_nll`, EBEs re-solved warm-started at every
+/// perturbed point, `1e20` on a guard rejection); the new function has to be
+/// that plus the penalties, and on a model with no NN regularizer and no priors
+/// "plus the penalties" is plus exactly zero. Any drift in the re-typed
+/// objective — a dropped `2 ·`, a cold instead of warm inner solve, a different
+/// guard — shows up here as a difference rather than as a plausible-looking
+/// number nothing can check.
+///
+/// Bit-equality, not a tolerance: both sides evaluate the identical expression
+/// at the identical points, so anything but `==` would be hiding something.
+#[test]
+fn reporting_fd_gradient_equals_the_reconverged_one_when_nothing_is_penalized() {
+    let model = make_model();
+    let population = make_population(3);
+    let template = &model.default_params;
+    let options = FitOptions {
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let x = pack_params(template);
+    let bounds = compute_bounds(template);
+    let warm: Vec<DVector<f64>> = (0..population.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+    let priors = build_prior_set(&model, template);
+    assert!(
+        !priors.is_active(),
+        "fixture precondition: this model declares no priors"
+    );
+
+    let established =
+        reconverged_fd_gradient(&x, template, &model, &population, &warm, &bounds, &options);
+    let reporting = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+
+    // The comparison is worthless if both are zero — that is the shape a
+    // "return vec![0.0; n]" mutation takes, and it would pass `==` happily.
+    assert!(
+        established.iter().any(|g| g.abs() > 1e-6),
+        "fixture precondition: the reference gradient must be non-degenerate, got {established:?}"
+    );
+    assert_eq!(
+        reporting, established,
+        "the reporting gradient must differentiate the same objective the optimizer's own \
+         FD gradient does when there is no penalty to add"
+    );
+}
+
+/// The penalties go **inside** the stencil, not next to it.
+///
+/// `FitResult::final_gradient` is documented as the gradient of the objective
+/// the fit *minimised*, which under a prior (or an NN regularizer) is
+/// `∇(OFV + penalty)` — the gradient of the reported, unpenalized OFV is not ≈ 0
+/// at a regularized optimum by design. The optimizer's own path splices the
+/// analytic penalty gradient into the likelihood gradient afterwards; the
+/// reporting path has no caller to splice anything, so the penalty has to be
+/// differenced along with everything else.
+///
+/// Pinned against the analytic `∂penalty/∂x = 2(x−m)/s²` that
+/// `PriorSet::add_gradient` supplies to the optimizer, so the two paths agree on
+/// what the penalty contributes. Deleting `priors.penalty(xv)` from the eval
+/// leaves the difference at zero and fails here.
+#[test]
+fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
+    let mut model = make_model();
+    let population = make_population(3);
+    let options = FitOptions {
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let template = &model.default_params;
+    let x = pack_params(template);
+    let bounds = compute_bounds(template);
+    let warm: Vec<DVector<f64>> = (0..population.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+
+    let unpenalized = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &build_prior_set(&model, template),
+    );
+
+    // A prior deliberately *away* from the initial value (TVCL starts at 5.0),
+    // so `2(x−m)/s²` is far from zero and the assertion can distinguish
+    // "differenced the penalty" from "differenced nothing".
+    model.priors = vec![crate::types::ParameterPrior {
+        name: "TVCL".into(),
+        value: 2.0,
+        spread: crate::types::PriorSpread::Rse(0.2),
+        kind: Some(crate::types::ParameterKind::Theta),
+    }];
+    let template = &model.default_params;
+    let priors = build_prior_set(&model, template);
+    assert!(priors.is_active(), "the prior must have resolved");
+
+    let penalized = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+
+    // What the optimizer's own path adds for the same prior at the same point.
+    let mut analytic_penalty_grad = vec![0.0; x.len()];
+    priors.add_gradient(&x, &mut analytic_penalty_grad);
+    assert!(
+        analytic_penalty_grad[0].abs() > 1.0,
+        "fixture precondition: the prior must pull hard enough to be visible above FD noise, \
+         got {}",
+        analytic_penalty_grad[0]
+    );
+
+    for k in 0..x.len() {
+        let observed = penalized[k] - unpenalized[k];
+        let want = analytic_penalty_grad[k];
+        assert!(
+            observed.is_finite() && want.is_finite(),
+            "coordinate {k}: non-finite gradient (observed {observed}, want {want})"
+        );
+        // Measured, not argued: the worst realised |observed − want| over the four
+        // coordinates is 4.03e-9 (all of it on the priored coordinate 0; the other
+        // three are exactly 0, the penalty not touching them). That residue is the
+        // FD truncation error of the quadratic penalty at `h = 1e-4·(1+|x|)`. The
+        // bound is 1e-7 — 25× the realised error, and eight orders below the
+        // ≈ 33 the assertion is trying to see, so a dropped penalty cannot pass.
+        assert!(
+            (observed - want).abs() < 1e-7,
+            "coordinate {k}: the reporting gradient must pick up the prior penalty \
+             analytically-equivalently — differenced {observed}, analytic {want}"
+        );
+    }
+}
+
+/// End to end: a **derivative-free** fit must come back carrying a gradient, and
+/// it must be the gradient at the point the fit actually reported.
+///
+/// This is the defect #997 was filed on — `converged = TRUE` with
+/// `final_gradient = NULL` for exactly the optimizer where a premature stop is
+/// most likely. The point assertion is the substantive half: a gradient computed
+/// at the *initial* estimates, or at the last probe NLopt happened to evaluate
+/// rather than the restored best point, would be finite, plausible and wrong, and
+/// no "is_some" check could tell. `packed_estimate` is the exact vector the
+/// reported estimates and the covariance step were built from, so recomputing the
+/// gradient there and requiring equality pins the point.
+#[test]
+fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimates() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+
+    assert_eq!(
+        result.final_gradient_source.as_deref(),
+        Some("finite_difference"),
+        "a derivative-free run has no gradient of its own to report"
+    );
+    let reported = result
+        .final_gradient
+        .as_ref()
+        .expect("the source says finite_difference, so there must be a gradient");
+    assert!(
+        reported.iter().all(|g| g.is_finite()),
+        "a reporting gradient that is NaN/inf is worse than none: {reported:?}"
+    );
+
+    let packed = result
+        .packed_estimate
+        .as_ref()
+        .expect("the NLopt path records the exact packed estimate");
+    let bounds = compute_bounds(&model.default_params);
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+    let priors = build_prior_set(&model, &model.default_params);
+    // The warm start the production path used: the final inner-loop EBEs, which
+    // the result carries per subject.
+    let ebes: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
+    let recomputed = reporting_fd_gradient(
+        packed,
+        &model.default_params,
+        &model,
+        &population,
+        &ebes,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+    assert_eq!(
+        reported.len(),
+        packed.len(),
+        "the gradient is reported in packed space, one entry per coordinate"
+    );
+    // Measured: the realised difference is exactly 0.0 on every coordinate — the
+    // same deterministic stencil over the same objective at the same point, so
+    // there is nothing for it to be. The bound is a relative 1e-12 rather than
+    // `==` only to leave room for a platform whose parallel reduction order in
+    // `pop_nll_opts` differs; anything larger would stop discriminating the
+    // wrong-point failure this test exists for: measured on this fixture, the same
+    // gradient taken at the *initial* estimates instead differs by 1.2e3 to 2.5e5
+    // per coordinate, so the bound has fifteen orders of margin over the mistake.
+    for (k, (got, want)) in reported.iter().zip(&recomputed).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-12 * (1.0 + want.abs()),
+            "coordinate {k}: the reported gradient must be the one at the reported estimates \
+             — got {got}, recomputed at `packed_estimate` {want}"
+        );
+    }
+}
+
+/// A gradient-based run keeps reporting the gradient it actually used, labelled
+/// as such. The two labels are what let a consumer tell a stationarity claim the
+/// optimizer acted on from an after-the-fact check on a run that had none — so a
+/// change that relabelled everything `"finite_difference"` (or recomputed a
+/// perfectly good optimizer gradient for the sake of uniformity) must fail here.
+#[test]
+fn a_gradient_based_fit_reports_the_optimizers_own_gradient() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+    assert_eq!(
+        result.final_gradient_source.as_deref(),
+        Some("optimizer"),
+        "L-BFGS computes a gradient at every iteration; there is nothing to recompute"
+    );
+    assert!(result.final_gradient.is_some());
+}
+
+/// `report_final_gradient = false` opts out of the `2·n_free` evaluations and
+/// restores the pre-#997 shape: no gradient, and — this is the part worth
+/// pinning — no *label* either, so `final_gradient_source` cannot claim a
+/// provenance for a gradient that does not exist.
+#[test]
+fn report_final_gradient_false_leaves_a_derivative_free_fit_with_no_gradient() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+    assert!(
+        result.final_gradient.is_none(),
+        "the caller opted out of computing one"
+    );
+    assert!(
+        result.final_gradient_source.is_none(),
+        "no gradient means no provenance to report"
+    );
+}
+
+/// End to end (#997 §2): a fit that never left its initial estimates must *say
+/// so on the result*, not merely be diagnosable by a caller who knows to call
+/// `stalled_at_init` themselves. The predicate predates this; the wiring is what
+/// was missing, so the wiring is what this test exists for — delete the emit
+/// site in `api::fit` and it reddens.
+///
+/// A one-evaluation budget is the deterministic way to produce the condition:
+/// NLopt returns after evaluating the start, so the reported estimates are the
+/// initial ones exactly and the optimizer's own escape test records
+/// `left_init = Some(false)`.
+#[test]
+fn a_fit_that_never_left_its_initial_estimates_says_so_on_the_result() {
+    let (model, template) = pinned_at_init_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 30,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = crate::api::fit(&model, &population, &template, &options).expect("fit");
+
+    assert_eq!(
+        result.left_init,
+        Some(false),
+        "fixture precondition: a one-eval budget must not let the fit escape its start"
+    );
+    let entry = result
+        .warnings_structured
+        .iter()
+        .find(|e| e.category == crate::types::WarningCode::StalledAtInit)
+        .unwrap_or_else(|| {
+            panic!(
+                "a fit pinned to its initial estimates must carry the warning; got {:?}",
+                result
+                    .warnings_structured
+                    .iter()
+                    .map(|e| e.category)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        entry.details.is_some(),
+        "the structured entry must survive `rebuild_warnings_structured` with its payload \
+         intact — a re-classified copy would have none"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_STALLED_AT_INIT")),
+        "the flat warning list the CLI prints must carry it too: {:?}",
+        result.warnings
+    );
+}
+
+/// The negative arm of the same wiring, on the same model and data: a fit given
+/// a real budget moves, and must not be flagged. Without this the test above is
+/// satisfied by an implementation that warns unconditionally.
+#[test]
+fn a_fit_with_a_real_budget_is_not_flagged_as_stalled() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 60,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+
+    assert_eq!(
+        result.left_init,
+        Some(true),
+        "fixture precondition: this budget must actually let the fit move, or the assertion \
+         below passes for the wrong reason"
+    );
+    assert!(
+        !result
+            .warnings_structured
+            .iter()
+            .any(|e| e.category == crate::types::WarningCode::StalledAtInit),
+        "a fit that moved must not be flagged: {:?}",
+        result.warnings
+    );
+}
+
+/// A model that genuinely cannot leave its initial estimates, built without
+/// reaching into the optimizer.
+///
+/// The obvious way to produce a stall — a tiny evaluation budget — does not
+/// work: BOBYQA's budget is `outer_maxiter · (n+1) + 40 · (n+1)` evaluations, so
+/// even `outer_maxiter = 1` buys it 205 on this model and it moves freely. So
+/// pin the objective instead of the budget: FIX Ω and Σ, and put a prior on each
+/// free θ centred exactly on its own initial value with a 0.01 % RSE. The
+/// penalized objective is then a quadratic well of curvature ~2/(1e-4·ln θ₀)²
+/// centred at the start, which no likelihood improvement this dataset can offer
+/// comes close to paying for — the fit converges normally, and converges where
+/// it began.
+fn pinned_at_init_model() -> (CompiledModel, ModelParameters) {
+    let mut model = make_model();
+    let mut template = model.default_params.clone();
+    template.omega_fixed = vec![true];
+    template.sigma_fixed = vec![true];
+    model.priors = template
+        .theta_names
+        .iter()
+        .zip(&template.theta)
+        .map(|(name, value)| crate::types::ParameterPrior {
+            name: name.clone(),
+            value: *value,
+            spread: crate::types::PriorSpread::Rse(1e-4),
+            kind: Some(crate::types::ParameterKind::Theta),
+        })
+        .collect();
+    model.default_params = template.clone();
+    (model, template)
+}
+
+/// A `[mixture]` model's objective is the K-fold log-sum-exp, not any one
+/// class's likelihood, and the reporting stencil has to difference *that*.
+///
+/// The check needs a second implementation, or it proves nothing: comparing the
+/// reported gradient against a recomputation by the same function agrees with a
+/// wrong answer by construction. `mixture::mixture_gradient_fd` is that second
+/// implementation — an independent central difference of `mixture_ofv` with its
+/// own absolute step (`1e-5`), no bounds clamping and no fixed mask — so a
+/// reporting stencil that fell through to the single-class path would disagree
+/// with it by the whole class-mixing term.
+#[test]
+fn reporting_fd_gradient_differences_the_mixture_objective() {
+    let src = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+    let population = make_population(4);
+    let template = &model.default_params;
+    assert!(
+        template.mixture.is_some(),
+        "fixture precondition: the template must carry a mixture, or this test runs the \
+         single-class branch and proves nothing"
+    );
+    let options = FitOptions {
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let x = pack_params(template);
+    let bounds = compute_bounds(template);
+    let warm: Vec<DVector<f64>> = (0..population.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+    let priors = build_prior_set(&model, template);
+
+    let ours = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+    let independent = crate::estimation::mixture::mixture_gradient_fd(
+        &model,
+        &population,
+        &x,
+        template,
+        &options,
+    );
+
+    for (k, (got, want)) in ours.iter().zip(&independent).enumerate() {
+        assert!(
+            got.is_finite() && want.is_finite(),
+            "coordinate {k}: non-finite ({got} vs {want}) — a diverged solve must not be \
+             folded away as agreement"
+        );
+        // Measured on this fixture: worst realised relative gap 1.18e-7 over the six
+        // coordinates, set by the two stencils' different steps (`1e-4·(1+|x|)` here
+        // against a flat `1e-5` there). The bound is 1e-5, ~85x that.
+        //
+        // Measured for the failure it exists to catch, too: forcing the single-class
+        // branch leaves coordinates 0-2 within 1.2e-7 (the class-shared θ and Ω are
+        // barely affected) and moves **coordinate 3, the mixing logit `MIXL`, to
+        // 8.0e-1** — five orders above the bound. So it is the mixing coordinate
+        // that does the discriminating here, which is why the fixture declares a
+        // free `logit(1) = MIXL`; a mixture fixture with the mixing probability
+        // FIXed would pass this test with the branch deleted.
+        let rel = (got - want).abs() / (1.0 + want.abs());
+        assert!(
+            rel < 1e-5,
+            "coordinate {k}: the reporting stencil must difference the mixture objective — \
+             got {got}, independent mixture FD {want} (relative {rel:.3e})"
+        );
+    }
+    assert!(
+        independent.iter().any(|g| g.abs() > 1e-3),
+        "fixture precondition: the reference gradient must be non-degenerate, got {independent:?}"
+    );
+}

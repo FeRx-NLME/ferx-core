@@ -1700,6 +1700,98 @@ pub(crate) fn high_correlation_warning(result: &FitResult) -> Option<(String, Wa
     )
 }
 
+/// Build the human message + native structured entry for a fit that never left
+/// its initial estimates, or `None` when it did (or when there is nothing to
+/// judge by).
+///
+/// Surfaces [`crate::stalled_at_init`] — which already existed as a public
+/// predicate (#751) but was reachable only by a caller who thought to ask — as a
+/// warning on the result, alongside `boundary_estimate` (#997 §2).
+///
+/// **Why this is not the ratio test the issue proposed.** #997 §2 asked for a
+/// warning on `theta / theta_init ≈ 1`, and its own author then withdrew the
+/// suggestion: on his anchor model the data were simulated at `KON = 1000` and
+/// started there, so the *correct* arm left `KON` at 0.999 of its initial value
+/// and a per-parameter ratio test fired hardest on the arm that was right. The
+/// predicate here is not that test. It asks whether **any** free coordinate
+/// moved, over θ, Ω and σ together, and it prefers the optimizer's own
+/// scaled-space escape verdict when the run recorded one. A well-chosen start
+/// that one parameter stays at is not a stall; a fit where nothing at all moved
+/// is, whatever the start was worth.
+///
+/// `converged` is deliberately left alone — unlike
+/// [`runaway_guard_warning`], which demotes it. A runaway hit is by construction
+/// not an interior optimum; a stall at the start *can* be one (the initial
+/// estimates may simply be the optimum, the degenerate but real case of a fit
+/// restarted from its own output). What the warning asserts is that the OFV is
+/// the OFV of the initial values and so carries no information about the model —
+/// a judgement for the caller, and one `Strictness::reject_init_stall` already
+/// makes for search harnesses that want it fatal.
+pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
+    // An evaluation-only run (`outer_maxiter = 0`, NONMEM `MAXEVAL=0`) reports the
+    // objective at the initial estimates *by request*. The predicate is perfectly
+    // correct there and the warning tells the caller nothing they did not ask for,
+    // so it is suppressed — the one case where "the estimates are the initial
+    // values" is the answer rather than a symptom.
+    if result.outer_maxiter == 0 {
+        return None;
+    }
+    if crate::model_selection::stalled_at_init(result) != Some(true) {
+        return None;
+    }
+    // Which reading fired, so the message can quote the tolerance that applies.
+    // `stalled_at_init` prefers `left_init` whenever the result carries it.
+    let from_optimizer = result.left_init.is_some();
+    let free_thetas: Vec<(String, f64, f64)> = result
+        .theta_names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !result.theta_fixed.get(*i).copied().unwrap_or(false))
+        .filter_map(|(i, name)| {
+            Some((
+                name.clone(),
+                *result.theta.get(i)?,
+                *result.theta_init.get(i)?,
+            ))
+        })
+        .collect();
+    let list = free_thetas
+        .iter()
+        .map(|(name, est, init)| format!("{name} ({init:.4} → {est:.4})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let basis = if from_optimizer {
+        "the optimizer's own escape test (no packed coordinate moved by 1% of its scaled range)"
+    } else {
+        "a comparison against the initial estimates (no free THETA, OMEGA or SIGMA moved by 1%)"
+    };
+    let msg = format!(
+        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. The reported \
+         objective is the objective *of the initial values* and says nothing about the model, \
+         even though `converged` may be true — a fit that never moved has a flat objective \
+         trace to plateau on. Unmoved free THETA: {list}. Check the optimizer's own diagnostics \
+         (`final_gradient`), try different initial estimates, or a gradient-based \
+         `optimizer` if this fit used a derivative-free one."
+    );
+    let entry = warning_entry(
+        WarningCode::StalledAtInit,
+        msg.clone(),
+        Some(serde_json::json!({
+            "verdict_source": if from_optimizer { "optimizer_escape_test" } else { "natural_scale" },
+            "n_free_parameters": result.n_parameters,
+            "theta": free_thetas
+                .iter()
+                .map(|(name, est, init)| serde_json::json!({
+                    "parameter": name,
+                    "estimate": est,
+                    "init": init,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+    Some((msg, entry))
+}
+
 /// Build the human message + native structured entry for a **twin-less** transit /
 /// IG absorption closed form whose *fitted* per-subject EBE crosses into the
 /// flip-flop regime, or `None`.
