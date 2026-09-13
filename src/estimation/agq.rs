@@ -686,6 +686,8 @@ pub(crate) fn agq_subject_nll(
 /// `model` + `subject`, so the two population-level callers ([`agq_population_nll`],
 /// [`agq_population_evaluate`]) build the cache once per outer-loop evaluation and hand each
 /// subject its entry, rather than every subject re-walking its own dose/event timeline.
+/// If no schedule is supplied, the caller continues using the legacy per-call
+/// [`cacheable_schedule`] path.
 #[allow(clippy::too_many_arguments)]
 fn agq_subject_evaluate(
     model: &CompiledModel,
@@ -701,6 +703,12 @@ fn agq_subject_evaluate(
 ) -> (f64, Option<PreparedGrid>) {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+    let local_schedule = if schedule.is_none() {
+        cacheable_schedule(model, subject)
+    } else {
+        None
+    };
+    let schedule = schedule.or(local_schedule.as_ref());
 
     // No random effects: the "integral" is a point mass and AGQ degenerates to the
     // conditional likelihood itself. (The formula below would agree — an empty tensor
@@ -1151,7 +1159,13 @@ fn agq_population_evaluate_impl(
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            let schedule = schedules.and_then(|s| s[i].as_ref());
+            let cached_schedule = schedules.and_then(|s| s[i].as_ref());
+            let local_schedule = if cached_schedule.is_none() {
+                cacheable_schedule(model, subject)
+            } else {
+                None
+            };
+            let schedule = cached_schedule.or(local_schedule.as_ref());
             let (nll, grid) = agq_subject_evaluate(
                 model,
                 subject,
