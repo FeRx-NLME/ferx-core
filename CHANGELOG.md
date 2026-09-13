@@ -200,6 +200,8 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- Population fitting and prediction use the available worker budget more efficiently: Bayesian chains and underfilled AGQ grids run concurrently, small FOCE populations avoid fine-grained dispatch overhead, concurrent cold callers share pool construction, AGQ-IOV nodes avoid a heap allocation, and public `predict()` evaluates subjects in parallel.
+
 - **FOCEI, Laplace, and `focei` with `n_agq > 1` now build each subject's `EventSchedule`
   once per outer-loop evaluation instead of once per subject per AGQ node/gradient call.**
   `cacheable_schedule` gates this on time-varying covariates or `EVID=3/4` resets (its

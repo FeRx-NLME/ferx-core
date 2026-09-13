@@ -41,6 +41,11 @@ use std::time::Instant;
 /// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 ///
+/// Subjects are evaluated in parallel when more than one worker is available.
+/// Calls made inside a [`PoolPlan`] reuse that enclosing pool; standalone calls
+/// use ferx's persistent default pool. Results are still returned in population
+/// and observation order.
+///
 /// **Gaussian rows only.** Non-Gaussian endpoints keep their own entry points, because
 /// their prediction is not a scalar concentration: TTE → [`predict_survival`], binary →
 /// [`predict_categorical`]. A model whose only endpoint is non-Gaussian therefore gets an
