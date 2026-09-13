@@ -90,23 +90,6 @@ pub fn tafd_tad_for_subject(
     (tafd, tad)
 }
 
-/// Build a per-observation HashMap mapping `model.indiv_param_names` to their
-/// values from `pk`. Individual parameters the parser synthesized for a direct-θ/η
-/// Form-C readout (`__ferx_ro_*`, #486) are internal — they are skipped so they never
-/// surface as a user-facing EBE / sdtab column.
-pub(crate) fn build_indiv_map(
-    pk: &PkParams,
-    names: &[String],
-    pk_indices: &[usize],
-) -> HashMap<String, f64> {
-    names
-        .iter()
-        .zip(pk_indices.iter())
-        .filter(|(name, _)| !crate::parser::model_parser::is_synthetic_readout_param(name))
-        .map(|(name, &idx)| (name.clone(), pk.values[idx]))
-        .collect()
-}
-
 /// Trapezoid integration over (time, value) pairs.
 /// Observation times are not guaranteed to be sorted (preserved in input row
 /// order), so sort by time before integrating to prevent negative dt windows.
@@ -243,8 +226,7 @@ pub(crate) fn compute_extra_output_columns(
             let cov_j = subject.obs_cov(j);
             // Evaluate at this observation's time so the sdtab individual-parameter
             // columns honour the `TIME` built-in per row, matching IPRED (#610).
-            let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j, subject.obs_times[j]);
-            let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
+            let indiv_j = model.indiv_param_value_map(theta, eta_full, cov_j, subject.obs_times[j]);
             let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
             per_obs_indiv.push(indiv_j);

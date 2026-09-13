@@ -3878,12 +3878,17 @@ pub struct CompiledModel {
     /// assigned on every branch of an `if`/`else` when `[odes]`,
     /// `[structural_model]`, `[scaling]` or `[derived]` reads it (#357). The
     /// parser-synthesized `__ferx_ro_*` / `__ferx_pktime_*` parameters follow.
-    /// Parallel to `pk_indices` on both engines: read the i-th name's value from
-    /// `PkParams.values[pk_indices[i]]`, never from slot `i`. On an analytical
-    /// model that read is valid only for the names described below: a
-    /// placeholder entry cannot yet be told apart from a genuine `CL` entry
-    /// (#1356). Used by the FFI to label per-subject EBE individual parameter
-    /// values (e.g. `CL`, `V`, `Ka`).
+    /// Used by the FFI to label per-subject EBE individual parameter values (e.g.
+    /// `CL`, `V`, `Ka`).
+    ///
+    /// **To read the i-th name's *value*, call
+    /// [`indiv_param_values`](Self::indiv_param_values) (or
+    /// [`indiv_param_value_map`](Self::indiv_param_value_map)), not
+    /// `PkParams.values[pk_indices[i]]`.** `pk_indices` is parallel to this list on
+    /// both engines, but it maps to the PK *slots* the engine consumes, and on an
+    /// analytical model a placeholder entry is indistinguishable from a genuine `CL`
+    /// entry — so the slot read silently returns `CL`'s value for every unbound name
+    /// (#1356).
     ///
     /// Where `pk_indices[i]` comes from differs by engine:
     /// - **ODE and compartment-free models** route every name through
@@ -3897,10 +3902,10 @@ pub struct CompiledModel {
     ///   or referenced by a readout (#650, a spare slot). Every other name gets
     ///   a placeholder `0`, which aliases the `CL` slot rather than holding that
     ///   name's value; a name that differs from a bound name only in case (`v`
-    ///   next to `V`) instead gets that bound name's slot (#1356). Most such names (e.g. an intermediate `TVCL`) are
-    ///   never written to `PkParams`; a modeled-dose `D{n}`/`R{n}` is written,
-    ///   to a spare slot above `PK_IDX_LAGTIME`, but still cannot be read back
-    ///   through `pk_indices`.
+    ///   next to `V`) instead gets that bound name's slot (#1356). Most such names
+    ///   (e.g. an intermediate `TVCL`) are never written to `PkParams`; a
+    ///   modeled-dose `D{n}`/`R{n}` is written, to a spare slot above
+    ///   `PK_IDX_LAGTIME`, but still cannot be read back through `pk_indices`.
     ///
     /// Bound: an ODE or compartment-free model whose names do not all fit the
     /// `MAX_PK_PARAMS`-slot layout is rejected at parse time by
@@ -4741,6 +4746,104 @@ impl CompiledModel {
     #[cfg(not(feature = "survival"))]
     pub fn has_discrete(&self) -> bool {
         false
+    }
+
+    /// Value of every `[individual_parameters]` name at `(theta, eta, covariates,
+    /// time)`, parallel to [`indiv_param_names`](Self::indiv_param_names) (#1356).
+    ///
+    /// **Use this, not `PkParams.values[pk_indices[i]]`, to read a name's value.**
+    /// `pk_indices` is a map to the PK *slots* the engine consumes, and on an
+    /// analytical model a name that is neither bound on the `[structural_model]`
+    /// line nor referenced by a `[scaling] y` readout has no slot of its own: its
+    /// entry is a placeholder `0`, so the slot read silently returns `CL`'s value.
+    /// An intermediate such as `TVCL = THCL * 3` is the common case, and a modeled
+    /// dose `D{n}`/`R{n}` — whose value *is* written, to a spare slot `pk_indices`
+    /// does not record — is another. This method reads the evaluator's own var
+    /// slot for each name, which every name has on either engine.
+    ///
+    /// `eta` is the extended vector the `pk_param_fn` consumes (BSV η followed by
+    /// IOV κ). `time` feeds the `TIME` built-in (#610), so pass the event or
+    /// observation time the values are wanted at; a model that does not read the
+    /// built-in ignores it.
+    ///
+    /// The parser-synthesized internal parameters (`__ferx_ro_*`, `__ferx_pktime_*`;
+    /// #486) are present here, positionally, because the result is parallel to
+    /// `indiv_param_names`. Use [`indiv_param_value_map`](Self::indiv_param_value_map)
+    /// for a user-facing name → value map, which drops them.
+    ///
+    /// Falls back to the `pk_indices` slot read — with its placeholder caveat — for
+    /// a hand-built `CompiledModel` whose `indiv_param_partials` carries no compiled
+    /// program (test fixtures, `generate_data`). Every parsed model has one.
+    pub fn indiv_param_values(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+    ) -> Vec<f64> {
+        let Some(prog) = self.indiv_param_partials.indiv_param_program.as_ref() else {
+            let pk = (self.pk_param_fn)(theta, eta, covariates, time);
+            return self
+                .pk_indices
+                .iter()
+                .map(|&i| pk.values.get(i).copied().unwrap_or(0.0))
+                .collect();
+        };
+        #[cfg(feature = "nn")]
+        let nn_outputs: Vec<Vec<f64>> = self
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                use crate::nn::CovariateMapper;
+                let n_w = nn.mapper.n_weights();
+                let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                nn.mapper.forward_raw(weights, covariates).expect(
+                    "NN forward_raw failed in indiv_param_values: this indicates a \
+                     weight-offset/length wiring bug (missing covariates are \
+                     substituted with 0.0, not errored on)",
+                )
+            })
+            .collect();
+        #[cfg(not(feature = "nn"))]
+        let nn_outputs: Vec<Vec<f64>> = Vec::new();
+        let mut vals = prog.eval_param_values(theta, eta, covariates, time, &nn_outputs);
+        // The program's var-slot prefix and `indiv_param_names` are built from the
+        // same list, so this is an identity in practice; resize rather than index
+        // blind so a hand-edited fixture cannot make a caller's `zip` silently drop
+        // the tail of the name list.
+        debug_assert_eq!(
+            vals.len(),
+            self.indiv_param_names.len(),
+            "indiv_param_values must be parallel to indiv_param_names"
+        );
+        vals.resize(self.indiv_param_names.len(), 0.0);
+        vals
+    }
+
+    /// User-facing name → value map of the `[individual_parameters]` block at
+    /// `(theta, eta, covariates, time)` — [`indiv_param_values`](Self::indiv_param_values)
+    /// keyed by name, with the parser-synthesized internal parameters
+    /// (`__ferx_ro_*` Form-C readout, `__ferx_pktime_*` direct-`TIME` mapping; #486)
+    /// dropped so they never surface as an sdtab / EBE column.
+    ///
+    /// This is what sdtab `[output]` columns, `[derived]` expressions and the
+    /// ferx-r `individual_estimates` table read (#1356).
+    pub fn indiv_param_value_map(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+    ) -> HashMap<String, f64> {
+        let values = self.indiv_param_values(theta, eta, covariates, time);
+        self.indiv_param_names
+            .iter()
+            .zip(values)
+            .filter(|(name, _)| {
+                !crate::parser::model_parser::is_synthetic_readout_param(name.as_str())
+            })
+            .map(|(name, v)| (name.clone(), v))
+            .collect()
     }
 
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its

@@ -52,6 +52,24 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | *`[derived]` names* | One column per expression in the `[derived]` block |
 | *`[output]` names* | Covariates and individual parameters declared in `[output]` |
 
+### Individual-parameter columns
+
+Any name assigned in `[individual_parameters]` may be declared in `[output]`, and each
+one reports **its own value**, re-evaluated on every row with that row's EBE η, that
+row's covariates, and that row's `TIME`. That includes names the `[structural_model]`
+line never binds — an intermediate such as `TVCL = THCL * 3`, and a modeled-dose
+duration/rate `D{n}` / `R{n}`. The same values back the `[derived]` block and the
+ferx-r `individual_estimates` table.
+
+::: {.callout-note}
+Before ferx-core 0.4.0 an unbound name on an **analytical** (`pk ...`) model reported
+`CL`'s value instead of its own, because the column was read from the parameter's PK
+slot and such a name has no slot of its own. Under the usual `CL = TVCL * exp(ETA_CL)`
+the two coincide at η = 0, so the column often looked plausible. ODE and
+compartment-free models were never affected. See
+[#1356](https://github.com/FeRx-NLME/ferx-core/issues/1356).
+:::
+
 ### Residual Definitions
 
 **IWRES** (Individual Weighted Residual):
