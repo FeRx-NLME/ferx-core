@@ -21,6 +21,8 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
+- **A gradient at the solution for derivative-free fits**, so `converged` is checkable on the runs where it matters most. When the outer optimizer supplies no gradient of its own — `bobyqa`, which is what `optimizer = auto` picks for ODE/PD, LTBS/SDE and `gradient = fd` models — ferx now computes a central finite-difference gradient of the same objective at the reported estimates and reports it as `final_gradient`, with a new `final_gradient_source` field (`"optimizer"` or `"finite_difference"`) saying which kind it is. Previously `final_gradient` was `NULL` for exactly the optimizer where a premature stop is most likely, so `converged = true` was unfalsifiable. The EBEs are re-solved inside the stencil, so it is the gradient of the marginal objective, not a fixed-EBE approximation. It is a reporting quantity only — it never steers the optimizer and the estimates are bit-identical either way — and costs `2 × n_free` objective evaluations, one gradient's worth. New `[fit_options]` key `report_final_gradient` (default `true`) turns it off ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997)).
+- **A `stalled_at_init` warning** when a fit never left its initial estimates — no free THETA, OMEGA or SIGMA coordinate moved — so the reported objective is the objective *of the initial values* and says nothing about the model. This most often arrives alongside `converged: true`, since a fit that never moved has a perfectly flat objective trace to plateau on, which is why it is its own warning code rather than a convergence one. The underlying predicate (`stalled_at_init`) already existed for model-selection strictness; it is now surfaced on every fit alongside `boundary_estimate` ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997)).
 - `CompiledModel::indiv_param_values` and `CompiledModel::indiv_param_value_map` — read
   every `[individual_parameters]` value **by name**, at a given `(theta, eta, covariates,
   time)`. This is the supported way to get an individual parameter's value; the previous
@@ -131,6 +133,7 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- `method = gn_hybrid` no longer reports a `final_gradient` belonging to the **Gauss-Newton phase** when the FOCEI polish is the result being reported. Whenever the accepted polish had no gradient of its own — reachable with a derivative-free `optimizer` such as the `auto` default on ODE/PD models, or the built-in BFGS — the merge kept the GN phase's vector, so `fit$final_gradient` described the *pre-polish* point while every estimate beside it came from after the polish. It is now the polish's gradient or nothing ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997) review).
 - **A fit whose objective is not a usable number is no longer reported as converged.**
   `fit()` could return `converged: true` alongside `ofv: NaN` — measured on a population
   carrying one subject whose timeline could not be ordered, where the `NaN` spreads to the

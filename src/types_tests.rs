@@ -843,8 +843,72 @@ fn warning_code_tokens_are_stable() {
         (Cancelled, "cancelled"),
         (Threads, "threads"),
         (Simulation, "simulation"),
+        (FlipFlop, "flip_flop"),
+        (AbsorptionTwinDeclined, "absorption_twin_declined"),
+        (FlatParameter, "flat_parameter"),
+        (OdeSolver, "ode_solver"),
+        (StalledAtInit, "stalled_at_init"),
         (General, "general"),
     ];
+    // The list is hand-maintained, and had silently fallen four variants behind
+    // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
+    // `FlatParameter` and `OdeSolver` were each shipped without a row here, so
+    // their tokens were never pinned by the test whose job that is. The match
+    // below is the guard against that recurring: it has no wildcard arm, so a new
+    // `WarningCode` variant fails to compile here until someone touches this test.
+    // It deliberately does not call `as_str` — a body that delegated would pin
+    // nothing, since `as_str` is the thing under test.
+    fn _every_variant_is_listed_above(c: WarningCode) -> usize {
+        match c {
+            Convergence => 0,
+            CovarianceStep => 1,
+            CovarianceFailed => 2,
+            CovarianceRegularized => 3,
+            ConditionNumber => 4,
+            OptimizerHealth => 5,
+            ViBadBasin => 6,
+            DwAutocorrelation => 7,
+            EtaNormality => 8,
+            Experimental => 9,
+            BloqMethod => 10,
+            Sir => 11,
+            ImportanceSampling => 12,
+            EpsShrinkage => 13,
+            EtaShrinkage => 14,
+            BoundaryEstimate => 15,
+            ParameterAtRunawayGuard => 16,
+            InitOutsideBounds => 17,
+            InflatedRse => 18,
+            HighCorrelation => 19,
+            DataQuality => 20,
+            OmegaStructure => 21,
+            GradientFallback => 22,
+            MuReferencing => 23,
+            OptimizerConfig => 24,
+            MultiStart => 25,
+            Cancelled => 26,
+            Threads => 27,
+            Simulation => 28,
+            FlipFlop => 29,
+            AbsorptionTwinDeclined => 30,
+            FlatParameter => 31,
+            OdeSolver => 32,
+            StalledAtInit => 33,
+            General => 34,
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        35,
+        "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
+    );
+    for (i, (code, _)) in expected.iter().enumerate() {
+        assert_eq!(
+            _every_variant_is_listed_above(*code),
+            i,
+            "`expected` and the exhaustiveness match disagree on {code:?}"
+        );
+    }
     for (code, token) in expected {
         assert_eq!(code.as_str(), *token, "as_str drift for {code:?}");
         // serde token == as_str token (rename_all = "snake_case").

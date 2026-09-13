@@ -467,7 +467,14 @@ pub fn run_foce_gn(
     let mut grad_final = grad_final.as_slice().to_vec();
     nn_reg.add_packed_gradient(&gn_params.theta, &mut grad_final);
     priors.add_gradient(&x, &mut grad_final);
-    let mut final_gradient: Option<Vec<f64>> = Some(grad_final);
+    // The reported gradient and *where it came from*, carried as one value rather
+    // than two variables kept in step by hand. They are only meaningful together:
+    // a vector from one phase under the other phase's label is worse than no
+    // gradient at all, and the two-variable spelling let exactly that happen —
+    // see the polish merge below. `zip`/`unzip` at the two ends then encode the
+    // invariant `final_gradient.is_some() == final_gradient_source.is_some()`
+    // structurally, instead of restating it at each `OuterResult` literal.
+    let mut final_gradient: Option<(Vec<f64>, String)> = Some((grad_final, "optimizer".into()));
 
     // Penalized: this is what the FOCEI polish below is ranked against.
     let gn_ofv = ofv;
@@ -518,6 +525,7 @@ pub fn run_foce_gn(
             eprintln!("FOCE-GN completed. Final OFV = {:.4}", gn_ofv_clean);
         }
 
+        let (final_gradient, final_gradient_source) = final_gradient.unzip();
         return OuterResult {
             params: gn_params,
             ofv: gn_ofv_clean,
@@ -535,6 +543,7 @@ pub fn run_foce_gn(
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             final_gradient,
+            final_gradient_source,
             sir_fallback_proposal,
             impmap_trace: None,
             bayes: None,
@@ -599,7 +608,27 @@ pub fn run_foce_gn(
         final_h_mats = polish_result.h_matrices;
         final_kappas = polish_result.kappas;
         converged = polish_result.converged || converged;
-        final_gradient = polish_result.final_gradient.or(final_gradient);
+        // The polish's estimates are the ones being reported, so the polish's
+        // gradient is the only one that may be reported with them — *including*
+        // when the polish has none, which is why this is an unconditional
+        // transfer and not an `.or(…)`.
+        //
+        // The `.or(…)` it replaces (and the `is_some()` guard that replaced that)
+        // kept the GN phase's gradient whenever the polish supplied none —
+        // reachable under `optimizer = bobyqa` with `report_final_gradient =
+        // false`, or with the built-in BFGS — and reported a vector evaluated at
+        // the *pre-polish* GN point against post-polish estimates, labelled
+        // `"optimizer"`. Finite, plausible, and wrong at a point nobody asked
+        // about: precisely what `FitResult::final_gradient`'s "at the reported
+        // estimates" contract exists to exclude. `None` is the honest answer when
+        // the accepted phase computed nothing.
+        //
+        // `zip` also enforces the pairing: a polish that somehow carried a
+        // gradient without a source (or the reverse) yields `None` rather than a
+        // half-populated pair.
+        final_gradient = polish_result
+            .final_gradient
+            .zip(polish_result.final_gradient_source);
     } else {
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
@@ -651,6 +680,7 @@ pub fn run_foce_gn(
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);
     }
 
+    let (final_gradient, final_gradient_source) = final_gradient.unzip();
     OuterResult {
         params: final_params,
         ofv: final_ofv,
@@ -668,6 +698,7 @@ pub fn run_foce_gn(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient,
+        final_gradient_source,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
@@ -4072,6 +4103,151 @@ mod tests {
             !res.warnings.iter().any(is_targeted),
             "mixed-effects gn must not carry the #1006 warning: {:?}",
             res.warnings
+        );
+    }
+
+    /// `gn_hybrid` options with the FOCEI polish reached through `run_foce_gn`.
+    fn hybrid_opts(report_final_gradient: bool) -> FitOptions {
+        FitOptions {
+            method: crate::types::EstimationMethod::FoceGnHybrid,
+            optimizer: crate::types::Optimizer::Bobyqa,
+            outer_maxiter: 30,
+            run_covariance_step: false,
+            report_final_gradient,
+            ..Default::default()
+        }
+    }
+
+    /// When the FOCEI polish wins, the reported gradient must be the **polish's**
+    /// — including when the polish has none.
+    ///
+    /// The merge used to keep the GN phase's gradient whenever the polish supplied
+    /// one of `None`, which `optimizer = bobyqa` + `report_final_gradient = false`
+    /// reaches directly. The reported estimates are then the polish's while the
+    /// reported gradient was evaluated at the *pre-polish* GN point, and labelled
+    /// `"optimizer"` on top: finite, plausible, and about a point nobody asked
+    /// about. `FitResult::final_gradient` is documented as the gradient **at the
+    /// reported estimates**, so `None` is the only honest answer here (reviewer
+    /// catch on #1380).
+    #[test]
+    fn an_accepted_polish_with_no_gradient_reports_none_not_the_gn_phase_vector() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = hybrid_opts(false);
+
+        // Precondition, established independently of the fields under test: the
+        // polish has to actually win on this fixture, or the assertions below are
+        // about a branch that never ran. Pure GN on the identical model/data/budget
+        // is the control.
+        let pure = run_foce_gn(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..opts.clone()
+            },
+        );
+        let hybrid = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            hybrid.ofv < pure.ofv,
+            "fixture precondition: the FOCEI polish must be accepted, or this test \
+             exercises the `else` arm — pure GN {:.6}, hybrid {:.6}",
+            pure.ofv,
+            hybrid.ofv
+        );
+        // And the control confirms the GN phase *does* produce a gradient, so
+        // "None" below is the transfer working and not a phase that had nothing.
+        assert!(
+            pure.final_gradient.is_some(),
+            "fixture precondition: the GN phase must have a gradient to leak"
+        );
+
+        assert!(
+            hybrid.final_gradient.is_none(),
+            "the accepted polish computed no gradient, so there is none to report; \
+             got the GN phase's {:?}",
+            hybrid.final_gradient
+        );
+        assert!(
+            hybrid.final_gradient_source.is_none(),
+            "and no provenance to claim for it, got {:?}",
+            hybrid.final_gradient_source
+        );
+    }
+
+    /// The other half of the same transfer: when the polish *does* carry a
+    /// gradient it must arrive with the polish's own label. The FOCEI polish is an
+    /// ordinary NLopt run, so under a derivative-free `optimizer` that label is
+    /// `"finite_difference"` (#997 §1) — **not** the `"optimizer"` the GN phase
+    /// would have claimed. Without this arm, "transfer both fields unconditionally"
+    /// is satisfied by an implementation that hard-codes the GN label.
+    #[test]
+    fn an_accepted_polish_reports_its_own_gradient_under_its_own_label() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = hybrid_opts(true);
+
+        let pure = run_foce_gn(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..opts.clone()
+            },
+        );
+        let hybrid = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            hybrid.ofv < pure.ofv,
+            "fixture precondition: the FOCEI polish must be accepted — pure GN \
+             {:.6}, hybrid {:.6}",
+            pure.ofv,
+            hybrid.ofv
+        );
+        assert_eq!(
+            hybrid.final_gradient_source.as_deref(),
+            Some("finite_difference"),
+            "a derivative-free polish reports the post-fit FD gradient, not the GN \
+             phase's optimizer gradient"
+        );
+        assert!(hybrid.final_gradient.is_some());
+    }
+
+    /// The GN phase reports its own gradient under its own `"optimizer"` label —
+    /// the value the polish merge above overwrites, and the one a *rejected*
+    /// polish leaves standing.
+    ///
+    /// There is no separate rejected-polish test because after the fix that arm
+    /// contains no gradient code at all: it neither reads nor writes the pair, so
+    /// its behaviour is whatever the initializer left, which is exactly what this
+    /// test pins. (It is also not reachable on this fixture — the polish improves
+    /// 57706.3 → 28.6 from every start tried, and the polish budget is hard-coded
+    /// to 100 evaluations inside `run_foce_gn`, so it cannot be starved into
+    /// losing.) A future edit that adds gradient handling to the `else` arm needs
+    /// its own fixture; this one would not see it.
+    #[test]
+    fn the_gn_phase_reports_its_own_gradient_under_the_optimizer_label() {
+        let model = make_model();
+        let pop = make_population();
+        let res = run_foce_gn(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..hybrid_opts(false)
+            },
+        );
+        assert!(
+            res.final_gradient.is_some(),
+            "GN computes a gradient every iteration; there is nothing to recompute"
+        );
+        assert_eq!(
+            res.final_gradient_source.as_deref(),
+            Some("optimizer"),
+            "and `report_final_gradient = false` must not suppress a gradient the \
+             optimizer produced anyway"
         );
     }
 }

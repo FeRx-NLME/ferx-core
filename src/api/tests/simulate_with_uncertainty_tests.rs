@@ -498,6 +498,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sigma_init: template.sigma.values.clone(),
         obs_time_range: None,
         final_gradient: None,
+        final_gradient_source: None,
         optimizer: "bobyqa".to_string(),
         n_starts: 1,
         multi_start_seed: None,

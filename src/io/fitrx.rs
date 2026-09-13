@@ -193,6 +193,8 @@ struct FitWire {
     obs_time_range: Option<(f64, f64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_gradient_source: Option<String>,
     // ── Run settings ─────────────────────────────────────────────────────────
     #[serde(default)]
     optimizer: String,
@@ -711,6 +713,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
+        final_gradient_source: r.final_gradient_source.clone(),
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
@@ -2003,6 +2006,7 @@ fn wire_to_fit_result(
         sigma_init: w.sigma_init,
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
+        final_gradient_source: w.final_gradient_source,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
@@ -2723,6 +2727,53 @@ mod tests {
         assert!(
             crate::model_selection::bic(&l, crate::model_selection::BicType::Mixed).is_finite()
         );
+    }
+
+    /// `final_gradient_source` has to survive the checkpoint alongside the vector
+    /// it labels (#997 §1). A bundle that kept the gradient and dropped the label
+    /// is worse than one that kept neither: the reader then has a plausible vector
+    /// and no way to tell an optimizer's own stationarity claim from an
+    /// after-the-fact finite-difference check on a run that had none.
+    ///
+    /// Pinned with `"finite_difference"` rather than `"optimizer"` — the label a
+    /// `Default`-ing or hard-coded mutation would not produce by accident.
+    #[test]
+    fn final_gradient_and_its_source_round_trip_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grad.fitrx");
+        let mut r = minimal_fit_result();
+        r.final_gradient = Some(vec![0.25, -1.5, 3.0]);
+        r.final_gradient_source = Some("finite_difference".to_string());
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let l = load_fit(&path).unwrap().fit;
+        assert_eq!(l.final_gradient, Some(vec![0.25, -1.5, 3.0]));
+        assert_eq!(
+            l.final_gradient_source.as_deref(),
+            Some("finite_difference")
+        );
+    }
+
+    /// A bundle written before #997 carries no `final_gradient_source` key at all.
+    /// It must load as `None` rather than default to a label it cannot support —
+    /// an old BOBYQA bundle has no gradient, and an old L-BFGS one has a gradient
+    /// whose provenance the file never recorded.
+    #[test]
+    fn fit_wire_missing_final_gradient_source_defaults_to_none() {
+        let mut r = minimal_fit_result();
+        r.final_gradient = Some(vec![1.0, 2.0]);
+        r.final_gradient_source = Some("optimizer".to_string());
+        let wire = build_fit_wire(&r);
+        let mut value = serde_json::to_value(&wire).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        assert!(
+            obj.remove("final_gradient_source").is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert_eq!(reloaded.final_gradient_source, None);
+        assert_eq!(reloaded.final_gradient, Some(vec![1.0, 2.0]));
     }
 
     /// A bundle saved before #1177 has neither key: the tally defaults to all

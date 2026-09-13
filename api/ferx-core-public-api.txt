@@ -425,6 +425,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::covariance_wall_time_se
 pub ferx_core::estimation::outer_optimizer::OuterResult::ebe_convergence_warnings: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::eta_hats: alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::final_gradient: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::estimation::outer_optimizer::OuterResult::final_gradient_source: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::h_matrices: alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::impmap_trace: core::option::Option<ferx_core::ImpmapTrace>
 pub ferx_core::estimation::outer_optimizer::OuterResult::kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
@@ -2504,6 +2505,7 @@ pub ferx_core::types::WarningCode::OptimizerHealth
 pub ferx_core::types::WarningCode::ParameterAtRunawayGuard
 pub ferx_core::types::WarningCode::Simulation
 pub ferx_core::types::WarningCode::Sir
+pub ferx_core::types::WarningCode::StalledAtInit
 pub ferx_core::types::WarningCode::Threads
 pub ferx_core::types::WarningCode::ViBadBasin
 impl ferx_core::WarningCode
@@ -2883,6 +2885,7 @@ pub ferx_core::types::FitOptions::outer_maxiter: usize
 pub ferx_core::types::FitOptions::outer_xtol: f64
 pub ferx_core::types::FitOptions::parameter_scaling: ferx_core::ParameterScaling
 pub ferx_core::types::FitOptions::reconverge_gradient_interval: usize
+pub ferx_core::types::FitOptions::report_final_gradient: bool
 pub ferx_core::types::FitOptions::run_covariance_step: bool
 pub ferx_core::types::FitOptions::saem_adapt_interval: usize
 pub ferx_core::types::FitOptions::saem_conddist: bool
@@ -2965,6 +2968,7 @@ pub ferx_core::types::FitResult::eta_param_info: alloc::vec::Vec<ferx_core::EtaP
 pub ferx_core::types::FitResult::exclusions: core::option::Option<ferx_core::ExclusionSummary>
 pub ferx_core::types::FitResult::ferx_version: alloc::string::String
 pub ferx_core::types::FitResult::final_gradient: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::final_gradient_source: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::gradient_method_inner: alloc::string::String
 pub ferx_core::types::FitResult::gradient_method_outer: alloc::string::String
 pub ferx_core::types::FitResult::imp_seed: core::option::Option<u64>
@@ -3815,6 +3819,7 @@ pub ferx_core::WarningCode::OptimizerHealth
 pub ferx_core::WarningCode::ParameterAtRunawayGuard
 pub ferx_core::WarningCode::Simulation
 pub ferx_core::WarningCode::Sir
+pub ferx_core::WarningCode::StalledAtInit
 pub ferx_core::WarningCode::Threads
 pub ferx_core::WarningCode::ViBadBasin
 impl ferx_core::WarningCode
@@ -4311,6 +4316,7 @@ pub ferx_core::FitOptions::outer_maxiter: usize
 pub ferx_core::FitOptions::outer_xtol: f64
 pub ferx_core::FitOptions::parameter_scaling: ferx_core::ParameterScaling
 pub ferx_core::FitOptions::reconverge_gradient_interval: usize
+pub ferx_core::FitOptions::report_final_gradient: bool
 pub ferx_core::FitOptions::run_covariance_step: bool
 pub ferx_core::FitOptions::saem_adapt_interval: usize
 pub ferx_core::FitOptions::saem_conddist: bool
@@ -4393,6 +4399,7 @@ pub ferx_core::FitResult::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInf
 pub ferx_core::FitResult::exclusions: core::option::Option<ferx_core::ExclusionSummary>
 pub ferx_core::FitResult::ferx_version: alloc::string::String
 pub ferx_core::FitResult::final_gradient: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::final_gradient_source: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::gradient_method_inner: alloc::string::String
 pub ferx_core::FitResult::gradient_method_outer: alloc::string::String
 pub ferx_core::FitResult::imp_seed: core::option::Option<u64>

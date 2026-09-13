@@ -1601,6 +1601,7 @@ pub fn run_bayes(
         max_unconverged_subjects: ebe_stats.n_unconverged as u32,
         total_ebe_fallbacks: ebe_stats.n_fallback as u32,
         final_gradient: None,
+        final_gradient_source: None,
         sir_fallback_proposal: None,
         impmap_trace: None,
         bayes: Some(bayes),

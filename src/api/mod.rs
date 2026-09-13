@@ -71,7 +71,8 @@ pub(crate) use postfit::{
     is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
     nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
     rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
-    runaway_guard_warning, sir_unavailable_warning, sweep_sensitivity_solver_stats,
+    runaway_guard_warning, sir_unavailable_warning, stalled_at_init_warning,
+    sweep_sensitivity_solver_stats,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
@@ -255,6 +256,10 @@ mod tests_param_corr;
 #[cfg(test)]
 #[path = "tests/ode_solver_diagnostics_tests.rs"]
 mod ode_solver_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "tests/stalled_at_init_warning_tests.rs"]
+mod stalled_at_init_warning_tests;
 
 #[cfg(test)]
 #[path = "tests/nonfinite_objective_tests.rs"]

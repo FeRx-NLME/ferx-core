@@ -60,8 +60,14 @@ pub struct OuterResult {
     /// Gradient at the best-OFV parameter point in packed space (log-theta,
     /// Cholesky-omega, log-sigma). `Some` for NLopt gradient-based runs
     /// (SLSQP, L-BFGS, MMA) when at least one gradient-requesting iteration
-    /// improved the OFV; `None` for BOBYQA, built-in BFGS, GN, and SAEM.
+    /// improved the OFV. For a *derivative-free* NLopt run it is instead the
+    /// post-fit reporting gradient (#997 §1, see `final_gradient_source`);
+    /// `None` for built-in BFGS and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// `"optimizer"` or `"finite_difference"` — where `final_gradient` came from;
+    /// lifted onto [`crate::types::FitResult::final_gradient_source`], where the
+    /// distinction is documented. `None` exactly when `final_gradient` is `None`.
+    pub final_gradient_source: Option<String>,
     /// Fallback proposal covariance for the SIR sampler, set when the FD
     /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
@@ -535,6 +541,7 @@ fn evaluate_at_initial_params(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        final_gradient_source: None,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
@@ -2842,7 +2849,40 @@ fn optimize_nlopt_once(
         warnings.push("Outer optimization did not converge".to_string());
     }
 
-    let final_gradient = last_gradient.lock().unwrap().clone();
+    // The gradient to report, and where it came from (#997 §1). A gradient-based
+    // NLopt run already has one at the best point; a derivative-free one has
+    // nothing, which is exactly the case where `converged` most needs checking —
+    // so compute it here, once, at the same restored point the estimates and the
+    // covariance step were built from. Skipped on cancellation (the result is
+    // discarded anyway) and when the caller opted out of the `2·n_free` evals.
+    let (final_gradient, final_gradient_source) = match last_gradient.lock().unwrap().clone() {
+        Some(g) => (Some(g), Some("optimizer".to_string())),
+        None if options.report_final_gradient && !crate::cancel::is_cancelled(&options.cancel) => {
+            if options.verbose {
+                eprintln!(
+                    "Computing a finite-difference gradient at the solution for reporting \
+                     ({} free coordinates) — the optimizer supplied none.",
+                    packed_fixed_mask(init_params)
+                        .iter()
+                        .filter(|f| !**f)
+                        .count(),
+                );
+            }
+            let g = reporting_fd_gradient(
+                &x0,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &bounds,
+                options,
+                &nn_reg,
+                &priors,
+            );
+            (Some(g), Some("finite_difference".to_string()))
+        }
+        None => (None, None),
+    };
 
     let ebe_final = ebe_accum.lock().unwrap();
     let result = OuterResult {
@@ -2867,6 +2907,7 @@ fn optimize_nlopt_once(
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
+        final_gradient_source,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
@@ -3338,6 +3379,7 @@ fn optimize_bfgs(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        final_gradient_source: None,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
@@ -3405,6 +3447,84 @@ fn reconverged_fd_gradient(
     };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/`is_finite`-drop convention can't drift (#466 review round 4 #8).
+    central_diff_packed(x, &fixed, bounds, eval)
+}
+
+/// Central-FD gradient of the **penalized** outer objective at the reported
+/// estimates, for a run whose optimizer supplied no gradient of its own (#997 §1).
+///
+/// A derivative-free fit (BOBYQA, the `optimizer = auto` choice whenever the
+/// analytic FOCE/FOCEI gradient is unavailable) reports `converged` with
+/// `final_gradient = None`, so there is nothing in the result to tell "the
+/// objective stopped moving" from "the optimizer stopped moving" — the two arms
+/// #997 measured 1.54 OFV apart, both reporting success. This computes the
+/// missing quantity once, after the fit, purely so the claim is checkable.
+///
+/// It is **not** [`reconverged_fd_gradient`] with a different name, and the
+/// difference is the reason for the second function rather than a flag on the
+/// first: that one is a gradient *fed to the optimizer*, so it differentiates the
+/// likelihood alone and the caller splices the NN-penalty and prior gradients in
+/// afterwards (they are available analytically in the same pass). Here there is
+/// no caller to splice anything: the quantity that has to come out is
+/// `∇(OFV + penalty)` — the objective the fit actually converged on, matching
+/// [`FitResult::final_gradient`](crate::types::FitResult::final_gradient)'s
+/// documented contract — so the penalties go inside the stencil. The EBEs are
+/// re-solved (warm-started from the final ones) at every perturbed point, like
+/// the objective closure itself, rather than held fixed.
+///
+/// Cost: `2·n_free` objective evaluations, one gradient's worth.
+#[allow(clippy::too_many_arguments)]
+fn reporting_fd_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    warm_etas: &[DVector<f64>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Vec<f64> {
+    let n_subj = population.subjects.len();
+    let fixed = packed_fixed_mask(init_params);
+    let eval = |xv: &[f64]| -> f64 {
+        let params = unpack_params(xv, init_params);
+        // Mirror the objective closure's own two branches, so the mixture path
+        // differentiates the K-fold log-sum-exp it minimised rather than a
+        // single-class stand-in for it.
+        let (raw, stats) = if params.mixture.is_some() {
+            let m =
+                crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
+            let stats = InnerLoopStats {
+                n_unconverged: m.ebe_stats.n_unconverged,
+                n_fallback: m.ebe_stats.n_fallback,
+                n_start_rejected: m.ebe_stats.n_start_rejected,
+            };
+            (m.ofv, stats)
+        } else {
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+                model,
+                population,
+                &params,
+                options.inner_maxiter,
+                options.inner_tol,
+                Some(warm_etas),
+                Some(&mu_k),
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+            );
+            let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+            (2.0 * nll, ebe_stats)
+        };
+        let raw = raw + nn_reg.penalty_value(&params.theta) + priors.penalty(xv);
+        if !raw.is_finite() || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
+        {
+            1e20
+        } else {
+            raw
+        }
+    };
     central_diff_packed(x, &fixed, bounds, eval)
 }
 

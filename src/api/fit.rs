@@ -1671,6 +1671,7 @@ fn fit_inner(
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
                         final_gradient: None,
+                        final_gradient_source: None,
                         sir_fallback_proposal: None,
                         impmap_trace: None,
                         bayes: None,
@@ -1756,6 +1757,7 @@ fn fit_inner(
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
                     final_gradient: None,
+                    final_gradient_source: None,
                     sir_fallback_proposal: None,
                     impmap_trace: None,
                     bayes: None,
@@ -2763,6 +2765,7 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
+        final_gradient_source: result.final_gradient_source.clone(),
         optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
@@ -2842,6 +2845,16 @@ fn fit_inner(
     // packed parameter names, which are derived from the assembled `FitResult`;
     // `rebuild_warnings_structured` preserves this native entry by message.
     if let Some((msg, entry)) = high_correlation_warning(&fit_result) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
+    }
+
+    // A fit that never left its initial estimates (#997 §2). Appended
+    // post-construction for the same reason as `high_correlation_warning`: the
+    // predicate it surfaces (`crate::stalled_at_init`) reads the assembled
+    // `FitResult` — `left_init`, `theta_init`/`theta`, and the fixed masks —
+    // none of which exist as one object before this point.
+    if let Some((msg, entry)) = crate::api::stalled_at_init_warning(&fit_result) {
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }

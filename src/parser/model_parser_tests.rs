@@ -3392,6 +3392,51 @@ fn test_parse_inits_from_nca() {
     assert!(parse_fit_options(&["inits_from_nca = bogus".to_string()]).is_err());
 }
 
+/// `report_final_gradient` reaches `FitOptions` from the DSL (#997 §1).
+///
+/// The key is only useful as a way to *turn the reporting gradient off*, so the
+/// `false` spelling is the one that has to arrive: a parser arm that silently
+/// dropped the key would leave the default `true` in place and the user would pay
+/// the `2·n_free` evaluations they asked not to. Reachability through
+/// `framework_keys` (which stops `unsupported_keys_warnings` flagging it) is a
+/// different property and does not imply the value is read.
+#[test]
+fn test_parse_report_final_gradient() {
+    // Reporting is on unless asked otherwise.
+    assert!(FitOptions::default().report_final_gradient);
+
+    let opts = parse_fit_options(&["report_final_gradient = false".to_string()]).unwrap();
+    assert!(
+        !opts.report_final_gradient,
+        "the DSL value must reach FitOptions, not just be tolerated"
+    );
+
+    // …and an explicit `true` round-trips rather than being ignored as a no-op.
+    let opts = parse_fit_options(&["report_final_gradient = true".to_string()]).unwrap();
+    assert!(opts.report_final_gradient);
+
+    // The shared `parse_bool` spellings, so this key is not quietly stricter than
+    // the other boolean fit options.
+    for on in ["true", "t", "yes", "1", "on"] {
+        let opts = parse_fit_options(&[format!("report_final_gradient = {on}")]).unwrap();
+        assert!(opts.report_final_gradient, "`{on}` should read as true");
+    }
+    for off in ["false", "f", "no", "0", "off"] {
+        let opts = parse_fit_options(&[format!("report_final_gradient = {off}")]).unwrap();
+        assert!(!opts.report_final_gradient, "`{off}` should read as false");
+    }
+
+    // A non-boolean is rejected outright. It must not fall through to the
+    // default: a typo that silently left reporting on is the same silent-cost
+    // failure as a dropped key.
+    let err = parse_fit_options(&["report_final_gradient = maybe".to_string()])
+        .expect_err("a non-boolean must be refused");
+    assert!(
+        err.contains("report_final_gradient") && err.contains("true/false"),
+        "the error must name the key and the expected values, got: {err}"
+    );
+}
+
 #[test]
 fn test_parse_nn_regularization_lambdas() {
     // Default: both off (0.0), a strict no-op for existing fits.
