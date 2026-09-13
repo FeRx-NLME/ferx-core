@@ -653,6 +653,7 @@ fn anchor_hessian(
 /// re-optimise it, it only lays the grid around it. `nodes`/`log_weights` are the 1-D
 /// Gauss–Hermite rule, hoisted by the caller so the eigenproblem is solved once per
 /// population rather than once per subject.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -662,6 +663,7 @@ pub(crate) fn agq_subject_nll(
     nodes: &[f64],
     log_weights: &[f64],
     anchor: HessianAnchor,
+    schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
     agq_subject_evaluate(
         model,
@@ -673,10 +675,17 @@ pub(crate) fn agq_subject_nll(
         log_weights,
         anchor,
         false,
+        schedule,
     )
     .0
 }
 
+/// Same as the body [`agq_subject_nll`] delegates to, but `schedule` is now a caller-supplied
+/// parameter instead of a fresh [`cacheable_schedule`] rebuild on every call — see
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]. It depends only on
+/// `model` + `subject`, so the two population-level callers ([`agq_population_nll`],
+/// [`agq_population_evaluate`]) build the cache once per outer-loop evaluation and hand each
+/// subject its entry, rather than every subject re-walking its own dose/event timeline.
 #[allow(clippy::too_many_arguments)]
 fn agq_subject_evaluate(
     model: &CompiledModel,
@@ -688,23 +697,16 @@ fn agq_subject_evaluate(
     log_weights: &[f64],
     anchor: HessianAnchor,
     retain_gradient_work: bool,
+    schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> (f64, Option<PreparedGrid>) {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    let schedule = cacheable_schedule(model, subject);
 
     // No random effects: the "integral" is a point mass and AGQ degenerates to the
     // conditional likelihood itself. (The formula below would agree — an empty tensor
     // product is the single empty node — but there is no Σ to factor, so short-circuit.)
     if d == 0 {
-        let nll = stack.nll_at(
-            model,
-            subject,
-            params,
-            b_hat,
-            &mut scratch,
-            schedule.as_ref(),
-        );
+        let nll = stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule);
         return (nll, None);
     }
 
@@ -717,7 +719,7 @@ fn agq_subject_evaluate(
             stack,
             b_hat,
             &mut scratch,
-            schedule.as_ref(),
+            schedule,
         )
     } else {
         anchor_hessian(
@@ -728,7 +730,7 @@ fn agq_subject_evaluate(
             stack,
             b_hat,
             &mut scratch,
-            schedule.as_ref(),
+            schedule,
         )
         .map(|h| (h, None))
     };
@@ -756,7 +758,7 @@ fn agq_subject_evaluate(
         log_weights,
         &proposal,
         &mut scratch,
-        schedule.as_ref(),
+        schedule,
         retain_gradient_work,
     );
 
@@ -903,6 +905,7 @@ pub(crate) fn agq_subject_objective(
         &nodes,
         &log_weights,
         HessianAnchor::GaussNewton,
+        None,
     )
 }
 
@@ -993,6 +996,50 @@ pub fn agq_population_nll(
     n_nodes: usize,
     anchor: HessianAnchor,
 ) -> f64 {
+    agq_population_nll_impl(
+        model, population, params, eta_hats, kappas, n_nodes, anchor, None,
+    )
+}
+
+/// Same objective as [`agq_population_nll`], but with a caller-hoisted
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`] so every subject's
+/// per-eval schedule rebuild is skipped in favor of the one built for the whole fit.
+/// Used only by the FOCEI/Laplace/AGQ outer hot loop (`outer_optimizer.rs`); every other
+/// caller goes through [`agq_population_nll`] and pays the per-call rebuild.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_population_nll_with_schedules(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+) -> f64 {
+    agq_population_nll_impl(
+        model,
+        population,
+        params,
+        eta_hats,
+        kappas,
+        n_nodes,
+        anchor,
+        Some(schedules),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agq_population_nll_impl(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+) -> f64 {
     let (nodes, weights) = cached_gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let per_subject: Vec<f64> = population
@@ -1003,6 +1050,7 @@ pub fn agq_population_nll(
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+            let schedule = schedules.and_then(|s| s[i].as_ref());
             agq_subject_nll(
                 model,
                 subject,
@@ -1012,6 +1060,7 @@ pub fn agq_population_nll(
                 nodes,
                 &log_weights,
                 anchor,
+                schedule,
             )
         })
         .collect();
@@ -1035,6 +1084,61 @@ pub(crate) fn agq_population_evaluate(
     n_nodes: usize,
     anchor: HessianAnchor,
 ) -> PopulationEvaluation {
+    agq_population_evaluate_impl(
+        model, population, params, template, x, eta_hats, kappas, bounds, options, n_nodes, anchor,
+        None,
+    )
+}
+
+/// Same evaluation as [`agq_population_evaluate`], but with a caller-hoisted
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`] — see
+/// [`agq_population_nll_with_schedules`]. Used only by the FOCEI/Laplace/AGQ outer hot loop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_population_evaluate_with_schedules(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    bounds: &crate::estimation::parameterization::PackedBounds,
+    options: &crate::types::FitOptions,
+    n_nodes: usize,
+    anchor: HessianAnchor,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+) -> PopulationEvaluation {
+    agq_population_evaluate_impl(
+        model,
+        population,
+        params,
+        template,
+        x,
+        eta_hats,
+        kappas,
+        bounds,
+        options,
+        n_nodes,
+        anchor,
+        Some(schedules),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agq_population_evaluate_impl(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    bounds: &crate::estimation::parameterization::PackedBounds,
+    options: &crate::types::FitOptions,
+    n_nodes: usize,
+    anchor: HessianAnchor,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
@@ -1047,6 +1151,7 @@ pub(crate) fn agq_population_evaluate(
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+            let schedule = schedules.and_then(|s| s[i].as_ref());
             let (nll, grid) = agq_subject_evaluate(
                 model,
                 subject,
@@ -1057,10 +1162,16 @@ pub(crate) fn agq_population_evaluate(
                 &log_weights,
                 anchor,
                 true,
+                schedule,
             );
             let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
-            let score =
-                context.score_with_prepared(subject, eta_hats[i].as_slice(), subj_kappas, prepared);
+            let score = context.score_with_prepared(
+                subject,
+                eta_hats[i].as_slice(),
+                subj_kappas,
+                prepared,
+                schedule,
+            );
             (nll, score)
         })
         .collect();
@@ -2464,7 +2575,7 @@ impl<'a> SubjectScoreContext<'a> {
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
     ) -> Option<Vec<f64>> {
-        self.score_with_prepared(subject, eta, kappas, None)
+        self.score_with_prepared(subject, eta, kappas, None, None)
     }
 
     fn score_with_prepared(
@@ -2473,6 +2584,7 @@ impl<'a> SubjectScoreContext<'a> {
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
         prepared: Option<PreparedSubject>,
+        schedule: Option<&pk::event_driven::EventSchedule>,
     ) -> Option<Vec<f64>> {
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
@@ -2480,7 +2592,7 @@ impl<'a> SubjectScoreContext<'a> {
         if !self.force_fd {
             let mut g = vec![0.0; self.x.len()];
             let analytic = if let Some(prepared) = prepared {
-                self.prepared_score(subject, prepared, &mut g)
+                self.prepared_score(subject, prepared, schedule, &mut g)
             } else {
                 let stack = Stack::new(self.model, &self.params, kappas.len());
                 let b = stack_mode(eta, kappas);
@@ -2515,12 +2627,12 @@ impl<'a> SubjectScoreContext<'a> {
         &self,
         subject: &Subject,
         prepared: PreparedSubject,
+        schedule: Option<&pk::event_driven::EventSchedule>,
         out: &mut [f64],
     ) -> Option<()> {
         match prepared {
             PreparedSubject::Grid { stack, b_hat, grid } => {
                 let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-                let schedule = cacheable_schedule(self.model, subject);
                 finish_agq_subject_gradient(
                     self.model,
                     subject,
@@ -2536,7 +2648,7 @@ impl<'a> SubjectScoreContext<'a> {
                     &grid.bs,
                     &grid.softmax,
                     &mut scratch,
-                    schedule.as_ref(),
+                    schedule,
                     grid.base_jet,
                     out,
                 )
@@ -2575,6 +2687,7 @@ impl<'a> SubjectScoreContext<'a> {
             &self.nodes,
             &self.log_weights,
             self.options.hessian_anchor(),
+            None,
         );
         (nll.is_finite() && nll < NLL_SENTINEL).then_some(nll)
     }
@@ -2633,6 +2746,7 @@ pub(crate) fn population_gradient_mixed(
                 subject,
                 eta_hats[i].as_slice(),
                 kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                None,
                 None,
             )
         })
@@ -2757,6 +2871,7 @@ mod tests {
             &nodes,
             &lw,
             HessianAnchor::GaussNewton,
+            None,
         );
         assert!(
             base.is_finite() && base < NLL_SENTINEL,
@@ -4083,6 +4198,7 @@ mod tests {
             &nodes,
             &log_weights,
             HessianAnchor::GaussNewton,
+            None,
         );
 
         let d = stack.d();
@@ -4147,5 +4263,129 @@ mod tests {
         // 21^50 overflows u64/usize many times over; must saturate, not wrap to something
         // small that would sneak past the MAX_AGQ_GRID check.
         assert_eq!(grid_size(21, 50), usize::MAX);
+    }
+
+    /// `agq_population_nll_with_schedules` / `agq_population_evaluate_with_schedules` must be
+    /// bit-identical to the uncached `agq_population_nll` / `agq_population_evaluate` they
+    /// wrap. Mixes a subject with an `EVID 3/4` reset (`cacheable_schedule` returns `Some`)
+    /// and one with neither a reset nor a time-varying covariate (`None`) in the same
+    /// population, since that mix is what would expose the cache's per-subject index ever
+    /// drifting out of alignment with `population.subjects`.
+    #[test]
+    fn cached_schedule_agq_population_matches_uncached() {
+        use crate::estimation::inner_optimizer::{build_schedule_cache, find_ebe};
+        use crate::estimation::parameterization::{compute_bounds, pack_params};
+        use crate::types::{DoseEvent, EstimationMethod, FitOptions, Population};
+
+        let model = parse_model_string(M3_MODEL).unwrap();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let params = crate::estimation::parameterization::unpack_params(&x, template);
+
+        let no_reset = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
+        assert!(!no_reset.has_resets());
+
+        let mut reset_subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
+        reset_subject
+            .doses
+            .push(DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0));
+        reset_subject.reset_times = vec![12.0];
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &reset_subject,
+            &params.theta,
+            &[0.12, -0.08, 0.2],
+        );
+        reset_subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        assert!(reset_subject.has_resets());
+
+        let population = Population {
+            subjects: vec![no_reset, reset_subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let schedules = build_schedule_cache(&model, &population);
+        assert!(schedules[0].is_none());
+        assert!(schedules[1].is_some());
+
+        let eta_hats: Vec<_> = population
+            .subjects
+            .iter()
+            .map(|s| find_ebe(&model, s, &params, 200, 1e-11, None, None, 0).eta)
+            .collect();
+        let kappas = vec![Vec::new(); population.subjects.len()];
+        let bounds = compute_bounds(template);
+
+        for (method, anchor) in [
+            (EstimationMethod::FoceI, HessianAnchor::GaussNewton),
+            (EstimationMethod::Laplace, HessianAnchor::Exact),
+        ] {
+            let options = FitOptions {
+                method,
+                n_agq: 3,
+                ..FitOptions::default()
+            };
+            let uncached_nll =
+                agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
+            let cached_nll = agq_population_nll_with_schedules(
+                &model,
+                &population,
+                &params,
+                &eta_hats,
+                &kappas,
+                3,
+                anchor,
+                &schedules,
+            );
+            assert_eq!(
+                uncached_nll.to_bits(),
+                cached_nll.to_bits(),
+                "{anchor:?}: cached population NLL diverged from the uncached rebuild"
+            );
+
+            let uncached_eval = agq_population_evaluate(
+                &model,
+                &population,
+                &params,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                3,
+                anchor,
+            );
+            let cached_eval = agq_population_evaluate_with_schedules(
+                &model,
+                &population,
+                &params,
+                template,
+                &x,
+                &eta_hats,
+                &kappas,
+                &bounds,
+                &options,
+                3,
+                anchor,
+                &schedules,
+            );
+            assert_eq!(uncached_eval.nll.to_bits(), cached_eval.nll.to_bits());
+            let (uncached_grad, cached_grad) = (
+                uncached_eval.gradient.expect("uncached gradient"),
+                cached_eval.gradient.expect("cached gradient"),
+            );
+            assert_eq!(uncached_grad.len(), cached_grad.len());
+            for (i, (u, c)) in uncached_grad.iter().zip(&cached_grad).enumerate() {
+                assert_eq!(
+                    u.to_bits(),
+                    c.to_bits(),
+                    "{anchor:?} gradient coordinate {i}: uncached={u:e}, cached={c:e}"
+                );
+            }
+        }
     }
 }
