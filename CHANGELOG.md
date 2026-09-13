@@ -47,11 +47,18 @@ section of the SDLC for the versioning policy).
   #619 landed on 0, 480 OFV units above NONMEM). The parser now records such a value as a
   *covariate mu-reference* and the EM estimators re-fit its thetas jointly to the
   population of individual values every iteration — exactly (Gauss–Newton) when the
-  covariates are constant within each subject and no group theta is read elsewhere in the
-  model, numerically (prior + data term) otherwise — the same thing NONMEM does for a MU
+  covariates are constant within each subject, no group theta is read elsewhere in the
+  model and no other individual parameter reads the group's eta, numerically (prior +
+  data term) otherwise — the same thing NONMEM does for a MU
   written as a function of several thetas. `mu_refs`, inner-loop centring and every FOCE/FOCEI/Laplace fit are
   unchanged. A group that shares a theta with another eta's anchor, has negligible IIV,
-  or sits in a mixture model is declined with a warning and stays on the numerical M-step.
+  is entirely `FIX`ed, or sits in a mixture model is declined with a warning and stays on
+  the numerical M-step — and the "individual parameter not mu-referenced" advisory now
+  fires for those declined groups, where it is true. A group whose typical value is not
+  finite for some subject at the current θ (an additive form can go ≤ 0 for a
+  low-covariate subject) stands down for that iteration, with a fit warning counting the
+  iterations; under IMP/IMPMAP its thetas are no longer left frozen at their initial
+  values when that happens.
   Anchored against NONMEM `METHOD=SAEM` with `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`
   and `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`.
 - **Mu-reference detection sees through local definitions** ([#918](https://github.com/FeRx-NLME/ferx-core/issues/918)).

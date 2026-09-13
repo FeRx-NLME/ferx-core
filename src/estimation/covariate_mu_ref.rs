@@ -24,10 +24,11 @@
 //! and the θ that minimises it is the M-step. Two engines, chosen per group:
 //!
 //! - **Exact** ([`CovariateMuGroup::solve_exact`]) when the data term really is
-//!   a constant in the group's thetas, which takes *both* of: every covariate
-//!   the typical value reads is constant within each subject, **and** no free
+//!   a constant in the group's thetas, which takes *all three* of: every
+//!   covariate the typical value reads is constant within each subject, no free
 //!   theta of the group is read anywhere else in the model
-//!   ([`CovariateMuRef::shared_thetas`]). Then `P_i = g⁻¹(φ_i)` does not depend
+//!   ([`CovariateMuRef::shared_thetas`]), **and** no other typical value reads
+//!   the group's eta (`CovariateMuRef::eta_shared`). Then `P_i = g⁻¹(φ_i)` does not depend
 //!   on θ at all and the M-step is a small nonlinear least-squares fit of
 //!   `g(A_i(θ))` to the `φ_i` — solved by Gauss–Newton with Levenberg–Marquardt
 //!   damping. For `g(A_i) = log θ + c_i` this reduces to the classical
@@ -36,7 +37,9 @@
 //!   varying within a subject leaves a θ-dependence through the within-subject
 //!   ratio `P_i(t) = g⁻¹(φ_i + g(A_i(t;θ)) − g(A_i(t₀;θ)))`; a theta shared with
 //!   another parameter (`CL = (TVCL + TH_X*WT)*exp(ETA_CL)` next to
-//!   `V = TVV + TH_X`) leaves one through that other parameter. Either way the
+//!   `V = TVV + TH_X`) leaves one through that other parameter; an eta shared
+//!   with another parameter (next to `V = TVV*exp(0.5*ETA_CL)`) leaves one
+//!   through the re-centring, which moves that parameter. Any of them and the
 //!   data term is kept and the sum above is minimised by a few BOBYQA iterations
 //!   over the group's thetas — still in the φ-frozen coordinates, which is what
 //!   removes the drift. Dropping a live data term would not be an M-step of
@@ -86,7 +89,10 @@ pub(crate) struct CovariateMuGroup<'m> {
     ///   `P_i(t)` keeps a θ-dependence through the within-subject ratio;
     /// - a free theta of the group is read **elsewhere in the model**
     ///   ([`CovariateMuRef::shared_thetas`]), so it reaches the likelihood by a
-    ///   route `φ_i` does not pin.
+    ///   route `φ_i` does not pin;
+    /// - the group's **eta** is read by a second typical value
+    ///   (`CovariateMuRef::eta_shared`), so the per-subject re-centring that
+    ///   holds this `φ_i` fixed moves that other parameter's prediction.
     pub needs_data_term: bool,
     spec: &'m CovariateMuRef,
 }
@@ -225,12 +231,24 @@ pub(crate) fn resolve_covariate_mu_groups<'m>(
                 shared_free.join(", ")
             ));
         }
+        // The eta-side twin of the same condition: the step re-centres `η_ik`,
+        // so a second typical value reading that eta has its prediction moved
+        // while `φ_i` stays put, and the data term is live in the group's
+        // thetas after all (#918 review).
+        if spec.eta_shared {
+            notes.push(format!(
+                "covariate mu-reference on {} (reads {}) keeps the observation term in its \
+                 M-step: {} is also read by another individual parameter, so re-centring it to \
+                 hold this typical value's φ fixed changes that parameter's prediction (#619).",
+                spec.eta_name, names, spec.eta_name
+            ));
+        }
         claimed.extend(theta_idx.iter().copied());
         groups.push(CovariateMuGroup {
             eta_idx,
             theta_idx,
             transform: spec.transform,
-            needs_data_term: time_varying || !shared_free.is_empty(),
+            needs_data_term: time_varying || !shared_free.is_empty() || spec.eta_shared,
             spec,
         });
     }
@@ -264,6 +282,26 @@ impl CovariateMuGroup<'_> {
             .copied()
             .filter(|&t| !theta_fixed.get(t).copied().unwrap_or(false))
             .collect()
+    }
+
+    /// Whether a group step started from `theta` can do anything at all — the
+    /// exact predicate under which [`Self::solve_exact`] and
+    /// [`Self::solve_numerical`] both return `None`: no free theta, or a
+    /// starting point at which some subject's mu is not finite (an additive
+    /// typical value gone ≤ 0 for a low-covariate subject, say).
+    ///
+    /// Callers that **pin** the group's thetas out of their general M-step must
+    /// ask this *before* pinning. IMP/IMPMAP set the pin bounds ahead of the
+    /// weighted M-step and only discover the `None` afterwards, at which point
+    /// the thetas are frozen for that iteration with no channel left to move
+    /// them — they then sit at their initial values through a convergent-looking
+    /// fit (#918 review).
+    pub fn can_step(&self, theta: &[f64], population: &Population, theta_fixed: &[bool]) -> bool {
+        !self.free_thetas(theta_fixed).is_empty()
+            && self
+                .mus(theta, population)
+                .iter()
+                .all(|m: &f64| m.is_finite())
     }
 
     /// `g(A_i(θ))` for one subject: `log A_i` under the lognormal link, `A_i`
@@ -495,11 +533,15 @@ impl CovariateMuGroup<'_> {
             .collect();
 
         let base_theta = input.theta.to_vec();
-        let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
+        let theta_at = |xv: &[f64]| -> Vec<f64> {
             let mut theta = base_theta.clone();
             for (j, &t) in free.iter().enumerate() {
                 theta[t] = unpack(t, xv[j]);
             }
+            theta
+        };
+        let eval = |xv: &[f64]| -> f64 {
+            let theta = theta_at(xv);
             let mu_new = self.mus(&theta, population);
             if mu_new.iter().any(|m| !m.is_finite()) {
                 return 1e20;
@@ -522,30 +564,55 @@ impl CovariateMuGroup<'_> {
                 1e20
             }
         };
-        let mut opt = nlopt::Nlopt::new(
-            nlopt::Algorithm::Bobyqa,
-            d,
-            obj,
-            nlopt::Target::Minimize,
-            (),
-        );
-        opt.set_lower_bounds(&lower).ok()?;
-        opt.set_upper_bounds(&upper).ok()?;
-        opt.set_maxeval(maxiter.max(1) * (d as u32 + 2)).ok()?;
-        opt.set_ftol_rel(1e-5).ok()?;
-        let mut x = x0
+        let start = x0
             .iter()
             .zip(lower.iter().zip(upper.iter()))
             .map(|(&v, (&lo, &hi))| v.clamp(lo, hi))
             .collect::<Vec<f64>>();
-        match opt.optimize(&mut x) {
-            Ok(_) | Err(_) => {}
+        // Best point actually evaluated, recorded as the optimiser goes. What
+        // the group step returns is *this*, not whatever `optimize` leaves in
+        // `x` — the status is deliberately ignored (a hit maxeval is the normal
+        // exit on this budget) and the point must not be trusted on the
+        // strength of an exit code either. `eval` reports the `1e20` sentinel
+        // for every θ that makes a mu or the NLL non-finite, so on a mostly
+        // inadmissible region the search runs over a flat plateau; the group's
+        // thetas are pinned out of the estimator's general M-step, so a point
+        // worse than θ_old would stand uncorrected for the rest of the fit
+        // (#918 review). Tracking the running best costs no extra objective
+        // evaluation — the alternative, re-evaluating the start and the result
+        // afterwards, costs two full data-term passes per group per iteration.
+        let best: std::cell::RefCell<Option<(Vec<f64>, f64)>> = std::cell::RefCell::new(None);
+        let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
+            let v = eval(xv);
+            let mut b = best.borrow_mut();
+            // `eval` maps every non-finite value to the sentinel, so `v` is
+            // finite here and the comparison is total.
+            if b.as_ref().is_none_or(|&(_, bv)| v < bv) {
+                *b = Some((xv.to_vec(), v));
+            }
+            v
+        };
+        let mut x = start.clone();
+        {
+            let mut opt = nlopt::Nlopt::new(
+                nlopt::Algorithm::Bobyqa,
+                d,
+                obj,
+                nlopt::Target::Minimize,
+                (),
+            );
+            opt.set_lower_bounds(&lower).ok()?;
+            opt.set_upper_bounds(&upper).ok()?;
+            opt.set_maxeval(maxiter.max(1) * (d as u32 + 2)).ok()?;
+            opt.set_ftol_rel(1e-5).ok()?;
+            let _ = opt.optimize(&mut x);
         }
-        let mut theta = base_theta;
-        for (j, &t) in free.iter().enumerate() {
-            theta[t] = unpack(t, x[j]);
-        }
-        Some(theta)
+        // BOBYQA's first evaluation is its starting point, so `best` is at
+        // least as good as `start` whenever the objective ran at all; `None`
+        // means it never ran, and there is then nothing better than where we
+        // started.
+        let chosen = best.into_inner().map(|(xb, _)| xb).unwrap_or(start);
+        Some(theta_at(&chosen))
     }
 }
 

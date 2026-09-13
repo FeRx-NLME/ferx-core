@@ -592,31 +592,24 @@ fn detect_mu_refs(
     // fallback existed keeps producing exactly the same `MuRef`.
     let mut assign_counts: HashMap<&str, usize> = HashMap::new();
     count_all_assignments(stmts, &mut assign_counts);
-    // Definitions are accumulated in statement order, so a line can only be
-    // rewritten with values that are already in scope where it sits — a forward
-    // reference reads a covariate (or zero) at eval time and must not be
-    // "resolved" into a definition that comes later.
+    // Definitions are accumulated in statement order *and resolved where they
+    // sit* ([`record_inline_def`]), so a line can only be rewritten with values
+    // that are already in scope — a forward reference reads a covariate (or
+    // zero) at eval time and must not be "resolved" into a definition that
+    // comes later, not even through a chain.
     let mut inline_defs: HashMap<String, Expression> = HashMap::new();
 
     for s in stmts {
         if let Statement::Assign(name, raw_expr) = s {
             let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
             if found.is_none() && !inline_defs.is_empty() {
-                let inlined = inline_local_vars(raw_expr, &inline_defs, 0);
+                let inlined = inline_local_vars(raw_expr, &inline_defs);
                 found = classify_mu_ref(&inlined, theta_names, eta_names, nn_specs);
             }
             if let Some((eta_idx, mu_ref)) = found {
                 result.insert(eta_names[eta_idx].clone(), mu_ref);
             }
-            // Eligible as a substitution for *later* lines: assigned exactly
-            // once in the whole block (so no `if` branch overrides it) and
-            // eta-free (an eta-bearing definition is an individual parameter,
-            // not a typical value).
-            if assign_counts.get(name.as_str()).copied().unwrap_or(0) == 1
-                && !expr_contains_eta(raw_expr)
-            {
-                inline_defs.insert(name.clone(), raw_expr.clone());
-            }
+            record_inline_def(&mut inline_defs, &assign_counts, name, raw_expr);
         }
     }
     result
@@ -877,11 +870,6 @@ fn classify_mu_ref(
     ))
 }
 
-/// Maximum substitution depth for [`inline_local_vars`]. Chains longer than
-/// this (or cyclic ones, which the parser rejects elsewhere but which must not
-/// hang detection here) stop expanding and simply fail to match a pattern.
-const MU_REF_INLINE_MAX_DEPTH: usize = 4;
-
 /// Count assignments per variable name across top-level statements *and* every
 /// `if` branch, so a name that is conditionally reassigned is never inlined.
 fn count_all_assignments<'a>(stmts: &'a [Statement], out: &mut HashMap<&'a str, usize>) {
@@ -917,9 +905,15 @@ fn expr_contains_eta(expr: &Expression) -> bool {
     }
 }
 
-/// Substitute `defs` into every named reference in `expr`, recursively, up to
-/// [`MU_REF_INLINE_MAX_DEPTH`] levels. Names with no definition (genuine
-/// covariates, forward references) are left untouched.
+/// Substitute `defs` into every named reference in `expr`. Names with no
+/// definition (genuine covariates, forward references) are left untouched.
+///
+/// The substitution is **one level deep, and deliberately so**: `defs` only
+/// ever holds definitions that [`record_inline_def`] already resolved against
+/// the scope *at their own statement*, so a stored body needs no further
+/// expansion, and expanding it anyway is the #918-review defect — it would
+/// resolve a name against a definition that comes *later* in the block. See
+/// [`record_inline_def`].
 ///
 /// Both `Variable` and `Covariate` nodes are substituted: `parse_atom` emits
 /// `Variable` for a name already assigned earlier in the block and `Covariate`
@@ -928,34 +922,64 @@ fn expr_contains_eta(expr: &Expression) -> bool {
 /// for the same name. `defs` only ever holds names assigned earlier in this
 /// block, and such an assignment shadows any same-named covariate at eval time,
 /// so treating the two node kinds alike is consistent either way.
-fn inline_local_vars(
-    expr: &Expression,
-    defs: &HashMap<String, Expression>,
-    depth: usize,
-) -> Expression {
+fn inline_local_vars(expr: &Expression, defs: &HashMap<String, Expression>) -> Expression {
     match expr {
-        Expression::Variable(name) | Expression::Covariate(name)
-            if depth < MU_REF_INLINE_MAX_DEPTH =>
-        {
-            match defs.get(name) {
-                Some(def) => inline_local_vars(def, defs, depth + 1),
-                None => expr.clone(),
-            }
-        }
+        Expression::Variable(name) | Expression::Covariate(name) => match defs.get(name) {
+            Some(def) => def.clone(),
+            None => expr.clone(),
+        },
         Expression::BinOp(l, op, r) => Expression::BinOp(
-            Box::new(inline_local_vars(l, defs, depth)),
+            Box::new(inline_local_vars(l, defs)),
             *op,
-            Box::new(inline_local_vars(r, defs, depth)),
+            Box::new(inline_local_vars(r, defs)),
         ),
         Expression::Power(b, e) => Expression::Power(
-            Box::new(inline_local_vars(b, defs, depth)),
-            Box::new(inline_local_vars(e, defs, depth)),
+            Box::new(inline_local_vars(b, defs)),
+            Box::new(inline_local_vars(e, defs)),
         ),
         Expression::UnaryFn(name, a) => {
-            Expression::UnaryFn(name.clone(), Box::new(inline_local_vars(a, defs, depth)))
+            Expression::UnaryFn(name.clone(), Box::new(inline_local_vars(a, defs)))
         }
         _ => expr.clone(),
     }
+}
+
+/// Record `name = raw_expr` as a substitution available to the lines *below*
+/// it, with the definitions already in scope resolved into it right here.
+///
+/// Eligible as a substitution at all when the name is assigned exactly once in
+/// the whole block (so no `if` branch overrides it) and its right-hand side is
+/// eta-free (an eta-bearing definition is an individual parameter, not a
+/// typical value).
+///
+/// **Resolving at the definition, not at the use, is the correctness
+/// condition.** Storing the raw body and expanding it recursively at each use
+/// site reads the map as it stands *there*, which can contain names defined
+/// after the definition was written:
+///
+/// ```text
+///   A   = FOO          # FOO is unknown here, so this reads the data covariate
+///   FOO = THETA_X
+///   CL  = A * exp(ETA_CL)
+/// ```
+///
+/// Use-site expansion walks `A → FOO → THETA_X` and records a mu-reference on
+/// `THETA_X`, a theta `CL` never reads — SAEM would then shift and pin it and
+/// re-centre `ETA_CL` by that delta. Resolving `A` when it is *recorded* freezes
+/// it as `Covariate("FOO")`, which is what the model actually evaluates (#918
+/// review). Chains that are genuinely in scope still collapse, in one step: `B =
+/// A` stores `A`'s already-resolved body.
+fn record_inline_def(
+    inline_defs: &mut HashMap<String, Expression>,
+    assign_counts: &HashMap<&str, usize>,
+    name: &str,
+    raw_expr: &Expression,
+) {
+    if assign_counts.get(name).copied().unwrap_or(0) != 1 || expr_contains_eta(raw_expr) {
+        return;
+    }
+    let resolved = inline_local_vars(raw_expr, inline_defs);
+    inline_defs.insert(name.to_string(), resolved);
 }
 
 // ── Multi-theta (covariate) mu-referencing (#619) ────────────────────────────
@@ -1002,7 +1026,7 @@ fn detect_covariate_mu_refs(
                 let expr = if inline_defs.is_empty() {
                     raw_expr
                 } else {
-                    inlined = inline_local_vars(raw_expr, &inline_defs, 0);
+                    inlined = inline_local_vars(raw_expr, &inline_defs);
                     &inlined
                 };
                 let classified = classify_covariate_mu_ref(expr, theta_names, eta_names, n_bsv_eta);
@@ -1013,11 +1037,7 @@ fn detect_covariate_mu_refs(
                 if let Some((eta_idx, entry)) = classified {
                     found.push((eta_idx, name.clone(), entry));
                 }
-                if assign_counts.get(name.as_str()).copied().unwrap_or(0) == 1
-                    && !expr_contains_eta(raw_expr)
-                {
-                    inline_defs.insert(name.clone(), raw_expr.clone());
-                }
+                record_inline_def(&mut inline_defs, &assign_counts, name, raw_expr);
             }
             // A branch body can overwrite a typical value recorded above it, and
             // nothing inside it may *record* one (the branch need not be taken),
@@ -1038,7 +1058,7 @@ fn detect_covariate_mu_refs(
     }
     found
         .into_iter()
-        .map(|(_, owner, mut entry)| {
+        .map(|(eta_idx, owner, mut entry)| {
             entry.shared_thetas = thetas_read_outside_the_group(
                 stmts,
                 theta_names,
@@ -1046,6 +1066,7 @@ fn detect_covariate_mu_refs(
                 &owner,
                 &entry.theta_names,
             );
+            entry.eta_shared = eta_read_outside_the_group(stmts, &owner, eta_idx);
             entry
         })
         .collect()
@@ -1160,6 +1181,61 @@ fn thetas_read_outside_the_group(
         .collect()
 }
 
+/// Whether an assignment **other than** the group's own typical value reads the
+/// group's eta — the eta-side twin of [`thetas_read_outside_the_group`], and
+/// the second precondition the exact M-step engine needs.
+///
+/// The exact engine drops the observation term on the argument that freezing
+/// `φ_i` freezes the individual parameter. That argument needs the eta to be
+/// exclusive to this typical value, not just the thetas: the step re-centres
+/// each subject by `η_ik −= Δ_i`, so in
+///
+/// ```text
+///   CL = (TVCL + TH_X*(CRCL-90)) * exp(ETA_CL)
+///   V  = TVV * exp(0.5*ETA_CL)
+/// ```
+///
+/// the re-centring moves `V`'s prediction while `φ_CL` stays put, and the data
+/// term is *not* constant in `TVCL`/`TH_X`. [`retire_superseded_group`] does not
+/// catch this: it is keyed on [`split_typical_and_eta`], which returns `None`
+/// for any shape it does not recognise, so the `V` line above retires nothing
+/// and the group survives (#918 review).
+///
+/// Occurrence, not reachability — unlike the theta side, which can stop the
+/// taint at the group's own parameter. An `ETA_CL` written into a second
+/// right-hand side is a second latent-variable use by construction; there is no
+/// `φ` freezing it. The group is not dropped, only routed to the prior-plus-data
+/// engine, which evaluates the data term *with* the shift applied and is
+/// therefore correct for any number of uses.
+fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) -> bool {
+    stmts.iter().any(|s| match s {
+        Statement::Assign(name, expr) => {
+            if name == owner {
+                return false;
+            }
+            let mut reads = false;
+            visit_expr_nodes(expr, &mut |n| {
+                if let Expression::Eta(i) = n {
+                    reads |= *i == eta_idx;
+                }
+            });
+            reads
+        }
+        Statement::If {
+            branches,
+            else_body,
+        } => {
+            branches
+                .iter()
+                .any(|(_, body)| eta_read_outside_the_group(body, owner, eta_idx))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|eb| eta_read_outside_the_group(eb, owner, eta_idx))
+        }
+        _ => false,
+    })
+}
+
 /// Names (uppercased) whose value depends on `theta_idx`, following assignments
 /// in statement order and stopping at `owner`. See
 /// [`thetas_read_outside_the_group`] for why the taint stops there.
@@ -1255,10 +1331,11 @@ fn classify_covariate_mu_ref(
             theta_names: theta_idx.iter().map(|&i| theta_names[i].clone()).collect(),
             transform,
             covariate_names,
-            // Filled by `detect_covariate_mu_refs` once the whole block (and the
-            // other blocks' identifiers) are in view; a single right-hand side
-            // cannot see what else reads its thetas.
+            // Both filled by `detect_covariate_mu_refs` once the whole block
+            // (and the other blocks' identifiers) are in view; a single
+            // right-hand side cannot see what else reads its thetas or its eta.
             shared_thetas: Vec::new(),
+            eta_shared: false,
             typical,
         },
     ))

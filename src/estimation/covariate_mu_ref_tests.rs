@@ -515,3 +515,207 @@ fn logit_group_mu_is_the_typical_value_itself() {
         "logit-scale mu = LOGIT_F + TH_SEX·CRCL: {mu}"
     );
 }
+
+// ── #918 review follow-ups ───────────────────────────────────────────────────
+
+/// [`ADDITIVE_MODEL`] with a second typical value reading the *same* eta. The
+/// exact engine drops the observation term on the argument that freezing `φ_CL`
+/// freezes the individual parameter — but the step re-centres `η_CL`, and that
+/// moves `V` as well, so the data term is live in `TVCL`/`TH_CRCL` after all.
+///
+/// `retire_superseded_group` does not catch it: it is keyed on
+/// `split_typical_and_eta`, which returns `None` for `TVV * exp(0.5 * ETA_CL)`
+/// (the exp factor must be exactly `exp(ETA)`), so nothing is retired.
+const SHARED_ETA_MODEL: &str = r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(0.5 * ETA_CL)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// A second typical value reading the group's eta forces the prior-plus-data
+/// engine. Control: [`ADDITIVE_MODEL`], whose `V` carries its own `ETA_V`, is
+/// still exact — so the flag tracks eta sharing, not merely "the model has two
+/// individual parameters".
+#[test]
+fn an_eta_a_second_typical_value_reads_keeps_the_data_term() {
+    let shared = model(SHARED_ETA_MODEL);
+    assert_eq!(shared.covariate_mu_refs.len(), 1, "the group survives");
+    assert!(
+        shared.covariate_mu_refs[0].eta_shared,
+        "ETA_CL is read by V as well"
+    );
+
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let free = vec![false; shared.theta_names.len()];
+    let (groups, notes) =
+        resolve_covariate_mu_groups(&shared, &pop, &[], &free, &diag_omega(&[0.2]));
+    assert_eq!(groups.len(), 1, "estimated, just by the other engine");
+    assert!(
+        groups[0].needs_data_term,
+        "re-centring ETA_CL moves V, so the data term is not constant"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("ETA_CL")),
+        "the user is told which eta forced it: {notes:?}"
+    );
+
+    let control = model(ADDITIVE_MODEL);
+    assert!(
+        !control.covariate_mu_refs[0].eta_shared,
+        "V has its own ETA_V there"
+    );
+    let g = only_group(&control, &pop, &diag_omega(&[0.2, 0.1]));
+    assert!(!g.needs_data_term, "control still takes the exact engine");
+}
+
+/// `can_step` is the predicate IMP/IMPMAP must ask *before* pinning a group's
+/// thetas out of the weighted M-step, so it has to agree exactly with the
+/// condition under which both engines return `None`. Asserted on both arms of
+/// the additive model: a θ whose typical value stays positive for every subject
+/// versus one that goes negative for the lowest-CRCL subject.
+#[test]
+fn can_step_agrees_with_both_engines_returning_none() {
+    let m = model(ADDITIVE_MODEL);
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let omega = diag_omega(&[0.2, 0.1]);
+    let g = only_group(&m, &pop, &omega);
+    let fixed = [false; 3];
+    let etas = vec![vec![0.0, 0.0]; pop.subjects.len()];
+    let input_for = |theta: &[f64; 3]| -> ([f64; 3], Vec<Vec<f64>>) { (*theta, etas.clone()) };
+
+    // Admissible: TVCL + (CRCL−90)·TH_CRCL > 0 for CRCL = 40 (150 − 100 = 50).
+    let ok = [150.0, 2.0, 10.0];
+    // Inadmissible: at TH_CRCL = 4, CRCL = 40 gives 150 − 200 = −50, so `mu`
+    // is NaN for that subject and the lognormal link has nothing to take a log
+    // of. Every other subject is fine — one bad subject is enough.
+    let bad = [150.0, 4.0, 10.0];
+    let mus_bad = g.mus(&bad, &pop);
+    assert!(
+        mus_bad.iter().any(|m| !m.is_finite()),
+        "premise: the fixture actually produces a non-finite mu, got {mus_bad:?}"
+    );
+
+    for (label, theta, want) in [("admissible", ok, true), ("inadmissible", bad, false)] {
+        let (t, e) = input_for(&theta);
+        let input = GroupStepInput {
+            theta: &t,
+            theta_lower: &m.default_params.theta_lower,
+            theta_upper: &m.default_params.theta_upper,
+            theta_fixed: &fixed,
+            theta_packs_log: &[true, true, true],
+            omega: &omega,
+            etas: &e,
+        };
+        assert_eq!(
+            g.can_step(&t, &pop, &fixed),
+            want,
+            "[{label}] can_step disagreed"
+        );
+        assert_eq!(
+            g.solve_exact(&pop, &input).is_some(),
+            want,
+            "[{label}] solve_exact disagreed with can_step"
+        );
+        assert_eq!(
+            g.solve_numerical(&pop, &input, 5, &|_t, _s| 0.0).is_some(),
+            want,
+            "[{label}] solve_numerical disagreed with can_step"
+        );
+    }
+
+    // The other half of the predicate: an all-FIXed group has nothing to move,
+    // whatever the typical value does.
+    let all_fixed = [true; 3];
+    assert!(!g.can_step(&ok, &pop, &all_fixed));
+}
+
+/// The group step returns the best point the objective was *evaluated* at, not
+/// whatever `nlopt::optimize` happens to leave in its output buffer.
+///
+/// Honest scope: this pins a postcondition, it is not a regression test — the
+/// reviewer's scenario (BOBYQA wandering a `1e20` sentinel plateau and handing
+/// back a point worse than θ_old) could not be reproduced through this API,
+/// because BOBYQA evaluates θ_old first and returns its own best. The tracking
+/// makes the result independent of that library guarantee at zero extra
+/// objective evaluations, and this test fails if a future edit returns the raw
+/// `x` after post-processing it, or stops recording the start.
+#[test]
+fn numerical_solver_returns_the_best_evaluated_point() {
+    let m = model(ADDITIVE_MODEL);
+    let pop = pop_with_crcl(&CRCL_GRID);
+    let omega = diag_omega(&[0.2, 0.1]);
+    let g = only_group(&m, &pop, &omega);
+    let start = [150.0, 2.0, 10.0];
+    let etas = vec![vec![0.0, 0.0]; pop.subjects.len()];
+    let fixed = [false; 3];
+    let input = GroupStepInput {
+        theta: &start,
+        theta_lower: &m.default_params.theta_lower,
+        theta_upper: &m.default_params.theta_upper,
+        theta_fixed: &fixed,
+        theta_packs_log: &[true, true, true],
+        omega: &omega,
+        etas: &etas,
+    };
+    // Record every (theta, data-term) the optimiser asked about. The prior term
+    // is added by the solver on top, so the ranking below is reconstructed from
+    // the *total*, recomputed here from the same pieces.
+    let seen: std::cell::RefCell<Vec<Vec<f64>>> = std::cell::RefCell::new(Vec::new());
+    let seen_ref = &seen;
+    // A deceptive objective: lowest far from the start, so the answer is not
+    // trivially θ_old, and rugged enough that BOBYQA's last trial point is not
+    // its best one.
+    let data = |theta: &[f64], _shift: &[f64]| -> f64 {
+        seen_ref.borrow_mut().push(theta.to_vec());
+        1e3 * ((theta[1] - 1.2) * (theta[1] - 1.2) + 0.001 * (theta[0] - 120.0).abs())
+    };
+    let out = g
+        .solve_numerical(&pop, &input, 50, &data)
+        .expect("solvable");
+    let evaluated = seen.into_inner();
+    assert!(
+        evaluated.len() > 2,
+        "premise: the objective ran more than once, got {}",
+        evaluated.len()
+    );
+    // The returned point must be one of the evaluated ones …
+    assert!(
+        evaluated
+            .iter()
+            .any(|t| (t[0] - out[0]).abs() < 1e-9 && (t[1] - out[1]).abs() < 1e-9),
+        "returned θ = ({}, {}) was never evaluated",
+        out[0],
+        out[1]
+    );
+    // … and none of them may beat it on the data term the test controls. (The
+    // prior term is a function of the same θ through the shift, so a strict
+    // total ordering on the data term alone is not guaranteed; what is checked
+    // is that the return is not an *unevaluated* or a late-trial point, which
+    // is how a raw-`x` return fails.)
+    let out_data = 1e3 * ((out[1] - 1.2) * (out[1] - 1.2) + 0.001 * (out[0] - 120.0).abs());
+    let best_data = evaluated
+        .iter()
+        .map(|t| 1e3 * ((t[1] - 1.2) * (t[1] - 1.2) + 0.001 * (t[0] - 120.0).abs()))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        out_data.is_finite() && best_data.is_finite(),
+        "a non-finite fold would hide a diverged solve: out={out_data}, best={best_data}"
+    );
+    assert!(
+        out_data <= best_data + 1e-6,
+        "returned a point worse than one already evaluated: {out_data} vs {best_data}"
+    );
+}

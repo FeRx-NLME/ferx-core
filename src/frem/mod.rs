@@ -978,9 +978,22 @@ pub fn prepare_frem(
     // know the estimator, `mu_referencing`, or the packing/IIV filters that decide
     // whether the class-aware shift actually runs, so the advisory stays
     // conservative and flags every ETA-less estimated parameter (#996 review).
+    // The covariate-group thetas, by contrast, *are* excluded — and here they
+    // come from the parsed `covariate_mu_refs` rather than a resolved group
+    // list, for the same reason: conversion time cannot run
+    // `resolve_covariate_mu_groups` (no population, no Ω for this fit). Each of
+    // them carries an ETA in the model text, so telling the user to add one
+    // would be wrong whichever engine ends up moving it.
+    let parsed_cov_group_thetas: Vec<usize> = base_model
+        .covariate_mu_refs
+        .iter()
+        .flat_map(|g| g.theta_names.iter())
+        .filter_map(|n| base_model.theta_names.iter().position(|t| t == n))
+        .collect();
     let no_eta = crate::estimation::impmap::non_fixed_thetas_without_eta(
         base_model,
         &base_model.default_params.theta_fixed,
+        &parsed_cov_group_thetas,
         &[],
     );
     if !no_eta.is_empty() {

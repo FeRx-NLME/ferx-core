@@ -3413,6 +3413,16 @@ pub struct CovariateMuRef {
     /// estimated by the group — it just forces the prior-plus-data engine, which
     /// keeps the term it is live in.
     pub shared_thetas: Vec<String>,
+    /// Whether a right-hand side other than this group's own typical value also
+    /// reads [`Self::eta_name`].
+    ///
+    /// The eta-side twin of [`Self::shared_thetas`], and the second reason the
+    /// exact engine can be inadmissible: the group step re-centres `η_ik` to
+    /// hold `φ_i` fixed, which only leaves the data alone when this typical
+    /// value is the eta's *only* consumer. Like a shared theta it does not drop
+    /// the group — it forces the prior-plus-data engine, which evaluates the
+    /// observation term with the shift applied.
+    pub(crate) eta_shared: bool,
     /// The eta-free typical value `A(θ, covariates)`, with every local
     /// `[individual_parameters]` definition it referenced already inlined.
     pub(crate) typical: crate::parser::model_parser::Expression,

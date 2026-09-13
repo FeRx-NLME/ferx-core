@@ -6037,7 +6037,7 @@ fn test_logit_mu_ref_full_model_parse_and_no_warning() {
         .expect("ETA_F should be mu-referenced");
     assert_eq!(f_ref.theta_name, "LOGIT_F");
     assert_eq!(f_ref.transform, MuTransform::Logit);
-    let warning = crate::api::saem_non_mu_referenced_individual_params_warning(&parsed.model, true);
+    let warning = crate::api::saem_non_mu_referenced_individual_params_warning(&parsed.model, &[]);
     assert!(
         warning.is_none(),
         "no parameter should be flagged as non-mu-referenced, got {warning:?}"
@@ -23659,4 +23659,100 @@ fn a_relative_from_fit_resolves_against_the_model_file() {
     std::fs::write(&model_path, &abs_src).unwrap();
     assert_eq!(parse_model_file(&model_path).unwrap().priors.len(), 4);
     assert_eq!(parse_full_model(&abs_src).unwrap().model.priors.len(), 4);
+}
+
+/// Mu-ref inlining resolves a local definition where it is *written*, not
+/// where it is used, so a name that was a data covariate at its definition
+/// stays one (#918 review).
+///
+/// `A = FOO` reads the covariate `FOO` — at that line `FOO` is not a local.
+/// Expanding `A` lazily at the `CL` line walks `A → FOO → THX` and records a
+/// mu-reference on a theta `CL` never reads; SAEM would then shift and pin
+/// `THX` and re-centre `ETA_CL` by that delta.
+///
+/// The control is the same three statements with the definitions in scope
+/// order, which *must* still produce the anchor — the pair straddles the
+/// predicate, so a fix that simply stopped inlining chains would fail it.
+///
+/// **Reachability, measured, not assumed:** the same three lines in a model
+/// *file* never reach the detector — #710's guard rejects them first with
+/// "forward reference(s) to name(s) declared later in the block: `FOO` (used
+/// in `A`)". So this is defence in depth, and the value of the fix is that
+/// `inline_local_vars`' own invariant now holds locally instead of resting on
+/// a guard three phases away. Detection is tested at the statement level
+/// precisely because that is where the property lives.
+#[test]
+fn mu_ref_inlining_does_not_resolve_a_forward_reference() {
+    let forward = "A = FOO\nFOO = THX\nCL = A * exp(ETA_CL)";
+    let got = detect_plain(forward, &["THX"], &["ETA_CL"]);
+    assert!(
+        got.get("ETA_CL").is_none(),
+        "CL evaluates to the covariate FOO, so nothing anchors ETA_CL; got {:?}",
+        got.get("ETA_CL").map(|m| m.theta_name.clone())
+    );
+
+    let in_scope = "FOO = THX\nA = FOO\nCL = A * exp(ETA_CL)";
+    let got = detect_plain(in_scope, &["THX"], &["ETA_CL"]);
+    assert_eq!(
+        got.get("ETA_CL").map(|m| m.theta_name.as_str()),
+        Some("THX"),
+        "a chain that is genuinely in scope still collapses"
+    );
+}
+
+/// The covariate-group twin of
+/// [`mu_ref_inlining_does_not_resolve_a_forward_reference`]: the same lazy
+/// expansion would invent a two-theta group out of a typical value that reads
+/// one theta and a covariate.
+#[test]
+fn covariate_mu_ref_inlining_does_not_resolve_a_forward_reference() {
+    let forward = "A = FOO\nFOO = TH_CRCL\nCL = (TVCL + A * (CRCL - 90.0)) * exp(ETA_CL)";
+    let g = detect_groups(forward, &["TVCL", "TH_CRCL"], &["ETA_CL"]);
+    assert!(
+        g.is_empty(),
+        "the typical value reads TVCL and the covariates FOO/CRCL — one theta, no group; got {:?}",
+        g.iter().map(|e| e.theta_names.clone()).collect::<Vec<_>>()
+    );
+
+    let in_scope = "FOO = TH_CRCL\nA = FOO\nCL = (TVCL + A * (CRCL - 90.0)) * exp(ETA_CL)";
+    let g = detect_groups(in_scope, &["TVCL", "TH_CRCL"], &["ETA_CL"]);
+    assert_eq!(g.len(), 1, "in-scope chain still forms the group");
+    assert_eq!(g[0].theta_names, vec!["TVCL", "TH_CRCL"]);
+}
+
+/// `eta_shared` is occurrence-based and must not fire on the group's own
+/// typical value, nor on a parameter derived from it that carries no eta of
+/// its own — only on a second right-hand side that writes the eta.
+#[test]
+fn covariate_mu_ref_flags_an_eta_a_second_typical_value_reads() {
+    let tn = ["TVCL", "TH_CRCL", "TVV"];
+    let en = ["ETA_CL", "ETA_V"];
+
+    // Exclusive: V carries its own eta, and Q is derived from CL.
+    let g = detect_groups(
+        "CL = (TVCL + TH_CRCL * CRCL) * exp(ETA_CL)\nV = TVV * exp(ETA_V)\nQ = CL / 2.0",
+        &tn,
+        &en,
+    );
+    assert_eq!(g.len(), 1);
+    assert!(!g[0].eta_shared, "ETA_CL is written by CL alone");
+
+    // Shared: V reads ETA_CL through a shape `split_typical_and_eta` does not
+    // recognise, so `retire_superseded_group` leaves the group standing.
+    let g = detect_groups(
+        "CL = (TVCL + TH_CRCL * CRCL) * exp(ETA_CL)\nV = TVV * exp(0.5 * ETA_CL)",
+        &tn,
+        &en,
+    );
+    assert_eq!(g.len(), 1, "premise: the group is not retired");
+    assert!(g[0].eta_shared, "V reads ETA_CL too");
+
+    // Shared from inside a branch, which is still a second consumer.
+    let g = detect_groups(
+        "CL = (TVCL + TH_CRCL * CRCL) * exp(ETA_CL)\nif (CRCL > 90.0) {\n  V = TVV + ETA_CL\n}",
+        &tn,
+        &en,
+    );
+    assert_eq!(g.len(), 1);
+    assert!(g[0].eta_shared, "a conditional second consumer counts");
 }

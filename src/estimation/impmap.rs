@@ -184,6 +184,7 @@ fn covariance_to_proposal_hessian(
 /// review). Pass `&[]` where no class-aware shift runs.
 pub(crate) fn theta_is_mu_ref_anchor_mask(
     model: &CompiledModel,
+    cov_group_thetas: &[usize],
     class_mu_ref_thetas: &[usize],
 ) -> Vec<bool> {
     use std::collections::HashSet;
@@ -192,13 +193,18 @@ pub(crate) fn theta_is_mu_ref_anchor_mask(
         .values()
         .map(|m| m.theta_name.as_str())
         .collect();
-    // Every theta of a covariate mu-reference (#619) is an anchor: the group
-    // step moves it through its eta's population of individual values.
+    // Every theta of a covariate mu-reference group (#619) is an anchor: the
+    // group step moves it through its eta's population of individual values.
+    // Like `class_mu_ref_thetas`, these are the thetas of the groups the run
+    // *resolved*, not the ones the parser detected —
+    // `resolve_covariate_mu_groups` drops a group for weak IIV, a conflicting
+    // single-anchor pair or an all-FIXed theta list, and for a dropped group
+    // the theta really is estimated by the weighted M-step alone, which is the
+    // situation these consumers exist for (#918 review).
     with_eta.extend(
-        model
-            .covariate_mu_refs
+        cov_group_thetas
             .iter()
-            .flat_map(|g| g.theta_names.iter().map(String::as_str)),
+            .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
     );
     with_eta.extend(
         class_mu_ref_thetas
@@ -224,13 +230,14 @@ pub(crate) fn theta_is_mu_ref_anchor_mask(
 /// See [`theta_is_mu_ref_anchor_mask`] for the exact predicate this uses as the
 /// stand-in for "carries an ETA" — it is mu-reference detection, so an η in a
 /// form the detector does not recognise is reported here too — and for what
-/// `class_mu_ref_thetas` must contain.
+/// `cov_group_thetas` and `class_mu_ref_thetas` must contain.
 pub(crate) fn non_fixed_thetas_without_eta(
     model: &CompiledModel,
     theta_fixed: &[bool],
+    cov_group_thetas: &[usize],
     class_mu_ref_thetas: &[usize],
 ) -> Vec<String> {
-    let anchored = theta_is_mu_ref_anchor_mask(model, class_mu_ref_thetas);
+    let anchored = theta_is_mu_ref_anchor_mask(model, cov_group_thetas, class_mu_ref_thetas);
     model
         .theta_names
         .iter()
@@ -671,24 +678,6 @@ fn run_mcem(
     // EM methods likewise require mu-referencing.
     let mut warnings: Vec<String> = Vec::new();
 
-    // STRONG warning: any estimated (non-fixed) θ without an associated ETA is
-    // handled only by the weighted M-step, which is biased for such parameters
-    // under importance sampling. ferx mu-references automatically, so the user
-    // only needs to attach a random effect.
-    let thetas_without_eta = non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &[]);
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
-             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
-             fixed-effect-only parameter is estimated solely through the importance-weighted \
-             M-step, which is biased for weakly-identified parameters and may converge to the \
-             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
-             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
-             parameter FIX, or use FOCEI.",
-            thetas_without_eta.join(", ")
-        ));
-    }
-
     // Same eligibility rule as SAEM: a pair qualifies when the packed theta *is*
     // the mu (log-packed lognormal, identity-packed logit — see
     // `classify_mu_ref_pairs`), which is exactly what the `log_theta[t] +=
@@ -722,6 +711,31 @@ fn run_mcem(
         .iter()
         .flat_map(|g| g.theta_idx.iter().copied())
         .collect();
+
+    // STRONG warning: any estimated (non-fixed) θ without an associated ETA is
+    // handled only by the weighted M-step, which is biased for such parameters
+    // under importance sampling. ferx mu-references automatically, so the user
+    // only needs to attach a random effect.
+    //
+    // Assembled *after* the groups resolve, and from the resolved list: a
+    // theta whose #619 group was dropped (weak IIV, a conflicting anchor, an
+    // all-FIXed list) has no group moving it, so it belongs in this warning
+    // (#918 review).
+    let thetas_without_eta =
+        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &cov_group_thetas, &[]);
+    if !thetas_without_eta.is_empty() {
+        warnings.push(format!(
+            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
+             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
+             fixed-effect-only parameter is estimated solely through the importance-weighted \
+             M-step, which is biased for weakly-identified parameters and may converge to the \
+             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
+             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
+             parameter FIX, or use FOCEI.",
+            thetas_without_eta.join(", ")
+        ));
+    }
+
     let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
         .into_iter()
         .filter(|(_t, e)| !cov_group_etas.contains(e))
@@ -870,6 +884,11 @@ fn run_mcem(
     // for the post-fit under-sampling warning.
     let mut final_k_samples = k_samples;
     let mut final_mc_se = 0.0_f64;
+    // Iterations on which each #619 group had no admissible step, so neither it
+    // nor the weighted M-step moved that group's thetas. Reported once after the
+    // loop — silence here reads as a converged estimate of a theta that never
+    // left its initial value (#918 review).
+    let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
@@ -1201,8 +1220,29 @@ fn run_mcem(
                 mstep_theta_upper[t] = log_theta[t];
             }
         }
-        // Covariate mu-reference thetas take the group step below (#619).
-        for group in &cov_mu_groups {
+        // Covariate mu-reference thetas take the group step below (#619) — but
+        // only pin the ones whose group step can actually run from here. A
+        // group whose starting point makes some subject's mu non-finite returns
+        // `None` from both engines, and the pin is set *before* the weighted
+        // M-step, so pinning it anyway freezes those thetas for the whole
+        // iteration with nothing left to move them (#918 review).
+        let theta_now_premstep: Vec<f64> = (0..n_theta)
+            .map(|i| {
+                if theta_packs_log_mask[i] {
+                    log_theta[i].exp()
+                } else {
+                    log_theta[i]
+                }
+            })
+            .collect();
+        let group_can_step: Vec<bool> = cov_mu_groups
+            .iter()
+            .map(|g| g.can_step(&theta_now_premstep, population, &init_params.theta_fixed))
+            .collect();
+        for (group, &can) in cov_mu_groups.iter().zip(group_can_step.iter()) {
+            if !can {
+                continue;
+            }
             for &t in &group.theta_idx {
                 if !init_params.theta_fixed.get(t).copied().unwrap_or(false) {
                     mstep_theta_lower[t] = log_theta[t];
@@ -1279,7 +1319,14 @@ fn run_mcem(
             };
             let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean.clone()).collect();
             let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
-            for group in &cov_mu_groups {
+            for (gi, group) in cov_mu_groups.iter().enumerate() {
+                // Not pinned above, so the weighted M-step already owned these
+                // thetas this iteration; running the group step on top would be
+                // a second M-step from a point it declared inadmissible.
+                if !group_can_step[gi] {
+                    cov_group_skipped[gi] += 1;
+                    continue;
+                }
                 let theta_now = unpack_all(&log_theta);
                 let input = GroupStepInput {
                     theta: &theta_now,
@@ -1327,7 +1374,12 @@ fn run_mcem(
                 } else {
                     group.solve_exact(population, &input)
                 };
+                // `can_step` cleared this group before the pin, so a `None`
+                // here means the solve became inadmissible partway — the
+                // thetas are pinned and nothing else will move them this
+                // iteration, which is worth the same report as a skipped step.
                 let Some(theta_star) = solved else {
+                    cov_group_skipped[gi] += 1;
                     continue;
                 };
                 for &t in &group.theta_idx {
@@ -1483,6 +1535,38 @@ fn run_mcem(
             final_ess_median,
             advice,
             collapse
+        ));
+    }
+
+    // A #619 group that could not step on some iterations left its thetas to
+    // the weighted M-step on exactly those iterations, and to neither channel
+    // when the step failed after the pin. Either way the estimate is not the
+    // one the group was meant to produce, so say so rather than return a
+    // plausible-looking number (#918 review).
+    for (gi, &skipped) in cov_group_skipped.iter().enumerate() {
+        if skipped == 0 {
+            continue;
+        }
+        let group = &cov_mu_groups[gi];
+        let names: Vec<&str> = group
+            .theta_idx
+            .iter()
+            .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
+            .collect();
+        warnings.push(format!(
+            "{label}: the covariate mu-reference on {} had no admissible step on {} of {} \
+             iteration(s) — its typical value was not finite for at least one subject at the \
+             current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
+             were then moved by the importance-weighted M-step alone, or not at all; check them \
+             against a FOCEI fit and consider bounding the covariate slope (#619).",
+            model
+                .eta_names
+                .get(group.eta_idx)
+                .map(String::as_str)
+                .unwrap_or("?"),
+            skipped,
+            n_iter,
+            names.join(", ")
         ));
     }
 
@@ -2013,7 +2097,10 @@ fn run_mcem_mixture(
         .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
         .collect();
     let (shift_disabled, thetas_without_eta): (Vec<String>, Vec<String>) =
-        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &mu_ref_pinned)
+        // `&[]` for the covariate groups: `run_mcem_mixture` builds none — the
+        // class draw would have to enter the group's prior term — so no theta
+        // is anchored by one here.
+        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &[], &mu_ref_pinned)
             .into_iter()
             .filter(|n| !mixing_names.contains(n.as_str()))
             .partition(|n| anchor_names.contains(n.as_str()));
@@ -3372,6 +3459,89 @@ mod tests {
         );
     }
 
+    /// [`COVMUREF_ONLY_MODEL`] started where the additive typical value is
+    /// negative for the lowest-CRCL subject: `TVCL + (40 − 90)·TH_CRCL =
+    /// 4 − 50·0.2 = −6`, so the lognormal `mu` is `NaN` for that subject and
+    /// both group engines decline.
+    const COVMUREF_INADMISSIBLE_START: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.2, 0.0, 5.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// A group that cannot step must not have its thetas pinned out of the
+    /// weighted M-step (#918 review).
+    ///
+    /// IMP sets the pin bounds *before* the M-step and only learns the solve
+    /// returned `None` afterwards, so pinning unconditionally left `TVCL` and
+    /// `TH_CRCL` frozen at their initial values for the whole fit — with no
+    /// warning, under a converged-looking result. The regression this catches
+    /// is exactly that: both thetas still bit-equal to their starts.
+    #[test]
+    fn imp_does_not_freeze_a_group_that_cannot_step() {
+        let model = crate::parser::model_parser::parse_model_string(COVMUREF_INADMISSIBLE_START)
+            .expect("parses");
+        let pop = covmuref_pop(false);
+        // Premise: the start really is inadmissible, so the fixture reaches the
+        // branch under test rather than passing on a healthy group.
+        let omega = model.default_params.omega.matrix.clone();
+        let (groups, _) = crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
+            &model,
+            &pop,
+            &[],
+            &model.default_params.theta_fixed,
+            &omega,
+        );
+        assert_eq!(groups.len(), 1, "premise: a group is resolved");
+        assert!(
+            !groups[0].can_step(
+                &model.default_params.theta,
+                &pop,
+                &model.default_params.theta_fixed
+            ),
+            "premise: the group cannot step from this start"
+        );
+
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Imp;
+        opts.imp_iterations = 4;
+        opts.imp_samples = 60;
+        opts.imp_auto = false;
+        opts.imp_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
+
+        let tvcl0 = model.default_params.theta[0];
+        let th0 = model.default_params.theta[1];
+        assert!(
+            (res.theta[0] - tvcl0).abs() > 1e-9 || (res.theta[1] - th0).abs() > 1e-9,
+            "both group thetas frozen at their starts ({tvcl0}, {th0}) — the pin was set for a \
+             group that could not step: got ({}, {})",
+            res.theta[0],
+            res.theta[1]
+        );
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("had no admissible step")),
+            "the skipped step must be reported, got {:?}",
+            res.warnings
+        );
+    }
+
     #[test]
     fn impmap_mixture_flags_class_anchors_when_the_shift_is_disabled() {
         // With `mu_referencing = false` the class thetas are estimated by the
@@ -3526,7 +3696,7 @@ mod tests {
 ";
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
-        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[]);
+        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[], &[]);
         assert!(
             flagged.contains(&"FRAC".to_string()),
             "FRAC flagged: {flagged:?}"
@@ -3558,7 +3728,66 @@ mod tests {
 ";
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
-        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[]);
+        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[], &[]);
+        assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
+    }
+
+    /// The #619 anchor set comes from the caller's **resolved** group list, not
+    /// from `model.covariate_mu_refs` (#918 review). A group the resolver drops
+    /// — weak IIV, a conflicting single-anchor pair, an all-FIXed theta list —
+    /// moves nothing, so its thetas really are M-step-only and must stay in the
+    /// advisory. Both arms are asserted on one model, so the difference is the
+    /// argument and nothing else.
+    #[test]
+    fn mu_ref_anchor_mask_reads_the_resolved_groups_not_the_parsed_ones() {
+        let src = r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        assert_eq!(
+            model.covariate_mu_refs.len(),
+            1,
+            "premise: the parser found a group, so reading it off the model would differ"
+        );
+        let names = &model.theta_names;
+        let tvcl = names.iter().position(|n| n == "TVCL").unwrap();
+        let th = names.iter().position(|n| n == "TH_CRCL").unwrap();
+
+        // No group resolved: neither group theta is an anchor.
+        let dropped = theta_is_mu_ref_anchor_mask(&model, &[], &[]);
+        assert!(!dropped[tvcl] && !dropped[th], "got {dropped:?}");
+        let flagged =
+            non_fixed_thetas_without_eta(&model, &model.default_params.theta_fixed, &[], &[]);
+        assert!(
+            flagged.contains(&"TVCL".to_string()) && flagged.contains(&"TH_CRCL".to_string()),
+            "a dropped group leaves its thetas M-step-only: {flagged:?}"
+        );
+
+        // Group resolved: both are anchors and neither is flagged.
+        let live = theta_is_mu_ref_anchor_mask(&model, &[tvcl, th], &[]);
+        assert!(live[tvcl] && live[th], "got {live:?}");
+        let flagged = non_fixed_thetas_without_eta(
+            &model,
+            &model.default_params.theta_fixed,
+            &[tvcl, th],
+            &[],
+        );
         assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
     }
 

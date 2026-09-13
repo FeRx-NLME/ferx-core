@@ -1522,6 +1522,11 @@ pub(crate) fn packed_scale_is_mu(transform: MuTransform, packs_log: bool) -> boo
 /// and *both* its pairs are dropped, leaving the theta to the numerical M-step,
 /// which is correct for any number of anchored etas.
 ///
+/// Sharing is counted over **every declared anchor**, not over the eligible
+/// ones: an ineligible anchor (`V = TVP + ETA_V`) still leaves its eta
+/// un-recentred when the shift pins the theta on behalf of an eligible one
+/// (#918 review).
+///
 /// This is deliberately stricter than [`get_mixture_mu_ref_pairs`], whose
 /// class-aware rule keeps the first eta to claim a theta (#996). Both avoid the
 /// double shift; only this one also avoids the pinned partial shift.
@@ -1533,6 +1538,15 @@ pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) 
         shared_theta: Vec::new(),
         shared_pairs: Vec::new(),
     };
+    // Every anchor the model declares, *before* the eligibility split — the
+    // shared-theta rule below has to see the ineligible ones too. A theta
+    // anchoring one eligible and one ineligible eta is exactly the pinned
+    // partial shift this function exists to prevent: `CL = TVP*exp(ETA_CL)`
+    // (log-packed Log, eligible) next to `V = TVP + ETA_V` (Identity, never
+    // eligible) would shift and pin `TVP` by `mean(η_CL)` while `ETA_V` is
+    // never re-centred for that delta. Scanning `eligible` alone misses it
+    // (#918 review).
+    let mut declared: Vec<(usize, usize, bool)> = Vec::new();
     for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
         let Some(mu_ref) = model.mu_refs.get(eta_name) else {
             continue;
@@ -1548,9 +1562,8 @@ pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) 
             continue;
         };
         let packs_log = crate::estimation::parameterization::theta_packs_log(lower);
-        if packed_scale_is_mu(mu_ref.transform, packs_log) {
-            out.eligible.push((theta_idx, eta_idx));
-        } else {
+        let eligible = packed_scale_is_mu(mu_ref.transform, packs_log);
+        if !eligible {
             // Not eligible: name the ones a bound change could rescue.
             match mu_ref.transform {
                 MuTransform::Log => out.identity_packed_log.push(theta_idx),
@@ -1558,29 +1571,39 @@ pub(crate) fn classify_mu_ref_pairs(model: &CompiledModel, theta_lower: &[f64]) 
                 MuTransform::Identity | MuTransform::LogitProbability => {}
             }
         }
+        declared.push((theta_idx, eta_idx, eligible));
     }
     // Drop every pair on a theta claimed by more than one eta (see the doc
     // comment): both pairs go, the theta goes to the numerical M-step.
     let mut shared: Vec<usize> = Vec::new();
-    for (i, &(t, _)) in out.eligible.iter().enumerate() {
-        if out
-            .eligible
+    for (i, &(t, _, _)) in declared.iter().enumerate() {
+        if declared
             .iter()
             .enumerate()
-            .any(|(j, &(t2, _))| j != i && t2 == t)
+            .any(|(j, &(t2, _, _))| j != i && t2 == t)
         {
             shared.push(t);
         }
     }
-    if !shared.is_empty() {
-        let (kept, dropped): (Vec<_>, Vec<_>) = out
-            .eligible
-            .drain(..)
-            .partition(|&(t, _)| !shared.contains(&t));
-        out.eligible = kept;
-        out.shared_pairs = dropped;
-        out.shared_theta = shared;
+    for &(t, e, eligible) in &declared {
+        if !eligible {
+            continue;
+        }
+        if shared.contains(&t) {
+            out.shared_pairs.push((t, e));
+        } else {
+            out.eligible.push((t, e));
+        }
     }
+    // Only name a theta whose *eligible* pair the rule actually dropped. Two
+    // ineligible anchors on one theta share nothing the closed form would have
+    // moved, and reporting them would read as a second, unrelated reason the
+    // packing advisory above has already covered.
+    out.shared_theta = shared
+        .iter()
+        .copied()
+        .filter(|t| out.shared_pairs.iter().any(|&(t2, _)| t2 == *t))
+        .collect();
     for v in [
         &mut out.identity_packed_log,
         &mut out.log_packed_logit,
@@ -2603,6 +2626,8 @@ pub fn run_saem(
     let thetas_without_eta: Vec<String> = crate::estimation::impmap::non_fixed_thetas_without_eta(
         model,
         &init_params.theta_fixed,
+        // Resolved groups, not parsed ones: a dropped group anchors nothing.
+        &cov_group_thetas,
         &class_mu_ref_thetas,
     )
     .into_iter()
@@ -2656,8 +2681,14 @@ pub fn run_saem(
                 .chain(cov_group_thetas.iter().copied())
                 .collect()
         };
-        let theta_is_mu_ref_anchor =
-            crate::estimation::impmap::theta_is_mu_ref_anchor_mask(model, &class_mu_ref_thetas);
+        // `cov_group_thetas` is the *resolved* group list, so a group the
+        // resolver dropped (weak IIV, a conflicting anchor, all-FIXed) leaves
+        // its thetas counted as numerically estimated — which they are.
+        let theta_is_mu_ref_anchor = crate::estimation::impmap::theta_is_mu_ref_anchor_mask(
+            model,
+            &cov_group_thetas,
+            &class_mu_ref_thetas,
+        );
         damps_numerical_mstep(
             saem_mix.is_some(),
             n_theta,
@@ -2727,6 +2758,14 @@ pub fn run_saem(
     // step resets every `adapt_interval`.
     let mut cum_mh_acc: u64 = 0;
     let mut cum_mh_prop: u64 = 0;
+
+    // Iterations on which each #619 group's solve returned `None` — its
+    // typical value was not finite for some subject at the current θ. SAEM
+    // leaves those thetas to the numerical M-step (it pins only after a
+    // successful solve), so this is not the IMP freeze; it is still worth
+    // reporting, because the estimate then did not come from the group the
+    // user configured (#918 review).
+    let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
     // Main loop
     for k in 1..=n_iter {
@@ -3458,7 +3497,7 @@ pub fn run_saem(
                         }
                     };
                     let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
-                    for group in &cov_mu_groups {
+                    for (gi, group) in cov_mu_groups.iter().enumerate() {
                         let theta_now = unpack_all(&log_theta);
                         let mu_old = group.mus(&theta_now, population);
                         let solved = {
@@ -3500,7 +3539,12 @@ pub fn run_saem(
                                 group.solve_exact(population, &input)
                             }
                         };
+                        // Pinning happens below, inside this `Some` arm, so a
+                        // skipped group leaves its thetas free for
+                        // `theta_sigma_mstep_light` — no freeze, but the run is
+                        // no longer the one the group describes.
                         let Some(theta_star) = solved else {
+                            cov_group_skipped[gi] += 1;
                             continue;
                         };
                         for &t in &group.theta_idx {
@@ -4019,6 +4063,34 @@ pub fn run_saem(
     // "0% acceptance" failure).
     if let Some(w) = saem_mixing_warning(cum_mh_acc, cum_mh_prop) {
         warnings.push(w);
+    }
+
+    // #918 review: a #619 group whose solve kept returning `None` never ran.
+    for (gi, &skipped) in cov_group_skipped.iter().enumerate() {
+        if skipped == 0 {
+            continue;
+        }
+        let group = &cov_mu_groups[gi];
+        let names: Vec<&str> = group
+            .theta_idx
+            .iter()
+            .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
+            .collect();
+        warnings.push(format!(
+            "SAEM: the covariate mu-reference on {} had no admissible step on {} of {} \
+             iteration(s) — its typical value was not finite for at least one subject at the \
+             current θ (an additive typical value can go ≤ 0 for a low-covariate subject). {} \
+             fell back to the numerical M-step on those iterations, which is the channel #619 \
+             exists to avoid; consider bounding the covariate slope.",
+            model
+                .eta_names
+                .get(group.eta_idx)
+                .map(String::as_str)
+                .unwrap_or("?"),
+            skipped,
+            n_iter,
+            names.join(", ")
+        ));
     }
 
     // #895: warn when a free RUV-scaled residual σ ended pinned against the
@@ -4954,6 +5026,59 @@ mod tests {
         assert!(
             slope > 0.02,
             "TH_CRCL must move from its 0.02 start: {slope}"
+        );
+    }
+
+    /// [`COVMUREF_ONLY_MODEL`] started where the additive typical value is
+    /// negative for the lowest-CRCL subject (`4 − 50·0.2 = −6`), so both group
+    /// engines return `None`.
+    const COVMUREF_INADMISSIBLE_START: &str = r"
+[parameters]
+  theta TVCL(4.0, 0.0, 100.0)
+  theta TH_CRCL(0.2, 0.0, 5.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.01 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    /// SAEM pins a group's thetas only *after* a successful solve, so an
+    /// inadmissible start costs no freeze — but it silently reverts the group
+    /// to the numerical M-step, which is the channel #619 exists to avoid. The
+    /// fit must say so (#918 review).
+    ///
+    /// The straddle is [`saem_covariate_mu_ref_group_drives_the_closed_form_channel`],
+    /// the same model from an admissible start, which asserts this warning does
+    /// *not* fire — so a fix that always warned would fail there.
+    #[test]
+    fn saem_reports_a_covariate_group_that_never_stepped() {
+        let model = crate::parser::model_parser::parse_model_string(COVMUREF_INADMISSIBLE_START)
+            .expect("parses");
+        let pop = covmuref_pop(false);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(918);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let hit = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("had no admissible step"))
+            .unwrap_or_else(|| panic!("expected the skipped-step report, got {:?}", res.warnings));
+        assert!(
+            hit.contains("ETA_CL") && hit.contains("TH_CRCL"),
+            "the report names the eta and the thetas: {hit}"
         );
     }
 
@@ -6087,6 +6212,66 @@ DV ~ additive(EPS)
         assert_eq!(split.eligible, vec![(1, 2)]);
         assert_eq!(split.shared_theta, vec![0]);
         assert!(split.identity_packed_log.is_empty());
+    }
+
+    /// The shared-anchor rule counts sharing over **every declared anchor**,
+    /// not just the eligible ones (#918 review).
+    ///
+    /// `CL = TVP*exp(ETA_CL)` is log-packed `Log`, so eligible; `V = TVP +
+    /// ETA_V` is `Identity`, which is never eligible whatever the packing.
+    /// Scanning `eligible` alone sees `TVP` claimed once, shifts it by
+    /// `mean(η_CL)` and pins it, while `ETA_V` is never re-centred for that
+    /// delta — the pinned partial shift the rule exists to prevent.
+    /// `ETA_OTHER` on `TVV` is the straddle: an unshared anchor in the same
+    /// model must keep its pair, so a fix that widened the drop instead of the
+    /// detection fails here.
+    #[test]
+    fn classify_mu_ref_pairs_drops_an_anchor_shared_with_an_ineligible_eta() {
+        let m = model_with_mu_refs(
+            &["TVP", "TVV"],
+            &["ETA_CL", "ETA_V", "ETA_OTHER"],
+            &[
+                ("ETA_CL", "TVP", MuTransform::Log),
+                ("ETA_V", "TVP", MuTransform::Identity),
+                ("ETA_OTHER", "TVV", MuTransform::Log),
+            ],
+        );
+        let split = classify_mu_ref_pairs(&m, &positive_lowers(2));
+        assert_eq!(
+            split.eligible,
+            vec![(1, 2)],
+            "only the unshared anchor keeps its closed-form shift"
+        );
+        assert_eq!(split.shared_pairs, vec![(0, 0)]);
+        assert_eq!(split.shared_theta, vec![0]);
+        // `Identity` is not a packing problem, so it earns no packing advisory.
+        assert!(split.identity_packed_log.is_empty());
+        assert!(split.log_packed_logit.is_empty());
+        // The dropped pair still counts as a conflict for a #619 group.
+        assert_eq!(mu_ref_pairs_for_cov_groups(&split), vec![(1, 2), (0, 0)]);
+    }
+
+    /// …but two *ineligible* anchors on one theta share nothing the closed
+    /// form would have moved, so they are not named as a shared-anchor drop —
+    /// the packing advisory already explains them, and a second, unrelated
+    /// message would send the user after the wrong fix.
+    #[test]
+    fn classify_mu_ref_pairs_does_not_name_a_theta_only_ineligible_etas_share() {
+        let m = model_with_mu_refs(
+            &["TVP"],
+            &["ETA_A", "ETA_B"],
+            &[
+                ("ETA_A", "TVP", MuTransform::Log),
+                ("ETA_B", "TVP", MuTransform::Log),
+            ],
+        );
+        // Identity-packed, so *both* anchors are ineligible for packing
+        // reasons before sharing is even considered.
+        let split = classify_mu_ref_pairs(&m, &[-1.0]);
+        assert!(split.eligible.is_empty());
+        assert!(split.shared_pairs.is_empty());
+        assert!(split.shared_theta.is_empty());
+        assert_eq!(split.identity_packed_log, vec![0]);
     }
 
     /// `packed_scale_is_mu` is the one condition the link-independent shift
