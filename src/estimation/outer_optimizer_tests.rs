@@ -2502,6 +2502,81 @@ fn global_presearch_branch_runs_or_warns() {
 // Run with:  cargo test --lib --no-default-features --features ci \
 //              bench_cov_hessian -- --ignored --nocapture
 
+#[test]
+#[ignore = "benchmark: optimized serial-vs-Rayon population NLL"]
+fn bench_small_population_nll_dispatch() {
+    use rayon::prelude::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let model = make_model();
+    let params = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for n_subj in [1usize, 2, 4, 8, 16, 32] {
+            let population = make_population(n_subj);
+            let eta_hats: Vec<DVector<f64>> =
+                (0..n_subj).map(|_| DVector::zeros(1)).collect();
+            let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+                .map(|_| DMatrix::from_element(3, 1, 0.1))
+                .collect();
+            let eval = |i: usize| {
+                subject_nll(
+                    &model,
+                    &population.subjects[i],
+                    params,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    &[],
+                    true,
+                )
+            };
+            let serial_once = || -> f64 {
+                let values: Vec<f64> = (0..n_subj).map(&eval).collect();
+                values.iter().sum()
+            };
+            let parallel_once = || -> f64 {
+                let values: Vec<f64> = (0..n_subj).into_par_iter().map(&eval).collect();
+                values.iter().sum()
+            };
+            assert_eq!(serial_once().to_bits(), parallel_once().to_bits());
+            for _ in 0..20 {
+                black_box(serial_once());
+                black_box(parallel_once());
+            }
+            let mut serial = Vec::with_capacity(31);
+            let mut parallel = Vec::with_capacity(31);
+            for rep in 0..31 {
+                if rep % 2 == 0 {
+                    let start = Instant::now();
+                    black_box(serial_once());
+                    serial.push(start.elapsed());
+                    let start = Instant::now();
+                    black_box(parallel_once());
+                    parallel.push(start.elapsed());
+                } else {
+                    let start = Instant::now();
+                    black_box(parallel_once());
+                    parallel.push(start.elapsed());
+                    let start = Instant::now();
+                    black_box(serial_once());
+                    serial.push(start.elapsed());
+                }
+            }
+            serial.sort_unstable();
+            parallel.sort_unstable();
+            eprintln!(
+                "n={n_subj}: serial median={:?} range={:?}..{:?}; parallel median={:?} range={:?}..{:?}; serial/parallel={:.3}x",
+                serial[15], serial[0], serial[30], parallel[15], parallel[0], parallel[30],
+                serial[15].as_secs_f64() / parallel[15].as_secs_f64(),
+            );
+        }
+    });
+}
+
 /// Measures wall time for the gradient-FD Hessian (new path, issue #209) vs
 /// the legacy scalar-FD Hessian (reconstructed inline) on the same setup.
 ///

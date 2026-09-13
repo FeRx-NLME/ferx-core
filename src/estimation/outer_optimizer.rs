@@ -776,22 +776,28 @@ pub(crate) fn pop_nll(
     kappas: &[Vec<DVector<f64>>],
     interaction: bool,
 ) -> f64 {
-    let per_subject: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            subject_nll(
-                model,
-                subject,
-                params,
-                &eta_hats[i],
-                &h_matrices[i],
-                kappas.get(i).map_or(&[], Vec::as_slice),
-                interaction,
-            )
-        })
-        .collect();
+    let eval = |(i, subject): (usize, &Subject)| {
+        subject_nll(
+            model,
+            subject,
+            params,
+            &eta_hats[i],
+            &h_matrices[i],
+            kappas.get(i).map_or(&[], Vec::as_slice),
+            interaction,
+        )
+    };
+    let per_subject: Vec<f64> =
+        if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
+            population
+                .subjects
+                .par_iter()
+                .enumerate()
+                .map(eval)
+                .collect()
+        } else {
+            population.subjects.iter().enumerate().map(eval).collect()
+        };
     // Preserve the existing subject-index summation order, including at width 1.
     per_subject.iter().sum()
 }
