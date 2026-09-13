@@ -1491,8 +1491,20 @@ pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
 /// return an [`OuterResult`]), and `fit()`'s own assembly adds the prior penalty
 /// to the objective *after* the last optimizer has returned. The pairing is
 /// pinned by `every_published_convergence_verdict_is_gated_on_its_objective`.
+///
+/// **The verdict coming in is not consulted, only overwritten.** An earlier
+/// version returned early on `!*converged`, so a run the optimizer had already
+/// failed for another reason (budget exhausted, line-search stall) reported
+/// *that* reason and never mentioned the objective. Those are different facts
+/// with different consequences — "stopped early, estimates are provisional"
+/// versus "the objective is not a number, so every quantity derived from it is
+/// meaningless" — and suppressing the second because the first happened to fire
+/// first is exactly backwards. It also meant the typed `details` payload the
+/// `fit()`-level warning carries was never built on the common path, because the
+/// estimator had already demoted the boolean. Callers that can receive the
+/// message twice deduplicate explicitly (`api::fit`'s assembly does).
 pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Option<String> {
-    if !*converged || ofv_is_valid(ofv) {
+    if ofv_is_valid(ofv) {
         return None;
     }
     *converged = false;

@@ -176,6 +176,13 @@ one, so it does not demote `converged`, and VI warns separately saying so. Set
 `vi_final_ofv = laplace` to get a real objective; it is then gated like every
 other method's.
 
+The exemption follows the objective, not the position in a method chain. A
+trailing `imp_eval_only` readout (`methods = [vi, imp]`, the recommended way to
+finish a VI fit) reports its importance-sampled −2 log L under
+`importance_sampling` and leaves VI's `NaN` in `ofv`, so that fit stays exempt.
+A trailing `agq_eval_only` readout instead *replaces* `ofv` with its quadrature
+marginal, so that objective is gated — it is a real number that can fail.
+
 ## Details payloads {#details}
 
 Numeric diagnostics **may** carry a `details` object with the value behind the
@@ -211,6 +218,12 @@ Treat `details` as optional: check for its presence rather than assuming it.
 A code omits the `details` key entirely (Rust field `None`) when it has no
 associated stored statistic, or when any contributing statistic is non-finite
 (`NaN`/`±Inf` — e.g. the condition number of a near-singular parameter space).
+
+`W_NONFINITE_OBJECTIVE` is the exception to that second rule rather than an
+instance of it: the offending value *is* the payload, so a non-finite `ofv` is
+carried as the string `"NaN"` / `"inf"` / `"-inf"` (JSON has no non-finite
+numbers) instead of dropping the key. Only `convergence` warnings raised by this
+check carry `details`; a plain "did not converge" carries none.
 
 ## How codes are assigned
 

@@ -124,7 +124,10 @@ pub(crate) fn gate_converged_on_mcem_objective(converged: &mut bool, ofv: f64) -
     if let Some(w) = gate_converged_on_objective(converged, ofv) {
         return Some(w);
     }
-    if !*converged || objective_converged(ofv) {
+    // Same shape as the shared gate: a pure predicate on the objective, not on
+    // the verdict coming in, so a run already failed for another reason still
+    // learns its objective is unusable.
+    if objective_converged(ofv) {
         return None;
     }
     *converged = false;

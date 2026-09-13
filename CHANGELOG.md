@@ -140,6 +140,11 @@ section of the SDLC for the versioning policy).
   refused to call a runaway converged, but demoted the flag silently, so a caller saw
   `converged: false` with nothing in `warnings` distinguishing it from any other failure
   ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
+- A fit that stopped for one reason and *also* has an unusable objective now reports both.
+  Previously whichever was noticed first silenced the other, so a run that hit its evaluation
+  budget was told only that — never that its objective was `NaN` and every number derived from
+  it meaningless. The two have different consequences (provisional estimates versus nothing
+  usable at all), so both are reported ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
 - A typical value used as the mu-reference anchor of **more than one** random effect
   (`F1 = inv_logit(LOGIT_F + ETA_F1)` alongside `F2 = inv_logit(LOGIT_F + ETA_F2)`, or
   the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is now estimated by the

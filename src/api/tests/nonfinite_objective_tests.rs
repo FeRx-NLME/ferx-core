@@ -34,6 +34,28 @@ use std::collections::HashMap;
 //  G1 — the reported regression, end to end
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A one-compartment closed form — no ODE solve, so a chain test that has to run
+/// two real estimators stays inside the Tier-1 time budget.
+fn one_cpt_model() -> CompiledModel {
+    parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse")
+}
+
 /// The #1296 model: a rapid-equilibrium two-state ODE, benign at `KFAST = 1`.
 fn two_state_model() -> CompiledModel {
     parse_model_string(
@@ -187,10 +209,11 @@ fn a_fit_whose_objective_is_nan_is_not_reported_converged() {
         "the message must name *which* way the objective failed, not just that it did: {}",
         entry.message
     );
-    // Exactly one, not "at least one": the estimator's gate and fit()'s gate both
-    // apply, and the shared gate's `!*converged` early return is what stops the
-    // second from re-explaining a verdict the first already demoted. Without it a
-    // user would read the same paragraph twice.
+    // Exactly one, not "at least one". The estimator's gate and fit()'s gate both
+    // fire on this run — deliberately, since neither may stay silent because the
+    // other spoke (G3b) — so `fit_inner` drops the estimator's plain-string copy
+    // and keeps the typed one. Without that explicit de-duplication a user reads
+    // the same paragraph twice.
     assert_eq!(
         result
             .warnings
@@ -201,6 +224,80 @@ fn a_fit_whose_objective_is_nan_is_not_reported_converged() {
         "the plain-text warnings must carry it exactly once — that is what the CLI and the \
          fit YAML print: {:?}",
         result.warnings
+    );
+    assert_eq!(
+        result
+            .warnings_structured
+            .iter()
+            .filter(|w| w.message.contains(NONFINITE_OBJECTIVE_TOKEN))
+            .count(),
+        1,
+        "...and so must the structured ones: {:?}",
+        result.warnings_structured
+    );
+}
+
+/// **G10 — the documented `details` payload is present on the *common* path.**
+/// (Review of #1303, finding 2.)
+///
+/// `docs/warnings.qmd` documents `ofv` / `reason` / `divergence_cutoff` /
+/// `method` for this code, and a programmatic consumer is told to read the
+/// numbers there rather than parse prose. Before the review that payload existed
+/// only for the rare case first discovered at the fit-level total (G5's prior
+/// overflow): on every ordinary run the estimator had already demoted the
+/// boolean, the fit-level helper returned early, no native `WarningEntry` was
+/// built, and `rebuild_warnings_structured` fell back to string classification —
+/// which has no `Convergence` enrichment arm in `diagnostic_details`, so
+/// `details` came back `None`. The docs and the code disagreed exactly on the
+/// path a user actually hits.
+///
+/// Same fixture as G1, asserting the half G1 does not.
+///
+/// Mutation (run): restore the `!*converged` early return in
+/// `gate_converged_on_objective` → `details` is `None` and this fires. Drop the
+/// `warnings.retain(...)` de-duplication in `fit_inner` → G1's exactly-one
+/// assertions fire instead.
+#[test]
+fn the_demotion_carries_its_documented_details_payload() {
+    let model = two_state_model();
+    let pop = Population {
+        subjects: vec![
+            subject_with_dose_time("bad", f64::NAN, 1.0),
+            subject_with_dose_time("2", 0.0, 1.2),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
+    assert!(result.ofv.is_nan(), "fixture premise: {}", result.ofv);
+
+    let entry = result
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains(NONFINITE_OBJECTIVE_TOKEN))
+        .expect("the demotion must be a typed entry");
+    let details = entry.details.as_ref().unwrap_or_else(|| {
+        panic!(
+            "docs/warnings.qmd documents a details payload for this code; the entry carries \
+             none, so the structured warning was string-classified rather than emitted typed \
+             at source: {entry:?}"
+        )
+    });
+    // JSON has no non-finite numbers, so the value is carried as a string here.
+    assert_eq!(details["ofv"], "NaN", "{details}");
+    assert_eq!(details["reason"], "NaN", "{details}");
+    assert_eq!(
+        details["divergence_cutoff"].as_f64(),
+        Some(DIVERGENCE_OFV),
+        "the consumer needs the cutoff to tell a sentinel from a real objective: {details}"
+    );
+    assert_eq!(
+        details["method"],
+        EstimationMethod::FoceI.label(),
+        "the payload names the stage that produced the objective: {details}"
     );
 }
 
@@ -250,20 +347,16 @@ fn the_gate_rejects_the_finite_sentinel_not_only_nan() {
     }
 }
 
-/// **G3 — the two ways this gate could fire when it must not.** A gate that
-/// demoted everything would pass G1 and G2 and be worse than the defect.
+/// **G3 — the gate must not fire on a real objective.** A gate that demoted
+/// everything would pass G1 and G2 and be worse than the defect.
 ///
-/// * A real population objective — both signs, and the extremes of the valid range.
-///   The negative extreme is deliberate: the cutoff is **one-sided**, because a
-///   large negative −2 log L is legitimate (log-transformed DV on a large cohort),
-///   and `ofv_is_valid_rejects_the_clamped_sentinel_not_just_non_finite` pins that
-///   independently.
-/// * An *already* failed verdict must come back with no message. Otherwise a fit
-///   that failed for some other reason would grow a second, wrong explanation —
-///   and, worse, the `!*converged` early return is what stops the MCEM gate from
-///   reporting the shared reason for a #528 runaway.
+/// Both signs, and the extremes of the valid range. The negative extreme is
+/// deliberate: the cutoff is **one-sided**, because a large negative −2 log L is
+/// legitimate (log-transformed DV on a large cohort), and
+/// `ofv_is_valid_rejects_the_clamped_sentinel_not_just_non_finite` pins that
+/// independently.
 #[test]
-fn the_gate_leaves_a_real_objective_and_an_already_failed_verdict_alone() {
+fn the_gate_leaves_a_real_objective_alone() {
     for ofv in [-1e15, -286.0, 0.0, 12_345.678, DIVERGENCE_OFV - 1.0] {
         let mut converged = true;
         assert!(
@@ -271,11 +364,46 @@ fn the_gate_leaves_a_real_objective_and_an_already_failed_verdict_alone() {
             "ofv = {ofv:?} is a legitimate population objective and must not be demoted"
         );
         assert!(converged, "ofv = {ofv:?}");
+        // ...and it does not *promote* either: a run that already failed stays failed.
+        let mut already_failed = false;
+        assert!(gate_converged_on_objective(&mut already_failed, ofv).is_none());
+        assert!(!already_failed, "ofv = {ofv:?}");
     }
-    // An optimizer that already said "no" is not re-explained.
+}
+
+/// **G3b — a run that already failed for another reason still learns its
+/// objective is unusable.** (Review of #1303, finding 2.)
+///
+/// The gate is a predicate on the **objective**, not on the verdict handed to it.
+/// The first version returned early on `!*converged`, which looked like sensible
+/// de-duplication and was not: "the optimizer hit its evaluation budget" and "the
+/// objective is not a number" are different facts with different consequences —
+/// provisional estimates in the first case, nothing usable at all in the second —
+/// and whichever fired first silenced the other.
+///
+/// It also had a second, quieter effect: because every estimator demotes the
+/// boolean before `fit()`'s assembly sees it, the fit-level helper's early return
+/// meant the typed `details` payload was **never built on the common path**, so
+/// the payload `docs/warnings.qmd` documents existed only for the rare
+/// prior-overflow case. G10 is that half.
+///
+/// Mutation (run): restore `!*converged ||` to either gate's early return → this
+/// fires on the arm whose gate was changed, and G10 fires too.
+#[test]
+fn a_run_that_already_failed_still_reports_an_unusable_objective() {
     let mut converged = false;
-    assert!(gate_converged_on_objective(&mut converged, f64::NAN).is_none());
+    let msg = gate_converged_on_objective(&mut converged, f64::NAN).expect(
+        "an optimizer that stopped for another reason must still be told its objective is NaN",
+    );
     assert!(!converged);
+    assert!(msg.contains(NONFINITE_OBJECTIVE_TOKEN), "{msg}");
+
+    // The MCEM composite has the same shape, on its own rule (#528's cap).
+    let mut converged = false;
+    let msg = crate::estimation::impmap::gate_converged_on_mcem_objective(&mut converged, 1e35)
+        .expect("a #528 runaway must be reported whatever else already failed");
+    assert!(!converged);
+    assert!(msg.contains(NONFINITE_OBJECTIVE_TOKEN), "{msg}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -347,6 +475,179 @@ fn vi_publishing_no_objective_is_exempt_but_vi_publishing_one_is_not() {
     assert!(!converged);
     assert!(msg.contains(NONFINITE_OBJECTIVE_TOKEN));
     assert_eq!(entry.severity, WarningSeverity::Critical);
+}
+
+/// **G11 — the exemption survives a trailing evaluation-only IMP stage.**
+/// (Review of #1303, finding 1 — a `converged: true` fit demoted to `false`.)
+///
+/// `methods = vi, imp` with `imp_eval_only = true` is the **documented** way to
+/// finish a VI fit: `ViFinalOfv`'s own doc points at it, because it consumes VI's
+/// parameters, EBEs and Hessians and reports a genuine importance-sampled
+/// −2 log L alongside the IS diagnostics.
+///
+/// The trap is where that number lands. An `imp_eval_only` stage deliberately
+/// **does not touch `result`** — it writes `FitResult::importance_sampling` and
+/// `continue`s, so the preceding estimator's objective stays in `FitResult::ofv`.
+/// For this chain that objective is VI's deliberate `NaN`. Keying the exemption
+/// on `chain.last()` therefore read it as *IMP's* failed objective and demoted a
+/// converged VI fit — the exact configuration the exemption exists to protect.
+///
+/// So the gate is keyed on the tracked **owner** of `result.ofv`, and the premise
+/// this test asserts first is the fact that makes the two different: the IS
+/// likelihood is finite while `ofv` is still `NaN`. Without that premise the test
+/// would pass on a chain where IMP never ran.
+///
+/// The `agq_eval_only` twin is the mirror image and is why the owner is tracked
+/// rather than switched back to `final_method`: an AGQ readout *does* replace
+/// `prev.ofv`, so there the eval-only stage is the owner. G12 pins that direction.
+///
+/// Mutation (run): `objective_stage.unwrap_or(final_method)` →
+/// `*chain.last().unwrap()` in `fit_inner` → this fires; every other test in this
+/// file stays green, which is why the reviewer found it and the suite did not.
+#[test]
+fn a_trailing_eval_only_imp_stage_does_not_claim_vis_deliberate_nan() {
+    let model = one_cpt_model();
+    let pop = Population {
+        subjects: vec![
+            subject_with_dose_time("1", 0.0, 1.0),
+            subject_with_dose_time("2", 0.0, 1.2),
+            subject_with_dose_time("3", 0.0, 0.9),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Vi, EstimationMethod::Imp],
+        imp_eval_only: true,
+        vi_final_ofv: ViFinalOfv::None,
+        vi_iters: 40,
+        imp_samples: 20,
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+
+    // Premise 1: the published objective really is VI's deliberate NaN — the
+    // eval-only IMP stage did not replace it.
+    assert!(
+        result.ofv.is_nan(),
+        "premise: under `vi_final_ofv = none` the published ofv is VI's deliberate NaN; got {}",
+        result.ofv
+    );
+    // Premise 2: IMP really ran and produced a real objective, which went
+    // somewhere else. Without this the chain under test never happened.
+    let is = result
+        .importance_sampling
+        .as_ref()
+        .expect("premise: the eval-only IMP stage must have produced an IS result");
+    assert!(
+        is.minus2_log_likelihood.is_finite(),
+        "premise: IMP's own objective is finite and is reported here, not in `ofv`: {}",
+        is.minus2_log_likelihood
+    );
+
+    // The regression: VI's declaration that it published no objective must not be
+    // read as IMP's failure to produce one.
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        "the deliberate VI NaN was reported as a non-finite-objective failure: {:?}",
+        result.warnings
+    );
+    assert_eq!(
+        result.converged,
+        fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                methods: vec![EstimationMethod::Vi],
+                imp_eval_only: false,
+                ..opts.clone()
+            }
+        )
+        .expect("solo VI fit")
+        .converged,
+        "appending a successful IMP readout must not change VI's convergence verdict — that \
+         is the whole point of an evaluation-only stage"
+    );
+}
+
+/// **G12 — the mirror image: an AGQ readout *is* the owner.**
+///
+/// `agq_eval_only` is evaluation-only like `imp_eval_only`, and the two differ in
+/// exactly the thing the gate needs: an AGQ readout **replaces `prev.ofv`** with
+/// its quadrature marginal, so the eval-only stage owns the published objective
+/// there, while an IMP readout leaves the estimator's in place.
+///
+/// That asymmetry is why the owner is *tracked* rather than derived from the
+/// chain — `final_method` (which fixes G11) is wrong here, and `chain.last()`
+/// (which is right here) is what broke G11. This test is the half that stops the
+/// G11 fix from being "switch to `final_method`".
+///
+/// Mutation (run): `objective_stage.unwrap_or(final_method)` → `final_method` in
+/// `fit_inner`, i.e. ignore the AGQ arm's ownership → the objective is attributed
+/// to VI, `publishes_no_objective` exempts it, and this fires.
+#[test]
+fn an_agq_readout_owns_the_objective_it_writes() {
+    let model = two_state_model();
+    let pop = Population {
+        subjects: vec![
+            subject_with_dose_time("bad", f64::NAN, 1.0),
+            subject_with_dose_time("2", 0.0, 1.2),
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Vi, EstimationMethod::Laplace],
+        agq_eval_only: true,
+        n_agq: 3,
+        vi_final_ofv: ViFinalOfv::None,
+        vi_iters: 40,
+        run_covariance_step: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+
+    // The AGQ readout replaced `ofv` with its own quadrature marginal, which the
+    // NaN-timeline subject poisons. That is a real failed objective, not VI's
+    // deliberate absence of one, so the VI exemption must not reach it.
+    //
+    // Measured: the quadrature comes back at the **sentinel** (`2e20`), not `NaN`
+    // — `agq_population_nll` sums per-subject contributions that the inner
+    // objective has already clamped. So this arm also exercises the half of the
+    // gate `is_finite()` would miss, end to end, which G2 only pins as a unit.
+    assert!(
+        !result.ofv.is_nan() && result.ofv >= DIVERGENCE_OFV,
+        "fixture premise: the AGQ readout must publish a clamped (finite, sentinel-sized) \
+         objective here; got {}. If this became a real number the fixture stopped producing \
+         the defect's input.",
+        result.ofv
+    );
+    assert!(
+        !result.converged,
+        "the AGQ readout owns the published objective, so its NaN must demote: ofv = {}",
+        result.ofv
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        "{:?}",
+        result.warnings
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
