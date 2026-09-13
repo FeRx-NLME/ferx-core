@@ -762,6 +762,72 @@ pub fn find_ebe(
     mu_k: Option<&[f64]>,
     restarts: usize,
 ) -> EbeResult {
+    let schedule = cacheable_schedule(model, subject);
+    find_ebe_impl(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        schedule.as_ref(),
+    )
+}
+
+/// Same as [`find_ebe`], but takes an already-resolved [`EventSchedule`](pk::event_driven::EventSchedule)
+/// instead of rebuilding one via [`cacheable_schedule`] on every call.
+///
+/// `cacheable_schedule`'s result depends only on `model` + `subject` — never on `params`/`eta`
+/// — so it is identical on every outer-loop evaluation of the same subject, not just across the
+/// BFGS steps of one `find_ebe` call. A caller that re-solves the same subject many times over a
+/// fit (the FOCEI/AGQ/Laplace outer hot loop) builds a `Vec<Option<EventSchedule>>` once via
+/// [`build_schedule_cache`] and passes each subject's entry here instead of paying the merged
+/// dose/event-timeline rebuild on every one of those calls.
+pub(crate) fn find_ebe_cached(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> EbeResult {
+    find_ebe_impl(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule,
+    )
+}
+
+/// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
+/// fit, for reuse across every outer-loop evaluation via [`find_ebe_cached`]. Mirrors the
+/// once-per-population `schedules` cache `bayes.rs`'s chain loop already builds — the schedule
+/// is fit-invariant (see [`cacheable_schedule`]'s own doc for the staleness analysis), so
+/// building it once here instead of once per `find_ebe` call is always sound.
+pub(crate) fn build_schedule_cache(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Option<pk::event_driven::EventSchedule>> {
+    population
+        .subjects
+        .iter()
+        .map(|subject| cacheable_schedule(model, subject))
+        .collect()
+}
+
+fn find_ebe_impl(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> EbeResult {
     let n_eta = model.n_eta;
 
     if inner_profile_enabled() {
@@ -854,9 +920,10 @@ pub fn find_ebe(
     //
     // Event parameter storage is allocated lazily by per-event prediction paths.
     // The schedule is built only when cacheable_schedule permits reuse; a static
-    // fast path needs neither event storage nor a merged schedule.
+    // fast path needs neither event storage nor a merged schedule. It is now a
+    // parameter (see `find_ebe_cached`/`build_schedule_cache`) rather than being
+    // rebuilt here on every call.
     let pk_scratch_cell = RefCell::new(pk::EventPkParams::default());
-    let schedule = cacheable_schedule(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here — not inside `agrad`, which BFGS calls on
     // every inner step (and every line-search trial) — instead of re-walking
@@ -903,7 +970,7 @@ pub fn find_ebe(
             // search at the declared correlation while the outer loop moved it.
             &params.residual_correlations,
             &mut scratch,
-            schedule.as_ref(),
+            schedule,
             err_keys.as_ref(),
             mult.as_deref(),
             &mut pred_recycle.borrow_mut(),
@@ -945,7 +1012,7 @@ pub fn find_ebe(
             // Live ρ (#847) — the same value `obj` above scores, so the BFGS
             // gradient and objective can never disagree about the residual R.
             &params.residual_correlations,
-            schedule.as_ref(),
+            schedule,
             mult.as_deref(),
             err_keys.as_ref(),
             &mut obs_grad_recycle.borrow_mut(),
@@ -1202,7 +1269,7 @@ pub fn find_ebe(
                 &params.theta,
                 &eta_true,
                 &mut scratch,
-                schedule.as_ref(),
+                schedule,
             );
             GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
             j
@@ -3514,6 +3581,43 @@ pub fn run_inner_loop_warm(
     (etas, h_matrices, stats, kappas)
 }
 
+/// Same as [`run_inner_loop_warm`], but reuses a [`build_schedule_cache`] built once per
+/// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
+/// outer-loop evaluation. See [`find_ebe_cached`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_inner_loop_warm_cached(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map_cached(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        schedules,
+        |_, _| (),
+    );
+    (etas, h_matrices, stats, kappas)
+}
+
 /// Finish subject-local work on the same worker immediately after its EBE solve,
 /// before the population barrier. The FOCE outer loop uses this to score the
 /// marginal without launching another subject pass. Results retain subject order.
@@ -3536,6 +3640,79 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
     Vec<Vec<DVector<f64>>>,
     Vec<T>,
 ) {
+    run_inner_loop_warm_map_impl(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        None,
+        finish_subject,
+    )
+}
+
+/// Same as [`run_inner_loop_warm_map`], but reuses a [`build_schedule_cache`] built once per
+/// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
+/// outer-loop evaluation. See [`find_ebe_cached`].
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
+    run_inner_loop_warm_map_impl(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        Some(schedules),
+        finish_subject,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn run_inner_loop_warm_map_impl<T: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
     use rayon::prelude::*;
 
     let results: Vec<(EbeResult, T)> = population
@@ -3544,7 +3721,20 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            let ebe = find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts);
+            let ebe = match schedules {
+                Some(cache) => find_ebe_cached(
+                    model,
+                    subject,
+                    params,
+                    max_iter,
+                    tol,
+                    init,
+                    mu_k,
+                    restarts,
+                    cache[i].as_ref(),
+                ),
+                None => find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts),
+            };
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })

@@ -1570,10 +1570,21 @@ pub fn run_bayes(
         );
     }
 
+    // #1303. R-hat is a *sampling* diagnostic: chains can mix perfectly across a
+    // region where the reported objective at the posterior mean is still `NaN`
+    // (one subject's predictions non-finite there), so the two are independent
+    // and both have to hold.
+    let mut converged = max_rhat.is_finite() && max_rhat < RHAT_CONVERGENCE_THRESHOLD;
+    if let Some(w) =
+        crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, ofv)
+    {
+        warnings.push(w);
+    }
+
     Ok(OuterResult {
         params: mean_params,
         ofv,
-        converged: max_rhat.is_finite() && max_rhat < RHAT_CONVERGENCE_THRESHOLD,
+        converged,
         n_iterations: n_warmup + n_sample,
         eta_hats,
         h_matrices,

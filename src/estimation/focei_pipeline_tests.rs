@@ -107,8 +107,15 @@ fn fused_inner_and_marginal_match_separate_passes() {
                                 interaction,
                             )
                         };
-                        let fused =
-                            run_inner_loop_and_nll(&model, &pop, params, &opts, warm, Some(&mu));
+                        let fused = run_inner_loop_and_nll(
+                            &model,
+                            &pop,
+                            params,
+                            &opts,
+                            warm,
+                            Some(&mu),
+                            None,
+                        );
                         assert_eq!(expected_nll.to_bits(), fused.4.to_bits());
                         for (a, b) in separate.0.iter().zip(&fused.0) {
                             assert_eq!(bits(a.as_slice()), bits(b.as_slice()));
@@ -158,7 +165,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             &separate.3,
             &opts,
         );
-        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None);
+        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None, None);
         assert_eq!(expected.to_bits(), fused.4.to_bits());
     }
 }

@@ -1384,6 +1384,31 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // Which stage last **wrote** `result.ofv` — i.e. who owns the number this fit
+    // will publish as `FitResult::ofv` (#1303).
+    //
+    // It cannot be derived from the chain, and both obvious guesses are wrong on
+    // a real configuration:
+    //
+    //   * `chain.last()` — an `imp_eval_only` stage deliberately does **not**
+    //     touch `result`; its importance-sampled −2 log L goes to
+    //     `FitResult::importance_sampling`, and the preceding estimator's
+    //     objective stays in `ofv`. So `methods = vi, imp` + `imp_eval_only`
+    //     publishes *VI's* objective, under IMP's name.
+    //   * `final_method` (the last **estimating** stage) — an AGQ readout stage is
+    //     evaluation-only *and* replaces `prev.ofv` with its quadrature marginal,
+    //     so `methods = focei, laplace` + `agq_eval_only` publishes the
+    //     eval-only stage's objective, not the estimator's.
+    //
+    // The two evaluation-only families differ in exactly this, so the only
+    // honest answer is to record it where the write happens. Consumed by the
+    // non-finite-objective gate, whose one exemption (`publishes_no_objective`:
+    // VI's deliberate `NaN` under `vi_final_ofv = none`) is a statement about
+    // *whose* objective this is — naming the wrong stage either demotes a
+    // perfectly good VI fit or exempts a real objective from the gate.
+    //
+    // `None` only until the first stage writes one.
+    let mut objective_stage: Option<EstimationMethod> = None;
     // A VI stage's result must survive later stages of a chain: `methods = vi, imp`
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
@@ -1608,6 +1633,9 @@ fn fit_inner(
                 stage_opts.hessian_anchor(),
             );
             let ofv = 2.0 * nll;
+            // This stage writes `result.ofv` on both branches, so it owns the
+            // published objective even though it estimates nothing (#1303).
+            objective_stage = Some(method);
             match result.as_mut() {
                 // Chained: keep the estimator's parameters and replace only the OFV, so the
                 // reported objective is the quadrature marginal at the point it reached.
@@ -1615,17 +1643,28 @@ fn fit_inner(
                 // Standalone: there is nothing to preserve, so this becomes the canonical
                 // result at the (unchanged) initial parameters.
                 None => {
+                    // #1303: no optimizer ran, so "converged" here only ever
+                    // meant "the quadrature evaluated". It must still not claim
+                    // success at an objective that is `NaN` or a sentinel —
+                    // `agq_population_nll` can return either on a subject whose
+                    // timeline or variance is degenerate.
+                    let mut converged = true;
+                    let gate_warning =
+                        crate::estimation::outer_optimizer::gate_converged_on_objective(
+                            &mut converged,
+                            ofv,
+                        );
                     result = Some(crate::estimation::outer_optimizer::OuterResult {
                         params: stage_params.clone(),
                         ofv,
-                        converged: true,
+                        converged,
                         n_iterations: 0,
                         eta_hats,
                         h_matrices,
                         kappas,
                         covariance_matrix: None,
                         covariance_wall_time_secs: 0.0,
-                        warnings: Vec::new(),
+                        warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
                         saem_n_subjects_hmc: None,
                         ebe_convergence_warnings: 0,
@@ -1686,17 +1725,32 @@ fn fit_inner(
                     &kappas,
                     stage_opts.interaction,
                 );
+                // #1303 — as in the AGQ arm above: an evaluation-only stage still
+                // publishes a `(converged, ofv)` pair, and must not claim the
+                // first at a `NaN` or sentinel value of the second.
+                //
+                // Only *this* branch owns the objective. The chained branch below
+                // (a preceding estimator exists) writes `is_result` and leaves
+                // `result.ofv` alone, so `objective_stage` must stay pointing at
+                // that estimator — which is the #1303 review's P1.
+                objective_stage = Some(method);
+                let ofv = 2.0 * nll;
+                let mut converged = true;
+                let gate_warning = crate::estimation::outer_optimizer::gate_converged_on_objective(
+                    &mut converged,
+                    ofv,
+                );
                 result = Some(crate::estimation::outer_optimizer::OuterResult {
                     params: stage_params.clone(),
-                    ofv: 2.0 * nll,
-                    converged: true,
+                    ofv,
+                    converged,
                     n_iterations: 0,
                     eta_hats,
                     h_matrices,
                     kappas,
                     covariance_matrix: None,
                     covariance_wall_time_secs: 0.0,
-                    warnings: Vec::new(),
+                    warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
                     saem_n_subjects_hmc: None,
                     ebe_convergence_warnings: 0,
@@ -1857,6 +1911,9 @@ fn fit_inner(
                 w.clone()
             });
         }
+        // An estimating stage replaces the whole `OuterResult`, objective included,
+        // so it becomes the owner of the published `ofv` (#1303).
+        objective_stage = Some(method);
         result = Some(stage_result);
 
         // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
@@ -2392,6 +2449,38 @@ fn fit_inner(
     // `result.params` holds the *final* stage's estimates, so a chained
     // `methods = vi, focei` is gated on its last stage, like `run_covariance_step`.
     let mut converged = result.converged;
+    // The objective gate (#1303), applied to the OFV this `FitResult` publishes
+    // — `ofv_data + ofv_prior`, which includes a penalty evaluated after the last
+    // optimizer returned and so is a different number from the one any estimator
+    // gated. Placed ahead of the parameter-level warnings because it is the
+    // stronger statement: at a `NaN` or sentinel objective the estimates are not
+    // a minimum of anything, so the boundary / RSE / shrinkage diagnostics below
+    // are describing a point rather than a solution.
+    //
+    // The stage passed is the tracked **owner** of `result.ofv` (see
+    // `objective_stage` where it is declared), not a position in the chain.
+    // Neither `chain.last()` nor `final_method` is right for both evaluation-only
+    // families, and getting it wrong demotes a converged VI fit that was finished
+    // the recommended way (`methods = vi, imp` + `imp_eval_only`).
+    let objective_stage = objective_stage.unwrap_or(final_method);
+    if let Some((msg, entry)) =
+        nonfinite_objective_warning(&mut converged, ofv, objective_stage, options)
+    {
+        // The estimator that produced this objective has already pushed the same
+        // sentence as a plain string — `[STAGE] `-prefixed when the chain has more
+        // than one stage. Drop that copy and keep this one: they say the same
+        // thing, but only this one carries the typed `details` payload
+        // (`ofv`, `reason`, `divergence_cutoff`, `method`) that `docs/warnings.qmd`
+        // documents and a programmatic consumer reads.
+        //
+        // Matched on suffix rather than equality so the chain prefix does not
+        // defeat it, and the message interpolates the offending value, so a
+        // *different* stage's non-finite objective in the same chain is a
+        // different string and survives.
+        warnings.retain(|w| !w.ends_with(msg.as_str()));
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     if let Some((msg, entry)) = runaway_guard_warning(&mut converged, &result.params) {
         warnings.push(msg);
         native_warnings.push(entry);

@@ -1440,6 +1440,68 @@ pub(crate) fn boundary_estimate_warning(
     )
 }
 
+/// **The user-facing half of #1303's gate.** Demote `converged` when the OFV
+/// `fit()` is about to publish is not a reportable objective, and build the
+/// typed warning saying why — `None` when the objective is sound.
+///
+/// This is not a second copy of the estimators' gate; it is the same
+/// [`gate_converged_on_objective`](crate::estimation::outer_optimizer::gate_converged_on_objective)
+/// applied to a *different number*. Each estimator gates the objective **it**
+/// reports (`OuterResult::ofv`, the clean −2 log L); `FitResult::ofv` is
+/// `ofv_data + ofv_prior`, and the parameter-prior penalty (#254) is evaluated
+/// here, after the last optimizer has returned. So a finite −2 log L plus a
+/// non-finite penalty — a prior whose density is zero at the estimate, an
+/// overflowing log-normal prior on a runaway θ — produces a `FitResult` whose
+/// published `ofv` no estimator ever saw. The chained case is the same shape:
+/// `methods = vi, focei` reports the last stage's objective, and a multi-start
+/// splice re-homes warnings across runs.
+///
+/// Severity is [`WarningSeverity::Critical`] and the code is
+/// [`WarningCode::Convergence`], matching the other verdict-demoting warnings
+/// (`W_VI_BAD_BASIN`, the runaway-guard hit): every quantity derived from the
+/// objective — OFV, AIC, BIC, the standard errors, any likelihood-ratio test —
+/// is meaningless, so this is not an advisory.
+///
+/// **Why a warning and not an `Err`** (the question #1303 asks to decide): the
+/// diagnostics a user needs to *find* the bad subject all live on the
+/// `FitResult` this would throw away — `W_ODE_SOLVER_DIAGNOSTICS`' abandoned-walk
+/// count (#1296), the per-subject sdtab rows, the EBEs that show which subject
+/// diverged. An `Err(String)` carries one line of prose and deletes the rest.
+/// Nor is the sentinel case an error in any useful sense: a repelled fit has
+/// real, finite parameter estimates and is exactly the "scored but rejected"
+/// candidate `ferx-tools`' model-space search expects from
+/// [`crate::model_selection::Strictness::require_converged`] — turning it into
+/// an exception would abort a search instead of stepping past one candidate.
+/// The place to *error* on this population is the front door, where
+/// `check_model_data` can name the offending record before a fit is paid for
+/// (#1235/#1286 own that); a back-door `Err` after four outer iterations tells
+/// the user strictly less. So: the boolean carries the verdict, the warning
+/// carries the reason, and `Err` stays for inputs that can be rejected up front.
+pub(crate) fn nonfinite_objective_warning(
+    converged: &mut bool,
+    ofv: f64,
+    method: EstimationMethod,
+    options: &FitOptions,
+) -> Option<(String, WarningEntry)> {
+    if crate::estimation::outer_optimizer::publishes_no_objective(method, options) {
+        return None;
+    }
+    let msg = crate::estimation::outer_optimizer::gate_converged_on_objective(converged, ofv)?;
+    let details = serde_json::json!({
+        "ofv": if ofv.is_finite() { serde_json::json!(ofv) } else { serde_json::json!(ofv.to_string()) },
+        "reason": crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv),
+        "divergence_cutoff": crate::estimation::outer_optimizer::DIVERGENCE_OFV,
+        "method": method.label(),
+    });
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Critical,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
 /// Build the warning for parameter estimates pinned to an internal
 /// runaway guard, or `None` when every free coordinate is interior.
 ///

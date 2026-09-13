@@ -97,6 +97,51 @@ pub(crate) fn objective_converged(ofv: f64) -> bool {
     ofv.is_finite() && ofv.abs() < OFV_DIVERGENCE_CAP
 }
 
+/// The MCEM family's convergence gate: #1303's shared
+/// [`gate_converged_on_objective`](crate::estimation::outer_optimizer::gate_converged_on_objective)
+/// composed with [`objective_converged`]'s #528 runaway cap, demoting `converged`
+/// and returning the reason.
+///
+/// **This is not a redundant second gate.** Neither predicate subsumes the
+/// other, and the two witnesses are disjoint — both measured, and both pinned by
+/// `the_two_mcem_objective_rules_reject_different_runs`:
+///
+/// | `ofv` | `ofv_is_valid` (#1303) | `objective_converged` (#528) |
+/// |---|---|---|
+/// | `5e14` | **false** (≥ `DIVERGENCE_OFV` = 1e14) | true (`abs` < 1e15) |
+/// | `-1e16` | true (the cutoff is deliberately **one-sided**: a large negative −2 log L is legitimate) | **false** |
+///
+/// So deleting either leaves a class of diverged MCEM run reported as converged.
+/// Before #1303 the three MCEM exits applied the second rule alone and demoted
+/// **silently** — a caller got `converged: false` with nothing in `warnings`
+/// saying which of the many reasons a fit can fail it was.
+pub(crate) fn gate_converged_on_mcem_objective(converged: &mut bool, ofv: f64) -> Option<String> {
+    use crate::estimation::outer_optimizer::{
+        gate_converged_on_objective, NONFINITE_OBJECTIVE_TOKEN,
+    };
+    // The shared rule first, so a `NaN` / sentinel run gets the message every
+    // other estimator gives it rather than a Monte-Carlo-specific one.
+    if let Some(w) = gate_converged_on_objective(converged, ofv) {
+        return Some(w);
+    }
+    // Same shape as the shared gate: a pure predicate on the objective, not on
+    // the verdict coming in, so a run already failed for another reason still
+    // learns its objective is unusable.
+    if objective_converged(ofv) {
+        return None;
+    }
+    *converged = false;
+    Some(format!(
+        "{NONFINITE_OBJECTIVE_TOKEN}: the Monte-Carlo EM objective at the final estimates \
+         ({ofv:?}) is beyond any physically meaningful −2 log L, so the run did not converge \
+         and is reported converged: false. This is the signature of an importance-weight \
+         collapse: the weighted M-step walks THETA out to the parameter bounds and the final \
+         Laplace objective blows up to a large but finite value, which is why `is_finite()` \
+         does not catch it. Raise the sample count (`imp_isample`), start from better initial \
+         estimates, or chain a FOCE/FOCEI stage first."
+    ))
+}
+
 /// How each MCEM iteration positions the per-subject importance-sampling
 /// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
 /// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
@@ -1724,6 +1769,22 @@ fn run_mcem(
         None
     };
 
+    // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
+    // stopping test yet), so the only convergence signal we can honestly
+    // report is a sane final objective. A non-finite OFV means the MCEM
+    // diverged; but a *runaway* (importance weights collapse → weighted
+    // M-step walks θ to the bounds) produces a finite-but-enormous OFV
+    // (~1e35), which `is_finite()` alone would wave through as converged and
+    // could then win multi-start selection (issue #528).
+    //
+    // #1303: both rules now live in `gate_converged_on_mcem_objective`, which also
+    // *says* which one fired — the verdict used to be a bare boolean with nothing
+    // in `warnings` to explain it.
+    let mut converged = true;
+    if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
+        warnings.push(w);
+    }
+
     if verbose {
         eprintln!("{} completed. Final OFV (Laplace) = {:.4}", label, ofv);
     }
@@ -1731,17 +1792,7 @@ fn run_mcem(
     Ok(OuterResult {
         params: final_params,
         ofv,
-        // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
-        // stopping test yet), so the only convergence signal we can honestly
-        // report is a sane final objective. A non-finite OFV means the MCEM
-        // diverged; but a *runaway* (importance weights collapse → weighted
-        // M-step walks θ to the bounds) produces a finite-but-enormous OFV
-        // (~1e35), which `is_finite()` alone would wave through as converged and
-        // could then win multi-start selection (issue #528). Treat any objective
-        // beyond a generous physical ceiling as non-converged too — real −2logL
-        // values are at most thousands. Matches SAEM's `converged: ofv.is_finite()`
-        // in spirit while catching the bounded blowup.
-        converged: objective_converged(ofv),
+        converged,
         n_iterations: n_iter,
         eta_hats,
         h_matrices,
@@ -2646,6 +2697,12 @@ fn run_mcem_mixture(
     } = cov_out;
     warnings.extend(cov_warnings);
 
+    // #1303 / #528 — the same two rules as the single-population exit above.
+    let mut converged = true;
+    if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
+        warnings.push(w);
+    }
+
     if verbose {
         eprintln!("{label} (mixture) completed. Final marginal OFV = {ofv:.4}");
     }
@@ -2653,7 +2710,7 @@ fn run_mcem_mixture(
     Ok(OuterResult {
         params: final_params,
         ofv,
-        converged: objective_converged(ofv),
+        converged,
         n_iterations: n_iter,
         eta_hats,
         h_matrices,
@@ -3669,6 +3726,48 @@ mod tests {
         assert!(!objective_converged(1e35));
         assert!(!objective_converged(1e20));
         assert!(!objective_converged(OFV_DIVERGENCE_CAP));
+    }
+
+    /// #1303: the MCEM exits apply **two** objective rules, and this pins that
+    /// neither is redundant — the trap being that two conditions rejecting the
+    /// same inputs cover for each other, so deleting either leaves the suite
+    /// green and the gate has quietly stopped gating.
+    ///
+    /// The witnesses are disjoint and measured, not reasoned:
+    ///
+    /// * `5e14` — inside #528's `abs() < 1e15` cap, past #1303's one-sided
+    ///   `DIVERGENCE_OFV = 1e14` sentinel cutoff.
+    /// * `-1e16` — past #528's cap, inside the sentinel cutoff, which is
+    ///   deliberately one-sided because a large negative −2 log L is legitimate.
+    ///
+    /// Mutation (run): delete the `gate_converged_on_objective` call from
+    /// `gate_converged_on_mcem_objective` → the `5e14` half fires. Delete the
+    /// `objective_converged` half → the `-1e16` half fires. Neither mutation is
+    /// caught by the other's witness.
+    #[test]
+    fn the_two_mcem_objective_rules_reject_different_runs() {
+        use crate::estimation::outer_optimizer::{ofv_is_valid, NONFINITE_OBJECTIVE_TOKEN};
+
+        // The witnesses separate the two rules — assert that, or the rest of this
+        // test is two copies of one check.
+        assert!(objective_converged(5e14) && !ofv_is_valid(5e14));
+        assert!(!objective_converged(-1e16) && ofv_is_valid(-1e16));
+
+        for ofv in [5e14, -1e16, f64::NAN, 2e20] {
+            let mut converged = true;
+            let msg = gate_converged_on_mcem_objective(&mut converged, ofv)
+                .unwrap_or_else(|| panic!("ofv = {ofv:?} must demote an MCEM verdict"));
+            assert!(!converged, "ofv = {ofv:?}");
+            assert!(
+                msg.contains(NONFINITE_OBJECTIVE_TOKEN),
+                "every demotion carries the classifier's token: {msg}"
+            );
+        }
+
+        // ...and a real MCEM objective is left alone.
+        let mut converged = true;
+        assert!(gate_converged_on_mcem_objective(&mut converged, -249.23).is_none());
+        assert!(converged);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
-    ofv_is_valid, pop_nll_opts, resolve_outer_ftol, OuterResult,
+    gate_converged_on_objective, pop_nll_opts, resolve_outer_ftol, OuterResult,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
@@ -827,12 +827,16 @@ pub fn optimize_trust_region(
     // other diverged value. `is_finite()` is *not* enough — the sentinel is
     // finite — so this uses the same validity cutoff the multi-start ranking
     // applies (`DIVERGENCE_OFV`).
-    let converged = converged && ofv_is_valid(final_ofv);
-    if !converged && warnings.is_empty() {
-        warnings.push(format!(
-            "Trust-region did not converge: the final OFV ({final_ofv:.4e}) is not a valid \
-             population objective — the fit diverged."
-        ));
+    //
+    // #1303 moved the demotion itself into the shared gate, so this engine, the
+    // NLopt and built-in descents, Gauss–Newton, the MCEM family and `fit()`'s
+    // own assembly all apply one rule and emit one message. The local
+    // `warnings.is_empty()` guard the reason used to sit behind went with it: a
+    // trust region that both stalled *and* landed on a `NaN` said only the first,
+    // and the second is the one that invalidates every derived quantity.
+    let mut converged = converged;
+    if let Some(w) = gate_converged_on_objective(&mut converged, final_ofv) {
+        warnings.push(w);
     }
 
     let out = crate::estimation::covariance::run_covariance_step(

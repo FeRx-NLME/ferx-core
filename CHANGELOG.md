@@ -134,6 +134,30 @@ section of the SDLC for the versioning policy).
 ### Fixed
 
 - `method = gn_hybrid` no longer reports a `final_gradient` belonging to the **Gauss-Newton phase** when the FOCEI polish is the result being reported. Whenever the accepted polish had no gradient of its own — reachable with a derivative-free `optimizer` such as the `auto` default on ODE/PD models, or the built-in BFGS — the merge kept the GN phase's vector, so `fit$final_gradient` described the *pre-polish* point while every estimate beside it came from after the polish. It is now the polish's gradient or nothing ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997) review).
+- **A fit whose objective is not a usable number is no longer reported as converged.**
+  `fit()` could return `converged: true` alongside `ofv: NaN` — measured on a population
+  carrying one subject whose timeline could not be ordered, where the `NaN` spreads to the
+  whole population's objective. `converged` is now `false` whenever the reported objective is
+  `NaN`, infinite, or the clamped divergence sentinel, with a new `W_NONFINITE_OBJECTIVE`
+  warning (severity `Critical`, category `convergence`) naming which of the three it is and
+  what to look for. `is_finite()` alone was never enough: a *repelled* fit comes back at a
+  finite `~1e20` sentinel, so the same cutoff the multi-start ranking uses is applied here.
+  The rule is enforced at every place a `(converged, ofv)` pair is published — `fit()` and
+  each estimator's own result, so a tool driving an optimizer directly gets the same verdict —
+  and the parameter estimates, per-subject diagnostics and other warnings are still returned,
+  because they are what a user needs to find the offending record. The one exemption is
+  `method = vi` under the default `vi_final_ofv = none`, which reports `ofv: NaN` deliberately
+  because the ELBO is not a −2 log L; `vi_final_ofv = laplace` is gated like everything else
+  ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
+- The IMP / IMPMAP / SAEM divergence verdict (#528) now *says why*: those methods already
+  refused to call a runaway converged, but demoted the flag silently, so a caller saw
+  `converged: false` with nothing in `warnings` distinguishing it from any other failure
+  ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
+- A fit that stopped for one reason and *also* has an unusable objective now reports both.
+  Previously whichever was noticed first silenced the other, so a run that hit its evaluation
+  budget was told only that — never that its objective was `NaN` and every number derived from
+  it meaningless. The two have different consequences (provisional estimates versus nothing
+  usable at all), so both are reported ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
 - On an **analytical** (`pk ...`) model, an `[individual_parameters]` name that the
   `[structural_model]` line does not bind — an intermediate such as `TVCL = THCL * 3`,
   or a modeled-dose `D{n}` / `R{n}` — is no longer reported as **`CL`'s value**. The
@@ -175,6 +199,19 @@ section of the SDLC for the versioning policy).
   including `RAYON_NUM_THREADS` and caller-configured pools (#1330).
 
 ### Performance
+
+- **FOCEI, Laplace, and `focei` with `n_agq > 1` now build each subject's `EventSchedule`
+  once per outer-loop evaluation instead of once per subject per AGQ node/gradient call.**
+  `cacheable_schedule` gates this on time-varying covariates or `EVID=3/4` resets (its
+  guard is otherwise unchanged), so a fit with only baseline covariates and no resets never
+  allocated a cacheable schedule in the first place and sees no change. Verified bit-identical
+  OFVs against `main` across every configuration tested. Measured on `ci-fast`, single Rayon
+  thread: no resolvable difference on the 24-subject/2-occasion-per-subject Schnider propofol
+  fixture (`tests/schnider_propofol_nonmem.rs`), where schedule construction is a small share
+  of per-eval cost; a synthetic 40-subject/15-occasion-per-subject stress fixture (built to
+  amplify per-subject schedule-construction cost) showed a modest, directionally consistent
+  ~3–6% wall-clock reduction across FOCEI, Laplace, and `focei`+AGQ(n=3). No claim is made
+  beyond that stress scenario (#1345).
 
 - **FOCE, FOCEI, Laplace, and AGQ now reuse prediction and prior-matrix storage across
   repeated conditional-likelihood evaluations.** AGQ also caches invariant Hermite rules;

@@ -4272,13 +4272,22 @@ pub fn run_saem(
         None
     };
 
+    // A finite-but-enormous OFV is the bounded blowup of a runaway, not a
+    // converged fit — guard against it the same way IMP/IMPMAP does, since
+    // SAEM is commonly the first phase of a SAEM→IMP chain (issue #528) — and a
+    // `NaN` one is not a converged fit either (#1303). One shared gate, and it
+    // reports which rule it applied.
+    let mut converged = true;
+    if let Some(w) =
+        crate::estimation::impmap::gate_converged_on_mcem_objective(&mut converged, ofv)
+    {
+        warnings.push(w);
+    }
+
     Ok(OuterResult {
         params: final_params,
         ofv,
-        // A finite-but-enormous OFV is the bounded blowup of a runaway, not a
-        // converged fit — guard against it the same way IMP/IMPMAP does, since
-        // SAEM is commonly the first phase of a SAEM→IMP chain (issue #528).
-        converged: crate::estimation::impmap::objective_converged(ofv),
+        converged,
         n_iterations: n_iter,
         eta_hats,
         h_matrices,

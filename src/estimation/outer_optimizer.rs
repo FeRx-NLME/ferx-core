@@ -849,6 +849,7 @@ fn run_inner_loop_and_nll(
     options: &FitOptions,
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
+    schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -856,11 +857,17 @@ fn run_inner_loop_and_nll(
     Vec<Vec<DVector<f64>>>,
     f64,
 ) {
-    let (etas, h_matrices, stats, kappas, nll, _) =
-        run_inner_loop_and_nll_prepared(model, population, params, options, prev_etas, mu_k, None);
+    let (etas, h_matrices, stats, kappas, nll, _) = run_inner_loop_and_nll_prepared(
+        model, population, params, options, prev_etas, mu_k, None, schedules,
+    );
     (etas, h_matrices, stats, kappas, nll)
 }
 
+/// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
+/// and an optional caller-hoisted schedule cache (see
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
+/// `run_global_presearch` build the cache once per fit and pass it through here on every
+/// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
 #[allow(clippy::type_complexity)]
 fn run_inner_loop_and_nll_prepared(
     model: &CompiledModel,
@@ -870,6 +877,7 @@ fn run_inner_loop_and_nll_prepared(
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
+    schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -879,20 +887,34 @@ fn run_inner_loop_and_nll_prepared(
     Option<crate::estimation::agq::PopulationEvaluation>,
 ) {
     if options.agq_nodes().is_some() {
-        let (etas, h_matrices, stats, kappas) = run_inner_loop_warm(
-            model,
-            population,
-            params,
-            options.inner_maxiter,
-            options.inner_tol,
-            prev_etas,
-            mu_k,
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-        );
+        let (etas, h_matrices, stats, kappas) = match schedules {
+            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_cached(
+                model,
+                population,
+                params,
+                options.inner_maxiter,
+                options.inner_tol,
+                prev_etas,
+                mu_k,
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+                cache,
+            ),
+            None => run_inner_loop_warm(
+                model,
+                population,
+                params,
+                options.inner_maxiter,
+                options.inner_tol,
+                prev_etas,
+                mu_k,
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+            ),
+        };
         let n_nodes = options.agq_nodes().expect("AGQ branch");
-        let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| {
-            crate::estimation::agq::agq_population_evaluate(
+        let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| match schedules {
+            Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
                 model,
                 population,
                 params,
@@ -904,11 +926,25 @@ fn run_inner_loop_and_nll_prepared(
                 options,
                 n_nodes,
                 options.hessian_anchor(),
-            )
+                cache,
+            ),
+            None => crate::estimation::agq::agq_population_evaluate(
+                model,
+                population,
+                params,
+                template,
+                x,
+                &etas,
+                &kappas,
+                bounds,
+                options,
+                n_nodes,
+                options.hessian_anchor(),
+            ),
         });
         let nll = evaluation.as_ref().map_or_else(
-            || {
-                crate::estimation::agq::agq_population_nll(
+            || match schedules {
+                Some(cache) => crate::estimation::agq::agq_population_nll_with_schedules(
                     model,
                     population,
                     params,
@@ -916,23 +952,24 @@ fn run_inner_loop_and_nll_prepared(
                     &kappas,
                     n_nodes,
                     options.hessian_anchor(),
-                )
+                    cache,
+                ),
+                None => crate::estimation::agq::agq_population_nll(
+                    model,
+                    population,
+                    params,
+                    &etas,
+                    &kappas,
+                    n_nodes,
+                    options.hessian_anchor(),
+                ),
             },
             |evaluation| evaluation.nll,
         );
         return (etas, h_matrices, stats, kappas, nll, evaluation);
     }
-    let (etas, h_matrices, stats, kappas, contributions) = run_inner_loop_warm_map(
-        model,
-        population,
-        params,
-        options.inner_maxiter,
-        options.inner_tol,
-        prev_etas,
-        mu_k,
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-        |subject, ebe| {
+    let finish_subject =
+        |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
             subject_nll(
                 model,
                 subject,
@@ -942,8 +979,35 @@ fn run_inner_loop_and_nll_prepared(
                 &ebe.kappas,
                 options.interaction,
             )
-        },
-    );
+        };
+    let (etas, h_matrices, stats, kappas, contributions) = if let Some(cache) = schedules {
+        crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
+            model,
+            population,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            prev_etas,
+            mu_k,
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+            cache,
+            finish_subject,
+        )
+    } else {
+        run_inner_loop_warm_map(
+            model,
+            population,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            prev_etas,
+            mu_k,
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+            finish_subject,
+        )
+    };
     let nll = contributions.iter().sum();
     (etas, h_matrices, stats, kappas, nll, None)
 }
@@ -1131,6 +1195,12 @@ fn run_global_presearch(
     let n_subj = population.subjects.len();
     let n_eta = model.n_eta;
 
+    // Built once for the whole pre-search: every probe below re-solves the same
+    // subjects' schedules, which depend only on `model` + `population` (never on the
+    // trial `params`) — see `run_inner_loop_and_nll_prepared`.
+    let schedule_cache =
+        crate::estimation::inner_optimizer::build_schedule_cache(model, population);
+
     // Probe CRS2-LM availability — some NLopt builds (notably the
     // minimal one in the homebrew nlopt-rs crate) ship without it.
     // Catch the panic so we surface a useful warning instead of
@@ -1180,6 +1250,7 @@ fn run_global_presearch(
             options,
             Some(&cached_zero),
             Some(&mu_k),
+            Some(&schedule_cache),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -1217,6 +1288,7 @@ fn run_global_presearch(
             options,
             Some(&state.cached_etas),
             Some(&mu_k),
+            Some(&schedule_cache),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -1421,6 +1493,113 @@ pub(crate) const DIVERGENCE_OFV: f64 = 1e14;
 /// inner objective clamped).
 pub(crate) fn ofv_is_valid(ofv: f64) -> bool {
     ofv.is_finite() && ofv < DIVERGENCE_OFV
+}
+
+/// **The one exemption from [`gate_converged_on_objective`], named once (#1303).**
+///
+/// `method = vi` with the default `vi_final_ofv = none` reports `ofv = NaN`
+/// *deliberately*: the ELBO is a lower bound on the log likelihood, not a
+/// −2 log L, and [`crate::ViFinalOfv::None`]'s whole argument is that no number
+/// is safer than a number that looks like an OFV and is not one. VI already
+/// warns saying so, and points at `vi.neg_two_elbo` for the bound itself.
+///
+/// So that `NaN` is a *declaration that no objective was published*, not a
+/// failed one, and gating on it would report `converged: false` for every
+/// default VI fit — a false alarm on the common path, and one that
+/// `ferx-tools`' `require_converged` would turn into a rejected search
+/// candidate. The quantity VI converges on (the ELBO trace, plus the final
+/// bound-tightness check that owns `bad_basin_warning`) is checked on its own
+/// terms and is unaffected.
+///
+/// `vi_final_ofv = laplace` publishes a real `2·pop_nll` and is gated like every
+/// other method — so this exempts a *setting*, not an estimator.
+pub(crate) fn publishes_no_objective(method: EstimationMethod, options: &FitOptions) -> bool {
+    method == EstimationMethod::Vi && options.vi_final_ofv == crate::types::ViFinalOfv::None
+}
+
+/// The `W_` token every non-finite-objective demotion carries, so
+/// [`crate::types::classify_warning`] routes it on the token rather than on
+/// prose that a later edit could change out from under it (#1303).
+pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
+
+/// Which way the reported objective failed [`ofv_is_valid`], in the user's words.
+///
+/// The three classes are genuinely different outcomes and the remediation
+/// differs, so the message names which one happened rather than saying
+/// "non-finite" for all of them:
+///
+/// * `NaN` — a prediction, a variance, or a likelihood term went `NaN` and
+///   poisoned the sum. Nothing was optimized; the parameters reported are
+///   wherever the optimizer happened to stop.
+/// * `±inf` — an overflow rather than an indeterminate form.
+/// * the **sentinel** — finite, and the reason `is_finite()` alone is not the
+///   gate. The inner objective clamps a blown-up individual contribution to a
+///   `~1e20` rail, the outer objective doubles it, and an optimizer can report
+///   `Success` sitting on that plateau because every direction looks flat. The
+///   fit was *repelled*, not solved. See [`DIVERGENCE_OFV`].
+pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
+    if ofv.is_nan() {
+        "NaN"
+    } else if ofv.is_infinite() {
+        "infinite"
+    } else {
+        "at the divergence sentinel"
+    }
+}
+
+/// **The gate (#1303).** Demote a convergence verdict the reported objective
+/// does not support, and return the warning saying why (`None` when there is
+/// nothing to demote).
+///
+/// `converged` is the boolean a consumer is most likely to key on — the R
+/// wrapper, `ferx-tools`' model-space search via
+/// [`crate::model_selection::Strictness::require_converged`], an agent reading
+/// the fit YAML — and before this it could be `true` alongside `ofv = NaN`: the
+/// optimizer's stop rule reports on *its* trace, and the objective finally
+/// reported is recomputed at the restored best point, so the two can disagree.
+///
+/// **`is_finite()` is deliberately not the test.** The inner objective clamps a
+/// blown-up value to a finite `~1e20` sentinel and the outer one doubles it, so
+/// a repelled fit comes back finite and an `is_finite()` gate waves it through.
+/// [`ofv_is_valid`] is the shared predicate that closes both halves, and
+/// `ofv_is_valid_rejects_the_clamped_sentinel_not_just_non_finite` pins that.
+///
+/// Called at **every** site that publishes a `(converged, ofv)` pair rather than
+/// at one chokepoint, because each is separately reachable: `ferx-tools` calls
+/// `run_foce_gn` / `run_imp` / `run_bayes` directly (they are public API and
+/// return an [`OuterResult`]), and `fit()`'s own assembly adds the prior penalty
+/// to the objective *after* the last optimizer has returned. The pairing is
+/// pinned by `every_published_convergence_verdict_is_gated_on_its_objective`.
+///
+/// **The verdict coming in is not consulted, only overwritten.** An earlier
+/// version returned early on `!*converged`, so a run the optimizer had already
+/// failed for another reason (budget exhausted, line-search stall) reported
+/// *that* reason and never mentioned the objective. Those are different facts
+/// with different consequences — "stopped early, estimates are provisional"
+/// versus "the objective is not a number, so every quantity derived from it is
+/// meaningless" — and suppressing the second because the first happened to fire
+/// first is exactly backwards. It also meant the typed `details` payload the
+/// `fit()`-level warning carries was never built on the common path, because the
+/// estimator had already demoted the boolean. Callers that can receive the
+/// message twice deduplicate explicitly (`api::fit`'s assembly does).
+pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Option<String> {
+    if ofv_is_valid(ofv) {
+        return None;
+    }
+    *converged = false;
+    Some(format!(
+        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {} ({ofv:?}), so \
+         the run did not converge on a solution of the problem posed and is reported \
+         converged: false whatever the optimizer's own stop rule said. The parameter \
+         estimates are wherever the optimizer stopped, not a minimum, and every quantity \
+         derived from the objective (OFV, AIC, BIC, standard errors, any likelihood-ratio \
+         comparison) is meaningless. Look for the subject or record that poisons the \
+         objective — a non-finite dose time, lagtime, bioavailability or infusion duration, \
+         a covariate model that overflows at an observed covariate value, or a residual \
+         variance driven to zero — and fix the data or the model rather than the optimizer \
+         settings.",
+        nonfinite_objective_reason(ofv)
+    ))
 }
 
 /// Resolve a model's declared parameter priors (#254) against `template`'s
@@ -1750,6 +1929,11 @@ fn optimize_nlopt_once(
     // optimizer minimises the penalized objective, everything user-facing keeps
     // the clean −2LL, and `FitResult` reports the two halves separately.
     let priors = build_prior_set(model, init_params);
+    // Built once for the whole outer optimization: every eval below re-solves the same
+    // subjects' schedules, which depend only on `model` + `population` (never on the
+    // trial `params`) — see `run_inner_loop_and_nll_prepared`.
+    let schedule_cache =
+        crate::estimation::inner_optimizer::build_schedule_cache(model, population);
 
     // Per-element scale factors: present O(1) coordinates to NLopt.
     //
@@ -2020,6 +2204,7 @@ fn optimize_nlopt_once(
                 Some(&state.cached_etas),
                 Some(&mu_k),
                 fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
+                Some(&schedule_cache),
             );
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
@@ -2650,6 +2835,16 @@ fn optimize_nlopt_once(
         (matrix, wall_time_secs, sir_fallback_proposal)
     };
 
+    // #1303. Placed *before* the plain "did not converge" line so a demoted run
+    // carries both: the generic notice a consumer already greps for, and the
+    // specific reason. `final_ofv` is what this `OuterResult` publishes, and it
+    // is recomputed at the restored best point — NLopt can report `Success` on
+    // its own trace and still hand back a `NaN` here (measured on a population
+    // with one unorderable timeline: trace bottoms out at 1e12, `Final OFV =
+    // NaN`), which is exactly the disagreement this closes.
+    if let Some(w) = gate_converged_on_objective(&mut converged, final_ofv) {
+        warnings.push(w);
+    }
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
     }
@@ -2791,6 +2986,7 @@ fn optimize_bfgs(
             options,
             Some(prev_etas),
             Some(&mu_k),
+            None,
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(x);
@@ -2814,6 +3010,7 @@ fn optimize_bfgs(
             options,
             Some(prev_etas),
             Some(&mu_k),
+            None,
         );
         let ofv = 2.0 * nll;
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
@@ -3149,6 +3346,12 @@ fn optimize_bfgs(
     } = out;
     warnings.extend(cov_warnings);
 
+    // #1303 — same gate as the NLopt path above, on this path's own `final_ofv`,
+    // which is likewise recomputed by the final inner loop and can therefore
+    // disagree with the descent's own stop rule.
+    if let Some(w) = gate_converged_on_objective(&mut converged, final_ofv) {
+        warnings.push(w);
+    }
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
     }

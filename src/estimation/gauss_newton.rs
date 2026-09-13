@@ -510,6 +510,17 @@ pub fn run_foce_gn(
         } = out;
         warnings.extend(cov_warnings);
 
+        // #1303: `converged` here is the LM loop's own stop rule (a small
+        // parameter/objective step), which a run whose objective went `NaN`
+        // partway can still satisfy. Gate it on the objective this result
+        // publishes.
+        if let Some(w) = crate::estimation::outer_optimizer::gate_converged_on_objective(
+            &mut converged,
+            gn_ofv_clean,
+        ) {
+            warnings.push(w);
+        }
+
         if verbose {
             eprintln!("FOCE-GN completed. Final OFV = {:.4}", gn_ofv_clean);
         }
@@ -655,6 +666,15 @@ pub fn run_foce_gn(
         sir_fallback_proposal,
     } = out;
     warnings.extend(cov_warnings);
+
+    // #1303 — the hybrid's verdict is `polish_result.converged || converged`, an
+    // OR that can keep a `true` from whichever half did *not* supply `final_ofv`.
+    // Gate on the objective actually published.
+    if let Some(w) =
+        crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, final_ofv)
+    {
+        warnings.push(w);
+    }
 
     if verbose {
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);
