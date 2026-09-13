@@ -868,8 +868,54 @@ pub fn fit(
     }
 }
 
+/// The etas a SAEM run started with these options would actually build a
+/// covariate mu-reference group for (#619) — `run_saem`'s two outer gates
+/// (`mu_referencing`, non-mixture) *and* `resolve_covariate_mu_groups` itself,
+/// which additionally drops a group for weak IIV, a conflicting single-anchor
+/// pair, or an all-`FIX`ed theta list.
+///
+/// Kept as one function because the caller is the pre-run warning assembly in
+/// [`fit_inner`], which must not disagree with what the estimator will do —
+/// mirroring only the two outer gates suppressed the #621 warning for every
+/// group the resolver drops, which is exactly where it is true (#918 review).
+pub(crate) fn saem_active_covariate_group_etas<'m>(
+    model: &'m CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<&'m str> {
+    if !options.mu_referencing || model.mixture.is_some() {
+        return Vec::new();
+    }
+    let split = crate::estimation::saem::classify_mu_ref_pairs(model, &init_params.theta_lower);
+    let conflicts = crate::estimation::saem::mu_ref_pairs_for_cov_groups(&split);
+    let (groups, _notes) = crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
+        model,
+        population,
+        &conflicts,
+        &init_params.theta_fixed,
+        &init_params.omega.matrix,
+    );
+    groups
+        .iter()
+        .filter_map(|g| model.eta_names.get(g.eta_idx).map(String::as_str))
+        .collect()
+}
+
+/// `active_group_etas` names the etas the run about to start will actually
+/// build a covariate mu-reference group for (#619) — the resolved list, not the
+/// parsed one. Group membership is *not* a property of the model: `run_saem`
+/// builds none under `mu_referencing = false` and none for a mixture (the class
+/// draw would have to enter the group's prior term, which has not been
+/// derived), and `resolve_covariate_mu_groups` drops individual groups for weak
+/// IIV, a conflicting single-anchor pair, or an all-`FIX`ed theta list. Reading
+/// the group off `model.covariate_mu_refs` would silence this warning in
+/// exactly the cases where nothing mu-references the parameter — and
+/// `mu_referencing = false` is the case the warning exists for (#621, #918
+/// review). Pass `&[]` where no group runs.
 pub(crate) fn saem_non_mu_referenced_individual_params_warning(
     model: &CompiledModel,
+    active_group_etas: &[&str],
 ) -> Option<String> {
     let mut names = Vec::new();
     for (param_name, &eta_idx) in model.indiv_param_names.iter().zip(model.eta_map.iter()) {
@@ -889,7 +935,11 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
             continue;
         };
-        if !model.mu_refs.contains_key(eta_name) {
+        // A multi-theta typical value (#619) is mu-referenced too: SAEM moves
+        // its thetas through the covariate mu-reference group — but only when
+        // the run builds one for *this* eta.
+        let has_group = active_group_etas.contains(&eta_name.as_str());
+        if !model.mu_refs.contains_key(eta_name) && !has_group {
             names.push(param_name.as_str());
         }
     }
@@ -959,7 +1009,16 @@ fn fit_inner(
     // matters most (#621). This is assembled before the startup banner so verbose
     // runs show it before SAEM begins.
     if chain.iter().any(|&m| m == EstimationMethod::Saem) {
-        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
+        // Resolve the groups the way `run_saem` will — the two gates it applies
+        // first, then `resolve_covariate_mu_groups` itself, which drops a group
+        // for weak IIV, a conflicting single-anchor pair or an all-FIXed theta
+        // list. Mirroring only the two outer gates suppressed this warning for
+        // the dropped groups, which is precisely where it is true (#918 review).
+        let active_group_eta_names =
+            saem_active_covariate_group_etas(model, population, init_params, options);
+        if let Some(w) =
+            saem_non_mu_referenced_individual_params_warning(model, &active_group_eta_names)
+        {
             pre_run_warnings.push(if n_stages > 1 {
                 format!("[SAEM] {w}")
             } else {
@@ -2387,7 +2446,7 @@ fn fit_inner(
             model
                 .mu_refs
                 .get(name)
-                .map(|r| r.log_transformed)
+                .map(|r| r.log_transformed())
                 .unwrap_or(false)
         })
         .collect();
@@ -2408,7 +2467,7 @@ fn fit_inner(
                 model
                     .kappa_mu_refs
                     .get(name)
-                    .map(|r| r.log_transformed)
+                    .map(|r| r.log_transformed())
                     .unwrap_or(false)
             })
             .collect();

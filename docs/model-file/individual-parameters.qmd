@@ -353,7 +353,9 @@ fraction you specify is what the optimiser uses as the typical F:
 
 The alternative form `inv_logit(THETA_F + ETA_F)` is also supported, where
 `THETA_F` is on the logit scale (e.g., `logit(0.70) ≈ 0.847`). This is
-less readable but may be useful when comparing with NONMEM models.
+less readable but may be useful when comparing with NONMEM models — and, as the
+next section explains, it is the form whose typical value SAEM / IMP can update
+in closed form.
 
 ## Automatic MU-referencing
 
@@ -364,9 +366,95 @@ PARAM = THETA * exp(ETA)              # multiplicative / log-normal
 PARAM = THETA * <anything> * exp(ETA) # multiplicative with covariate terms
 PARAM = exp(log(THETA) + ETA)         # canonical MU form
 PARAM = THETA + ETA                   # additive
+PARAM = inv_logit(THETA + ETA)        # logit-normal, THETA on the logit scale
+PARAM = inv_logit(logit(THETA) + ETA) # logit-normal, THETA on the (0,1) scale
+PARAM = 1/(1 + exp(-(THETA + ETA)))   # the same, written out by hand
 ```
 
 ferx records the `(ETA → THETA)` mapping and uses it to re-centre the inner-loop ETA search at each outer iteration — reproducing NONMEM / nlmixr2's MU-referencing behaviour without requiring you to write an explicit `MU_i` line. See the [FAQ](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2) for details on which patterns are and are not detected, and for the `mu_referencing = false` escape hatch.
+
+### Typical values on their own line, and explicit `MU_` variables
+
+Detection also sees through a local variable that is defined earlier in the
+block, as long as that variable is assigned exactly once (never inside an `if`)
+and does not itself contain an ETA. So both of these are recognised, and give
+the same `(ETA_CL → TVCL)` mapping as the one-line forms above:
+
+```
+[individual_parameters]
+  # typical value on its own line
+  TVCL = THETA_CL * (WT/70)^0.75
+  CL   = TVCL * exp(ETA_CL)
+
+  # NONMEM-style explicit MU_ syntax
+  MU_1 = log(THETA_V)
+  V    = exp(MU_1 + ETA_V)
+```
+
+### Logit-normal parameters and the EM estimators {#sec-logit-mu-ref}
+
+SAEM and IMP/IMPMAP update a mu-referenced typical value with the closed-form EM
+step `mu += gamma * mean(eta)`, which is much better conditioned than the numeric
+M-step. That step is applied on the scale the optimiser packs the theta on, so it
+is used only when the packed scale *is* the mu scale:
+
+| Form | mu scale | Closed-form EM step |
+|------|----------|---------------------|
+| `THETA * exp(ETA)` | `log(THETA)` | yes — `THETA` is log-packed (lower bound ≥ 0) |
+| `inv_logit(THETA + ETA)` | `THETA` | yes — a logit-scale `THETA` has a negative lower bound, so it is packed as-is |
+| `inv_logit(logit(THETA) + ETA)` | `logit(THETA)` | no — falls back to the numeric M-step |
+| `THETA + ETA` | `THETA` | no — falls back to the numeric M-step |
+
+Both logit forms are correct and both are mu-referenced; the difference is only
+which one gets the faster, better-behaved M-step. For a bounded parameter that is
+estimated with SAEM or IMP — especially in a model that also has IIV on the
+residual error, where the numeric M-step sees noisy conditional samples — prefer
+
+```
+theta LOGIT_F(-0.477, -10.0, 10.0)   # declared on the logit scale
+
+F = inv_logit(LOGIT_F + ETA_F)       # or 1/(1 + exp(-(LOGIT_F + ETA_F)))
+```
+
+and convert back with `inv_logit(LOGIT_F)` when reporting.
+
+### Covariate models that read several thetas {#sec-covariate-mu-ref}
+
+A typical value built from two or more thetas has no single anchor theta:
+
+```
+CL = (TVCL + (CRCL - 90) * TH_CRCL) * exp(ETA_CL)   # additive covariate
+CL = TVCL * (WT / 70) ^ TH_WT * exp(ETA_CL)           # estimated allometric exponent
+CL = TVCL * exp(TH_AGE * (AGE - 40)) * exp(ETA_CL)    # exponential covariate
+F  = inv_logit(LOGIT_F + TH_SEX * SEX + ETA_F)        # logit-scale covariate
+```
+
+Since [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) the parser records
+each of these as a **covariate mu-reference** — the whole eta-free typical value,
+all the thetas it reads, and the link (`log` for the `* exp(ETA)` and
+`exp(log(A) + ETA)` spellings, logit for `inv_logit(A + ETA)`). SAEM and
+IMP/IMPMAP then re-fit those thetas jointly to the population of individual values
+every iteration, the way NONMEM does for a MU written as a function of several
+thetas (`MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`), instead of leaving the slope
+on the eta-frozen numerical M-step where it used to drift. Local definitions are
+seen through (`TVCL = THETA_CL + TH_CRCL * (CRCL - 90)` then `CL = TVCL *
+exp(ETA_CL)`), as long as the intermediate is assigned once and carries no eta.
+
+The single-anchor forms above are unaffected: a value with exactly one theta keeps
+its plain mu-reference, and a form that also matches one (the allometric power, whose
+anchor is `TVCL`) keeps it alongside the covariate mu-reference for the inner-loop
+centring and reporting. FOCE/FOCEI/Laplace fits do not change. Not recorded: a value
+that reads `TIME` or `MIXNUM`, a second eta, an NN output or θ level block, or a local
+variable assigned inside an `if` — those stay on the numerical M-step, and the SAEM
+warning still names them.
+
+A theta the rest of the model also reads (`CL = (TVCL + TH_X*WT) * exp(ETA_CL)` next
+to `V = TVV + TH_X`) is still estimated by the group, but the M-step keeps the
+observation term: preserving the individual `CL` does not pin `V`, so the data are
+not independent of `TH_X`. ferx detects this and names the theta in a fit warning;
+the only cost is a slower M-step. See the SAEM page for the
+[M-step](../estimation/saem.qmd#saem-mstep-covariate-mu-ref) and its validation
+against NONMEM.
 
 ## Covariate Detection
 

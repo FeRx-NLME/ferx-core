@@ -1,0 +1,566 @@
+Sat Aug 15 12:36:58 AM UTC 2026
+$PROBLEM Logit-normal pathway fraction, SAEM with MU_ referencing -- anchor for ferx logit mu-referencing [#918]
+; Reference SAEM fit for ferx's logit-normal mu-referencing. Parallel dual
+; first-order absorption (fast KA1 / slow KA2) into a 1-cpt central compartment,
+; split by a dose fraction FR1 that carries IIV *on the logit scale*:
+;
+;     FR1_i = 1 / (1 + EXP(-(MU_3 + ETA(3))))  ,  MU_3 = THETA(3)
+;
+; This is the NONMEM-canonical logit mu-reference: THETA(3) is declared on the
+; logit scale, so MU_3 = THETA(3) with no link function, and the SAEM M-step
+; updates it by the closed-form mean-eta shift. ferx detects the same structure
+; automatically from `FR1 = 1/(1+exp(-(LOGIT_FR1 + ETA_FR1)))` (issue #918);
+; before that fix it warned "individual parameter(s) not mu-referenced: FR1" and
+; sent THETA(3) through the numeric M-step instead.
+;
+; The dataset logit_fraction_oral.csv is simulated FROM this model
+; (nonmem_anchor/simulate_logit_fraction_data.py, same truths), so this is a
+; matched (well-specified) fit: NONMEM and ferx should agree AND both recover the
+; data-generating values.
+;
+; Truths: CL=5, V=50, FR1=0.6 (logit 0.405465), KA1=2.0, KA2=0.2,
+;         omega^2 = 0.09 (CL), 0.09 (V), 0.25 (logit FR1), sigma^2 = 0.0064.
+;
+; Identifiability: the two pathways are exchangeable (pathway 1 <-> 2 with
+; FR1 <-> 1-FR1, KA1 <-> KA2). The KA1 > KA2 bounds below (fast vs slow) break
+; that label symmetry; keep the same convention in the ferx fit when comparing.
+
+$INPUT ID TIME DV AMT EVID CMT MDV
+$DATA logit_fraction_oral.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+$MODEL
+  COMP=(DEPOT,DEFDOSE)     ; 1 = inert dose carrier (F1=0); first-order sum feeds central
+  COMP=(CENTRAL,DEFOBS)    ; 2 = central (amount; concentration = A(2)/V)
+
+$PK
+  MU_1 = LOG(THETA(1))
+  MU_2 = LOG(THETA(2))
+  MU_3 = THETA(3)          ; already on the logit scale -- identity link
+
+  CL  = EXP(MU_1 + ETA(1))
+  V   = EXP(MU_2 + ETA(2))
+  FR1 = 1.0/(1.0 + EXP(-(MU_3 + ETA(3))))   ; logit-normal fraction in (0,1)
+  KA1 = THETA(4)           ; fast-pathway absorption rate (1/h)
+  KA2 = THETA(5)           ; slow-pathway absorption rate (1/h)
+
+  FR2 = 1.0 - FR1
+  K20 = CL/V
+
+  ; PODO (last oral dose amount) and TDOS (its time) captured at the dose record;
+  ; NONMEM carries them forward for $DES to read.
+  IF (AMT.GT.0.0.AND.CMT.EQ.1) PODO = AMT
+  IF (AMT.GT.0.0.AND.CMT.EQ.1) TDOS = TIME
+  ; F1=0: no bolus; PODO drives the two first-order inputs in $DES (each pathway's
+  ; integral R_in = FRi*dose, so the total delivered is the dose).
+  F1  = 0.0
+
+$DES
+  TAD = T - TDOS
+  IF (TAD.LE.1.0E-10) TAD = 1.0E-10
+  FO1 = FR1*PODO*KA1*EXP(-KA1*TAD)
+  FO2 = FR2*PODO*KA2*EXP(-KA2*TAD)
+  RIN = FO1 + FO2                ; parallel input rate (dose split FR1 / 1-FR1)
+  DADT(1) = 0.0                  ; depot is an inert dose carrier
+  DADT(2) = RIN - K20*A(2)       ; dual first-order input straight into central
+
+$ERROR
+  IPRED = A(2)/V                 ; central concentration (mg/L)
+  Y = IPRED*(1.0 + EPS(1))       ; proportional residual error
+
+$THETA
+  (0.1,   5.0,  100)    ; 1 CL    (L/h)
+  (5.0,   50.0, 500)    ; 2 V     (L)
+  (-10.0, -0.405465, 10.0) ; 3 LOGIT_FR1   logit of the fast-pathway fraction (start FR1 = 0.4)
+  (0.5,   2.0,  24)     ; 4 KA1   (1/h) fast pathway (bounded > KA2 to break label symmetry)
+  (0.01,  0.2,  0.5)    ; 5 KA2   (1/h) slow pathway
+
+$OMEGA
+  0.09    ; IIV CL
+  0.09    ; IIV V
+  0.25    ; IIV logit FR1
+
+$SIGMA
+  0.0064  ; proportional residual variance (0.08^2)
+
+$ESTIMATION METHOD=SAEM INTERACTION NBURN=2000 NITER=1000 ISAMPLE=10 PRINT=200 SEED=918 NOABORT
+$ESTIMATION METHOD=IMP INTERACTION EONLY=1 NITER=10 ISAMPLE=3000 PRINT=1 SEED=918 NOABORT
+; No $COVARIANCE: this anchor compares point estimates, not standard errors, and
+; printing the R matrix aborts this NONMEM 7.5.1 build on the SAEM+IMP chain.
+$TABLE ID TIME DV IPRED CWRES MDV NOPRINT ONEHEADER FILE=logit_fraction_saem.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:       15 AUG 2026
+Days until program expires : 364
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.5.1
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ Logit-normal pathway fraction, SAEM with MU_ referencing -- anchor for f
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ NO. OF DATA RECS IN DATA SET:     1020
+ NO. OF DATA ITEMS IN DATA SET:   7
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   3
+ MDV DATA ITEM IS DATA ITEM NO.:  7
+0INDICES PASSED TO SUBROUTINE PRED:
+   5   2   4   0   0   0   6   0   0   0   0
+0LABELS FOR DATA ITEMS:
+ ID TIME DV AMT EVID CMT MDV
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ IPRED
+0FORMAT FOR DATA:
+ (7E10.0)
+
+ TOT. NO. OF OBS RECS:      960
+ TOT. NO. OF INDIVIDUALS:       60
+0LENGTH OF THETA:   5
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   3
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0SIGMA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT SIGMA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+  0.1000E+00     0.5000E+01     0.1000E+03
+  0.5000E+01     0.5000E+02     0.5000E+03
+ -0.1000E+02    -0.4055E+00     0.1000E+02
+  0.5000E+00     0.2000E+01     0.2400E+02
+  0.1000E-01     0.2000E+00     0.5000E+00
+0INITIAL ESTIMATE OF OMEGA:
+ 0.9000E-01
+ 0.0000E+00   0.9000E-01
+ 0.0000E+00   0.0000E+00   0.2500E+00
+0INITIAL ESTIMATE OF SIGMA:
+ 0.6400E-02
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    YES
+ PRINTED:                NO
+ HEADERS:               ONE
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                S1PE11.4
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID TIME DV IPRED CWRES MDV
+1DOUBLE PRECISION PREDPP VERSION 7.5.1
+
+ GENERAL NONLINEAR KINETICS MODEL WITH STIFF/NONSTIFF EQUATIONS (LSODA, ADVAN13)
+0MODEL SUBROUTINE USER-SUPPLIED - ID NO. 9999
+0MAXIMUM NO. OF BASIC PK PARAMETERS:   7
+0COMPARTMENT ATTRIBUTES
+ COMPT. NO.   FUNCTION   INITIAL    ON/OFF      DOSE      DEFAULT    DEFAULT
+                         STATUS     ALLOWED    ALLOWED    FOR DOSE   FOR OBS.
+    1         DEPOT        ON         YES        YES        YES        NO
+    2         CENTRAL      ON         YES        YES        NO         YES
+    3         OUTPUT       OFF        YES        NO         NO         NO
+ INITIAL (BASE) TOLERANCE SETTINGS:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+1
+ ADDITIONAL PK PARAMETERS - ASSIGNMENT OF ROWS IN GG
+ COMPT. NO.                             INDICES
+              SCALE      BIOAVAIL.   ZERO-ORDER  ZERO-ORDER  ABSORB
+                         FRACTION    RATE        DURATION    LAG
+    1            *           8           *           *           *
+    2            *           *           *           *           *
+    3            *           -           -           -           -
+             - PARAMETER IS NOT ALLOWED FOR THIS MODEL
+             * PARAMETER IS NOT SUPPLIED BY PK SUBROUTINE;
+               WILL DEFAULT TO ONE IF APPLICABLE
+0DATA ITEM INDICES USED BY PRED ARE:
+   EVENT ID DATA ITEM IS DATA ITEM NO.:      5
+   TIME DATA ITEM IS DATA ITEM NO.:          2
+   DOSE AMOUNT DATA ITEM IS DATA ITEM NO.:   4
+   COMPT. NO. DATA ITEM IS DATA ITEM NO.:    6
+
+0PK SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+ PK SUBROUTINE NOT CALLED AT NONEVENT (ADDITIONAL OR LAGGED) DOSE TIMES.
+0ERROR SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+0ERROR SUBROUTINE INDICATES THAT DERIVATIVES OF COMPARTMENT AMOUNTS ARE USED.
+0DES SUBROUTINE USES COMPACT STORAGE MODE.
+1
+
+
+ #TBLN:      1
+ #METH: Stochastic Approximation Expectation-Maximization
+
+ ESTIMATION STEP OMITTED:                 NO
+ ANALYSIS TYPE:                           POPULATION
+ NUMBER OF SADDLE POINT RESET ITERATIONS:      0
+ GRADIENT METHOD USED:               NOSLOW
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     YES
+ LAPLACIAN OBJ. FUNC.:                    NO
+ NO. OF FUNCT. EVALS. ALLOWED:            528
+ NO. OF SIG. FIGURES REQUIRED:            3
+ INTERMEDIATE PRINTOUT:                   YES
+ ESTIMATE OUTPUT TO MSF:                  NO
+ ABORT WITH PRED EXIT CODE 1:             NO
+ IND. OBJ. FUNC. VALUES SORTED:           NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): logit_fraction_saem.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ EM OR BAYESIAN METHOD USED:                STOCHASTIC APPROXIMATION EXPECTATION MAXIMIZATION (SAEM)
+ MU MODELING PATTERN (MUM):
+ GRADIENT/GIBBS PATTERN (GRD):
+ AUTOMATIC SETTING FEATURE (AUTO):          0
+ CONVERGENCE TYPE (CTYPE):                  0
+ BURN-IN ITERATIONS (NBURN):                2000
+ FIRST ITERATION FOR MAP (MAPITERS):          NO
+ ITERATIONS (NITER):                        1000
+ ANNEAL SETTING (CONSTRAIN):                 1
+ STARTING SEED FOR MC METHODS (SEED):       918
+ MC SAMPLES PER SUBJECT (ISAMPLE):          10
+ RANDOM SAMPLING METHOD (RANMETHOD):        3U
+ EXPECTATION ONLY (EONLY):                  0
+ PROPOSAL DENSITY SCALING RANGE
+              (ISCALE_MIN, ISCALE_MAX):     1.000000000000000E-06   ,1000000.00000000
+ SAMPLE ACCEPTANCE RATE (IACCEPT):          0.400000000000000
+ METROPOLIS HASTINGS SAMPLING FOR INDIVIDUAL ETAS:
+ SAMPLES FOR GLOBAL SEARCH KERNEL (ISAMPLE_M1):          2
+ SAMPLES FOR NEIGHBOR SEARCH KERNEL (ISAMPLE_M1A):       0
+ SAMPLES FOR MASS/IMP/POST. MATRIX SEARCH (ISAMPLE_M1B): 2
+ SAMPLES FOR LOCAL SEARCH KERNEL (ISAMPLE_M2):           2
+ SAMPLES FOR LOCAL UNIVARIATE KERNEL (ISAMPLE_M3):       2
+ PWR. WT. MASS/IMP/POST MATRIX ACCUM. FOR ETAS (IKAPPA): 1.00000000000000
+ MASS/IMP./POST. MATRIX REFRESH SETTING (MASSRESET):      -1
+
+ TOLERANCES FOR ESTIMATION/EVALUATION STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+ TOLERANCES FOR COVARIANCE STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=PREDI
+ RES=RESI
+ WRES=WRESI
+ IWRS=IWRESI
+ IPRD=IPREDI
+ IRS=IRESI
+
+ EM/BAYES SETUP:
+ THETAS THAT ARE MU MODELED:
+   1   2   3
+ THETAS THAT ARE SIGMA-LIKE:
+ 
+
+ MONITORING OF SEARCH:
+
+ Stochastic/Burn-in Mode
+ iteration        -2000  SAEMOBJ=  -3535.1451085733656
+ iteration        -1800  SAEMOBJ=  -4593.2832576271230
+ iteration        -1600  SAEMOBJ=  -4595.0580053356916
+ iteration        -1400  SAEMOBJ=  -4598.9643221760707
+ iteration        -1200  SAEMOBJ=  -4606.0622629801164
+ iteration        -1000  SAEMOBJ=  -4598.5933837931398
+ iteration         -800  SAEMOBJ=  -4602.9547407582968
+ iteration         -600  SAEMOBJ=  -4597.5943877147638
+ iteration         -400  SAEMOBJ=  -4589.0243891445134
+ iteration         -200  SAEMOBJ=  -4606.4966943689597
+ Reduced Stochastic/Accumulation Mode
+ iteration            0  SAEMOBJ=  -4602.6289206616075
+ iteration          200  SAEMOBJ=  -4604.4634639109263
+ iteration          400  SAEMOBJ=  -4604.2654254701283
+ iteration          600  SAEMOBJ=  -4604.2007363710945
+ iteration          800  SAEMOBJ=  -4604.0788744892288
+ iteration         1000  SAEMOBJ=  -4603.9955974827953
+
+ #TERM:
+ STOCHASTIC PORTION WAS NOT TESTED FOR CONVERGENCE
+ REDUCED STOCHASTIC PORTION WAS COMPLETED
+
+ ETABAR IS THE ARITHMETIC MEAN OF THE ETA-ESTIMATES,
+ AND THE P-VALUE IS GIVEN FOR THE NULL HYPOTHESIS THAT THE TRUE MEAN IS 0.
+
+ ETABAR:         2.5790E-06  1.2227E-06  1.9350E-06
+ SE:             3.8373E-02  4.3281E-02  4.5617E-02
+ N:                      60          60          60
+
+ P VAL.:         9.9995E-01  9.9998E-01  9.9997E-01
+
+ ETASHRINKSD(%)  1.0303E+00  1.4486E+00  1.7352E+01
+ ETASHRINKVR(%)  2.0500E+00  2.8761E+00  3.1694E+01
+ EBVSHRINKSD(%)  1.0303E+00  1.4473E+00  1.7354E+01
+ EBVSHRINKVR(%)  2.0500E+00  2.8736E+00  3.1697E+01
+ RELATIVEINF(%)  9.7902E+01  9.6110E+01  6.7561E+01
+ EPSSHRINKSD(%)  8.7472E+00
+ EPSSHRINKVR(%)  1.6729E+01
+
+  
+ TOTAL DATA POINTS NORMALLY DISTRIBUTED (N):          960
+ N*LOG(2PI) CONSTANT TO OBJECTIVE FUNCTION:    1764.3619837529716     
+ OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT:   -4603.9955974827953     
+ OBJECTIVE FUNCTION VALUE WITH CONSTANT:      -2839.6336137298240     
+ REPORTED OBJECTIVE FUNCTION DOES NOT CONTAIN CONSTANT
+  
+ TOTAL EFFECTIVE ETAS (NIND*NETA):                           180
+ NIND*NETA*LOG(2PI) CONSTANT TO OBJECTIVE FUNCTION:    330.81787195368219     
+ OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT:   -4603.9955974827953     
+ OBJECTIVE FUNCTION VALUE WITH CONSTANT:      -4273.1777255291136     
+ REPORTED OBJECTIVE FUNCTION DOES NOT CONTAIN CONSTANT
+  
+ #TERE:
+ Elapsed estimation  time in seconds:  1199.18
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                STOCHASTIC APPROXIMATION EXPECTATION-MAXIMIZATION               ********************
+ #OBJT:**************                        FINAL VALUE OF LIKELIHOOD FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************    -4603.996       **************************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                STOCHASTIC APPROXIMATION EXPECTATION-MAXIMIZATION               ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3      TH 4      TH 5     
+ 
+         5.29E+00  5.57E+01  4.22E-01  2.06E+00  2.23E-01
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1      ETA2      ETA3     
+ 
+ ETA1
++        9.02E-02
+ 
+ ETA2
++        0.00E+00  1.16E-01
+ 
+ ETA3
++        0.00E+00  0.00E+00  1.83E-01
+ 
+
+
+ SIGMA - COV MATRIX FOR RANDOM EFFECTS - EPSILONS  ****
+
+
+         EPS1     
+ 
+ EPS1
++        6.54E-03
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1      ETA2      ETA3     
+ 
+ ETA1
++        3.00E-01
+ 
+ ETA2
++        0.00E+00  3.40E-01
+ 
+ ETA3
++        0.00E+00  0.00E+00  4.28E-01
+ 
+
+
+ SIGMA - CORR MATRIX FOR RANDOM EFFECTS - EPSILONS  ***
+
+
+         EPS1     
+ 
+ EPS1
++        8.09E-02
+ 
+1
+
+
+ #TBLN:      2
+ #METH: Objective Function Evaluation by Importance Sampling
+
+ ESTIMATION STEP OMITTED:                 NO
+ ANALYSIS TYPE:                           POPULATION
+ NUMBER OF SADDLE POINT RESET ITERATIONS:      0
+ GRADIENT METHOD USED:               NOSLOW
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     YES
+ LAPLACIAN OBJ. FUNC.:                    NO
+ NO. OF FUNCT. EVALS. ALLOWED:            528
+ NO. OF SIG. FIGURES REQUIRED:            3
+ INTERMEDIATE PRINTOUT:                   YES
+ ESTIMATE OUTPUT TO MSF:                  NO
+ ABORT WITH PRED EXIT CODE 1:             NO
+ IND. OBJ. FUNC. VALUES SORTED:           NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): logit_fraction_saem.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ EM OR BAYESIAN METHOD USED:                IMPORTANCE SAMPLING (IMP)
+ MU MODELING PATTERN (MUM):
+ GRADIENT/GIBBS PATTERN (GRD):
+ AUTOMATIC SETTING FEATURE (AUTO):          0
+ CONVERGENCE TYPE (CTYPE):                  0
+ ITERATIONS (NITER):                        10
+ ANNEAL SETTING (CONSTRAIN):                 1
+ STARTING SEED FOR MC METHODS (SEED):       918
+ MC SAMPLES PER SUBJECT (ISAMPLE):          3000
+ RANDOM SAMPLING METHOD (RANMETHOD):        3U
+ EXPECTATION ONLY (EONLY):                  1
+ PROPOSAL DENSITY SCALING RANGE
+              (ISCALE_MIN, ISCALE_MAX):     0.100000000000000       ,10.0000000000000
+ SAMPLE ACCEPTANCE RATE (IACCEPT):          0.400000000000000
+ LONG TAIL SAMPLE ACCEPT. RATE (IACCEPTL):   0.00000000000000
+ T-DIST. PROPOSAL DENSITY (DF):             0
+ NO. ITERATIONS FOR MAP (MAPITER):          1
+ INTERVAL ITER. FOR MAP (MAPINTER):         0
+ MAP COVARIANCE/MODE SETTING (MAPCOV):      1
+ Gradient Quick Value (GRDQ):               0.00000000000000
+
+ TOLERANCES FOR ESTIMATION/EVALUATION STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+ TOLERANCES FOR COVARIANCE STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+ TOLERANCES FOR TABLE/SCATTER STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=PREDI
+ RES=RESI
+ WRES=WRESI
+ IWRS=IWRESI
+ IPRD=IPREDI
+ IRS=IRESI
+
+ EM/BAYES SETUP:
+ THETAS THAT ARE MU MODELED:
+   1   2   3
+ THETAS THAT ARE SIGMA-LIKE:
+ 
+
+ MONITORING OF SEARCH:
+
+ iteration            0  OBJ=  -3697.9878613170863 eff.=    3008. Smpl.=    3000. Fit.= 0.97448
+ iteration            1  OBJ=  -3698.1139189819019 eff.=    1183. Smpl.=    3000. Fit.= 0.85986
+ iteration            2  OBJ=  -3698.3213865586722 eff.=    1168. Smpl.=    3000. Fit.= 0.85858
+ iteration            3  OBJ=  -3698.3932416881976 eff.=    1193. Smpl.=    3000. Fit.= 0.86175
+ iteration            4  OBJ=  -3698.7041400106941 eff.=    1213. Smpl.=    3000. Fit.= 0.86423
+ iteration            5  OBJ=  -3698.4711308304250 eff.=    1199. Smpl.=    3000. Fit.= 0.86209
+ iteration            6  OBJ=  -3698.1622656988811 eff.=    1198. Smpl.=    3000. Fit.= 0.86269
+ iteration            7  OBJ=  -3698.2707099783165 eff.=    1199. Smpl.=    3000. Fit.= 0.86279
+ iteration            8  OBJ=  -3698.4716139433685 eff.=    1200. Smpl.=    3000. Fit.= 0.86314
+ iteration            9  OBJ=  -3698.4226586801756 eff.=    1209. Smpl.=    3000. Fit.= 0.86277
+ iteration           10  OBJ=  -3698.4483460261481 eff.=    1199. Smpl.=    3000. Fit.= 0.86239
+
+ #TERM:
+ EXPECTATION ONLY PROCESS WAS NOT TESTED FOR CONVERGENCE
+Stop Time:
+Sat Aug 15 12:58:19 AM UTC 2026

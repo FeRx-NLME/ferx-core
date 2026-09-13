@@ -532,12 +532,12 @@ fn saem_non_mu_referenced_warning_lists_individual_params_with_unmapped_eta() {
         "ETA_CL".into(),
         MuRef {
             theta_name: "TVCL".into(),
-            log_transformed: true,
+            transform: MuTransform::Log,
         },
     );
 
     let warning =
-        saem_non_mu_referenced_individual_params_warning(&model).expect("expected warning");
+        saem_non_mu_referenced_individual_params_warning(&model, &[]).expect("expected warning");
     assert!(warning.contains("not mu-referenced: V."));
     assert!(!warning.contains("not mu-referenced: CL"));
     assert!(!warning.contains("KA"));
@@ -553,18 +553,59 @@ fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
         "ETA_CL".into(),
         MuRef {
             theta_name: "TVCL".into(),
-            log_transformed: true,
+            transform: MuTransform::Log,
         },
     );
     model.mu_refs.insert(
         "ETA_V".into(),
         MuRef {
             theta_name: "TVV".into(),
-            log_transformed: true,
+            transform: MuTransform::Log,
         },
     );
 
-    assert!(saem_non_mu_referenced_individual_params_warning(&model).is_none());
+    assert!(saem_non_mu_referenced_individual_params_warning(&model, &[]).is_none());
+}
+
+/// A covariate mu-reference group (#619) mu-references its eta — but only in a
+/// run that builds one. `run_saem` builds none under `mu_referencing = false`,
+/// and none for a mixture, and those are exactly the runs where the warning has
+/// to survive: reading the group off the model alone would silence it in the
+/// case it exists for (#621).
+#[test]
+fn saem_non_mu_referenced_warning_returns_when_the_run_builds_no_covariate_group() {
+    let src = r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let model = crate::parser::model_parser::parse_model_string(src).expect("model parses");
+    assert_eq!(model.covariate_mu_refs.len(), 1, "CL carries a group");
+    assert!(
+        saem_non_mu_referenced_individual_params_warning(&model, &["ETA_CL"]).is_none(),
+        "a run that builds the group does mu-reference CL"
+    );
+    let w = saem_non_mu_referenced_individual_params_warning(&model, &[])
+        .expect("with no group built, nothing mu-references CL");
+    assert!(w.contains("CL"), "{w}");
+    assert!(
+        !w.contains(" V"),
+        "V keeps its own single-anchor mu-ref: {w}"
+    );
 }
 
 // ── kappa shrinkage ──────────────────────────────────────────────────────
@@ -683,4 +724,125 @@ fn test_eps_shrinkage_ignores_nan_iwres() {
     ];
     let sh = compute_eps_shrinkage(&subjects);
     assert!((sh).abs() < 1e-10, "NaN IWRES not filtered, got {}", sh);
+}
+
+// ── #619 groups the run actually builds (#918 review) ────────────────────
+
+/// `TVCL + (CRCL−90)·TH_CRCL` on `ETA_CL`, with the IIV variance left as a
+/// parameter so the weak-IIV drop can be exercised.
+fn additive_group_model(eta_cl_var: f64) -> crate::types::CompiledModel {
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL(150.0, 0.0, 1000.0)
+  theta TH_CRCL(2.0, 0.0, 50.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ {eta_cl_var}
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+    );
+    crate::parser::model_parser::parse_model_string(&src).expect("model parses")
+}
+
+fn crcl_population() -> Population {
+    use std::io::Write;
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,CRCL\n");
+    for (i, c) in [60.0f64, 90.0, 120.0].iter().enumerate() {
+        let id = i + 1;
+        csv.push_str(&format!("{id},0,0,100,1,1,{c}\n{id},1,5.0,0,0,1,{c}\n"));
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::io::datareader::read_nonmem_csv(f.path(), Some(&["CRCL"]), None).unwrap()
+}
+
+/// The pre-run #621 warning has to ask what the estimator will *do*, not what
+/// the parser found. `resolve_covariate_mu_groups` drops a group whose eta has
+/// negligible IIV, and then nothing mu-references `CL` — so the warning must
+/// fire, exactly as it does when `mu_referencing` is off.
+///
+/// The healthy-IIV arm is the straddle: same model, same code path, group
+/// alive, no warning. Without it a fix that returned `&[]` unconditionally
+/// would pass.
+#[test]
+fn saem_active_covariate_group_etas_drops_a_weak_iiv_group() {
+    let pop = crcl_population();
+    let options = FitOptions {
+        mu_referencing: true,
+        ..Default::default()
+    };
+
+    let healthy = additive_group_model(0.2);
+    assert_eq!(
+        healthy.covariate_mu_refs.len(),
+        1,
+        "premise: parsed a group"
+    );
+    let etas = saem_active_covariate_group_etas(&healthy, &pop, &healthy.default_params, &options);
+    assert_eq!(etas, vec!["ETA_CL"], "a healthy group is built");
+    assert!(
+        saem_non_mu_referenced_individual_params_warning(&healthy, &etas).is_none(),
+        "CL is mu-referenced through the group"
+    );
+
+    // ω² = 1e-4 is below WEAK_GROUP_IIV_VAR (1e-3).
+    let weak = additive_group_model(0.0001);
+    assert_eq!(weak.covariate_mu_refs.len(), 1, "premise: still parsed");
+    let etas = saem_active_covariate_group_etas(&weak, &pop, &weak.default_params, &options);
+    assert!(
+        etas.is_empty(),
+        "the resolver drops it for negligible IIV, got {etas:?}"
+    );
+    let w = saem_non_mu_referenced_individual_params_warning(&weak, &etas)
+        .expect("with no group built, nothing mu-references CL");
+    assert!(w.contains("CL"), "{w}");
+    assert!(
+        !w.contains(" V"),
+        "V keeps its own single-anchor mu-ref: {w}"
+    );
+}
+
+/// The two outer gates `run_saem` applies before it resolves anything.
+#[test]
+fn saem_active_covariate_group_etas_honours_the_two_outer_gates() {
+    let pop = crcl_population();
+    let m = additive_group_model(0.2);
+
+    let off = FitOptions {
+        mu_referencing: false,
+        ..Default::default()
+    };
+    assert!(
+        saem_active_covariate_group_etas(&m, &pop, &m.default_params, &off).is_empty(),
+        "no group under mu_referencing = false"
+    );
+
+    let mut mixture = additive_group_model(0.2);
+    mixture.mixture = Some(crate::types::MixtureSpec {
+        n_classes: 2,
+        mixing: Vec::new(),
+        logit_covariates: Vec::new(),
+        omega_overrides: Vec::new(),
+        sigma_overrides: Vec::new(),
+        mu_refs: Vec::new(),
+    });
+    let on = FitOptions {
+        mu_referencing: true,
+        ..Default::default()
+    };
+    assert!(
+        saem_active_covariate_group_etas(&mixture, &pop, &mixture.default_params, &on).is_empty(),
+        "no group under a mixture"
+    );
 }

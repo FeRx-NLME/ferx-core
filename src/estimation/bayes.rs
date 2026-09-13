@@ -487,7 +487,7 @@ pub fn run_bayes(
     let mut mu_pairs: Vec<Option<usize>> = vec![None; n_eta];
     for (ei, ename) in model.eta_names.iter().enumerate() {
         if let Some(mr) = model.mu_refs.get(ename) {
-            if mr.log_transformed {
+            if mr.log_transformed() {
                 if let Some(ti) = model.theta_names.iter().position(|t| t == &mr.theta_name) {
                     mu_pairs[ei] = Some(ti);
                 }

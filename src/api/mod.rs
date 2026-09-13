@@ -100,7 +100,8 @@ pub(crate) use adaptive::{
 };
 #[cfg(test)]
 pub(crate) use fit::{
-    multistart_prefers, perturb_init, saem_non_mu_referenced_individual_params_warning,
+    multistart_prefers, perturb_init, saem_active_covariate_group_etas,
+    saem_non_mu_referenced_individual_params_warning,
 };
 #[cfg(test)]
 pub(crate) use output_columns::build_indiv_map;

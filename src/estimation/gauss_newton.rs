@@ -2118,6 +2118,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
@@ -2293,7 +2294,7 @@ mod tests {
                 "ETA_CL".to_string(),
                 crate::types::MuRef {
                     theta_name: "TVCL".to_string(),
-                    log_transformed: true,
+                    transform: MuTransform::Log,
                 },
             );
             m
@@ -3183,6 +3184,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
@@ -3480,6 +3482,7 @@ mod tests {
             kappa_init_as_sd: vec![false],
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
@@ -3651,7 +3654,7 @@ mod tests {
                 "ETA_CL".to_string(),
                 crate::types::MuRef {
                     theta_name: "TVCL".to_string(),
-                    log_transformed: true,
+                    transform: MuTransform::Log,
                 },
             );
             m
