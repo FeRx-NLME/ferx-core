@@ -217,9 +217,11 @@ random 610.741, iiv 594.431.
 
 ### Strictness (`check_strictness`)
 
-`FitResult::converged` is a bool. It does not distinguish a genuine optimum from
-an init stall (#751), a boundary estimate, an ill-conditioned covariance step or
-a near-singular correlation matrix. Under automation every one of those becomes
+`FitResult::converged` is a bool. It is never `true` at an objective that is not
+a usable number — `NaN`, infinite, or the clamped divergence sentinel all report
+`converged: false` with a `W_NONFINITE_OBJECTIVE` warning (#1303) — but it does
+not distinguish a genuine optimum from an init stall (#751), a boundary estimate,
+an ill-conditioned covariance step or a near-singular correlation matrix. Under automation every one of those becomes
 a *model-selection error*: a candidate that never left its initial estimates is
 ranked on an OFV that says nothing about the model. `Strictness` is the
 pyDarwin-style gate, and the verdict carries the *reasons*, so a search report
@@ -242,7 +244,7 @@ if !verdict.passed {
 
 | field | default | fails when |
 |---|---|---|
-| `require_converged` | `true` | `converged == false` (also covers an internal runaway-guard hit, which demotes `converged`) |
+| `require_converged` | `true` | `converged == false` — which also covers an internal runaway-guard hit, and a [non-finite objective](../warnings.qmd#non-finite-objective) (`NaN`, infinite, or the clamped divergence sentinel), both of which demote `converged` |
 | `require_covariance` | `false` | the covariance step did not run or failed. A SIR fallback that delivered credible intervals is accepted — unless its importance weights collapsed onto a single draw (Kish ESS below 2, every interval of zero width), which fails like a failed step; an accepted fallback stores no matrix, so the threshold gates below then report `skipped` |
 | `max_condition_number` | `Some(1000)` | `cov_condition_number` exceeds it (∞ for a singular correlation matrix) |
 | `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ, read on the natural scale (a `block_omega` / block-κ segment is mapped off its Cholesky coordinates by the delta method first, so the number is the ω correlation NONMEM's `.cor` would show — the layout comes from `FitResult::omega_is_diagonal` / `kappa_is_diagonal`, and a bundle saved before those were recorded is read as stored); the offending pair is named by its packed coordinate (`CL ~ log_chol_ETA_CL`) |

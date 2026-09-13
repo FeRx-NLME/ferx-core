@@ -47,7 +47,7 @@ a code never moves between groups in a way that changes its `category` string.
 
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
-| `convergence` | Critical | Optimizer did not converge. | Reject; adjust inits / method / bounds and refit. |
+| `convergence` | Critical | Optimizer did not converge, **or** (`W_NONFINITE_OBJECTIVE`) the objective at the final estimates is `NaN`, infinite, or the clamped divergence sentinel. | Reject; adjust inits / method / bounds and refit. For `W_NONFINITE_OBJECTIVE`, first find the record or parameter that poisons the objective — see [A non-finite objective](#non-finite-objective). |
 | `covariance_failed` | Critical | Covariance step failed — no standard errors. | SEs unavailable — try `covariance_fallback = sir` or refit with different inits. |
 | `covariance_regularized` | Warning | Covariance step succeeded but was regularized / degraded. | SEs may be over-optimistic — inspect eigenvalues; consider SIR intervals. |
 | `covariance_step` | Info | Covariance-step informational note (e.g. evaluation cost). | None. |
@@ -117,6 +117,72 @@ a code never moves between groups in a way that changes its `category` string.
 | `ode_solver` | Warning / Info | The ODE solver's own health at the final estimates (#1080). **Warning** when steps clamped at the minimum step size (a stability-limited segment whose un-integrated tail is freeze-padded), when a segment stopped before its requested end, when `ode_stiff_abort_after` cut segments short, or when `ode_method = auto` discarded an escalation and re-solved it explicitly — including when only its **analytic derivatives** overflowed, its values staying finite — and when that re-solve failed too. Also **Warning** when a prediction walk was abandoned *before integrating* because the subject's timeline could not be ordered — a `NaN` or infinite dose time, lagtime, route lag, or infusion duration (#1234). That case is the only one here whose predictions are `NaN` rather than merely inaccurate, and it leaves every step counter at zero, so it is reported by its own counter (`abandoned_non_finite_timeline`) rather than inferred from the others. **Info** when `auto` escalated and everything worked (a separate `W_ODE_SOLVER_ESCALATION_NOTE` token, so the severity survives re-classification) — routine on a stiff model, but a decision you never asked for and cannot otherwise see. Both severities report how many segments changed stepper **part-way through** (`ode_auto_switch`, default on): steps before a switch were taken by a different method than those after. | A rejected escalation means the probe was right about the stiffness and wrong about the method: name `ode_method = rodas5p` (or `rosenbrock23`). Non-zero `auto_stiff_rejected_jets` is the exception: the method worked, the *sensitivities* overflowed — check units and scaling, not `ode_method`. Non-zero `auto_fallback_failed`: neither attempt gave a usable trajectory; do not trust the fit. Clamps with no rejection mean the explicit stepper is stability-limited — try a stiff method, or loosen `ode_reltol` / `ode_abstol`. Non-zero `abandoned_non_finite_timeline` is not a solver setting at all: some subject's timeline is unorderable, so check the dose records and any exponential covariate model on `ALAG` / `F` / `D` / `R` for a value that overflows at typical covariates. |
 | `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
 
+## A non-finite objective {#non-finite-objective}
+
+`converged` is the field most consumers branch on, so it is never `true` at an
+objective that is not a usable number. Whenever the reported OFV is `NaN`,
+infinite, or the clamped divergence sentinel, the fit comes back with
+`converged: false` and a `W_NONFINITE_OBJECTIVE` warning saying which of the
+three it was.
+
+`is_finite()` is deliberately **not** the test. A *repelled* fit — one the
+optimizer walked into a region where an individual contribution blows up — is
+clamped to a finite `~1e20` sentinel, so it would pass a finiteness check while
+being no more a solution than a `NaN` is. The threshold is `1e14`, far above any
+legitimate population OFV (real −2 log L values reach at most ~10⁶–10⁷ even for
+very large cohorts) and far below the sentinel. The cutoff is one-sided: a large
+*negative* objective is legitimate on log-transformed data.
+
+### What it means for the result
+
+The parameter estimates, per-subject diagnostics and remaining warnings are
+still returned — they are what you need in order to find the offending record —
+but nothing derived from the objective is meaningful: the OFV, AIC, BIC, the
+standard errors, and any likelihood-ratio comparison against another model.
+Treat the run as failed.
+
+A single bad subject is enough. The objective is a sum over subjects, so one
+`NaN` contribution destroys it for the whole population, including subjects that
+fitted perfectly well.
+
+### What to look for
+
+The usual causes, in rough order of how often they turn up:
+
+* a non-finite **dose time**, `lagtime`/`ALAG{n}`, bioavailability `F{n}`,
+  infusion duration `D{n}` or rate `R{n}` in the data or produced by the
+  parameter model;
+* a covariate model that **overflows** at an observed covariate value — `exp()`
+  is not clamped in the DSL, so `ALAG1 = TVLAG * exp(WT)` on an unscaled weight
+  reaches `+inf`;
+* a residual variance driven to zero, making the individual likelihood infinite;
+* a prior (`prior(...)`) whose penalty overflows at the final estimates — the
+  reported OFV is `ofv_data + ofv_prior`, so the likelihood half can be perfectly
+  finite while the published total is not. `ofv_data` and `ofv_prior` are
+  reported separately, which tells the two apart immediately.
+
+If the model also carries a `W_ODE_SOLVER_DIAGNOSTICS` warning with a non-zero
+`abandoned_non_finite_timeline`, that is the first place to look: it means a
+subject's timeline could not be ordered and its predictions are `NaN` by
+construction.
+
+### The one exception
+
+`method = vi` with the default `vi_final_ofv = none` reports `ofv: NaN` on
+purpose — the ELBO is a lower bound on the log likelihood, not a −2 log L, and
+reporting no number is safer than reporting one that looks like an OFV and is
+not. That is a declaration that no objective was published rather than a failed
+one, so it does not demote `converged`, and VI warns separately saying so. Set
+`vi_final_ofv = laplace` to get a real objective; it is then gated like every
+other method's.
+
+The exemption follows the objective, not the position in a method chain. A
+trailing `imp_eval_only` readout (`methods = [vi, imp]`, the recommended way to
+finish a VI fit) reports its importance-sampled −2 log L under
+`importance_sampling` and leaves VI's `NaN` in `ofv`, so that fit stays exempt.
+A trailing `agq_eval_only` readout instead *replaces* `ofv` with its quadrature
+marginal, so that objective is gated — it is a real number that can fail.
+
 ## Details payloads {#details}
 
 Numeric diagnostics **may** carry a `details` object with the value behind the
@@ -135,6 +201,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"` or `"at the divergence sentinel"`), `divergence_cutoff` (the sentinel threshold, `1e14`), `method` (the stage that produced the objective) |
 | `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
 | `condition_number` | `condition_number` |
 
@@ -151,6 +218,12 @@ Treat `details` as optional: check for its presence rather than assuming it.
 A code omits the `details` key entirely (Rust field `None`) when it has no
 associated stored statistic, or when any contributing statistic is non-finite
 (`NaN`/`±Inf` — e.g. the condition number of a near-singular parameter space).
+
+`W_NONFINITE_OBJECTIVE` is the exception to that second rule rather than an
+instance of it: the offending value *is* the payload, so a non-finite `ofv` is
+carried as the string `"NaN"` / `"inf"` / `"-inf"` (JSON has no non-finite
+numbers) instead of dropping the key. Only `convergence` warnings raised by this
+check carry `details`; a plain "did not converge" carries none.
 
 ## How codes are assigned
 

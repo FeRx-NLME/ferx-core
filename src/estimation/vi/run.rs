@@ -1099,6 +1099,24 @@ pub fn run_vi(
         superseded_by: None,
     };
 
+    // #1303. Gated like every other estimator, *except* under the default
+    // `vi_final_ofv = none`, where the `NaN` above is VI declaring that it
+    // published no objective rather than failing to reach one — see
+    // `publishes_no_objective`, which owns that exemption. Under
+    // `vi_final_ofv = laplace` the objective is a real `2·pop_nll` and a `NaN`
+    // there means the same thing it means everywhere else.
+    let objective_gate = if crate::estimation::outer_optimizer::publishes_no_objective(
+        crate::types::EstimationMethod::Vi,
+        options,
+    ) {
+        None
+    } else {
+        crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, ofv)
+    };
+    if let Some(w) = objective_gate {
+        warnings.push(w);
+    }
+
     Ok(OuterResult {
         params: final_params,
         ofv,

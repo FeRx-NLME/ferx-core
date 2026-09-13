@@ -6146,6 +6146,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // methods and quotes counters, and "did not converge" style prose could plausibly be
         // added to it later without anyone remembering this chain exists.
         (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_nonfinite_objective") {
+        // #1303: the convergence verdict was demoted because the objective at
+        // the final estimates is `NaN`, infinite, or the clamped divergence
+        // sentinel. Matched on its `W_` token and placed with the other token
+        // arms, ahead of every prose arm — the message quotes the offending
+        // value and lists candidate causes ("infusion duration", "residual
+        // variance", …), any of which a later edit could grow into a phrase a
+        // prose arm below claims. Same `(Critical, Convergence)` verdict the
+        // prose arm gives, reached deterministically.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")

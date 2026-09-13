@@ -131,6 +131,30 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A fit whose objective is not a usable number is no longer reported as converged.**
+  `fit()` could return `converged: true` alongside `ofv: NaN` — measured on a population
+  carrying one subject whose timeline could not be ordered, where the `NaN` spreads to the
+  whole population's objective. `converged` is now `false` whenever the reported objective is
+  `NaN`, infinite, or the clamped divergence sentinel, with a new `W_NONFINITE_OBJECTIVE`
+  warning (severity `Critical`, category `convergence`) naming which of the three it is and
+  what to look for. `is_finite()` alone was never enough: a *repelled* fit comes back at a
+  finite `~1e20` sentinel, so the same cutoff the multi-start ranking uses is applied here.
+  The rule is enforced at every place a `(converged, ofv)` pair is published — `fit()` and
+  each estimator's own result, so a tool driving an optimizer directly gets the same verdict —
+  and the parameter estimates, per-subject diagnostics and other warnings are still returned,
+  because they are what a user needs to find the offending record. The one exemption is
+  `method = vi` under the default `vi_final_ofv = none`, which reports `ofv: NaN` deliberately
+  because the ELBO is not a −2 log L; `vi_final_ofv = laplace` is gated like everything else
+  ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
+- The IMP / IMPMAP / SAEM divergence verdict (#528) now *says why*: those methods already
+  refused to call a runaway converged, but demoted the flag silently, so a caller saw
+  `converged: false` with nothing in `warnings` distinguishing it from any other failure
+  ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
+- A fit that stopped for one reason and *also* has an unusable objective now reports both.
+  Previously whichever was noticed first silenced the other, so a run that hit its evaluation
+  budget was told only that — never that its objective was `NaN` and every number derived from
+  it meaningless. The two have different consequences (provisional estimates versus nothing
+  usable at all), so both are reported ([#1303](https://github.com/FeRx-NLME/ferx-core/issues/1303)).
 - On an **analytical** (`pk ...`) model, an `[individual_parameters]` name that the
   `[structural_model]` line does not bind — an intermediate such as `TVCL = THCL * 3`,
   or a modeled-dose `D{n}` / `R{n}` — is no longer reported as **`CL`'s value**. The

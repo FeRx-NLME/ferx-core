@@ -247,6 +247,11 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 ### Key Fields
 
+- **converged**: whether the run reached a solution of the problem posed. It is
+  never `true` at an objective that is not a usable number — `NaN`, infinite, or
+  the clamped divergence sentinel all report `converged: false` with a
+  `W_NONFINITE_OBJECTIVE` warning saying which. See [A non-finite
+  objective](warnings.qmd#non-finite-objective).
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
