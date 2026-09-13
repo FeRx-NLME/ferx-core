@@ -104,8 +104,6 @@ pub(crate) use fit::{
     saem_non_mu_referenced_individual_params_warning,
 };
 #[cfg(test)]
-pub(crate) use output_columns::build_indiv_map;
-#[cfg(test)]
 pub(crate) use pool::{cap_default_threads, default_thread_count, effective_default_threads};
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -176,8 +174,8 @@ const OUTPUT_MANDATORY: &[&str] = &[
 mod multistart_prefers_tests;
 
 #[cfg(test)]
-#[path = "tests/build_indiv_map_tests.rs"]
-mod build_indiv_map_tests;
+#[path = "tests/indiv_param_values_tests.rs"]
+mod indiv_param_values_tests;
 
 #[cfg(test)]
 #[path = "tests/quiet_fit_tests.rs"]

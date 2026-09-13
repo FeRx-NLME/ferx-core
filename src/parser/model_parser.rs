@@ -17346,6 +17346,10 @@ fn build_pk_param_fn(
         n_eta: n_eta_extended,
         cov_names: cov_names_for_lookup.clone(),
         uses_time_builtin,
+        // `all_var_names` starts as a copy of `var_names` (= `indiv_param_names`)
+        // and only appends if-body names after it, so this prefix length is exactly
+        // the top-level individual parameters (#1356).
+        n_top_level_vars: vars_in_order.len(),
     };
 
     // Snapshot the NN handles into the closure. Empty when no
@@ -21896,6 +21900,17 @@ pub struct IndivParamProgram {
     /// Whether `[individual_parameters]` or a direct analytical `pk(...=TIME)`
     /// mapping reads the event-time built-in.
     uses_time_builtin: bool,
+    /// How many leading var slots are top-level individual parameters, i.e. the
+    /// length of `CompiledModel::indiv_param_names`.
+    ///
+    /// `build_pk_param_fn` lays the evaluator's var slots out with the top-level
+    /// names first, in `indiv_param_names` order, and appends only the extra names
+    /// assigned inside `if`/`else` bodies after them. So var slot `i < this` is the
+    /// value of `indiv_param_names[i]` — the one lookup that is correct for *every*
+    /// name on both engines, including an intermediate that `pk_indices` can only
+    /// point at the `CL` slot for (#1356). [`eval_param_values`](Self::eval_param_values)
+    /// is the reader; `indiv_param_values_are_var_slot_ordered` pins the layout.
+    n_top_level_vars: usize,
 }
 
 impl IndivParamProgram {
@@ -22046,6 +22061,53 @@ impl IndivParamProgram {
             &dynamic,
         );
         vars.iter().map(|d| d.value).collect()
+    }
+
+    /// Evaluate every top-level `[individual_parameters]` name in plain `f64`,
+    /// returning one value per `CompiledModel::indiv_param_names` entry, in
+    /// declaration order (#1356).
+    ///
+    /// This is the value lookup `PkParams.values[pk_indices[i]]` cannot be: on an
+    /// analytical model a name that is not bound on the `[structural_model]` line
+    /// and not referenced by a readout has no PK slot of its own, so `pk_indices[i]`
+    /// is a placeholder `0` and that read returns `CL`'s value for it. The values
+    /// come straight off the evaluator's var slots instead, which every name has.
+    ///
+    /// Runs the *same* statements through the *same* evaluator the `pk_param_fn`
+    /// closure uses, so a name that does have a slot gets a bit-identical value on
+    /// both routes (`indiv_param_values_match_pk_slot_reads` pins that).
+    ///
+    /// `nn_outputs` is the per-`[covariate_nn]` forward output, in block order;
+    /// pass an empty slice for a model with no networks. `time` feeds the `TIME`
+    /// built-in (#610) and is ignored by a program that does not read it.
+    pub(crate) fn eval_param_values(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+        nn_outputs: &[Vec<f64>],
+    ) -> Vec<f64> {
+        let _time_guard = self.uses_time_builtin.then(|| ModelTimeGuard::enter(time));
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![0.0f64; self.n_vars];
+        let mut stack: Vec<f64> = Vec::new();
+        eval_statements_indexed_with_stack(
+            &self.stmts,
+            theta,
+            eta,
+            &cov_vec,
+            &mut vars,
+            None,
+            nn_outputs,
+            &mut stack,
+        );
+        vars.truncate(self.n_top_level_vars);
+        vars
     }
 
     /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**

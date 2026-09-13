@@ -23,7 +23,16 @@ section of the SDLC for the versioning policy).
 
 - **A gradient at the solution for derivative-free fits**, so `converged` is checkable on the runs where it matters most. When the outer optimizer supplies no gradient of its own — `bobyqa`, which is what `optimizer = auto` picks for ODE/PD, LTBS/SDE and `gradient = fd` models — ferx now computes a central finite-difference gradient of the same objective at the reported estimates and reports it as `final_gradient`, with a new `final_gradient_source` field (`"optimizer"` or `"finite_difference"`) saying which kind it is. Previously `final_gradient` was `NULL` for exactly the optimizer where a premature stop is most likely, so `converged = true` was unfalsifiable. The EBEs are re-solved inside the stencil, so it is the gradient of the marginal objective, not a fixed-EBE approximation. It is a reporting quantity only — it never steers the optimizer and the estimates are bit-identical either way — and costs `2 × n_free` objective evaluations, one gradient's worth. New `[fit_options]` key `report_final_gradient` (default `true`) turns it off ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997)).
 - **A `stalled_at_init` warning** when a fit never left its initial estimates — no free THETA, OMEGA or SIGMA coordinate moved — so the reported objective is the objective *of the initial values* and says nothing about the model. This most often arrives alongside `converged: true`, since a fit that never moved has a perfectly flat objective trace to plateau on, which is why it is its own warning code rather than a convergence one. The underlying predicate (`stalled_at_init`) already existed for model-selection strictness; it is now surfaced on every fit alongside `boundary_estimate` ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997)).
-
+- `CompiledModel::indiv_param_values` and `CompiledModel::indiv_param_value_map` — read
+  every `[individual_parameters]` value **by name**, at a given `(theta, eta, covariates,
+  time)`. This is the supported way to get an individual parameter's value; the previous
+  `PkParams.values[pk_indices[i]]` idiom maps to the PK slots the engine consumes and
+  returns the wrong number for any analytical name that has no slot of its own. The map
+  form drops the parser-internal `__ferx_ro_*` / `__ferx_pktime_*` parameters, so a
+  consumer no longer has to carry its own copy of that prefix list. Both take the
+  `MIXNUM` subpopulation to evaluate under, so a mixture model can be read at a
+  subject's own fitted class rather than always at class 1
+  ([#1356](https://github.com/FeRx-NLME/ferx-core/issues/1356)).
 - **Per-parameter priors for penalized maximum-likelihood (MAP) estimation**, declared inline as `prior(value, rse = 25%)` on any `theta`, `omega`, `sigma` or `kappa` — the simple alternative to NONMEM `$PRIOR`, with no separate prior problem and no matrices. The fit reports the data and prior halves of the OFV separately plus a per-parameter shift-toward-prior summary; AIC/BIC stay on the data half, and the prior's curvature reaches the reported standard errors and the SIR intervals. Applies to `foce`, `focei`, `laplace`, `gn` and `gn_hybrid`; a chain whose last estimating stage cannot apply priors, and an `S`-based covariance estimator (`covariance_method = s` or `rsr`, neither of which can represent one), are refused rather than run unpenalized. The θ prior is anchored against NONMEM `$PRIOR NWPRI` (#254).
 - **`[priors] from_fit = "<previous fit>"`** — build the priors for a model update from a previous ferx run in one line, instead of transcribing a parameter table by hand. Every θ, Ω diagonal, Σ and κ the source run reports with a usable standard error, and whose name and family match a `[parameters]` declaration in the new model, becomes `prior(estimate, rse = SE/estimate)` on the new model's declared scale — variance-vs-`(sd)` conversions included. Reads `{model}-fit.yaml`, `{model}-fit.json` or a `.fitrx` bundle; a relative path resolves against the model file's directory, like `[data] path`, and the file is read once when the model is parsed, so a bad path is refused by `ferx check` rather than surfacing mid-fit. Matching is on name **and** family, so a model carrying both `theta CL` and `omega CL` imports each onto the right one. An inline `prior(...)` on the same parameter wins, parameters that cannot be imported are listed in the fit's warnings, and an import that lands nothing at all is refused rather than run unpenalized. See `examples/warfarin_update.ferx` (#254).
 - `ParameterPrior::kind` records which `[parameters]` family a prior was declared on, so a `prior(...)` still resolves in a model that reuses one name across two families (`theta CL` alongside `omega CL`) instead of being refused as ambiguous (#254).
@@ -125,7 +134,18 @@ section of the SDLC for the versioning policy).
 ### Fixed
 
 - `method = gn_hybrid` no longer reports a `final_gradient` belonging to the **Gauss-Newton phase** when the FOCEI polish is the result being reported. Whenever the accepted polish had no gradient of its own — reachable with a derivative-free `optimizer` such as the `auto` default on ODE/PD models, or the built-in BFGS — the merge kept the GN phase's vector, so `fit$final_gradient` described the *pre-polish* point while every estimate beside it came from after the polish. It is now the polish's gradient or nothing ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997) review).
-
+- On an **analytical** (`pk ...`) model, an `[individual_parameters]` name that the
+  `[structural_model]` line does not bind — an intermediate such as `TVCL = THCL * 3`,
+  or a modeled-dose `D{n}` / `R{n}` — is no longer reported as **`CL`'s value**. The
+  sdtab `[output]` column, any `[derived]` expression that reads the name, and the
+  ferx-r `individual_estimates` table all took the value from the name's PK *slot*,
+  and such a name has no slot of its own, so the lookup silently aliased `CL`. Under
+  the common `CL = TVCL * exp(ETA_CL)` the two coincide at η = 0, which is why an
+  sdtab eyeball rarely caught it; the bundled `examples/tte_exponential.ferx` showed
+  it plainly, reporting `LAMBDA` as `DUMMY_CL`. ODE and compartment-free models were
+  never affected. Values now come from the parameter's own name via the new
+  `CompiledModel::indiv_param_values` / `indiv_param_value_map`
+  ([#1356](https://github.com/FeRx-NLME/ferx-core/issues/1356)).
 - A typical value used as the mu-reference anchor of **more than one** random effect
   (`F1 = inv_logit(LOGIT_F + ETA_F1)` alongside `F2 = inv_logit(LOGIT_F + ETA_F2)`, or
   the lognormal `CL = TVP*exp(ETA_CL)` / `V = TVP*exp(ETA_V)`) is now estimated by the
