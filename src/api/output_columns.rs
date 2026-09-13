@@ -134,9 +134,9 @@ pub(crate) fn compute_extra_output_columns(
         .collect();
 
     for (si, sr) in subjects.iter_mut().enumerate() {
-        let _mix_guard = mixest
-            .and_then(|m| m.get(si))
-            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+        // `MIXNUM` is 1-based; `mixest` is the 0-based fitted class.
+        let mix_class: Option<usize> = mixest.and_then(|m| m.get(si)).map(|&c| c + 1);
+        let _mix_guard = mix_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
         let subject = &population.subjects[si];
         let eta_hat = sr.eta.as_slice();
         let n_obs = sr.ipred.len();
@@ -226,7 +226,17 @@ pub(crate) fn compute_extra_output_columns(
             let cov_j = subject.obs_cov(j);
             // Evaluate at this observation's time so the sdtab individual-parameter
             // columns honour the `TIME` built-in per row, matching IPRED (#610).
-            let indiv_j = model.indiv_param_value_map(theta, eta_full, cov_j, subject.obs_times[j]);
+            // The subject's own mixture class is passed explicitly rather than left to
+            // the ambient guard above: `MIXNUM` defaults to class 1, so a lookup that
+            // relies on the guard is one refactor away from reporting class-1 typical
+            // values for every class-2 subject (PR #1379 review).
+            let indiv_j = model.indiv_param_value_map(
+                theta,
+                eta_full,
+                cov_j,
+                subject.obs_times[j],
+                mix_class,
+            );
             let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
             per_obs_indiv.push(indiv_j);

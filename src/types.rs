@@ -4771,16 +4771,44 @@ impl CompiledModel {
     /// `indiv_param_names`. Use [`indiv_param_value_map`](Self::indiv_param_value_map)
     /// for a user-facing name → value map, which drops them.
     ///
+    /// `mixture_class` selects the `MIXNUM` subpopulation (1-based) an
+    /// `[individual_parameters]` expression branches on — pass `Some(mixest + 1)` for
+    /// a fitted subject, since [`SubjectResult::mixest`] is 0-based. **A mixture
+    /// model needs it**: `MIXNUM` reads a thread-local that defaults to class 1, so
+    /// `None` on a model such as `CL = if (MIXNUM == 1) TVCL1 else TVCL2` returns
+    /// class-1 values for every subject, including a class-2 one. `None` is correct —
+    /// and the only meaningful value — for a model with no `[mixture]` block.
+    ///
     /// Falls back to the `pk_indices` slot read — with its placeholder caveat — for
     /// a hand-built `CompiledModel` whose `indiv_param_partials` carries no compiled
     /// program (test fixtures, `generate_data`). Every parsed model has one.
+    ///
+    /// # Panics
+    ///
+    /// If `mixture_class` is `Some(k)` with `k == 0` or `k` past the model's class
+    /// count (1 when the model declares no `[mixture]` block). An out-of-range class
+    /// matches no `MIXNUM` arm, so it would otherwise return whichever `else` branch
+    /// happens to be last — a silently wrong number of exactly the kind this method
+    /// exists to remove. Every in-tree caller derives the class from a fit, where it
+    /// cannot be out of range.
     pub fn indiv_param_values(
         &self,
         theta: &[f64],
         eta: &[f64],
         covariates: &HashMap<String, f64>,
         time: f64,
+        mixture_class: Option<usize>,
     ) -> Vec<f64> {
+        let n_classes = self.mixture.as_ref().map_or(1, |m| m.n_classes);
+        if let Some(k) = mixture_class {
+            assert!(
+                k >= 1 && k <= n_classes,
+                "indiv_param_values: mixture class {k} is out of range for a model with \
+                 {n_classes} class(es) (MIXNUM is 1-based; pass `Some(mixest + 1)`, or \
+                 `None` for a model with no [mixture] block)"
+            );
+        }
+        let _mix_guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
         let Some(prog) = self.indiv_param_partials.indiv_param_program.as_ref() else {
             let pk = (self.pk_param_fn)(theta, eta, covariates, time);
             return self
@@ -4828,14 +4856,24 @@ impl CompiledModel {
     ///
     /// This is what sdtab `[output]` columns, `[derived]` expressions and the
     /// ferx-r `individual_estimates` table read (#1356).
+    ///
+    /// `mixture_class` carries the same contract — and the same panic — as
+    /// [`indiv_param_values`](Self::indiv_param_values): pass `Some(mixest + 1)` on a
+    /// mixture model, `None` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If `mixture_class` is out of range; see
+    /// [`indiv_param_values`](Self::indiv_param_values).
     pub fn indiv_param_value_map(
         &self,
         theta: &[f64],
         eta: &[f64],
         covariates: &HashMap<String, f64>,
         time: f64,
+        mixture_class: Option<usize>,
     ) -> HashMap<String, f64> {
-        let values = self.indiv_param_values(theta, eta, covariates, time);
+        let values = self.indiv_param_values(theta, eta, covariates, time, mixture_class);
         self.indiv_param_names
             .iter()
             .zip(values)

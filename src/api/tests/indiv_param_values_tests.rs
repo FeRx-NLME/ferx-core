@@ -165,8 +165,13 @@ fn analytical_unbound_intermediate_reports_its_own_value() {
     let model = parse_model_string(ANALYTIC_INTERMEDIATE).expect("model must parse");
     assert_placeholder_is_live(&model, "TVCL", 12.0);
 
-    let vals =
-        model.indiv_param_value_map(&model.default_params.theta, &[0.0], &HashMap::new(), 0.0);
+    let vals = model.indiv_param_value_map(
+        &model.default_params.theta,
+        &[0.0],
+        &HashMap::new(),
+        0.0,
+        None,
+    );
     // Hand-computed: TVCL = THCL·3 = 6, CL = TVCL·2·exp(0) = 12.
     assert_eq!(vals["TVCL"], 6.0, "TVCL must be THCL*3, not CL");
     assert_eq!(vals["CL"], 12.0);
@@ -180,7 +185,13 @@ fn analytical_unbound_intermediate_reports_its_own_value() {
 fn indiv_param_values_honour_eta() {
     let model = parse_model_string(ANALYTIC_INTERMEDIATE).expect("model must parse");
     let eta = [0.25f64];
-    let vals = model.indiv_param_value_map(&model.default_params.theta, &eta, &HashMap::new(), 0.0);
+    let vals = model.indiv_param_value_map(
+        &model.default_params.theta,
+        &eta,
+        &HashMap::new(),
+        0.0,
+        None,
+    );
     assert_eq!(vals["TVCL"], 6.0, "TVCL carries no eta");
     assert_eq!(
         vals["CL"],
@@ -199,7 +210,7 @@ fn indiv_param_values_match_pk_slot_reads_for_bound_names() {
     let eta = [0.31f64];
     let theta = &model.default_params.theta;
     let pk = (model.pk_param_fn)(theta, &eta, &HashMap::new(), 0.0);
-    let vals = model.indiv_param_values(theta, &eta, &HashMap::new(), 0.0);
+    let vals = model.indiv_param_values(theta, &eta, &HashMap::new(), 0.0, None);
     for name in ["CL", "V", "KA"] {
         let i = idx_of(&model, name);
         assert_eq!(
@@ -236,7 +247,8 @@ fn analytical_modeled_duration_reports_its_own_value() {
 ";
     let model = parse_model_string(MODEL).expect("model must parse");
     assert_placeholder_is_live(&model, "D1", 12.0);
-    let vals = model.indiv_param_value_map(&model.default_params.theta, &[], &HashMap::new(), 0.0);
+    let vals =
+        model.indiv_param_value_map(&model.default_params.theta, &[], &HashMap::new(), 0.0, None);
     assert_eq!(vals["D1"], 3.0, "D1 must report THD, not CL");
     assert_eq!(vals["CL"], 12.0);
 }
@@ -274,7 +286,7 @@ fn ode_model_values_unchanged() {
     let model = parse_model_string(MODEL).expect("model must parse");
     let theta = &model.default_params.theta;
     let pk = (model.pk_param_fn)(theta, &[], &HashMap::new(), 0.0);
-    let vals = model.indiv_param_values(theta, &[], &HashMap::new(), 0.0);
+    let vals = model.indiv_param_values(theta, &[], &HashMap::new(), 0.0, None);
     for (i, name) in model.indiv_param_names.iter().enumerate() {
         assert_eq!(
             vals[i].to_bits(),
@@ -282,7 +294,7 @@ fn ode_model_values_unchanged() {
             "ODE `{name}` must be unchanged by #1356"
         );
     }
-    let map = model.indiv_param_value_map(theta, &[], &HashMap::new(), 0.0);
+    let map = model.indiv_param_value_map(theta, &[], &HashMap::new(), 0.0, None);
     assert_eq!(map["V"], 10.0);
     assert_eq!(map["KA"], 1.5);
     assert_eq!(map["KE"], 0.2);
@@ -313,7 +325,7 @@ fn indiv_param_values_honour_the_time_builtin() {
     let model = parse_model_string(MODEL).expect("model must parse");
     let theta = &model.default_params.theta;
     for t in [0.0, 3.0] {
-        let vals = model.indiv_param_value_map(theta, &[], &HashMap::new(), t);
+        let vals = model.indiv_param_value_map(theta, &[], &HashMap::new(), t, None);
         assert_eq!(vals["TSCALE"], 1.0 + t, "TSCALE at t={t}");
         assert_eq!(vals["CL"], 2.0 * (1.0 + t), "CL at t={t}");
     }
@@ -358,13 +370,13 @@ fn synthetic_readout_params_hidden_from_the_value_map() {
          filter"
     );
     let theta = &model.default_params.theta;
-    let vals = model.indiv_param_values(theta, &[0.0], &HashMap::new(), 0.0);
+    let vals = model.indiv_param_values(theta, &[0.0], &HashMap::new(), 0.0, None);
     assert_eq!(
         vals.len(),
         model.indiv_param_names.len(),
         "the positional form stays parallel to indiv_param_names"
     );
-    let map = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0);
+    let map = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, None);
     assert!(
         !map.keys()
             .any(|k| crate::parser::model_parser::is_synthetic_readout_param(k)),
@@ -393,7 +405,7 @@ fn hand_built_model_without_a_program_falls_back_to_the_slot_read() {
         p.values[crate::types::PK_IDX_V] = 7.5;
         p
     });
-    let map = model.indiv_param_value_map(&[], &[], &HashMap::new(), 0.0);
+    let map = model.indiv_param_value_map(&[], &[], &HashMap::new(), 0.0, None);
     assert_eq!(map["CL"], 1.25);
     assert_eq!(map["V"], 7.5);
 }
@@ -453,9 +465,162 @@ fn bundled_tte_exponential_example_reports_lambda_not_dummy_cl() {
     .expect("bundled example must be readable");
     let model = parse_model_string(&src).expect("bundled example must parse");
     assert_placeholder_is_live(&model, "LAMBDA", 1.0);
-    let map =
-        model.indiv_param_value_map(&model.default_params.theta, &[0.0], &HashMap::new(), 0.0);
+    let map = model.indiv_param_value_map(
+        &model.default_params.theta,
+        &[0.0],
+        &HashMap::new(),
+        0.0,
+        None,
+    );
     // TVLAMBDA = 0.05, η = 0 ⇒ LAMBDA = 0.05. `DUMMY_CL` is FIXed at 1.0.
     assert_eq!(map["LAMBDA"], 0.05, "LAMBDA reported DUMMY_CL before #1356");
     assert_eq!(map["CL"], 1.0);
+}
+
+// ── mixture class selection (PR #1379 review) ────────────────────────────────
+
+/// A 2-class mixture whose class-specific typical value is reached through an **unbound
+/// intermediate**, so the class selection and the #1356 lookup are exercised together.
+/// `TVCL1 = 1`, `TVCL2 = 3`; `CL = TVCL * 5` keeps `CL` off `TVCL`'s value, so the
+/// placeholder read is still observable.
+const MIXTURE_INTERMEDIATE: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  TVCL = if (MIXNUM == 1) TVCL1 else TVCL2
+  CL   = TVCL * 5 * exp(ETA_CL)
+  V    = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// `MIXNUM` reads a thread-local that defaults to class 1, so a class argument is the
+/// only way an external caller can read a class-2 subject's values. Without it every
+/// call returns `TVCL1` (PR #1379 review, P2).
+#[test]
+fn mixture_class_selects_the_class_specific_typical_value() {
+    let model = parse_model_string(MIXTURE_INTERMEDIATE).expect("mixture model must parse");
+    assert_eq!(
+        model.mixture.as_ref().map(|m| m.n_classes),
+        Some(2),
+        "fixture must actually be a 2-class mixture"
+    );
+    assert_placeholder_is_live(&model, "TVCL", 5.0);
+    let theta = &model.default_params.theta;
+
+    let c1 = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, Some(1));
+    let c2 = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, Some(2));
+    // Hand-computed: TVCL1 = 1 -> CL = 5; TVCL2 = 3 -> CL = 15.
+    assert_eq!(c1["TVCL"], 1.0);
+    assert_eq!(c1["CL"], 5.0);
+    assert_eq!(c2["TVCL"], 3.0, "class 2 must read TVCL2, not TVCL1");
+    assert_eq!(c2["CL"], 15.0);
+
+    // `None` is the ambient default, which is class 1 — the behaviour the class
+    // argument exists to override. Pinned so the default cannot drift silently.
+    let ambient = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, None);
+    assert_eq!(ambient["TVCL"], c1["TVCL"]);
+}
+
+/// The guard is scoped to the call: a class-2 lookup must not leave `MIXNUM` at 2 for
+/// the next caller on the same thread.
+#[test]
+fn mixture_class_guard_is_restored_after_the_call() {
+    let model = parse_model_string(MIXTURE_INTERMEDIATE).expect("mixture model must parse");
+    let theta = &model.default_params.theta;
+    let before = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, None);
+    let _ = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, Some(2));
+    let after = model.indiv_param_value_map(theta, &[0.0], &HashMap::new(), 0.0, None);
+    assert_eq!(
+        before["TVCL"], after["TVCL"],
+        "MIXNUM leaked out of the call"
+    );
+}
+
+/// An out-of-range class matches no `MIXNUM` arm, so it would return whichever `else`
+/// branch is last — a silently wrong number. It is rejected instead.
+#[test]
+#[should_panic(expected = "mixture class 3 is out of range")]
+fn mixture_class_past_the_class_count_is_rejected() {
+    let model = parse_model_string(MIXTURE_INTERMEDIATE).expect("mixture model must parse");
+    let theta = &model.default_params.theta;
+    let _ = model.indiv_param_values(theta, &[0.0], &HashMap::new(), 0.0, Some(3));
+}
+
+/// `MIXNUM` is 1-based; class 0 is a caller passing `mixest` without the `+ 1`.
+#[test]
+#[should_panic(expected = "mixture class 0 is out of range")]
+fn mixture_class_zero_is_rejected() {
+    let model = parse_model_string(MIXTURE_INTERMEDIATE).expect("mixture model must parse");
+    let theta = &model.default_params.theta;
+    let _ = model.indiv_param_values(theta, &[0.0], &HashMap::new(), 0.0, Some(0));
+}
+
+/// A model with no `[mixture]` block has exactly one class, so anything but `Some(1)` /
+/// `None` is a caller bug.
+#[test]
+#[should_panic(expected = "out of range for a model with 1 class(es)")]
+fn a_class_on_a_non_mixture_model_is_rejected() {
+    let model = parse_model_string(ANALYTIC_INTERMEDIATE).expect("model must parse");
+    let theta = &model.default_params.theta;
+    let _ = model.indiv_param_values(theta, &[0.0], &HashMap::new(), 0.0, Some(2));
+}
+
+/// End-to-end: the sdtab `[output]` column for a **class-2** subject must carry the
+/// class-2 value. This is the path ferx-r's `individual_estimates` mirrors.
+///
+/// **This test cannot fail from the class argument alone.** `compute_extra_output_columns`
+/// also installs the ambient `MixtureClassGuard` for the subject — it has to, for the
+/// `pk_param_fn` and `[derived]` evaluations in the same loop — so the explicit
+/// `mix_class` argument and that guard are two gates rejecting the same inputs, and
+/// removing either leaves this green (measured). What it pins is the end-to-end column
+/// value; the argument's own gate is
+/// `mixture_class_selects_the_class_specific_typical_value`, which dies when
+/// `indiv_param_values` ignores the class. The explicit argument is kept anyway because
+/// the ambient guard is not part of the public contract — an external caller (ferx-r)
+/// has no way to set it.
+#[test]
+fn output_column_uses_the_subjects_own_mixture_class() {
+    let model = parse_model_string(&format!("{MIXTURE_INTERMEDIATE}\n[output]\n  CL\n  TVCL\n"))
+        .expect("mixture model must parse");
+    let population = one_obs_population();
+    let theta = &model.default_params.theta;
+
+    for (class0, want_tvcl, want_cl) in [(0usize, 1.0, 5.0), (1usize, 3.0, 15.0)] {
+        let mut results = vec![sr_for(model.n_eta)];
+        compute_extra_output_columns(
+            &model,
+            &population,
+            theta,
+            &[],
+            &mut results,
+            Some(&[class0]),
+        );
+        let cols: HashMap<String, f64> = results[0]
+            .extra_columns
+            .iter()
+            .map(|(n, v)| (n.clone(), v[0]))
+            .collect();
+        assert_eq!(
+            cols["TVCL"],
+            want_tvcl,
+            "subject fitted to class {} must report its own TVCL",
+            class0 + 1
+        );
+        assert_eq!(cols["CL"], want_cl);
+    }
 }
