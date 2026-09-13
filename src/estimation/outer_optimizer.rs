@@ -842,6 +842,7 @@ fn run_inner_loop_and_nll(
     options: &FitOptions,
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
+    schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -849,11 +850,17 @@ fn run_inner_loop_and_nll(
     Vec<Vec<DVector<f64>>>,
     f64,
 ) {
-    let (etas, h_matrices, stats, kappas, nll, _) =
-        run_inner_loop_and_nll_prepared(model, population, params, options, prev_etas, mu_k, None);
+    let (etas, h_matrices, stats, kappas, nll, _) = run_inner_loop_and_nll_prepared(
+        model, population, params, options, prev_etas, mu_k, None, schedules,
+    );
     (etas, h_matrices, stats, kappas, nll)
 }
 
+/// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
+/// and an optional caller-hoisted schedule cache (see
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
+/// `run_global_presearch` build the cache once per fit and pass it through here on every
+/// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
 #[allow(clippy::type_complexity)]
 fn run_inner_loop_and_nll_prepared(
     model: &CompiledModel,
@@ -863,6 +870,7 @@ fn run_inner_loop_and_nll_prepared(
     prev_etas: Option<&[DVector<f64>]>,
     mu_k: Option<&[f64]>,
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds)>,
+    schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -872,20 +880,34 @@ fn run_inner_loop_and_nll_prepared(
     Option<crate::estimation::agq::PopulationEvaluation>,
 ) {
     if options.agq_nodes().is_some() {
-        let (etas, h_matrices, stats, kappas) = run_inner_loop_warm(
-            model,
-            population,
-            params,
-            options.inner_maxiter,
-            options.inner_tol,
-            prev_etas,
-            mu_k,
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-        );
+        let (etas, h_matrices, stats, kappas) = match schedules {
+            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_cached(
+                model,
+                population,
+                params,
+                options.inner_maxiter,
+                options.inner_tol,
+                prev_etas,
+                mu_k,
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+                cache,
+            ),
+            None => run_inner_loop_warm(
+                model,
+                population,
+                params,
+                options.inner_maxiter,
+                options.inner_tol,
+                prev_etas,
+                mu_k,
+                options.min_obs_for_convergence_check as usize,
+                options.inner_restarts,
+            ),
+        };
         let n_nodes = options.agq_nodes().expect("AGQ branch");
-        let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| {
-            crate::estimation::agq::agq_population_evaluate(
+        let evaluation = agq_gradient_inputs.map(|(template, x, bounds)| match schedules {
+            Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
                 model,
                 population,
                 params,
@@ -897,11 +919,25 @@ fn run_inner_loop_and_nll_prepared(
                 options,
                 n_nodes,
                 options.hessian_anchor(),
-            )
+                cache,
+            ),
+            None => crate::estimation::agq::agq_population_evaluate(
+                model,
+                population,
+                params,
+                template,
+                x,
+                &etas,
+                &kappas,
+                bounds,
+                options,
+                n_nodes,
+                options.hessian_anchor(),
+            ),
         });
         let nll = evaluation.as_ref().map_or_else(
-            || {
-                crate::estimation::agq::agq_population_nll(
+            || match schedules {
+                Some(cache) => crate::estimation::agq::agq_population_nll_with_schedules(
                     model,
                     population,
                     params,
@@ -909,23 +945,24 @@ fn run_inner_loop_and_nll_prepared(
                     &kappas,
                     n_nodes,
                     options.hessian_anchor(),
-                )
+                    cache,
+                ),
+                None => crate::estimation::agq::agq_population_nll(
+                    model,
+                    population,
+                    params,
+                    &etas,
+                    &kappas,
+                    n_nodes,
+                    options.hessian_anchor(),
+                ),
             },
             |evaluation| evaluation.nll,
         );
         return (etas, h_matrices, stats, kappas, nll, evaluation);
     }
-    let (etas, h_matrices, stats, kappas, contributions) = run_inner_loop_warm_map(
-        model,
-        population,
-        params,
-        options.inner_maxiter,
-        options.inner_tol,
-        prev_etas,
-        mu_k,
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-        |subject, ebe| {
+    let finish_subject =
+        |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
             subject_nll(
                 model,
                 subject,
@@ -935,8 +972,35 @@ fn run_inner_loop_and_nll_prepared(
                 &ebe.kappas,
                 options.interaction,
             )
-        },
-    );
+        };
+    let (etas, h_matrices, stats, kappas, contributions) = if let Some(cache) = schedules {
+        crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
+            model,
+            population,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            prev_etas,
+            mu_k,
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+            cache,
+            finish_subject,
+        )
+    } else {
+        run_inner_loop_warm_map(
+            model,
+            population,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            prev_etas,
+            mu_k,
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+            finish_subject,
+        )
+    };
     let nll = contributions.iter().sum();
     (etas, h_matrices, stats, kappas, nll, None)
 }
@@ -1124,6 +1188,12 @@ fn run_global_presearch(
     let n_subj = population.subjects.len();
     let n_eta = model.n_eta;
 
+    // Built once for the whole pre-search: every probe below re-solves the same
+    // subjects' schedules, which depend only on `model` + `population` (never on the
+    // trial `params`) — see `run_inner_loop_and_nll_prepared`.
+    let schedule_cache =
+        crate::estimation::inner_optimizer::build_schedule_cache(model, population);
+
     // Probe CRS2-LM availability — some NLopt builds (notably the
     // minimal one in the homebrew nlopt-rs crate) ship without it.
     // Catch the panic so we surface a useful warning instead of
@@ -1173,6 +1243,7 @@ fn run_global_presearch(
             options,
             Some(&cached_zero),
             Some(&mu_k),
+            Some(&schedule_cache),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -1210,6 +1281,7 @@ fn run_global_presearch(
             options,
             Some(&state.cached_etas),
             Some(&mu_k),
+            Some(&schedule_cache),
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
@@ -1743,6 +1815,11 @@ fn optimize_nlopt_once(
     // optimizer minimises the penalized objective, everything user-facing keeps
     // the clean −2LL, and `FitResult` reports the two halves separately.
     let priors = build_prior_set(model, init_params);
+    // Built once for the whole outer optimization: every eval below re-solves the same
+    // subjects' schedules, which depend only on `model` + `population` (never on the
+    // trial `params`) — see `run_inner_loop_and_nll_prepared`.
+    let schedule_cache =
+        crate::estimation::inner_optimizer::build_schedule_cache(model, population);
 
     // Per-element scale factors: present O(1) coordinates to NLopt.
     //
@@ -2013,6 +2090,7 @@ fn optimize_nlopt_once(
                 Some(&state.cached_etas),
                 Some(&mu_k),
                 fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
+                Some(&schedule_cache),
             );
             (ehs, hms, ebe_stats, kappas, 2.0 * nll, prepared)
         };
@@ -2750,6 +2828,7 @@ fn optimize_bfgs(
             options,
             Some(prev_etas),
             Some(&mu_k),
+            None,
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta) + priors.penalty(x);
@@ -2773,6 +2852,7 @@ fn optimize_bfgs(
             options,
             Some(prev_etas),
             Some(&mu_k),
+            None,
         );
         let ofv = 2.0 * nll;
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
