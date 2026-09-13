@@ -282,6 +282,12 @@ pub(crate) struct Stack {
     prior_sd: Vec<f64>,
 }
 
+// Test-only A/B switch for measuring the former per-node allocation without
+// carrying a production branch. Numeric work remains identical.
+#[cfg(test)]
+static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Subject-local AGQ work that an outer objective evaluation can hand directly
 /// to the gradient requested by the same optimizer callback.
 struct PreparedGrid {
@@ -357,7 +363,6 @@ impl Stack {
         self.n_occ > 0 && self.n_kappa > 0
     }
 
-    /// Split `b` back into `(η, [κ₁ … κ_K])`.
     fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<&'a [f64]>) {
         let eta = &b[..self.n_eta];
         let kappas = (0..self.n_occ)
@@ -443,18 +448,46 @@ impl Stack {
                 prior_work,
             );
         }
-        let (eta, kappas) = self.split(b);
-        crate::stats::likelihood::individual_nll_iov_with_scratch(
-            model,
-            subject,
-            &params.theta,
-            eta,
-            &kappas,
-            &params.omega,
-            params.omega_iov.as_ref(),
-            &params.sigma.values,
-            scratch,
-        )
+        let eta = &b[..self.n_eta];
+        const INLINE_OCCASIONS: usize = 16;
+        #[cfg(test)]
+        let force_legacy = LEGACY_KAPPA_SLICE_ALLOCATION.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let force_legacy = false;
+        if self.n_occ <= INLINE_OCCASIONS && !force_legacy {
+            let kappas: [&[f64]; INLINE_OCCASIONS] = std::array::from_fn(|k| {
+                if k < self.n_occ {
+                    let s = self.n_eta + k * self.n_kappa;
+                    &b[s..s + self.n_kappa]
+                } else {
+                    &[]
+                }
+            });
+            crate::stats::likelihood::individual_nll_iov_with_scratch(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                &kappas[..self.n_occ],
+                &params.omega,
+                params.omega_iov.as_ref(),
+                &params.sigma.values,
+                scratch,
+            )
+        } else {
+            let (_, kappas) = self.split(b);
+            crate::stats::likelihood::individual_nll_iov_with_scratch(
+                model,
+                subject,
+                &params.theta,
+                eta,
+                &kappas,
+                &params.omega,
+                params.omega_iov.as_ref(),
+                &params.sigma.values,
+                scratch,
+            )
+        }
     }
 }
 
@@ -2908,6 +2941,165 @@ pub fn agq_population_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_iov_slice_table_is_bitwise_identical_to_legacy_allocation() {
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+
+        let model = parse_model_file(Path::new("examples/warfarin_iov.ferx")).expect("model");
+        let population =
+            read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC")).expect("data");
+        let eta_hats = vec![DVector::zeros(model.n_eta); population.subjects.len()];
+        let kappas: Vec<Vec<DVector<f64>>> = population
+            .subjects
+            .iter()
+            .map(|subject| {
+                vec![
+                    DVector::zeros(model.n_kappa);
+                    crate::stats::likelihood::iov_occasion_groups(subject).len()
+                ]
+            })
+            .collect();
+        let evaluate = || {
+            agq_population_nll(
+                &model,
+                &population,
+                &model.default_params,
+                &eta_hats,
+                &kappas,
+                1,
+                HessianAnchor::GaussNewton,
+            )
+        };
+
+        LEGACY_KAPPA_SLICE_ALLOCATION.store(true, std::sync::atomic::Ordering::Relaxed);
+        let legacy = evaluate();
+        LEGACY_KAPPA_SLICE_ALLOCATION.store(false, std::sync::atomic::Ordering::Relaxed);
+        let inline = evaluate();
+        assert_eq!(legacy.to_bits(), inline.to_bits());
+    }
+
+    /// End-to-end A/B over the real IOV quadrature objective. Five nodes over
+    /// three ETAs plus two occasion kappas gives 5^5 = 3,125 nodes per subject
+    /// (31,250 over the ten-subject warfarin fixture).
+    #[test]
+    #[ignore = "performance probe: run explicitly with --profile ci-test --nocapture"]
+    fn iov_node_slice_reuse_objective_benchmark() {
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::parser::model_parser::parse_model_file;
+        use std::hint::black_box;
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        let model =
+            parse_model_file(Path::new("examples/warfarin_iov.ferx")).expect("IOV model parses");
+        let mut population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+            .expect("IOV data loads");
+        let population_multiplier = std::env::var("FERX_AGQ_IOV_BENCH_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let original_subjects = population.subjects.clone();
+        population.subjects = (0..population_multiplier)
+            .flat_map(|replicate| {
+                original_subjects.iter().cloned().map(move |mut subject| {
+                    subject.id = format!("{}-replicate-{replicate}", subject.id);
+                    subject
+                })
+            })
+            .collect();
+        let eta_hats = vec![DVector::zeros(model.n_eta); population.subjects.len()];
+        let kappas: Vec<Vec<DVector<f64>>> = population
+            .subjects
+            .iter()
+            .map(|subject| {
+                vec![
+                    DVector::zeros(model.n_kappa);
+                    crate::stats::likelihood::iov_occasion_groups(subject).len()
+                ]
+            })
+            .collect();
+        let evaluate = || {
+            agq_population_nll(
+                &model,
+                &population,
+                &model.default_params,
+                &eta_hats,
+                &kappas,
+                5,
+                HessianAnchor::GaussNewton,
+            )
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("benchmark pool");
+
+        let run = |legacy: bool| {
+            LEGACY_KAPPA_SLICE_ALLOCATION.store(legacy, std::sync::atomic::Ordering::Relaxed);
+            let start = Instant::now();
+            let value = pool.install(|| black_box(evaluate()));
+            (start.elapsed(), value)
+        };
+
+        // Warm both paths before the interleaved samples.
+        let (_, legacy_value) = run(true);
+        let (_, reused_value) = run(false);
+        assert_eq!(
+            legacy_value.to_bits(),
+            reused_value.to_bits(),
+            "slice storage reuse must be numerically exact"
+        );
+
+        let mut legacy = Vec::new();
+        let mut reused = Vec::new();
+        let repetitions = std::env::var("FERX_AGQ_IOV_BENCH_REPETITIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(11);
+        assert!(repetitions > 0);
+        for repetition in 0..repetitions {
+            // Alternate which arm runs first to avoid assigning monotonic thermal
+            // or frequency drift to one implementation.
+            let order = if repetition % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            for old in order {
+                let (elapsed, value) = run(old);
+                assert_eq!(value.to_bits(), legacy_value.to_bits());
+                if old {
+                    legacy.push(elapsed);
+                } else {
+                    reused.push(elapsed);
+                }
+            }
+        }
+        LEGACY_KAPPA_SLICE_ALLOCATION.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let summary = |samples: &mut Vec<Duration>| {
+            samples.sort_unstable();
+            (
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+            )
+        };
+        let (old_med, old_min, old_max) = summary(&mut legacy);
+        let (new_med, new_min, new_max) = summary(&mut reused);
+        eprintln!(
+            "AGQ-IOV subjects={} nodes={}: legacy median={old_med:?} range={old_min:?}..{old_max:?}; \
+             reuse median={new_med:?} range={new_min:?}..{new_max:?}; speedup={:.3}x; \
+             node-table allocations removed={}/objective",
+            population.subjects.len(),
+            population.subjects.len() * 3_125,
+            old_med.as_secs_f64() / new_med.as_secs_f64(),
+            population.subjects.len() * 3_125
+        );
+    }
     use crate::parser::model_parser::parse_model_string;
 
     #[test]
