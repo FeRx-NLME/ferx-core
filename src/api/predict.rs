@@ -105,27 +105,73 @@ pub fn predict(
     );
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    let mut results = Vec::new();
+    let assemble = |subject_predictions: Vec<Vec<f64>>| {
+        let mut results = Vec::with_capacity(population.n_obs());
+        for (subject, preds) in population.subjects.iter().zip(subject_predictions) {
+            results.extend(preds.into_iter().enumerate().map(|(j, pred)| {
+                PredictionResult {
+                    id: subject.id.clone(),
+                    // Raw data TIME (matches sdtab / input); `obs_times` may be the
+                    // internal shifted clock for stacked reset occasions.
+                    time: subject
+                        .obs_raw_times
+                        .get(j)
+                        .copied()
+                        .unwrap_or(subject.obs_times[j]),
+                    pred,
+                }
+            }));
+        }
+        results
+    };
+    let predict_subjects = || {
+        assemble(
+            population
+                .subjects
+                .par_iter()
+                .map(|subject| {
+                    pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta)
+                })
+                .collect(),
+        )
+    };
+    let predict_subjects_serial = || {
+        let mut results = Vec::with_capacity(population.n_obs());
+        for subject in &population.subjects {
+            let preds = pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
+            results.extend(preds.into_iter().enumerate().map(|(j, pred)| {
+                PredictionResult {
+                    id: subject.id.clone(),
+                    time: subject
+                        .obs_raw_times
+                        .get(j)
+                        .copied()
+                        .unwrap_or(subject.obs_times[j]),
+                    pred,
+                }
+            }));
+        }
+        results
+    };
 
-    for subject in &population.subjects {
-        let preds = pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
-
-        for (j, &pred) in preds.iter().enumerate() {
-            results.push(PredictionResult {
-                id: subject.id.clone(),
-                // Raw data TIME (matches sdtab / input); `obs_times` may be the
-                // internal shifted clock for stacked reset occasions.
-                time: subject
-                    .obs_raw_times
-                    .get(j)
-                    .copied()
-                    .unwrap_or(subject.obs_times[j]),
-                pred,
-            });
+    // A caller already running on a Rayon worker owns the thread budget (for
+    // example `PoolPlan` around many predictions), so use that enclosing pool.
+    // Standalone calls use ferx's persistent, capped, large-stack pool rather
+    // than Rayon's process-global pool or a fresh pool per call.
+    if rayon::current_thread_index().is_some() {
+        if rayon::current_num_threads() == 1 {
+            predict_subjects_serial()
+        } else {
+            predict_subjects()
+        }
+    } else {
+        match super::pool::default_fit_pool() {
+            Some(pool) if pool.current_num_threads() > 1 => pool.install(predict_subjects),
+            Some(pool) => pool.install(predict_subjects_serial),
+            None if rayon::current_num_threads() > 1 => predict_subjects(),
+            None => predict_subjects_serial(),
         }
     }
-
-    results
 }
 
 /// A single prediction
