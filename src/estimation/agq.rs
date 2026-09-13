@@ -1149,7 +1149,8 @@ fn agq_population_evaluate_impl(
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false)
+        .with_parallel_grid(population.subjects.len() < rayon::current_num_threads());
 
     let per_subject: Vec<(f64, Option<Vec<f64>>)> = population
         .subjects
@@ -1712,6 +1713,7 @@ fn grid_response_correction(
     template: &ModelParameters,
     stack: &Stack,
     anchor: HessianAnchor,
+    parallel_grid: bool,
     h: &DMatrix<f64>,
     x: &[f64],
     b_hat: &[f64],
@@ -1748,27 +1750,55 @@ fn grid_response_correction(
     // `mult`/`err_keys` already get (this loop runs up to `MAX_AGQ_GRID` times per subject).
     let mult = model.ruv_obs_mult(subject, &params.theta);
     let err_keys = model.error_spec.obs_keys(subject);
-    let mut obs_grad_recycle = Vec::new();
-    let mut eta_work = DVector::zeros(model.n_eta);
-    let mut prior_work = DVector::zeros(model.n_eta);
-    let node_grads: Option<Vec<Vec<f64>>> = bs
-        .iter()
-        .map(|b| {
-            node_nll_gradient(
-                model,
-                subject,
-                params,
-                stack,
-                b,
-                schedule,
-                mult.as_deref(),
-                err_keys.as_ref(),
-                &mut obs_grad_recycle,
-                &mut eta_work,
-                &mut prior_work,
+    let node_grads: Option<Vec<Vec<f64>>> = if parallel_grid {
+        bs.par_iter()
+            .map_init(
+                || {
+                    (
+                        Vec::new(),
+                        DVector::zeros(model.n_eta),
+                        DVector::zeros(model.n_eta),
+                    )
+                },
+                |(obs_grad_recycle, eta_work, prior_work), b| {
+                    node_nll_gradient(
+                        model,
+                        subject,
+                        params,
+                        stack,
+                        b,
+                        schedule,
+                        mult.as_deref(),
+                        err_keys.as_ref(),
+                        obs_grad_recycle,
+                        eta_work,
+                        prior_work,
+                    )
+                },
             )
-        })
-        .collect();
+            .collect()
+    } else {
+        let mut obs_grad_recycle = Vec::new();
+        let mut eta_work = DVector::zeros(model.n_eta);
+        let mut prior_work = DVector::zeros(model.n_eta);
+        bs.iter()
+            .map(|b| {
+                node_nll_gradient(
+                    model,
+                    subject,
+                    params,
+                    stack,
+                    b,
+                    schedule,
+                    mult.as_deref(),
+                    err_keys.as_ref(),
+                    &mut obs_grad_recycle,
+                    &mut eta_work,
+                    &mut prior_work,
+                )
+            })
+            .collect()
+    };
 
     // Assemble `dH/dx` (or `dH̃/dx`) in closed form instead of rebuilding the anchor at
     // `x ± h` for every free coordinate. Both anchors take this route by default (#1335; see
@@ -2422,6 +2452,7 @@ fn agq_subject_packed_gradient(
     nodes: &[f64],
     log_weights: &[f64],
     anchor: HessianAnchor,
+    parallel_grid: bool,
     out: &mut [f64],
 ) -> Option<()> {
     let d = stack.d();
@@ -2482,6 +2513,7 @@ fn agq_subject_packed_gradient(
         nodes,
         log_weights,
         anchor,
+        parallel_grid,
         &h,
         &bs,
         &softmax,
@@ -2504,6 +2536,7 @@ fn finish_agq_subject_gradient(
     nodes: &[f64],
     log_weights: &[f64],
     anchor: HessianAnchor,
+    parallel_grid: bool,
     h: &DMatrix<f64>,
     bs: &[Vec<f64>],
     softmax: &[f64],
@@ -2512,11 +2545,34 @@ fn finish_agq_subject_gradient(
     base_jet: Option<SubjectSens>,
     out: &mut [f64],
 ) -> Option<()> {
-    for (b_j, &w) in bs.iter().zip(softmax.iter()) {
-        if w == 0.0 {
-            continue; // exp underflow — contributes nothing to the average
+    if parallel_grid {
+        let node_scores: Option<Vec<Vec<f64>>> = bs
+            .par_iter()
+            .zip(softmax.par_iter())
+            .map(|(b_j, &w)| {
+                let mut score = vec![0.0; out.len()];
+                if w != 0.0 {
+                    accumulate_fixed_eta_packed_gradient(
+                        model, subject, params, template, stack, b_j, w, &mut score,
+                    )?;
+                }
+                Some(score)
+            })
+            .collect();
+        for score in node_scores? {
+            for (dst, value) in out.iter_mut().zip(score) {
+                *dst += value;
+            }
         }
-        accumulate_fixed_eta_packed_gradient(model, subject, params, template, stack, b_j, w, out)?;
+    } else {
+        for (b_j, &w) in bs.iter().zip(softmax.iter()) {
+            if w == 0.0 {
+                continue; // exp underflow — contributes nothing to the average
+            }
+            accumulate_fixed_eta_packed_gradient(
+                model, subject, params, template, stack, b_j, w, out,
+            )?;
+        }
     }
 
     // …plus the grid's response to H — the only term the fixed-node score omits, and the
@@ -2528,6 +2584,7 @@ fn finish_agq_subject_gradient(
         template,
         stack,
         anchor,
+        parallel_grid,
         h,
         x,
         b_hat,
@@ -2556,6 +2613,7 @@ pub(crate) struct SubjectScoreContext<'a> {
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
     force_fd: bool,
+    parallel_grid: bool,
 }
 
 impl<'a> SubjectScoreContext<'a> {
@@ -2579,7 +2637,13 @@ impl<'a> SubjectScoreContext<'a> {
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
+            parallel_grid: false,
         }
+    }
+
+    fn with_parallel_grid(mut self, enabled: bool) -> Self {
+        self.parallel_grid = enabled;
+        self
     }
 
     /// Negative-log-likelihood score, with per-subject numerical salvage.
@@ -2621,6 +2685,7 @@ impl<'a> SubjectScoreContext<'a> {
                     &self.nodes,
                     &self.log_weights,
                     self.options.hessian_anchor(),
+                    self.parallel_grid,
                     &mut g,
                 )
             };
@@ -2658,6 +2723,7 @@ impl<'a> SubjectScoreContext<'a> {
                     &self.nodes,
                     &self.log_weights,
                     self.options.hessian_anchor(),
+                    self.parallel_grid,
                     &grid.h,
                     &grid.bs,
                     &grid.softmax,
@@ -2750,7 +2816,8 @@ pub(crate) fn population_gradient_mixed(
     if let Some(evaluation) = evaluation {
         return evaluation.gradient;
     }
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd)
+        .with_parallel_grid(population.subjects.len() < rayon::current_num_threads());
     let scores: Vec<_> = population
         .subjects
         .par_iter()
@@ -2795,6 +2862,7 @@ pub fn agq_population_gradient(
     let n_packed = x.len();
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let parallel_grid = population.subjects.len() < rayon::current_num_threads();
 
     let per_subject: Vec<Option<Vec<f64>>> = population
         .subjects
@@ -2816,6 +2884,7 @@ pub fn agq_population_gradient(
                 &nodes,
                 &log_weights,
                 anchor,
+                parallel_grid,
                 &mut g,
             )
             .map(|()| g)
@@ -3233,6 +3302,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "benchmark: release-only AGQ underfilled-pool scheduling A/B"]
+    fn bench_underfilled_agq_gradient() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::parameterization::{compute_bounds, pack_params, unpack_params};
+        use crate::types::{EstimationMethod, FitOptions, Population};
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+        let model = parse_model_string(M3_MODEL).unwrap();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let params = unpack_params(&x, template);
+        let subject = score_subject(
+            &model,
+            &params.theta,
+            &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+        );
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        assert!(ebe.converged);
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let eta_hats = vec![ebe.eta];
+        let kappas = vec![Vec::new()];
+        let bounds = compute_bounds(template);
+        let options = FitOptions {
+            method: EstimationMethod::FoceI,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut samples = Vec::with_capacity(15);
+        pool.install(|| {
+            let serial = SubjectScoreContext::new(&model, template, &x, &options, &bounds, false)
+                .score(&population.subjects[0], eta_hats[0].as_slice(), &kappas[0])
+                .expect("serial score");
+            let parallel = SubjectScoreContext::new(&model, template, &x, &options, &bounds, false)
+                .with_parallel_grid(true)
+                .score(&population.subjects[0], eta_hats[0].as_slice(), &kappas[0])
+                .expect("parallel score");
+            assert_eq!(serial.len(), parallel.len());
+            for (coordinate, (serial, parallel)) in serial.iter().zip(&parallel).enumerate() {
+                assert_eq!(
+                    serial.to_bits(),
+                    parallel.to_bits(),
+                    "packed coordinate {coordinate} changed"
+                );
+            }
+            for _ in 0..3 {
+                black_box(agq_population_evaluate(
+                    &model,
+                    &population,
+                    &params,
+                    template,
+                    &x,
+                    &eta_hats,
+                    &kappas,
+                    &bounds,
+                    &options,
+                    3,
+                    HessianAnchor::GaussNewton,
+                ));
+            }
+            for _ in 0..15 {
+                let start = Instant::now();
+                black_box(agq_population_evaluate(
+                    &model,
+                    &population,
+                    &params,
+                    template,
+                    &x,
+                    &eta_hats,
+                    &kappas,
+                    &bounds,
+                    &options,
+                    3,
+                    HessianAnchor::GaussNewton,
+                ));
+                samples.push(start.elapsed());
+            }
+        });
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+        eprintln!("underfilled AGQ: median={median:?}, mean={mean:?}, samples={samples:?}");
     }
 
     /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`
