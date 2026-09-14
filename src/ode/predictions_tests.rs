@@ -6724,11 +6724,6 @@ fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: u
 /// warning. Proves the exact-solve short-circuit does not swallow a genuinely nonlinear model.
 #[test]
 fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
-
     let mut ode = mm_disposition_spec();
     ode.solver_opts.reltol = 1e-10;
     ode.solver_opts.abstol = 1e-12;
@@ -6746,8 +6741,17 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
     );
     let reference = bolus_ss_reference(&ode, &pk.values, &dose, 500);
     assert_relative_eq!(trough[0], reference[0], max_relative = 1e-6);
+    // Read this equilibration's OWN answer, not the process-global sink (#1289). The sink is
+    // shared by every thread in the test binary and its reader guard serializes only readers,
+    // so `take_ss_nonconvergence_warnings().is_empty()` — what this line used to be — failed
+    // whenever any concurrently-running test capped an SS equilibration between the clear and
+    // the take. Reproducible on the first iteration of `cargo test --lib --features ci -- ss_`.
+    //
+    // The `true` half of this differential pair is `ss_nonlinear_over_capacity_bolus_caps_and_warns`
+    // below, on the same helper: without it a flag that was never written would satisfy this
+    // assertion vacuously, since a fresh harness thread starts at `false`.
     assert!(
-        crate::dosing::take_ss_nonconvergence_warnings().is_empty(),
+        !crate::dosing::last_ss_equilibration_warned(),
         "a converging nonlinear SS must not warn"
     );
 }
@@ -6775,6 +6779,14 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
         crate::dosing::last_ss_equilibration_cycles(),
         SS_EQUILIBRATION_CYCLES,
         "an over-capacity (no-SS) nonlinear disposition must run the full capped budget"
+    );
+    // The `true` half of the #1289 differential pair — this equilibration's own answer, read
+    // per-thread. The sink assertion further down cannot serve that role: every writer emits
+    // the same deduplicated message, so `.any(|w| w.contains(…))` passes just as happily on a
+    // foreign test's warning as on this one's.
+    assert!(
+        crate::dosing::last_ss_equilibration_warned(),
+        "an over-capacity bolus must record a non-convergence warning for its own equilibration"
     );
     assert!(trough.iter().all(|x| x.is_finite()));
 
@@ -7888,6 +7900,14 @@ fn ss_input_rate_no_steady_state_warns() {
     // A warning must fire (both the ρ ≥ 1 "no steady state" text and the near-ρ = 1 "below the
     // true periodic steady state" text are valid here — the capped drift can estimate ρ either
     // side of 1 — so assert on the shared prefix rather than one branch).
+    //
+    // The per-thread flag first (#1289): it pins that *this* prediction pass warned, which the
+    // sink `.any(…)` below cannot, since every writer emits the same deduplicated message and a
+    // concurrently-running test's warning satisfies it identically.
+    assert!(
+        crate::dosing::last_ss_equilibration_warned(),
+        "the input-rate train must record a non-convergence warning for its own equilibration"
+    );
     let warnings = crate::dosing::take_ss_nonconvergence_warnings();
     assert!(
         warnings

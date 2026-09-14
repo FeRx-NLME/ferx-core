@@ -390,10 +390,34 @@ thread_local! {
     static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
         const { std::cell::Cell::new(SsBranch::None) };
 
+    /// Whether the most recent [`note_ss_nonconvergence_if_capped`] call on this thread
+    /// produced a warning — a **test-only** observation, and the only way to ask that question
+    /// without reading the process-global sink (#1289).
+    ///
+    /// The sink is one `Mutex<BTreeSet<String>>` for the whole process, and
+    /// [`SS_WARN_SINK_READER_GUARD`] serializes only its *readers*. That is enough for a test
+    /// asserting its own warning is present, and not enough for one asserting the sink is
+    /// **empty**: any concurrently-running test that caps an SS equilibration inserts through
+    /// [`note_ss_nonconvergence_if_capped`], which never touches the guard, so the reader fails
+    /// on a warning it did not produce. Nothing about the guard can prevent that. This cell is
+    /// per-thread, so "did *my* equilibration warn" has a correct answer regardless of what
+    /// else is running — the same arrangement [`LAST_SS_EQUILIBRATION_CYCLES`] already uses,
+    /// and it carries the same caveat: it reports whichever call ran *last* on this thread, so
+    /// assert it only from a test that calls the equilibration helpers directly.
+    static LAST_SS_NONCONVERGENCE_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
     /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
     /// equilibration (#532 review #4).
     static FORCE_FULL_SS_EQUILIBRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the most recent SS equilibration on this thread warned (test observation; see
+/// [`LAST_SS_NONCONVERGENCE_WARNED`]). Prefer this to draining the sink whenever the question
+/// is about *this* call rather than about the message text (#1289).
+#[cfg(test)]
+pub(crate) fn last_ss_equilibration_warned() -> bool {
+    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.get())
 }
 
 #[cfg(test)]
@@ -560,7 +584,13 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     abs_last: f64,
     mag: f64,
 ) {
-    if let Some(msg) = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag) {
+    let warning = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag);
+    // Recorded on EVERY call, not only the warning ones, so a test reading it sees this
+    // equilibration's own answer rather than a stale `true` from an earlier call on the same
+    // harness thread (#1289). Mirrors `record_ss_equilibration_cycles`.
+    #[cfg(test)]
+    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.set(warning.is_some()));
+    if let Some(msg) = warning {
         if let Ok(mut set) = ss_nonconvergence_sink().lock() {
             set.insert(msg);
         }

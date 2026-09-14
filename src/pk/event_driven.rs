@@ -3169,6 +3169,15 @@ mod tests {
             approx::assert_relative_eq!(state[0], n as f64 * 100.0, max_relative = 1e-12);
         }
 
+        // Per-thread, so it is this walk's own answer (#1289). The sink assertion below cannot
+        // serve that role on its own: every writer emits the same deduplicated message, so
+        // `.any(…)` is satisfied by a concurrently-running test's warning just as well as by
+        // this one's. Keep both — the flag pins *who* warned, the sink pins the message text
+        // that reaches `FitResult.warnings`.
+        assert!(
+            crate::dosing::last_ss_equilibration_warned(),
+            "the analytical walk must record a non-convergence warning for its own equilibration"
+        );
         let warnings = crate::dosing::take_ss_nonconvergence_warnings();
         assert!(
             warnings
