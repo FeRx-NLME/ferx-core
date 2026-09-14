@@ -2981,125 +2981,6 @@ mod tests {
         assert_eq!(legacy.to_bits(), inline.to_bits());
     }
 
-    /// End-to-end A/B over the real IOV quadrature objective. Five nodes over
-    /// three ETAs plus two occasion kappas gives 5^5 = 3,125 nodes per subject
-    /// (31,250 over the ten-subject warfarin fixture).
-    #[test]
-    #[ignore = "performance probe: run explicitly with --profile ci-test --nocapture"]
-    fn iov_node_slice_reuse_objective_benchmark() {
-        use crate::io::datareader::read_nonmem_csv;
-        use crate::parser::model_parser::parse_model_file;
-        use std::hint::black_box;
-        use std::path::Path;
-        use std::time::{Duration, Instant};
-
-        let model =
-            parse_model_file(Path::new("examples/warfarin_iov.ferx")).expect("IOV model parses");
-        let mut population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
-            .expect("IOV data loads");
-        let population_multiplier = std::env::var("FERX_AGQ_IOV_BENCH_MULTIPLIER")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1);
-        let original_subjects = population.subjects.clone();
-        population.subjects = (0..population_multiplier)
-            .flat_map(|replicate| {
-                original_subjects.iter().cloned().map(move |mut subject| {
-                    subject.id = format!("{}-replicate-{replicate}", subject.id);
-                    subject
-                })
-            })
-            .collect();
-        let eta_hats = vec![DVector::zeros(model.n_eta); population.subjects.len()];
-        let kappas: Vec<Vec<DVector<f64>>> = population
-            .subjects
-            .iter()
-            .map(|subject| {
-                vec![
-                    DVector::zeros(model.n_kappa);
-                    crate::stats::likelihood::iov_occasion_groups(subject).len()
-                ]
-            })
-            .collect();
-        let evaluate = || {
-            agq_population_nll(
-                &model,
-                &population,
-                &model.default_params,
-                &eta_hats,
-                &kappas,
-                5,
-                HessianAnchor::GaussNewton,
-            )
-        };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .expect("benchmark pool");
-
-        let run = |legacy: bool| {
-            LEGACY_KAPPA_SLICE_ALLOCATION.store(legacy, std::sync::atomic::Ordering::Relaxed);
-            let start = Instant::now();
-            let value = pool.install(|| black_box(evaluate()));
-            (start.elapsed(), value)
-        };
-
-        // Warm both paths before the interleaved samples.
-        let (_, legacy_value) = run(true);
-        let (_, reused_value) = run(false);
-        assert_eq!(
-            legacy_value.to_bits(),
-            reused_value.to_bits(),
-            "slice storage reuse must be numerically exact"
-        );
-
-        let mut legacy = Vec::new();
-        let mut reused = Vec::new();
-        let repetitions = std::env::var("FERX_AGQ_IOV_BENCH_REPETITIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(11);
-        assert!(repetitions > 0);
-        for repetition in 0..repetitions {
-            // Alternate which arm runs first to avoid assigning monotonic thermal
-            // or frequency drift to one implementation.
-            let order = if repetition % 2 == 0 {
-                [true, false]
-            } else {
-                [false, true]
-            };
-            for old in order {
-                let (elapsed, value) = run(old);
-                assert_eq!(value.to_bits(), legacy_value.to_bits());
-                if old {
-                    legacy.push(elapsed);
-                } else {
-                    reused.push(elapsed);
-                }
-            }
-        }
-        LEGACY_KAPPA_SLICE_ALLOCATION.store(false, std::sync::atomic::Ordering::Relaxed);
-
-        let summary = |samples: &mut Vec<Duration>| {
-            samples.sort_unstable();
-            (
-                samples[samples.len() / 2],
-                samples[0],
-                samples[samples.len() - 1],
-            )
-        };
-        let (old_med, old_min, old_max) = summary(&mut legacy);
-        let (new_med, new_min, new_max) = summary(&mut reused);
-        eprintln!(
-            "AGQ-IOV subjects={} nodes={}: legacy median={old_med:?} range={old_min:?}..{old_max:?}; \
-             reuse median={new_med:?} range={new_min:?}..{new_max:?}; speedup={:.3}x; \
-             node-table allocations removed={}/objective",
-            population.subjects.len(),
-            population.subjects.len() * 3_125,
-            old_med.as_secs_f64() / new_med.as_secs_f64(),
-            population.subjects.len() * 3_125
-        );
-    }
     use crate::parser::model_parser::parse_model_string;
 
     #[test]
@@ -3497,34 +3378,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "benchmark: release-only AGQ underfilled-pool scheduling A/B"]
-    fn bench_underfilled_agq_gradient() {
+    fn underfilled_parallel_grid_score_is_bitwise_identical() {
         use crate::estimation::inner_optimizer::find_ebe;
-        use crate::estimation::parameterization::{compute_bounds, pack_params, unpack_params};
-        use crate::types::{EstimationMethod, FitOptions, Population};
-        use std::hint::black_box;
-        use std::time::{Duration, Instant};
+        use crate::estimation::parameterization::{compute_bounds, pack_params};
+        use crate::types::{EstimationMethod, FitOptions};
+
         let model = parse_model_string(M3_MODEL).unwrap();
         let template = &model.default_params;
         let x = pack_params(template);
-        let params = unpack_params(&x, template);
         let subject = score_subject(
             &model,
-            &params.theta,
+            &template.theta,
             &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
         );
-        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        let ebe = find_ebe(&model, &subject, template, 200, 1e-11, None, None, 0);
         assert!(ebe.converged);
-        let population = Population {
-            subjects: vec![subject],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
-        let eta_hats = vec![ebe.eta];
-        let kappas = vec![Vec::new()];
         let bounds = compute_bounds(template);
         let options = FitOptions {
             method: EstimationMethod::FoceI,
@@ -3535,14 +3403,14 @@ mod tests {
             .num_threads(4)
             .build()
             .unwrap();
-        let mut samples = Vec::with_capacity(15);
         pool.install(|| {
-            let serial = SubjectScoreContext::new(&model, template, &x, &options, &bounds, false)
-                .score(&population.subjects[0], eta_hats[0].as_slice(), &kappas[0])
+            let context = SubjectScoreContext::new(&model, template, &x, &options, &bounds, false);
+            let serial = context
+                .score(&subject, ebe.eta.as_slice(), &[])
                 .expect("serial score");
-            let parallel = SubjectScoreContext::new(&model, template, &x, &options, &bounds, false)
+            let parallel = context
                 .with_parallel_grid(true)
-                .score(&population.subjects[0], eta_hats[0].as_slice(), &kappas[0])
+                .score(&subject, ebe.eta.as_slice(), &[])
                 .expect("parallel score");
             assert_eq!(serial.len(), parallel.len());
             for (coordinate, (serial, parallel)) in serial.iter().zip(&parallel).enumerate() {
@@ -3552,43 +3420,7 @@ mod tests {
                     "packed coordinate {coordinate} changed"
                 );
             }
-            for _ in 0..3 {
-                black_box(agq_population_evaluate(
-                    &model,
-                    &population,
-                    &params,
-                    template,
-                    &x,
-                    &eta_hats,
-                    &kappas,
-                    &bounds,
-                    &options,
-                    3,
-                    HessianAnchor::GaussNewton,
-                ));
-            }
-            for _ in 0..15 {
-                let start = Instant::now();
-                black_box(agq_population_evaluate(
-                    &model,
-                    &population,
-                    &params,
-                    template,
-                    &x,
-                    &eta_hats,
-                    &kappas,
-                    &bounds,
-                    &options,
-                    3,
-                    HessianAnchor::GaussNewton,
-                ));
-                samples.push(start.elapsed());
-            }
         });
-        samples.sort_unstable();
-        let median = samples[samples.len() / 2];
-        let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
-        eprintln!("underfilled AGQ: median={median:?}, mean={mean:?}, samples={samples:?}");
     }
 
     /// The analytic fixed-b score vs a central difference of `Stack::nll_at` -- at a `b`
