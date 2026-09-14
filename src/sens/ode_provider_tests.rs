@@ -654,6 +654,28 @@ fn ode_form_c_time_readout_prediction_uses_obs_time() {
 
 /// Shared check: provider `f`/`∂f/∂η`/`∂f/∂θ` vs production predictor + FD.
 fn check_vs_production(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+    check_vs_production_after(model, subject, theta, eta, 0);
+}
+
+/// [`check_vs_production`] with the *first-order* checks restricted to observations from
+/// index `first` on.
+///
+/// Needed where an earlier observation sits exactly on a moving boundary: its `∂f/∂η` and
+/// `∂f/∂θ` are one-sided limits there and a central difference returns the mean of two
+/// different branches, which is an oracle for nothing. Those rows get a dedicated
+/// one-sided check at the call site instead. The **value** is not a one-sided quantity, so
+/// it is still checked at every observation.
+///
+/// Dropping `check_vs_production` wholesale for such a fixture left `∂f/∂θ` and the
+/// non-boundary etas unchecked at *every* observation, not only the kinked one
+/// (PR #1391 review).
+fn check_vs_production_after(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    first: usize,
+) {
     let sens = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");
     let pred = |e: &[f64], th: &[f64], j: usize| -> f64 {
         compute_predictions_with_tv(model, subject, th, e)[j]
@@ -666,6 +688,9 @@ fn check_vs_production(model: &CompiledModel, subject: &Subject, theta: &[f64], 
             max_relative = 1e-6,
             epsilon = 1e-9
         );
+        if j < first {
+            continue;
+        }
         for k in 0..model.n_eta {
             let mut ep = eta.to_vec();
             ep[k] += he;
@@ -739,6 +764,28 @@ fn check_hessian_vs_production_fd(
     theta: &[f64],
     eta: &[f64],
 ) {
+    check_hessian_vs_production_fd_after(model, subject, theta, eta, 0);
+}
+
+/// [`check_hessian_vs_production_fd`] restricted to observations from index `first` on —
+/// **both** second-order blocks, `∂²f/∂η²` and `∂²f/∂η∂θ`, exactly as the full check does.
+///
+/// Needed where an *earlier* observation sits exactly on a moving boundary: the value is
+/// then a one-sided limit in `eta` and a central stencil returns the mean of two different
+/// branches, so that row's "reference" measures the stencil rather than the provider. The
+/// rows after the boundary are ordinary two-sided points and are checked normally.
+///
+/// `first = 0` is the full check, so there is one stencil here rather than two copies: an
+/// earlier split let the `_after` variant silently drop the mixed η×θ block, leaving the
+/// infusion-end fixture with no second-derivative check across `theta` at all
+/// (PR #1391 review).
+fn check_hessian_vs_production_fd_after(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    first: usize,
+) {
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
     let base = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");
@@ -748,7 +795,7 @@ fn check_hessian_vs_production_fd(
     let h = 1e-4;
     // ∂²f/∂η_k∂η_p via a 4-point cross stencil.
     for p in 0..n_eta {
-        for (j, o) in base.obs.iter().enumerate() {
+        for (j, o) in base.obs.iter().enumerate().skip(first) {
             for k in 0..n_eta {
                 let mut epp = eta.to_vec();
                 epp[k] += h;
@@ -765,6 +812,7 @@ fn check_hessian_vs_production_fd(
                 let fd = (pred(&epp, theta, j) - pred(&epm, theta, j) - pred(&emp, theta, j)
                     + pred(&emm, theta, j))
                     / (4.0 * h * h);
+                assert!(fd.is_finite(), "obs{j}[{k},{p}]: non-finite FD reference");
                 approx::assert_relative_eq!(
                     o.d2f_deta2[k * n_eta + p],
                     fd,
@@ -777,7 +825,7 @@ fn check_hessian_vs_production_fd(
     // ∂²f/∂η_k∂θ_m via a 4-point cross stencil.
     for m in 0..n_theta {
         let sm = h * (1.0 + theta[m].abs());
-        for (j, o) in base.obs.iter().enumerate() {
+        for (j, o) in base.obs.iter().enumerate().skip(first) {
             for k in 0..n_eta {
                 let mut epp = eta.to_vec();
                 epp[k] += h;
@@ -791,52 +839,12 @@ fn check_hessian_vs_production_fd(
                     (pred(&epp, &tp, j) - pred(&epp, &tm, j) - pred(&emm_eta(eta, k, h), &tp, j)
                         + pred(&emm_eta(eta, k, h), &tm, j))
                         / (4.0 * h * sm);
+                assert!(
+                    fd.is_finite(),
+                    "obs{j}[eta{k},theta{m}]: non-finite FD reference"
+                );
                 approx::assert_relative_eq!(
                     o.d2f_deta_dtheta[k * n_theta + m],
-                    fd,
-                    max_relative = 5e-3,
-                    epsilon = 5e-3
-                );
-            }
-        }
-    }
-}
-
-/// [`check_hessian_vs_production_fd`] restricted to observations from index `first` on.
-///
-/// Needed where an *earlier* observation sits exactly on a moving boundary: the value is
-/// then a one-sided limit in `eta` and a central stencil returns the mean of two different
-/// branches, so that row's "reference" measures the stencil rather than the provider. The
-/// rows after the boundary are ordinary two-sided points and are checked normally.
-fn check_hessian_vs_production_fd_after(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    first: usize,
-) {
-    let n_eta = model.n_eta;
-    let base = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");
-    let pred =
-        |e: &[f64], j: usize| -> f64 { compute_predictions_with_tv(model, subject, theta, e)[j] };
-    let h = 1e-4;
-    for (j, o) in base.obs.iter().enumerate().skip(first) {
-        for p in 0..n_eta {
-            for k in 0..n_eta {
-                let shift = |sk: f64, sp: f64| {
-                    let mut e = eta.to_vec();
-                    e[k] += sk * h;
-                    e[p] += sp * h;
-                    e
-                };
-                let fd = (pred(&shift(1.0, 1.0), j)
-                    - pred(&shift(1.0, -1.0), j)
-                    - pred(&shift(-1.0, 1.0), j)
-                    + pred(&shift(-1.0, -1.0), j))
-                    / (4.0 * h * h);
-                assert!(fd.is_finite(), "obs{j}[{k},{p}]: non-finite FD reference");
-                approx::assert_relative_eq!(
-                    o.d2f_deta2[k * n_eta + p],
                     fd,
                     max_relative = 5e-3,
                     epsilon = 5e-3
@@ -11091,6 +11099,36 @@ fn one_sided_eta_limits(
     (fwd, bwd)
 }
 
+/// [`one_sided_eta_limits`] one order up: the two one-sided limits of `∂²f/∂η_k²` at
+/// observation `j`, each from a second-order-accurate one-sided stencil
+/// (`(2f₀ − 5f₁ + 4f₂ − f₃)/h²` and its mirror).
+///
+/// The coincidence fixtures pin `∂f/∂η` against the branch the boundary sorts to, but the
+/// #1068 fix also moves `J⁺` and the `δlag²` curvature coefficient, and nothing was pinning
+/// those at a coincidence — a central Hessian stencil is useless there for the same reason
+/// the central gradient stencil is (PR #1391 review). Needs a larger `h` than the gradient
+/// helper: the `h²` denominator puts the solver's own noise floor at `abstol/h²`, so the
+/// fixtures using it run at `reltol = 1e-10` / `abstol = 1e-12`.
+fn one_sided_eta_second_limits(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    k: usize,
+    j: usize,
+    h: f64,
+) -> (f64, f64) {
+    let pred = |s: f64| -> f64 {
+        let mut e = eta.to_vec();
+        e[k] += s;
+        compute_predictions_with_tv(model, subject, theta, &e)[j]
+    };
+    let f0 = pred(0.0);
+    let fwd = (2.0 * f0 - 5.0 * pred(h) + 4.0 * pred(2.0 * h) - pred(3.0 * h)) / (h * h);
+    let bwd = (2.0 * f0 - 5.0 * pred(-h) + 4.0 * pred(-2.0 * h) - pred(-3.0 * h)) / (h * h);
+    (fwd, bwd)
+}
+
 /// The fix, and the non-degeneracy pair that makes it observable.
 ///
 /// Mutation guard: restoring the pre-#1068 lookahead (`post_snapshot(p, t_event)
@@ -11174,6 +11212,29 @@ fn ode_provider_lagged_arrival_on_a_covariate_record_returns_a_one_sided_derivat
             // the quantity it has to resolve, and 5 orders of magnitude inside the 0.89 %
             // the defect produced.
             approx::assert_relative_eq!(a, bwd, max_relative = 1e-6, epsilon = 1e-7);
+
+            // Second order, same branch. The fix moves `J⁺` and the `δlag²` curvature
+            // coefficient as well as the first-order jump, and nothing pinned those at a
+            // coincidence before (PR #1391 review) — `check_hessian_vs_production_fd` is
+            // central, so it cannot be used here any more than `check_vs_production` can.
+            //
+            // Measured across both arms and all three observations: worst relative miss
+            // against the backward limit 1.624e-6, against a `fwd − bwd` straddle of 2.6e-3
+            // (residual-drug arm) to 2.2e-2 (empty arm). The bound below carries ~6x over
+            // the measurement and sits ~160x inside the smaller of the two gaps.
+            let (f2, b2) = one_sided_eta_second_limits(&model, &subject, &theta, &eta, 2, j, 1e-3);
+            let a2 = sens.obs[j].d2f_deta2[2 * model.n_eta + 2];
+            assert!(
+                f2.is_finite() && b2.is_finite(),
+                "{label} obs{j}: non-finite one-sided second-derivative reference"
+            );
+            assert!(
+                (f2 - b2).abs() > 1e-4 * f2.abs().max(b2.abs()),
+                "{label} obs{j}: the two one-sided SECOND derivatives coincide ({f2} vs \
+                 {b2}) — the arrival no longer lands on the record and the curvature half \
+                 of this fixture tests nothing"
+            );
+            approx::assert_relative_eq!(a2, b2, max_relative = 1e-5, epsilon = 1e-7);
         }
     }
 }
@@ -11290,13 +11351,19 @@ fn ode_provider_input_rate_onset_across_a_covariate_record_needs_no_field_jump()
     // Non-degeneracy, and the whole point of the fixture: without the `init(...)` baseline
     // the state is zero at the onset, `g⁻ = g⁺ = 0`, and the term under test vanishes
     // vacuously — the trap the issue itself flags.
+    //
+    // Read obs **3** (`t = 2.0`), the first observation AFTER the onset at `t ≈ 1.75`, not
+    // obs 0: at `t = 0` the prediction is just `BASE/V` for any non-zero `BASE`, so that
+    // comparison is a tautology and says nothing about the baseline surviving to the
+    // boundary, which is the property this guard exists to establish (PR #1391 review).
+    // Realised difference here is ≈0.19 (≈0.19 vs 0.0), so the 1e-3 bound has ~190x margin.
     let with_base = compute_predictions_with_tv(&model, &subject, &theta, &eta);
     let mut no_base = theta;
     no_base[5] = 0.0;
     let without = compute_predictions_with_tv(&model, &subject, &no_base, &eta);
     assert!(
-        (with_base[0] - without[0]).abs() > 1e-3,
-        "the init(...) baseline is not reaching the observations — the fixture is vacuous"
+        (with_base[3] - without[3]).abs() > 1e-3,
+        "the init(...) baseline is not reaching past the onset — the fixture is vacuous"
     );
 
     check_vs_production(&model, &subject, &theta, &eta);
@@ -11374,9 +11441,14 @@ fn ode_provider_infusion_end_on_a_covariate_record_reads_one_snapshot() {
             epsilon = 1e-7
         );
     }
-    // `check_vs_production` is deliberately NOT called: its central difference straddles the
-    // `t = 1.5` kink and returns the mean of two different one-sided limits, which is not an
-    // oracle for anything. The per-observation assertions above are the check.
+    // The full `check_vs_production` is deliberately NOT called: at obs 2 its central
+    // difference straddles the `t = 1.5` kink and returns the mean of two different
+    // one-sided limits, which is not an oracle for anything. The per-observation assertions
+    // above are the check *there*. Everywhere else the ordinary first-order oracle still
+    // applies — including `∂f/∂θ` and the non-lag etas, which the one-sided assertions above
+    // never touch — so run it from obs 3 on rather than skipping it entirely
+    // (PR #1391 review).
+    check_vs_production_after(&model, &subject, &theta, &eta, 3);
     check_hessian_vs_production_fd_after(&model, &subject, &theta, &eta, 3);
 }
 
@@ -11468,6 +11540,21 @@ fn ode_provider_lagged_infusion_rate_on_a_covariate_record_returns_a_one_sided_d
             max_relative = 1e-6,
             epsilon = 1e-7
         );
+        // Second order, same branch — the `δlag²` curvature coefficient and `J⁺` move with
+        // the fix too, and a central Hessian stencil is no more usable here than a central
+        // gradient stencil (PR #1391 review). Measured at `h = 1e-3`: worst relative miss
+        // against the backward limit 1.662e-6, against a `fwd − bwd` straddle of 7.4e-3
+        // (obs5) to 7.1e-2. The bound is ~6x over the measurement and ~440x inside the
+        // smaller gap.
+        let (f2, b2) = one_sided_eta_second_limits(&model, &subject, &theta, &eta, 2, j, 1e-3);
+        let a2 = sens.obs[j].d2f_deta2[2 * model.n_eta + 2];
+        assert!(f2.is_finite() && b2.is_finite());
+        assert!(
+            (f2 - b2).abs() > 1e-3 * f2.abs().max(b2.abs()),
+            "obs{j}: the one-sided SECOND derivatives coincide ({f2} vs {b2}) — the rate-on \
+             no longer lands on the record and the curvature half tests nothing"
+        );
+        approx::assert_relative_eq!(a2, b2, max_relative = 1e-5, epsilon = 1e-7);
     }
 }
 
@@ -11483,21 +11570,28 @@ fn ode_provider_lagged_infusion_rate_on_a_covariate_record_returns_a_one_sided_d
 fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_derivative() {
     let model = parse_model_string(ONECPT_INIT_LAG_FIRSTORDER_ODE).expect("parse");
     let mut subject = straddling_forcing_subject();
-    // `ALAG = 0.5` with the dose at t = 1 puts the onset exactly on the `t = 1.5` record,
-    // where `WT` steps 70 → 140 (a steep step, so the two branches are far apart).
+    // `ALAG = 0.5` with the dose at t = 1 puts the onset exactly on the `t = 1.5` record.
+    // `straddling_forcing_subject` carries `WT = 70` at that record and steps to 140 at the
+    // NEXT one (`t = 2.0`); the step is what separates the branches, because under the
+    // end-of-interval convention the pre-#1068 post side WAS that `t = 2.0` record while the
+    // correct post side is the co-timed `t = 1.5` one. (An earlier comment here claimed the
+    // step sat on `t = 1.5` itself — it does not; PR #1391 review.)
     subject.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0)];
     subject.dose_covariates = vec![HashMap::from([("WT".to_string(), 70.0)])];
     let theta = [10.0, 50.0, 0.75, 0.5, 0.8, 20.0];
     let eta = [0.1, -0.05, 0.0];
     assert!(ode_tvcov_supported(&model, &subject));
 
+    // Non-degeneracy: read obs **3** (`t = 2.0`), the first observation AFTER the onset, not
+    // obs 1 (`t = 0.5`, before the dose) — there the prediction is the bare `BASE` decay and
+    // the comparison is nearly a tautology. Realised difference here is ≈0.24 vs 0.0.
     let with_base = compute_predictions_with_tv(&model, &subject, &theta, &eta);
     let mut no_base = theta;
     no_base[5] = 0.0;
     let without = compute_predictions_with_tv(&model, &subject, &no_base, &eta);
     assert!(
-        (with_base[1] - without[1]).abs() > 1e-3,
-        "the init(...) baseline is not reaching the onset — the fixture is vacuous"
+        (with_base[3] - without[3]).abs() > 1e-3,
+        "the init(...) baseline is not reaching past the onset — the fixture is vacuous"
     );
 
     let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
@@ -11523,6 +11617,26 @@ fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_deriv
             max_relative = 5e-5,
             epsilon = 1e-7
         );
+        // Second order, same branch (PR #1391 review). `h = 5e-3`, not the `1e-3` the
+        // bolus/rate-on arms use: the `h²` denominator amplifies the same `ka·dose`-vs-decay
+        // cancellation that already forced a larger `h` on the gradient above. Swept over
+        // `h` from 1e-2 down to 1e-4, the backward limit is best at 5e-3 and has lost every
+        // digit by 2e-4 (obs3's limit flips sign there).
+        //
+        // Measured at `h = 5e-3`: worst relative miss 1.151e-3 (obs3, whose `∂²f/∂η²` is
+        // only −7.8e-3, so that is an absolute miss of 9.0e-6; obs4 1.297e-4, obs5
+        // 1.295e-4). The `epsilon` floor is what carries obs3; the straddle there is 0.99
+        // *relative*, i.e. 7.8e-3 absolute, so the floor still sits ~78x inside the quantity
+        // the assertion has to resolve.
+        let (f2, b2) = one_sided_eta_second_limits(&model, &subject, &theta, &eta, 2, j, 5e-3);
+        let a2 = sens.obs[j].d2f_deta2[2 * model.n_eta + 2];
+        assert!(f2.is_finite() && b2.is_finite());
+        assert!(
+            (f2 - b2).abs() > 1e-2 * f2.abs().max(b2.abs()),
+            "obs{j}: the one-sided SECOND derivatives coincide ({f2} vs {b2}) — the onset no \
+             longer lands on the record and the curvature half tests nothing"
+        );
+        approx::assert_relative_eq!(a2, b2, max_relative = 5e-3, epsilon = 1e-4);
     }
 }
 
@@ -11533,7 +11647,9 @@ fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_deriv
 /// the shared `K_DOSE` onset. It therefore has its own snapshot lookup, which the first cut
 /// of #1391 left on the pre-#1068 forward scan — so an unlagged `first_order` forcing and an
 /// otherwise identical `lag=`-carrying one reported **opposite** one-sided branches at a
-/// record coincidence. Caught in review; measured at 2.5 % between the branches.
+/// record coincidence. Caught in review. The gap between the branches is the fixture's own
+/// covariate contrast, not a constant of the defect: 0.53 %-1.2 % here, 2.5 % on the
+/// reviewer's geometry. The per-observation table below carries this fixture's numbers.
 ///
 /// `K_ROUTE_ONSET` = 4 sorts before `K_PKONLY` = 5 / `K_OBS` = 6, so like every other arrival
 /// it must report the limit from below.
@@ -11643,6 +11759,24 @@ fn ode_provider_route_lagged_onset_on_a_covariate_record_returns_a_one_sided_der
             max_relative = 5e-5,
             epsilon = 1e-7
         );
+        // Second order, same branch (PR #1391 review), at `h = 5e-3` for the same
+        // cancellation reason as the shared onset above — swept 1e-2 → 1e-4, the backward
+        // limit is stable to ~4 digits at 5e-3 and is 13 % off by 1e-4.
+        //
+        // Measured at `h = 5e-3`: relative miss 1.989e-4 / 4.190e-4 / 8.862e-5 across obs
+        // 3/4/5, against a `fwd − bwd` straddle of 7.1e-3 / 3.2e-2 / 1.1e-2. This is the
+        // tightest of the four arms: the bound carries ~4.8x over the measurement and sits
+        // ~3.6x inside the *smallest* gap, so do not loosen it without re-measuring — at
+        // 5e-3 it would stop separating the branches at obs3.
+        let (f2, b2) = one_sided_eta_second_limits(&model, &subject, &theta, &eta, 2, j, 5e-3);
+        let a2 = sens.obs[j].d2f_deta2[2 * model.n_eta + 2];
+        assert!(f2.is_finite() && b2.is_finite());
+        assert!(
+            (f2 - b2).abs() > 1e-3 * f2.abs().max(b2.abs()),
+            "obs{j}: the one-sided SECOND derivatives coincide ({f2} vs {b2}) — the route \
+             onset no longer lands on the record and the curvature half tests nothing"
+        );
+        approx::assert_relative_eq!(a2, b2, max_relative = 2e-3, epsilon = 1e-6);
     }
 }
 
