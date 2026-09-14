@@ -6954,9 +6954,9 @@ fn test_unknown_scale_tag_is_rejected() {
 /// carrying the sentinel `parse_error_to_diagnostic` lifts to
 /// `E_BLOCK_VARIANCE_ONLY`.
 ///
-/// Reddens if the `\s*$` anchor is dropped from any one block regex (that
-/// form's nine rows go `Ok`), or if the classify branch of the `else` arm is
-/// removed (the rows still error, but with the generic message and no sentinel).
+/// Reddens if one block arm's `reject_block_scale_tag` call is deleted (that
+/// form's nine rows go `Ok`), or if a block regex loses its tag group (the rows
+/// still error, but through the generic `else` arm with no sentinel).
 #[test]
 fn block_scale_tag_is_rejected_on_every_block_form() {
     let forms = [
@@ -7100,9 +7100,31 @@ fn every_listed_parameter_form_actually_parses() {
 }
 
 /// `;` is not a comment marker, and the message has to say so (#1388 review).
+///
+/// Three shapes, one row set each. A leading `;` and a trailing one after a
+/// complete declaration are comments the author meant; round 3 (#7) found the
+/// second, the shape a NONMEM-converted file carries, got the generic message.
+/// A `;` between complete declarations is not a comment at all but several
+/// declarations on one line — the shape `docs/estimation/tte.qmd` shipped
+/// (round 3 #2) — and is told to split them, not to use `#`.
+///
+/// Reddens if the trailing branch goes back to `starts_with(';')` (the second
+/// row set gets the generic message), or if the separator branch is deleted
+/// (the third row set is told to write a comment).
 #[test]
 fn a_semicolon_line_is_told_it_is_not_a_comment() {
-    for line in ["; theta TVCL(1, 0.1, 100)", "; this is a note", ";"] {
+    for line in [
+        "; theta TVCL(1, 0.1, 100)",
+        "; this is a note",
+        ";",
+        // A complete declaration, then a comment.
+        "theta TVCL(0.2, 0.001, 10.0) ; 30% CV",
+        "omega ETA_CL ~ 0.09; between-subject CL",
+        "block_omega (A, B) = [0.09, 0.02, 0.04] ;",
+        // A complete declaration then more declarations *and* prose is a
+        // comment that happens to contain one, not a separator.
+        "theta A(1.0); theta B(2.0); was 3.0",
+    ] {
         let err = parse_parameters(&[line.to_string()], &Default::default())
             .err()
             .unwrap_or_else(|| panic!("`{line}` must be rejected"));
@@ -7110,12 +7132,145 @@ fn a_semicolon_line_is_told_it_is_not_a_comment() {
             err.contains("does not start a comment") && err.contains("`#`"),
             "`{line}` must name the comment markers: {err}"
         );
+        assert!(err.contains(line), "`{line}` must be quoted: {err}");
     }
+    for line in [
+        "theta TVCL(0.2, 0.001, 10.0); theta TVX(1.0)",
+        "theta TVCL(1.0, 0.01, 100); theta TVV(10, 0.1, 500); theta TVKA(1, 0.01, 50)",
+        "omega ETA_CL ~ 0.09 ; sigma PROP ~ 0.04 (sd)",
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected"));
+        assert!(
+            err.contains("does not separate declarations") && !err.contains("`#`"),
+            "`{line}` holds only declarations, so it must be told to split them, \
+             not to write a comment: {err}"
+        );
+        assert!(err.contains(line), "`{line}` must be quoted: {err}");
+    }
+    // A `;` after text that is *not* a declaration says nothing about comments:
+    // the line is wrong before the `;` is reached.
+    let err = parse_parameters(&["banana ; note".to_string()], &Default::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("unrecognized line"), "{err}");
+}
+
+/// A theta bound that is present but not a number is an error, not the default
+/// box edge (#1388 review round 3 #1).
+///
+/// The bound groups are `[0-9eE.+-]+`, which admits `0.001-10.0`, `-` and `1e`,
+/// and each was read with `.parse().unwrap_or(1e-9 / 1e9)`. So
+/// `theta TVCL(50, 0.001-10.0)` — a mistyped comma — declared the box
+/// `(1e-9, 1e9)` and `ferx check` reported VALID, while the correct spelling
+/// raised `E_THETA_INIT_OUTSIDE_BOUNDS` (measured through the CLI at `f71736a`).
+///
+/// Reddens if either bound goes back to `unwrap_or`: that bound's rows parse.
+#[test]
+fn a_malformed_theta_bound_is_an_error_not_the_default() {
+    for (line, which) in [
+        ("theta TVCL(50, 0.001-10.0)", "lower"),
+        ("theta TVCL(0.2, -, 10.0)", "lower"),
+        ("theta TVCL(0.2, 1e, 10.0)", "lower"),
+        ("theta TVCL(0.2, 0.001, 1e)", "upper"),
+        ("theta TVCL(0.2, 0.001, 10.0-)", "upper"),
+        ("theta P[3](0.1, --1.0, 1.0)", "lower"),
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{line}`: a non-numeric {which} bound must be rejected"));
+        assert!(
+            err.contains(&format!("Bad theta {which} bound")) && err.contains(line),
+            "`{line}`: {err}"
+        );
+    }
+    // The control: an *absent* bound still takes its default.
+    let (thetas, ..) = parse_parameters(&["theta T(0.2)".to_string()], &Default::default())
+        .unwrap_or_else(|e| panic!("an absent bound must still default: {e}"));
+    assert_eq!((thetas[0].lower, thetas[0].upper), (1e-9, 1e9));
+    let (thetas, ..) =
+        parse_parameters(&["theta T(0.2, 0.001)".to_string()], &Default::default()).unwrap();
+    assert_eq!((thetas[0].lower, thetas[0].upper), (0.001, 1e9));
+}
+
+/// A scale tag matches in ASCII case only (#1388 review round 3 #3).
+///
+/// `(?i)` is Unicode simple case folding, so `(ſd)` — U+017F LONG S folds to
+/// `s` — satisfied the tag group, while the read-back is `eq_ignore_ascii_case`
+/// and saw no `sd`. The value was accepted and never squared: `~ 0.002 (ſd)`
+/// read as a variance of 0.002 instead of 4e-6, with `ferx check` VALID. On a
+/// block the removed classifier's lowercase read-back had the same split and
+/// told an SD author to delete the tag, the numbers being correct.
+///
+/// Reddens if `(?-u:…)` is dropped from any one tag group: that row parses, or
+/// (block) is handed the variance-only code.
+#[test]
+fn a_non_ascii_scale_tag_is_not_a_scale_tag() {
+    for line in [
+        "omega ETA_KA ~ 0.002 (\u{017f}d)",
+        "sigma PROP ~ 0.002 (\u{017f}d)",
+        "kappa KAPPA_CL ~ 0.002 (\u{017f}d)",
+        "block_omega (A, B) = [0.09, 0.02, 0.04] (\u{017f}d)",
+        "block_sigma (A, B) = [0.04, 0.10, 1.00] (\u{017f}d)",
+        "block_kappa (A, B) = [0.09, 0.02, 0.04] (\u{017f}d)",
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected, not read as an unsquared SD"));
+        assert!(
+            err.contains("unrecognized line") && !err.contains("is variance-only"),
+            "`{line}`: {err}"
+        );
+    }
+    // `[mixture]`'s per-class override regex carries the same tag group.
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4 (\u{017f}d)");
+    assert!(src.contains('\u{017f}'), "the fixture line moved");
+    parse_model_string(&src)
+        .err()
+        .expect("a `(ſd)` mixture override must be rejected, not read as a variance");
+    // The control: the ASCII tag in every case still reads as SD.
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4 (SD)");
+    let model = parse_model_string(&src).expect("`(SD)` on a mixture override parses");
+    assert!(model.mixture.unwrap().omega_overrides[0].as_sd);
+}
+
+/// The own-line fold attaches only to a real `block_*` declaration (#1388
+/// review round 3 #11).
+///
+/// Its gate is `BLOCK_DECL_RE`'s keyword plus word boundary. A typo'd keyword
+/// is not a block, so a bare `FIX` after it stays its own line and the error
+/// quotes the typo'd line alone. Both lines fail either way; only the quoted
+/// text shows whether the fold ran, which is why the assertion is on the quote.
+///
+/// Reddens if the `\b` is dropped (both rows fold and the quote gains ` FIX`),
+/// and the positive row reddens if the fold's gate stops matching blocks.
+#[test]
+fn the_own_line_fold_attaches_only_to_a_block_declaration() {
+    for prev in [
+        "block_omegas (A) = [0.1]",
+        "block_omega\u{00e9} (A) = [0.1]",
+    ] {
+        let err = parse_parameters(&[prev.to_string(), "FIX".to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{prev}` is not a declaration"));
+        assert!(
+            err.contains(&format!("`{prev}`")),
+            "`{prev}` is not a block, so `FIX` must not fold onto it: {err}"
+        );
+    }
+    let (_, _, block_omegas, ..) = parse_parameters(
+        &["block_omega (A) = [0.1]".to_string(), "FIX".to_string()],
+        &Default::default(),
+    )
+    .unwrap_or_else(|e| panic!("a bare `FIX` after a real block must fold: {e}"));
+    assert!(block_omegas[0].fixed);
 }
 
 /// A non-ASCII `[parameters]` line must not panic the parser (#1388 review).
 ///
-/// `opens_a_block_declaration` byte-sliced `t[..kw.len()]`; on
+/// The fold's block test (then `opens_a_block_declaration`, now a regex in
+/// `folds_onto_block_declaration`) byte-sliced `t[..kw.len()]`; on
 /// `theta PLAC\u{00c9}B[3](...)` followed by a bare `FIX` the boundary landed
 /// inside the two-byte character and the parse aborted instead of reporting
 /// `E_PARSE` -- through `ferx check` and the ferx-r FFI alike.
@@ -7243,7 +7398,16 @@ fn leading_text_is_rejected_on_every_parameters_form() {
 /// an auto-fixer would square the diagonal of a block that was never on the SD
 /// scale.
 ///
-/// Reddens if `scale_tag_re` loses its `\]` prefix and scans the whole line.
+/// The classification is now exact by construction: the block regexes capture
+/// the tag and their own arm rejects it, so a line gets the code only if
+/// deleting the tag leaves a declaration that parses. Round 3 (#8) found the
+/// `else`-arm regex this replaced read `[...] (sd) banana` as a tag problem —
+/// applying its repair still left the line failing — hence the tag-plus-garbage
+/// rows.
+///
+/// Reddens if the `else` arm grows a second, looser tag classifier again (the
+/// tag-plus-garbage rows claim the code), or if a block regex's trailing-`FIX`
+/// group is moved out of the tag group (`FIX FIX` parses).
 #[test]
 fn a_block_without_a_scale_tag_never_claims_the_variance_only_code() {
     for (line, why) in [
@@ -7256,6 +7420,32 @@ fn a_block_without_a_scale_tag_never_claims_the_variance_only_code() {
         (
             "block_sigma (VARIANCE) = [0.04] banana",
             "`VARIANCE` is a sigma name",
+        ),
+        // A real tag *plus* other text: deleting the tag still leaves a line
+        // that fails, so the tag is not the problem to report.
+        (
+            "block_omega (A, B) = [0.09, 0.02, 0.04] (sd) banana",
+            "the line also carries `banana`",
+        ),
+        (
+            "block_kappa (A) = [0.1] FIX (sd) FIX FIX",
+            "the line also carries a doubled `FIX`",
+        ),
+        // A doubled `FIX` with no tag, on the two forms the `(SD)` row above
+        // does not cover. The trailing `FIX` group sits inside the tag group,
+        // so it cannot match without a tag; moved outside it, `FIX FIX` would
+        // parse on that form (the mutation that survived the first sweep).
+        (
+            "block_omega (A, B) = [0.09, 0.02, 0.04] FIX FIX",
+            "a doubled `FIX` with no tag",
+        ),
+        (
+            "block_sigma (A, B) = [0.04, 0.10, 1.00] FIX FIX",
+            "a doubled `FIX` with no tag",
+        ),
+        (
+            "block_sigma (A) = [0.04] banana (sd)",
+            "the tag does not follow the `]`",
         ),
     ] {
         let err = parse_parameters(&[line.to_string()], &Default::default())

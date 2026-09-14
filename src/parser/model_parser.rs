@@ -13523,23 +13523,52 @@ const PARAMETER_FORMS: &[(&str, &str, bool)] = &[
     ),
 ];
 
-/// Does a `[parameters]` line open a `block_*` declaration, and does it carry a
-/// scale tag **after the closing `]`**?
+/// Does a `[parameters]` line open a `block_*` declaration?
 ///
-/// Read only on the error path, but compiled once per process rather than per
-/// failing line: `Regex::new` in a loop is a clippy lint and the ~0.9 ms-per-parse
-/// cost this file documents at #1027. `src/edit/apply.rs` uses the same shape.
+/// The one test for "is a block declaration" that the own-line fold in
+/// `join_bracketed_lines` and the editor's `logical_lines` both use, so they
+/// cannot disagree about which line a bare `FIX` or scale tag belongs to. `\b`
+/// is Unicode-aware, the same word boundary the declaration regexes apply, so a
+/// typo'd `block_omegas` — or `block_omegaé` — is not a block (#1388 review
+/// round 3 #11, which found the byte-wise twin this replaced disagreeing on the
+/// second spelling).
 ///
-/// The tag must follow the `]`. A scan over the whole line also reads the name
-/// list, so `block_kappa (SD) = [0.1] FIX FIX` — a doubled `FIX` with no tag at
-/// all — would be told to square each SD (#1388 review §3). Both `] FIX (sd)`
-/// and `] (sd) FIX` still classify.
+/// `LazyLock` rather than per-call `Regex::new`, which is a clippy lint and the
+/// ~0.9 ms-per-parse cost this file documents at #1027.
 static BLOCK_DECL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(block_omega|block_sigma|block_kappa)\b").unwrap()
 });
-static SCALE_TAG_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"(?i)\]\s*(?:FIX\s*)?\(\s*(sd|variance|var)\s*\)").unwrap()
-});
+
+/// Reject a scale tag a `block_*` regex captured in group 4 (#1377).
+///
+/// The message opens ``[parameters]: `block_…` is variance-only``, and that exact
+/// prefix is what `parse_error_to_diagnostic` keys `E_BLOCK_VARIANCE_ONLY` on —
+/// keep it if the wording moves. The repair depends on which tag was written:
+/// telling a `(variance)` author to "square each SD" is worse than saying
+/// nothing, since they wrote variances already.
+fn reject_block_scale_tag(
+    kw: &str,
+    caps: &regex::Captures,
+    source_line: &str,
+) -> Result<(), String> {
+    let Some(tag) = caps.get(4) else {
+        return Ok(());
+    };
+    let tag = tag.as_str().to_ascii_lowercase();
+    let repair = if tag == "sd" {
+        "Square each SD into a variance and write the off-diagonals as covariances."
+    } else {
+        "The lower triangle is always variances and covariances, so the tag says \
+         nothing about it. Delete the tag."
+    };
+    Err(format!(
+        "[parameters]: `{kw}` is variance-only — the scale tag `({tag})` is not \
+         accepted on a block declaration, since the lower triangle mixes variances \
+         and covariances and one tag cannot say which entry is on which scale. \
+         {repair} Offending line: `{}`.",
+        source_line.trim()
+    ))
+}
 
 /// `PARAMETER_FORMS` as the diagnostic renders it.
 fn parameter_form_list() -> String {
@@ -13572,37 +13601,33 @@ fn parameter_forms_taking_a_prior() -> String {
         .join(", ")
 }
 
-/// True for a line that opens a `block_omega` / `block_sigma` / `block_kappa`
+/// True when `line` — a whole logical line on its own — folds back onto `prev`:
+/// it is a bare `FIX` or a bare scale tag, and `prev` opens a `block_*`
 /// declaration.
 ///
-/// Compares **bytes**, not a string slice. `t[..kw.len()]` panics when the
-/// boundary lands inside a multi-byte character, and a `[parameters]` line holds
-/// whatever UTF-8 the user typed: `theta PLACÉB[3](...)` followed by a bare
-/// `FIX` hit exactly that and aborted the parse instead of reporting `E_PARSE`
-/// (#1388 review) — a panic reaching `ferx check` and the ferx-r FFI alike.
+/// Shared by `join_bracketed_lines` and `crate::edit`'s `logical_lines`, which
+/// has to address the same logical lines the parser reads (#1388 review round 3
+/// #10: the editor kept the older `FIX`-only, `contains(']')` rule under a
+/// comment saying it folded "exactly as" the parser did).
 ///
-/// The trailing word-boundary test is the rule `BLOCK_DECL_RE`'s `\b` applies,
-/// so the fold and the classifier agree on what a block declaration is; a typo'd
-/// `block_omegas` is neither.
-fn opens_a_block_declaration(line: &str) -> bool {
-    let t = line.trim_start().as_bytes();
-    ["block_omega", "block_sigma", "block_kappa"]
-        .iter()
-        .any(|kw| {
-            let k = kw.as_bytes();
-            t.len() >= k.len()
-                && t[..k.len()].eq_ignore_ascii_case(k)
-                && !t
-                    .get(k.len())
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
-        })
+/// One gate, not two. The fold used to require `prev.contains(']')` *and* a
+/// block keyword. Both reject the level-block `theta X[3](...)` line that made
+/// the gate load-bearing (#1388 review §2), so deleting either one left every
+/// test green and the pair pinned nothing (round 3 #11). The keyword is the one
+/// that states the rule.
+///
+/// A regex rather than a byte slice of the line, so a multi-byte character at
+/// the keyword boundary cannot panic the parse (`theta PLACÉB[3](...)` then a
+/// bare `FIX` once did, #1388 review).
+pub(crate) fn folds_onto_block_declaration(prev: &str, line: &str) -> bool {
+    (line.trim().eq_ignore_ascii_case("FIX") || is_bare_scale_tag(line))
+        && BLOCK_DECL_RE.is_match(prev)
 }
 
 /// True for a line that is nothing but a scale annotation — `(sd)`,
-/// `(variance)`, `(var)`, in any case, with or without inner spaces.
+/// `(variance)`, `(var)`, in ASCII case, with or without inner spaces.
 ///
-/// Used only by `join_bracketed_lines`'s fold, which is where the restriction on
-/// which line it may fold onto is documented.
+/// Used only by `folds_onto_block_declaration`.
 fn is_bare_scale_tag(line: &str) -> bool {
     let Some(inner) = line
         .trim()
@@ -13663,13 +13688,10 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
             depth = 0;
             let logical = std::mem::take(&mut buf);
             // Fold a bare `FIX` line — or, since #1377, a bare scale tag —
-            // onto the block declaration just emitted. Restricted to a previous
-            // line containing `]` so we never attach it to a non-block
-            // parameter line.
-            if (logical.trim().eq_ignore_ascii_case("FIX") || is_bare_scale_tag(&logical))
-                && out
-                    .last()
-                    .is_some_and(|l: &String| l.contains(']') && opens_a_block_declaration(l))
+            // onto the block declaration just emitted, and onto nothing else.
+            if out
+                .last()
+                .is_some_and(|l: &String| folds_onto_block_declaration(l, &logical))
             {
                 let last = out.last_mut().unwrap();
                 last.push(' ');
@@ -13679,9 +13701,10 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
             }
         }
     }
-    // An unterminated `[` leaves text in the buffer; emit it so the downstream
-    // regex fails to match and the user gets a clear "Bad block_omega" error
-    // rather than the line silently vanishing.
+    // An unterminated `[` leaves text in the buffer: the opening line and every
+    // line after it, joined. Emit it so no declaration regex matches and the
+    // `[parameters]` `else` arm rejects it as an unrecognized line quoting the
+    // whole run, rather than the lines silently vanishing.
     if !buf.is_empty() {
         out.push(buf);
     }
@@ -13810,7 +13833,7 @@ fn parse_mixture_block(
     // `omega(k) NAME ~ var [FIX] [(sd|var)] [FIX]` — mirrors the base omega/sigma
     // regexes in `parse_parameters`, prefixed with the `(k)` class selector.
     let ov_re = Regex::new(
-        r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?$",
+        r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(((?-u:sd|variance|var))\))?(?:\s+(FIX)\b)?$",
     )
     .unwrap();
 
@@ -14327,8 +14350,16 @@ fn parse_parameters(
     // Note: the first FIX group requires \s+ (at least one space) so that
     // `value(sd)` without a space between value and annotation still matches
     // correctly — the annotation group uses \s* (zero or more) intentionally.
+    //
+    // The tag group is `(?-u:…)`: ASCII case-insensitive only. Under the outer
+    // `(?i)` it is Unicode simple case folding, so `(ſd)` — U+017F LONG S folds
+    // to `s` — matched, while the read-back below is `eq_ignore_ascii_case`, so
+    // the value was accepted and never squared: a 500x misread on
+    // `~ 0.002 (ſd)` with `ferx check` reporting VALID (#1388 review round 3 #3).
+    // The grammar and the read-back now agree, and `(ſd)` is an unrecognized
+    // line. Every tag group in this file carries the same flag.
     let omega_re = Regex::new(
-        r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*(sd|variance|var)\s*\))?(?:\s+(FIX)\b)?\s*$",
+        r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\))?(?:\s+(FIX)\b)?\s*$",
     )
     .unwrap();
 
@@ -14336,21 +14367,33 @@ fn parse_parameters(
     //
     // Block omegas are variance-scale only — the lower triangle mixes
     // variances and covariances, so a single `(sd)` flag would be ambiguous.
-    // #1377: that ambiguity is *rejected*, not dropped. A scale tag fails the
-    // `\s*$` anchor below and lands in the `else` arm, which gives it its own
-    // message and `E_BLOCK_VARIANCE_ONLY`.
-    let block_omega_re =
-        Regex::new(r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?\s*$")
-            .unwrap();
+    // #1377: that ambiguity is *rejected*, not dropped. The regex matches a scale
+    // tag after the `]` and the matched arm rejects it with its own message,
+    // which `parse_error_to_diagnostic` maps to `E_BLOCK_VARIANCE_ONLY`.
+    // Group 4 captures a scale tag so the matched arm can reject it. Rejecting
+    // there, rather than letting the tag fail the anchor and guessing at it in
+    // the `else` arm with a second regex, makes the classification exact by
+    // construction: a line gets `E_BLOCK_VARIANCE_ONLY` only if deleting the tag
+    // would leave a declaration that parses. The guess read `[...] (sd) banana`
+    // as a tag problem, and applying its repair still left the line failing
+    // (#1388 review round 3 #8). Group 3 is `FIX`; group 5, a `FIX` after the
+    // tag, sits *inside* the tag group so both `] FIX (sd)` and `] (sd) FIX`
+    // classify while `] FIX FIX` — no tag at all — still matches nothing.
+    let block_omega_re = Regex::new(
+        r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\)(?:\s+(FIX)\b)?)?\s*$",
+    )
+    .unwrap();
 
     // block_sigma (NAME1, NAME2, ...) = [lower_triangle_covariances] | ... FIX
     //
     // Diagonal entries initialise the named sigma SDs; off-diagonal entries are
     // converted to fixed correlations so the existing positive sigma
     // parameterization remains intact.
-    let block_sigma_re =
-        Regex::new(r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?\s*$")
-            .unwrap();
+    // Same group layout as `block_omega_re`, tag in group 4.
+    let block_sigma_re = Regex::new(
+        r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\)(?:\s+(FIX)\b)?)?\s*$",
+    )
+    .unwrap();
 
     // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
@@ -14361,21 +14404,23 @@ fn parse_parameters(
     // FIX may appear before or after the scale annotation (same group layout
     // as omega_re: group 3 = FIX before, group 4 = annotation, group 5 = FIX after).
     let sigma_re = Regex::new(
-        r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*(sd|variance|var)\s*\))?(?:\s+(FIX)\b)?\s*$",
+        r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\))?(?:\s+(FIX)\b)?\s*$",
     )
     .unwrap();
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
     let kappa_re = Regex::new(
-        r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*(sd|variance|var)\s*\))?(?:\s+(FIX)\b)?\s*$",
+        r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\))?(?:\s+(FIX)\b)?\s*$",
     )
     .unwrap();
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
-    let block_kappa_re =
-        Regex::new(r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?\s*$")
-            .unwrap();
+    // Same group layout as `block_omega_re`, tag in group 4.
+    let block_kappa_re = Regex::new(
+        r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\)(?:\s+(FIX)\b)?)?\s*$",
+    )
+    .unwrap();
 
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
@@ -14386,7 +14431,7 @@ fn parse_parameters(
         // #1377 every regex was an unanchored prefix match, so a weight left in
         // place would sit past the end of a successful match and be silently
         // dropped — the specific failure mode this feature exists to remove.
-        // They are now pinned with `\s*$`, so it would instead stop the line
+        // They are now pinned with `^\s*…\s*$`, so it would instead stop the line
         // matching at all; the peel is what keeps the modifier legal. A weight
         // left on any other declaration is rejected below rather than ignored,
         // for the same reason.
@@ -14413,14 +14458,24 @@ fn parse_parameters(
             let init: f64 = caps[3]
                 .parse()
                 .map_err(|_| format!("Bad theta init: {}", line))?;
-            let lower: f64 = caps
-                .get(4)
-                .map(|m| m.as_str().parse().unwrap_or(1e-9))
-                .unwrap_or(1e-9);
-            let upper: f64 = caps
-                .get(5)
-                .map(|m| m.as_str().parse().unwrap_or(1e9))
-                .unwrap_or(1e9);
+            // An absent bound takes its default; a bound that is *present* but
+            // not a number is an error, as the init above already is. The
+            // character class `[0-9eE.+-]+` admits `0.001-10.0`, `-` and `1e`,
+            // and a `.parse().unwrap_or(default)` here used to swap each for
+            // the default box edge with no diagnostic (#1388 review round 3 #1).
+            let bound = |i: usize, which: &str, default: f64| -> Result<f64, String> {
+                caps.get(i).map_or(Ok(default), |m| {
+                    m.as_str().parse().map_err(|_| {
+                        format!(
+                            "Bad theta {which} bound `{}`: {}",
+                            m.as_str(),
+                            source_line.trim()
+                        )
+                    })
+                })
+            };
+            let lower = bound(4, "lower", 1e-9)?;
+            let upper = bound(5, "upper", 1e9)?;
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
             match block {
                 None => {
@@ -14509,6 +14564,7 @@ fn parse_parameters(
                 }
             }
         } else if let Some(caps) = block_omega_re.captures(line) {
+            reject_block_scale_tag("block_omega", &caps, source_line)?;
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -14539,6 +14595,7 @@ fn parse_parameters(
                 fixed,
             });
         } else if let Some(caps) = block_sigma_re.captures(line) {
+            reject_block_scale_tag("block_sigma", &caps, source_line)?;
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -14589,6 +14646,7 @@ fn parse_parameters(
                 fixed,
             });
         } else if let Some(caps) = block_kappa_re.captures(line) {
+            reject_block_scale_tag("block_kappa", &caps, source_line)?;
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -14708,70 +14766,61 @@ fn parse_parameters(
                 init_as_sd,
             });
         } else {
-            // #1377: a `[parameters]` line is either consumed end-to-end by
-            // exactly one declaration form above, or it is an error — never
-            // partly read, never dropped. Every form is pinned with `\s*$`, so
-            // arriving here means no grammar covers the *whole* line. Before
-            // #1377 this arm did not exist: an unmatched line fell out of the
-            // chain and vanished, which is how `(sd)` on a block came to be
-            // read as three variances with the file reporting VALID.
+            // #1377: a `[parameters]` line is either consumed end to end by
+            // exactly one declaration form above, or it is an error. Every form
+            // is pinned with `^\s*…\s*$`, so arriving here means no grammar
+            // covers the *whole* line. Before #1377 this arm did not exist: an
+            // unmatched line fell out of the chain and vanished, which is how
+            // `(sd)` on a block came to be read as three variances with the file
+            // reporting VALID. (A block scale tag no longer reaches this arm at
+            // all: the block regexes capture it and their own arm rejects it.)
             //
-            // `extract_blocks` drops blank lines and comment tails before the
-            // block ever reaches here, so every line that arrives is one the
-            // user wrote and meant.
-            // Built here rather than beside the declaration forms: they are read
-            // only on this arm, which returns immediately, so the happy path
-            // compiles nothing extra (`model_parser.rs` measures per-call
-            // `Regex::new` at ~0.9 ms of the parse, #1027).
+            // `extract_blocks` drops blank lines and `#` / `//` comment tails
+            // before the block ever reaches here, so every line that arrives is
+            // one the user wrote and meant.
             //
-            // The tag must sit *after* the closing `]`, which is why this is not
-            // a bare `contains` (#1388 review §3). A scan over the whole line
-            // also reads the name list, so `block_kappa (SD) = [0.1] FIX FIX` --
-            // a doubled `FIX`, no tag anywhere -- would be told to square each
-            // SD. The code exists so a consumer can apply the repair
-            // mechanically, and an auto-fixer keyed on a misclassification would
-            // square a block that was never on the SD scale. Both `] FIX (sd)`
-            // and `] (sd) FIX` still classify.
             // Quote what the user wrote, not the peeled remainder: `shown` used
             // to be the post-`prior(...)` / post-`weight =` text, so the
             // "offending line" could be a string appearing nowhere in the file
             // (#1388 review). Still post-*join*, so a multi-line `block_*`
             // declaration is quoted as the one logical line it forms.
             let shown = source_line.trim();
-            // A `;` comment is the shape a NONMEM-converted file carries on most
+            // A `;` is the comment a NONMEM-converted file carries on most
             // lines, and the generic message never says the word "comment"
-            // (#1388 review). The repair is as mechanical as the block-tag one,
-            // so it gets the same treatment: named, at the same depth.
-            if shown.starts_with(';') {
-                return Err(format!(
-                    "[parameters]: `;` does not start a comment in a `.ferx` file — use `#` \
-                     or `//`. Until then the rest of the line is read as a declaration, so \
-                     `; theta TVCL(1, 0.1, 100)` silently declared a live theta. Offending \
-                     line: `{shown}`."
-                ));
-            }
-            let block_kw = BLOCK_DECL_RE.captures(shown).map(|c| c[1].to_lowercase());
-            let tag = SCALE_TAG_RE.captures(shown).map(|c| c[1].to_lowercase());
-            if let (Some(kw), Some(tag)) = (block_kw, tag) {
-                // Sentinel `is variance-only`, matched by
-                // `parse_error_to_diagnostic` to raise this above the `E_PARSE`
-                // catch-all. Keep the phrase if the wording moves.
-                //
-                // The repair depends on which tag was written, and telling a
-                // `(variance)` author to "square each SD" is worse than saying
-                // nothing — they wrote variances already.
-                let repair = if tag == "sd" {
-                    "Square each SD into a variance and write the off-diagonals as covariances."
-                } else {
-                    "The lower triangle is always variances and covariances, so the tag says \
-                     nothing about it. Delete the tag."
+            // (#1388 review). It gets a named message when the rest of the line
+            // shows that is what it was: nothing before the `;`, or a complete
+            // declaration before it. The second shape is the common one — a
+            // trailing `; 30% CV` — and round 3 (#7) found only a leading `;`
+            // was recognised. A complete declaration on *both* sides is not a
+            // comment but an attempt to write several on one line, which the docs
+            // themselves did (#1388 review round 3 #2), and says so instead.
+            if let Some((head, _)) = shown.split_once(';') {
+                let is_declaration = |s: &str| {
+                    [
+                        &theta_re,
+                        &omega_re,
+                        &block_omega_re,
+                        &block_sigma_re,
+                        &sigma_re,
+                        &kappa_re,
+                        &block_kappa_re,
+                    ]
+                    .iter()
+                    .any(|re| re.is_match(s))
                 };
-                return Err(format!(
-                    "[parameters]: `{kw}` is variance-only — the scale tag `({tag})` is not \
-                     accepted on a block declaration, since the lower triangle mixes variances \
-                     and covariances and one tag cannot say which entry is on which scale. \
-                     {repair} Offending line: `{shown}`."
-                ));
+                if shown.split(';').all(is_declaration) {
+                    return Err(format!(
+                        "[parameters]: `;` does not separate declarations in a `.ferx` file — \
+                         write each one on its own line. Offending line: `{shown}`."
+                    ));
+                }
+                if head.trim().is_empty() || is_declaration(head) {
+                    return Err(format!(
+                        "[parameters]: `;` does not start a comment in a `.ferx` file — use `#` \
+                         or `//`. The text after it is read as part of the line, not skipped. \
+                         Offending line: `{shown}`."
+                    ));
+                }
             }
             return Err(format!(
                 "[parameters]: unrecognized line `{shown}`. Expected one of: {}. A {} \

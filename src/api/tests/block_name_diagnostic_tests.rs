@@ -297,3 +297,72 @@ fn repeated_sigma_argument_is_not_coded_as_an_order_mismatch() {
     let d = parse_error_to_diagnostic(&err);
     assert_eq!(d.code, "E_PARSE", "{err}");
 }
+
+/// `E_BLOCK_VARIANCE_ONLY` keys on the message's own head, never on the quoted
+/// user line (#1388 review round 3 #9).
+///
+/// The sentinel used to be a substring of the whole message, which quotes the
+/// offending line, so an unrecognized line whose *text* read `is variance-only`
+/// was raised to the block-tag code and handed a "delete the tag" suggestion for
+/// a tag it did not have. The control row is the real block tag, through the
+/// same `parse_full_model` path, so a sentinel that stops matching at all
+/// reddens too.
+///
+/// Reddens if the mapping goes back to `err.contains("is variance-only")`.
+#[test]
+fn a_quoted_line_cannot_claim_the_block_variance_only_code() {
+    let model = |omega_line: &str| {
+        format!(
+            "
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  {omega_line}
+  sigma S_A ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V + ETA_KA)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(S_A)
+"
+        )
+    };
+    let err_for = |omega_line: &str| match crate::parser::model_parser::parse_full_model(&model(
+        omega_line,
+    )) {
+        Ok(_) => panic!("`{omega_line}` must be rejected"),
+        Err(e) => e,
+    };
+
+    for line in [
+        "omega ETA_KA ~ 0.30 is variance-only",
+        "omega ETA_KA ~ 0.30 `block_omega` is variance-only — the scale tag `(sd)`",
+    ] {
+        let err = err_for(line);
+        let d = parse_error_to_diagnostic(&err);
+        assert_eq!(d.code, "E_PARSE", "`{line}` has no block tag: {err}");
+        assert!(d.suggestion.is_none(), "`{line}`: {:?}", d.suggestion);
+    }
+
+    // The control: a real tag on the real block still gets the code, and the
+    // `(sd)` repair.
+    let parsed = crate::parser::model_parser::parse_full_model(
+        &model("omega ETA_KA ~ 0.30").replace("0.04]", "0.04] (sd)"),
+    );
+    let err = match parsed {
+        Ok(_) => panic!("a scale tag on a block must be rejected"),
+        Err(e) => e,
+    };
+    let d = parse_error_to_diagnostic(&err);
+    assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY", "{err}");
+    assert!(
+        d.suggestion
+            .as_deref()
+            .is_some_and(|s| s.contains("square each SD")),
+        "{:?}",
+        d.suggestion
+    );
+}
