@@ -5752,29 +5752,23 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     // dropped in silence and the file reported VALID, which is why the code is
     // worth having at all.
     //
-    // The sentinel is the message's own head, ``[parameters]: `block_…` is
-    // variance-only``, read only from the text *before* `Offending line:`.
-    // Every other unrecognised `[parameters]` line stays `E_PARSE` deliberately,
-    // since there is no mechanical repair to offer for arbitrary trailing text.
+    // The sentinel is the message's own prefix, ``[parameters]: `block_``, which
+    // `reject_block_scale_tag` is the only writer of. Every other unrecognised
+    // `[parameters]` line stays `E_PARSE` deliberately, since there is no
+    // mechanical repair to offer for arbitrary trailing text.
     //
-    // Not a substring of the whole message. That message quotes the user's line,
-    // so `omega ETA_KA ~ 0.30 is variance-only` — an unrecognized line whose
-    // text happened to contain the phrase — was raised to this code with a
-    // "delete the tag" suggestion for a tag it did not have (#1388 review round
-    // 3 #9). The prefix is written by `reject_block_scale_tag` alone, and the
-    // quoted line always follows `Offending line:`, so neither half of the test
-    // can be satisfied by user text. The tag read-back below is scoped the same
-    // way.
+    // A prefix, not a substring of the whole message. That message quotes the
+    // user's line, so `omega ETA_KA ~ 0.30 is variance-only` — an unrecognized
+    // line whose text happened to contain the phrase — was raised to this code
+    // with a "delete the tag" suggestion for a tag it did not have (#1388 review
+    // round 3 #9). One gate: a second condition on the same message (an
+    // `is variance-only` filter, an `Offending line:` split) rejected no input
+    // the prefix accepts, so no test could see it go (round 4 #3).
     //
     // No `.with_block()`: the message already opens with `[parameters]`, and the
     // renderer prefixes whatever block it is given — setting both prints it
     // twice. Same reasoning as `E_SIGMA_ORDER_MISMATCH` above.
-    let block_tag_head = err
-        .strip_prefix("[parameters]: `block_")
-        .and_then(|rest| rest.split_once("Offending line:"))
-        .map(|(head, _)| head)
-        .filter(|head| head.contains("` is variance-only"));
-    if let Some(head) = block_tag_head {
+    if let Some(head) = err.strip_prefix("[parameters]: `block_") {
         // The repair travels as a field, not only inside the prose (#1388
         // review): a mechanical remedy is the whole reason this shape has a code
         // of its own, and a consumer that offers a fix should not have to scrape
@@ -5786,8 +5780,12 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
         // `(variance)` author to "square each SD" is worse than saying nothing --
         // they wrote variances already, and squaring them would break a correct
         // model. The tag is read back out of the one phrase the emitting arm
-        // always carries it in.
-        let suggestion = if head.contains("the scale tag `(sd)`") {
+        // always carries it in, at its first occurrence: the emitter writes it
+        // before the quoted line.
+        let tag_is_sd = head
+            .split_once("the scale tag `(")
+            .is_some_and(|(_, rest)| rest.starts_with("sd)`"));
+        let suggestion = if tag_is_sd {
             "square each SD into a variance and write the off-diagonals as covariances"
         } else {
             "delete the tag: the lower triangle is already variances and covariances, \

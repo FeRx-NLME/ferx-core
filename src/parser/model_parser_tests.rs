@@ -7233,6 +7233,12 @@ fn a_non_ascii_scale_tag_is_not_a_scale_tag() {
     let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4 (SD)");
     let model = parse_model_string(&src).expect("`(SD)` on a mixture override parses");
     assert!(model.mixture.unwrap().omega_overrides[0].as_sd);
+    // ...with the inner whitespace every other tag group accepts. The override
+    // regex kept its own copy of the tag and never gained it (#1388 review
+    // round 4 #2); it now splices `SCALE_TAG_GROUP` like the rest.
+    let src = MIXTURE_2CLASS.replace("omega(2) ETA_CL ~ 0.4", "omega(2) ETA_CL ~ 0.4 ( sd )");
+    let model = parse_model_string(&src).expect("`( sd )` on a mixture override parses");
+    assert!(model.mixture.unwrap().omega_overrides[0].as_sd);
 }
 
 /// The own-line fold attaches only to a real `block_*` declaration (#1388
@@ -7456,6 +7462,55 @@ fn a_block_without_a_scale_tag_never_claims_the_variance_only_code() {
             "{why}, so `{line}` must not be told to square its diagonal: {err}"
         );
         assert!(err.contains("unrecognized line"), "`{line}`: {err}");
+    }
+
+    // A real tag after the `]`, on a line that is wrong for another reason as
+    // well. The code promises a sufficient repair, so it waits until the rest of
+    // the line has parsed; each row reports its other defect first (#1388 review
+    // round 4 #1, measured: all five used to claim E_BLOCK_VARIANCE_ONLY).
+    for (lines, other) in [
+        (
+            vec!["block_omega (A, B) = [banana, 0.02, 0.04] (sd)"],
+            "Bad block_omega value",
+        ),
+        (
+            vec!["block_omega (A, B) = [0.09, 0.02] (sd)"],
+            "expects 3 lower-triangle values",
+        ),
+        (
+            vec!["block_omega (A, B) = [0.09, 0.02, 0.04] (sd) prior(0.1, rse = 25%)"],
+            "`prior(...)` is only supported",
+        ),
+        (
+            vec!["block_kappa (A) = [0.1] (sd) weight = NARM"],
+            "`weight = NARM` is only supported",
+        ),
+        (
+            vec!["block_sigma (A, B) = [-0.04, 0.10, 1.00] (sd)"],
+            "negative initial variance",
+        ),
+    ] {
+        let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let err = parse_parameters(&lines, &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{}` must be rejected", lines[0]));
+        assert!(
+            err.contains(other) && !err.contains("is variance-only"),
+            "`{}` must report `{other}` before the tag: {err}",
+            lines[0]
+        );
+    }
+    // The control: the same tag on a line with nothing else wrong still claims
+    // the code, for every block form (the three arms each gate it separately).
+    for line in [
+        "block_omega (A, B) = [0.09, 0.02, 0.04] (sd)",
+        "block_sigma (A, B) = [0.04, 0.10, 1.00] (sd)",
+        "block_kappa (A) = [0.1] (sd)",
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap();
+        assert!(err.contains("is variance-only"), "`{line}`: {err}");
     }
 
     // ...and a real tag after the `]` still classifies, in both FIX orders.
@@ -7711,10 +7766,12 @@ fn the_quoted_line_is_the_source_line_not_the_peeled_remainder() {
             "; omega ETA_CL ~ 0.09 prior(0.1, rse = 25%)",
             "the `;`-is-not-a-comment branch",
         ),
-        (
-            "block_omega (A, B) = [0.09, 0.02, 0.04] (sd) prior(0.1, rse = 25%)",
-            "the E_BLOCK_VARIANCE_ONLY branch",
-        ),
+        // No E_BLOCK_VARIANCE_ONLY row any more, and not by omission: that code
+        // now waits for the rest of the line to parse, and a peeled `prior(...)`
+        // or `weight =` tail on a block is itself an error reported first
+        // (#1388 review round 4 #1). So a line reaching that branch carries no
+        // peel, and its source and peeled text are the same string -- a row
+        // here could not tell the two apart.
     ] {
         let err = parse_parameters(&[line.to_string()], &Default::default())
             .err()

@@ -13523,6 +13523,17 @@ const PARAMETER_FORMS: &[(&str, &str, bool)] = &[
     ),
 ];
 
+/// The scale-tag group every `[parameters]` and `[mixture]` regex splices in:
+/// `(sd)`, `(variance)` or `(var)`, inner whitespace allowed, capturing the tag.
+///
+/// One copy, spliced with `format!`, because the copies drifted twice: the
+/// `(?-u:…)` ASCII-only flag had to be added to seven of them by hand (#1388
+/// review round 3 #3), and `[mixture]`'s override regex never gained the inner
+/// whitespace the base forms accept (round 4 #2). `(?-u:…)` keeps the match in
+/// ASCII case, agreeing with the `eq_ignore_ascii_case` read-back and with
+/// `is_bare_scale_tag`.
+const SCALE_TAG_GROUP: &str = r"\(\s*((?-u:sd|variance|var))\s*\)";
+
 /// Does a `[parameters]` line open a `block_*` declaration?
 ///
 /// The one test for "is a block declaration" that the own-line fold in
@@ -13833,7 +13844,9 @@ fn parse_mixture_block(
     // `omega(k) NAME ~ var [FIX] [(sd|var)] [FIX]` — mirrors the base omega/sigma
     // regexes in `parse_parameters`, prefixed with the `(k)` class selector.
     let ov_re = Regex::new(
-        r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(((?-u:sd|variance|var))\))?(?:\s+(FIX)\b)?$",
+        &format!(
+            r"(?i)^(omega|sigma)\s*\(\s*(\d+)\s*\)\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?$"
+        ),
     )
     .unwrap();
 
@@ -14357,9 +14370,11 @@ fn parse_parameters(
     // the value was accepted and never squared: a 500x misread on
     // `~ 0.002 (ſd)` with `ferx check` reporting VALID (#1388 review round 3 #3).
     // The grammar and the read-back now agree, and `(ſd)` is an unrecognized
-    // line. Every tag group in this file carries the same flag.
+    // line. Every tag group splices the one `SCALE_TAG_GROUP`.
     let omega_re = Regex::new(
-        r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\))?(?:\s+(FIX)\b)?\s*$",
+        &format!(
+            r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
+        ),
     )
     .unwrap();
 
@@ -14380,7 +14395,9 @@ fn parse_parameters(
     // tag, sits *inside* the tag group so both `] FIX (sd)` and `] (sd) FIX`
     // classify while `] FIX FIX` — no tag at all — still matches nothing.
     let block_omega_re = Regex::new(
-        r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\)(?:\s+(FIX)\b)?)?\s*$",
+        &format!(
+            r"(?i)^\s*block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
+        ),
     )
     .unwrap();
 
@@ -14391,7 +14408,9 @@ fn parse_parameters(
     // parameterization remains intact.
     // Same group layout as `block_omega_re`, tag in group 4.
     let block_sigma_re = Regex::new(
-        r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\)(?:\s+(FIX)\b)?)?\s*$",
+        &format!(
+            r"(?i)^\s*block_sigma\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
+        ),
     )
     .unwrap();
 
@@ -14404,21 +14423,27 @@ fn parse_parameters(
     // FIX may appear before or after the scale annotation (same group layout
     // as omega_re: group 3 = FIX before, group 4 = annotation, group 5 = FIX after).
     let sigma_re = Regex::new(
-        r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\))?(?:\s+(FIX)\b)?\s*$",
+        &format!(
+            r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
+        ),
     )
     .unwrap();
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
     let kappa_re = Regex::new(
-        r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\))?(?:\s+(FIX)\b)?\s*$",
+        &format!(
+            r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP})?(?:\s+(FIX)\b)?\s*$"
+        ),
     )
     .unwrap();
 
     // block_kappa (NAME1, NAME2, ...) = [lower_triangle_values]  |  ... FIX
     // Same group layout as `block_omega_re`, tag in group 4.
     let block_kappa_re = Regex::new(
-        r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*\(\s*((?-u:sd|variance|var))\s*\)(?:\s+(FIX)\b)?)?\s*$",
+        &format!(
+            r"(?i)^\s*block_kappa\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?(?:\s*{SCALE_TAG_GROUP}(?:\s+(FIX)\b)?)?\s*$"
+        ),
     )
     .unwrap();
 
@@ -14564,7 +14589,6 @@ fn parse_parameters(
                 }
             }
         } else if let Some(caps) = block_omega_re.captures(line) {
-            reject_block_scale_tag("block_omega", &caps, source_line)?;
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -14589,13 +14613,20 @@ fn parse_parameters(
                 eta_names_ordered.push(n.clone());
             }
             let fixed = caps.get(3).is_some();
+            // Last, not first: the code promises its repair is sufficient, so it
+            // is raised only once the rest of the line has parsed. A tag beside a
+            // bad value, a wrong count or a `prior(...)` / `weight =` tail reports
+            // that defect instead, and the tag after it is fixed (#1388 review
+            // round 4 #1).
+            if prior_decl.is_none() && weight_expr.is_none() {
+                reject_block_scale_tag("block_omega", &caps, source_line)?;
+            }
             block_omegas.push(BlockOmegaSpec {
                 names,
                 lower_triangle: values,
                 fixed,
             });
         } else if let Some(caps) = block_sigma_re.captures(line) {
-            reject_block_scale_tag("block_sigma", &caps, source_line)?;
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -14640,13 +14671,20 @@ fn parse_parameters(
                     val_idx += 1;
                 }
             }
+            // Last, not first: the code promises its repair is sufficient, so it
+            // is raised only once the rest of the line has parsed. A tag beside a
+            // bad value, a wrong count or a `prior(...)` / `weight =` tail reports
+            // that defect instead, and the tag after it is fixed (#1388 review
+            // round 4 #1).
+            if prior_decl.is_none() && weight_expr.is_none() {
+                reject_block_scale_tag("block_sigma", &caps, source_line)?;
+            }
             block_sigmas.push(BlockSigmaSpec {
                 names,
                 lower_triangle: values,
                 fixed,
             });
         } else if let Some(caps) = block_kappa_re.captures(line) {
-            reject_block_scale_tag("block_kappa", &caps, source_line)?;
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
                 .split(',')
@@ -14672,6 +14710,14 @@ fn parse_parameters(
                 kappa_weights_ordered.push(None);
             }
             let fixed = caps.get(3).is_some();
+            // Last, not first: the code promises its repair is sufficient, so it
+            // is raised only once the rest of the line has parsed. A tag beside a
+            // bad value, a wrong count or a `prior(...)` / `weight =` tail reports
+            // that defect instead, and the tag after it is fixed (#1388 review
+            // round 4 #1).
+            if prior_decl.is_none() && weight_expr.is_none() {
+                reject_block_scale_tag("block_kappa", &caps, source_line)?;
+            }
             block_kappas.push(BlockKappaSpec {
                 names,
                 lower_triangle: values,
