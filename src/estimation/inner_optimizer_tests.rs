@@ -887,7 +887,7 @@ fn inner_solver_scaling_bench() {
             t0.elapsed().as_secs_f64() * 1e3 / runs as f64
         };
         let t_dense =
-            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, None, false));
         let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
         eprintln!(
             "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
@@ -1132,7 +1132,7 @@ fn run_dense_scratch_fixture(n: usize, legacy: bool) -> (bool, Vec<u64>, u64, us
     let converged = if legacy {
         legacy_dense_bfgs(&obj, &grad, &mut x, n, 200, 1e-10)
     } else {
-        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, false)
+        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, None, false)
     };
     let final_objective = obj(&x).to_bits();
     (
@@ -1327,7 +1327,7 @@ fn dense_bfgs_converges_on_quadratic() {
         |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
     let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
     let mut x = vec![0.0, 0.0];
-    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, false);
+    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, None, false);
     assert!(ok, "BFGS should report convergence");
     assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
     assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -1412,6 +1412,7 @@ fn test_ebe_result_converged_flag() {
     let r = EbeResult {
         eta: nalgebra::DVector::zeros(2),
         h_matrix: nalgebra::DMatrix::identity(2, 2),
+        terminal_hessian: None,
         converged: true,
         used_fallback: false,
         grad_norm: 0.0,
@@ -1425,6 +1426,18 @@ fn test_ebe_result_converged_flag() {
 }
 
 #[test]
+fn hessian_seed_is_applied_through_a_cholesky_solve() {
+    let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
+    let got = init_h_inv(2, None, Some(&h));
+    let identity = &h * got;
+    assert!((identity - DMatrix::identity(2, 2)).norm() < 1e-12);
+
+    // An indefinite analytical seed must preserve the legacy identity fallback.
+    let bad = DMatrix::from_diagonal(&DVector::from_column_slice(&[1.0, -1.0]));
+    assert_eq!(init_h_inv(2, None, Some(&bad)), DMatrix::identity(2, 2));
+}
+
+#[test]
 fn test_inner_loop_stats_min_obs_filter() {
     // min_obs filter: subjects with fewer obs than min_obs are excluded
     // from n_unconverged count. We exercise this logic by constructing
@@ -1433,6 +1446,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            terminal_hessian: None,
             converged: false, // unconverged
             used_fallback: false,
             grad_norm: 0.0,
@@ -1443,6 +1457,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            terminal_hessian: None,
             converged: false, // also unconverged
             used_fallback: true,
             grad_norm: 0.0,
@@ -1474,6 +1489,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
     let make = |hard_reject: bool| EbeResult {
         eta: nalgebra::DVector::zeros(1),
         h_matrix: nalgebra::DMatrix::zeros(1, 1),
+        terminal_hessian: None,
         converged: false,
         used_fallback: false,
         grad_norm: 0.0,
