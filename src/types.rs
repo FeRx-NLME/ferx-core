@@ -5946,17 +5946,21 @@ pub enum WarningCode {
     /// *nothing* moved — a well-chosen start that the optimizer correctly leaves
     /// in place on one parameter while moving another is not a stall.
     StalledAtInit,
-    /// The empirical Bayes estimates at the final parameters depend on where the
-    /// inner loop starts: re-solving them cold at the reported estimates lands on a
-    /// materially worse objective than re-solving them from the EBEs the optimizer
-    /// itself was minimising against (#833). The individual objective is multimodal
-    /// at those estimates, so every EBE-derived diagnostic (IPRED, IWRES, CWRES,
-    /// shrinkage, the covariance step's inner solve) is start-dependent.
+    /// The empirical Bayes estimates at the final parameters depend on where the inner
+    /// loop starts: re-solving them cold at the reported estimates lands on a materially
+    /// worse objective than the EBEs the optimizer itself was minimising against — or on
+    /// no usable number at all (#833). Every EBE-derived diagnostic (IPRED, IWRES, CWRES,
+    /// shrinkage, the covariance step's inner solve) is therefore start-dependent.
+    ///
+    /// It reports a *measurement*, not a diagnosis: two things produce it — an individual
+    /// objective with more than one mode at these estimates, and an `inner_maxiter` a cold
+    /// start cannot converge within — and the two objectives alone do not distinguish
+    /// them. The message names both.
     ///
     /// Distinct from [`WarningCode::Convergence`]: the *outer* fit may be perfectly
-    /// converged — this says the inner problem has more than one mode at the point
-    /// it converged to. The reported fit uses whichever of the two EBE sets scores
-    /// the lower objective, so the number is the better of the two, not a coin flip.
+    /// converged; this is about the inner problem at the point it converged to. The
+    /// reported fit uses whichever EBE set scores the lowest objective, so the number is
+    /// the best of the candidates, not a coin flip.
     EbeStartDependent,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.

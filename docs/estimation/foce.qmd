@@ -482,19 +482,29 @@ When the outer optimizer stops, ferx restores the best point it saw
 the EBEs that reach the sdtab, the covariance step and the reported objective come from that
 solve, not from the trajectory.
 
-It is run **twice**: once cold, and once from the EBEs the optimizer was minimising against.
-Whichever scores the lower objective is reported. Before
-[#833](https://github.com/FeRx-NLME/ferx-core/issues/833) only the cold solve ran, and on a
-multimodal individual objective it could settle at a different η̂ than the warm trajectory had —
-so the reported OFV came out *above* the best-seen value the point had just been restored for
-(+3.5 on a fluconazole 2-cpt binding model), and the covariance step ran at those different
-EBEs. Re-solving from both and keeping the better one cannot make the reported number worse
-than either.
+That solve runs **cold**, from η = 0. When its objective reproduces the best value the
+optimizer saw, it is what the fit reports and nothing else runs — which is the ordinary case,
+and it costs exactly what it always did.
 
-The two solves are also a diagnostic. A cold re-solve that lands materially worse raises the
-`ebe_start_dependent` warning (see [Warnings](../warnings.qmd#codes-convergence)), which quotes
-both values: the estimates are fine, but the EBEs at them — and every EBE-derived diagnostic —
-depend on where the inner loop starts, which is worth knowing before reading an IWRES plot.
+When it does **not** reproduce that value, two more candidates are scored on the same
+objective: the EBEs the optimizer was minimising against, exactly as it left them, and a
+re-solve seeded from those. The lowest of the three is reported. Before
+[#833](https://github.com/FeRx-NLME/ferx-core/issues/833) only the cold solve ran, so where it
+settled at a different η̂ than the trajectory had, the reported OFV came out *above* the
+best-seen value the point had just been restored for (+3.5 on a fluconazole 2-cpt binding
+model), and the covariance step ran at those different EBEs. The held EBEs are scored as a
+candidate in their own right, not merely used as a seed, because a re-solve is not guaranteed
+to improve on the point it starts from.
+
+The comparison is also a diagnostic. A cold re-solve that lands materially worse — or returns
+no usable number at all — raises the `ebe_start_dependent` warning (see
+[Warnings](../warnings.qmd#codes-convergence)), which quotes both objectives. The estimates are
+unaffected; what depends on the starting point is the EBEs at them, and so every diagnostic
+built on those (IPRED, IWRES, CWRES, shrinkage) plus the covariance step. Two things produce
+it, and the warning names both rather than guessing: an individual objective with more than one
+mode at these estimates, and an `inner_maxiter` a cold start cannot converge within. Raising
+`inner_maxiter`, or `inner_restarts` for a suspected second mode, tells them apart.
+
 The cold number is also what the convergence self-consistency check reads
 ([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)); a fit whose "optimum" exists only
 under a warm start is still rejected.
