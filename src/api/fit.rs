@@ -1631,6 +1631,19 @@ fn fit_inner(
         let mut stage_opts = options.clone();
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
+        crate::estimation::inner_optimizer::set_capture_terminal_hessian(
+            stage_opts.agq_nodes().is_some(),
+        );
+        crate::estimation::inner_optimizer::set_hessian_seed_for_fit(
+            stage_opts.agq_nodes().is_none()
+                && matches!(
+                    method,
+                    EstimationMethod::Foce
+                        | EstimationMethod::FoceI
+                        | EstimationMethod::FoceGn
+                        | EstimationMethod::FoceGnHybrid
+                ),
+        );
         // Per-stage interaction flag: FOCEI=on, FOCE=off, others inherit from user options.
         match method {
             EstimationMethod::FoceI => stage_opts.interaction = true,

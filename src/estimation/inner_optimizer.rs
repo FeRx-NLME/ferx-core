@@ -453,6 +453,10 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
+    /// Exact conditional eta Hessian at the returned mode when the second-order
+    /// sensitivity provider can produce it.  Laplace/AGQ may reuse this instead
+    /// of immediately repeating the same `Dual2` evaluation.
+    pub(crate) terminal_hessian: Option<DMatrix<f64>>,
     /// True when the optimizer (BFGS or Nelder-Mead) met its tolerance criterion.
     /// False on iteration-limit exit regardless of which optimizer was used.
     pub converged: bool,
@@ -472,6 +476,103 @@ pub struct EbeResult {
     /// OFV. Unlike plain non-convergence this forces rejection regardless of
     /// `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
     pub hard_reject: bool,
+}
+
+/// Exact conditional eta Hessian from the shared second-order sensitivity pass.
+/// `None` is a cheap scope decision for models/subjects without a `Dual2` route.
+fn analytic_inner_seed_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> Option<DMatrix<f64>> {
+    if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        return None;
+    }
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
+    crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta,
+        model.residual_error_eta,
+    )
+    // Match nlmixr2est's normal-endpoint `warm="calc"` seed: the positive
+    // Gauss-Newton/Almquist curvature is a robust optimizer metric.  The exact
+    // Hessian remains the Laplace/AGQ integration anchor below, but can be
+    // indefinite away from the mode and was slower as a BFGS seed in A/B runs.
+    .map(|core| core.htilde)
+}
+
+fn analytic_terminal_work(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> Option<(DMatrix<f64>, DMatrix<f64>)> {
+    if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        return None;
+    }
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
+    let core = crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta,
+        model.residual_error_eta,
+    )?;
+    let mut jac = DMatrix::zeros(subject.obs_times.len(), model.n_eta);
+    if sens.obs.len() != jac.nrows() {
+        return None;
+    }
+    for (row, obs) in sens.obs.iter().enumerate() {
+        for col in 0..model.n_eta {
+            jac[(row, col)] = obs.df_deta[col];
+        }
+    }
+    overwrite_frem_pseudo_obs_rows(&mut jac, model, subject, model.n_eta);
+    Some((jac, core.h_inner))
+}
+
+static CAPTURE_TERMINAL_HESSIAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable terminal curvature retention for a Laplace/AGQ fit.
+pub(crate) fn set_capture_terminal_hessian(on: bool) {
+    static REUSE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *REUSE_ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_TERMINAL_HESSIAN_REUSE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    });
+    CAPTURE_TERMINAL_HESSIAN.store(on && enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn capture_terminal_hessian() -> bool {
+    CAPTURE_TERMINAL_HESSIAN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn hessian_seed_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    HESSIAN_SEED_FOR_FIT.load(std::sync::atomic::Ordering::Relaxed)
+        && *ENABLED.get_or_init(|| {
+            std::env::var("FERX_NO_INNER_HESSIAN_SEED")
+                .map(|v| v != "1")
+                .unwrap_or(true)
+        })
+}
+
+static HESSIAN_SEED_FOR_FIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_hessian_seed_for_fit(on: bool) {
+    HESSIAN_SEED_FOR_FIT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Aggregate statistics from running the inner loop over all subjects.
@@ -1063,6 +1164,13 @@ fn find_ebe_impl(
             }
         }
     };
+    // nlmixr2est's `warm="calc"` idea, using ferx's exact `Dual2` curvature:
+    // seed dense BFGS from the conditional Hessian at the current warm EBE and
+    // current population parameters. A failed/out-of-scope factorization falls
+    // through to the historical identity/diagonal metric.
+    let initial_hessian = hessian_seed_enabled()
+        .then(|| analytic_inner_seed_hessian(model, subject, params, &eta))
+        .flatten();
     let result = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -1071,6 +1179,7 @@ fn find_ebe_impl(
         max_iter,
         tol,
         precond.as_deref(),
+        initial_hessian.as_ref(),
         stop_precond,
         enable_stall,
     );
@@ -1187,6 +1296,7 @@ fn find_ebe_impl(
                         max_iter,
                         tol,
                         precond.as_deref(),
+                        None,
                         stop_precond,
                         enable_stall,
                     );
@@ -1272,7 +1382,13 @@ fn find_ebe_impl(
     // and then overridden, which keeps the diff minimal and trivially
     // revertible while the values come from the exact sensitivities.
     let t_jac = std::time::Instant::now();
-    let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
+    let terminal_work = capture_terminal_hessian()
+        .then(|| analytic_terminal_work(model, subject, params, &eta_true))
+        .flatten();
+    let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
+    let analytic_jac: Option<DMatrix<f64>> = if let Some((jac, _)) = terminal_work {
+        Some(jac)
+    } else if analytic_inner_grad_supported(model, subject) {
         crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, &eta_true)
             .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j))
             .filter(|j| j.iter().all(|v| v.is_finite()))
@@ -1309,6 +1425,7 @@ fn find_ebe_impl(
     EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
+        terminal_hessian,
         converged: ebe_converged,
         used_fallback,
         grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
@@ -1466,6 +1583,7 @@ fn find_ebe_iov(
         return EbeResult {
             eta: DVector::from_column_slice(&bsv_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            terminal_hessian: None,
             converged: false,
             used_fallback: false,
             grad_norm: 0.0,
@@ -1482,6 +1600,7 @@ fn find_ebe_iov(
         n_flat,
         max_iter,
         tol,
+        None,
         None,
         None,
         enable_stall,
@@ -1600,6 +1719,7 @@ fn find_ebe_iov(
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
+        terminal_hessian: None,
         converged: (bfgs_converged || nm_converged) && nll.is_finite(),
         used_fallback,
         grad_norm: 0.0,
@@ -2858,7 +2978,21 @@ fn preconditioner_from_parts(
 
 /// Initial inverse-Hessian for the inner BFGS: `diag(precond)` when a
 /// preconditioner is supplied, else identity.
-fn init_h_inv(n: usize, precond: Option<&[f64]>) -> DMatrix<f64> {
+fn init_h_inv(
+    n: usize,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+) -> DMatrix<f64> {
+    if let Some(h) = hessian_seed {
+        if h.nrows() == n && h.ncols() == n {
+            if let Some(chol) = h.clone().cholesky() {
+                let solved = chol.solve(&DMatrix::identity(n, n));
+                if solved.iter().all(|v| v.is_finite()) {
+                    return solved;
+                }
+            }
+        }
+    }
     match precond {
         Some(p) => DMatrix::from_diagonal(&DVector::from_column_slice(p)),
         None => DMatrix::identity(n, n),
@@ -2908,6 +3042,7 @@ fn inner_minimize_with_grad(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
 ) -> bool {
@@ -2938,6 +3073,7 @@ fn inner_minimize_with_grad(
             max_iter,
             tol,
             precond,
+            hessian_seed,
             stop_precond,
             enable_stall,
         )
@@ -3055,10 +3191,11 @@ fn dense_bfgs_core(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
 ) -> bool {
-    let mut h_inv = init_h_inv(n, precond);
+    let mut h_inv = init_h_inv(n, precond, hessian_seed);
     let mut g = grad(x);
     let mut g_vec = DVector::zeros(n);
     let mut d_vec = DVector::zeros(n);
@@ -3095,7 +3232,7 @@ fn dense_bfgs_core(
         // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
         // `None`, so `gnorm` here is the raw L2 norm; a diagonal preconditioner
         // already sets the per-dim scale.
-        if precond.is_none() && first_step && gnorm > 1.0 {
+        if precond.is_none() && hessian_seed.is_none() && first_step && gnorm > 1.0 {
             h_inv *= 1.0 / gnorm;
             first_step = false;
         }
@@ -3112,7 +3249,7 @@ fn dense_bfgs_core(
             // Reset to the (preconditioned) steepest-descent metric, not raw
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
-            h_inv = init_h_inv(n, precond);
+            h_inv = init_h_inv(n, precond, hessian_seed);
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
             let (alpha, f_new) =
@@ -3615,6 +3752,7 @@ pub fn run_inner_loop_warm(
 /// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
 /// outer-loop evaluation. See [`find_ebe_cached`].
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn run_inner_loop_warm_cached(
     model: &CompiledModel,
     population: &Population,
