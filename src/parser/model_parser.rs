@@ -13475,62 +13475,134 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 /// half that makes it a pin rather than a comment —
 /// `every_listed_parameter_form_actually_parses` parses each one, so a form can
 /// never be advertised that the parser does not accept.
-const PARAMETER_FORMS: &[(&str, &str)] = &[
+const PARAMETER_FORMS: &[(&str, &str, bool)] = &[
     (
         "theta NAME(init[, lower, upper]) [FIX]",
         "theta T(1.0, 0.0, 2.0) FIX",
+        true,
     ),
     (
-        "theta NAME[N](...) or theta NAME[COL, ...](...) (level block)",
+        "theta NAME[N](...) (level block, literal count)",
         "theta P[3](0.1, -1.0, 1.0)",
+        false,
+    ),
+    (
+        "theta NAME[COL, ...](...) (level block, one level per observed combination)",
+        "theta Q[STUDY](0.1, -1.0, 1.0)",
+        false,
     ),
     (
         "omega NAME ~ value [(sd|variance|var)] [FIX]",
         "omega E ~ 0.09 (sd) FIX",
+        true,
     ),
     (
         "sigma NAME ~ value [(sd|variance|var)] [FIX]",
         "sigma S ~ 0.01 (sd)",
+        true,
     ),
     (
         "kappa NAME ~ value [(sd|variance|var)] [FIX] [weight = <expr>]",
         "kappa K ~ 0.1 weight = NARM",
+        true,
     ),
     (
         "block_omega (A, B) = [lower triangle] [FIX]",
         "block_omega (A, B) = [0.09, 0.02, 0.04] FIX",
+        false,
     ),
     (
         "block_sigma (A, B) = [lower triangle] [FIX]",
         "block_sigma (A, B) = [0.04, 0.10, 1.00]",
+        false,
     ),
     (
         "block_kappa (A, B) = [lower triangle] [FIX]",
         "block_kappa (A, B) = [0.09, 0.02, 0.04]",
+        false,
     ),
 ];
+
+/// Does a `[parameters]` line open a `block_*` declaration, and does it carry a
+/// scale tag **after the closing `]`**?
+///
+/// Read only on the error path, but compiled once per process rather than per
+/// failing line: `Regex::new` in a loop is a clippy lint and the ~0.9 ms-per-parse
+/// cost this file documents at #1027. `src/edit/apply.rs` uses the same shape.
+///
+/// The tag must follow the `]`. A scan over the whole line also reads the name
+/// list, so `block_kappa (SD) = [0.1] FIX FIX` — a doubled `FIX` with no tag at
+/// all — would be told to square each SD (#1388 review §3). Both `] FIX (sd)`
+/// and `] (sd) FIX` still classify.
+static BLOCK_DECL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*(block_omega|block_sigma|block_kappa)\b").unwrap()
+});
+static SCALE_TAG_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?i)\]\s*(?:FIX\s*)?\(\s*(sd|variance|var)\s*\)").unwrap()
+});
 
 /// `PARAMETER_FORMS` as the diagnostic renders it.
 fn parameter_form_list() -> String {
     PARAMETER_FORMS
         .iter()
-        .map(|(spelling, _)| format!("`{spelling}`"))
+        .map(|(spelling, _, _)| format!("`{spelling}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The forms that accept a trailing `prior(...)`, as the diagnostic names them.
+///
+/// Not all of them do, and the message used to say they all did (#1388 review):
+/// a `block_*` element cannot carry one (its packed coordinates are Cholesky
+/// entries) and neither can a θ level block (one prior would have to mean the
+/// same prior on every level). A user who followed that advice hit a second,
+/// contradictory error.
+fn parameter_forms_taking_a_prior() -> String {
+    PARAMETER_FORMS
+        .iter()
+        .filter(|(_, _, prior)| *prior)
+        .map(|(spelling, _, _)| {
+            spelling
+                .split_once(' ')
+                .map_or(*spelling, |(head, _)| head)
+                .to_string()
+        })
+        .map(|kw| format!("`{kw}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// True for a line that opens a `block_omega` / `block_sigma` / `block_kappa`
+/// declaration.
+///
+/// Compares **bytes**, not a string slice. `t[..kw.len()]` panics when the
+/// boundary lands inside a multi-byte character, and a `[parameters]` line holds
+/// whatever UTF-8 the user typed: `theta PLACÉB[3](...)` followed by a bare
+/// `FIX` hit exactly that and aborted the parse instead of reporting `E_PARSE`
+/// (#1388 review) — a panic reaching `ferx check` and the ferx-r FFI alike.
+///
+/// The trailing word-boundary test is the rule `BLOCK_DECL_RE`'s `\b` applies,
+/// so the fold and the classifier agree on what a block declaration is; a typo'd
+/// `block_omegas` is neither.
+fn opens_a_block_declaration(line: &str) -> bool {
+    let t = line.trim_start().as_bytes();
+    ["block_omega", "block_sigma", "block_kappa"]
+        .iter()
+        .any(|kw| {
+            let k = kw.as_bytes();
+            t.len() >= k.len()
+                && t[..k.len()].eq_ignore_ascii_case(k)
+                && !t
+                    .get(k.len())
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        })
 }
 
 /// True for a line that is nothing but a scale annotation — `(sd)`,
 /// `(variance)`, `(var)`, in any case, with or without inner spaces.
 ///
-/// Used only by `join_bracketed_lines`'s fold, which is where the `]`
-/// restriction on it is documented.
-fn opens_a_block_declaration(line: &str) -> bool {
-    let t = line.trim_start();
-    ["block_omega", "block_sigma", "block_kappa"]
-        .iter()
-        .any(|kw| t.len() >= kw.len() && t[..kw.len()].eq_ignore_ascii_case(kw))
-}
-
+/// Used only by `join_bracketed_lines`'s fold, which is where the restriction on
+/// which line it may fold onto is documented.
 fn is_bare_scale_tag(line: &str) -> bool {
     let Some(inner) = line
         .trim()
@@ -14660,18 +14732,26 @@ fn parse_parameters(
             // mechanically, and an auto-fixer keyed on a misclassification would
             // square a block that was never on the SD scale. Both `] FIX (sd)`
             // and `] (sd) FIX` still classify.
-            let block_decl_re =
-                Regex::new(r"(?i)^\s*(block_omega|block_sigma|block_kappa)\b").unwrap();
-            let scale_tag_re =
-                Regex::new(r"(?i)\]\s*(?:FIX\s*)?\(\s*(sd|variance|var)\s*\)").unwrap();
             // Quote what the user wrote, not the peeled remainder: `shown` used
             // to be the post-`prior(...)` / post-`weight =` text, so the
             // "offending line" could be a string appearing nowhere in the file
             // (#1388 review). Still post-*join*, so a multi-line `block_*`
             // declaration is quoted as the one logical line it forms.
             let shown = source_line.trim();
-            let block_kw = block_decl_re.captures(shown).map(|c| c[1].to_lowercase());
-            let tag = scale_tag_re.captures(shown).map(|c| c[1].to_lowercase());
+            // A `;` comment is the shape a NONMEM-converted file carries on most
+            // lines, and the generic message never says the word "comment"
+            // (#1388 review). The repair is as mechanical as the block-tag one,
+            // so it gets the same treatment: named, at the same depth.
+            if shown.starts_with(';') {
+                return Err(format!(
+                    "[parameters]: `;` does not start a comment in a `.ferx` file — use `#` \
+                     or `//`. Until then the rest of the line is read as a declaration, so \
+                     `; theta TVCL(1, 0.1, 100)` silently declared a live theta. Offending \
+                     line: `{shown}`."
+                ));
+            }
+            let block_kw = BLOCK_DECL_RE.captures(shown).map(|c| c[1].to_lowercase());
+            let tag = SCALE_TAG_RE.captures(shown).map(|c| c[1].to_lowercase());
             if let (Some(kw), Some(tag)) = (block_kw, tag) {
                 // Sentinel `is variance-only`, matched by
                 // `parse_error_to_diagnostic` to raise this above the `E_PARSE`
@@ -14694,10 +14774,12 @@ fn parse_parameters(
                 ));
             }
             return Err(format!(
-                "[parameters]: unrecognized line `{shown}`. Expected one of: {}; any of \
-                 these may carry a trailing `prior(value, rse = 25%)`. A declaration must be \
-                 the whole line — leading or trailing text is rejected, not ignored.",
-                parameter_form_list()
+                "[parameters]: unrecognized line `{shown}`. Expected one of: {}. A {} \
+                 declaration may additionally carry a trailing `prior(value, rse = 25%)`; the \
+                 block and level-block forms may not. A declaration must be the whole line — \
+                 leading or trailing text is rejected, not ignored.",
+                parameter_form_list(),
+                parameter_forms_taking_a_prior()
             ));
         }
         // #254: attach the peeled prior to whichever declaration matched. A

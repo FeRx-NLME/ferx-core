@@ -233,7 +233,7 @@ Each variance represents the between-subject variability for that parameter. The
 
 The `(sd)` form is convenient when you're setting initial values from expected CV%, e.g. "I expect ~25% CV on CL" → `omega ETA_CL ~ 0.25 (sd)`. The fit result records which form you used so that downstream printers can annotate the estimate with `[initial specified as SD]`.
 
-Block omega (`block_omega (...) = [...]`) is variance-only, and a scale tag on one is **rejected** with `E_BLOCK_VARIANCE_ONLY`: the lower-triangle list mixes variances and covariances, so a single tag cannot say which entry is on which scale. Square each SD into a variance and write the off-diagonals as covariances.
+Block omega (`block_omega (...) = [...]`) is variance-only, and a scale tag on one is **rejected** with `E_BLOCK_VARIANCE_ONLY`: the lower-triangle list mixes variances and covariances, so a single tag cannot say which entry is on which scale. What to do about it depends on the tag you wrote. After `(sd)`, square each SD into a variance and write the off-diagonals as covariances - the numbers change. After `(variance)` or `(var)`, delete the tag and leave the numbers alone: the lower triangle is always variances and covariances, so the tag was already saying nothing.
 
 ::: {.callout-important}
 #### A free `omega NAME ~ 0.0` is rejected — write `FIX`

@@ -358,6 +358,41 @@ fn block_sd_tag_is_reported_as_its_own_code() {
         "{}",
         d.message
     );
+    // The repair is the reason this shape has a code of its own, so it must be
+    // readable as a field and not only out of the prose (#1388 review).
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("square each SD into a variance and write the off-diagonals as covariances"),
+        "the `(sd)` repair must ride along in `suggestion`"
+    );
+    let _ = std::fs::remove_file(&model);
+
+    // ...and it must be the repair for the tag that was actually written. A
+    // `(variance)` author already wrote variances: squaring them would break a
+    // model that was numerically correct, so the only thing to change is the
+    // tag. Reddens if the suggestion goes back to one unconditional sentence.
+    let model = temp_model(
+        "block_variance_tag",
+        &base.replace(untagged, &format!("{untagged} (variance)")),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY");
+    let s = d
+        .suggestion
+        .as_deref()
+        .expect("a `(variance)` tag must carry a suggestion too");
+    assert!(
+        s.contains("delete the tag") && !s.contains("square"),
+        "a `(variance)` author must not be told to square anything: {s}"
+    );
     let _ = std::fs::remove_file(&model);
 
     // The control the widening rests on: the untouched example is still valid.

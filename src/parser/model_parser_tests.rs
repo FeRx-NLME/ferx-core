@@ -7055,7 +7055,8 @@ fn trailing_text_is_rejected_on_every_parameters_form() {
 /// the single source and this test is what keeps it honest.
 #[test]
 fn every_listed_parameter_form_actually_parses() {
-    for (spelling, example) in PARAMETER_FORMS {
+    // 1. every advertised form parses.
+    for (spelling, example, _) in PARAMETER_FORMS {
         parse_parameters(&[example.to_string()], &Default::default()).unwrap_or_else(|e| {
             panic!(
                 "the diagnostic advertises `{spelling}` but its example `{example}` \
@@ -7063,13 +7064,77 @@ fn every_listed_parameter_form_actually_parses() {
             )
         });
     }
-    // ...and the rendered list is what the message shows.
-    let listed = parameter_form_list();
-    for (spelling, _) in PARAMETER_FORMS {
-        assert!(
-            listed.contains(spelling),
-            "`{spelling}` missing from the list"
+
+    // 2. the `prior(...)` claim is true per form. The message used to say every
+    //    form takes one, which is false for the block and level-block forms, so
+    //    a user who followed it hit a second contradictory error (#1388 review).
+    for (spelling, example, takes_prior) in PARAMETER_FORMS {
+        let with_prior = format!("{example} prior(0.1, rse = 25%)");
+        let got = parse_parameters(&[with_prior.clone()], &Default::default());
+        assert_eq!(
+            got.is_ok(),
+            *takes_prior,
+            "`{spelling}`: the diagnostic says takes_prior={takes_prior}, but \
+             `{with_prior}` {}",
+            if got.is_ok() {
+                "parsed"
+            } else {
+                "was rejected"
+            }
         );
+    }
+
+    // 3. the list reaches the real diagnostic. Asserting against
+    //    `parameter_form_list()` alone is tautological -- it is literally the
+    //    array joined -- and would stay green if the `else` arm went back to an
+    //    inlined hand-written list, which is the drift the array exists to stop.
+    let err = parse_parameters(&["banana".to_string()], &Default::default())
+        .err()
+        .expect("a lone `banana` must be rejected");
+    for (spelling, _, _) in PARAMETER_FORMS {
+        assert!(
+            err.contains(spelling),
+            "the real diagnostic omits `{spelling}`: {err}"
+        );
+    }
+}
+
+/// `;` is not a comment marker, and the message has to say so (#1388 review).
+#[test]
+fn a_semicolon_line_is_told_it_is_not_a_comment() {
+    for line in ["; theta TVCL(1, 0.1, 100)", "; this is a note", ";"] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected"));
+        assert!(
+            err.contains("does not start a comment") && err.contains("`#`"),
+            "`{line}` must name the comment markers: {err}"
+        );
+    }
+}
+
+/// A non-ASCII `[parameters]` line must not panic the parser (#1388 review).
+///
+/// `opens_a_block_declaration` byte-sliced `t[..kw.len()]`; on
+/// `theta PLAC\u{00c9}B[3](...)` followed by a bare `FIX` the boundary landed
+/// inside the two-byte character and the parse aborted instead of reporting
+/// `E_PARSE` -- through `ferx check` and the ferx-r FFI alike.
+#[test]
+fn a_non_ascii_parameters_line_is_rejected_not_a_panic() {
+    for lines in [
+        vec![
+            "theta PLAC\u{00c9}B[3](0.1, -1.0, 1.0)".to_string(),
+            "FIX".to_string(),
+        ],
+        vec![
+            "theta PLAC\u{00c9}B[3](0.1, -1.0, 1.0)".to_string(),
+            "(sd)".to_string(),
+        ],
+        vec!["bl\u{00f6}ck_omega (A, B) = [0.09, 0.02, 0.04]".to_string()],
+        vec!["\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9}\u{00e9} ]".to_string()],
+    ] {
+        // `Err` is fine, `Ok` is fine; a panic is not.
+        let _ = parse_parameters(&lines, &Default::default());
     }
 }
 
@@ -7087,35 +7152,73 @@ fn every_listed_parameter_form_actually_parses() {
 #[test]
 fn leading_text_is_rejected_on_every_parameters_form() {
     // The shapes measured on the unanchored-head build, with what each silently
-    // became there. Every one must now be an error.
-    for (line, was) in [
-        ("block_sigma PROP ~ 0.04", "a diagonal sigma"),
-        ("block_omega ETA_CL ~ 0.09", "a diagonal omega"),
-        ("block_kappa KAPPA_CL ~ 0.04", "a diagonal kappa"),
-        ("; theta TVCL(1, 0.1, 100)", "a live theta"),
-        ("xtheta CL(1, 0, 10)", "theta CL"),
+    // became there, and the phrase the message must carry. All but one land on
+    // the generic `unrecognized line`; `;` gets the named comment-marker branch
+    // instead, because that is the shape a NONMEM-converted file carries on most
+    // of its lines and the generic wording never says the word "comment"
+    // (#1388 review).
+    for (line, was, sentinel) in [
+        (
+            "block_sigma PROP ~ 0.04",
+            "a diagonal sigma",
+            "unrecognized line",
+        ),
+        (
+            "block_omega ETA_CL ~ 0.09",
+            "a diagonal omega",
+            "unrecognized line",
+        ),
+        (
+            "block_kappa KAPPA_CL ~ 0.04",
+            "a diagonal kappa",
+            "unrecognized line",
+        ),
+        (
+            "; theta TVCL(1, 0.1, 100)",
+            "a live theta",
+            "does not start a comment",
+        ),
+        ("xtheta CL(1, 0, 10)", "theta CL", "unrecognized line"),
         (
             "x = block_omega (A, B) = [0.09, 0.02, 0.04]",
             "a block_omega",
+            "unrecognized line",
         ),
-        ("junk omega ETA_CL ~ 0.09", "a diagonal omega"),
-        ("junk sigma PROP ~ 0.04", "a diagonal sigma"),
-        ("junk kappa KAPPA_CL ~ 0.04", "a diagonal kappa"),
+        (
+            "junk omega ETA_CL ~ 0.09",
+            "a diagonal omega",
+            "unrecognized line",
+        ),
+        (
+            "junk sigma PROP ~ 0.04",
+            "a diagonal sigma",
+            "unrecognized line",
+        ),
+        (
+            "junk kappa KAPPA_CL ~ 0.04",
+            "a diagonal kappa",
+            "unrecognized line",
+        ),
         (
             "junk block_sigma (A, B) = [0.04, 0.10, 1.00]",
             "a block_sigma",
+            "unrecognized line",
         ),
         (
             "junk block_kappa (A, B) = [0.09, 0.02, 0.04]",
             "a block_kappa",
+            "unrecognized line",
         ),
     ] {
         let err = parse_parameters(&[line.to_string()], &Default::default())
             .err()
             .unwrap_or_else(|| panic!("`{line}` must be rejected; it used to declare {was}"));
+        assert!(err.contains(sentinel), "`{line}` (was {was}): {err}");
+        // Quote what the user wrote, so the offending line can be found in the
+        // file (#1388 review). Every branch of the `else` arm owes this.
         assert!(
-            err.contains("unrecognized line"),
-            "`{line}` (was {was}): {err}"
+            err.contains(line),
+            "`{line}` (was {was}): the message must quote the line: {err}"
         );
     }
 
@@ -7254,6 +7357,13 @@ fn anchored_forms_still_accept_every_documented_tail() {
         // No space between value and tag: why the tag group uses `\s*` while
         // the leading FIX group uses `\s+`.
         ("omega E ~ 0.09(sd)", 0.0081, true, false),
+        // Inner whitespace in the tag. Asserting only that the line parses
+        // would miss the failure that matters: if the capture group moved, the
+        // line still matches, `init_as_sd` goes false, and `~ 0.3 ( sd )` starts
+        // the fit at variance 0.3 instead of 0.09 -- the 3.8x silent wrong
+        // initial estimate #1377 exists to close (#1388 review).
+        ("omega E ~ 0.09 ( sd )", 0.0081, true, false),
+        ("omega E ~ 0.09 (  variance  ) FIX", 0.09, false, true),
         // Trailing whitespace is not trailing *text*, and this is the row that
         // makes the `\s*` in every anchor load-bearing. `parse_parameters` is
         // reached today only through `extract_blocks`, which trims, and through
@@ -7278,6 +7388,31 @@ fn anchored_forms_still_accept_every_documented_tail() {
         assert_eq!(omegas[0].init_as_sd, want_sd, "`{line}`");
         assert_eq!(omegas[0].fixed, want_fix, "`{line}`");
     }
+
+    // ...and the spaced spelling is read as the tag on sigma/kappa too, not
+    // merely tolerated.
+    let (_, _, _, sig, _, _, kap, _, _, _, _) = parse_parameters(
+        &[
+            "sigma SS ~ 0.01 (  sd  )".to_string(),
+            "kappa KS ~ 0.30 ( sd )".to_string(),
+        ],
+        &Default::default(),
+    )
+    .expect("spaced tags must parse");
+    assert!(
+        sig[0].init_as_sd,
+        "sigma spaced `( sd )` must set init_as_sd"
+    );
+    assert!((sig[0].value - 0.01).abs() < 1e-12);
+    assert!(
+        kap.diagonal[0].init_as_sd,
+        "kappa spaced `( sd )` must set init_as_sd"
+    );
+    assert!(
+        (kap.diagonal[0].variance - 0.09).abs() < 1e-12,
+        "kappa `( sd )` must square: {}",
+        kap.diagonal[0].variance
+    );
 
     // `sigma (sd)` stores the SD verbatim (the default path takes `sqrt`).
     let (_, _, _, sigmas, _, _, _, _, _, _, _) =
@@ -7332,8 +7467,7 @@ fn anchored_forms_still_accept_every_documented_tail() {
         // and `scale_tag_re` all tolerate inner whitespace now. Before, only the
         // latter two did, so `( sd )` was rejected with a message listing
         // `(sd)` back at the author and no hint that the spaces were the fault.
-        ("omega-spaced-tag", "omega ES ~ 0.09 ( sd )"),
-        ("sigma-spaced-tag", "sigma SS ~ 0.01 (  variance  )"),
+        ("sigma-spaced-tag", "sigma SS ~ 0.01 (  sd  )"),
         ("kappa-spaced-tag", "kappa KS ~ 0.04 ( var )"),
         ("theta-lead", "\t theta TVKA(1.0, 0.01, 9.0)"),
         ("omega", "omega ETA_CL ~ 0.09 (sd)  "),
@@ -7356,6 +7490,138 @@ fn anchored_forms_still_accept_every_documented_tail() {
             panic!("trailing whitespace must not make a `{form}` declaration unrecognized: {e}")
         });
     }
+}
+
+/// The quoted "offending line" must be a string the user can find in the file
+/// (#1388 review).
+///
+/// `prior(...)` and `weight = <expr>` are peeled off the line *before* the
+/// declaration regexes run, so inside the loop there are two candidates for
+/// "the line": the source line and the peeled remainder. Quoting the remainder
+/// prints text that appears nowhere in the file, which is worse than no quote
+/// at all -- a reader searching for it finds nothing.
+///
+/// This is its own test because the `leading_text_is_rejected_on_every_parameters_form`
+/// table cannot pin it: none of those rows carries a peel-able tail, so there
+/// the two candidates are the same string and the assertion is vacuous.
+/// Measured -- reverting `shown` to the remainder leaves that whole table green.
+/// Every branch of the `else` arm owes this, so all three are covered.
+#[test]
+fn the_quoted_line_is_the_source_line_not_the_peeled_remainder() {
+    for (line, why) in [
+        (
+            "junk omega ETA_CL ~ 0.09 prior(0.1, rse = 25%)",
+            "the generic branch, with a prior peeled off",
+        ),
+        (
+            "junk kappa KAPPA_CL ~ 0.04 weight = NARM",
+            "the generic branch, with a weight peeled off",
+        ),
+        (
+            "; omega ETA_CL ~ 0.09 prior(0.1, rse = 25%)",
+            "the `;`-is-not-a-comment branch",
+        ),
+        (
+            "block_omega (A, B) = [0.09, 0.02, 0.04] (sd) prior(0.1, rse = 25%)",
+            "the E_BLOCK_VARIANCE_ONLY branch",
+        ),
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected ({why})"));
+        assert!(
+            err.contains(line),
+            "{why}: the message must quote the line the user wrote, \
+             not the peeled remainder.\n  wrote: `{line}`\n  said:  {err}"
+        );
+    }
+}
+
+/// A scale tag written with inner whitespace must *mean* what the unspaced tag
+/// means, not merely parse (#1388 review).
+///
+/// The parse-only rows above already redden if the tag group loses its inner
+/// `\s*`: the declaration regexes are anchored end to end, so a `( sd )` the
+/// group cannot absorb leaves unmatched text and the line is rejected outright.
+/// What they do not catch is the tag being matched and then *dropped* -- widen
+/// the group to a non-capturing `(?:sd|variance|var)` and `( sd )` still
+/// parses, with `init_as_sd` silently `false` and the initial value read on the
+/// wrong scale. That is the silent-drop class #1377 exists to close, so the
+/// meaning is asserted here and not just the `Ok`.
+///
+/// Written as a contrast against the unspaced spelling rather than against
+/// hard-coded numbers: the conversion each family applies (omega squares, sigma
+/// stores an SD, kappa squares) is pinned elsewhere, and what is under test is
+/// only that the two spellings are the same declaration.
+#[test]
+fn a_spaced_scale_tag_means_what_the_unspaced_one_means() {
+    let omega = |line: &str| {
+        let (_, omegas, _, _, _, _, _, _, _, _, _) =
+            parse_parameters(&[line.to_string()], &Default::default())
+                .unwrap_or_else(|e| panic!("`{line}` must parse: {e}"));
+        assert_eq!(omegas.len(), 1, "`{line}`");
+        (omegas[0].variance, omegas[0].init_as_sd)
+    };
+    let sigma = |line: &str| {
+        let (_, _, _, sigmas, _, _, _, _, _, _, _) =
+            parse_parameters(&[line.to_string()], &Default::default())
+                .unwrap_or_else(|e| panic!("`{line}` must parse: {e}"));
+        assert_eq!(sigmas.len(), 1, "`{line}`");
+        (sigmas[0].value, sigmas[0].init_as_sd)
+    };
+    let kappa = |line: &str| {
+        let (_, _, _, _, _, _, kappas, _, _, _, _) =
+            parse_parameters(&[line.to_string()], &Default::default())
+                .unwrap_or_else(|e| panic!("`{line}` must parse: {e}"));
+        assert_eq!(kappas.diagonal.len(), 1, "`{line}`");
+        (kappas.diagonal[0].variance, kappas.diagonal[0].init_as_sd)
+    };
+
+    // Each row: the reference spelling, then spellings that must be identical
+    // to it, then the flag the tag claims.
+    let omega_sd = omega("omega ES ~ 0.09 (sd)");
+    assert!(omega_sd.1, "`(sd)` must set init_as_sd: {omega_sd:?}");
+    for line in [
+        "omega ES ~ 0.09 ( sd )",
+        "omega ES ~ 0.09 (  sd  )",
+        "omega ES ~ 0.09 (\tsd\t)",
+        "omega ES ~ 0.09 ( SD )",
+    ] {
+        assert_eq!(omega(line), omega_sd, "`{line}` must mean `(sd)`");
+    }
+
+    let sigma_sd = sigma("sigma SS ~ 0.01 (sd)");
+    assert!(sigma_sd.1, "`(sd)` must set init_as_sd: {sigma_sd:?}");
+    for line in ["sigma SS ~ 0.01 ( sd )", "sigma SS ~ 0.01 (  sd  )"] {
+        assert_eq!(sigma(line), sigma_sd, "`{line}` must mean `(sd)`");
+    }
+
+    let kappa_var = kappa("kappa KS ~ 0.04 (var)");
+    assert!(
+        !kappa_var.1,
+        "`(var)` must leave init_as_sd false: {kappa_var:?}"
+    );
+    for line in [
+        "kappa KS ~ 0.04 ( var )",
+        "kappa KS ~ 0.04 (  var  )",
+        "kappa KS ~ 0.04 ( variance )",
+    ] {
+        assert_eq!(kappa(line), kappa_var, "`{line}` must mean `(var)`");
+    }
+
+    // The scales really are distinguishable, so the equalities above are not
+    // comparing two copies of the same default. Reddens if a tag stops being
+    // read at all: every spelling would collapse onto the untagged reading.
+    assert_ne!(
+        omega_sd,
+        omega("omega ES ~ 0.09"),
+        "`(sd)` and no tag must differ, or this test compares nothing"
+    );
+    assert_ne!(
+        sigma_sd,
+        sigma("sigma SS ~ 0.01"),
+        "`(sd)` and no tag must differ, or this test compares nothing"
+    );
 }
 
 #[test]
