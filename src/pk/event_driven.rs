@@ -422,6 +422,12 @@ fn equilibrate_ss_state_event_driven(
     pk: &PkParams,
     dose: &DoseEvent,
 ) -> Vec<f64> {
+    // Clear the warning observation up front (#1289, PR #1392 review): the exact affine fixed
+    // point below and the two bail-outs return without reaching
+    // `note_ss_nonconvergence_if_capped`, so without this `last_ss_equilibration_warned()` would
+    // report an earlier capped run's `true` as this call's answer. Deterministic on a reused
+    // harness thread, not a race.
+    crate::dosing::record_ss_nonconvergence_warned(false);
     let (n_states, _) = state_layout(pk_model);
     let mut state = vec![0.0_f64; n_states];
 
@@ -3186,6 +3192,48 @@ mod tests {
             "a model with no periodic steady state must surface a non-convergence warning \
              from the analytical walk; got: {warnings:?}"
         );
+    }
+
+    /// #1289 / PR #1392 review, analytical half. See
+    /// `ode::predictions::tests::an_exact_ss_equilibration_clears_a_previous_runs_warning_flag`
+    /// for the ODE half and the full rationale: `last_ss_equilibration_warned()` must report
+    /// *this* equilibration, and the exact affine fixed point here returns without ever reaching
+    /// `note_ss_nonconvergence_if_capped`, so a warning-producing run earlier on the same thread
+    /// would otherwise still be reported as this one's.
+    ///
+    /// Lives here rather than beside its ODE twin because
+    /// [`equilibrate_ss_state_event_driven`] is private to this module — a test-only shim to
+    /// reach it from another file would be a wider change than the test is worth.
+    #[test]
+    fn an_exact_event_driven_ss_clears_a_previous_runs_warning_flag() {
+        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dosing::clear_ss_nonconvergence_warnings();
+
+        // `CL = 0` ⇒ `ke = 0` ⇒ `M = I`: nothing is ever eliminated, so no periodic steady state
+        // exists, the exact solve declines and the capped train warns. (The same fixture
+        // `ss_equilibration_falls_back_when_no_steady_state_exists` uses.)
+        let no_ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = equilibrate_ss_state_event_driven(PkModel::OneCptIv, &pk_one(0.0, 50.0), &no_ss);
+        assert!(
+            crate::dosing::last_ss_equilibration_warned(),
+            "the fixture must actually warn first, or this test cannot observe a stale flag"
+        );
+
+        // An ordinary linear disposition now takes the exact fixed point and must report its own
+        // answer, not the run above's.
+        let state =
+            equilibrate_ss_state_event_driven(PkModel::OneCptIv, &pk_one(5.0, 50.0), &no_ss);
+        assert!(state[0] > 0.0, "the linear equilibration must have run");
+        assert!(
+            !crate::dosing::last_ss_equilibration_warned(),
+            "the reset at the top of `equilibrate_ss_state_event_driven` is missing: an exact \
+             analytical equilibration reports the PREVIOUS capped run's warning as its own"
+        );
+
+        // This test fills the sink on purpose; drain it rather than leaving entries behind.
+        let _ = crate::dosing::take_ss_nonconvergence_warnings();
     }
 
     #[test]

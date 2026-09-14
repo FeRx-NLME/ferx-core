@@ -420,6 +420,23 @@ pub(crate) fn last_ss_equilibration_warned() -> bool {
     LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.get())
 }
 
+/// Record whether this SS equilibration warned (test observation; see
+/// [`LAST_SS_NONCONVERGENCE_WARNED`]).
+///
+/// Called with `false` at the **top of every top-level equilibration** and with the real answer
+/// by [`note_ss_nonconvergence_if_capped`]. The up-front `false` is what makes
+/// [`last_ss_equilibration_warned`] mean "did *this* call warn" rather than "did any call on
+/// this thread ever warn": the paths that succeed without ever reaching the capped fallback —
+/// the exact affine fixed point, the input-rate closed form, and the `II <= 0` /
+/// out-of-range-compartment bail-outs — return without noting anything, so without the reset a
+/// warning-producing capped run followed by an exact one would still report `true`. That is
+/// deterministic on a reused harness thread, not a race, and it is the same stale-state class
+/// the [`SsBranch::None`] reset exists for (PR #1392 review).
+#[cfg(test)]
+pub(crate) fn record_ss_nonconvergence_warned(warned: bool) {
+    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.set(warned));
+}
+
 #[cfg(test)]
 pub(crate) fn record_ss_equilibration_cycles(n: usize) {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
@@ -521,6 +538,12 @@ pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_branch(_b: SsBranch) {}
 
+/// The warning observation's non-test counterpart — same signature, so the reset at the top of
+/// each top-level equilibration is unconditional and costs nothing outside tests.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn record_ss_nonconvergence_warned(_warned: bool) {}
+
 /// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
 /// non-converged (#867). The pulse-train equilibration
 /// (`crate::ode::predictions::equilibrate_ss_state`) is a geometric contraction with per-cycle
@@ -585,11 +608,11 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     mag: f64,
 ) {
     let warning = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag);
-    // Recorded on EVERY call, not only the warning ones, so a test reading it sees this
-    // equilibration's own answer rather than a stale `true` from an earlier call on the same
-    // harness thread (#1289). Mirrors `record_ss_equilibration_cycles`.
-    #[cfg(test)]
-    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.set(warning.is_some()));
+    // Recorded on EVERY call, not only the warning ones, so a capped run that converges clears
+    // a `true` left by an earlier capped run on the same harness thread (#1289). The paths that
+    // never reach here at all are covered by the up-front `false` each top-level equilibration
+    // records — see `record_ss_nonconvergence_warned`.
+    record_ss_nonconvergence_warned(warning.is_some());
     if let Some(msg) = warning {
         if let Ok(mut set) = ss_nonconvergence_sink().lock() {
             set.insert(msg);

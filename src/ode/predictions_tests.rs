@@ -6805,6 +6805,87 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
     );
 }
 
+/// #1289 / PR #1392 review: `last_ss_equilibration_warned()` must mean "did **this**
+/// equilibration warn", not "has anything on this thread ever warned".
+///
+/// The observation is written by `note_ss_nonconvergence_if_capped`, and the paths that
+/// succeed never reach it — the exact affine fixed point returns from `equilibrate_ss_pk_state`
+/// before either capped train, and `equilibrate_ss_state_event_driven` has the same shape. So a
+/// warning-producing run followed by an exact one on the **same thread** left the accessor
+/// reporting the exact run as having warned. That is deterministic rather than a race, and it is
+/// the same stale-state class the observer was added to remove, so it gets its own test rather
+/// than riding on the two tests that read the flag for their own purposes.
+///
+/// Each engine has its own top-level entry and therefore its own reset, and a mutation of one
+/// leaves the other green — so they are pinned separately. This is the ODE entry,
+/// `equilibrate_ss_pk_state`; the analytical one is
+/// `pk::event_driven`'s `an_exact_event_driven_ss_clears_a_previous_runs_warning_flag`, next to
+/// the private function it has to call.
+#[test]
+fn an_exact_ss_equilibration_clears_a_previous_runs_warning_flag() {
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
+    // 1. Produce a warning: the over-capacity MM disposition (mean input 6.25 > Vmax 5) has no
+    //    periodic steady state, so the capped train runs the full budget and notes it.
+    let mm = mm_disposition_spec();
+    let mut mm_pk = PkParams::default();
+    mm_pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
+    mm_pk.values[crate::types::PK_IDX_V] = 8.0; // Km
+    let over = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0);
+    let _ = equilibrate_ss_state(&mm, &mm_pk.values, &over, &mm.solver_opts, &[]);
+    assert!(
+        crate::dosing::last_ss_equilibration_warned(),
+        "the fixture must actually warn first, or this test cannot observe a stale flag"
+    );
+
+    // 2. ODE side: a linear disposition takes the exact affine fixed point and returns from
+    //    `equilibrate_ss_pk_state` without ever calling `note_ss_nonconvergence_if_capped`.
+    let lin = one_cpt_ode_spec();
+    let mut lin_pk = PkParams::default();
+    lin_pk.values[crate::types::PK_IDX_CL] = 5.0;
+    lin_pk.values[crate::types::PK_IDX_V] = 80.0;
+    let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    let trough = equilibrate_ss_state(&lin, &lin_pk.values, &ss, &lin.solver_opts, &[]);
+    assert!(trough[0] > 0.0, "the linear equilibration must have run");
+    assert!(
+        !crate::dosing::last_ss_equilibration_warned(),
+        "the ODE reset in `equilibrate_ss_pk_state` is missing: an exact linear equilibration \
+         reports the PREVIOUS capped run's warning as its own"
+    );
+
+    // 3. The other entry point the flag can go stale through is the input-rate closed form,
+    //    which `sens::ode_provider` calls directly rather than via `equilibrate_ss_pk_state`.
+    //    Reached here through the MM absorption spec at a rate the Anderson solve *can* settle.
+    let _ = equilibrate_ss_state(&mm, &mm_pk.values, &over, &mm.solver_opts, &[]);
+    assert!(crate::dosing::last_ss_equilibration_warned());
+    let ir = mm_ss_absorption_spec();
+    let mut ir_pk = PkParams::default();
+    ir_pk.values[crate::types::PK_IDX_CL] = 50.0; // Vmax ≫ mean input
+    ir_pk.values[crate::types::PK_IDX_V] = 30.0; // Km
+    ir_pk.values[4] = 0.5; // ka
+    ir_pk.values[crate::types::PK_IDX_F] = 1.0;
+    let in_cap = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
+    let prepared = prepare_input_rates(&ir, &ir_pk.values);
+    assert!(
+        equilibrate_ss_input_rate(&ir, &ir_pk.values, &in_cap, 1.0, &ir.solver_opts, &prepared)
+            .is_some(),
+        "this fixture must take the input-rate solve, not decline to the capped train"
+    );
+    assert!(
+        !crate::dosing::last_ss_equilibration_warned(),
+        "the reset in `equilibrate_ss_input_rate_g` is missing: a converging input-rate solve \
+         reports the PREVIOUS capped run's warning as its own — the shape `sens::ode_provider` \
+         hits, since it calls that helper directly"
+    );
+
+    // Housekeeping: this test deliberately fills the sink, so drain it rather than leaving the
+    // entries for whichever reader runs next.
+    let _ = crate::dosing::take_ss_nonconvergence_warnings();
+}
+
 #[test]
 fn ode_ss_iv_bolus_matches_analytical_ss() {
     // The test ODE stores compartment AMOUNT (dA/dt = -ke·A), while the
