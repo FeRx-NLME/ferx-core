@@ -709,6 +709,7 @@ pub(crate) fn agq_subject_nll(
         anchor,
         false,
         schedule,
+        None,
     )
     .0
 }
@@ -733,6 +734,7 @@ fn agq_subject_evaluate(
     anchor: HessianAnchor,
     retain_gradient_work: bool,
     schedule: Option<&pk::event_driven::EventSchedule>,
+    terminal_hessian: Option<&DMatrix<f64>>,
 ) -> (f64, Option<PreparedGrid>) {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
@@ -751,7 +753,21 @@ fn agq_subject_evaluate(
         return (nll, None);
     }
 
-    let anchor_work = if retain_gradient_work {
+    let anchor_work = if !retain_gradient_work && matches!(anchor, HessianAnchor::Exact) {
+        terminal_hessian.cloned().map(|h| (h, None)).or_else(|| {
+            anchor_hessian(
+                anchor,
+                model,
+                subject,
+                params,
+                stack,
+                b_hat,
+                &mut scratch,
+                schedule,
+            )
+            .map(|h| (h, None))
+        })
+    } else if retain_gradient_work {
         anchor_hessian_and_base_jet(
             anchor,
             model,
@@ -1038,7 +1054,7 @@ pub fn agq_population_nll(
     anchor: HessianAnchor,
 ) -> f64 {
     agq_population_nll_impl(
-        model, population, params, eta_hats, kappas, n_nodes, anchor, None,
+        model, population, params, eta_hats, kappas, n_nodes, anchor, None, None,
     )
 }
 
@@ -1048,6 +1064,7 @@ pub fn agq_population_nll(
 /// Used only by the FOCEI/Laplace/AGQ outer hot loop (`outer_optimizer.rs`); every other
 /// caller goes through [`agq_population_nll`] and pays the per-call rebuild.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn agq_population_nll_with_schedules(
     model: &CompiledModel,
     population: &Population,
@@ -1067,6 +1084,33 @@ pub(crate) fn agq_population_nll_with_schedules(
         n_nodes,
         anchor,
         Some(schedules),
+        None,
+    )
+}
+
+/// Schedule-cached objective that also reuses exact terminal inner Hessians.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_population_nll_with_schedules_and_hessians(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+    terminal_hessians: &[Option<DMatrix<f64>>],
+) -> f64 {
+    agq_population_nll_impl(
+        model,
+        population,
+        params,
+        eta_hats,
+        kappas,
+        n_nodes,
+        anchor,
+        Some(schedules),
+        Some(terminal_hessians),
     )
 }
 
@@ -1080,6 +1124,7 @@ fn agq_population_nll_impl(
     n_nodes: usize,
     anchor: HessianAnchor,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
 ) -> f64 {
     let (nodes, weights) = cached_gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
@@ -1092,7 +1137,7 @@ fn agq_population_nll_impl(
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let schedule = schedules.and_then(|s| s[i].as_ref());
-            agq_subject_nll(
+            agq_subject_evaluate(
                 model,
                 subject,
                 params,
@@ -1101,8 +1146,11 @@ fn agq_population_nll_impl(
                 nodes,
                 &log_weights,
                 anchor,
+                false,
                 schedule,
+                terminal_hessians.and_then(|all| all[i].as_ref()),
             )
+            .0
         })
         .collect();
     per_subject.iter().sum()
@@ -1211,6 +1259,7 @@ fn agq_population_evaluate_impl(
                 anchor,
                 true,
                 schedule,
+                None,
             );
             let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
             let score = context.score_with_prepared(
@@ -4547,6 +4596,43 @@ mod tests {
                 cached_nll.to_bits(),
                 "{anchor:?}: cached population NLL diverged from the uncached rebuild"
             );
+            if matches!(anchor, HessianAnchor::Exact) {
+                let terminal_hessians: Vec<_> = population
+                    .subjects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, subject)| {
+                        let stack = Stack::new(&model, &params, 0);
+                        let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+                        anchor_hessian(
+                            anchor,
+                            &model,
+                            subject,
+                            &params,
+                            &stack,
+                            eta_hats[i].as_slice(),
+                            &mut scratch,
+                            schedules[i].as_ref(),
+                        )
+                    })
+                    .collect();
+                let reused = agq_population_nll_with_schedules_and_hessians(
+                    &model,
+                    &population,
+                    &params,
+                    &eta_hats,
+                    &kappas,
+                    3,
+                    anchor,
+                    &schedules,
+                    &terminal_hessians,
+                );
+                assert_eq!(
+                    cached_nll.to_bits(),
+                    reused.to_bits(),
+                    "terminal Hessian reuse changed the exact-anchor objective"
+                );
+            }
 
             let uncached_eval = agq_population_evaluate(
                 &model,

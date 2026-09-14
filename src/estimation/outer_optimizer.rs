@@ -893,8 +893,8 @@ fn run_inner_loop_and_nll_prepared(
     Option<crate::estimation::agq::PopulationEvaluation>,
 ) {
     if options.agq_nodes().is_some() {
-        let (etas, h_matrices, stats, kappas) = match schedules {
-            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_cached(
+        let (etas, h_matrices, stats, kappas, terminal_hessians) = match schedules {
+            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
                 model,
                 population,
                 params,
@@ -905,8 +905,9 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 cache,
+                |_, ebe| ebe.terminal_hessian.clone(),
             ),
-            None => run_inner_loop_warm(
+            None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
                 model,
                 population,
                 params,
@@ -916,6 +917,7 @@ fn run_inner_loop_and_nll_prepared(
                 mu_k,
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
+                |_, ebe| ebe.terminal_hessian.clone(),
             ),
         };
         let n_nodes = options.agq_nodes().expect("AGQ branch");
@@ -950,16 +952,19 @@ fn run_inner_loop_and_nll_prepared(
         });
         let nll = evaluation.as_ref().map_or_else(
             || match schedules {
-                Some(cache) => crate::estimation::agq::agq_population_nll_with_schedules(
-                    model,
-                    population,
-                    params,
-                    &etas,
-                    &kappas,
-                    n_nodes,
-                    options.hessian_anchor(),
-                    cache,
-                ),
+                Some(cache) => {
+                    crate::estimation::agq::agq_population_nll_with_schedules_and_hessians(
+                        model,
+                        population,
+                        params,
+                        &etas,
+                        &kappas,
+                        n_nodes,
+                        options.hessian_anchor(),
+                        cache,
+                        &terminal_hessians,
+                    )
+                }
                 None => crate::estimation::agq::agq_population_nll(
                     model,
                     population,
