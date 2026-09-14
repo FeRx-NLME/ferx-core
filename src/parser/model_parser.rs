@@ -13465,6 +13465,60 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
 // --- Parameter parsing ---
 
+/// Every `[parameters]` declaration form as the "expected one of …" diagnostic
+/// lists it, paired with a minimal example that must parse.
+///
+/// One array, for the reason `FORM_SPELLINGS` exists in `covariate_model.rs`:
+/// the message used to carry its own copy of the grammar and had already lost
+/// the level-block forms and the `prior(...)` tail, so it told a level-block
+/// author their valid form was unsupported (#1388 review). The examples are the
+/// half that makes it a pin rather than a comment —
+/// `every_listed_parameter_form_actually_parses` parses each one, so a form can
+/// never be advertised that the parser does not accept.
+const PARAMETER_FORMS: &[(&str, &str)] = &[
+    (
+        "theta NAME(init[, lower, upper]) [FIX]",
+        "theta T(1.0, 0.0, 2.0) FIX",
+    ),
+    (
+        "theta NAME[N](...) or theta NAME[COL, ...](...) (level block)",
+        "theta P[3](0.1, -1.0, 1.0)",
+    ),
+    (
+        "omega NAME ~ value [(sd|variance|var)] [FIX]",
+        "omega E ~ 0.09 (sd) FIX",
+    ),
+    (
+        "sigma NAME ~ value [(sd|variance|var)] [FIX]",
+        "sigma S ~ 0.01 (sd)",
+    ),
+    (
+        "kappa NAME ~ value [(sd|variance|var)] [FIX] [weight = <expr>]",
+        "kappa K ~ 0.1 weight = NARM",
+    ),
+    (
+        "block_omega (A, B) = [lower triangle] [FIX]",
+        "block_omega (A, B) = [0.09, 0.02, 0.04] FIX",
+    ),
+    (
+        "block_sigma (A, B) = [lower triangle] [FIX]",
+        "block_sigma (A, B) = [0.04, 0.10, 1.00]",
+    ),
+    (
+        "block_kappa (A, B) = [lower triangle] [FIX]",
+        "block_kappa (A, B) = [0.09, 0.02, 0.04]",
+    ),
+];
+
+/// `PARAMETER_FORMS` as the diagnostic renders it.
+fn parameter_form_list() -> String {
+    PARAMETER_FORMS
+        .iter()
+        .map(|(spelling, _)| format!("`{spelling}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// True for a line that is nothing but a scale annotation — `(sd)`,
 /// `(variance)`, `(var)`, in any case, with or without inner spaces.
 ///
@@ -14202,7 +14256,7 @@ fn parse_parameters(
     // `value(sd)` without a space between value and annotation still matches
     // correctly — the annotation group uses \s* (zero or more) intentionally.
     let omega_re = Regex::new(
-        r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?\s*$",
+        r"(?i)^\s*omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*(sd|variance|var)\s*\))?(?:\s+(FIX)\b)?\s*$",
     )
     .unwrap();
 
@@ -14235,14 +14289,14 @@ fn parse_parameters(
     // FIX may appear before or after the scale annotation (same group layout
     // as omega_re: group 3 = FIX before, group 4 = annotation, group 5 = FIX after).
     let sigma_re = Regex::new(
-        r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?\s*$",
+        r"(?i)^\s*sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*(sd|variance|var)\s*\))?(?:\s+(FIX)\b)?\s*$",
     )
     .unwrap();
 
     // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
     // Same group layout as omega_re.
     let kappa_re = Regex::new(
-        r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?\s*$",
+        r"(?i)^\s*kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\(\s*(sd|variance|var)\s*\))?(?:\s+(FIX)\b)?\s*$",
     )
     .unwrap();
 
@@ -14253,7 +14307,7 @@ fn parse_parameters(
 
     // Rejoin multi-line `block_*` declarations before matching.
     let lines = join_bracketed_lines(lines);
-    for line in &lines {
+    for source_line in &lines {
         // #1031: a `kappa` declaration may carry a trailing `weight = <expr>`
         // (sample-size-weighted IOV). It is peeled off before the declaration
         // regexes run because it is no part of any declaration grammar. Before
@@ -14269,7 +14323,7 @@ fn parse_parameters(
         // one more — `weight =` takes everything to its right as an expression,
         // so on `kappa K ~ 0.1 weight = NARM prior(0.1, rse = 30%)` the weight
         // would otherwise swallow the prior and the model would fit unpenalized.
-        let (line, prior_decl) = split_prior_modifier(line, "parameters")?;
+        let (line, prior_decl) = split_prior_modifier(source_line, "parameters")?;
         let (line, weight_expr) =
             split_weight_modifier(&line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
         let line = &line;
@@ -14610,7 +14664,12 @@ fn parse_parameters(
                 Regex::new(r"(?i)^\s*(block_omega|block_sigma|block_kappa)\b").unwrap();
             let scale_tag_re =
                 Regex::new(r"(?i)\]\s*(?:FIX\s*)?\(\s*(sd|variance|var)\s*\)").unwrap();
-            let shown = line.trim();
+            // Quote what the user wrote, not the peeled remainder: `shown` used
+            // to be the post-`prior(...)` / post-`weight =` text, so the
+            // "offending line" could be a string appearing nowhere in the file
+            // (#1388 review). Still post-*join*, so a multi-line `block_*`
+            // declaration is quoted as the one logical line it forms.
+            let shown = source_line.trim();
             let block_kw = block_decl_re.captures(shown).map(|c| c[1].to_lowercase());
             let tag = scale_tag_re.captures(shown).map(|c| c[1].to_lowercase());
             if let (Some(kw), Some(tag)) = (block_kw, tag) {
@@ -14635,17 +14694,10 @@ fn parse_parameters(
                 ));
             }
             return Err(format!(
-                "[parameters]: unrecognized line `{shown}`. Expected one of: \
-                 `theta NAME(init[, lower, upper]) [FIX]`, a level block \
-                 `theta NAME[N](...)` / `theta NAME[COL, ...](...)`, \
-                 `omega NAME ~ value [(sd|variance|var)] [FIX]`, \
-                 `sigma NAME ~ value [(sd|variance|var)] [FIX]`, \
-                 `kappa NAME ~ value [(sd|variance|var)] [FIX] [weight = <expr>]`, \
-                 `block_omega (A, B) = [lower triangle] [FIX]`, \
-                 `block_sigma (A, B) = [lower triangle] [FIX]`, \
-                 `block_kappa (A, B) = [lower triangle] [FIX]`; any of these may carry a \
-                 trailing `prior(value, rse = 25%)`. A declaration must be the whole line — \
-                 leading or trailing text is rejected, not ignored."
+                "[parameters]: unrecognized line `{shown}`. Expected one of: {}; any of \
+                 these may carry a trailing `prior(value, rse = 25%)`. A declaration must be \
+                 the whole line — leading or trailing text is rejected, not ignored.",
+                parameter_form_list()
             ));
         }
         // #254: attach the peeled prior to whichever declaration matched. A

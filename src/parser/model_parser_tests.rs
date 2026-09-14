@@ -7047,6 +7047,32 @@ fn trailing_text_is_rejected_on_every_parameters_form() {
     }
 }
 
+/// Every form the "expected one of …" diagnostic lists must actually parse.
+///
+/// The message used to carry its own copy of the grammar and had drifted --
+/// it omitted the level-block forms, so it told a level-block author their
+/// valid declaration was unsupported (#1388 review). `PARAMETER_FORMS` is now
+/// the single source and this test is what keeps it honest.
+#[test]
+fn every_listed_parameter_form_actually_parses() {
+    for (spelling, example) in PARAMETER_FORMS {
+        parse_parameters(&[example.to_string()], &Default::default()).unwrap_or_else(|e| {
+            panic!(
+                "the diagnostic advertises `{spelling}` but its example `{example}` \
+                 does not parse: {e}"
+            )
+        });
+    }
+    // ...and the rendered list is what the message shows.
+    let listed = parameter_form_list();
+    for (spelling, _) in PARAMETER_FORMS {
+        assert!(
+            listed.contains(spelling),
+            "`{spelling}` missing from the list"
+        );
+    }
+}
+
 /// Leading text is rejected on every form, the other half of "consumed end to
 /// end" (#1388 review §1).
 ///
@@ -7302,6 +7328,13 @@ fn anchored_forms_still_accept_every_documented_tail() {
     // in each anchor is pinned individually rather than by shape.
     for (form, line) in [
         ("theta", "  theta TVCL(0.13, 0.01, 1.0) FIX  "),
+        // One tag vocabulary (#1388 review): the grammar, `is_bare_scale_tag`
+        // and `scale_tag_re` all tolerate inner whitespace now. Before, only the
+        // latter two did, so `( sd )` was rejected with a message listing
+        // `(sd)` back at the author and no hint that the spaces were the fault.
+        ("omega-spaced-tag", "omega ES ~ 0.09 ( sd )"),
+        ("sigma-spaced-tag", "sigma SS ~ 0.01 (  variance  )"),
+        ("kappa-spaced-tag", "kappa KS ~ 0.04 ( var )"),
         ("theta-lead", "\t theta TVKA(1.0, 0.01, 9.0)"),
         ("omega", "omega ETA_CL ~ 0.09 (sd)  "),
         ("sigma", "sigma PROP_ERR ~ 0.04 FIX \t"),
