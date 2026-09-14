@@ -11525,3 +11525,155 @@ fn ode_provider_input_rate_onset_on_a_covariate_record_returns_a_one_sided_deriv
         );
     }
 }
+
+/// Fourth arrival site, and the one a per-route `lag=` reaches: `K_ROUTE_ONSET`.
+///
+/// `first_order(ka=KA, lag=LAG)` switches on at `t_dose + ALAG_cmt + lag_route`, which is a
+/// moving boundary in **both** lags and is handled by its own timeline event rather than by
+/// the shared `K_DOSE` onset. It therefore has its own snapshot lookup, which the first cut
+/// of #1391 left on the pre-#1068 forward scan — so an unlagged `first_order` forcing and an
+/// otherwise identical `lag=`-carrying one reported **opposite** one-sided branches at a
+/// record coincidence. Caught in review; measured at 2.5 % between the branches.
+///
+/// `K_ROUTE_ONSET` = 4 sorts before `K_PKONLY` = 5 / `K_OBS` = 6, so like every other arrival
+/// it must report the limit from below.
+const ONECPT_ROUTE_LAG_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVLAG(0.5, 0.05, 5.0)
+  theta TVKA(0.8, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL  = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  KA  = TVKA * (WT/70)^THETA_WT
+  LAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=LAG) - (CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+#[test]
+fn ode_provider_route_lagged_onset_on_a_covariate_record_returns_a_one_sided_derivative() {
+    let model = parse_model_string(ONECPT_ROUTE_LAG_TVCOV_ODE).expect("parse");
+    let mut subject = lag_crossing_subject();
+    // Two doses, because the incoming side of the *second* onset is what this tests. The
+    // first is dosed at t = 0 and its route onset (0 + 0.5 = 0.5) is an ordinary interior
+    // boundary that leaves drug in `central`; the second is dosed at t = 1 so its onset is
+    // exactly 1.5 — the record where `WT` steps 72 → 74. Both `CL` and `KA` read `WT`, so
+    // the two candidate snapshots differ in the kernel as well as in the field.
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(70.0), wt(70.0)];
+    let theta = [10.0, 50.0, 0.75, 0.5, 0.8];
+    let eta = [0.1, -0.05, 0.0];
+    assert!(ode_tvcov_supported(&model, &subject));
+    assert!(
+        !model.ode_spec.as_ref().unwrap().input_rate.is_empty(),
+        "fixture must carry a built-in input-rate forcing"
+    );
+
+    // Non-degeneracy: the first dose's absorption must have put drug in the compartment
+    // before the second onset fires, or `g(x⁻) = 0` there and the term under test is
+    // multiplied away — the shape that hid #1068 on every single-dose fixture.
+    let one_dose = {
+        let mut s = subject.clone();
+        s.doses = vec![subject.doses[1].clone()];
+        s.dose_covariates = vec![wt(70.0)];
+        compute_predictions_with_tv(&model, &s, &theta, &eta)
+    };
+    let two_dose = compute_predictions_with_tv(&model, &subject, &theta, &eta);
+    // Read it at `t = 1.5`, the instant of the second onset — not at `t = 0.5`, which is the
+    // *first* onset, where nothing has absorbed yet and the two runs agree for a reason that
+    // has nothing to do with this fixture.
+    assert!(
+        (two_dose[2] - one_dose[2]).abs() > 1e-3 * two_dose[2].abs(),
+        "the first dose has delivered nothing by the second onset — its incoming side is \
+         empty and this fixture cannot see the defect"
+    );
+
+    let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    for j in [3usize, 4, 5] {
+        // `h = 1e-4` and a 5e-5 bound, for the reason the shared-onset fixture records: the
+        // backward stencil cancels the `ka·dose` onset against the decay, so it resolves ~5
+        // digits, not the ~9 the bolus arm's stencil manages.
+        //
+        // Measured on this fixture, before and after the `:6101` fix:
+        //
+        // | obs | before      | after       | fwd limit   | bwd limit   |
+        // |-----|-------------|-------------|-------------|-------------|
+        // | t=2 | -0.59502583 | -0.59188908 | -0.59502582 | -0.59188932 |
+        // | t=4 | +0.15285989 | +0.15473657 | +0.15285990 | +0.15473582 |
+        // | t=8 | +0.11211076 | +0.11275115 | +0.11211076 | +0.11275090 |
+        //
+        // i.e. it sat exactly on the FORWARD limit — the branch a rate-off takes, not an
+        // onset — and now sits on the backward one. Worst realised miss after the fix is
+        // 4.8e-6, so the 5e-5 bound carries ~10x headroom; the two branches are 0.53 % to
+        // 1.2 % apart, so the stencil separates them with three orders to spare.
+        let (fwd, bwd) = one_sided_eta_limits(&model, &subject, &theta, &eta, 2, j, 1e-4);
+        assert!(fwd.is_finite() && bwd.is_finite());
+        // Measured straddle is 0.53 %-1.2 %; require a tenth of the smallest of those, so
+        // the guard fires long before the fixture degenerates but never on stencil noise.
+        assert!(
+            (fwd - bwd).abs() > 5e-4 * fwd.abs().max(bwd.abs()),
+            "obs{j}: the one-sided derivatives coincide ({fwd} vs {bwd}) — the route onset no \
+             longer lands on the record and this fixture tests nothing"
+        );
+        approx::assert_relative_eq!(
+            sens.obs[j].df_deta[2],
+            bwd,
+            max_relative = 5e-5,
+            epsilon = 1e-7
+        );
+    }
+}
+
+/// The interior control for the route-lagged onset: same model, same per-route `lag=`, but
+/// the onset falls strictly between records, where `params` and the old forward scan resolve
+/// to the same record. Two-sided differentiable, and exact on both orders.
+#[test]
+fn ode_provider_route_lagged_onset_between_records_is_exact() {
+    let model = parse_model_string(ONECPT_ROUTE_LAG_TVCOV_ODE).expect("parse");
+    let mut subject = lag_crossing_subject();
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(70.0), wt(70.0)];
+    // `LAG = 0.5·e^0.07 ≈ 0.536`, so the second onset is ≈1.536 — inside `[1.5, 2.0]`.
+    let theta = [10.0, 50.0, 0.75, 0.5, 0.8];
+    let eta = [0.1, -0.05, 0.07];
+    assert!(ode_tvcov_supported(&model, &subject));
+    let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    for j in [3usize, 4, 5] {
+        let (fwd, bwd) = one_sided_eta_limits(&model, &subject, &theta, &eta, 2, j, 1e-5);
+        approx::assert_relative_eq!(fwd, bwd, max_relative = 1e-4, epsilon = 1e-8);
+        approx::assert_relative_eq!(
+            sens.obs[j].df_deta[2],
+            bwd,
+            max_relative = 1e-4,
+            epsilon = 1e-7
+        );
+    }
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}

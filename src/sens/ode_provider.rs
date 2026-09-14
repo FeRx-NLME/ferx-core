@@ -6085,20 +6085,28 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             if cmt_idx < n_states {
                 let f = &ode.input_rate[fi];
                 // #880: read the onset kernel (`ka`/shape via `prep`), pathway `frac`, and the
-                // post-side Jacobian from the POST-ARRIVAL segment snapshot — the record ending
-                // the segment where this route's `R_in` turns on (NONMEM end-of-interval) — not
-                // the pre-onset `last_params` (which `prepared_forcings` here is built from) nor
-                // the dose record's snapshot. Under a TV covariate crossing the route onset those
-                // diverge (a several-percent gradient error), exactly as at the shared `K_DOSE`
-                // onset. The dose **mass** `F·amt` stays fixed at dose time (mass-exact).
+                // post-side Jacobian from the segment where this route's `R_in` turns on
+                // (NONMEM end-of-interval) — not the dose record's snapshot. Under a TV
+                // covariate crossing the route onset those diverge (a several-percent gradient
+                // error), exactly as at the shared `K_DOSE` onset. The dose **mass** `F·amt`
+                // stays fixed at dose time (mass-exact).
                 //
-                // With no later record the fallback is `last_params` — the most recent record —
-                // NOT the dose snapshot: since #1073 the dose row is no longer a parameter
-                // source past its own record. That is also what the segment resolution's own
-                // trailing-tail rule returns (`governing_record_indices`), so both sides of a
-                // trailing boundary carry the same field and the saltation correctly vanishes:
-                // nothing follows to change it.
-                let onset_params: &[T] = post_snapshot(p, t_event).unwrap_or(last_params);
+                // That snapshot is `params`, the enclosing record's, for the same reason it is
+                // at the shared `K_DOSE` onset — see the long note there (#1060 / #1068).
+                // Since #1073 `params` already IS the post-onset segment's snapshot wherever
+                // this boundary is interior to a record interval, and where it is *not* — a
+                // record landing exactly on the onset — reading a strictly-later record on one
+                // side charges this **moving** boundary with a **stationary** record's field
+                // jump and returns a derivative on neither one-sided branch.
+                //
+                // `K_ROUTE_ONSET` = 4 sorts BEFORE `K_PKONLY` = 5 / `K_OBS` = 6, so like every
+                // other arrival it reports the limit from below. Getting this site wrong while
+                // the shared onset was right would have left a per-route `first_order(…, lag=L)`
+                // on the opposite branch from the identical unlagged forcing — measured at 2.5 %
+                // between the two branches on a two-dose route-lag fixture (PR #1391 review).
+                // It is the second site #1069 named, and it is a separate `post_snapshot` call
+                // rather than a shared one, so fixing the shared arms did not reach it.
+                let onset_params: &[T] = params;
                 let prep_onset = prep_for(onset_params);
                 let prep = &prep_onset[fi];
                 let lag_cmt = if has_lagtime {
