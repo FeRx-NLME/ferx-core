@@ -443,7 +443,7 @@ section of the SDLC for the versioning policy).
   Gauss–Newton eta Hessian through a Cholesky solve; Laplace/AGQ fuse the terminal
   prediction Jacobian with their exact Hessian and reuse that curvature in the
   quadrature objective. Unsupported or non-positive-definite seeds retain the
-  previous initialization ([#1385](https://github.com/FeRx-NLME/ferx-core/pull/1385)).
+  previous initialization ([#1389](https://github.com/FeRx-NLME/ferx-core/pull/1389)).
 
 - Population fitting and prediction use the available worker budget more efficiently: Bayesian chains and underfilled AGQ grids run concurrently, small FOCE populations avoid fine-grained dispatch overhead, concurrent cold callers share pool construction, AGQ-IOV nodes avoid a heap allocation, and public `predict()` evaluates subjects in parallel ([#1385](https://github.com/FeRx-NLME/ferx-core/pull/1385)).
 
