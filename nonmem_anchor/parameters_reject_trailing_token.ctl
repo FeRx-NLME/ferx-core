@@ -14,9 +14,25 @@
 ; the repo's "vary one input at a time" discipline, so no separate baseline file
 ; is needed.
 ;
-; NM-TRAN (nmfe76, nonmemdocker:V0.1):
-;   AN ERROR WAS FOUND IN THE CONTROL STATEMENTS.
-;   ... THE CHARACTERS IN ERROR ARE: FOO
+; Measured first-hand, not inherited: nmfe76 (/opt/NONMEM/nm760/run/nmfe76),
+; NONMEM VERSION 7.6.0 (nm760), docker image nonmemdocker:V0.1
+; (sha256:2ee46060f1e0). Run from nonmem_anchor/ against ../data/warfarin.csv.
+; Rejected, nmfe exit 107. Verbatim, leading spaces as printed:
+;
+;  AN ERROR WAS FOUND IN THE CONTROL STATEMENTS.
+;
+; AN ERROR WAS FOUND ON LINE <N> AT THE APPROXIMATE POSITION NOTED:
+;  $OMEGA BLOCK(2) 0.09 0.02 0.04 FOO
+;                                 X
+;  THE CHARACTERS IN ERROR ARE: FOO
+;    20  UNKNOWN OPTION.
+;
+; <N> is spelled out as a number in the real output. It counts every line of the
+; file, this comment header included, so it moves whenever the header does - the
+; one part of the message not worth pinning here.
+;
+; The control: deleting `FOO` and nothing else is ACCEPTED, exit 0, OBJECTIVE
+; FUNCTION VALUE: 213.51174651518426.
 ;
 ; The ferx equivalent is
 ;   block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] banana
