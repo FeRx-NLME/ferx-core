@@ -135,6 +135,23 @@ while SAEM, IMPMAP, and IMPMAP+MCETA3 all agree closely. On this small model
 (5 ETAs) the MCETA benefit is modest (~0.4 OFV); on larger FREM models with
 many covariates the improvement can be dramatic.
 
+::: {.callout-note}
+## The FOCEI column has moved since this table was measured
+
+Two fixes landed on the FOCEI arm of this fixture. Its Nelder–Mead inner-loop
+restart used to reset a FREM covariate eta to zero, tens of units from where its
+pseudo-observation pins it, and the reported OFV used to be read off a **cold** EBE
+re-solve rather than the one the optimizer minimised
+([#1349](https://github.com/FeRx-NLME/ferx-core/issues/1349),
+[#833](https://github.com/FeRx-NLME/ferx-core/issues/833)). Re-measured 2026-09-13
+on the fix, the Linux arm reaches **OFV −220.7** — the same value SAEM and IMPMAP
+reach above — while the macOS arm lands at **−174.9** in a different basin, with
+ω²(V) and ω²(KA) inflated. That remaining platform split is
+[#990](https://github.com/FeRx-NLME/ferx-core/issues/990); the FOCEI row above
+predates both fixes and is kept as the historical measurement rather than
+half-updated.
+:::
+
 ## Limitations
 
 - Categorical covariates are binarized (one-hot encoded) before the FREM

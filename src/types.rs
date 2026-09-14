@@ -5946,6 +5946,18 @@ pub enum WarningCode {
     /// *nothing* moved — a well-chosen start that the optimizer correctly leaves
     /// in place on one parameter while moving another is not a stall.
     StalledAtInit,
+    /// The empirical Bayes estimates at the final parameters depend on where the
+    /// inner loop starts: re-solving them cold at the reported estimates lands on a
+    /// materially worse objective than re-solving them from the EBEs the optimizer
+    /// itself was minimising against (#833). The individual objective is multimodal
+    /// at those estimates, so every EBE-derived diagnostic (IPRED, IWRES, CWRES,
+    /// shrinkage, the covariance step's inner solve) is start-dependent.
+    ///
+    /// Distinct from [`WarningCode::Convergence`]: the *outer* fit may be perfectly
+    /// converged — this says the inner problem has more than one mode at the point
+    /// it converged to. The reported fit uses whichever of the two EBE sets scores
+    /// the lower objective, so the number is the better of the two, not a coin flip.
+    EbeStartDependent,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
@@ -6030,6 +6042,7 @@ impl WarningCode {
             WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
             WarningCode::InitOutsideBounds => "init_outside_bounds",
             WarningCode::StalledAtInit => "stalled_at_init",
+            WarningCode::EbeStartDependent => "ebe_start_dependent",
             WarningCode::InflatedRse => "inflated_rse",
             WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
@@ -6161,6 +6174,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // consumer branching on `convergence` would read the opposite of what
         // happened.
         (WarningSeverity::Warning, WarningCode::StalledAtInit)
+    } else if lower.contains("w_ebe_start_dependent") {
+        // #833: the inner loop has more than one mode at the final estimates. Matched
+        // on its `W_` token and placed with the other token arms: the message quotes
+        // OFV values and names the EBE-derived diagnostics, and the prose arms below
+        // claim on substrings like "shrinkage" (`eta_shrinkage`, whose category drives
+        // a different user action entirely) and "converge".
+        (WarningSeverity::Warning, WarningCode::EbeStartDependent)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the

@@ -3060,6 +3060,52 @@ fn short_descending_tail_is_not_converged() {
     ));
 }
 
+// ── #833: which of the final inner loop's two EBE solves is reported ──────────
+
+#[test]
+fn the_lower_objective_solve_is_the_one_reported() {
+    // FREM warfarin, measured: cold -167.95, warm -174.91 → the warm solve wins.
+    assert!(warm_solve_wins(-174.91, -167.95));
+    // And the other way round, so the rule is a comparison and not "always warm".
+    assert!(!warm_solve_wins(-167.95, -174.91));
+}
+
+#[test]
+fn a_tie_reports_the_cold_solve() {
+    // The unimodal case — most fits. Reporting the cold number on a tie is what keeps
+    // those fits bit-identical to the behaviour before #833.
+    assert!(!warm_solve_wins(-286.004205, -286.004205));
+}
+
+#[test]
+fn a_diverged_solve_never_displaces_a_finite_one() {
+    // `NaN < x` is false for every x, which is why the comparison is written as
+    // `warm < cold` rather than `!(cold < warm)`: the latter would hand a NaN warm
+    // objective the win and report a fit at EBEs that blew up.
+    assert!(!warm_solve_wins(f64::NAN, 42.0));
+    assert!(!warm_solve_wins(f64::INFINITY, 42.0));
+    // The same comparison alone would also pin the fit to a NaN *cold* objective,
+    // since `warm < NaN` is false too — hence the second clause.
+    assert!(warm_solve_wins(42.0, f64::NAN));
+    assert!(!warm_solve_wins(f64::NAN, f64::NAN));
+}
+
+#[test]
+fn the_start_dependence_warning_fires_only_on_a_material_gap() {
+    // Measured FREM gap: 6.96 on a reported -174.91 → the tolerance is
+    // 1e-3 * (1 + 174.91) = 0.176, so this is ~40x over and fires.
+    let gap = ebe_start_dependence_gap(-167.95, -174.91).expect("6.96 is material");
+    assert!((gap - 6.96).abs() < 1e-9, "gap = {gap}");
+
+    // A cold solve that ties (or beats) the reported one says nothing — no warning.
+    assert!(ebe_start_dependence_gap(-174.91, -174.91).is_none());
+    assert!(ebe_start_dependence_gap(-200.0, -174.91).is_none());
+
+    // The threshold itself: 1e-3 * (1 + 100) = 0.101, so 0.05 is silent and 0.5 is not.
+    assert!(ebe_start_dependence_gap(-99.95, -100.0).is_none());
+    assert!(ebe_start_dependence_gap(-99.5, -100.0).is_some());
+}
+
 #[test]
 fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold

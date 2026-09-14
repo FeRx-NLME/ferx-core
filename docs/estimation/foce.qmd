@@ -475,6 +475,30 @@ The inner loop warm-starts EBE estimation from the previous outer iteration's EB
 
 The warm start is taken from the **best point seen so far**, not from whatever the optimizer evaluated last ([#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290)). That distinction matters because the individual objective can be multimodal: a trial step the line search is about to reject may land somewhere the inner loop solves into a different, worse basin, and if those EBEs were carried forward, every later evaluation would inherit them. The starting point would then re-evaluate *worse* than it did a moment earlier — an objective that moves under the optimizer's feet, which no line search can descend. Anchoring the warm start to the incumbent keeps the objective at the incumbent reproducible; evaluations that do not improve on it leave the cache untouched.
 
+### The final inner loop {#final-inner-loop}
+
+When the outer optimizer stops, ferx restores the best point it saw
+([#59](https://github.com/FeRx-NLME/ferx-core/issues/59)) and runs one more inner loop there —
+the EBEs that reach the sdtab, the covariance step and the reported objective come from that
+solve, not from the trajectory.
+
+It is run **twice**: once cold, and once from the EBEs the optimizer was minimising against.
+Whichever scores the lower objective is reported. Before
+[#833](https://github.com/FeRx-NLME/ferx-core/issues/833) only the cold solve ran, and on a
+multimodal individual objective it could settle at a different η̂ than the warm trajectory had —
+so the reported OFV came out *above* the best-seen value the point had just been restored for
+(+3.5 on a fluconazole 2-cpt binding model), and the covariance step ran at those different
+EBEs. Re-solving from both and keeping the better one cannot make the reported number worse
+than either.
+
+The two solves are also a diagnostic. A cold re-solve that lands materially worse raises the
+`ebe_start_dependent` warning (see [Warnings](../warnings.qmd#codes-convergence)), which quotes
+both values: the estimates are fine, but the EBEs at them — and every EBE-derived diagnostic —
+depend on where the inner loop starts, which is worth knowing before reading an IWRES plot.
+The cold number is also what the convergence self-consistency check reads
+([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)); a fit whose "optimum" exists only
+under a warm start is still rejected.
+
 ## Configuration Example
 
 ```

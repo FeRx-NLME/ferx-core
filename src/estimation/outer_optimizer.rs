@@ -1657,6 +1657,40 @@ const PLATEAU_MIN_FLAT_EVALS: usize = 5;
 /// is rejected even if the OFV trace looked flat.
 const PLATEAU_CONSISTENCY_REL_TOL: f64 = 1e-3;
 
+/// Which of the final inner loop's two EBE solves the fit reports (#833).
+///
+/// The restored best point is re-solved twice — once cold, once from the EBEs the
+/// optimizer was minimising against — and the lower objective wins, because that is
+/// the very quantity being reported. Two properties are deliberate, and both are
+/// about the failure direction:
+///
+/// - **Ties go to the cold solve.** The two agree on a unimodal inner problem, which
+///   is most fits, and reporting the cold number there leaves those fits bit-identical
+///   to the pre-#833 behaviour.
+/// - **A non-finite warm objective can never win.** `NaN < cold` is `false`, so a warm
+///   solve that diverged leaves the finite cold result in place; the comparison is
+///   written as a positive test for that reason (`cold < warm` would hand a `NaN` warm
+///   objective the win).
+/// - **A `NaN` cold objective is displaceable.** Without the second clause a cold solve
+///   that blew up would be reported in preference to a perfectly finite warm one, since
+///   `warm < NaN` is false too — the same asymmetry [`BestPoint::observe`] carries.
+fn warm_solve_wins(warm_ofv: f64, cold_ofv: f64) -> bool {
+    warm_ofv < cold_ofv || (cold_ofv.is_nan() && !warm_ofv.is_nan())
+}
+
+/// Does a cold re-solve at the final estimates land materially above `reference_ofv`
+/// (#833)? Same relative scale as the plateau self-consistency check, so "materially
+/// worse" means one thing in this file.
+///
+/// Two callers, one rule. Against `best_seen_ofv` it is the *trigger*: only a cold solve
+/// that failed to reproduce the objective the optimizer measured is worth a second,
+/// warm-seeded solve. Against the reported OFV it is the *warning*: the gap that
+/// survived that second solve is the part the user has to know about.
+fn ebe_start_dependence_gap(cold_ofv: f64, reference_ofv: f64) -> Option<f64> {
+    let gap = cold_ofv - reference_ofv;
+    (gap > PLATEAU_CONSISTENCY_REL_TOL * (1.0 + reference_ofv.abs())).then_some(gap)
+}
+
 /// Classify a bare NLopt `Failure`/`ForcedStop` as convergence-at-a-plateau
 /// (issue #751). Every eval index and count here is measured over *feasible*
 /// (unguarded) evals only — guarded/penalty evals are excluded entirely, so
@@ -2051,6 +2085,15 @@ fn optimize_nlopt_once(
     let best_seen: Arc<Mutex<BestPoint>> = Arc::new(Mutex::new(BestPoint::new()));
     let best_seen_cl = Arc::clone(&best_seen);
 
+    // EBEs of the best feasible eval, published by the objective closure (#833).
+    // They seed — they do not decide — the final inner loop: the restored point's
+    // objective is re-minimised from both this seed and the cold one and the lower
+    // of the two is reported, so a seed that belongs to a slightly different point
+    // (the tracker also observes guard-penalised evals, whose EBEs are not adopted)
+    // can only cost an inner solve, never a wrong number.
+    let best_etas: Arc<Mutex<Option<Vec<DVector<f64>>>>> = Arc::new(Mutex::new(None));
+    let best_etas_cl = Arc::clone(&best_etas);
+
     let last_gradient: Arc<Mutex<Option<Vec<f64>>>> = Arc::new(Mutex::new(None));
     let last_gradient_cl = Arc::clone(&last_gradient);
 
@@ -2387,6 +2430,11 @@ fn optimize_nlopt_once(
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         state.cached_h_mats = hms;
         if warm_start_improved {
+            // Publish the incumbent's EBEs for the final inner loop (#833). NLopt
+            // never hands `state` back, so the cache the anchoring keeps at the
+            // incumbent (#1290) has to be copied out here; the clone costs one
+            // allocation per *improving* eval, not per eval.
+            *best_etas_cl.lock().unwrap() = Some(ehs.clone());
             state.cached_etas = ehs;
         } else if let Some(prev) = warm_start_by_class {
             state.cached_etas_by_class = prev;
@@ -2699,6 +2747,12 @@ fn optimize_nlopt_once(
     let final_params = unpack_params(&x0, init_params);
     let final_is_mixture = final_params.mixture.is_some();
 
+    // The −2LL of a *cold* re-solve at the restored point, kept separately from the
+    // reported `final_ofv` because the plateau self-consistency check (#751) is a
+    // statement about the cold restart specifically. `None` on the mixture path,
+    // whose own solve has no cold/warm split.
+    let mut cold_ofv: Option<f64> = None;
+
     // Final inner loop at converged parameters. Mixture (#977 Phase 3): the OFV
     // is the K-fold log-sum-exp and the reported EBEs are the MIXEST class.
     let (final_ehs, final_hms, final_kappas, final_ofv, final_mixture_posteriors) =
@@ -2727,27 +2781,74 @@ fn optimize_nlopt_once(
             )
         } else {
             let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-            let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
-                model,
-                population,
-                &final_params,
-                options.inner_maxiter,
-                options.inner_tol,
-                None,
-                Some(&final_mu_k),
-                options.min_obs_for_convergence_check as usize,
-                options.inner_restarts,
-            );
-            let final_nll = pop_nll_opts(
-                model,
-                population,
-                &final_params,
-                &final_ehs,
-                &final_hms,
-                &final_kappas,
-                options,
-            );
-            (final_ehs, final_hms, final_kappas, 2.0 * final_nll, None)
+            let solve_at = |seed: Option<&[DVector<f64>]>| {
+                let (ehs, hms, _, kappas) = run_inner_loop_warm(
+                    model,
+                    population,
+                    &final_params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    seed,
+                    Some(&final_mu_k),
+                    options.min_obs_for_convergence_check as usize,
+                    options.inner_restarts,
+                );
+                let nll = pop_nll_opts(
+                    model,
+                    population,
+                    &final_params,
+                    &ehs,
+                    &hms,
+                    &kappas,
+                    options,
+                );
+                (ehs, hms, kappas, 2.0 * nll)
+            };
+
+            // The cold solve is kept for its own sake: `failure_is_converged_plateau`
+            // reads it as the warm-start-artifact probe (#751), and that check is only
+            // worth anything while the number it reads is genuinely cold.
+            let (cold_ehs, cold_hms, cold_kappas, cold) = solve_at(None);
+            cold_ofv = Some(cold);
+
+            // #833: the cold EBEs are not automatically the ones the optimizer's own
+            // objective was measured at. The individual objective is multimodal
+            // (#864 / #891), so on a weakly-identified inner problem the cold restart
+            // settles at a different η̂ than the warm trajectory did and the reported
+            // OFV comes out *above* the best-seen value the point was restored for —
+            // measured at +3.5 on the fluconazole 2-cpt binding model and +6.96 on the
+            // FREM warfarin fixture (+3513 for the same fixture on glibc, #1349), which
+            // also drags the covariance step off the reported minimum. When that
+            // happens, re-minimise from the incumbent's EBEs too and keep whichever set
+            // scores lower. Ranking on `pop_nll_opts` is ranking on the very quantity
+            // that gets reported, so the choice cannot make the reported OFV worse than
+            // either candidate alone.
+            //
+            // The second solve is *conditional* on the cold one having failed to
+            // reproduce `best_seen_ofv`. On a unimodal inner problem — most fits — the
+            // two agree, there is nothing to recover, and the fit stays bit-identical
+            // to the pre-#833 behaviour at exactly the old cost. A non-finite cold
+            // objective also asks for the retry: `is_none_or` covers the no-incumbent
+            // case, and the `is_nan` clause is there because every comparison against
+            // `NaN` is false, so the gap test alone would decline to re-solve precisely
+            // when the cold solve blew up.
+            let cold_missed_the_incumbent = cold.is_nan()
+                || best_seen_ofv.is_some_and(|best| ebe_start_dependence_gap(cold, best).is_some());
+            let seed = best_etas.lock().unwrap().take();
+            let (ehs, hms, kappas, ofv) = match seed {
+                Some(seed)
+                    if cold_missed_the_incumbent && seed.len() == population.subjects.len() =>
+                {
+                    let (w_ehs, w_hms, w_kappas, warm) = solve_at(Some(&seed));
+                    if warm_solve_wins(warm, cold) {
+                        (w_ehs, w_hms, w_kappas, warm)
+                    } else {
+                        (cold_ehs, cold_hms, cold_kappas, cold)
+                    }
+                }
+                _ => (cold_ehs, cold_hms, cold_kappas, cold),
+            };
+            (ehs, hms, kappas, ofv, None)
         };
 
     if options.verbose {
@@ -2779,13 +2880,19 @@ fn optimize_nlopt_once(
     //       best-seen 83.3 vs cold 121.4 exposes a warm-start artifact).
     // Both must hold; a genuine mid-descent stall fails at least one, so this
     // never papers over non-convergence.
+    // The number this check reads is the *cold* re-solve, not the reported
+    // `final_ofv` — since #833 those differ whenever the warm re-solve found a
+    // better EBE mode, and handing it the warm one would make the probe compare the
+    // best-seen objective against a re-run of itself (`consistent` would then be
+    // true by construction and the check would stop rejecting warm-start artifacts).
+    let consistency_ofv = cold_ofv.unwrap_or(final_ofv);
     if stationarity_check_pending {
         let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
         if failure_is_converged_plateau(
             feasible_evals,
             last_sig_feasible_eval,
             best_seen_ofv,
-            final_ofv,
+            consistency_ofv,
             left_init,
         ) {
             converged = true;
@@ -2794,15 +2901,37 @@ fn optimize_nlopt_once(
             let flat_tail = feasible_evals.saturating_sub(last_sig_feasible_eval);
             eprintln!(
                 "Plateau check: flat_tail = {} feasible evals (min {}), feasible_evals = {}, \
-                 best-seen {:?} vs final {:.6}, left init = {} → converged = {}",
+                 best-seen {:?} vs cold {:.6} (reported {:.6}), left init = {} → converged = {}",
                 flat_tail,
                 PLATEAU_MIN_FLAT_EVALS,
                 feasible_evals,
                 best_seen_ofv,
+                consistency_ofv,
                 final_ofv,
                 left_init,
                 converged,
             );
+        }
+    }
+
+    // A cold re-solve that lands materially above the reported objective is a
+    // statement about the model, not a defect: the individual objective has more
+    // than one mode at these estimates, so the EBEs — and every EBE-derived
+    // diagnostic — depend on where the inner loop starts. Surface it rather than
+    // silently reporting the better of the two (#833).
+    if let Some(cold) = cold_ofv {
+        if let Some(gap) = ebe_start_dependence_gap(cold, final_ofv) {
+            warnings.push(format!(
+                "W_EBE_START_DEPENDENT: empirical Bayes estimates at the final \
+                 parameters depend on the inner loop's starting point — re-solving them \
+                 cold scores {:.4} OFV units worse than re-solving them from the EBEs \
+                 the optimizer minimised against ({:.4} vs the reported {:.4}). The \
+                 reported fit uses the better of the two. A gap this large means the \
+                 individual objective has more than one mode at these estimates, so \
+                 EBE-derived diagnostics (IPRED, IWRES, CWRES, shrinkage) and the \
+                 covariance step depend on that choice.",
+                gap, cold, final_ofv,
+            ));
         }
     }
 
