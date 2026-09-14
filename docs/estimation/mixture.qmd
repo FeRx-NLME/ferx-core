@@ -21,7 +21,8 @@ select class-specific typical values with the reserved read-only `MIXNUM` index
 
 ```toml
 [parameters]
-  theta TVCL1(1.0); theta TVCL2(3.0)   # class-specific clearance
+  theta TVCL1(1.0)                      # class-specific clearance
+  theta TVCL2(3.0)
   theta TVV(10.0)
   theta MIXL(0.0)                       # mixing logit intercept
   omega ETA_CL ~ 0.09

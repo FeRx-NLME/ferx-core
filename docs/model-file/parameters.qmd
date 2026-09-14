@@ -9,7 +9,7 @@ description-meta: "Define theta fixed effects, omega between-subject variability
 
 The `[parameters]` block defines all model parameters: fixed effects (theta), between-subject variability (omega), and residual error (sigma).
 
-Every line in the block must be consumed end to end by exactly one declaration form — both ends. Text *after* a complete declaration (a stray word, a misspelt `(sdx)`, a scale tag on a form that takes none) is a parse error quoting the offending line, and so is text *before* one: `block_sigma PROP ~ 0.04` used to declare a diagonal `sigma` and `; theta TVCL(1, 0.1, 100)` a live theta, because `;` is not a comment marker here (only `#` and `//` are). So is a line matching no form at all. Before 0.4.0 all of it was silently dropped, which is how an SD-coded `block_omega` came to fit as variances with `ferx check` reporting the file VALID.
+Every line in the block must be consumed end to end by exactly one declaration form — both ends. Text *after* a complete declaration (a stray word, a misspelt `(sdx)`, a scale tag on a form that takes none) is a parse error quoting the offending line, and so is text *before* one: `block_sigma PROP ~ 0.04` used to declare a diagonal `sigma` and `; theta TVCL(1, 0.1, 100)` a live theta, because `;` is not a comment marker here (only `#` and `//` are). Nor does `;` separate declarations: write one per line. So is a line matching no form at all, and a `theta` bound that is present but not a number (`theta TVCL(50, 0.001-10.0)`), which used to take the default bound instead. Before 0.4.0 all of it was silently dropped, which is how an SD-coded `block_omega` came to fit as variances with `ferx check` reporting the file VALID.
 
 ## Theta (Fixed Effects)
 
