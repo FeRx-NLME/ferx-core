@@ -82,7 +82,7 @@ The file could not be read as a ferx model at all, or names a block ferx does no
 
 A theta, eta, kappa or sigma the model uses is not declared, is declared in the wrong order, or has no data to bind to.
 
-A `[parameters]` line must also be consumed end to end by exactly one declaration form. Trailing text after a complete declaration is reported as `E_PARSE` with the offending line quoted; the one shape with a code of its own is a scale tag on a `block_*` declaration, below. Before 0.4.0 both were dropped without a diagnostic.
+A `[parameters]` line must also be consumed end to end by exactly one declaration form, at both ends: text before or after a complete declaration is reported as `E_PARSE` with the offending line quoted, and so is a line matching no form at all. The one shape with a code of its own is a scale tag on a `block_*` declaration, below. Before 0.4.0 all of it was dropped without a diagnostic — including leading text, which could silently turn `block_sigma PROP ~ 0.04` into a diagonal `sigma`.
 
 | Code | Severity | Meaning |
 |------|----------|---------|
