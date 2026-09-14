@@ -9933,7 +9933,6 @@ fn ode_iov_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
   theta TVF(0.7, 0.05, 1.0)
   omega ETA_CL ~ 0.09
   omega ETA_V ~ 0.09
-  iov_column OCC
   kappa KAPPA_CL ~ 0.04
   sigma PROP_ERR ~ 0.04 (sd)
 [individual_parameters]
@@ -9949,6 +9948,7 @@ fn ode_iov_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
+  iov_column = OCC
   ode_reltol = 1e-10
   ode_abstol = 1e-12
 "#;
@@ -10125,7 +10125,6 @@ fn ode_iov_ss_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
   theta TVF(0.7, 0.05, 1.0)
   omega ETA_CL ~ 0.09
   omega ETA_V ~ 0.09
-  iov_column OCC
   kappa KAPPA_CL ~ 0.04
   sigma PROP_ERR ~ 0.04 (sd)
 [individual_parameters]
@@ -10141,6 +10140,7 @@ fn ode_iov_ss_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
+  iov_column = OCC
   ode_reltol = 1e-10
   ode_abstol = 1e-12
 "#;

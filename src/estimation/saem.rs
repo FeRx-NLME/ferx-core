@@ -5491,8 +5491,8 @@ mod tests {
 
         const ZERO_FIT_MODEL: &str = r#"
 [parameters]
-TVCL(1.0, 0.1, 100.0) FIX
-TVV(10.0, 0.1, 1000.0) FIX
+theta TVCL(1.0, 0.1, 100.0) FIX
+theta TVV(10.0, 0.1, 1000.0) FIX
 sigma EPS ~ 0.04
 
 [individual_parameters]

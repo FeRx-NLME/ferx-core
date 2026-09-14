@@ -9,6 +9,8 @@ description-meta: "Define theta fixed effects, omega between-subject variability
 
 The `[parameters]` block defines all model parameters: fixed effects (theta), between-subject variability (omega), and residual error (sigma).
 
+Every line in the block must be consumed end to end by exactly one declaration form. Trailing text after a complete declaration — a stray word, a misspelt `(sdx)`, a scale tag on a form that takes none — is a parse error that quotes the offending line, and so is a line matching no form at all. Before 0.4.0 all of it was silently dropped, which is how an SD-coded `block_omega` came to fit as variances with `ferx check` reporting the file VALID.
+
 ## Theta (Fixed Effects)
 
 ```
@@ -225,11 +227,13 @@ omega ETA_V  ~ 0.141 (sd)    # ≡ ~ 0.0200
 omega ETA_KA ~ 0.632 (sd)    # ≡ ~ 0.400
 ```
 
+#### Choosing the scale: variance or SD
+
 Each variance represents the between-subject variability for that parameter. The coefficient of variation (CV%) is approximately `sqrt(variance) * 100` for log-normally distributed parameters. For example, `omega ETA_CL ~ 0.09` corresponds to ~30% CV.
 
 The `(sd)` form is convenient when you're setting initial values from expected CV%, e.g. "I expect ~25% CV on CL" → `omega ETA_CL ~ 0.25 (sd)`. The fit result records which form you used so that downstream printers can annotate the estimate with `[initial specified as SD]`.
 
-Block omega (`block_omega (...) = [...]`) is variance-only — `(sd)` is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.
+Block omega (`block_omega (...) = [...]`) is variance-only, and a scale tag on one is **rejected** with `E_BLOCK_VARIANCE_ONLY`: the lower-triangle list mixes variances and covariances, so a single tag cannot say which entry is on which scale. Square each SD into a variance and write the off-diagonals as covariances.
 
 ::: {.callout-important}
 #### A free `omega NAME ~ 0.0` is rejected — write `FIX`
@@ -458,7 +462,7 @@ kappa NAME ~ value FIX
 kappa NAME ~ value weight = W   # kappa ~ N(0, value / W) — sample-size-weighted IOV
 ```
 
-Each `kappa` line adds one diagonal element to the IOV omega matrix. Occasions are independent. The `(sd)` annotation is accepted with the same semantics as for `omega`. `block_kappa` is variance-only.
+Each `kappa` line adds one diagonal element to the IOV omega matrix. Occasions are independent. The `(sd)` annotation is accepted with the same semantics as for `omega`. `block_kappa` is variance-only, and rejects a scale tag with `E_BLOCK_VARIANCE_ONLY` exactly as `block_omega` does.
 
 The optional `weight = <expr>` modifier declares a **sample-size-weighted** kappa, `κ ~ N(0, value / W)` — the between-treatment-arm variability of a longitudinal MBMA, which scales with the number of subjects in the arm. See [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
 

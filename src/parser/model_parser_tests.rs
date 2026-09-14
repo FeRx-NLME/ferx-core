@@ -6914,21 +6914,242 @@ fn test_sd_annotation_case_insensitive() {
 }
 
 #[test]
-fn test_unknown_scale_tag_is_ignored_as_trailing_garbage() {
-    // The omega regex is intentionally unanchored — it matches the
-    // leading `omega NAME ~ value` and lets trailing tokens fall through.
-    // An unrecognized tag like `(foo)` therefore doesn't fail the parse;
-    // the value is taken as variance and `init_as_sd` stays `false`, just
-    // as if the tag weren't there. (This matches how the `FIX` keyword's
-    // prefix-match check works — only the exact, recognized tag changes
-    // behavior; anything else is silently ignored, consistent with the
-    // parser's existing FIXED-vs-FIX handling.)
+fn test_unknown_scale_tag_is_rejected() {
+    // #1377 **inverted** this test. It was
+    // `test_unknown_scale_tag_is_ignored_as_trailing_garbage`, and it pinned the
+    // behaviour the issue is about: the omega regex was an unanchored prefix
+    // match, so `(foo)` sat past the end of a successful match and was dropped —
+    // a misspelt `(sd)` silently becoming "no tag at all", the value read as a
+    // variance with `init_as_sd = false` and the file reporting VALID.
+    //
+    // The regex is now pinned with `\s*$`, so a tag the grammar does not know
+    // is a rejected line rather than an ignored token.
     let lines = vec!["omega ETA_CL ~ 0.07 (foo)".to_string()];
-    let (_, omegas, _, _, _, _, _, _, _, _, _) =
-        parse_parameters(&lines, &Default::default()).unwrap();
-    assert_eq!(omegas.len(), 1);
-    assert!((omegas[0].variance - 0.07).abs() < 1e-12);
-    assert!(!omegas[0].init_as_sd);
+    // `.err().expect(..)`, not `expect_err`: the Ok half is an 11-tuple of spec
+    // vectors that does not implement `Debug`.
+    let err = parse_parameters(&lines, &Default::default())
+        .err()
+        .expect("a misspelt scale tag must not be silently ignored");
+    assert!(
+        err.contains("unrecognized line") && err.contains("omega ETA_CL ~ 0.07 (foo)"),
+        "the message must quote the offending line so the repair is one edit: {err}"
+    );
+    // The block-specific code is for `block_*` declarations only — a diagonal
+    // omega with a bad tag is a plain unrecognized line.
+    assert!(
+        !err.contains("is variance-only"),
+        "a diagonal omega must not claim E_BLOCK_VARIANCE_ONLY: {err}"
+    );
+}
+
+// -- #1377: a `[parameters]` line is consumed whole, or it is an error -------
+//
+// Before #1377 every declaration regex was an unanchored prefix match and the
+// `if let / else if` chain had no `else`, so anything the grammar did not cover
+// was dropped without a trace: `(sd)` on a block was read as three variances and
+// `ferx check` called the file VALID. The four tests below pin the reject from
+// both sides -- what must now fail, and what must still pass.
+
+/// Every `block_*` form x every scale tag x every `FIX` placement is rejected,
+/// carrying the sentinel `parse_error_to_diagnostic` lifts to
+/// `E_BLOCK_VARIANCE_ONLY`.
+///
+/// Reddens if the `\s*$` anchor is dropped from any one block regex (that
+/// form's nine rows go `Ok`), or if the classify branch of the `else` arm is
+/// removed (the rows still error, but with the generic message and no sentinel).
+#[test]
+fn block_scale_tag_is_rejected_on_every_block_form() {
+    let forms = [
+        (
+            "block_omega",
+            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+        ),
+        (
+            "block_sigma",
+            "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]",
+        ),
+        (
+            "block_kappa",
+            "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]",
+        ),
+    ];
+    let mut rows = 0;
+    for (kw, body) in forms {
+        for tag in ["(sd)", "(variance)", "(var)"] {
+            for line in [
+                format!("{body} {tag}"),
+                format!("{body} FIX {tag}"),
+                format!("{body} {tag} FIX"),
+            ] {
+                rows += 1;
+                let err = parse_parameters(&[line.clone()], &Default::default())
+                    .err()
+                    .unwrap_or_else(|| panic!("`{line}` must be rejected, not silently dropped"));
+                assert!(
+                    err.contains("is variance-only"),
+                    "`{line}` must carry the E_BLOCK_VARIANCE_ONLY sentinel: {err}"
+                );
+                assert!(err.contains(kw), "`{line}` must name `{kw}`: {err}");
+            }
+        }
+    }
+    assert_eq!(
+        rows, 27,
+        "the table must stay 3 block forms x 3 tags x 3 FIX placements"
+    );
+}
+
+/// Trailing text is rejected on all seven declaration forms.
+///
+/// Reddens one row at a time: removing `\s*$` from a single regex sends exactly
+/// that form back to `Ok`, and the assertion message names which.
+#[test]
+fn trailing_text_is_rejected_on_every_parameters_form() {
+    let forms = [
+        ("theta", "theta TVCL(0.13, 0.01, 1.0)"),
+        ("omega", "omega ETA_CL ~ 0.09"),
+        ("sigma", "sigma PROP_ERR ~ 0.04"),
+        ("kappa", "kappa KAPPA_CL ~ 0.04"),
+        (
+            "block_omega",
+            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+        ),
+        (
+            "block_sigma",
+            "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]",
+        ),
+        (
+            "block_kappa",
+            "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]",
+        ),
+    ];
+    for (form, body) in forms {
+        let line = format!("{body} banana");
+        let err = parse_parameters(&[line.clone()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("trailing text on a `{form}` declaration must be rejected"));
+        assert!(
+            err.contains("unrecognized line") && err.contains(&line),
+            "`{form}`: the message must quote the offending line: {err}"
+        );
+    }
+    // Two shapes from the issue that read as a scale tag but are not one. A
+    // misspelt tag used to mean "no tag", i.e. the value silently became a
+    // variance; text after a good tag used to be dropped outright.
+    for line in [
+        "omega ETA_CL ~ 0.09 (sdx)",
+        "sigma PROP_ERR ~ 0.04 (sd) banana",
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected"));
+        assert!(err.contains("unrecognized line"), "`{line}`: {err}");
+    }
+}
+
+/// A line matching no declaration form at all, in both spellings the old chain
+/// dropped: a lone word, and a scale tag written on its own line.
+///
+/// Reddens if the `else` arm is deleted (both go `Ok`), and the second case
+/// reddens on its own if the `join_bracketed_lines` fold is reverted to
+/// `FIX`-only -- the tag then arrives as an anonymous line and reads as the
+/// generic message instead of the block-specific one.
+#[test]
+fn unrecognized_parameters_line_is_rejected() {
+    let err = parse_parameters(&["banana".to_string()], &Default::default())
+        .err()
+        .expect("a lone `banana` line must not be dropped");
+    assert!(
+        err.contains("unrecognized line") && err.contains("banana"),
+        "{err}"
+    );
+
+    let lines = vec![
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]".to_string(),
+        "(sd)".to_string(),
+    ];
+    let err = parse_parameters(&lines, &Default::default())
+        .err()
+        .expect("a scale tag on its own line must not be dropped");
+    assert!(
+        err.contains("is variance-only") && err.contains("block_omega"),
+        "an own-line tag must still read as a tag on the block it follows: {err}"
+    );
+}
+
+/// The positive control for the anchoring: every tail the docs promise still
+/// parses, and still parses to the same numbers.
+///
+/// Reddens on an over-tight anchor -- a bare `$` instead of `\s*$`, or a regex
+/// that loses its trailing-`FIX` group while gaining the anchor.
+#[test]
+fn anchored_forms_still_accept_every_documented_tail() {
+    for (line, want_variance, want_sd, want_fix) in [
+        ("omega E ~ 0.09", 0.09, false, false),
+        ("omega E ~ 0.09 FIX (variance)", 0.09, false, true),
+        ("omega E ~ 0.09 (sd) FIX", 0.0081, true, true),
+        ("omega E ~ 0.09 FIX (sd)", 0.0081, true, true),
+        // No space between value and tag: why the tag group uses `\s*` while
+        // the leading FIX group uses `\s+`.
+        ("omega E ~ 0.09(sd)", 0.0081, true, false),
+    ] {
+        let (_, omegas, _, _, _, _, _, _, _, _, _) =
+            parse_parameters(&[line.to_string()], &Default::default())
+                .unwrap_or_else(|e| panic!("`{line}` must still parse: {e}"));
+        assert_eq!(omegas.len(), 1, "`{line}`");
+        assert!(
+            (omegas[0].variance - want_variance).abs() < 1e-12,
+            "`{line}`: variance {} != {want_variance}",
+            omegas[0].variance
+        );
+        assert_eq!(omegas[0].init_as_sd, want_sd, "`{line}`");
+        assert_eq!(omegas[0].fixed, want_fix, "`{line}`");
+    }
+
+    // `sigma (sd)` stores the SD verbatim (the default path takes `sqrt`).
+    let (_, _, _, sigmas, _, _, _, _, _, _, _) =
+        parse_parameters(&["sigma S ~ 0.01 (sd)".to_string()], &Default::default()).unwrap();
+    assert!((sigmas[0].value - 0.01).abs() < 1e-12);
+    assert!(sigmas[0].init_as_sd);
+
+    // #1031: `weight =` is peeled before the match, so the anchor never sees it.
+    let (_, _, _, _, _, _, kappas, _, _, _, _) = parse_parameters(
+        &["kappa K ~ 0.1 weight = NARM".to_string()],
+        &Default::default(),
+    )
+    .expect("a weighted kappa must still parse");
+    assert_eq!(kappas.diagonal.len(), 1);
+    assert!(
+        kappas.weights.len() == 1
+            && kappas.weights[0]
+                .as_deref()
+                .is_some_and(|w| w.contains("NARM")),
+        "the peeled weight must survive the anchoring: {:?}",
+        kappas.weights
+    );
+
+    // #254: so is `prior(...)`, and it must still find its home.
+    let (thetas, _, _, _, _, _, _, _, _, _, priors) = parse_parameters(
+        &["theta T(1.0, 0.0, 2.0) prior(1.0, sd = 0.1)".to_string()],
+        &Default::default(),
+    )
+    .expect("a priored theta must still parse");
+    assert_eq!(thetas.len(), 1);
+    assert_eq!(priors.len(), 1, "the peeled prior must still find its home");
+
+    // A multi-line block whose `FIX` sits on its own line after the `]` -- the
+    // fold the scale-tag fold was grafted onto.
+    let lines = vec![
+        "block_omega (ETA_CL, ETA_V) = [".to_string(),
+        "0.09,".to_string(),
+        "0.02, 0.04".to_string(),
+        "]".to_string(),
+        "FIX".to_string(),
+    ];
+    let (_, _, blocks, _, _, _, _, _, _, _, _) =
+        parse_parameters(&lines, &Default::default()).expect("a multi-line block must still parse");
+    assert_eq!(blocks.len(), 1);
+    assert!(blocks[0].fixed, "the own-line `FIX` fold must still apply");
 }
 
 #[test]
@@ -6972,21 +7193,28 @@ fn test_parse_full_model_threads_init_as_sd_to_compiled_model() {
 
 #[test]
 fn test_fix_keyword_rejects_prefix_match() {
-    // `FIXED` must not be silently accepted as `FIX`. Any non-exact token
-    // should leave the parameter as free (or fail to parse the line),
-    // never flip `fixed = true`.
-    let lines = vec![
-        "omega ETA_CL ~ 0.09 FIXED".to_string(),
-        "sigma PROP ~ 0.02 FIXED".to_string(),
-        "block_omega (A, B) = [1.0, 0.0, 1.0] FIXED".to_string(),
-    ];
-    let (_, omegas, blocks, sigmas, _, _, _, _, _, _, _) =
-        parse_parameters(&lines, &Default::default()).unwrap();
-    // omega/sigma still parse (trailing `FIXED` is ignored) but must NOT
-    // be marked fixed.
-    assert!(!omegas[0].fixed);
-    assert!(!sigmas[0].fixed);
-    assert!(!blocks[0].fixed);
+    // `FIXED` must not be silently accepted as `FIX`. The invariant is unchanged
+    // by #1377; the mechanism is. Before, the unanchored regexes let the token
+    // fall past the match and the parameter stayed free — which is why this
+    // test's original comment already allowed the alternative, "or fail to parse
+    // the line". Pinning the regexes with `\s*$` is that alternative: `\b` after
+    // `FIX` still refuses the prefix match, and the leftover `ED` now fails the
+    // end-of-line anchor instead of being dropped.
+    //
+    // Either way, a non-exact token never flips `fixed = true`.
+    for line in [
+        "omega ETA_CL ~ 0.09 FIXED",
+        "sigma PROP ~ 0.02 FIXED",
+        "block_omega (A, B) = [1.0, 0.0, 1.0] FIXED",
+    ] {
+        let err = parse_parameters(&[line.to_string()], &Default::default())
+            .err()
+            .expect("`FIXED` must not be read as `FIX`");
+        assert!(
+            err.contains("unrecognized line") && err.contains(line),
+            "`{line}` must be rejected and quoted: {err}"
+        );
+    }
 }
 
 #[test]

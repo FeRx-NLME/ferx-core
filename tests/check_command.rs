@@ -315,6 +315,99 @@ fn single_endpoint_sigma_order_mismatch_is_reported_as_its_own_code() {
     let _ = std::fs::remove_file(&model);
 }
 
+/// #1377. `(sd)` on a block used to be dropped in silence: the file validated
+/// clean, every entry was read as a variance, and an SD of 0.2646 fitted as a
+/// variance -- a 3.8x error in the initial estimate with nothing to notice.
+///
+/// Its own code rather than `E_PARSE` because the repair is mechanical (square
+/// each diagonal entry), and -- like #993 and #1001 -- the mapping keys off a
+/// prose substring, so without this test a reworded message silently downgrades
+/// every case to `E_PARSE`.
+#[test]
+fn block_sd_tag_is_reported_as_its_own_code() {
+    // Derived from the bundled example by appending the tag and changing nothing
+    // else, so this test is literally the issue's reproducer.
+    let base = std::fs::read_to_string("examples/warfarin_block_omega.ferx")
+        .expect("read the bundled block-omega example");
+    let untagged = "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]";
+    assert!(
+        base.contains(untagged),
+        "the example's block line moved; update this test"
+    );
+    let model = temp_model(
+        "block_sd_tag",
+        &base.replace(untagged, &format!("{untagged} (sd)")),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    // Assert the count before indexing, so a regression that reports nothing
+    // fails here rather than with an opaque index-out-of-bounds panic.
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY");
+    // The message already opens with the block, so attaching one too would print
+    // it twice -- the renderer prefixes whatever `block` it is given.
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[parameters]") && d.message.contains("block_omega"),
+        "{}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+
+    // The control the widening rests on: the untouched example is still valid.
+    let report = validate_model_file("examples/warfarin_block_omega.ferx", None);
+    assert!(
+        report.valid,
+        "the untagged example must stay valid: {:?}",
+        report.diagnostics
+    );
+}
+
+/// #1377. Trailing text on *any* `[parameters]` line is an error now; before
+/// 0.4.0 it was ignored. Only the block scale tag earns a dedicated code -- the
+/// rest stay `E_PARSE`, because there is no mechanical repair to offer for
+/// arbitrary trailing text beyond deleting it.
+#[test]
+fn trailing_text_in_parameters_is_e_parse() {
+    let base = std::fs::read_to_string("examples/warfarin_block_omega.ferx")
+        .expect("read the bundled block-omega example");
+    let clean = "omega ETA_KA ~ 0.30";
+    assert!(
+        base.contains(clean),
+        "the example's diagonal omega line moved; update this test"
+    );
+    let model = temp_model(
+        "trailing_text",
+        &base.replace(clean, &format!("{clean} banana")),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "trailing text must not validate clean: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_PARSE");
+    assert!(
+        d.message.contains("unrecognized line") && d.message.contains("omega ETA_KA ~ 0.30 banana"),
+        "the message must quote the offending line so the repair is one edit: {}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
 #[test]
 fn no_data_means_no_covariate_check() {
     // Same model, but without --data the covariate check does not run, so the
