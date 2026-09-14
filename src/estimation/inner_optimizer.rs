@@ -487,6 +487,48 @@ pub struct InnerLoopStats {
     pub n_start_rejected: usize,
 }
 
+/// The non-IOV inner-EBE cold seed: η = 0, except that every FREM covariate
+/// pseudo-observation eta starts at its data-implied mode `cov_obs − TV`.
+///
+/// Those etas are pinned by their pseudo-observations (precision ≫ prior), so the
+/// shift is essentially their exact posterior mode. Starting them at 0 instead
+/// leaves them ~±40 off, and the block-Ω⁻¹ PK↔covariate coupling turns that error
+/// into a large spurious force on the PK etas — which is what sent a handful of
+/// subjects' PK etas running away (V≈e⁻⁹, MAT≈e¹¹) and produced modes with obs-NLL
+/// ~1e7–1e8 that wrecked the IMP proposal (issue #406).
+///
+/// It is a *function* rather than an inline block at the one cold start because the
+/// Nelder–Mead fallback needs the same seed (#1349): NM's initial simplex step is
+/// `0.05·|ηᵢ|`, or `0.00025` at `ηᵢ = 0`, so a restart from a plain zero vector
+/// cannot travel the ±40 a FREM covariate eta needs — it returns a point whose
+/// covariate etas are still at zero and whose PK etas have absorbed the resulting
+/// force. Returns plain zeros for a non-FREM model, so every non-FREM caller is
+/// bit-identical.
+fn cold_eta_seed(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    n_eta: usize,
+) -> Vec<f64> {
+    let mut eta = vec![0.0; n_eta];
+    if let Some(fc) = model.frem_config.as_ref() {
+        for (j, &ft) in subject.fremtype.iter().enumerate() {
+            if ft == 0 {
+                continue;
+            }
+            if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                if eta_idx < n_eta
+                    && theta_idx < params.theta.len()
+                    && j < subject.observations.len()
+                {
+                    eta[eta_idx] = subject.observations[j] - params.theta[theta_idx];
+                }
+            }
+        }
+    }
+    eta
+}
+
 /// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
 /// BFGS reports non-convergence. Keeps the lower-objective of the BFGS partial and a single
 /// Nelder–Mead restart, so a `false`-on-a-converged search (gradient-noise floor / line-
@@ -855,35 +897,10 @@ fn find_ebe_impl(
     let _ = mu_k;
     let mut eta: Vec<f64> = match eta_init {
         Some(warm) => warm.to_vec(),
-        None => vec![0.0; n_eta],
+        // The cold seed is FREM-aware; see [`cold_eta_seed`]. A warm start already
+        // carries good covariate etas.
+        None => cold_eta_seed(model, subject, params, n_eta),
     };
-
-    // FREM-aware cold-start: initialise each covariate pseudo-obs eta at its
-    // data-implied mode `cov_obs − TV`. These etas are pinned by their
-    // pseudo-observations (precision ≫ prior), so this is essentially their
-    // exact posterior mode. Starting them at 0 instead leaves them ~±40 off,
-    // and the block-Ω⁻¹ PK↔covariate coupling turns that error into a large
-    // spurious force on the PK etas — which is what sent a handful of subjects'
-    // PK etas running away (V≈e⁻⁹, MAT≈e¹¹) and produced modes with obs-NLL
-    // ~1e7–1e8 that wrecked the IMP proposal (issue #406). Only on a cold start;
-    // a warm start already carries good covariate etas.
-    if eta_init.is_none() {
-        if let Some(fc) = model.frem_config.as_ref() {
-            for (j, &ft) in subject.fremtype.iter().enumerate() {
-                if ft == 0 {
-                    continue;
-                }
-                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
-                    if eta_idx < n_eta
-                        && theta_idx < params.theta.len()
-                        && j < subject.observations.len()
-                    {
-                        eta[eta_idx] = subject.observations[j] - params.theta[theta_idx];
-                    }
-                }
-            }
-        }
-    }
 
     // Diagonal preconditioner for the inner BFGS. FREM posteriors are extremely
     // multi-scale: PK etas have curvature ~1e2 and scale ~0.1, covariate
@@ -1063,7 +1080,7 @@ fn find_ebe_impl(
     let bfgs_converged = result;
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
-        let cold = vec![0.0; n_eta];
+        let cold = cold_eta_seed(model, subject, params, n_eta);
         if enable_stall {
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
             eta = best;
@@ -1071,8 +1088,11 @@ fn find_ebe_impl(
         } else if model.frem_config.is_some() {
             // FREM: the BFGS partial can be a *non-stationary*, merely-low-objective point (run
             // out along a covariate pseudo-obs flat direction) that would mis-center the
-            // FREM/IMP proposal. Re-center with NM from η=0 and take it unconditionally — the
-            // prior-release behaviour for the exact path.
+            // FREM/IMP proposal, so the restart is what re-centers it. The restart itself now
+            // starts from the FREM-aware `cold` seed rather than a plain zero vector (#1349) —
+            // NM cannot travel the ±40 a covariate eta needs from η=0, so the "re-centred"
+            // point it returned had its covariate etas still at zero and its PK etas carrying
+            // the resulting block-Ω⁻¹ force.
             let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
             eta = if warm { partial } else { cold };
             let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);

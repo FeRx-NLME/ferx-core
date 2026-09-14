@@ -621,8 +621,11 @@ fn frem_iiv_on_ruv_saem_stays_bounded() {
 ///   after fix:   OFV =  211.0      (ω_WT = 118.67, ω_AGE = 104.27)
 /// ```
 ///
-/// This PR does not touch the objective, only the gradients — so the entire OFV gap is the
-/// fit landing somewhere else. That is what the `ofv < 1000.0` bound below pins.
+/// That PR did not touch the objective, only the gradients — so the entire OFV gap was the
+/// fit landing somewhere else. That is what the bound below pins, and the numbers in it have
+/// moved twice since: the `211.0` above is the value as of #251, and the fixture now lands
+/// at −174.91 (macOS) / −220.71 (Linux) after #833 stopped the reported OFV being read off
+/// a cold EBE restart. The bound's own comment carries the current measurements.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -650,16 +653,30 @@ fn frem_covariate_omega_matches_sample_variance_under_focei() {
     );
     assert!(fit_result.ofv.is_finite(), "OFV should be finite");
 
-    // THE regression assertion. With the analytic gradients corrected the fit converges to
-    // OFV ≈ 211; with the PK jet / PK variance on the pseudo-obs rows it settles at ≈ 4901,
-    // because the inner loop drives the EBEs to the mode of a likelihood that is not the one
-    // being minimised. The bound sits far from both, so it discriminates without being
-    // brittle. (The covariate-ω assertions below pass either way — see the doc comment.)
+    // THE regression assertion, and the bound is measured rather than picked. Three
+    // failure modes have come through this fixture, each with its own signature:
+    //
+    //   ≈ 4901  the analytic gradient differentiating the PK likelihood on the covariate
+    //           pseudo-observation rows while the objective scores them against
+    //           `theta[i] + eta[j]` with EPSCOV (#251, fixed);
+    //   3345.8  the final inner loop's *cold* EBE restart on glibc — the fit itself was
+    //           fine (ω identical to the macOS run to every printed digit), only the
+    //           readout was not (#833 / #1349, fixed);
+    //    278.4  an earlier landing point that passed the old `< 1000` bound.
+    //
+    // Measured at the fix (2026-09-13): macOS/arm64 −174.91, linux/arm64 −220.71 — the
+    // Linux arm now agrees with what SAEM and IMPMAP reach on this model (−220.7, see
+    // docs/estimation/frem.qmd). The two platforms land in different basins, so the bound
+    // cannot be a tight pin; −100 sits ~75 units below the better-behaved platform and
+    // rejects every one of the three failures above, including the 278.4 the old bound let
+    // through. (The covariate-ω assertions below pass either way — see the doc comment.)
     assert!(
-        fit_result.ofv < 1000.0,
-        "FOCEI FREM OFV = {:.1}; expected ≈ 211. A value near 4900 means the analytic \
-         gradient is differentiating the PK likelihood on covariate pseudo-observation rows \
-         while the objective scores them against theta[i] + eta[j] with EPSCOV.",
+        fit_result.ofv < -100.0,
+        "FOCEI FREM OFV = {:.1}; expected ≈ −175 (macOS) / −221 (Linux). A value near 4900 \
+         means the analytic gradient is differentiating the PK likelihood on covariate \
+         pseudo-observation rows while the objective scores them against theta[i] + eta[j] \
+         with EPSCOV; a value in the thousands with the covariate omegas still ≈ right means \
+         the reported EBEs are a cold-restart artifact (#833).",
         fit_result.ofv
     );
 

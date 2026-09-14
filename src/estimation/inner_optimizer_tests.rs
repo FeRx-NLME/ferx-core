@@ -1499,8 +1499,18 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
     assert_eq!(n_start_rejected, 1);
 }
 
-#[test]
-fn test_frem_jacobian_overrides_fd_with_exact_values() {
+/// A minimal FREM model + subject: 3 etas (CL, V, COV_WT), and a subject with two PK
+/// observations plus one covariate pseudo-observation (`FREMTYPE = 100`, value 90,
+/// mapping to `theta[2]` = `TV_WT` and `eta[2]` = `ETA_WT_FREM`).
+///
+/// `default_params.theta[2]` is 90, i.e. the same value as the pseudo-observation, so a
+/// caller testing anything that reads `cov_obs − TV` must move one of the two first —
+/// at the default they are equal and a wrong answer is indistinguishable from a right one.
+///
+/// Shared by the Jacobian-override test and the cold-seed tests so the FREM shape is
+/// declared once: a `CompiledModel` literal is ~50 fields wide and a second copy would
+/// have to be edited on every field addition.
+fn frem_model_and_subject() -> (CompiledModel, Subject) {
     use crate::types::{
         DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
     };
@@ -1630,6 +1640,13 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         obs_records: vec![],
     };
 
+    (model, subject)
+}
+
+#[test]
+fn test_frem_jacobian_overrides_fd_with_exact_values() {
+    let (model, subject) = frem_model_and_subject();
+
     let theta = [10.0, 100.0, 90.0];
     let eta = [0.1, -0.05, 2.5];
 
@@ -1646,6 +1663,86 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         jac[(0, 0)].abs() > 1e-10,
         "PK row: ∂Y/∂η_CL should be nonzero"
     );
+}
+
+// ── FREM-aware cold seed (#406 / #1349) ────────────────────────────
+
+/// The cold seed places each FREM covariate eta at its data-implied mode `cov_obs − TV`
+/// and leaves every other eta at zero.
+#[test]
+fn cold_seed_places_frem_covariate_etas_at_their_data_implied_mode() {
+    let (model, subject) = frem_model_and_subject();
+    let mut params = model.default_params.clone();
+    // The fixture ships `TV_WT` equal to the pseudo-observation, where the seed is 0 and
+    // indistinguishable from the plain zero vector this test exists to reject. Move it.
+    params.theta[2] = 72.0;
+
+    let seed = cold_eta_seed(&model, &subject, &params, 3);
+
+    // Non-degeneracy first: the quantity under test must not be zero, or the assertion
+    // below passes against the very behaviour it is meant to catch.
+    assert_eq!(subject.observations[2], 90.0);
+    assert!(
+        seed[2].abs() > 1.0,
+        "the seeded value must be far from 0, or this test passes under the \
+         pre-#1349 plain zero vector"
+    );
+    assert!(
+        (seed[2] - 18.0).abs() < 1e-12,
+        "covariate eta seeded at cov_obs − TV = 90 − 72 = 18, got {}",
+        seed[2]
+    );
+    // PK etas carry no pseudo-observation and stay at 0.
+    assert_eq!(seed[0], 0.0);
+    assert_eq!(seed[1], 0.0);
+}
+
+/// #1349 — the *fallback* has to use the same seed, not a plain zero vector.
+///
+/// This is the call site the fix is about: when the inner BFGS does not certify
+/// convergence, the FREM arm re-centres with a Nelder–Mead restart, and that restart used
+/// to start at η = 0. NM's initial simplex step at zero is 0.00025 per coordinate, so it
+/// cannot travel the 18 units this subject's covariate eta needs — it returned a point
+/// with the covariate eta still at ~0 and the PK etas carrying the block-Ω⁻¹ force that
+/// produces.
+///
+/// `max_iter = 1` is what forces the fallback: one BFGS iteration cannot reach a gradient
+/// norm below `tol`, so `bfgs_converged` is false and the restart runs. The assertion is
+/// on the covariate eta, which is the coordinate the two seeds disagree about.
+#[test]
+fn the_frem_nelder_mead_fallback_restarts_from_the_data_implied_seed() {
+    let (model, subject) = frem_model_and_subject();
+    let mut params = model.default_params.clone();
+    params.theta[2] = 72.0; // pseudo-obs is 90 → the covariate eta's mode is 18
+
+    let result = find_ebe(&model, &subject, &params, 1, 1e-12, None, None, 0);
+
+    // Precondition: the fallback must actually have run, or this test is an assertion
+    // about the ordinary BFGS path and the seed it exercises is the cold-start one.
+    assert!(
+        result.used_fallback,
+        "max_iter = 1 must leave the inner BFGS uncertified so the NM restart runs"
+    );
+    assert!(
+        (result.eta[2] - 18.0).abs() < 1.0,
+        "covariate eta should stay at its data-implied mode 18, got {} — a restart from \
+         a plain zero vector cannot travel there (#1349)",
+        result.eta[2]
+    );
+}
+
+/// A model with no `[frem]` config gets the plain zero vector, so every non-FREM caller
+/// (the cold start *and* the Nelder–Mead fallback seed) is bit-identical to the
+/// pre-#1349 `vec![0.0; n_eta]`.
+#[test]
+fn cold_seed_is_all_zeros_without_frem() {
+    let (mut model, subject) = frem_model_and_subject();
+    model.frem_config = None;
+    let params = model.default_params.clone();
+
+    let seed = cold_eta_seed(&model, &subject, &params, 3);
+
+    assert_eq!(seed, vec![0.0, 0.0, 0.0]);
 }
 
 #[test]

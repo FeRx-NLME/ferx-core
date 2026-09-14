@@ -133,6 +133,27 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **The reported OFV is no longer worse than the objective the optimizer actually reached.**
+  After the outer loop restored its best-seen point, the final inner loop re-derived the
+  empirical Bayes estimates from a **cold** start, while every evaluation during the fit had
+  warm-started them. On a multimodal individual objective the cold restart settles at a
+  different η̂, so the reported `ofv` — and the AIC/BIC and covariance step built on it — came
+  out *above* the value that made the point best-seen: +3.5 OFV on a fluconazole 2-cpt binding
+  model, +6.96 on the FREM warfarin fixture. The final inner loop now also re-solves from the
+  EBEs the optimizer minimised against and reports whichever set scores lower, and a new
+  `ebe_start_dependent` warning names the gap when a cold re-solve lands materially worse, since
+  that gap is a real statement about the model's EBE surface. The convergence
+  self-consistency check that compares a cold restart against the best-seen objective still
+  reads the cold number, so it keeps rejecting warm-start-only "optima"
+  ([#833](https://github.com/FeRx-NLME/ferx-core/issues/833),
+  [#1349](https://github.com/FeRx-NLME/ferx-core/issues/1349)).
+- **A FREM inner-loop restart no longer resets the covariate etas to zero.** When the inner BFGS
+  did not certify convergence, the Nelder–Mead restart that re-centres a FREM subject started
+  from a plain η = 0 vector — but a FREM covariate eta sits at `covariate − typical value`, tens
+  of units from zero, and Nelder–Mead's initial simplex step at zero is 0.00025, so the restart
+  could not travel there. It now starts from the same data-implied seed the cold start uses
+  (`cov_obs − TV`), which is essentially that eta's exact posterior mode. Non-FREM models are
+  bit-identical ([#1349](https://github.com/FeRx-NLME/ferx-core/issues/1349)).
 - `method = gn_hybrid` no longer reports a `final_gradient` belonging to the **Gauss-Newton phase** when the FOCEI polish is the result being reported. Whenever the accepted polish had no gradient of its own — reachable with a derivative-free `optimizer` such as the `auto` default on ODE/PD models, or the built-in BFGS — the merge kept the GN phase's vector, so `fit$final_gradient` described the *pre-polish* point while every estimate beside it came from after the polish. It is now the polish's gradient or nothing ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997) review).
 - **A fit whose objective is not a usable number is no longer reported as converged.**
   `fit()` could return `converged: true` alongside `ofv: NaN` — measured on a population
