@@ -7092,6 +7092,17 @@ fn anchored_forms_still_accept_every_documented_tail() {
         // No space between value and tag: why the tag group uses `\s*` while
         // the leading FIX group uses `\s+`.
         ("omega E ~ 0.09(sd)", 0.0081, true, false),
+        // Trailing whitespace is not trailing *text*, and this is the row that
+        // makes the `\s*` in every anchor load-bearing. `parse_parameters` is
+        // reached today only through `extract_blocks`, which trims, and through
+        // the `prior(...)` / `weight =` peels, which trim their head too -- so
+        // without this row the anchor could be a bare `$` and no test would
+        // notice. That is a property of today's callers, not of this function:
+        // a caller that stops trimming would turn a valid declaration into
+        // `unrecognized line`, which is precisely the false reject #1377 exists
+        // to avoid. Pin the contract here rather than rely on the callers.
+        ("omega E ~ 0.09 (sd)   ", 0.0081, true, false),
+        ("omega E ~ 0.09\t", 0.09, false, false),
     ] {
         let (_, omegas, _, _, _, _, _, _, _, _, _) =
             parse_parameters(&[line.to_string()], &Default::default())
@@ -7150,6 +7161,31 @@ fn anchored_forms_still_accept_every_documented_tail() {
         parse_parameters(&lines, &Default::default()).expect("a multi-line block must still parse");
     assert_eq!(blocks.len(), 1);
     assert!(blocks[0].fixed, "the own-line `FIX` fold must still apply");
+
+    // ...and the same guarantee on every one of the seven forms, so the `\s*`
+    // in each anchor is pinned individually rather than by shape.
+    for (form, line) in [
+        ("theta", "theta TVCL(0.13, 0.01, 1.0) FIX  "),
+        ("omega", "omega ETA_CL ~ 0.09 (sd)  "),
+        ("sigma", "sigma PROP_ERR ~ 0.04 FIX \t"),
+        ("kappa", "kappa KAPPA_CL ~ 0.04 (var)  "),
+        (
+            "block_omega",
+            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04] FIX  ",
+        ),
+        (
+            "block_sigma",
+            "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]  ",
+        ),
+        (
+            "block_kappa",
+            "block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04] \t",
+        ),
+    ] {
+        parse_parameters(&[line.to_string()], &Default::default()).unwrap_or_else(|e| {
+            panic!("trailing whitespace must not make a `{form}` declaration unrecognized: {e}")
+        });
+    }
 }
 
 #[test]
