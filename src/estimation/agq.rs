@@ -91,13 +91,35 @@ use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Su
 /// NLME integrand.
 pub const MAX_AGQ_NODES: usize = 21;
 
-static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
+static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
     [const { OnceLock::new() }; MAX_AGQ_NODES];
 
-fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64]) {
+fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64], &'static [f64]) {
     assert!((1..=MAX_AGQ_NODES).contains(&n));
-    let (nodes, weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| gauss_hermite(n));
-    (nodes, weights)
+    let (nodes, weights, log_weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| {
+        let (nodes, weights) = gauss_hermite(n);
+        let log_weights = weights.iter().map(|w| w.ln()).collect();
+        (nodes, weights, log_weights)
+    });
+    (nodes, weights, log_weights)
+}
+
+fn cached_log_weights_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_AGQ_LOG_WEIGHT_CACHE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
+fn laplace_one_point_fast_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_ONE_POINT_FAST")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
 }
 
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
@@ -292,7 +314,8 @@ static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
 /// to the gradient requested by the same optimizer callback.
 struct PreparedGrid {
     h: DMatrix<f64>,
-    bs: Vec<Vec<f64>>,
+    /// Row-major quadrature modes (`n_grid × d`) in one allocation.
+    bs: Vec<f64>,
     softmax: Vec<f64>,
     base_jet: Option<SubjectSens>,
 }
@@ -805,6 +828,20 @@ fn agq_subject_evaluate(
         return (NLL_SENTINEL, None);
     };
 
+    // One-point AGQ is Laplace exactly.  Avoid constructing the one-element tensor
+    // grid and its coordinate/work vectors on objective-only evaluations: at z=0
+    // the transformed node is b_hat, while the sqrt(PI) rule weight cancels the
+    // d/2*log(PI) normalization term algebraically.
+    if nodes.len() == 1 && !retain_gradient_work && laplace_one_point_fast_enabled() {
+        let mode_nll = stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule);
+        let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
+        return if nll.is_finite() {
+            (nll, None)
+        } else {
+            (NLL_SENTINEL, None)
+        };
+    }
+
     let (bs, terms) = agq_nodes_and_terms(
         model,
         subject,
@@ -854,12 +891,12 @@ fn agq_nodes_and_terms(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     retain_nodes: bool,
-) -> (Vec<Vec<f64>>, Vec<f64>) {
+) -> (Vec<f64>, Vec<f64>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
     let mut bs = if retain_nodes {
-        Vec::with_capacity(cap)
+        Vec::with_capacity(cap * d)
     } else {
         Vec::new()
     };
@@ -910,7 +947,7 @@ fn agq_nodes_and_terms(
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
         if retain_nodes {
-            bs.push(b.clone());
+            bs.extend_from_slice(&b);
         }
 
         // Mixed-radix increment over the d-dimensional tensor grid.
@@ -1126,8 +1163,14 @@ fn agq_population_nll_impl(
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
 ) -> f64 {
-    let (nodes, weights) = cached_gauss_hermite(n_nodes);
-    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
+    let uncached_log_weights;
+    let log_weights = if cached_log_weights_enabled() {
+        cached_log_weights
+    } else {
+        uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
+        &uncached_log_weights
+    };
     let per_subject: Vec<f64> = population
         .subjects
         .par_iter()
@@ -1144,7 +1187,7 @@ fn agq_population_nll_impl(
                 &stack,
                 &b_hat,
                 nodes,
-                &log_weights,
+                log_weights,
                 anchor,
                 false,
                 schedule,
@@ -1801,7 +1844,7 @@ fn grid_response_correction(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
-    bs: &[Vec<f64>],
+    bs: &[f64],
     softmax: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
@@ -1810,6 +1853,7 @@ fn grid_response_correction(
 ) -> Option<()> {
     use crate::estimation::parameterization::packed_fixed_mask;
 
+    let d = stack.d();
     let fixed = packed_fixed_mask(template);
 
     // `H = ∂²nll/∂η²|_{η̂(x)}` depends on `x` **twice**: explicitly through θ/Ω/σ, and
@@ -1833,7 +1877,7 @@ fn grid_response_correction(
     let mult = model.ruv_obs_mult(subject, &params.theta);
     let err_keys = model.error_spec.obs_keys(subject);
     let node_grads: Option<Vec<Vec<f64>>> = if parallel_grid {
-        bs.par_iter()
+        bs.par_chunks(d)
             .map_init(
                 || {
                     (
@@ -1863,7 +1907,7 @@ fn grid_response_correction(
         let mut obs_grad_recycle = Vec::new();
         let mut eta_work = DVector::zeros(model.n_eta);
         let mut prior_work = DVector::zeros(model.n_eta);
-        bs.iter()
+        bs.chunks_exact(d)
             .map(|b| {
                 node_nll_gradient(
                     model,
@@ -2620,7 +2664,7 @@ fn finish_agq_subject_gradient(
     anchor: HessianAnchor,
     parallel_grid: bool,
     h: &DMatrix<f64>,
-    bs: &[Vec<f64>],
+    bs: &[f64],
     softmax: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
@@ -2628,26 +2672,29 @@ fn finish_agq_subject_gradient(
     out: &mut [f64],
 ) -> Option<()> {
     if parallel_grid {
-        let node_scores: Option<Vec<Vec<f64>>> = bs
-            .par_iter()
+        let d = stack.d();
+        let score_width = out.len();
+        let mut node_scores = vec![0.0; softmax.len() * score_width];
+        node_scores
+            .par_chunks_mut(score_width)
+            .zip(bs.par_chunks(d))
             .zip(softmax.par_iter())
-            .map(|(b_j, &w)| {
-                let mut score = vec![0.0; out.len()];
+            .try_for_each(|((score, b_j), &w)| {
                 if w != 0.0 {
                     accumulate_fixed_eta_packed_gradient(
-                        model, subject, params, template, stack, b_j, w, &mut score,
+                        model, subject, params, template, stack, b_j, w, score,
                     )?;
                 }
-                Some(score)
-            })
-            .collect();
-        for score in node_scores? {
+                Some(())
+            })?;
+        // Preserve the former node-major summation order exactly.
+        for score in node_scores.chunks_exact(score_width) {
             for (dst, value) in out.iter_mut().zip(score) {
-                *dst += value;
+                *dst += *value;
             }
         }
     } else {
-        for (b_j, &w) in bs.iter().zip(softmax.iter()) {
+        for (b_j, &w) in bs.chunks_exact(stack.d()).zip(softmax.iter()) {
             if w == 0.0 {
                 continue; // exp underflow — contributes nothing to the average
             }
@@ -2707,7 +2754,8 @@ impl<'a> SubjectScoreContext<'a> {
         bounds: &'a crate::estimation::parameterization::PackedBounds,
         force_fd: bool,
     ) -> Self {
-        let (nodes, weights) = cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
+        let (nodes, weights, _) =
+            cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
         Self {
             model,
             template,
@@ -3137,7 +3185,7 @@ mod tests {
         let mut eta_work = DVector::zeros(model.n_eta);
         let mut prior_work = DVector::zeros(model.n_eta);
         let node_grads: Vec<Vec<f64>> = bs
-            .iter()
+            .chunks_exact(stack.d())
             .map(|b| {
                 node_nll_gradient(
                     &model,
@@ -3628,7 +3676,7 @@ mod tests {
                 let mut eta_work = DVector::zeros(model.n_eta);
                 let mut prior_work = DVector::zeros(model.n_eta);
                 let node_grads: Vec<Vec<f64>> = bs
-                    .iter()
+                    .chunks_exact(stack.d())
                     .map(|b| {
                         node_nll_gradient(
                             &model,
@@ -4255,13 +4303,15 @@ mod tests {
 
     #[test]
     fn cached_gauss_hermite_reuses_the_exact_rule_storage() {
-        let (nodes_a, weights_a) = cached_gauss_hermite(3);
-        let (nodes_b, weights_b) = cached_gauss_hermite(3);
+        let (nodes_a, weights_a, logs_a) = cached_gauss_hermite(3);
+        let (nodes_b, weights_b, logs_b) = cached_gauss_hermite(3);
         assert!(std::ptr::eq(nodes_a.as_ptr(), nodes_b.as_ptr()));
         assert!(std::ptr::eq(weights_a.as_ptr(), weights_b.as_ptr()));
+        assert!(std::ptr::eq(logs_a.as_ptr(), logs_b.as_ptr()));
         let (expected_nodes, expected_weights) = gauss_hermite(3);
         assert_eq!(nodes_a, expected_nodes);
         assert_eq!(weights_a, expected_weights);
+        assert_eq!(logs_a, weights_a.iter().map(|w| w.ln()).collect::<Vec<_>>());
     }
 
     /// Weights sum to `√π = ∫ e^{−x²} dx`, and the rule is exact for polynomials up to
