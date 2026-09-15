@@ -3476,6 +3476,73 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // `gradient = fd` with `optimizer` left at `auto` moves **two** factors, not one
+    // (#1381). `auto` resolves to `nlopt_lbfgs` when the exact analytic outer gradient
+    // is available and `bobyqa` when only finite differences are, so forcing the
+    // gradient also swaps the optimizer — and the swap is the larger effect: on the
+    // reporter's model the one-line change moved the OFV by 4.98, of which only 0.38
+    // was the gradient once the optimizer was pinned to BOBYQA in both arms.
+    //
+    // That default is right (it rests on #490's benchmarking across ~10 FOCEI
+    // datasets); what was missing is anything saying so at the point the coupling
+    // bites, so a user running a one-variable experiment gets two variables moved
+    // silently. `FitResult.optimizer` already records `"auto (bobyqa)"` (#490) and
+    // `final_gradient_source` records the effect (#1380) — both are fields the user
+    // has to think to read *afterwards*.
+    //
+    // Fires only when the coupling actually changed the pick: the counterfactual is
+    // taken off `resolve_auto_given_analytic` fed the scope-only predicate, i.e. what
+    // `auto` would have resolved to with `gradient = auto` on this same model. So a
+    // model that is out of the analytic scope anyway (ODE/PD, LTBS, TTE) stays quiet —
+    // `fd` changed nothing there — as does a model above `BOBYQA_MAX_DIM`, where `auto`
+    // takes L-BFGS on an FD gradient either way.
+    if options.optimizer == Optimizer::Auto
+        // The user's own `gradient = fd`, not an engine-forced one. An SDE model has
+        // `model.gradient_method` overwritten to `Fd` by `fit()`/`run_*` regardless of
+        // what the user asked for; there is no user-side coupling to report there, and
+        // this gate — read off `options`, where the counterfactual below is read off
+        // `model` — is what excludes it.
+        && options.gradient_method == crate::types::GradientMethod::Fd
+    {
+        // The FOCE/FOCEI-family stages that actually consult `resolve_auto`. `laplace`
+        // is excluded because `fit()` overrides `auto` to `nlopt_lbfgs` for it before
+        // the outer loop sees it (#317), so its optimizer does not move; `saem`,
+        // `imp`/`impmap`, `bayes` and `vi` never run the outer optimizer at all.
+        // `gn_hybrid` is included: its FOCEI polish routes through
+        // `optimize_population_warm` → `optimize_population` with `auto` still live.
+        let runs_outer = chain.iter().any(|&m| {
+            matches!(
+                m,
+                EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::FoceGnHybrid
+            )
+        });
+        let forced = Optimizer::Auto.resolve_auto(model, options.interaction);
+        let unforced = Optimizer::Auto.resolve_auto_given_analytic(
+            model,
+            crate::sens::provider::analytic_outer_gradient_in_scope(model),
+        );
+        if runs_outer && forced != unforced {
+            diags.push(
+                Diagnostic::warning(
+                    "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT",
+                    &format!(
+                        "gradient = fd also changed the outer optimizer: with optimizer = auto \
+                         left in place it resolved to {} rather than the {} this model would \
+                         have used under gradient = auto, because auto picks the derivative-free \
+                         optimizer when there is no exact analytic gradient to feed a \
+                         gradient-based one. Two factors moved, not one — if you are comparing \
+                         an fd arm against an auto arm, pin optimizer = {} in both so the \
+                         difference you measure is the gradient.",
+                        forced.label(),
+                        unforced.label(),
+                        forced.label(),
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
             if !matches!(

@@ -34,6 +34,7 @@
 //! | `E_DATA`                  | the `--data` file could not be read or parsed |
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
 //! | `E_AD_RETIRED`            | `gradient_method = ad` requested; the Enzyme AD path was retired (use `auto` / `fd`) |
+//! | `W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT` | `gradient = fd` with `optimizer` left at `auto` on a model whose analytic gradient *is* in scope: `auto` follows the gradient, so the one line moved the optimizer too (#1381) |
 //! | `E_IMP_CHAIN`             | `imp` mis-placed in a method chain (repeated / non-terminal) |
 //! | `E_SAEM_NO_RANDOM_EFFECTS`| `method = saem` anywhere in a chain on a model with `n_eta = 0` |
 //! | `E_METHOD_NO_RANDOM_EFFECTS` | `method = imp` / `impmap` / `bayes` anywhere in a chain on a model with `n_eta = 0` |

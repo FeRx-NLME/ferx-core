@@ -600,6 +600,12 @@ Notes:
   and `bobyqa` both fastest and most reliable on the FD-only problems. The fit
   output records the resolved optimizer as `auto (<resolved>)`. Set `optimizer`
   explicitly to override the choice.
+- Because of that, setting `gradient = fd` and leaving `optimizer` at `auto`
+  moves **two** factors, not one — on the model behind #1381 the optimizer swap
+  was 4.6 of the 4.98 OFV difference and the gradient only 0.38. ferx emits
+  `W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT` when that happens; pin
+  `optimizer = bobyqa` in both arms to measure the gradient alone. See
+  [`gradient = fd` moves the optimizer too](../estimation/optimizers.qmd#gradient-fd-moves-the-optimizer).
 - `bobyqa` does not use gradients, so it is robust to small discontinuities in
   the FOCE surface caused by EBE re-estimation, but it converges more slowly
   than gradient-based methods on smooth problems.

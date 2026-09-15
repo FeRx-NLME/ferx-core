@@ -8149,6 +8149,29 @@ impl Optimizer {
     /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
     /// is in scope.
     pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
+        self.resolve_auto_given_analytic(
+            model,
+            crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction),
+        )
+    }
+
+    /// [`Optimizer::resolve_auto`] with the analytic-outer-gradient predicate supplied
+    /// by the caller instead of read off `model`.
+    ///
+    /// The one production caller passes the live predicate (via `resolve_auto`). The
+    /// point of the split is the **counterfactual**: the `gradient = fd` ⇒
+    /// `optimizer = auto` coupling warning (#1381) has to ask what `auto` would have
+    /// picked with the gradient left at `auto`, and it must ask it off this function
+    /// rather than a re-spelled copy of the rule — a second copy is what lets the
+    /// warning claim a coupling that the resolver does not actually have (the
+    /// `BOBYQA_MAX_DIM` arm below being the arm that would drift first, since above
+    /// the threshold `auto` takes L-BFGS on an FD gradient and there is no coupling
+    /// to report).
+    pub(crate) fn resolve_auto_given_analytic(
+        self,
+        model: &CompiledModel,
+        analytic_outer_gradient: bool,
+    ) -> Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
@@ -8167,7 +8190,7 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
-        if crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction) {
+        if analytic_outer_gradient {
             Optimizer::NloptLbfgs
         } else {
             Optimizer::Bobyqa
