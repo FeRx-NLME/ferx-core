@@ -416,6 +416,28 @@ argument right after `check`/`summary` (`ferx check --help`, `ferx summary
 --help`); it prints usage to stdout and exits `0` (usage-error paths print the
 same text to stderr and exit `1`/`2`).
 
+## Tool name or model file?
+
+The first argument is either a tool (`covsearch`, `bootstrap`, …) or the model
+to fit. A tool name is a bare word, so anything carrying a `.` or a path
+separator is read as a file path — and a file that exists is always taken as
+the model, whatever it is called.
+
+That split decides which error you get when the argument resolves to nothing:
+
+```bash
+$ ferx covsearch run1.ferxsearch      # on a build without covsearch
+Error: tool `covsearch` not recognized.
+Available tools: check, summary, bootstrap, gam, ...
+To fit a model, give its file path: ferx run1.ferx --data data.csv
+
+$ ferx run1.ferx --data data.csv      # run1.ferx is not in this directory
+Error: the model `run1.ferx` was not found at this location. Please check folder and file names.
+```
+
+A tool name within two edits of a real one also gets a `Did you mean ...?`
+line. Both cases exit `1`.
+
 ## Examples
 
 ```bash

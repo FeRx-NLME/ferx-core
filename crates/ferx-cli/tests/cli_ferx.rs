@@ -307,6 +307,117 @@ fn fit_with_missing_files_errors() {
     );
 }
 
+// ── the first argument: tool name vs model path (#1396) ──────────────────────
+
+/// A bare word that is not a tool this build has: the CLI used to read it as a
+/// model path and report `Failed to read model file: No such file or directory`,
+/// which says nothing about the real mistake.
+#[test]
+fn an_unknown_tool_name_is_named_as_a_tool_not_as_a_missing_file() {
+    let out = ferx()
+        .args(["covsearchx", "covsearch.ferxsearch"])
+        .output()
+        .expect("run ferx with an unknown tool name");
+    assert_eq!(out.status.code(), Some(1), "unknown tool → exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tool `covsearchx` not recognized"),
+        "expected the unknown-tool error: {stderr}"
+    );
+    // The regression this exists to catch: the old model-file reading.
+    assert!(
+        !stderr.contains("Failed to read model file"),
+        "a tool name must not be reported as a model file: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `covsearch`?"),
+        "expected a suggestion for a one-edit typo: {stderr}"
+    );
+    assert!(
+        stderr.contains("Available tools:"),
+        "expected the tool list: {stderr}"
+    );
+}
+
+/// The other half of #1396: an argument that *is* a path gets a readable
+/// not-found message instead of the raw io error.
+#[test]
+fn a_missing_model_file_is_reported_by_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["run1.ferx", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on a missing model");
+    assert_eq!(out.status.code(), Some(1), "missing model → exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the model `run1.ferx` was not found at this location"),
+        "expected the not-found message: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not recognized"),
+        "a path must not be reported as a tool: {stderr}"
+    );
+}
+
+/// An extension-less file that exists is still a model: it must reach the fit
+/// path, not the unknown-tool arm. Pins the `exists` half of the rule — without
+/// it, classification could key on the extension alone and pass every other
+/// test here.
+#[test]
+fn an_extensionless_model_file_that_exists_is_fitted_not_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = tmp.path().join("mymodel");
+    std::fs::write(&model, "not a valid model\n").expect("write model");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["mymodel", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on an extension-less model");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // It fails — the contents are not a model — but as a *parse* failure from
+    // the fit path, not as an unrecognized tool.
+    assert!(
+        !stderr.contains("not recognized") && !stderr.contains("was not found at this location"),
+        "an existing file must reach the fit path: {stderr}"
+    );
+}
+
+/// `main` looks the word up in the subcommand table before classifying it, so
+/// no shipped tool can be reported as unrecognized. Every name is a bare word,
+/// so this ordering is the only thing keeping them out of that arm.
+#[test]
+fn every_listed_tool_still_dispatches() {
+    // The list printed by the unknown-tool error — the same table `main`
+    // dispatches from, read back out of the binary so the two cannot drift.
+    let out = ferx()
+        .arg("definitely-not-a-tool-name")
+        .output()
+        .expect("run ferx with an unknown tool");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let listed = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("Available tools: "))
+        .expect("the error lists the available tools")
+        .trim_end_matches('.')
+        .split(", ")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(listed.len() >= 12, "expected every tool listed: {listed:?}");
+    for tool in listed {
+        let out = ferx()
+            .args([&tool, "--help"])
+            .output()
+            .unwrap_or_else(|e| panic!("run ferx {tool} --help: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("not recognized"),
+            "`{tool}` is advertised but not dispatched: {stderr}"
+        );
+    }
+}
+
 // ── ferx bootstrap (#1140) ───────────────────────────────────────────────────
 
 #[test]
