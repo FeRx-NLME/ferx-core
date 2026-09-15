@@ -2484,6 +2484,7 @@ pub ferx_core::types::WarningCode::CovarianceRegularized
 pub ferx_core::types::WarningCode::CovarianceStep
 pub ferx_core::types::WarningCode::DataQuality
 pub ferx_core::types::WarningCode::DwAutocorrelation
+pub ferx_core::types::WarningCode::EbeStartDependent
 pub ferx_core::types::WarningCode::EpsShrinkage
 pub ferx_core::types::WarningCode::EtaNormality
 pub ferx_core::types::WarningCode::EtaShrinkage
@@ -3798,6 +3799,7 @@ pub ferx_core::WarningCode::CovarianceRegularized
 pub ferx_core::WarningCode::CovarianceStep
 pub ferx_core::WarningCode::DataQuality
 pub ferx_core::WarningCode::DwAutocorrelation
+pub ferx_core::WarningCode::EbeStartDependent
 pub ferx_core::WarningCode::EpsShrinkage
 pub ferx_core::WarningCode::EtaNormality
 pub ferx_core::WarningCode::EtaShrinkage

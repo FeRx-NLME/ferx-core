@@ -1105,6 +1105,11 @@ where
     FUnf: Fn(&[T]) -> Option<Vec<T>>,
     FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
+    // A top-level entry in its own right: `sens::ode_provider` calls this directly for the dual
+    // SS equilibration, not only through `equilibrate_ss_pk_state`. Neither arm below ever
+    // reaches `note_ss_nonconvergence_if_capped`, so clear the warning observation here too or
+    // that caller reads an earlier capped run's `true` (#1289, PR #1392 review).
+    crate::dosing::record_ss_nonconvergence_warned(false);
     // `&F` still implements `Fn` when `F: Fn`, so borrowing lets the linear attempt and the
     // Anderson fallback share the same two closures without moving them.
     if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
@@ -1179,6 +1184,10 @@ fn equilibrate_ss_pk_state(
     // the previous call's value — see `crate::dosing::SsBranch`. Every completing path
     // overwrites it; every bail-out is then honestly reported as "no branch ran".
     crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::None);
+    // Same reasoning for the warning observation (#1289): the exact affine fixed point and the
+    // input-rate closed form below return without ever reaching `note_ss_nonconvergence_if_capped`,
+    // so without this an earlier capped run's `true` would be reported as *this* call's answer.
+    crate::dosing::record_ss_nonconvergence_warned(false);
     let n = ode.n_states;
     let chz = &ode.chz_state_slots[..];
     // The model's own RHS with the accumulator derivatives held at zero. Everything the

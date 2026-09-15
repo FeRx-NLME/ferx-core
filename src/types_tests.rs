@@ -848,6 +848,7 @@ fn warning_code_tokens_are_stable() {
         (FlatParameter, "flat_parameter"),
         (OdeSolver, "ode_solver"),
         (StalledAtInit, "stalled_at_init"),
+        (EbeStartDependent, "ebe_start_dependent"),
         (General, "general"),
     ];
     // The list is hand-maintained, and had silently fallen four variants behind
@@ -894,12 +895,13 @@ fn warning_code_tokens_are_stable() {
             FlatParameter => 31,
             OdeSolver => 32,
             StalledAtInit => 33,
-            General => 34,
+            EbeStartDependent => 34,
+            General => 35,
         }
     }
     assert_eq!(
         expected.len(),
-        35,
+        36,
         "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
     );
     for (i, (code, _)) in expected.iter().enumerate() {

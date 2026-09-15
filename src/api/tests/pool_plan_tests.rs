@@ -11,6 +11,65 @@
 //! a runtime probe that actually touches more stack than the default provides.
 
 use super::*;
+
+#[test]
+fn cheap_subject_dispatch_requires_enough_rows_per_active_worker() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        assert!(!parallelize_cheap_subject_pass(1));
+        assert!(!parallelize_cheap_subject_pass(31));
+        assert!(parallelize_cheap_subject_pass(32));
+    });
+
+    let serial = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    serial.install(|| assert!(!parallelize_cheap_subject_pass(20)));
+}
+
+#[test]
+#[ignore = "microbenchmark: run release with --ignored --nocapture cheap_subject_dispatch_bench"]
+fn cheap_subject_dispatch_bench() {
+    use rayon::prelude::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const REPEATS: usize = 100_000;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for n in [1usize, 2, 4, 8] {
+            let serial_start = Instant::now();
+            for _ in 0..REPEATS {
+                let values: Vec<f64> = (0..n)
+                    .map(|i| black_box(i as f64).mul_add(1.000_001, 0.25))
+                    .collect();
+                black_box(values);
+            }
+            let serial = serial_start.elapsed();
+
+            let parallel_start = Instant::now();
+            for _ in 0..REPEATS {
+                let values: Vec<f64> = (0..n)
+                    .into_par_iter()
+                    .map(|i| black_box(i as f64).mul_add(1.000_001, 0.25))
+                    .collect();
+                black_box(values);
+            }
+            let parallel = parallel_start.elapsed();
+            eprintln!(
+                "n={n}: serial={serial:?}, rayon={parallel:?}, serial speedup={:.2}x",
+                parallel.as_secs_f64() / serial.as_secs_f64()
+            );
+        }
+    });
+}
 use crate::parser::model_parser::parse_model_string;
 use std::collections::HashMap;
 

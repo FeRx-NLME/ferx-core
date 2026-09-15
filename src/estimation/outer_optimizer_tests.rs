@@ -2502,6 +2502,81 @@ fn global_presearch_branch_runs_or_warns() {
 // Run with:  cargo test --lib --no-default-features --features ci \
 //              bench_cov_hessian -- --ignored --nocapture
 
+#[test]
+#[ignore = "benchmark: optimized serial-vs-Rayon population NLL"]
+fn bench_small_population_nll_dispatch() {
+    use rayon::prelude::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let model = make_model();
+    let params = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for n_subj in [1usize, 2, 4, 8, 16, 32] {
+            let population = make_population(n_subj);
+            let eta_hats: Vec<DVector<f64>> =
+                (0..n_subj).map(|_| DVector::zeros(1)).collect();
+            let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+                .map(|_| DMatrix::from_element(3, 1, 0.1))
+                .collect();
+            let eval = |i: usize| {
+                subject_nll(
+                    &model,
+                    &population.subjects[i],
+                    params,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    &[],
+                    true,
+                )
+            };
+            let serial_once = || -> f64 {
+                let values: Vec<f64> = (0..n_subj).map(&eval).collect();
+                values.iter().sum()
+            };
+            let parallel_once = || -> f64 {
+                let values: Vec<f64> = (0..n_subj).into_par_iter().map(&eval).collect();
+                values.iter().sum()
+            };
+            assert_eq!(serial_once().to_bits(), parallel_once().to_bits());
+            for _ in 0..20 {
+                black_box(serial_once());
+                black_box(parallel_once());
+            }
+            let mut serial = Vec::with_capacity(31);
+            let mut parallel = Vec::with_capacity(31);
+            for rep in 0..31 {
+                if rep % 2 == 0 {
+                    let start = Instant::now();
+                    black_box(serial_once());
+                    serial.push(start.elapsed());
+                    let start = Instant::now();
+                    black_box(parallel_once());
+                    parallel.push(start.elapsed());
+                } else {
+                    let start = Instant::now();
+                    black_box(parallel_once());
+                    parallel.push(start.elapsed());
+                    let start = Instant::now();
+                    black_box(serial_once());
+                    serial.push(start.elapsed());
+                }
+            }
+            serial.sort_unstable();
+            parallel.sort_unstable();
+            eprintln!(
+                "n={n_subj}: serial median={:?} range={:?}..{:?}; parallel median={:?} range={:?}..{:?}; serial/parallel={:.3}x",
+                serial[15], serial[0], serial[30], parallel[15], parallel[0], parallel[30],
+                serial[15].as_secs_f64() / parallel[15].as_secs_f64(),
+            );
+        }
+    });
+}
+
 /// Measures wall time for the gradient-FD Hessian (new path, issue #209) vs
 /// the legacy scalar-FD Hessian (reconstructed inline) on the same setup.
 ///
@@ -3058,6 +3133,128 @@ fn short_descending_tail_is_not_converged() {
         -100.0,
         true,
     ));
+}
+
+// ── #833: which of the final inner loop's EBE candidates is reported ──────────
+
+#[test]
+fn the_lowest_objective_candidate_is_the_one_reported() {
+    // Candidates are passed [cold, warm re-solve, incumbent-as-held].
+    // FREM warfarin, measured: cold -167.95, the warm re-solve -174.91.
+    assert_eq!(reported_candidate(&[-167.95, -174.91, -174.90]), 1);
+    // The incumbent is a real candidate, not just a seed: `run_inner_loop_warm` is not
+    // monotone from its seed (the FREM NM arm, #1365), so the re-solve can score above
+    // the EBEs it started from — and then the held state has to win (review of #1386).
+    assert_eq!(reported_candidate(&[-100.0, -20.0, -174.91]), 2);
+    // And the cold solve wins when it is simply the best of the three.
+    assert_eq!(reported_candidate(&[-300.0, -174.91, -174.90]), 0);
+    // The held candidate is absent when it belongs to a different point than the one
+    // restored; two candidates then, same rule.
+    assert_eq!(reported_candidate(&[-167.95, -174.91]), 1);
+}
+
+#[test]
+fn a_tie_reports_the_cold_solve() {
+    // The unimodal case — most fits. Ties break by index and the caller passes the cold
+    // solve first, which is what keeps those fits bit-identical to the pre-#833
+    // behaviour.
+    assert_eq!(
+        reported_candidate(&[-286.004205, -286.004205, -286.004205]),
+        0
+    );
+}
+
+#[test]
+fn a_diverged_candidate_never_displaces_a_finite_one() {
+    // Every comparison against `NaN` is false, so a plain `<` chain gets this half right
+    // and the other half wrong. Both halves are asserted: a diverged warm solve must not
+    // win, *and* a diverged cold solve must not pin the fit to itself.
+    assert_eq!(reported_candidate(&[42.0, 50.0, f64::NAN]), 0);
+    assert_eq!(reported_candidate(&[42.0, 50.0, f64::INFINITY]), 0);
+    assert_eq!(reported_candidate(&[f64::NAN, 50.0, 42.0]), 2);
+    assert_eq!(reported_candidate(&[f64::NEG_INFINITY, 50.0, 42.0]), 2);
+    // All three unusable: index 0 comes back, so the caller reports the cold solve and
+    // `gate_converged_on_objective` (#1303) demotes the fit rather than this function
+    // inventing a verdict.
+    assert_eq!(reported_candidate(&[f64::NAN, f64::NAN, f64::NAN]), 0);
+}
+
+#[test]
+fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
+    // Measured FREM gap: 6.96 on a reported -174.91 → the tolerance is
+    // 1e-3 * (1 + 174.91) = 0.176, so this is ~40x over.
+    match cold_solve_verdict(-167.95, -174.91) {
+        ColdSolveVerdict::Worse(gap) => assert!((gap - 6.96).abs() < 1e-9, "gap = {gap}"),
+        other => panic!("expected a material gap, got {other:?}"),
+    }
+    // A cold solve that ties (or beats) the reference reproduces it.
+    assert_eq!(
+        cold_solve_verdict(-174.91, -174.91),
+        ColdSolveVerdict::Reproduces
+    );
+    assert_eq!(
+        cold_solve_verdict(-200.0, -174.91),
+        ColdSolveVerdict::Reproduces
+    );
+    // The threshold itself: 1e-3 * (1 + 100) = 0.101, so 0.05 is inside and 0.5 is not.
+    assert_eq!(
+        cold_solve_verdict(-99.95, -100.0),
+        ColdSolveVerdict::Reproduces
+    );
+    assert!(matches!(
+        cold_solve_verdict(-99.5, -100.0),
+        ColdSolveVerdict::Worse(_)
+    ));
+    // `missed()` is what gates the extra candidates.
+    assert!(!cold_solve_verdict(-174.91, -174.91).missed());
+    assert!(cold_solve_verdict(-99.5, -100.0).missed());
+}
+
+#[test]
+fn a_non_finite_cold_solve_is_its_own_verdict() {
+    // The reason this is not a gap test: `NaN - x > tol` is false, so `Worse` would
+    // decline both the retry and the warning in the one case where the cold EBEs are
+    // certainly not the ones to report (review of #1386).
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            cold_solve_verdict(bad, -174.91),
+            ColdSolveVerdict::NonFinite,
+            "{bad} must not be classified by the gap test"
+        );
+        assert!(cold_solve_verdict(bad, -174.91).missed());
+    }
+}
+
+#[test]
+fn the_start_dependence_warning_reports_what_was_measured() {
+    // Silent when the cold solve reproduces the reported objective — this is what keeps
+    // the warning off ordinary fits.
+    assert!(ebe_start_dependence_warning(-174.91, -174.91).is_none());
+    assert!(ebe_start_dependence_warning(-200.0, -174.91).is_none());
+
+    let w = ebe_start_dependence_warning(-167.95, -174.91).expect("6.96 is material");
+    assert!(w.contains("6.9600"), "the gap belongs in the message: {w}");
+    assert!(w.contains("-167.9500") && w.contains("-174.9100"), "{w}");
+    // It must not diagnose multimodality on its own: the regression fixture for this
+    // code path has a gap that comes from the inner *budget*, not from a second mode
+    // (review of #1386). Both causes are named, and the wording stays conditional.
+    assert!(w.contains("or the inner loop cannot reach it"), "{w}");
+    assert!(
+        !w.contains("means the individual objective has more than one mode"),
+        "the message must not assert multimodality as the cause: {w}"
+    );
+
+    // The non-finite arm gets its own message, and it is not silent.
+    let nf = ebe_start_dependence_warning(f64::NAN, -174.91).expect("NaN must be reported");
+    assert!(nf.contains("non-finite objective"), "{nf}");
+
+    // Both arms carry the token that classifies them, so a consumer branching on
+    // `warnings_structured[].category` sees the same code for either.
+    for msg in [w, nf] {
+        let entry = crate::types::classify_warning(&msg);
+        assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
 }
 
 #[test]

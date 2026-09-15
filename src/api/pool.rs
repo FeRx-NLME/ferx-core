@@ -236,6 +236,23 @@ pub(crate) fn effective_default_threads() -> usize {
     }
 }
 
+/// Whether a cheap population-wide pass has enough work to repay Rayon dispatch.
+///
+/// This is deliberately limited to cheap loops such as evaluating an already-converged
+/// FOCE likelihood. It
+/// must not gate inner EBE solves, ODE sensitivities, or finite differences: one subject in
+/// those loops can contain enough work to benefit from every available worker only when the
+/// algorithm exposes finer-grained parallelism.
+///
+/// Eight subjects per worker are required: below that granularity the fixed scheduling/join
+/// cost dominates the small closed-form fixtures used by interactive and test callers. The
+/// threshold scales with pool width and leaves expensive subject kernels free to use their
+/// existing parallel paths.
+pub(crate) fn parallelize_cheap_subject_pass(n_subjects: usize) -> bool {
+    let workers = rayon::current_num_threads();
+    workers > 1 && n_subjects >= workers.saturating_mul(8)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Nested-pool planning for tools that run many fits (#1115)
 // ─────────────────────────────────────────────────────────────────────────────
