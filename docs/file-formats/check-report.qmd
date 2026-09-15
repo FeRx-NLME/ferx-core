@@ -68,6 +68,8 @@ Treat an unrecognised code as a generic finding of its given `severity`.
 
 The file could not be read as a ferx model at all, or names a block ferx does not have.
 
+`[fit_options]` and `[error_model]` lines are consumed end to end or reported as `E_PARSE` with the offending line quoted. A `[fit_options]` line that is not a `key = value` pair names the repair (`` `method saem` is not a `key = value` pair — did you mean `method = saem`? ``); an `[error_model]` line matching no statement form lists the accepted forms. Before 0.4.0 both were dropped without a diagnostic, and the `method` case is the sharp one — the fit then ran the **default estimator** while `ferx check` reported the file VALID, so a run the author read as SAEM was FOCEI and its objective was not comparable to the one they asked for. See [#1390](https://github.com/FeRx-NLME/ferx-core/issues/1390), [Fit options](../model-file/fit-options.qmd#syntax) and [Error model](../model-file/error-model.qmd#syntax).
+
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_PARSE` | error | The model file failed to parse (catch-all for parser errors). |
