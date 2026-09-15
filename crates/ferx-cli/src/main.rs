@@ -103,6 +103,134 @@ fn normalize_args(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Every `ferx <word> ...` subcommand, paired with the function that runs it
+/// and returns the process exit code.
+///
+/// This table is the *only* list of tool names: `main` dispatches from it and
+/// the unknown-tool error below enumerates it, so a tool cannot be added to
+/// one and missed by the other (#1396).
+const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
+    // Parse + validate a model (optionally against data) and report structured
+    // diagnostics; no fit.
+    ("check", run_check),
+    // Read-only reporting over a saved fit bundle, like psn::sumo.
+    ("summary", run_summary),
+    // #1140, the first `ferx-tools` subcommand: many fits over resampled data.
+    ("bootstrap", bootstrap_cmd::run),
+    ("gam", gam_cmd::run),
+    // `covsearch` / `allometry` (#1180): the first model-space search tools,
+    // driven by a `.ferxsearch` file (or, for allometry, a model file + flags).
+    ("covsearch", covsearch_cmd::run),
+    ("allometry", allometry_cmd::run),
+    // #1181: structural PK search over the `pk` templates.
+    ("modelsearch", modelsearch_cmd::run),
+    // #1182: residual-error model search.
+    ("ruvsearch", ruvsearch_cmd::run),
+    // #1183: variability-structure search.
+    ("iivsearch", iivsearch_cmd::run),
+    ("iovsearch", iovsearch_cmd::run),
+    // #1184: the whole pipeline, one tool after another.
+    ("amd", amd_cmd::run),
+    // #1185: GA / exhaustive over one grid, penalized fitness.
+    ("globalsearch", globalsearch_cmd::run),
+];
+
+/// The runner for `word`, when it names a subcommand.
+fn subcommand(word: &str) -> Option<fn(&[String]) -> i32> {
+    SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == word)
+        .map(|(_, run)| *run)
+}
+
+/// What the first argument means once it is known not to name a [`SUBCOMMANDS`]
+/// entry (#1396).
+#[derive(Debug, PartialEq, Eq)]
+enum FirstArg<'a> {
+    /// A bare word — no dot, no path separator. The user meant a tool, and this
+    /// build does not have it (a typo, or a tool that only exists in a later
+    /// version). Reading it as a model path is what produced the misleading
+    /// "Failed to read model file: No such file or directory".
+    UnknownTool(&'a str),
+    /// Either the path is there, or the filesystem would not say: hand it to
+    /// the fit/simulate path, which opens it and reports whatever the OS says.
+    ModelFile(&'a str),
+    /// Looks like a path, and the filesystem says it is not there.
+    MissingModelFile(&'a str),
+    /// A flag in the model-file position.
+    Flag(&'a str),
+}
+
+/// Classify the first argument. `exists` is the filesystem answer for `arg`
+/// (`Path::try_exists`), passed in so the rule itself is testable without
+/// touching the disk.
+///
+/// A file that is present is a model file whatever the name — an extension is
+/// only the fallback signal for something that is *not* there, and a tool name
+/// is a bare word by construction, so anything carrying a `.` or a path
+/// separator is a path the user got wrong rather than a tool we do not have.
+/// "Whatever the name" is bounded by the two decisions `main` takes first: a
+/// [`SUBCOMMANDS`] name runs its tool, and a leading `-` is a flag, so a file
+/// called `check` is reachable only by a path (`./check`).
+///
+/// A probe that *fails* (`Err`) is not an absent file: an unreadable parent
+/// directory or a symlink loop answers neither question, and only
+/// `Path::try_exists` keeps the two apart — `Path::exists` folds every
+/// metadata error into `false`, which would report `EACCES` or `ELOOP` as
+/// "was not found". Such a path goes to the fit path, whose reader surfaces
+/// the real OS error.
+fn classify_first_arg(arg: &str, exists: std::io::Result<bool>) -> FirstArg<'_> {
+    if arg.starts_with('-') {
+        return FirstArg::Flag(arg);
+    }
+    match exists {
+        Ok(true) | Err(_) => return FirstArg::ModelFile(arg),
+        Ok(false) => {}
+    }
+    if arg.contains('.') || arg.contains('/') || arg.contains('\\') {
+        FirstArg::MissingModelFile(arg)
+    } else {
+        FirstArg::UnknownTool(arg)
+    }
+}
+
+/// The second line of the unknown-tool error: a `did you mean` when one tool
+/// name is within two edits of `word`, and the full list either way.
+fn unknown_tool_hint(word: &str) -> String {
+    let names: Vec<&str> = SUBCOMMANDS.iter().map(|(name, _)| *name).collect();
+    let mut hint = String::new();
+    if let Some(near) = names
+        .iter()
+        .map(|name| (edit_distance(word, name), *name))
+        .filter(|(d, _)| *d <= 2)
+        .min()
+        .map(|(_, name)| name)
+    {
+        hint.push_str(&format!("Did you mean `{near}`?\n"));
+    }
+    hint.push_str(&format!("Available tools: {}.\n", names.join(", ")));
+    hint.push_str("To fit a model, give its file path: ferx run1.ferx --data data.csv");
+    hint
+}
+
+/// Levenshtein distance, for the `did you mean` above only.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    // One row of the DP table: prev[j] is the distance between the prefix of
+    // `a` seen so far and the first j characters of `b`.
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let args = normalize_args(&raw_args);
@@ -112,68 +240,41 @@ fn main() {
         std::process::exit(0);
     }
 
-    // `ferx check ...` is a separate, non-fitting subcommand: parse + validate a
-    // model (optionally against data) and report structured diagnostics. Dispatch
-    // before the fit/simulate path so the rest of main() is unchanged.
-    if args.get(1).map(String::as_str) == Some("check") {
-        std::process::exit(run_check(&args));
-    }
-
-    // `ferx summary <run.fitrx>` is a read-only reporting subcommand (like
-    // psn::sumo): load a saved fit bundle and print parameter estimates plus
-    // basic run info to stdout. Dispatch before the fit/simulate path.
-    if args.get(1).map(String::as_str) == Some("summary") {
-        std::process::exit(run_summary(&args));
-    }
-
-    // `ferx bootstrap ...` (#1140) is the first `ferx-tools` subcommand: many
-    // fits over resampled data. Dispatched here for the same reason as the two
-    // above — the fit/simulate path below is untouched, and a plain
-    // `ferx model.ferx` still means what it always did.
-    if args.get(1).map(String::as_str) == Some("bootstrap") {
-        std::process::exit(bootstrap_cmd::run(&args));
-    }
-
-    if args.get(1).map(String::as_str) == Some("gam") {
-        std::process::exit(gam_cmd::run(&args));
-    }
-
-    // `ferx covsearch` / `ferx allometry` (#1180): the first model-space
-    // search tools, driven by a `.ferxsearch` file (or, for allometry, a
-    // model file plus flags).
-    if args.get(1).map(String::as_str) == Some("covsearch") {
-        std::process::exit(covsearch_cmd::run(&args));
-    }
-    if args.get(1).map(String::as_str) == Some("allometry") {
-        std::process::exit(allometry_cmd::run(&args));
-    }
-    // `ferx modelsearch` (#1181): structural PK search over the `pk` templates.
-    if args.get(1).map(String::as_str) == Some("modelsearch") {
-        std::process::exit(modelsearch_cmd::run(&args));
-    }
-    // `ferx ruvsearch` (#1182): residual-error model search.
-    if args.get(1).map(String::as_str) == Some("ruvsearch") {
-        std::process::exit(ruvsearch_cmd::run(&args));
-    }
-    // `ferx iivsearch` / `ferx iovsearch` (#1183): variability-structure search.
-    if args.get(1).map(String::as_str) == Some("iivsearch") {
-        std::process::exit(iivsearch_cmd::run(&args));
-    }
-    if args.get(1).map(String::as_str) == Some("iovsearch") {
-        std::process::exit(iovsearch_cmd::run(&args));
-    }
-    // `ferx amd` (#1184): the whole pipeline, one tool after another.
-    if args.get(1).map(String::as_str) == Some("amd") {
-        std::process::exit(amd_cmd::run(&args));
-    }
-    // `ferx globalsearch` (#1185): GA / exhaustive over one grid, penalized fitness.
-    if args.get(1).map(String::as_str) == Some("globalsearch") {
-        std::process::exit(globalsearch_cmd::run(&args));
+    // A subcommand (`ferx covsearch ...`) is dispatched before the fit/simulate
+    // path, so the rest of main() is unchanged and a plain `ferx model.ferx`
+    // still means what it always did.
+    if let Some(run) = args.get(1).and_then(|w| subcommand(w)) {
+        std::process::exit(run(&args));
     }
 
     if args.len() < 2 {
         eprint!("{MAIN_USAGE}");
         std::process::exit(1);
+    }
+
+    // Not a subcommand and not a flag: either a model file, or a tool name this
+    // build does not have (#1396). Telling those apart here is what keeps a
+    // mistyped or not-yet-shipped tool from being read as a model path and
+    // reported as a missing file.
+    match classify_first_arg(&args[1], std::path::Path::new(&args[1]).try_exists()) {
+        FirstArg::UnknownTool(word) => {
+            eprintln!("Error: tool `{word}` not recognized.");
+            eprintln!("{}", unknown_tool_hint(word));
+            std::process::exit(1);
+        }
+        FirstArg::MissingModelFile(path) => {
+            eprintln!(
+                "Error: the model `{path}` was not found at this location. \
+                 Please check folder and file names."
+            );
+            std::process::exit(1);
+        }
+        FirstArg::Flag(flag) => {
+            eprintln!("Error: expected a model file or a tool name, got the flag `{flag}`.");
+            eprint!("{MAIN_USAGE}");
+            std::process::exit(1);
+        }
+        FirstArg::ModelFile(_) => {}
     }
 
     let model_path = &args[1];
@@ -671,9 +772,10 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        is_help_flag, normalize_args, parse_check_args, parse_inits_from_nca_flag,
-        parse_output_flag, parse_output_format, parse_threads_flag, print_check_human, run_check,
-        run_summary, CheckArgsError, EstimatesFormat,
+        classify_first_arg, edit_distance, is_help_flag, normalize_args, parse_check_args,
+        parse_inits_from_nca_flag, parse_output_flag, parse_output_format, parse_threads_flag,
+        print_check_human, run_check, run_summary, subcommand, unknown_tool_hint, CheckArgsError,
+        EstimatesFormat, FirstArg, SUBCOMMANDS,
     };
     use ferx_core::NcaInit;
 
@@ -701,6 +803,138 @@ mod tests {
         let both = parse_output_format(&args(&["m.ferx", "--output-format", "both"]));
         assert!(both.wants_yaml() && both.wants_json());
         assert_eq!(both, EstimatesFormat::Both);
+    }
+
+    // ── first-argument classification (#1396) ───────────────────────────────
+
+    #[test]
+    fn a_bare_word_is_read_as_a_tool_name_not_a_model_path() {
+        // The reported case: a tool this build does not have. Before #1396 this
+        // fell through to the fit path and reported a missing model file.
+        assert_eq!(
+            classify_first_arg("covsearch", Ok(false)),
+            FirstArg::UnknownTool("covsearch")
+        );
+        assert_eq!(
+            classify_first_arg("bootstrap", Ok(false)),
+            FirstArg::UnknownTool("bootstrap")
+        );
+    }
+
+    #[test]
+    fn anything_with_a_dot_or_a_separator_is_a_path() {
+        // A tool name is a bare word, so a dot or a separator means the user
+        // got a path wrong — the two arms must not collapse into one.
+        assert_eq!(
+            classify_first_arg("run1.ferx", Ok(false)),
+            FirstArg::MissingModelFile("run1.ferx")
+        );
+        assert_eq!(
+            classify_first_arg("runs/run1", Ok(false)),
+            FirstArg::MissingModelFile("runs/run1")
+        );
+        assert_eq!(
+            classify_first_arg("runs\\run1", Ok(false)),
+            FirstArg::MissingModelFile("runs\\run1")
+        );
+    }
+
+    #[test]
+    fn a_file_that_exists_is_a_model_unless_its_name_is_reserved() {
+        // Extension-less model files are legal; existence wins over the name,
+        // so `ferx mymodel` still fits when `mymodel` is on disk. It does not
+        // win over the two decisions `main` takes before this one — a
+        // SUBCOMMANDS name and a leading `-` are settled there, which is why a
+        // file called `check` needs a path.
+        assert_eq!(
+            classify_first_arg("mymodel", Ok(true)),
+            FirstArg::ModelFile("mymodel")
+        );
+        assert_eq!(
+            classify_first_arg("run1.ferx", Ok(true)),
+            FirstArg::ModelFile("run1.ferx")
+        );
+    }
+
+    #[test]
+    fn a_probe_that_fails_is_not_an_absent_file() {
+        // `Path::exists` folds every metadata error into `false`, which would
+        // report an unreadable parent or a symlink loop as "was not found" and
+        // lose the actionable OS error. Only `Ok(false)` is an absent file;
+        // `Err` goes to the fit path, which opens it and reports what the OS
+        // says. Both spellings below reach `Ok(false)` arms above, so the two
+        // cases have to be told apart here.
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            classify_first_arg("run1.ferx", Err(denied())),
+            FirstArg::ModelFile("run1.ferx")
+        );
+        assert_eq!(
+            classify_first_arg("covsearch", Err(denied())),
+            FirstArg::ModelFile("covsearch")
+        );
+    }
+
+    #[test]
+    fn a_flag_in_the_model_position_is_neither_a_tool_nor_a_file() {
+        assert_eq!(
+            classify_first_arg("--data", Ok(false)),
+            FirstArg::Flag("--data")
+        );
+        assert_eq!(
+            classify_first_arg("--simulate", Ok(false)),
+            FirstArg::Flag("--simulate")
+        );
+    }
+
+    #[test]
+    fn every_subcommand_in_the_table_dispatches() {
+        // The table is the single list of tool names: dispatch reads it and the
+        // unknown-tool error enumerates it. A name in the list that does not
+        // resolve would be advertised and then rejected.
+        for (name, _) in SUBCOMMANDS {
+            assert!(
+                subcommand(name).is_some(),
+                "`{name}` is listed but does not dispatch"
+            );
+        }
+        // A listed name is a bare word, so `main` must consult `subcommand`
+        // *before* classifying — classification alone would call every tool
+        // unrecognized. `every_listed_tool_still_dispatches` (cli_ferx.rs) runs
+        // the binary to pin that ordering.
+        assert_eq!(
+            classify_first_arg("check", Ok(false)),
+            FirstArg::UnknownTool("check")
+        );
+        assert!(subcommand("covsearchx").is_none());
+    }
+
+    #[test]
+    fn the_hint_names_a_near_miss_and_always_lists_the_tools() {
+        let typo = unknown_tool_hint("covsearh");
+        assert!(
+            typo.contains("Did you mean `covsearch`?"),
+            "one-edit typo should suggest the tool: {typo}"
+        );
+        // Far from every name: no suggestion, but still the full list.
+        let far = unknown_tool_hint("zzzzzzzzzz");
+        assert!(
+            !far.contains("Did you mean"),
+            "unrelated word should not suggest anything: {far}"
+        );
+        for (name, _) in SUBCOMMANDS {
+            assert!(far.contains(name), "hint should list `{name}`: {far}");
+        }
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("covsearch", "covsearch"), 0);
+        assert_eq!(edit_distance("covsearh", "covsearch"), 1); // deletion
+        assert_eq!(edit_distance("covsearchh", "covsearch"), 1); // insertion
+        assert_eq!(edit_distance("covsearcz", "covsearch"), 1); // substitution
+        assert_eq!(edit_distance("", "amd"), 3);
+        assert_eq!(edit_distance("amd", ""), 3);
     }
 
     #[test]

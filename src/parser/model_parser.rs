@@ -8375,12 +8375,113 @@ fn parse_priors_block(lines: &[String]) -> Result<String, String> {
     })
 }
 
+/// The `;` message a block parser's reject arm emits for a line that looks like
+/// a NONMEM comment.
+///
+/// One copy shared by `[parameters]` (#1388), `[fit_options]` and
+/// `[error_model]` (#1390). A NONMEM-converted file carries `;` on most lines
+/// and the generic "unrecognized line" message never says the word *comment*,
+/// so every block that grows a reject arm needs this same sentence — and three
+/// copies of it would be three chances to disagree about what `.ferx` accepts as
+/// a comment. Accepting `;` as a comment outright is #1393.
+fn semicolon_is_not_a_comment(block: &str, shown: &str) -> String {
+    format!(
+        "[{block}]: `;` does not start a comment in a `.ferx` file — use `#` or `//`. The text \
+         after it is read as part of the line, not skipped. Offending line: `{shown}`."
+    )
+}
+
+/// The `;`-comment message for a `[fit_options]` line, when that is what the
+/// line is: nothing before the `;`, or a complete `key = value` pair before it.
+///
+/// Checked *before* the `=` split rather than inside the reject arm, and that
+/// placement is load-bearing. Both NONMEM-converted shapes carry an `=`, so
+/// neither ever reaches the reject arm: `; method = saem` split to the key
+/// `` `; method` `` and reported "unknown key", and `method = saem ; run 3`
+/// reported an unknown *method token*. Measured — the reject arm's own `;`
+/// branch was dead code until this moved out of it.
+///
+/// A `;` alone does not earn the message. `banana ; x` is not a comment the
+/// author meant, and naming it one would be the mistake #1388 review round 3 #9
+/// found: a message describing a problem the line does not have.
+fn fit_option_semicolon_hint(line: &str) -> Option<String> {
+    let shown = line.trim();
+    let (head, _) = shown.split_once(';')?;
+    let head = head.trim();
+    let is_pair = |s: &str| {
+        s.split_once('=').is_some_and(|(k, v)| {
+            let (k, v) = (k.trim(), v.trim());
+            k == "method"
+                || !matches!(
+                    apply_fit_option(&mut FitOptions::default(), k, v),
+                    Ok(false)
+                )
+        })
+    };
+    (head.is_empty() || is_pair(head)).then(|| semicolon_is_not_a_comment("fit_options", shown))
+}
+
+/// Reject a `[fit_options]` line that is not a `key = value` pair (#1390).
+///
+/// The whole `[fit_options]` grammar is `key = value`, so the diagnostic can
+/// name the exact repair rather than list forms the way `[parameters]` and
+/// `[error_model]` must.
+///
+/// Whether the first token is a real option decides which message is emitted,
+/// and the test for that is [`apply_fit_option`] itself rather than a second
+/// list of key names: it is the single source of truth for the key grammar (the
+/// R `settings` path shares it), so a key added there cannot fall out of this
+/// diagnostic. It is probed against a throwaway `FitOptions` — the function
+/// touches nothing but the `opts` it is handed — and an `Err` counts as
+/// *recognised*, since a known key with a malformed value is still a known key.
+fn reject_fit_option_line(line: &str) -> String {
+    let shown = line.trim();
+    let (head, rest) = shown
+        .split_once(char::is_whitespace)
+        .map_or((shown, ""), |(h, r)| (h, r.trim()));
+    // `method` is the one key `apply_fit_option` does not own — its list-chain
+    // syntax (`method = [saem, imp]`) keeps it in the block parser — so it is
+    // named here explicitly. It is also the key this whole arm exists for.
+    let recognised = head == "method"
+        || !matches!(
+            apply_fit_option(&mut FitOptions::default(), head, rest),
+            Ok(false)
+        );
+    if recognised {
+        let value = if rest.is_empty() { "<value>" } else { rest };
+        return format!(
+            "[fit_options]: `{shown}` is not a `key = value` pair — did you mean \
+             `{head} = {value}`? Every `[fit_options]` line assigns one key with `=`; a line \
+             without it is rejected, not ignored."
+        );
+    }
+    format!(
+        "[fit_options]: unrecognized line `{shown}` — every `[fit_options]` line is a \
+         `key = value` pair, and `{head}` is not a known fit option either."
+    )
+}
+
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
     let mut opts = FitOptions::default();
     for line in lines {
+        // `;` first: the shapes a NONMEM-converted file carries mostly *do*
+        // contain an `=`, so they never reach the reject arm below and would
+        // otherwise be reported as an unknown key or an unknown method token.
+        if let Some(hint) = fit_option_semicolon_hint(line) {
+            return Err(hint);
+        }
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
-            continue;
+            // #1390: a `[fit_options]` line is a `key = value` pair or it is an
+            // error. Before this it was `continue`d, so `method saem` — the `=`
+            // left out, one character from the accepted spelling — vanished, the
+            // fit ran the *default estimator*, and `ferx check` reported VALID.
+            // That is a different algorithm, not a perturbed start: the objective
+            // the user reads is not comparable to the one they asked for, and
+            // nothing at any level says so. `extract_blocks` has already dropped
+            // blank lines and `#` / `//` comment tails, so every line arriving
+            // here is one the user wrote and meant.
+            return Err(reject_fit_option_line(line));
         }
         if parts[0] == "method" {
             let raw = parts[1].trim();
@@ -14861,11 +14962,7 @@ fn parse_parameters(
                     ));
                 }
                 if head.trim().is_empty() || is_declaration(head) {
-                    return Err(format!(
-                        "[parameters]: `;` does not start a comment in a `.ferx` file — use `#` \
-                         or `//`. The text after it is read as part of the line, not skipped. \
-                         Offending line: `{shown}`."
-                    ));
+                    return Err(semicolon_is_not_a_comment("parameters", shown));
                 }
             }
             return Err(format!(
@@ -16478,7 +16575,132 @@ fn parse_selected_error_model(
     Ok(Some((branches, default, covariates)))
 }
 
+/// Every `[error_model]` statement form as the "expected one of …" diagnostic
+/// lists it, paired with a block body that must parse.
+///
+/// One array, for the reason `PARAMETER_FORMS` exists (#1388): a list and a
+/// grammar kept in two places drift, and the drift shows up as a message telling
+/// an author their valid form is unsupported. The examples are the half that
+/// makes it a pin rather than a comment —
+/// `every_listed_error_model_form_actually_parses` runs the real
+/// `parse_error_model` on each one, so a form can never be advertised that the
+/// parser does not accept. An example is a whole block body (`\n`-separated),
+/// since `iiv_on_ruv` is a modifier that needs a statement to accompany.
+const ERROR_MODEL_FORMS: &[(&str, &str)] = &[
+    ("DV ~ additive(SIGMA)", "DV ~ additive(ADD_ERR)"),
+    ("DV ~ proportional(SIGMA)", "DV ~ proportional(PROP_ERR)"),
+    (
+        "DV ~ combined(SIGMA_PROP, SIGMA_ADD)",
+        "DV ~ combined(PROP_ERR, ADD_ERR)",
+    ),
+    (
+        "DV ~ power(SIGMA, EXPONENT)",
+        "DV ~ power(PROP_ERR, RUV_POW)",
+    ),
+    ("DV ~ log_additive(SIGMA)", "DV ~ log_additive(ADD_ERR)"),
+    ("log(DV) ~ additive(SIGMA)", "log(DV) ~ additive(ADD_ERR)"),
+    (
+        "CMT=N: DV ~ TYPE(...) (per-endpoint, ODE models)",
+        "CMT=2: DV ~ proportional(PROP_ERR)",
+    ),
+    (
+        "<statement> weight = <expr>",
+        "DV ~ additive(ADD_ERR) weight = WPSE",
+    ),
+    (
+        "iiv_on_ruv = ETA_NAME (alongside a statement)",
+        "DV ~ proportional(PROP_ERR)\niiv_on_ruv = ETA_RUV",
+    ),
+    (
+        "if (COND) { DV ~ TYPE(...) } else { DV ~ TYPE(...) } (covariate-selected)",
+        "if (FREE == 0) { DV ~ proportional(PROP_TOTAL) } \
+         else { DV ~ proportional(PROP_UNBOUND) }",
+    ),
+];
+
+/// `ERROR_MODEL_FORMS` as the diagnostic renders it.
+fn error_model_form_list() -> String {
+    ERROR_MODEL_FORMS
+        .iter()
+        .map(|(spelling, _)| format!("`{spelling}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `;`-comment message for an `[error_model]` block, when that is what the
+/// `;` is: nothing before it, or a **complete error model** before it.
+///
+/// Placement is the whole point, and it is the same lesson
+/// `fit_option_semicolon_hint` records. The first version of this gate lived in
+/// the plain statement regex's `None` arm, which three accepted forms never
+/// reach: `parse_selected_error_model` consumes the whole block before that arm
+/// exists, and `split_weight_modifier` peels its tail before it. So
+/// `DV ~ additive(A) weight = WT ; comment` reported ``magnitude `(A) * (WT ;
+/// comment)`: Unexpected character: ;`` and an if/else with a trailing `;`
+/// reported `unexpected content after covariate-selected if/else` — two forms
+/// `ERROR_MODEL_FORMS` advertises, and the docs promised the comment message for
+/// both (#1390 review). Measured, not reasoned.
+///
+/// One gate, hoisted above every path, rather than teaching each path the same
+/// rule: three copies of a predicate that reject the same inputs is a test hole,
+/// not belt-and-braces (CLAUDE.md, and #1229 is the case that made the rule).
+///
+/// The "is the head complete?" test is [`parse_error_model_inner`] itself — the
+/// real parser, so every form it accepts is covered by construction and a form
+/// added later needs no edit here. Same reuse-the-source-of-truth trick as the
+/// `apply_fit_option` probe. No recursion: the head contains no `;` by
+/// construction, and it is the *inner* parse that is called.
+///
+/// The straddle is preserved and load-bearing: `banana ; x` and
+/// `DV ~ additive; (ADD)` have an *incomplete* head, so they get the ordinary
+/// form-list message instead of being told about a comment they did not write.
+fn error_model_semicolon_hint(lines: &[String]) -> Option<String> {
+    // Comment-stripped, exactly as the parse below sees them, so a `;` sitting
+    // inside a `#` comment is not classified as anything.
+    let stripped: Vec<String> = lines
+        .iter()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .collect();
+    let at = stripped.iter().position(|l| l.contains(';'))?;
+    let (before, _) = stripped[at].split_once(';')?;
+    let before = before.trim();
+
+    // The offending line as the user wrote it, for the message.
+    let shown = stripped[at].as_str();
+
+    // Nothing before the `;` is a whole line commented out. This arm is not
+    // redundant with the one below and cannot be folded into it: deleting the
+    // tail of such a line leaves the block *shorter*, so a single-line block
+    // becomes empty and fails with "No error model found" rather than parsing.
+    if before.is_empty() {
+        return Some(semicolon_is_not_a_comment("error_model", shown));
+    }
+
+    // Otherwise: is this a *trailing* comment? The literal question — delete
+    // from the `;` to the end of that line and does the block parse? — is the
+    // test, so the answer is right for every form by construction.
+    //
+    // The offending line is truncated **in place**; the lines after it are kept.
+    // Taking `stripped[..at]` instead would judge the head of a block whose rest
+    // was thrown away, and `DV ~ proportional(P)` + `iiv_on_ruv = E ; c` would
+    // be scored on a block that had lost its statement.
+    let mut without_tail = stripped.clone();
+    without_tail[at] = before.to_string();
+    parse_error_model_inner(&without_tail)
+        .is_ok()
+        .then(|| semicolon_is_not_a_comment("error_model", shown))
+}
+
 fn parse_error_model(
+    lines: &[String],
+) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
+    if let Some(hint) = error_model_semicolon_hint(lines) {
+        return Err(hint);
+    }
+    parse_error_model_inner(lines)
+}
+
+fn parse_error_model_inner(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
     // Covariate-selected if/else form (issue #658) — detected and parsed first;
@@ -16563,7 +16785,34 @@ fn parse_error_model(
         } else {
             match re.captures(&body) {
                 Some(c) => (false, c),
-                None => continue, // not an error-model statement
+                // #1390: an `[error_model]` line is consumed by exactly one
+                // statement form — `iiv_on_ruv`, the `CMT=N:` prefix and the
+                // `weight =` modifier have already been peeled above — or it is
+                // an error. Before this it was `continue`d, so a stray `banana`
+                // (or a `DV ~ additive` missing its argument list) was dropped
+                // with `ferx check` reporting VALID; the block then either fitted
+                // the *other* line or failed far downstream with "No error model
+                // found", neither of which names the line at fault.
+                //
+                // Quote `trimmed` — what the user wrote, minus the comment tail —
+                // not the peeled `body`, whose `CMT=` prefix and `weight =` tail
+                // are gone and which can therefore be a string appearing nowhere
+                // in the file (#1388 review made the same fix in `[parameters]`).
+                None => {
+                    // No `;` classification here: `error_model_semicolon_hint`
+                    // owns it, above every parse path, because three of the
+                    // accepted forms never reach this arm (#1390 review). A
+                    // second copy of the predicate here would reject exactly the
+                    // inputs that one already rejects, so deleting either would
+                    // leave the suite green and neither could be mutation-tested
+                    // — the #1229 shape.
+                    return Err(format!(
+                        "[error_model]: unrecognized line `{trimmed}`. Expected one of: {}. A \
+                         statement must be the whole line — leading or trailing text is \
+                         rejected, not ignored.",
+                        error_model_form_list()
+                    ));
+                }
             }
         };
         let error_type = caps[2].to_lowercase();

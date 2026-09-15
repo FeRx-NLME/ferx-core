@@ -1448,3 +1448,92 @@ fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
     );
     let _ = std::fs::remove_file(&ok_path);
 }
+
+/// #1390, the issue's own reproduction, through the tool the user actually runs.
+///
+/// `method saem` — the `=` left out — used to leave `ferx check` printing
+/// `ok: … — no errors (0 warning(s))`, and the fit then ran the **default
+/// estimator**. That is a different algorithm, not a perturbed start: the
+/// objective the user reads is not comparable to the one they asked for, and
+/// the `-fit.yaml` records the method that actually ran, which they have no
+/// reason to re-read.
+///
+/// The control below is the load-bearing half. Without it these arms are
+/// satisfied by a check that rejects every model it sees — and the *same*
+/// control also pins what the reject arm must not do: `method = saem` still
+/// parses and still selects SAEM.
+#[test]
+fn a_fit_option_or_error_model_line_that_matches_nothing_fails_the_check() {
+    let base = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+";
+
+    // The control: `=` present, check passes, and the method asked for is the
+    // method parsed.
+    let ok = temp_model(
+        "fit_option_equals_control",
+        &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n\n[fit_options]\n  method = saem\n"),
+    );
+    let report = validate_model_file(ok.to_str().unwrap(), None);
+    assert!(report.valid, "control model: {:?}", report.diagnostics);
+    let parsed = parse_full_model_file(&ok).expect("control model parses");
+    assert_eq!(
+        format!("{:?}", parsed.fit_options.method),
+        "Saem",
+        "the control must actually select SAEM, or the arms below prove nothing"
+    );
+    let _ = std::fs::remove_file(&ok);
+
+    // The defect: one character removed.
+    let bad = temp_model(
+        "fit_option_missing_equals",
+        &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n\n[fit_options]\n  method saem\n  maxiter 42\n"),
+    );
+    let report = validate_model_file(bad.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "`method saem` must not report VALID: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("method = saem")),
+        "the diagnostic must name the repair: {:?}",
+        report.diagnostics
+    );
+    let _ = std::fs::remove_file(&bad);
+
+    // The same for `[error_model]`.
+    let bad = temp_model(
+        "error_model_stray_line",
+        &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  banana\n"),
+    );
+    let report = validate_model_file(bad.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "a stray `[error_model]` line must not report VALID: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("banana")),
+        "the diagnostic must quote the offending line: {:?}",
+        report.diagnostics
+    );
+    let _ = std::fs::remove_file(&bad);
+}
