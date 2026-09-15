@@ -15,6 +15,37 @@ The `[error_model]` block defines the residual error structure, specifying how o
 DV ~ ERROR_TYPE(SIGMA_PARAMS)
 ```
 
+Every line in the block must be consumed end to end by exactly one statement
+form, and a line matching none of them is a **parse error** quoting the
+offending line and listing the forms:
+
+```
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  banana                        # rejected
+```
+
+Trailing text counts — a statement must be the whole line, so
+`DV ~ additive(ADD) oops` is rejected rather than read as
+`DV ~ additive(ADD)`. `;` does not start a comment here either (only `#` and
+`//` do), and a line carrying one says so rather than reporting a missing
+argument list.
+
+Before 0.4.0 an unmatched line was dropped without a diagnostic: `ferx check`
+reported the file VALID, and the block then either fitted whichever *other* line
+it had or failed with "No error model found in [error_model] block", neither of
+which named the line at fault. See
+[#1390](https://github.com/FeRx-NLME/ferx-core/issues/1390).
+
+The accepted forms are `DV ~ additive(SIGMA)`, `DV ~ proportional(SIGMA)`,
+`DV ~ combined(SIGMA_PROP, SIGMA_ADD)`, [`DV ~ power(SIGMA, EXPONENT)`](#power),
+the two log-transform-both-sides spellings `DV ~ log_additive(SIGMA)` and
+`log(DV) ~ additive(SIGMA)`, a [`CMT=N:`](#multiple-endpoints-per-cmt-error-models)
+prefix on any of them, the [`weight = <expr>`](#residual-weighting-weight-...)
+modifier, [`iiv_on_ruv = ETA_NAME`](#iiv-on-residual-error-iiv_on_ruv) alongside a
+statement, and the [covariate-selected `if/else`](#covariate-selected-error-models-ifelse)
+form. Each is described below.
+
 ## Available Error Models
 
 ### Additive
@@ -812,8 +843,9 @@ reports rho sitting on this rail is telling you the two endpoints are carrying
 the same noise — treat it as a diagnostic, not an estimate.
 
 **The rail applies to an estimate, not to a declaration.** A `FIX`ed correlation
-is held exactly, at any `|rho| < 1` the parser accepts, and is never moved onto
-the `0.995` rail. That is the whole difference between the two spellings: a rail
+is held exactly, at every `|rho| < 1` the parser accepts — right up to the unit
+boundary, where `atanh` stops being finite — and is never moved onto the
+`0.995` rail. That is the whole difference between the two spellings: a rail
 is an argument about what the optimizer may *search*, and `FIX` is not a search.
 An initial estimate for a **free** rho that is itself past the rail is clamped
 onto it before the first objective evaluation, and ferx says so

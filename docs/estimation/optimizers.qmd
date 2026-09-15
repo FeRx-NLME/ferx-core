@@ -168,6 +168,44 @@ The choice mirrors the analytic-vs-FD decision the outer loop already makes, so 
 
 The resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
+### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
+
+Because `auto` resolves off the availability of the analytic gradient, changing
+**one** line in `[fit_options]` — `gradient = auto` to `gradient = fd` — changes
+**two** factors: the gradient the outer loop computes, *and* the optimizer that
+consumes it. On the model that prompted [#1381](https://github.com/FeRx-NLME/ferx-core/issues/1381)
+that one-line change moved the OFV by 4.98; with `optimizer = bobyqa` pinned in
+both arms, the gradient alone accounted for **0.38**. The other 4.6 was the
+optimizer swap.
+
+The default is not wrong — picking the optimizer that suits the available
+gradient is the whole point of `auto`, and it rests on the #490 benchmarking
+above. But a controlled one-variable experiment has to pin the other variable:
+
+```
+[fit_options]
+gradient = fd
+optimizer = bobyqa      # pin it in BOTH arms, so the difference is the gradient
+```
+
+ferx warns when you don't. Setting `gradient = fd` while leaving `optimizer` at
+`auto`, on a model whose analytic gradient *is* in scope, emits
+`W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT` naming both the optimizer that ran and the
+one the unforced arm would use. `ferx check` reports it too, against the
+`gradient` line itself, so the coupling surfaces before the fit is run.
+
+The warning is silent whenever nothing was actually coupled — `optimizer`
+pinned; a model out of analytic scope anyway, where `auto` picks `bobyqa` either
+way; a model above `BOBYQA_MAX_DIM`, where `auto` takes `nlopt_lbfgs` on a
+finite-difference gradient regardless; a [mixture](mixture.qmd) model, whose
+`auto` is `bobyqa` whatever the gradient; an evaluation-only
+(`maxiter = 0`) run, which constructs no optimizer at all; and an SDE model,
+which the engine forces onto finite differences whatever you asked for.
+
+Two related fields record the *effect* after the fact rather than the coupling:
+`optimizer` reports the compound `"auto (bobyqa)"`, and `final_gradient_source`
+reports `"finite_difference"` for an arm that silently became derivative-free.
+
 ### Leaving the initial estimates
 
 Both gradient-based NLopt optimizers start with their quasi-Newton Hessian set to the identity, so their opening search direction is simply $-\nabla f$. On a typical PK model the scaled analytic gradient is large at the initial estimates ($10^2$–$10^3$ in log/Cholesky space), so that first step lands in a corner of the parameter box, the objective there explodes, and the line search fails — leaving the fit sitting on (or a hair off) its initial estimates for the rest of the budget.

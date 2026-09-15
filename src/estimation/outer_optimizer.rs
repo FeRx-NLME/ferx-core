@@ -116,6 +116,70 @@ pub struct OuterResult {
 }
 
 /// Run the outer optimization loop (population parameter estimation).
+/// Whether this fit runs an outer optimizer at all.
+///
+/// `outer_maxiter == 0` is an evaluation-only run (NONMEM `MAXEVAL=0`): the
+/// objective is reported at the initial parameters and **no optimizer is ever
+/// constructed** (see the short-circuit at the top of [`optimize_population`],
+/// which calls this). Shared rather than re-spelled so a diagnostic that talks
+/// about "the optimizer that ran" cannot claim one ran on a fit that never
+/// reached the optimizer (#1381 review).
+pub(crate) fn runs_outer_optimizer(options: &FitOptions) -> bool {
+    options.outer_maxiter > 0
+}
+
+/// The outer optimizer a fit actually runs, and the warning (if any) owed to a
+/// user whose explicit choice could not be honoured.
+///
+/// **Single source of truth for `optimizer = auto`.** `Optimizer::resolve_auto`
+/// is only half the rule — the mixture arm below overrides it outright — so a
+/// second caller that consults `resolve_auto` directly gets the wrong answer on
+/// a mixture model. That is exactly what the #1381 coupling check did before
+/// review: on an analytic-scope mixture with `gradient = fd` it reported a swap
+/// from `nlopt_lbfgs` to `bobyqa` although both arms run BOBYQA regardless.
+///
+/// `analytic_outer_gradient` is passed in rather than read off `model` so the
+/// same function answers the counterfactual — "what would `auto` have picked had
+/// the gradient not been forced?" — without a re-spelled copy of the rule.
+pub(crate) fn resolve_outer_optimizer(
+    requested: Optimizer,
+    model: &CompiledModel,
+    has_mixture: bool,
+    analytic_outer_gradient: bool,
+) -> (Optimizer, Option<String>) {
+    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
+    // choice — robust against the mixture's label-switching multimodality. Since
+    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
+    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
+    // honoured — those route through `optimize_nlopt`, whose objective closure
+    // branches to `mixture_gradient`. Every other choice (including `auto`, and
+    // the built-in BFGS / trust-region paths, which do not carry the mixture
+    // objective) falls back to BOBYQA.
+    if has_mixture {
+        return match requested {
+            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => (requested, None),
+            // `Auto` is the mixture default and downgrades silently by design;
+            // any *explicitly* chosen optimizer that the mixture path can't drive
+            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
+            // mixture objective) is run under BOBYQA instead, so say so rather than
+            // dropping the choice invisibly.
+            Optimizer::Auto => (Optimizer::Bobyqa, None),
+            other => (
+                Optimizer::Bobyqa,
+                Some(format!(
+                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
+                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
+                     the mixture objective and was replaced by BOBYQA."
+                )),
+            ),
+        };
+    }
+    (
+        requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
+        None,
+    )
+}
+
 pub fn optimize_population(
     model: &CompiledModel,
     population: &Population,
@@ -134,43 +198,23 @@ pub fn optimize_population(
     // from its analytical sibling on x86 Linux). BOBYQA and the built-in BFGS loop
     // already honour 0, but routing every optimizer through one eval-only path
     // keeps the semantics uniform.
-    if options.outer_maxiter == 0 {
+    if !runs_outer_optimizer(options) {
         return evaluate_at_initial_params(model, population, init_params, options);
     }
     // Resolve `auto` once, here, so the concrete optimizer flows through the rest
     // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
     // branching). Every other variant is returned unchanged, so this is a no-op
     // unless the user left the default `auto` in place.
-    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
-    // choice — robust against the mixture's label-switching multimodality. Since
-    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
-    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
-    // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. Every other choice (including `auto`, and
-    // the built-in BFGS / trust-region paths, which do not carry the mixture
-    // objective) falls back to BOBYQA.
-    let mut optimizer_downgrade_warning: Vec<String> = Vec::new();
-    let resolved = if init_params.mixture.is_some() {
-        match options.optimizer {
-            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => options.optimizer,
-            // `Auto` is the mixture default and downgrades silently by design;
-            // any *explicitly* chosen optimizer that the mixture path can't drive
-            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
-            // mixture objective) is run under BOBYQA instead, so say so rather than
-            // dropping the choice invisibly.
-            Optimizer::Auto => Optimizer::Bobyqa,
-            other => {
-                optimizer_downgrade_warning.push(format!(
-                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
-                     the mixture objective and was replaced by BOBYQA."
-                ));
-                Optimizer::Bobyqa
-            }
-        }
-    } else {
-        options.optimizer.resolve_auto(model, options.interaction)
-    };
+    // The mixture arm and the `auto` resolution both live in
+    // `resolve_outer_optimizer`, so the #1381 coupling check cannot describe a
+    // different rule than the one that runs here.
+    let (resolved, downgrade) = resolve_outer_optimizer(
+        options.optimizer,
+        model,
+        init_params.mixture.is_some(),
+        crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction),
+    );
+    let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
     let options = if resolved == options.optimizer {
         options

@@ -222,13 +222,8 @@ pub fn prepare_run_with_inits(
     // Sync the resolved gradient method from fit_options onto the model so
     // `resolve_gradient_method` (which reads `model.gradient_method`) honours
     // the file's `gradient = ...` key. Mirrors `fit_from_files` (SDE forces FD).
-    parsed.model.gradient_method = if parsed.model.is_sde()
-        && parsed.fit_options.gradient_method != crate::types::GradientMethod::Fd
-    {
-        crate::types::GradientMethod::Fd
-    } else {
-        parsed.fit_options.gradient_method
-    };
+    parsed.model.gradient_method =
+        crate::types::GradientMethod::effective(&parsed.model, &parsed.fit_options);
 
     // Hash both inputs up front (needed before the fit for the checkpoint
     // integrity check, #755) and reuse the digests for the post-fit result
