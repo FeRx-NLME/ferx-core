@@ -14,6 +14,35 @@ The optional `[fit_options]` block configures the estimation method and optimize
   key = value
 ```
 
+Every line is a `key = value` pair, and a line that is not one is a **parse
+error** naming the repair — it is not ignored:
+
+```
+[fit_options]
+  method saem       # rejected
+```
+
+```
+[fit_options]: `method saem` is not a `key = value` pair — did you mean
+`method = saem`? Every `[fit_options]` line assigns one key with `=`; a line
+without it is rejected, not ignored.
+```
+
+Before 0.4.0 such a line was dropped without a diagnostic. That is worth
+spelling out because of what the dropped line usually is: `method` written
+without its `=` differs from the accepted spelling by one character, the
+surrounding DSL is *not* uniformly `key = value` (`[parameters]` and
+`[error_model]` lines are not), and the consequence is that the fit silently
+runs the **default estimator**. A run that falls back from SAEM to FOCEI is a
+different algorithm, not a perturbed start, and its objective is not comparable
+to the one you asked for. `ferx check` reported the file VALID, and only the
+`{model}-fit.yaml` recorded the method that actually ran. See
+[#1390](https://github.com/FeRx-NLME/ferx-core/issues/1390).
+
+`;` does not start a comment in a `.ferx` file — use `#` or `//`. A line
+carrying one (`method = saem ; run 3`, or a whole line commented out with a
+leading `;`) says so rather than reporting an unknown key.
+
 ## General Options
 
 Keys that apply to every estimation method, grouped by the machinery each one
