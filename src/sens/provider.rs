@@ -1002,12 +1002,23 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// `resolve_auto` would pick a gradient-based optimizer that then stalls on a meaningless
 /// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
-    !matches!(model.gradient_method, GradientMethod::Fd)
-        // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
-        // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
-        // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
-        // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
-        && !model.has_non_gaussian()
+    !matches!(model.gradient_method, GradientMethod::Fd) && analytic_outer_gradient_in_scope(model)
+}
+
+/// The *scope* half of [`analytic_outer_gradient_available`]: whether the model's
+/// structure admits the exact analytic outer gradient, ignoring the user's
+/// `gradient_method` override.
+///
+/// Split out so the `gradient = fd` ⇒ `optimizer = auto` coupling (#1381) can ask
+/// the counterfactual — "what would `auto` have picked had the gradient not been
+/// forced?" — off the *same* predicate the live decision uses, rather than a second
+/// copy of the scope list that would drift from it.
+pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
+    // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
+    // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
+    // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
+    // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
+    !model.has_non_gaussian()
         // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
         // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
         // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the

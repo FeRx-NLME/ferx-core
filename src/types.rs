@@ -4401,6 +4401,42 @@ pub enum GradientMethod {
     Fd,
 }
 
+impl GradientMethod {
+    /// The gradient method the outer loop will actually use for this
+    /// `(model, options)` pair — **the** answer to "is this fit on finite
+    /// differences?", for a caller that has both.
+    ///
+    /// The outer loop reads `model.gradient_method`, and the production entry
+    /// points (`fit_from_files`, `run_model_with_data`) stamp it from
+    /// `options.gradient_method` — forcing `Fd` for an SDE model, which has no
+    /// analytic-sensitivity path — before calling `fit()`. Both of those now stamp
+    /// *this* function, so there is one rule rather than three copies of it.
+    ///
+    /// It is deliberately the **union** of the three sources rather than a replay
+    /// of the stamp, because not every caller has run the stamp:
+    ///
+    /// - `validate_model_file` (`ferx check`) hands `check_model_options` the model
+    ///   straight out of the parser, whose `gradient_method` is still `Auto` while
+    ///   `[fit_options] gradient = fd` sits in the *options* — reading the model
+    ///   alone there says `Auto` for a fit that will run on FD (#1381 review).
+    /// - a Rust caller invoking `fit()` directly may have set
+    ///   `model.gradient_method` by hand and never touched `options` — reading the
+    ///   options alone would miss it, and the loop honours the model.
+    ///
+    /// Taking either source's `Fd`, plus `is_sde`, is right in all three cases and
+    /// idempotent on an already-stamped model.
+    pub(crate) fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
+        if model.gradient_method == GradientMethod::Fd
+            || options.gradient_method == GradientMethod::Fd
+            || model.is_sde()
+        {
+            GradientMethod::Fd
+        } else {
+            options.gradient_method
+        }
+    }
+}
+
 impl CompiledModel {
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///
@@ -8149,6 +8185,29 @@ impl Optimizer {
     /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
     /// is in scope.
     pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
+        self.resolve_auto_given_analytic(
+            model,
+            crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction),
+        )
+    }
+
+    /// [`Optimizer::resolve_auto`] with the analytic-outer-gradient predicate supplied
+    /// by the caller instead of read off `model`.
+    ///
+    /// The one production caller passes the live predicate (via `resolve_auto`). The
+    /// point of the split is the **counterfactual**: the `gradient = fd` ⇒
+    /// `optimizer = auto` coupling warning (#1381) has to ask what `auto` would have
+    /// picked with the gradient left at `auto`, and it must ask it off this function
+    /// rather than a re-spelled copy of the rule — a second copy is what lets the
+    /// warning claim a coupling that the resolver does not actually have (the
+    /// `BOBYQA_MAX_DIM` arm below being the arm that would drift first, since above
+    /// the threshold `auto` takes L-BFGS on an FD gradient and there is no coupling
+    /// to report).
+    pub(crate) fn resolve_auto_given_analytic(
+        self,
+        model: &CompiledModel,
+        analytic_outer_gradient: bool,
+    ) -> Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
@@ -8167,7 +8226,7 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
-        if crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction) {
+        if analytic_outer_gradient {
             Optimizer::NloptLbfgs
         } else {
             Optimizer::Bobyqa

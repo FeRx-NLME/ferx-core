@@ -183,6 +183,10 @@ mod indiv_param_values_tests;
 mod quiet_fit_tests;
 
 #[cfg(test)]
+#[path = "tests/auto_optimizer_gradient_coupling_tests.rs"]
+mod auto_optimizer_gradient_coupling_tests;
+
+#[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
 

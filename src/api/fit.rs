@@ -113,13 +113,10 @@ pub fn fit_from_files(
     }
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
-    // SDE models have no analytic-sensitivity path — force FD.
-    model.gradient_method =
-        if model.is_sde() && opts.gradient_method != crate::types::GradientMethod::Fd {
-            crate::types::GradientMethod::Fd
-        } else {
-            opts.gradient_method
-        };
+    // SDE models have no analytic-sensitivity path — force FD. One rule, shared
+    // with `run.rs`'s stamp and with the #1381 coupling check, which has to agree
+    // with what the loop will actually do on a model the parser has not stamped.
+    model.gradient_method = crate::types::GradientMethod::effective(&model, &opts);
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     result.covariate_table = covariate_table;
     if let Some(w) = data_path_warning {
