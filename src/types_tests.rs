@@ -1829,13 +1829,15 @@ fn dose_event_resolve_rate_modeled_duration_matches_explicit_infusion() {
 
 #[test]
 fn dose_event_resolve_rate_clamps_nonpositive_duration() {
-    // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
+    // A transient *finite* D <= 0 mid-search clamps to DURATION_FLOOR so
     // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_PARAM).
+    // A NON-finite D is not a small positive one and takes the other branch —
+    // `dose_event_resolve_rate_repels_a_non_finite_duration` (#1284).
     let mut map = DoseAttrMap::default();
     map.insert(DoseAttr::Duration, 1, 9);
     let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
 
-    for bad in [0.0, -3.0, f64::NAN] {
+    for bad in [0.0, -3.0, -1e-9] {
         let mut params = [0.0; MAX_PK_PARAMS];
         params[9] = bad;
         let r = modeled.resolve_rate(&map, &params);
@@ -1874,13 +1876,15 @@ fn dose_event_resolve_rate_modeled_rate_matches_explicit_infusion() {
 
 #[test]
 fn dose_event_resolve_rate_clamps_nonpositive_rate() {
-    // A transient R <= 0 (or NaN) mid-search clamps to RATE_FLOOR so the
+    // A transient *finite* R <= 0 mid-search clamps to RATE_FLOOR so the
     // implied duration = amt / R stays finite (mirror of the duration clamp).
+    // A NON-finite R takes the other branch — see
+    // `dose_event_resolve_rate_repels_a_non_finite_duration` (#1284).
     let mut map = DoseAttrMap::default();
     map.insert(DoseAttr::Rate, 1, 9);
     let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
 
-    for bad in [0.0, -3.0, f64::NAN] {
+    for bad in [0.0, -3.0, -1e-9] {
         let mut params = [0.0; MAX_PK_PARAMS];
         params[9] = bad;
         let r = modeled.resolve_rate(&map, &params);
@@ -1889,6 +1893,73 @@ fn dose_event_resolve_rate_clamps_nonpositive_rate() {
             r.duration.is_finite() && r.duration > 0.0,
             "duration finite"
         );
+    }
+}
+
+#[test]
+fn dose_event_resolve_rate_repels_a_non_finite_duration_or_rate() {
+    // #1284. A non-finite modeled `D{n}`/`R{n}` must NOT take the domain-floor
+    // clamp: `x > floor` is false for `NaN`, so the floor arm served the dose as
+    // an instantaneous bolus (`duration = 1e-8`) and `+inf` served one too
+    // (`rate = amt/inf = 0`, which `is_infusion()` reads as "not an infusion").
+    // Both returned finite, silently wrong numbers — measured 2.03x high at one
+    // elimination half-time on a 1-cpt model.
+    //
+    // The property that makes the engines repel instead is that the resolved
+    // dose's **time** is non-finite: that is what every walk's timeline guard
+    // reads (`timeline_has_non_finite` / `EventSchedule::non_finite_event_time`,
+    // and `predict_concentration`'s `t_eff` guard). The `(rate, duration)` pair
+    // cannot carry it — `is_real_infusion` demands both finite and positive, so
+    // a non-finite pair falls to the bolus branch, which reads only `amt`.
+    //
+    // Mutation (run): drop either `if !d_raw.is_finite()` / `if !r_raw.is_finite()`
+    // early return in `resolve_rate` → that attribute's arm resolves to a finite
+    // time at the floor and the `is_finite()` assert below fires, naming D or R.
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Duration, 1, 9);
+    map.insert(DoseAttr::Rate, 1, 10);
+
+    for (attr, slot, mode) in [
+        ("D1", 9usize, RateMode::ModeledDuration),
+        ("R1", 10usize, RateMode::ModeledRate),
+    ] {
+        let modeled = DoseEvent::modeled(3.0, 100.0, 1, false, 0.0, mode);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut params = [0.0; MAX_PK_PARAMS];
+            params[slot] = bad;
+            let r = modeled.resolve_rate(&map, &params);
+            assert!(
+                !r.time.is_finite(),
+                "{attr} = {bad}: resolved time {} is finite, so no timeline guard sees it \
+                 and the dose is served as a bolus",
+                r.time
+            );
+            assert!(!r.rate.is_finite(), "{attr} = {bad}: rate {}", r.rate);
+            assert!(
+                !r.duration.is_finite(),
+                "{attr} = {bad}: duration {}",
+                r.duration
+            );
+            // Resolution still happened — a dose left `Modeled` would trip
+            // `is_real_infusion`'s unresolved tripwire in every engine.
+            assert_eq!(r.rate_mode, RateMode::Fixed, "{attr} = {bad}: resolved");
+            // The event is still recognisable: amt/cmt/ss/ii are untouched.
+            assert_eq!((r.amt, r.cmt, r.ss, r.ii), (100.0, 1, false, 0.0));
+        }
+
+        // The straddle, and it must straddle under the OLD behaviour too: a
+        // finite value just *below* the floor is the clamp's own job and keeps a
+        // finite time, while `NaN` — which the old `>` comparison sent down the
+        // same arm — does not. Assert the straddle itself so it cannot silently
+        // become a tautology.
+        let mut low = [0.0; MAX_PK_PARAMS];
+        low[slot] = 1e-12;
+        let clamped = modeled.resolve_rate(&map, &low);
+        assert!(
+            clamped.time.is_finite() && clamped.rate.is_finite() && clamped.duration.is_finite(),
+            "{attr}: a finite sub-floor value is clamped, not repelled"
+        );
+        assert_eq!(clamped.time, 3.0, "{attr}: the clamp leaves the time alone");
     }
 }
 

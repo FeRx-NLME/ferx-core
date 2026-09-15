@@ -1028,6 +1028,17 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
 - A transient `D{n} ≤ 0` during estimation is clamped to a tiny positive floor
   (so `AMT / D{n}` stays finite); the converged optimum is interior, so reported
   estimates are unaffected — the same guard the built-in absorption models use.
+- A **non-finite** `D{n}` (`NaN` / `Inf`) is *not* clamped — it is out of domain,
+  not on the wrong side of a wall. One that is already non-finite at typical
+  values is rejected at fit-init as `E_DOSE_ATTR_NONFINITE`, naming the subject
+  and the dose record; one produced by a mid-fit parameter excursion makes that
+  subject's predictions `NaN`, which the estimator reads as a diverged solve and
+  the optimizer as a wall to climb away from. Before
+  [#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284) both shapes were
+  quietly served as an **instantaneous bolus** — `NaN` took the floor (every `>`
+  is false for `NaN`) and `+Inf` gave `rate = AMT/Inf = 0`, which is not an
+  infusion at all — so the fit returned finite, silently wrong numbers, measured
+  2.03× high at one elimination half-time on a 1-cpt model.
 
 > ⚠️ Like `F{n}` / `ALAG{n}`, `D{n}` is a **reserved name** when a `RATE=-2` dose
 > targets compartment `n` (as in NONMEM). It then denotes that compartment's
@@ -1088,7 +1099,12 @@ matching `R{n}` (else a loud `E_MODELED_RATE_NO_PARAM` error, never a silent
 bolus); `R{n}` is a **reserved name** when a `RATE=-1` dose targets compartment
 `n`; it works on **both engines** over the same infusable compartments; a transient
 `R{n} ≤ 0` is clamped to a tiny positive floor (and warned via
-`W_MODELED_RATE_NONPOSITIVE` if non-positive at the initial estimate); and a
+`W_MODELED_RATE_NONPOSITIVE` if non-positive at the initial estimate); a
+**non-finite** `R{n}` is rejected at fit-init or repels the subject mid-fit,
+exactly as for `D{n}` above
+([#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284) — the damage ran the
+other way there, a `NaN` clamped to `RATE_FLOOR = 1e-8` spreading the dose over
+`AMT/1e-8` time units so that essentially nothing was delivered); and a
 modeled-rate dose routes its analytical gradient to finite differences. Internally,
 `RATE=-1 R{n}=r` resolves to exactly the explicit `RATE = r` infusion.
 
