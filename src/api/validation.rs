@@ -4504,32 +4504,68 @@ pub(crate) fn check_packed_start_in_box(
     // so an eval-only run reports the OFV of the substituted value; there is no
     // run of any length in which the declared number is used (#1307).
     //
-    // It reports only what the two walks below do **not** claim, which makes it
-    // exactly complementary to them rather than a second opinion. Two reasons,
-    // and the first is a correctness one:
+    // It stands down on a coordinate another diagnostic **will actually be
+    // emitted** for, so the two are complementary rather than two opinions —
+    // and "will actually be emitted" is the whole of the predicate, not a
+    // paraphrase of it. `claimed` used to be built unconditionally from the two
+    // walks below, but those walks sit *after* the `maxiter = 0` early return:
+    // at `maxiter = 0` their indices suppressed this arm while producing nothing
+    // themselves, so `theta TVCL(-5.0, 0.0, 10.0)` reported **nothing at all**
+    // on an eval-only run that scores `1e-10` — the exact guarantee this arm
+    // exists to make (#1307 review round 1). The `outer_search_runs` gate is
+    // what keeps the suppression tied to an actual emission.
     //
-    // * A coordinate the box *also* moves is moved **twice** — `sigma X ~ 0.0
-    //   (sd)` floors to an SD of `1e-10` here and is then clamped onto the
-    //   `exp(-8) = 3.355e-4` rail — so a message naming this guard's output
-    //   would name a number the fit never uses. On an unclaimed coordinate the
-    //   packed value is inside its box by definition, the clamp is a no-op, and
-    //   `represented` really is what every objective evaluation sees.
-    // * What is left over is precisely the set nothing else can see: a **held**
-    //   coordinate, whose box `pack_with_bounds` pins to the already-moved value;
-    //   a θ whose declared lower is itself at or below the floor, where the
-    //   packer floors the value and the bound identically; and a free ρ, which
-    //   lands exactly *on* its rail rather than outside it. Those three are the
-    //   #1309 doc's list of what the box predicate is structurally blind to.
+    // `coordinates_outside_bounds`' below-a-variance-rail hits are claimed here
+    // although *this* function skips them: `check_variance_init_rails` emits
+    // them, both call sites run it alongside this check (`api::fit` and
+    // `validate_model_file`), and it carries the identical `outer_search_runs`
+    // exemption — so the gate holds for that arm too.
     //
-    // The claimed set is taken from the same iterators the walks below use, so a
-    // coordinate cannot fall between the two.
-    let claimed: std::collections::BTreeSet<usize> = inverted
-        .iter()
-        .copied()
-        .chain(coordinates_outside_bounds(&start, &kinds).map(|h| h.index))
-        .chain(theta_outside_declared_range(init_params).map(|h| h.index))
-        .collect();
+    // What is left over is precisely the set nothing else can see: a **held**
+    // coordinate, whose box `pack_with_bounds` pins to the already-moved value;
+    // a θ whose declared lower is itself at or below the floor, where the packer
+    // floors the value and the bound identically; and a free ρ, which lands
+    // exactly *on* its rail rather than outside it. Those three are the #1309
+    // doc's own list of what the box predicate is structurally blind to.
+    let mut claimed: std::collections::BTreeSet<usize> = inverted.iter().copied().collect();
+    if outer_search_runs(options) {
+        claimed.extend(coordinates_outside_bounds(&start, &kinds).map(|h| h.index));
+        claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
+    }
+
+    // What the fit will **actually** use, which is not `mv.represented` whenever
+    // the box moves the coordinate a second time: `sigma X ~ 0.0 (sd)` is
+    // floored to an SD of `1e-10` by the packer and then clamped onto the
+    // `exp(-8) = 3.355e-4` rail, and a message naming the intermediate would
+    // name a number no objective evaluation ever sees.
+    //
+    // Taken by running the **real** unpacker over the clamped vector rather than
+    // by back-transforming each kind here, so there is no second copy of the
+    // packing convention to drift — `coordinate_values` puts it on the same
+    // reporting scale `PackMove::declared` uses. Built lazily: `start.moves` is
+    // empty on essentially every fit, and this allocates three vectors.
+    //
+    // Clamping per coordinate rather than through `clamp_to_bounds`, and
+    // skipping `inverted`, because that helper calls `f64::clamp`, which
+    // **panics** on `min > max` — and `inverted` holds exactly the coordinates
+    // `coordinates_with_inverted_bounds` found to be unorderable, so every index
+    // it does not hold satisfies `lower <= upper`.
+    let mut effective: Option<Vec<f64>> = None;
     for mv in start.moves.iter().filter(|m| !claimed.contains(&m.index)) {
+        let effective = effective.get_or_insert_with(|| {
+            let mut clamped = start.packed.clone();
+            for (i, x) in clamped.iter_mut().enumerate() {
+                if !inverted.contains(&i) {
+                    *x = x.clamp(start.bounds.lower[i], start.bounds.upper[i]);
+                }
+            }
+            crate::estimation::parameterization::coordinate_values(
+                &crate::estimation::parameterization::unpack_params(&clamped, init_params),
+            )
+        });
+        // Falls back to the packer's own output if the parallel vector is short
+        // — the same hand-built-`ModelParameters` guard the walks above carry.
+        let seen = effective.get(mv.index).copied().unwrap_or(mv.represented);
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
         let name = names
             .get(mv.index)
@@ -4565,7 +4601,7 @@ pub(crate) fn check_packed_start_in_box(
                 ),
             ),
             PackGuard::RhoUnit => (
-                "a correlation of exactly ±1 has no Fisher-z coordinate (`atanh(±1)` is \
+                "a correlation at or beyond ±1 has no Fisher-z coordinate (`atanh(±1)` is \
                  infinite), so the packer backs it off the unit boundary"
                     .to_string(),
                 format!("declare {name} strictly inside (−1, 1)"),
@@ -4584,14 +4620,26 @@ pub(crate) fn check_packed_start_in_box(
         } else {
             String::new()
         };
-        // The floor is one of ferx's own literals and `{:e}` round-trips it
-        // exactly (`1e-10`, `1e-20`); the ρ substitutes are *computed* and
-        // `{:e}` hands the user seventeen digits of a rail whose definition is
-        // `tanh(3)` — `9.950547536867305e-1`, measured. Same split #1309's
-        // review applied to the box messages, for the same reason.
-        let represented = match mv.guard {
-            PackGuard::ValueFloor => format!("{:e}", mv.represented),
-            PackGuard::RhoRail | PackGuard::RhoUnit => format!("{:.6e}", mv.represented),
+        // A ferx literal (`1e-10`, `1e-20`) round-trips exactly under `{:e}`;
+        // anything *computed* does not — `{:e}` on `tanh(3)` hands the user
+        // `9.950547536867305e-1`, seventeen digits of a rail whose definition is
+        // `tanh(3)`, and the box rails are `exp(-8)`-shaped too. Same split
+        // #1309's review applied to the box messages, for the same reason.
+        let computed = seen != mv.represented || mv.guard != PackGuard::ValueFloor;
+        let represented = if computed {
+            format!("{seen:.6e}")
+        } else {
+            format!("{seen:e}")
+        };
+        // The box moved it a *second* time, so the cause has to name both steps
+        // or the guard it blames will not explain the number it quotes.
+        let chain = if seen != mv.represented {
+            format!(
+                ", which the optimizer's own box then clamps to {:.6e}",
+                seen
+            )
+        } else {
+            String::new()
         };
         // A held coordinate never moves again, so the substituted value is what
         // the whole fit uses; a free one only *starts* there and the optimizer
@@ -4607,7 +4655,7 @@ pub(crate) fn check_packed_start_in_box(
                 NOT_REPRESENTABLE_TOKEN,
                 format!(
                     "{NOT_REPRESENTABLE_TOKEN}: {name} is declared as {:e} but the optimizer \
-                     sees {represented} — {cause}. Every objective evaluation, and every \
+                     sees {represented} — {cause}{chain}. Every objective evaluation, and every \
                      estimate that depends on {name}, uses the value the optimizer sees, so \
                      {consequence}.{box_note} {remedy}.",
                     mv.declared,

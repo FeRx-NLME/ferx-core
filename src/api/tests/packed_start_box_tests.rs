@@ -1580,3 +1580,209 @@ fn only_one_shipped_model_file_declares_a_value_the_packer_cannot_hold() {
     #[cfg(feature = "survival")]
     assert_eq!(found.len(), 1, "{found:#?}");
 }
+
+/// Regression: the `RhoUnit` arm's message, which nothing had ever rendered.
+///
+/// `|ρ| = 1` has no Fisher-z coordinate at all (`atanh(±1)` is `±inf`), so
+/// `RHO_CLAMP` backs it off the unit boundary on **both** spellings — including
+/// the `FIX`ed one whose estimation rail #1307 removed. The parser rejects
+/// `|ρ| >= 1` at declaration time, so the only way in is a hand-built
+/// `ModelParameters`; this mutates a parsed one, which is the same thing a
+/// `ferx-tools` caller assembling parameters programmatically would produce.
+///
+/// Worth a test rather than an `unreachable!()`: dropping `RHO_CLAMP` along with
+/// `RHO_Z_BOUND` would have put `±inf` in the packed vector, which
+/// `compute_scale` divides a coordinate by. The Tier-1 twin
+/// (`a_fixed_rho_at_the_unit_boundary_is_still_finite`) pins the *packing*; this
+/// pins that the user is told.
+#[test]
+fn a_correlation_at_the_unit_boundary_is_reported_with_its_own_remedy() {
+    let model = block_sigma_model("block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05994, 0.09] FIX");
+    let mut params = model.default_params.clone();
+    params.residual_correlations[0].rho = 1.0;
+
+    // The premise: `FIX`ed, so the rail arm cannot also fire and this is a
+    // single-guard fixture. A free ρ = 1 would report the chain
+    // (1 → 0.999999 → 0.995055) as two moves, which is truthful but is not
+    // what this test is about.
+    assert_eq!(params.residual_correlation_fixed, vec![true]);
+
+    let start = pack_with_bounds(&params);
+    let idx = start.packed.len() - 1;
+    assert!(
+        start.packed[idx].is_finite(),
+        "atanh(1) is +inf and must not reach the optimizer"
+    );
+    assert_eq!(start.moves.len(), 1, "one guard, not the rail as well");
+
+    let diags = check_packed_start_in_box(&params, &FitOptions::default());
+    let msg = only_message(&diags);
+    assert_eq!(diags[0].code, "W_INIT_NOT_REPRESENTABLE");
+    assert!(msg.contains("1e0"), "must quote the declared ±1 — {msg}");
+    assert!(
+        msg.contains("no Fisher-z coordinate"),
+        "the cause is the unit boundary, not the estimation rail — {msg}"
+    );
+    assert!(
+        msg.contains("strictly inside (−1, 1)"),
+        "the remedy must be the unit-boundary one — {msg}"
+    );
+    // Not the rail's remedy: a `FIX` is already written here, so telling the
+    // user to write `FIX` would be advice they have already taken.
+    assert!(
+        !msg.contains("with no rail"),
+        "the rail remedy must not leak into the unit-boundary arm — {msg}"
+    );
+    assert!(crate::diagnostics::first_error(&diags).is_ok());
+}
+
+// ── #1307 review round 1: two gaps the first pass left ──────────────────────
+
+/// Regression: a **second**, much narrower rail on the path #1307 had just
+/// cleared. `pack_rho_fixed` kept `RHO_CLAMP = 0.999999` as an unconditional
+/// clamp, so a parser-accepted `ρ = 0.999_999_9` was held at `0.999_999` — and
+/// reported with the unit-boundary message, telling the user to declare it
+/// strictly inside `(-1, 1)`, which it already was.
+///
+/// The guarantee is the **whole** open interval the parser accepts, not most of
+/// it: a promise with an undocumented edge is a promise the user has to know the
+/// edge of. `atanh` is finite across all of `(-1, 1)` — `atanh` of the largest
+/// `f64` below 1 is 18.71, asserted below — so nothing short of `|ρ| = 1` needs
+/// backing off.
+///
+/// The `> RHO_CLAMP` assertion is what stops this becoming a tautology: at
+/// `0.999999` exactly the old clamp was a no-op and the test would pass either
+/// way.
+#[test]
+fn a_fixed_correlation_above_the_old_unit_clamp_is_still_held_exactly() {
+    // atanh is finite right up to the boundary, which is why only |ρ| = 1 is
+    // guarded. Measured, not recalled.
+    let largest_below_one = 1.0_f64 - f64::EPSILON / 2.0;
+    assert!(largest_below_one < 1.0);
+    assert!(largest_below_one.atanh().is_finite());
+
+    // 0.059999994 = 0.999_999_9 * sqrt(0.04 * 0.09) — the reviewer's repro.
+    const DECLARED_RHO: f64 = 0.999_999_9;
+    let model =
+        block_sigma_model("block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.059999994, 0.09] FIX");
+    let p = &model.default_params;
+    let declared = p.residual_correlations[0].rho;
+    assert!(
+        (declared - DECLARED_RHO).abs() < 1e-12,
+        "the parser must accept and store ρ = {DECLARED_RHO}; got {declared}"
+    );
+    assert!(
+        declared > 0.999_999,
+        "the fixture must sit above the old `RHO_CLAMP`, or this cannot fail"
+    );
+
+    let start = pack_with_bounds(p);
+    let idx = start.packed.len() - 1;
+    assert!(start.packed[idx].is_finite());
+    let seen = crate::estimation::parameterization::unpack_params(&start.packed, p)
+        .residual_correlations[0]
+        .rho;
+    assert!(
+        (seen - DECLARED_RHO).abs() < 1e-12,
+        "a FIX-ed ρ must be held exactly across the whole open interval; got {seen} \
+         (the pre-review value was 0.999999)"
+    );
+    assert!(
+        start.moves.is_empty(),
+        "an admissible ρ is not a guard hit: {:#?}",
+        start.moves
+    );
+    assert!(
+        check_packed_start_in_box(p, &FitOptions::default()).is_empty(),
+        "nothing was moved, so nothing is reported"
+    );
+}
+
+/// Regression: the `claimed` set suppressing this arm at `maxiter = 0` while
+/// producing nothing itself.
+///
+/// `claimed` was built unconditionally from the two walks that sit *after* the
+/// eval-only early return. `theta TVCL(-5.0, 0.0, 10.0)` has both a `ValueFloor`
+/// move and a declared-range violation, so at `maxiter = 0` the move was
+/// filtered as "someone else will report it" and then nobody did — `ferx check`
+/// and `fit()` said **nothing at all** about a run that scores `1e-10` rather
+/// than the declared `-5`. That is the precise guarantee the arm exists to make.
+///
+/// Asserted as a straddle: the same declaration with a search *is* claimed, and
+/// reports the declared-range error instead. Without that half this would pass
+/// for a check that had simply started double-reporting.
+#[test]
+fn a_doubly_claimed_coordinate_is_still_reported_when_the_other_walk_is_exempt() {
+    let params = params_with_theta("theta TVCL(-5.0, 0.0, 10.0)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    // Premise: this coordinate really is claimed by the declared-range walk, so
+    // the suppression path is the one under test.
+    assert_eq!(
+        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
+        1
+    );
+    assert_eq!(pack_with_bounds(p).moves.len(), 1);
+
+    // Eval-only: the other walk never runs, so this arm must speak.
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+    let d = check_packed_start_in_box(p, &eval_only);
+    assert_eq!(
+        d.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
+        ["W_INIT_NOT_REPRESENTABLE"],
+        "an eval-only run scores 1e-10 and must say so — {d:#?}"
+    );
+
+    // With a search: the declared-range error is emitted, so this arm stands
+    // down and the coordinate is reported exactly once.
+    let searching = check_packed_start_in_box(p, &FitOptions::default());
+    assert_eq!(
+        searching
+            .iter()
+            .map(|x| x.code.as_str())
+            .collect::<Vec<_>>(),
+        ["E_THETA_INIT_OUTSIDE_BOUNDS"],
+        "a searching run reports the declared violation, once — {searching:#?}"
+    );
+}
+
+/// Regression: naming the packer's intermediate rather than the value the fit
+/// uses, on a coordinate that is moved **twice**.
+///
+/// `sigma PROP_ERR ~ 0.0 (sd)` is floored to an SD of `1e-10` by the packer and
+/// then clamped onto the `exp(-8)` rail by the box. At `maxiter = 0` the box
+/// walk is exempt, so this arm now speaks — and it must quote that rail,
+/// **3.354626e-4** (the realised value, not the `3.355e-4` the prose elsewhere
+/// rounds it to), rather than the `1e-10` no objective evaluation ever sees. The number is
+/// taken by running the real unpacker over the clamped vector, so it cannot
+/// drift from the packing convention.
+#[test]
+fn a_double_move_names_the_value_the_fit_actually_uses() {
+    let params = params_with_sigma("sigma PROP_ERR ~ 0.0 (sd)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+    let d = check_packed_start_in_box(p, &eval_only);
+    let msg = only_message(&d);
+    assert_eq!(d[0].code, "W_INIT_NOT_REPRESENTABLE");
+    assert!(
+        msg.contains("3.354626e-4"),
+        "must quote the rail the fit lands on — {msg}"
+    );
+    assert!(
+        msg.contains("clamps to"),
+        "and must name the second move rather than blaming the floor for a \
+         number the floor did not produce — {msg}"
+    );
+    // The intermediate still appears, as the floor's own output, so the cause
+    // explains the chain instead of skipping a step.
+    assert!(msg.contains("floor of 1e-10"), "{msg}");
+}

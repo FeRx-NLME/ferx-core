@@ -123,10 +123,42 @@ pub(crate) const SIGMA_PACK_UPPER: f64 = 5.0;
 /// converged.
 pub(crate) const RHO_Z_BOUND: f64 = 3.0;
 
-/// Largest `|ρ|` that survives the pack. The parser already rejects `|ρ| >= 1`
-/// at declaration time, so this only guards `atanh` against an init that lands
-/// on the boundary through a covariance/variance round-trip.
+/// Where a ρ that is **not** in `(-1, 1)` is placed so `atanh` has something to
+/// return. The parser rejects `|ρ| >= 1` at declaration time, so this is only
+/// reached by an init that lands on or past the boundary through a
+/// covariance/variance round-trip, or by a hand-built [`ModelParameters`].
+///
+/// It is a fallback for an **inadmissible** ρ, not a cap on an admissible one —
+/// see [`rho_within_unit`], which applies it only at `|ρ| >= 1`. It was a
+/// `clamp` on every ρ until #1307 review round 1, which put a second, much
+/// narrower rail on the `FIX` path the fix had just cleared: a parser-accepted
+/// `ρ = 0.999_999_9` was held at `0.999_999`, and reported with the
+/// unit-boundary message telling the user to declare it strictly inside
+/// `(-1, 1)` — which it already was.
 const RHO_CLAMP: f64 = 0.999_999;
+
+/// The admissible ρ the packer takes `atanh` of: `ρ` itself for every
+/// `|ρ| < 1`, and `±`[`RHO_CLAMP`] for a ρ at or beyond the unit boundary.
+///
+/// `atanh` is finite across the whole open interval — the largest `f64` below 1
+/// gives `atanh(0.999_999_999_999_999_9) = 18.71`, measured — so nothing between
+/// [`RHO_CLAMP`] and 1 needs backing off, and backing it off is what broke the
+/// `FIX` contract a second time. Only `|ρ| >= 1`, where `atanh` is `±inf`, does.
+///
+/// `NaN` passes through: `NaN.abs() >= 1.0` is false, so it reaches `atanh` and
+/// stays `NaN`, exactly as the previous `clamp` left it. That is the documented
+/// blind spot shared with [`coordinates_outside_bounds`], not a new one.
+///
+/// Spelled once and shared by [`pack_rho_fixed`] and the [`PackMove`] walk, so
+/// "did the guard bind" cannot drift from "the guard".
+#[inline]
+pub(crate) fn rho_within_unit(rho: f64) -> f64 {
+    if rho.abs() >= 1.0 {
+        rho.clamp(-RHO_CLAMP, RHO_CLAMP)
+    } else {
+        rho
+    }
+}
 
 /// Pack a residual correlation `ρ ∈ (-1, 1)` as its Fisher-z coordinate
 /// `atanh(ρ)`, clamped into `[-RHO_Z_BOUND, RHO_Z_BOUND]` — the **estimated**
@@ -136,9 +168,9 @@ pub(crate) fn pack_rho(rho: f64) -> f64 {
     pack_rho_fixed(rho).clamp(-RHO_Z_BOUND, RHO_Z_BOUND)
 }
 
-/// Pack a **`FIX`-ed** residual correlation: `atanh(ρ)` with [`RHO_CLAMP`]
-/// guarding `atanh` against the unit boundary, and **no** [`RHO_Z_BOUND`] rail
-/// (#1307).
+/// Pack a **`FIX`-ed** residual correlation: `atanh(ρ)` with
+/// [`rho_within_unit`] guarding `atanh` at the unit boundary, and **no**
+/// [`RHO_Z_BOUND`] rail (#1307).
 ///
 /// `RHO_Z_BOUND` is an argument about what the optimizer may *search* — a free ρ
 /// chasing `log|R| → −∞` is a degenerate optimum, not an estimate, and its own
@@ -155,9 +187,13 @@ pub(crate) fn pack_rho(rho: f64) -> f64 {
 /// rail, and cannot walk the objective toward a singular `R`. What it can do is
 /// make `R` singular where the user asked for it to be — `1 − ρ²` is theirs to
 /// choose once they have written `FIX`.
+///
+/// "Held at the declared value" means the **whole** open interval, not most of
+/// it: the exactness has to reach every ρ the parser accepts, or the guarantee
+/// is a range the user has to know the edges of. See [`rho_within_unit`].
 #[inline]
 pub(crate) fn pack_rho_fixed(rho: f64) -> f64 {
-    rho.clamp(-RHO_CLAMP, RHO_CLAMP).atanh()
+    rho_within_unit(rho).atanh()
 }
 
 /// Inverse of [`pack_rho`]: `ρ = tanh(z)`.
@@ -202,9 +238,13 @@ pub(crate) enum PackGuard {
     /// [`RHO_Z_BOUND`] — the Fisher-z estimation rail on a **free** ρ. A
     /// `FIX`-ed ρ no longer reaches this (#1307).
     RhoRail,
-    /// [`RHO_CLAMP`] — `|ρ|` at the unit boundary, where `atanh` is `±inf`. The
-    /// parser rejects `|ρ| >= 1` at declaration time, so this is reachable only
-    /// from a hand-built [`ModelParameters`] or a covariance round-trip.
+    /// [`rho_within_unit`] — a ρ **at or beyond** `±1`, where `atanh` is
+    /// `±inf`. The parser rejects `|ρ| >= 1` at declaration time, so this is
+    /// reachable only from a hand-built [`ModelParameters`] or a covariance
+    /// round-trip. It deliberately does **not** fire anywhere inside `(-1, 1)`:
+    /// until #1307 review round 1 it fired from `RHO_CLAMP = 0.999999` upward
+    /// and told the user to declare a value strictly inside an interval it was
+    /// already inside.
     RhoUnit,
 }
 
@@ -372,10 +412,10 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
             .get(i)
             .copied()
             .unwrap_or(false);
-        // `RHO_CLAMP` guards `atanh` against the unit boundary on both
-        // spellings; `RHO_Z_BOUND` is the *estimation* rail and applies to the
-        // free one only (#1307).
-        let unit = corr.rho.clamp(-RHO_CLAMP, RHO_CLAMP);
+        // `rho_within_unit` guards `atanh` at the unit boundary on both
+        // spellings, and binds only at `|ρ| >= 1`; `RHO_Z_BOUND` is the
+        // *estimation* rail and applies to the free one only (#1307).
+        let unit = rho_within_unit(corr.rho);
         if unit != corr.rho {
             moves.push(PackMove {
                 index: idx,
