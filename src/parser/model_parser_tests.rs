@@ -5010,6 +5010,329 @@ fn test_parse_all_example_ferx_files() {
     );
 }
 
+// ─── #1390: `[fit_options]` and `[error_model]` reject an unmatched line ────
+
+/// The sharp case: `method` written without its `=`.
+///
+/// Before #1390 the line was dropped, the fit ran the **default estimator**, and
+/// nothing said so — `ferx check` reported VALID and the user read a FOCEI
+/// objective believing they had run SAEM. The regression this catches is the
+/// `continue` coming back, so the assertion is on both halves: the line is
+/// rejected *and* the default is still in place (a reject arm that also managed
+/// to apply the option would be a different bug, and this pins that it does not
+/// quietly "helpfully" parse it).
+#[test]
+fn fit_option_missing_its_equals_is_rejected_and_never_applied() {
+    let err = parse_fit_options(&["method saem".to_string()])
+        .err()
+        .expect("`method saem` must be rejected, not dropped");
+    assert!(
+        err.contains("method = saem"),
+        "the message must name the repair: {err}"
+    );
+    assert!(err.contains("method saem"), "it must quote the line: {err}");
+
+    // Same shape on a non-`method` key, so the arm is not `method`-special.
+    let err = parse_fit_options(&["maxiter 42".to_string()])
+        .err()
+        .expect("`maxiter 42` must be rejected");
+    assert!(err.contains("maxiter = 42"), "{err}");
+
+    // A key with no value at all still gets a repair, with a placeholder.
+    let err = parse_fit_options(&["method".to_string()])
+        .err()
+        .expect("a bare `method` must be rejected");
+    assert!(err.contains("method = <value>"), "{err}");
+
+    // And the accepted spelling is untouched — the reject arm must not be
+    // reachable from a line that parses.
+    assert_eq!(
+        parse_fit_options(&["method = saem".to_string()])
+            .unwrap()
+            .method,
+        EstimationMethod::Saem
+    );
+}
+
+/// The two messages straddle the "is this a known key?" gate.
+///
+/// `method saem` earns a `did you mean` repair; `banana` cannot, because there
+/// is no key to repair it to. Asserting only the first would stay green if the
+/// gate were deleted and every line got the repair wording with a nonsense key
+/// in it, so both sides are pinned here — and the probe is `apply_fit_option`
+/// itself, so a key added there is recognised by this arm with no second list to
+/// update.
+#[test]
+fn fit_option_reject_distinguishes_a_known_key_from_an_unknown_one() {
+    let known = parse_fit_options(&["maxiter 42".to_string()])
+        .err()
+        .expect("rejected");
+    let unknown = parse_fit_options(&["banana 42".to_string()])
+        .err()
+        .expect("rejected");
+    assert!(known.contains("did you mean"), "{known}");
+    assert!(
+        !unknown.contains("did you mean"),
+        "`banana` has no repair to offer, so the message must not invent one: {unknown}"
+    );
+    assert!(
+        unknown.contains("not a known fit option"),
+        "the unknown-key message must say which token it did not recognise: {unknown}"
+    );
+
+    // A recognised key with a *malformed* value is still a recognised key: the
+    // repair is the one the user wants, and the value error comes on the retry.
+    let bad_value = parse_fit_options(&["maxiter lots".to_string()])
+        .err()
+        .expect("rejected");
+    assert!(bad_value.contains("maxiter = lots"), "{bad_value}");
+}
+
+/// `;` is not a comment marker in `.ferx`, and a `[fit_options]` line that opens
+/// with one says so rather than reporting a missing `=` (#1388 gave
+/// `[parameters]` the same message; the sentence is shared so the two blocks
+/// cannot drift on what `.ferx` accepts as a comment).
+/// Both NONMEM-converted shapes, and both carry an `=` — which is why the check
+/// sits ahead of the `=` split rather than in the reject arm. Written inside the
+/// arm, it was dead: `; method = saem` split to the key `` `; method` `` and got
+/// "unknown key", and `method = saem ; run 3` got an unknown *method token*.
+/// Measured on the first run of this test.
+///
+/// The straddle: a `;` alone must not earn the message, or it would name a
+/// problem a line like `banana ; x` does not have (#1388 review round 3 #9).
+#[test]
+fn a_semicolon_comment_in_fit_options_is_named_as_such() {
+    for line in [
+        "; method = saem",
+        "method = saem ; run 3",
+        "maxiter = 100 ; TeunP",
+    ] {
+        let err = parse_fit_options(&[line.to_string()])
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected"));
+        assert!(err.contains("does not start a comment"), "`{line}`: {err}");
+        assert!(err.contains("use `#` or `//`"), "`{line}`: {err}");
+        assert!(
+            err.contains("[fit_options]"),
+            "the block must be named: {err}"
+        );
+    }
+
+    // A `;` after something that is not a complete `key = value` pair is not a
+    // comment the author meant, so it falls through to the ordinary diagnostic.
+    let err = parse_fit_options(&["banana ; x".to_string()])
+        .err()
+        .expect("rejected");
+    assert!(
+        !err.contains("does not start a comment"),
+        "a `;` alone must not earn the comment message: {err}"
+    );
+}
+
+/// Every `[error_model]` statement form the diagnostic advertises must parse,
+/// and the list has to reach the real message.
+///
+/// Part 2 is the half that matters: asserting against `error_model_form_list()`
+/// alone is tautological — it is the array joined — and would stay green if the
+/// reject arm went back to an inlined hand-written list, which is exactly the
+/// drift `PARAMETER_FORMS` was introduced to stop (#1388 review).
+#[test]
+fn every_listed_error_model_form_actually_parses() {
+    for (spelling, example) in ERROR_MODEL_FORMS {
+        let lines: Vec<String> = example.lines().map(|l| l.trim().to_string()).collect();
+        parse_error_model(&lines).unwrap_or_else(|e| {
+            panic!(
+                "the diagnostic advertises `{spelling}` but its example `{example}` \
+                 does not parse: {e}"
+            )
+        });
+    }
+
+    let err = parse_error_model(&["banana".to_string()])
+        .err()
+        .expect("a lone `banana` must be rejected");
+    for (spelling, _) in ERROR_MODEL_FORMS {
+        assert!(
+            err.contains(spelling),
+            "the real diagnostic omits `{spelling}`: {err}"
+        );
+    }
+}
+
+/// An `[error_model]` line matching no statement form is an error, and the
+/// message quotes **what the user wrote** — not the peeled body.
+///
+/// The peel strips a `CMT=N:` prefix and a `weight =` tail before the statement
+/// regexes run, so quoting `body` would print a string appearing nowhere in the
+/// file. #1388 made exactly this fix in `[parameters]` after the same mistake.
+#[test]
+fn an_unrecognized_error_model_line_is_rejected_quoting_the_source_line() {
+    for line in [
+        "banana",
+        "DV ~ additive",           // no argument list
+        "DV ~ additive(ADD) oops", // trailing text defeats the `$` anchor
+        "CMT=2: banana",
+    ] {
+        let err = parse_error_model(&[line.to_string()])
+            .err()
+            .unwrap_or_else(|| panic!("`{line}` must be rejected, not dropped"));
+        assert!(err.contains("unrecognized line"), "`{line}`: {err}");
+        assert!(
+            err.contains(line),
+            "the message must quote the source line `{line}`, got: {err}"
+        );
+    }
+
+    // The companion half: a valid block still parses, so the arm is not simply
+    // rejecting everything.
+    parse_error_model(&["DV ~ proportional(PROP_ERR)".to_string()]).unwrap();
+}
+
+/// A stray line next to a valid statement used to vanish; now the *line* is
+/// named. Without the reject arm this block parses clean, which is the whole
+/// defect: the user's second thought is silently discarded.
+#[test]
+fn a_stray_line_beside_a_valid_error_model_statement_is_rejected() {
+    let err = parse_error_model(&[
+        "DV ~ proportional(PROP_ERR)".to_string(),
+        "banana".to_string(),
+    ])
+    .err()
+    .expect("the stray line must be rejected, not dropped");
+    assert!(err.contains("banana"), "{err}");
+}
+
+/// `;` in `[error_model]` gets the comment message only when the line looks like
+/// a comment — nothing before it, or a complete error model before it.
+///
+/// The straddle is the point: guessing from the `;` alone is how a message comes
+/// to name a problem the line does not have (#1388 review round 3 #9), so a `;`
+/// *inside* an argument list must fall through to the generic form list instead.
+///
+/// **Every form in `ERROR_MODEL_FORMS` is exercised, not a sample**, and that is
+/// the #1390-review finding: the gate first lived in the plain statement regex's
+/// `None` arm, which the `weight =` and covariate-selected forms never reach —
+/// `parse_selected_error_model` consumes the whole block before that arm exists
+/// and `split_weight_modifier` peels its tail before it. Both reported the
+/// *inner* parse failure instead (``magnitude `(A) * (WT ; c)`: Unexpected
+/// character: ;``, `unexpected content after covariate-selected if/else`) while
+/// the docs promised the comment message. Sampling three line-oriented forms was
+/// what let that through, so the loop below is driven off the array.
+#[test]
+fn a_semicolon_in_error_model_is_named_a_comment_only_when_it_is_one() {
+    // Nothing before the `;`, and each advertised form followed by one. Driving
+    // this off `ERROR_MODEL_FORMS` rather than a hand-picked list means a form
+    // added later cannot quietly skip the gate.
+    let mut cases = vec!["; DV ~ proportional(PROP_ERR)".to_string()];
+    for (_, example) in ERROR_MODEL_FORMS {
+        cases.push(format!("{example} ; NONMEM comment"));
+    }
+    // The two the review found, spelled out so a future edit to the array cannot
+    // silently drop them (the array's `weight` example has no covariate in its
+    // tail, which is the shape that broke).
+    cases.push("DV ~ additive(ADD_ERR) weight = WT ; NONMEM comment".to_string());
+    cases.push(
+        "if (WT == 0) { DV ~ additive(ADD_ERR) } else { DV ~ additive(ADD_ERR) } ; NONMEM comment"
+            .to_string(),
+    );
+    cases.push(
+        "DV ~ proportional(PROP_ERR)\niiv_on_ruv = ETA_RUV ; from the NONMEM control stream"
+            .to_string(),
+    );
+
+    for case in &cases {
+        // An example may itself be multi-line (`iiv_on_ruv` needs a statement
+        // above it); the `;` lands on the last line either way.
+        let lines: Vec<String> = case.lines().map(|l| l.trim().to_string()).collect();
+        let err = parse_error_model(&lines)
+            .err()
+            .unwrap_or_else(|| panic!("`{case}` must be rejected"));
+        assert!(err.contains("does not start a comment"), "`{case}`: {err}");
+    }
+
+    // The other side of the gate. `DV ~ combined(PROP; ADD)` is *not* the
+    // example to use here: the argument regex is greedy, so `PROP; ADD` is one
+    // argument and the line is caught by the sigma-count check long before the
+    // reject arm — measured, and it is why this test first read green on a
+    // message it never produced. This spelling does reach the arm, and its head
+    // (`DV ~ additive`) is not a statement, so it must get the form list.
+    let err = parse_error_model(&["DV ~ additive; (ADD)".to_string()])
+        .err()
+        .expect("rejected");
+    assert!(
+        !err.contains("does not start a comment"),
+        "a `;` with an incomplete statement before it is not a comment: {err}"
+    );
+    assert!(err.contains("unrecognized line"), "{err}");
+
+    // `banana ; x` is the same side of the gate, via a different route: deleting
+    // the tail leaves a line matching no form, so the form list is what the user
+    // needs to see.
+    let err = parse_error_model(&["banana ; x".to_string()])
+        .err()
+        .expect("rejected");
+    assert!(!err.contains("does not start a comment"), "{err}");
+
+    // The rule's boundary, pinned rather than assumed — and measured, because
+    // the first version of this assertion guessed the message and was wrong.
+    // `iiv_on_ruv` is a *modifier*: a block holding only one is not an error
+    // model whatever the `;` does, so deleting the tail does not make it parse
+    // and the comment message is correctly withheld. What comes out is the
+    // ordinary reject, which quotes the line and lists `iiv_on_ruv` among the
+    // forms — enough to see both that the `;` is not a comment and that a
+    // statement is missing.
+    let err = parse_error_model(&["iiv_on_ruv = ETA_RUV ; c".to_string()])
+        .err()
+        .expect("a block with no statement must be rejected");
+    assert!(!err.contains("does not start a comment"), "{err}");
+    assert!(err.contains("unrecognized line"), "{err}");
+    assert!(err.contains("iiv_on_ruv = ETA_NAME"), "{err}");
+
+    // Its paired form — the realistic one — *does* get the comment message; that
+    // case is in `cases` above. Asserted here too so the contrast between the
+    // two is visible in one place.
+    let err = parse_error_model(&[
+        "DV ~ proportional(PROP_ERR)".to_string(),
+        "iiv_on_ruv = ETA_RUV ; c".to_string(),
+    ])
+    .err()
+    .expect("rejected");
+    assert!(err.contains("does not start a comment"), "{err}");
+}
+
+/// End to end through `parse_full_model`: the issue's own reproduction.
+///
+/// The unit tests above call the block parsers directly; this one goes through
+/// the real entry point, because the defect the issue reports is that a *whole
+/// model file* parsed clean and then fitted with the wrong estimator.
+#[test]
+fn a_model_file_with_a_missing_equals_no_longer_parses_clean() {
+    let base = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                omega ETA_CL ~ 0.09\n  sigma ADD ~ 0.1\n[individual_parameters]\n  CL = TVCL * \
+                exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n";
+
+    // The control: the same model with the `=` present parses, and the method
+    // it asks for is the method it gets. Without this the test below is
+    // satisfied by a model that never parsed for an unrelated reason.
+    let ok = format!("{base}[error_model]\n  DV ~ additive(ADD)\n[fit_options]\n  method = saem\n");
+    let parsed = parse_full_model(&ok).expect("the control model must parse");
+    assert_eq!(parsed.fit_options.method, EstimationMethod::Saem);
+
+    let bad = format!("{base}[error_model]\n  DV ~ additive(ADD)\n[fit_options]\n  method saem\n");
+    let err = parse_full_model(&bad)
+        .err()
+        .expect("`method saem` must fail the parse, not fall back to the default estimator");
+    assert!(err.contains("method = saem"), "{err}");
+
+    let bad = format!(
+        "{base}[error_model]\n  DV ~ additive(ADD)\n  banana\n[fit_options]\n  method = saem\n"
+    );
+    let err = parse_full_model(&bad)
+        .err()
+        .expect("a stray `[error_model]` line must fail the parse");
+    assert!(err.contains("banana"), "{err}");
+}
+
 #[test]
 fn test_parse_fit_options_applies_known_keys() {
     let lines = vec![
@@ -12878,7 +13201,7 @@ fn test_diffusion_on_analytical_model_is_error() {
 [diffusion]
   central ~ 0.01
 [error_model]
-  additive
+  DV ~ additive(ADD)
 "#;
     assert!(
         parse_full_model(src).is_err(),
