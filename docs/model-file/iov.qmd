@@ -69,7 +69,7 @@ When occasion effects on different parameters are expected to covary, use `block
   block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]
 ```
 
-Values are the lower triangle of Ω_IOV: Var(KAPPA_CL), Cov(KAPPA_CL, KAPPA_V), Var(KAPPA_V). This mirrors the `block_omega` syntax for BSV.
+Values are the lower triangle of Ω_IOV: Var(KAPPA_CL), Cov(KAPPA_CL, KAPPA_V), Var(KAPPA_V). This mirrors the `block_omega` syntax for BSV, including that the block is variance-only: a scale tag such as `(sd)` after the `]` is rejected with `E_BLOCK_VARIANCE_ONLY`, not applied (see [Parameters](parameters.qmd#choosing-the-scale-variance-or-sd)).
 
 ### Mixed Option A + B
 

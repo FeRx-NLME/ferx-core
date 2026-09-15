@@ -286,11 +286,14 @@ impl ModelText {
                 if depth <= 0 {
                     depth = 0;
                     let (start, buf) = open.take().expect("opened just above");
-                    // A bare `FIX` line folds onto the block before it, exactly
-                    // as `join_bracketed_lines` folds it.
-                    if buf.eq_ignore_ascii_case("FIX")
-                        && out.last().is_some_and(|(_, c)| c.contains(']'))
-                    {
+                    // A bare `FIX` or scale-tag line folds onto the block
+                    // declaration before it, by the parser's own predicate, so
+                    // the editor addresses the logical lines the parser reads.
+                    // A private copy here had drifted to `FIX`-only and
+                    // `contains(']')` (#1388 review round 3 #10).
+                    if out.last().is_some_and(|(_, c)| {
+                        crate::parser::model_parser::folds_onto_block_declaration(c, &buf)
+                    }) {
                         let (r, c) = out.last_mut().expect("non-empty");
                         r.end = i + 1;
                         c.push(' ');

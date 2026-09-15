@@ -779,6 +779,14 @@ V = (f \sigma_\mathrm{prop})^2 + \sigma_\mathrm{add}^2
     + 2 f \rho \sigma_\mathrm{prop}\sigma_\mathrm{add}
 $$
 
+Like `block_omega`, a `block_sigma` is **variance-only**: a scale tag (`(sd)`,
+`(variance)` or `(var)`) on the declaration is rejected with
+`E_BLOCK_VARIANCE_ONLY`, since the lower triangle mixes variances and
+covariances and one tag cannot say which entry is on which scale. The diagonal
+entries are variances however you write them — ferx takes their square roots to
+initialize the sigma SDs. Before 0.4.0 the tag was accepted and then dropped in
+silence.
+
 ### Fixed vs. estimated `block_sigma` {#fixed-vs-estimated-block-sigma}
 
 A plain `block_sigma (...) = [...]` **estimates** both the diagonal sigma SDs and

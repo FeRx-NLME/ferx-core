@@ -5689,7 +5689,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the block
 /// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), the
 /// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
-/// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), and
+/// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), the
+/// scale tag on a `block_*` declaration (→ `E_BLOCK_VARIANCE_ONLY`, #1377), and
 /// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
 /// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
@@ -5742,6 +5743,56 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     // renderer prefixes whatever block it is given — setting both prints it twice.
     if err.contains("consumed positionally") {
         return Diagnostic::error("E_SIGMA_ORDER_MISMATCH", err.to_string());
+    }
+    // #1377: a scale tag on a `block_omega` / `block_sigma` / `block_kappa`
+    // declaration. Its own code rather than the `E_PARSE` catch-all for the same
+    // reason as #993 and #1001: the remedy is mechanical — square each diagonal
+    // entry and write the off-diagonals as covariances — so `ferxtranslate` or
+    // ferx-r can offer it instead of reprinting prose. Until #1377 the tag was
+    // dropped in silence and the file reported VALID, which is why the code is
+    // worth having at all.
+    //
+    // The sentinel is the message's own prefix, ``[parameters]: `block_``, which
+    // `reject_block_scale_tag` is the only writer of. Every other unrecognised
+    // `[parameters]` line stays `E_PARSE` deliberately, since there is no
+    // mechanical repair to offer for arbitrary trailing text.
+    //
+    // A prefix, not a substring of the whole message. That message quotes the
+    // user's line, so `omega ETA_KA ~ 0.30 is variance-only` — an unrecognized
+    // line whose text happened to contain the phrase — was raised to this code
+    // with a "delete the tag" suggestion for a tag it did not have (#1388 review
+    // round 3 #9). One gate: a second condition on the same message (an
+    // `is variance-only` filter, an `Offending line:` split) rejected no input
+    // the prefix accepts, so no test could see it go (round 4 #3).
+    //
+    // No `.with_block()`: the message already opens with `[parameters]`, and the
+    // renderer prefixes whatever block it is given — setting both prints it
+    // twice. Same reasoning as `E_SIGMA_ORDER_MISMATCH` above.
+    if let Some(head) = err.strip_prefix("[parameters]: `block_") {
+        // The repair travels as a field, not only inside the prose (#1388
+        // review): a mechanical remedy is the whole reason this shape has a code
+        // of its own, and a consumer that offers a fix should not have to scrape
+        // the sentence apart to find it.
+        //
+        // Which repair applies depends on the tag the author wrote. `(sd)` means
+        // the numbers are wrong and have to change; `(variance)` / `(var)` means
+        // the numbers were right all along and only the tag has to go. Telling a
+        // `(variance)` author to "square each SD" is worse than saying nothing --
+        // they wrote variances already, and squaring them would break a correct
+        // model. The tag is read back out of the one phrase the emitting arm
+        // always carries it in, at its first occurrence: the emitter writes it
+        // before the quoted line.
+        let tag_is_sd = head
+            .split_once("the scale tag `(")
+            .is_some_and(|(_, rest)| rest.starts_with("sd)`"));
+        let suggestion = if tag_is_sd {
+            "square each SD into a variance and write the off-diagonals as covariances"
+        } else {
+            "delete the tag: the lower triangle is already variances and covariances, \
+             so the numbers do not change"
+        };
+        return Diagnostic::error("E_BLOCK_VARIANCE_ONLY", err.to_string())
+            .with_suggestion(suggestion);
     }
     // #1040: the block-header shapes the parser used to drop silently.
     // `check_block_names` writes each offending header as ``[name] (line N)``,

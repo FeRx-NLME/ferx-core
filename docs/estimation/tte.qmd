@@ -225,8 +225,11 @@ with the PK, with shared random effects:
 
 ```
 [parameters]
-  theta TVCL(1.0, 0.01, 100); theta TVV(10, 0.1, 500); theta TVKA(1, 0.01, 50)
-  theta TVH0(0.01, 1e-5, 10); theta TVBETA(0.5, -10, 10)
+  theta TVCL(1.0, 0.01, 100)
+  theta TVV(10, 0.1, 500)
+  theta TVKA(1, 0.01, 50)
+  theta TVH0(0.01, 1e-5, 10)
+  theta TVBETA(0.5, -10, 10)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.05 (sd)
 

@@ -633,6 +633,33 @@ fn a_multi_line_block_omega_is_one_declaration_to_the_duplicate_guards() {
     assert!(err.contains("already declared by `block_omega"), "{err}");
 }
 
+/// The editor folds an own-line `FIX` or scale tag exactly where the parser
+/// does (#1388 review round 3 #10).
+///
+/// `logical_lines` kept a private copy of the fold — `FIX` only, keyed on the
+/// previous line containing `]` — under a comment saying it folded "exactly as
+/// `join_bracketed_lines`". The parser had since moved to the block keyword and
+/// learned scale tags, so the two disagreed on both rows below. Both are
+/// invalid input, but an editor that addresses a different line than the
+/// parser reads rewrites the wrong one.
+///
+/// Reddens if `logical_lines` goes back to its own predicate: the level-block
+/// `FIX` folds onto the theta, and the `(sd)` stays a separate line.
+#[test]
+fn logical_lines_fold_an_own_line_tag_the_way_the_parser_does() {
+    let src = "[parameters]\n  theta PLACEBO[3](0.1, -1.0, 1.0)\n  FIX\n  \
+               block_omega (ETA_CL, ETA_V) = [\n    0.09,\n    0.02, 0.04\n  ]\n  (sd)\n";
+    let text = ModelText::parse(src).unwrap();
+    assert_eq!(
+        text.block_lines("parameters"),
+        vec![
+            "theta PLACEBO[3](0.1, -1.0, 1.0)".to_string(),
+            "FIX".to_string(),
+            "block_omega (ETA_CL, ETA_V) = [ 0.09, 0.02, 0.04 ] (sd)".to_string(),
+        ]
+    );
+}
+
 // ── SetOmegaBlock ──────────────────────────────────────────────────────────
 
 #[test]
