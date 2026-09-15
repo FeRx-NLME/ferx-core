@@ -419,11 +419,21 @@ same text to stderr and exit `1`/`2`).
 ## Tool name or model file?
 
 The first argument is either a tool (`covsearch`, `bootstrap`, …) or the model
-to fit. A tool name is a bare word, so anything carrying a `.` or a path
-separator is read as a file path — and a file that exists is always taken as
-the model, whatever it is called.
+to fit, decided in this order:
 
-That split decides which error you get when the argument resolves to nothing:
+1. a tool name (`check`, `summary`, `bootstrap`, `gam`, `covsearch`,
+   `allometry`, `modelsearch`, `ruvsearch`, `iivsearch`, `iovsearch`, `amd`,
+   `globalsearch`) runs that tool — these names are reserved, so a *file*
+   called `check` in the working directory is not reachable as a model under
+   that name (give it a path: `ferx ./check`);
+2. an argument starting with `-` is a flag, not a model;
+3. otherwise a file that is there is the model, whatever it is called — an
+   extension-less model file works;
+4. otherwise a bare word is read as a tool name, and anything carrying a `.`
+   or a path separator as a file path.
+
+That last split decides which error you get when the argument resolves to
+nothing:
 
 ```bash
 $ ferx covsearch run1.ferxsearch      # on a build without covsearch
@@ -437,6 +447,10 @@ Error: the model `run1.ferx` was not found at this location. Please check folder
 
 A tool name within two edits of a real one also gets a `Did you mean ...?`
 line. Both cases exit `1`.
+
+A path the filesystem cannot answer for — an unreadable parent directory, a
+symlink loop — is not reported as missing: it goes to the fit path, which
+opens it and reports the OS error.
 
 ## Examples
 

@@ -152,27 +152,40 @@ enum FirstArg<'a> {
     /// version). Reading it as a model path is what produced the misleading
     /// "Failed to read model file: No such file or directory".
     UnknownTool(&'a str),
-    /// Looks like a path, and it is there: hand it to the fit/simulate path.
+    /// Either the path is there, or the filesystem would not say: hand it to
+    /// the fit/simulate path, which opens it and reports whatever the OS says.
     ModelFile(&'a str),
-    /// Looks like a path, and it is not there.
+    /// Looks like a path, and the filesystem says it is not there.
     MissingModelFile(&'a str),
     /// A flag in the model-file position.
     Flag(&'a str),
 }
 
-/// Classify the first argument. `exists` is the filesystem answer for `arg`,
-/// passed in so the rule itself is testable without touching the disk.
+/// Classify the first argument. `exists` is the filesystem answer for `arg`
+/// (`Path::try_exists`), passed in so the rule itself is testable without
+/// touching the disk.
 ///
-/// A file that is present is a model file whatever it is called — an extension
-/// is only the fallback signal for something that is *not* there, and a tool
-/// name is a bare word by construction, so anything carrying a `.` or a path
+/// A file that is present is a model file whatever the name — an extension is
+/// only the fallback signal for something that is *not* there, and a tool name
+/// is a bare word by construction, so anything carrying a `.` or a path
 /// separator is a path the user got wrong rather than a tool we do not have.
-fn classify_first_arg(arg: &str, exists: bool) -> FirstArg<'_> {
+/// "Whatever the name" is bounded by the two decisions `main` takes first: a
+/// [`SUBCOMMANDS`] name runs its tool, and a leading `-` is a flag, so a file
+/// called `check` is reachable only by a path (`./check`).
+///
+/// A probe that *fails* (`Err`) is not an absent file: an unreadable parent
+/// directory or a symlink loop answers neither question, and only
+/// `Path::try_exists` keeps the two apart — `Path::exists` folds every
+/// metadata error into `false`, which would report `EACCES` or `ELOOP` as
+/// "was not found". Such a path goes to the fit path, whose reader surfaces
+/// the real OS error.
+fn classify_first_arg(arg: &str, exists: std::io::Result<bool>) -> FirstArg<'_> {
     if arg.starts_with('-') {
         return FirstArg::Flag(arg);
     }
-    if exists {
-        return FirstArg::ModelFile(arg);
+    match exists {
+        Ok(true) | Err(_) => return FirstArg::ModelFile(arg),
+        Ok(false) => {}
     }
     if arg.contains('.') || arg.contains('/') || arg.contains('\\') {
         FirstArg::MissingModelFile(arg)
@@ -243,7 +256,7 @@ fn main() {
     // build does not have (#1396). Telling those apart here is what keeps a
     // mistyped or not-yet-shipped tool from being read as a model path and
     // reported as a missing file.
-    match classify_first_arg(&args[1], std::path::Path::new(&args[1]).exists()) {
+    match classify_first_arg(&args[1], std::path::Path::new(&args[1]).try_exists()) {
         FirstArg::UnknownTool(word) => {
             eprintln!("Error: tool `{word}` not recognized.");
             eprintln!("{}", unknown_tool_hint(word));
@@ -799,11 +812,11 @@ mod tests {
         // The reported case: a tool this build does not have. Before #1396 this
         // fell through to the fit path and reported a missing model file.
         assert_eq!(
-            classify_first_arg("covsearch", false),
+            classify_first_arg("covsearch", Ok(false)),
             FirstArg::UnknownTool("covsearch")
         );
         assert_eq!(
-            classify_first_arg("bootstrap", false),
+            classify_first_arg("bootstrap", Ok(false)),
             FirstArg::UnknownTool("bootstrap")
         );
     }
@@ -813,41 +826,63 @@ mod tests {
         // A tool name is a bare word, so a dot or a separator means the user
         // got a path wrong — the two arms must not collapse into one.
         assert_eq!(
-            classify_first_arg("run1.ferx", false),
+            classify_first_arg("run1.ferx", Ok(false)),
             FirstArg::MissingModelFile("run1.ferx")
         );
         assert_eq!(
-            classify_first_arg("runs/run1", false),
+            classify_first_arg("runs/run1", Ok(false)),
             FirstArg::MissingModelFile("runs/run1")
         );
         assert_eq!(
-            classify_first_arg("runs\\run1", false),
+            classify_first_arg("runs\\run1", Ok(false)),
             FirstArg::MissingModelFile("runs\\run1")
         );
     }
 
     #[test]
-    fn a_file_that_exists_is_a_model_whatever_it_is_called() {
+    fn a_file_that_exists_is_a_model_unless_its_name_is_reserved() {
         // Extension-less model files are legal; existence wins over the name,
-        // so `ferx mymodel` still fits when `mymodel` is on disk.
+        // so `ferx mymodel` still fits when `mymodel` is on disk. It does not
+        // win over the two decisions `main` takes before this one — a
+        // SUBCOMMANDS name and a leading `-` are settled there, which is why a
+        // file called `check` needs a path.
         assert_eq!(
-            classify_first_arg("mymodel", true),
+            classify_first_arg("mymodel", Ok(true)),
             FirstArg::ModelFile("mymodel")
         );
         assert_eq!(
-            classify_first_arg("run1.ferx", true),
+            classify_first_arg("run1.ferx", Ok(true)),
             FirstArg::ModelFile("run1.ferx")
+        );
+    }
+
+    #[test]
+    fn a_probe_that_fails_is_not_an_absent_file() {
+        // `Path::exists` folds every metadata error into `false`, which would
+        // report an unreadable parent or a symlink loop as "was not found" and
+        // lose the actionable OS error. Only `Ok(false)` is an absent file;
+        // `Err` goes to the fit path, which opens it and reports what the OS
+        // says. Both spellings below reach `Ok(false)` arms above, so the two
+        // cases have to be told apart here.
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            classify_first_arg("run1.ferx", Err(denied())),
+            FirstArg::ModelFile("run1.ferx")
+        );
+        assert_eq!(
+            classify_first_arg("covsearch", Err(denied())),
+            FirstArg::ModelFile("covsearch")
         );
     }
 
     #[test]
     fn a_flag_in_the_model_position_is_neither_a_tool_nor_a_file() {
         assert_eq!(
-            classify_first_arg("--data", false),
+            classify_first_arg("--data", Ok(false)),
             FirstArg::Flag("--data")
         );
         assert_eq!(
-            classify_first_arg("--simulate", false),
+            classify_first_arg("--simulate", Ok(false)),
             FirstArg::Flag("--simulate")
         );
     }
@@ -868,7 +903,7 @@ mod tests {
         // unrecognized. `every_listed_tool_still_dispatches` (cli_ferx.rs) runs
         // the binary to pin that ordering.
         assert_eq!(
-            classify_first_arg("check", false),
+            classify_first_arg("check", Ok(false)),
             FirstArg::UnknownTool("check")
         );
         assert!(subcommand("covsearchx").is_none());

@@ -384,6 +384,63 @@ fn an_extensionless_model_file_that_exists_is_fitted_not_rejected() {
     );
 }
 
+/// The documented precedence: a tool name is reserved, so a *file* of that
+/// name in the working directory does not shadow the tool. Pins the
+/// qualification in `docs/cli.qmd` — `ferx check` runs the checker even with a
+/// file called `check` next to it, and the file needs a path to be fitted.
+#[test]
+fn a_file_named_like_a_tool_does_not_shadow_the_tool() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("check"), "not a valid model\n").expect("write file");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg("check")
+        .output()
+        .expect("run ferx check with a file of that name present");
+    // `check` with no model is the checker's own usage error (2), not a fit of
+    // the file and not an unknown-tool error.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected the checker's usage error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A path the filesystem cannot answer for is not a missing model: the OS
+/// error has to survive. Pins the `try_exists` call site — `Path::exists`
+/// folds `ELOOP` into `false` and would answer "was not found", hiding the
+/// real problem. A symlink loop is the portable way to force the probe to
+/// fail: unlike an unreadable directory, it errors for root too.
+#[cfg(unix)]
+#[test]
+fn a_probe_error_keeps_the_os_error_instead_of_claiming_not_found() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink("loop_b.ferx", tmp.path().join("loop_a.ferx")).expect("link a");
+    std::os::unix::fs::symlink("loop_a.ferx", tmp.path().join("loop_b.ferx")).expect("link b");
+    // Precondition: the probe really does fail here, so a green assertion
+    // below cannot come from a plain missing file.
+    assert!(
+        tmp.path().join("loop_a.ferx").try_exists().is_err(),
+        "the symlink loop should make the existence probe fail"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["loop_a.ferx", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on a symlink loop");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("was not found at this location"),
+        "a probe error is not an absent file: {stderr}"
+    );
+    assert!(
+        stderr.contains("Too many levels of symbolic links") || stderr.contains("os error"),
+        "expected the underlying OS error: {stderr}"
+    );
+}
+
 /// `main` looks the word up in the subcommand table before classifying it, so
 /// no shipped tool can be reported as unrecognized. Every name is a bare word,
 /// so this ordering is the only thing keeping them out of that arm.
