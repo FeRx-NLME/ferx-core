@@ -4401,6 +4401,42 @@ pub enum GradientMethod {
     Fd,
 }
 
+impl GradientMethod {
+    /// The gradient method the outer loop will actually use for this
+    /// `(model, options)` pair — **the** answer to "is this fit on finite
+    /// differences?", for a caller that has both.
+    ///
+    /// The outer loop reads `model.gradient_method`, and the production entry
+    /// points (`fit_from_files`, `run_model_with_data`) stamp it from
+    /// `options.gradient_method` — forcing `Fd` for an SDE model, which has no
+    /// analytic-sensitivity path — before calling `fit()`. Both of those now stamp
+    /// *this* function, so there is one rule rather than three copies of it.
+    ///
+    /// It is deliberately the **union** of the three sources rather than a replay
+    /// of the stamp, because not every caller has run the stamp:
+    ///
+    /// - `validate_model_file` (`ferx check`) hands `check_model_options` the model
+    ///   straight out of the parser, whose `gradient_method` is still `Auto` while
+    ///   `[fit_options] gradient = fd` sits in the *options* — reading the model
+    ///   alone there says `Auto` for a fit that will run on FD (#1381 review).
+    /// - a Rust caller invoking `fit()` directly may have set
+    ///   `model.gradient_method` by hand and never touched `options` — reading the
+    ///   options alone would miss it, and the loop honours the model.
+    ///
+    /// Taking either source's `Fd`, plus `is_sde`, is right in all three cases and
+    /// idempotent on an already-stamped model.
+    pub(crate) fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
+        if model.gradient_method == GradientMethod::Fd
+            || options.gradient_method == GradientMethod::Fd
+            || model.is_sde()
+        {
+            GradientMethod::Fd
+        } else {
+            options.gradient_method
+        }
+    }
+}
+
 impl CompiledModel {
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///

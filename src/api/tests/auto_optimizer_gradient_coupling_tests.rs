@@ -6,9 +6,10 @@
 //! default is right (#490); what the warning adds is that the user is told, at the
 //! point the coupling bites, that a one-line change moved two factors.
 //!
-//! Each test below names the regression it exists to catch, because three of the
-//! four gates in the check reject overlapping inputs and a green suite is not
-//! evidence any of them is load-bearing.
+//! Each test below names the regression it exists to catch, because most of the
+//! gates in the check reject overlapping inputs and a green suite is not evidence
+//! any of them is load-bearing. Every one was mutated in turn; the test named in
+//! each doc comment is the one that went red.
 
 use super::*;
 use crate::diagnostics::Severity;
@@ -18,9 +19,10 @@ use crate::types::{EstimationMethod, GradientMethod, Optimizer};
 const CODE: &str = "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT";
 
 /// `fit()` / `run_*` mirror `options.gradient_method` onto `model.gradient_method`
-/// before the fit; the check reads the option for "did the user ask?" and the model
-/// for "what did `auto` resolve to?", so a test that sets only one of the two is
-/// testing a state no fit reaches. This mirrors both, as the engine does.
+/// before the fit; the check reads the option for "did the user ask?" and
+/// `GradientMethod::effective` for "what will the loop use?". This mirrors both, as
+/// the stamped engine path does — the *unstamped* path each source covers alone is
+/// what `an_unstamped_model_still_warns…` and `an_engine_forced_fd_is_silent…` take.
 fn coupled_case(
     gradient: GradientMethod,
     optimizer: Optimizer,
@@ -285,4 +287,190 @@ fn resolve_auto_is_unchanged_by_the_split() {
             Optimizer::Slsqp
         );
     }
+}
+
+// ── Review findings (#1381): three paths on which the first cut spoke falsely ──
+//
+// Each of the three is a place where the check's model of "what the outer loop
+// will do" diverged from what it actually does. All three are fixed by consulting
+// the production rule rather than a restatement of it, so each test below both
+// pins the symptom and guards the shared function it now goes through.
+
+/// **Finding 1 — the advertised `ferx check` case said nothing.**
+///
+/// `validate_model_file` hands `check_model_options` the model straight out of the
+/// parser, and the parser leaves `CompiledModel.gradient_method` at `Auto`:
+/// `[fit_options] gradient = fd` lands in `FitOptions` only. The stamp that
+/// reconciles the two lives in `fit_from_files` / `run_model_with_data`, which
+/// `ferx check` does not run — so reading `model.gradient_method` saw `Auto`, both
+/// arms resolved to `nlopt_lbfgs`, and the warning was omitted from exactly the
+/// entry point the docs point users at.
+///
+/// Reproduced at the seam rather than through the file reader: an unstamped model
+/// (`gradient_method: Auto`) plus options carrying the user's `fd`.
+#[test]
+fn an_unstamped_model_still_warns_because_the_options_carry_the_fd() {
+    // What `parse_full_model_file` produces for a model whose `[fit_options]` says
+    // `gradient = fd`: the option is set, the model field is not.
+    let model = analytical_model(GradientMethod::Auto);
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::Auto,
+        gradient_method: GradientMethod::Fd,
+        interaction: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        model.gradient_method,
+        GradientMethod::Auto,
+        "fixture must be UNSTAMPED, else it cannot reproduce the ferx check path"
+    );
+    let diags: Vec<_> = check_model_options(&model, &opts)
+        .into_iter()
+        .filter(|d| d.code == CODE)
+        .collect();
+    assert_eq!(
+        diags.len(),
+        1,
+        "ferx check must see the coupling it advertises, got {diags:?}"
+    );
+    assert!(diags[0].message.contains("bobyqa"));
+}
+
+/// The same finding's negative half: an **SDE** model reaches the loop on FD because
+/// `GradientMethod::effective` forces it, not because the user asked — so `ferx check`
+/// must stay silent there even though the effective gradient is `Fd`.
+///
+/// Also pins `effective` itself, since it is now the one rule the two production
+/// stamps and this check all read: a mutation making it ignore `is_sde` would leave
+/// an SDE fit reading `Auto` in `resolve_gradient_method` and silently claiming an
+/// analytic gradient it has no path for.
+#[test]
+fn an_sde_model_is_forced_to_fd_by_the_engine_and_stays_silent() {
+    let mut model = analytical_model(GradientMethod::Auto);
+    // `is_sde()` is `diffusion_theta_start.is_some()` — the θ index at which the
+    // `[diffusion]` block's parameters begin.
+    model.diffusion_theta_start = Some(model.n_theta);
+    assert!(model.is_sde(), "fixture must be an SDE model");
+
+    let user_asked_auto = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::Auto,
+        gradient_method: GradientMethod::Auto,
+        interaction: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        GradientMethod::effective(&model, &user_asked_auto),
+        GradientMethod::Fd,
+        "an SDE model has no analytic-sensitivity path; the engine forces FD"
+    );
+    assert!(
+        !check_model_options(&model, &user_asked_auto)
+            .iter()
+            .any(|d| d.code == CODE),
+        "the user wrote no `gradient` line; do not report a coupling they did not cause"
+    );
+}
+
+/// **Finding 2 — a mixture fit was told its optimizer moved when it had not.**
+///
+/// `optimize_population` special-cases mixtures: `optimizer = auto` is BOBYQA for a
+/// mixture *whatever* the gradient situation, because the label-switching
+/// multimodality is what the choice is about. The first cut asked `resolve_auto`,
+/// which knows nothing of that arm, so an analytic-scope mixture with `gradient = fd`
+/// was told it had swapped `nlopt_lbfgs` for `bobyqa` — a swap that never happened.
+///
+/// The straddle is asserted: the same model *without* the mixture does warn, so this
+/// test cannot pass by the fixture having drifted out of analytic scope.
+#[test]
+fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
+    let mut model = analytical_model(GradientMethod::Fd);
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::Auto,
+        gradient_method: GradientMethod::Fd,
+        interaction: true,
+        ..Default::default()
+    };
+    // Without the mixture this model is the warning's positive case…
+    assert_eq!(
+        check_model_options(&model, &opts)
+            .iter()
+            .filter(|d| d.code == CODE)
+            .count(),
+        1,
+        "the non-mixture twin must warn, or this test proves nothing about mixtures"
+    );
+
+    // …and with it, both arms run BOBYQA, so there is nothing to report.
+    model.default_params.mixture = Some(crate::types::MixtureParams {
+        omega: vec![model.default_params.omega.clone()],
+        sigma: vec![model.default_params.sigma.clone()],
+        omega_override_addr: Vec::new(),
+        omega_override_fixed: Vec::new(),
+        sigma_override_addr: Vec::new(),
+        sigma_override_fixed: Vec::new(),
+    });
+    assert_eq!(
+        crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            Optimizer::Auto,
+            &model,
+            true,
+            true,
+        )
+        .0,
+        Optimizer::Bobyqa,
+        "a mixture resolves `auto` to BOBYQA even with an analytic gradient available"
+    );
+    assert!(
+        !check_model_options(&model, &opts)
+            .iter()
+            .any(|d| d.code == CODE),
+        "a mixture's `auto` is BOBYQA with or without the gradient override"
+    );
+}
+
+/// **Finding 3 — an evaluation-only fit was told about an optimizer that never ran.**
+///
+/// `outer_maxiter == 0` (NONMEM `MAXEVAL=0`) short-circuits `optimize_population`
+/// before any optimizer is constructed: the objective is reported at the initial
+/// parameters. The warning's whole subject — "the optimizer that ran" — does not
+/// exist on such a fit.
+///
+/// The straddle is asserted against `maxiter = 1`, which does reach the optimizer,
+/// so a mutation that simply silences the check cannot pass this.
+#[test]
+fn an_evaluation_only_fit_is_silent_because_no_optimizer_runs() {
+    let model = analytical_model(GradientMethod::Fd);
+    let mk = |outer_maxiter| FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::Auto,
+        gradient_method: GradientMethod::Fd,
+        interaction: true,
+        outer_maxiter,
+        ..Default::default()
+    };
+    assert!(
+        !crate::estimation::outer_optimizer::runs_outer_optimizer(&mk(0)),
+        "maxiter = 0 constructs no optimizer"
+    );
+    assert!(crate::estimation::outer_optimizer::runs_outer_optimizer(
+        &mk(1)
+    ));
+
+    assert!(
+        !check_model_options(&model, &mk(0))
+            .iter()
+            .any(|d| d.code == CODE),
+        "no optimizer ran, so none of it moved"
+    );
+    assert_eq!(
+        check_model_options(&model, &mk(1))
+            .iter()
+            .filter(|d| d.code == CODE)
+            .count(),
+        1,
+        "the straddle: one outer iteration is enough to reach the optimizer"
+    );
 }

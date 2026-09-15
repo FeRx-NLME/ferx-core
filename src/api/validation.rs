@@ -3490,37 +3490,60 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // `final_gradient_source` records the effect (#1380) — both are fields the user
     // has to think to read *afterwards*.
     //
-    // Fires only when the coupling actually changed the pick: the counterfactual is
-    // taken off `resolve_auto_given_analytic` fed the scope-only predicate, i.e. what
-    // `auto` would have resolved to with `gradient = auto` on this same model. So a
-    // model that is out of the analytic scope anyway (ODE/PD, LTBS, TTE) stays quiet —
-    // `fd` changed nothing there — as does a model above `BOBYQA_MAX_DIM`, where `auto`
-    // takes L-BFGS on an FD gradient either way.
+    // Fires only when the coupling actually changed the pick. Both sides of the
+    // comparison go through `resolve_outer_optimizer` — the same function the outer
+    // loop resolves with — differing *only* in the analytic-gradient predicate fed
+    // to it: the live one, and the scope-only one that says what `auto` would have
+    // picked under `gradient = auto`. Asking that question of `resolve_auto`
+    // directly was wrong twice over on review: it misses the mixture arm (where
+    // `auto` is BOBYQA whatever the gradient), and it knows nothing about the
+    // `outer_maxiter == 0` short-circuit that constructs no optimizer at all.
+    //
+    // Quiet, therefore, on: a model out of the analytic scope anyway (ODE/PD, LTBS,
+    // TTE) where `fd` changed nothing; a model above `BOBYQA_MAX_DIM`, where `auto`
+    // takes L-BFGS on an FD gradient either way; a mixture model; and an
+    // evaluation-only (`maxiter = 0`) fit.
+    //
+    // The gradient is read through `GradientMethod::effective`, not off
+    // `model.gradient_method`, because `validate_model_file` (`ferx check`) hands us
+    // the model straight from the parser with `gradient = fd` still sitting in the
+    // *options* — the advertised case, which read the stale `Auto` and said nothing.
+    let effective_gradient = crate::types::GradientMethod::effective(model, options);
     if options.optimizer == Optimizer::Auto
-        // The user's own `gradient = fd`, not an engine-forced one. An SDE model has
-        // `model.gradient_method` overwritten to `Fd` by `fit()`/`run_*` regardless of
-        // what the user asked for; there is no user-side coupling to report there, and
-        // this gate — read off `options`, where the counterfactual below is read off
-        // `model` — is what excludes it.
+        // The user's own `gradient = fd`, not an engine-forced one. An SDE model is
+        // forced to `Fd` whatever was asked for; there is no user-side coupling to
+        // report there, and this gate — read off `options`, where the counterfactual
+        // below is read off the effective method — is what excludes it.
         && options.gradient_method == crate::types::GradientMethod::Fd
     {
-        // The FOCE/FOCEI-family stages that actually consult `resolve_auto`. `laplace`
-        // is excluded because `fit()` overrides `auto` to `nlopt_lbfgs` for it before
-        // the outer loop sees it (#317), so its optimizer does not move; `saem`,
-        // `imp`/`impmap`, `bayes` and `vi` never run the outer optimizer at all.
-        // `gn_hybrid` is included: its FOCEI polish routes through
+        // The FOCE/FOCEI-family stages that actually reach the outer optimizer.
+        // `laplace` is excluded because `fit()` overrides `auto` to `nlopt_lbfgs` for
+        // it before the outer loop sees it (#317), so its optimizer does not move;
+        // `saem`, `imp`/`impmap`, `bayes` and `vi` never run the outer optimizer at
+        // all. `gn_hybrid` is included: its FOCEI polish routes through
         // `optimize_population_warm` → `optimize_population` with `auto` still live.
-        let runs_outer = chain.iter().any(|&m| {
-            matches!(
-                m,
-                EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::FoceGnHybrid
+        let runs_outer = crate::estimation::outer_optimizer::runs_outer_optimizer(options)
+            && chain.iter().any(|&m| {
+                matches!(
+                    m,
+                    EstimationMethod::Foce
+                        | EstimationMethod::FoceI
+                        | EstimationMethod::FoceGnHybrid
+                )
+            });
+        let has_mixture = model.default_params.mixture.is_some();
+        let in_scope = crate::sens::provider::analytic_outer_gradient_in_scope(model);
+        let resolve = |analytic: bool| {
+            crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                Optimizer::Auto,
+                model,
+                has_mixture,
+                analytic,
             )
-        });
-        let forced = Optimizer::Auto.resolve_auto(model, options.interaction);
-        let unforced = Optimizer::Auto.resolve_auto_given_analytic(
-            model,
-            crate::sens::provider::analytic_outer_gradient_in_scope(model),
-        );
+            .0
+        };
+        let forced = resolve(in_scope && effective_gradient != crate::types::GradientMethod::Fd);
+        let unforced = resolve(in_scope);
         if runs_outer && forced != unforced {
             diags.push(
                 Diagnostic::warning(
