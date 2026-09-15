@@ -1251,3 +1251,153 @@ fn modeled_rate_addl_matches_nonmem() {
         preds[8]
     );
 }
+
+/// A **non-finite** modeled `D{n}` / `R{n}` must make the subject non-finite, not
+/// serve it as an instantaneous bolus (#1284).
+///
+/// `DoseEvent::resolve_rate` used to hand both non-finite shapes to the domain
+/// floor that exists for a transient `D ≤ 0`, and neither survived the trip:
+///
+/// | | resolved to | served |
+/// |---|---|---|
+/// | `D1 = NaN` | `duration = DURATION_FLOOR = 1e-8` (`NaN > floor` is false) | a bolus |
+/// | `D1 = +inf` | `rate = amt/inf = 0`, so `is_infusion()` is false | a bolus |
+/// | `R1 = NaN` | `rate = RATE_FLOOR = 1e-8` | `duration = 1e10` — nothing delivered |
+/// | `R1 = +inf` | `duration = amt/inf = 0` | a bolus |
+///
+/// The fixture below is the issue's: 1-cpt, `CL/V = 0.1`, `V = 10`, one 100-unit
+/// coded-`RATE` dose at `t = 0`, observations at `t = 1, 4, 8`. An instantaneous
+/// bolus there is the **exact closed form** `10·e^(−0.1t)` =
+/// `[9.0483741804, 6.7032004604, 4.4932896412]`, and that is what the engine
+/// returned — measured `[9.048374185, 6.703200632, 4.493299458]` for `D1 = NaN`,
+/// within 5e-9 of it — against a correct infusion of `4.758129098` at `t = 1`.
+/// **2.03× high**, on every channel at once: `check_model_data` returned `[]`,
+/// `predict()` returned those numbers, and a fit could converge to them.
+///
+/// Two layers are asserted, because they cover different populations and the
+/// second is the one that matters mid-fit:
+///
+///  * `check_model_data` (`E_DOSE_ATTR_NONFINITE`, #1235) is the front door, and
+///    only sees the **typical-value** case — a covariate model already broken at
+///    `η = 0`, which is what this fixture spells;
+///  * `predict()` runs no data check, so it reads the **engine**, which is the
+///    layer a mid-fit θ/η excursion into the same `exp` overflow lands on and
+///    which no init-time check can see.
+///
+/// Both engines are exercised and they repel through different machinery, so
+/// neither leg is a second copy of the other: the ODE walk is abandoned by
+/// `timeline_has_non_finite` on the `NaN` dose time, while the analytical
+/// superposition — which builds no timeline — is stopped by
+/// `predict_concentration`'s own `t_eff` guard. Before that guard the analytical
+/// arm returned `0.0`: a *finite* drug-free trajectory, which is the silent-drop
+/// failure mode rather than a diagnostic.
+///
+/// Mutation (run): drop `resolve_rate`'s `is_finite` early return → every
+/// non-finite arm reads the bolus closed form above and the `is_nan` assert fires,
+/// naming the engine and the attribute; drop `predict_concentration`'s guard and
+/// only the analytical legs go red, at `0.0`. The finite control is the straddle.
+#[test]
+fn non_finite_modeled_duration_or_rate_repels_instead_of_serving_a_bolus() {
+    // `WT = 1000` overflows `exp(WT)` to `+inf`, and `inf − inf` is `NaN`. `exp` is
+    // the one DSL arithmetic with no domain guard, so this is the reachable route.
+    fn model_src(structural: &str, attr: &str, expr: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  theta TVD(1.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {attr} = {expr}
+
+[structural_model]
+  {structural}
+
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        )
+    }
+    const ODE_STRUCT: &str = "ode(states=[central])\n\n[odes]\n  \
+         d/dt(central) = -CL/V * central\n\n[scaling]\n  y = central / V";
+    const ANALYTIC_STRUCT: &str = "pk one_cpt_iv(cl=CL, v=V)";
+
+    fn csv_for(rate: i32) -> String {
+        format!(
+            "ID,TIME,DV,AMT,EVID,CMT,RATE,WT\n\
+             1,0,.,100,1,1,{rate},1000\n\
+             1,1,1.0,.,0,1,.,1000\n\
+             1,4,1.0,.,0,1,.,1000\n\
+             1,8,1.0,.,0,1,.,1000\n"
+        )
+    }
+
+    // What the engine used to serve, hand-computed rather than tolerated: a
+    // 100-unit instantaneous bolus into V = 10 with k = CL/V = 0.1.
+    let bolus: Vec<f64> = [1.0_f64, 4.0, 8.0]
+        .iter()
+        .map(|t| 10.0 * (-0.1 * t).exp())
+        .collect();
+
+    for (engine, structural) in [("ODE", ODE_STRUCT), ("analytical", ANALYTIC_STRUCT)] {
+        for (attr, rate, finite) in [("D1", -2, "TVD * 2.0"), ("R1", -1, "TVD * 50.0")] {
+            let csv = csv_for(rate);
+
+            // The straddle: an in-domain value is untouched by the fix and must
+            // still predict the infusion, which is nowhere near the bolus.
+            let control = model_of(&model_src(structural, attr, finite));
+            let ok = preds_of(&control, &csv);
+            assert!(
+                check_model_data(&control, &pop_of(&csv)).is_empty(),
+                "{engine}/{attr}: the finite control must pass the data check"
+            );
+            assert!(
+                ok.iter().all(|p| p.is_finite()),
+                "{engine}/{attr}: finite control predicts {ok:?}"
+            );
+            assert!(
+                (ok[0] - bolus[0]).abs() > 1.0,
+                "{engine}/{attr}: the control must be far from the bolus it would \
+                 collapse to ({} vs {}) — otherwise the assertions below cannot \
+                 tell the two apart",
+                ok[0],
+                bolus[0]
+            );
+
+            for (shape, expr) in [
+                ("NaN", "TVD*exp(WT) - TVD*exp(WT)"),
+                ("+inf", "TVD*exp(WT)"),
+            ] {
+                let model = model_of(&model_src(structural, attr, expr));
+                let ctx = format!("{engine}/{attr} = {shape}");
+
+                // Layer 1 — the fit-init front door names the subject (#1235).
+                let issues = check_model_data(&model, &pop_of(&csv));
+                assert!(
+                    issues
+                        .iter()
+                        .any(|d| d.code == "E_DOSE_ATTR_NONFINITE"
+                            && d.severity == Severity::Error),
+                    "{ctx}: check_model_data must reject: {issues:?}"
+                );
+
+                // Layer 2 — the engine itself, which is what a mid-fit excursion
+                // reaches. Every prediction non-finite, none of them the bolus.
+                let preds = preds_of(&model, &csv);
+                assert_eq!(preds.len(), bolus.len(), "{ctx}: one prediction per obs");
+                for (i, (p, b)) in preds.iter().zip(&bolus).enumerate() {
+                    assert!(
+                        p.is_nan(),
+                        "{ctx}: obs {i} predicted {p}, want NaN \
+                         (the instantaneous bolus this used to serve is {b})"
+                    );
+                }
+            }
+        }
+    }
+}

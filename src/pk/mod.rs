@@ -1563,6 +1563,20 @@ pub fn predict_concentration(
     let mut conc = 0.0;
     for dose in doses {
         let t_eff = dose.time + lagtime;
+        // The superposition engine's `timeline_has_non_finite` (#1189, #1284). It
+        // has no break-time timeline to run that predicate over — it sums closed
+        // forms over doses — so the guard is the same shape spelled here: a
+        // non-finite arrival matches *neither* arm below (every comparison
+        // against `NaN` is false), so without this the dose is silently dropped
+        // and a drug-free trajectory is returned as a valid prediction. Both
+        // inputs to `t_eff` can reach here non-finite: a `NaN` `lagtime`, and a
+        // dose whose modeled `D{n}`/`R{n}` resolved out of domain
+        // (`DoseEvent::non_finite`). Returning `NaN` early also keeps it clear of
+        // the `conc.max(0.0)` floor at the end, which — like every `f64::max` —
+        // would discard the `NaN` and report `0.0`.
+        if !t_eff.is_finite() {
+            return f64::NAN;
+        }
         if t_eff <= t {
             let tau = t - t_eff;
             if dose.ss && dose.ii > 0.0 && !crate::dosing::ss_arrival_is_trough(dose, lagtime) {
@@ -3750,6 +3764,63 @@ mod tests {
         pk.values[crate::types::PK_IDX_LAGTIME] = 5.0;
         let c = predict_concentration(PkModel::OneCptOral, &doses, 1.0, &pk);
         assert_eq!(c, 0.0);
+    }
+
+    /// A non-finite dose arrival must come back `NaN`, never a drug-free `0.0`
+    /// (#1189's silent-drop shape, closed on this engine by #1284).
+    ///
+    /// `predict_concentration` sums closed forms over doses instead of walking a
+    /// break-time timeline, so it has no `timeline_has_non_finite` to run. Both
+    /// of its arms test `t_eff` against `t`, and every comparison against `NaN`
+    /// is false, so the dose was simply skipped and the *remaining* trajectory —
+    /// here, nothing at all — was returned as a valid prediction. Worse than the
+    /// dropped dose is what follows it: the trailing `conc.max(0.0)` is an
+    /// `f64::max`, which discards `NaN` (`0.0f64.max(NaN) == 0.0`, verified
+    /// below), so even a dose that *did* contribute `NaN` was floored to `0.0`.
+    /// Two independent ways for the same subject to read finite and wrong.
+    ///
+    /// Both inputs to `t_eff` are exercised, because they arrive from different
+    /// places: a `NaN` `lagtime` (an overflowing `$PK` expression) and a `NaN`
+    /// `dose.time` (`DoseEvent::non_finite`, a modeled `D{n}`/`R{n}` that
+    /// resolved out of domain). The finite control pins that the guard did not
+    /// simply start rejecting everything.
+    ///
+    /// Mutation (run): delete the `if !t_eff.is_finite()` guard → both non-finite
+    /// arms return `0.0` and this fires, naming which one.
+    #[test]
+    fn non_finite_arrival_gives_nan_not_a_drug_free_zero() {
+        // The floor that would have hidden it — measured here rather than recalled.
+        assert_eq!(f64::NAN.max(0.0), 0.0, "f64::max discards NaN");
+
+        let pk = make_pk_params(1.0, 10.0);
+        let finite = predict_concentration(PkModel::OneCptIv, &[bolus_dose(0.0, 100.0)], 4.0, &pk);
+        assert!(
+            finite.is_finite() && finite > 0.0,
+            "control: a finite dose still predicts ({finite})"
+        );
+
+        let mut nan_lag = pk;
+        nan_lag.values[crate::types::PK_IDX_LAGTIME] = f64::NAN;
+        let via_lag =
+            predict_concentration(PkModel::OneCptIv, &[bolus_dose(0.0, 100.0)], 4.0, &nan_lag);
+        assert!(via_lag.is_nan(), "NaN lagtime: got {via_lag}, want NaN");
+
+        let via_dose_time =
+            predict_concentration(PkModel::OneCptIv, &[bolus_dose(f64::NAN, 100.0)], 4.0, &pk);
+        assert!(
+            via_dose_time.is_nan(),
+            "NaN dose time: got {via_dose_time}, want NaN"
+        );
+
+        // The *other* finite dose in the same subject must not rescue it: the
+        // subject is non-finite, not "finite where it happens to have data".
+        let mixed = predict_concentration(
+            PkModel::OneCptIv,
+            &[bolus_dose(0.0, 100.0), bolus_dose(f64::NAN, 100.0)],
+            4.0,
+            &pk,
+        );
+        assert!(mixed.is_nan(), "one bad dose poisons the sum: got {mixed}");
     }
 
     #[test]

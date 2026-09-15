@@ -78,6 +78,11 @@ pub enum InfusionDef {
 /// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
 /// a `NaN` input also returns `floor`. The explicit comparison (not `f64::max`)
 /// is what makes the `NaN`-to-`floor` behaviour deliberate rather than incidental.
+///
+/// **A caller that must not treat a non-finite input as a small positive one
+/// tests for that first** — see [`DoseEvent::resolve_rate`], which repels the
+/// subject instead (#1284). The clamp answers "`x` is on the wrong side of the
+/// wall, pull it back"; `NaN` is not a side.
 #[inline]
 pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
     if x > floor {
@@ -162,18 +167,54 @@ impl DoseEvent {
     /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
     /// [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]: far below any
     /// realistic duration, so it never perturbs a converged fit — it only keeps
-    /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
-    /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
+    /// a transient `D ≤ 0` from turning `amt / D` into a non-finite rate. A
+    /// **non-finite** `D` is not clamped here — it repels the subject
+    /// ([`Self::non_finite`], #1284).
     pub(crate) const DURATION_FLOOR: f64 = 1e-8;
 
     /// Domain floor for a modeled infusion `rate` (`RATE = -1` → `R{cmt}`), the
-    /// mirror of [`Self::DURATION_FLOOR`]. A transient `R ≤ 0` (or `NaN`)
-    /// mid-search would otherwise make `amt / R` (the implied duration)
-    /// non-finite; clamping `R` to this floor keeps it finite (delivering the
-    /// dose over a very long duration) without perturbing a converged fit, whose
-    /// optimum is interior. `NaN` falls to the floor (every `>` is false for
-    /// `NaN`).
+    /// mirror of [`Self::DURATION_FLOOR`]. A transient `R ≤ 0` mid-search would
+    /// otherwise make `amt / R` (the implied duration) non-finite; clamping `R`
+    /// to this floor keeps it finite (delivering the dose over a very long
+    /// duration) without perturbing a converged fit, whose optimum is interior.
+    /// A **non-finite** `R` is not clamped here — it repels the subject
+    /// ([`Self::non_finite`], #1284).
     pub(crate) const RATE_FLOOR: f64 = 1e-8;
+
+    /// The resolved dose for a modeled `D{n}` / `R{n}` that came back
+    /// **non-finite** — the out-of-domain outcome, not a clamped one (#1284).
+    ///
+    /// Every field the engines derive a number from is `NaN`, **including
+    /// `time`**, and the `time` is the operative one. The `(rate, duration)`
+    /// pair alone cannot carry non-finiteness past
+    /// [`crate::dosing::is_real_infusion`]: that predicate requires
+    /// `rate > 0 && duration > 0 && duration.is_finite()`, and no assignment to
+    /// the pair satisfies it while being non-finite — a `NaN` rate already fails
+    /// [`Self::is_infusion`]'s `rate > 0.0`. So the dose falls to the **bolus**
+    /// branch, which reads only `amt`, and the whole excursion is served as a
+    /// finite instantaneous bolus: measured 2.03× high at one elimination
+    /// half-time on a 1-cpt model, with no diagnostic on any channel.
+    ///
+    /// A `NaN` `time` instead lands where every engine already looks. It is the
+    /// same shape a `NaN` `ALAG` produces (`dose.time + lag`), so the #1189
+    /// machinery absorbs it unchanged: each walk pushes `d.time` onto its
+    /// timeline, [`crate::ode::predictions::timeline_has_non_finite`] /
+    /// `EventSchedule::non_finite_event_time` sees it, and the subject comes
+    /// back `NaN` — which the estimation guards already read as a diverged solve
+    /// and the optimizer as a wall. One repulsion channel for every non-finite
+    /// dose attribute, rather than a second one threaded through four walks.
+    ///
+    /// `amt`, `cmt`, `ss` and `ii` are kept: nothing derives a *time* from them,
+    /// and preserving them keeps the event recognisable in a debug dump.
+    fn non_finite(&self) -> DoseEvent {
+        DoseEvent {
+            time: f64::NAN,
+            rate: f64::NAN,
+            duration: f64::NAN,
+            rate_mode: RateMode::Fixed,
+            ..self.clone()
+        }
+    }
 
     /// Resolve a modeled-`RATE` dose into a concrete ([`RateMode::Fixed`]) dose
     /// for this iteration's per-dose `PkParams` (`params` = `PkParams::values`).
@@ -195,7 +236,9 @@ impl DoseEvent {
     /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
     /// or rate here would drop its `∂/∂η`, so no `Dual` twin is ever needed. A
     /// transient `D ≤ 0` is clamped to [`Self::DURATION_FLOOR`]; a transient
-    /// `R ≤ 0` to [`Self::RATE_FLOOR`].
+    /// `R ≤ 0` to [`Self::RATE_FLOOR`]. A **non-finite** `D`/`R` is a different
+    /// case and gets a different answer — [`Self::non_finite`] (#1284), not the
+    /// floor.
     pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
         match self.rate_mode {
             RateMode::Fixed => self.clone(),
@@ -207,6 +250,9 @@ impl DoseEvent {
                     .indexed_slot(DoseAttr::Duration, self.cmt)
                     .expect("modeled-duration dose slot validated by check_model_data");
                 let d_raw = params.get(slot).copied().unwrap_or(0.0);
+                if !d_raw.is_finite() {
+                    return self.non_finite();
+                }
                 let duration = clamp_above_floor(d_raw, Self::DURATION_FLOOR);
                 DoseEvent {
                     rate: self.amt / duration,
@@ -223,6 +269,9 @@ impl DoseEvent {
                     .indexed_slot(DoseAttr::Rate, self.cmt)
                     .expect("modeled-rate dose slot validated by check_model_data");
                 let r_raw = params.get(slot).copied().unwrap_or(0.0);
+                if !r_raw.is_finite() {
+                    return self.non_finite();
+                }
                 let rate = clamp_above_floor(r_raw, Self::RATE_FLOOR);
                 DoseEvent {
                     rate,
