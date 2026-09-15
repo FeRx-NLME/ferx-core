@@ -204,6 +204,13 @@ impl DoseEvent {
     /// and the optimizer as a wall. One repulsion channel for every non-finite
     /// dose attribute, rather than a second one threaded through four walks.
     ///
+    /// The two **superposition** walks build no timeline, so they carry the same
+    /// predicate spelled for them, once, in
+    /// [`crate::pk::superposition_arrival_non_finite`] — read by the value twin
+    /// (`predict_concentration`) and the state twin (`analytical_state_at_times`)
+    /// alike. Guarding only the first is what let a repelled subject still report
+    /// a drug-free compartment amount (#1399 review).
+    ///
     /// `amt`, `cmt`, `ss` and `ii` are kept: nothing derives a *time* from them,
     /// and preserving them keeps the event recognisable in a debug dump.
     fn non_finite(&self) -> DoseEvent {

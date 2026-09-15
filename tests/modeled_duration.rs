@@ -23,6 +23,7 @@
 
 use ferx_core::api::{check_model_data, check_model_data_warnings};
 use ferx_core::parser::model_parser::parse_full_model;
+use ferx_core::pk::compute_predictions_with_states;
 use ferx_core::{
     predict, read_nonmem_csv, simulate, simulate_with_options, CompiledModel, Population, Severity,
     SimulateOptions,
@@ -1288,14 +1289,21 @@ fn modeled_rate_addl_matches_nonmem() {
 /// neither leg is a second copy of the other: the ODE walk is abandoned by
 /// `timeline_has_non_finite` on the `NaN` dose time, while the analytical
 /// superposition — which builds no timeline — is stopped by
-/// `predict_concentration`'s own `t_eff` guard. Before that guard the analytical
-/// arm returned `0.0`: a *finite* drug-free trajectory, which is the silent-drop
+/// `superposition_arrival_non_finite`. Before that guard the analytical arm
+/// returned `0.0`: a *finite* drug-free trajectory, which is the silent-drop
 /// failure mode rather than a diagnostic.
+///
+/// The **states** are asserted next to the predictions because the analytical
+/// engine computes them in a *second* superposition walk, and guarding only the
+/// prediction side left the two disagreeing about the same subject — `NaN`
+/// predictions beside `[[0.0]]` amounts (#1399 review finding 1).
 ///
 /// Mutation (run): drop `resolve_rate`'s `is_finite` early return → every
 /// non-finite arm reads the bolus closed form above and the `is_nan` assert fires,
-/// naming the engine and the attribute; drop `predict_concentration`'s guard and
-/// only the analytical legs go red, at `0.0`. The finite control is the straddle.
+/// naming the engine and the attribute; drop the guard in `predict_concentration`
+/// and only the analytical legs go red, at `0.0`; drop it in
+/// `analytical_state_at_times` and only the `states` assert goes red, also at
+/// `0.0`. The finite control is the straddle.
 #[test]
 fn non_finite_modeled_duration_or_rate_repels_instead_of_serving_a_bolus() {
     // `WT = 1000` overflows `exp(WT)` to `+inf`, and `inf − inf` is `NaN`. `exp` is
@@ -1395,6 +1403,30 @@ fn non_finite_modeled_duration_or_rate_repels_instead_of_serving_a_bolus() {
                         p.is_nan(),
                         "{ctx}: obs {i} predicted {p}, want NaN \
                          (the instantaneous bolus this used to serve is {b})"
+                    );
+                }
+
+                // Layer 2b — the **compartment states** the same call returns, which
+                // reach `[derived]` and the state output columns. They are computed by
+                // a second superposition walk on the analytical engine, and with the
+                // guard on the prediction side only it reported a drug-free `[[0.0]]`
+                // next to these `NaN`s — a valid-looking amount for a subject that had
+                // just been repelled (#1399 review finding 1). Asserted as a *pair*:
+                // the two must agree about the subject, per observation.
+                let pop = pop_of(&csv);
+                let (ipred, states) = compute_predictions_with_states(
+                    &model,
+                    &pop.subjects[0],
+                    &model.default_params.theta,
+                    &vec![0.0; model.default_params.omega.matrix.nrows()],
+                );
+                assert_eq!(ipred.len(), states.len(), "{ctx}: one state vector per obs");
+                for (i, (p, s)) in ipred.iter().zip(&states).enumerate() {
+                    assert!(p.is_nan(), "{ctx}: with_states ipred {i} = {p}, want NaN");
+                    assert!(
+                        !s.is_empty() && s.iter().all(|v| v.is_nan()),
+                        "{ctx}: states {i} = {s:?}, want all NaN — a finite amount \
+                         here is a drug-free state for a repelled subject"
                     );
                 }
             }
