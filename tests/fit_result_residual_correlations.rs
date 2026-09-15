@@ -212,3 +212,119 @@ fn block_sigma_chain_after_laplace_is_rejected() {
         .iter()
         .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }
+
+/// #1307. A `FIX`-ed correlation **above the Fisher-z estimation rail** reaches
+/// the fit at the declared value — the contract `src/types.rs` documents for
+/// `block_sigma ... FIX`, which `pack_rho`'s `clamp` used to break silently.
+///
+/// The fixture above is ρ = 0.5, four rail-widths inside, which is why
+/// `fit_result_carries_fixed_block_sigma_correlations` could not see this: every
+/// declared ρ above `tanh(3) = 0.995_055` collapsed onto that one number, so
+/// 0.999 and 0.9999 both fit as 0.995055 and the covariance the model declared
+/// was not the covariance scored.
+///
+/// The covariance is the assertion that makes it end-to-end rather than a
+/// packing round-trip: `ρ · σ_i · σ_j` must reproduce the off-diagonal written
+/// in the model file, and both σ are `FIX`ed here too, so every factor is the
+/// user's own number. Under the old behaviour it came back as 0.0597 against a
+/// declared 0.05994 — a 0.9% error in R, silently, on every evaluation.
+///
+/// `outer_maxiter: 0` keeps this Tier 2: one evaluation, no convergence loop.
+#[test]
+fn a_fixed_block_sigma_correlation_above_the_rail_is_held_at_the_declared_value() {
+    // σ_prop = 0.2, σ_add = 0.3, ρ = 0.999 ⇒ cov = 0.999 · 0.2 · 0.3 = 0.05994.
+    const DECLARED_COV: f64 = 0.05994;
+    const DECLARED_RHO: f64 = 0.999;
+    let src = MODEL.replace("[0.04, 0.10, 1.00] FIX", "[0.04, 0.05994, 0.09] FIX");
+    let model = parse_model_string(&src).expect("block_sigma model must parse");
+    let population = read_nonmem_csv(
+        Path::new("data/correlated_residual_combined.csv"),
+        None,
+        None,
+    )
+    .expect("correlated residual data must load");
+    let options = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+
+    // The premise: this ρ is outside the rail a *free* one would carry, so the
+    // test is capable of observing the fix. Without it the whole thing passes
+    // whether the rail is consulted or not.
+    let rail = 3.0_f64.tanh();
+    assert!(
+        DECLARED_RHO > rail,
+        "the fixture must declare a ρ above the {rail} rail"
+    );
+    assert!((model.residual_correlations[0].rho - DECLARED_RHO).abs() < 1e-12);
+
+    let result = fit(&model, &population, &model.default_params, &options)
+        .expect("initial correlated-residual evaluation must succeed");
+
+    let corr = result.residual_correlations[0];
+    assert!(
+        (corr.rho - DECLARED_RHO).abs() < 1e-9,
+        "a FIX-ed ρ must reach the fit as declared; got {} (the pre-#1307 value \
+         was {rail}, the rail itself)",
+        corr.rho
+    );
+    // The covariance the residual block is actually built from — the number in
+    // the model file, reassembled from what the fit reports.
+    let covariance = corr.rho * result.sigma[corr.sigma_i] * result.sigma[corr.sigma_j];
+    assert!(
+        (covariance - DECLARED_COV).abs() < 1e-9,
+        "the scored covariance must be the declared one; got {covariance}"
+    );
+    // …and the warning the free spelling earns is absent here, because there is
+    // nothing to warn about: the declared value survived.
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_INIT_NOT_REPRESENTABLE")),
+        "{:#?}",
+        result.warnings
+    );
+}
+
+/// The straddle for the test above: the identical declaration **without** `FIX`
+/// still takes the rail — the rail is an argument about what may be *searched*,
+/// and #1307 changed only the held case — and now says so in
+/// `FitResult.warnings`, where before it was silent.
+///
+/// Same data, same numbers, one keyword different. If this arm ever stops
+/// railing, the test above is passing for the wrong reason.
+#[test]
+fn a_free_block_sigma_correlation_above_the_rail_is_railed_and_reported() {
+    let src = MODEL.replace("[0.04, 0.10, 1.00] FIX", "[0.04, 0.05994, 0.09]");
+    let model = parse_model_string(&src).expect("free block_sigma model must parse");
+    let population = read_nonmem_csv(
+        Path::new("data/correlated_residual_combined.csv"),
+        None,
+        None,
+    )
+    .expect("correlated residual data must load");
+    let options = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+
+    let result = fit(&model, &population, &model.default_params, &options)
+        .expect("initial correlated-residual evaluation must succeed");
+
+    assert!(
+        (result.residual_correlations[0].rho - 3.0_f64.tanh()).abs() < 1e-9,
+        "a free ρ must still be railed; got {}",
+        result.residual_correlations[0].rho
+    );
+    let hit = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("W_INIT_NOT_REPRESENTABLE"))
+        .unwrap_or_else(|| panic!("the rail must be reported: {:#?}", result.warnings));
+    assert!(hit.contains("9.99e-1"), "{hit}");
+}

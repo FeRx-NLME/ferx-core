@@ -519,6 +519,8 @@ fn run_sir_core_scoped(
         packed: x_hat,
         bounds,
         fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
     } = pack_with_bounds(params);
     let n_packed = x_hat.len();
 

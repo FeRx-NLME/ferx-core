@@ -217,6 +217,8 @@ fn draw_asymptotic(
         packed: x_hat,
         bounds,
         fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
     } = pack_with_bounds(template);
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed {
@@ -292,6 +294,8 @@ fn draw_sir(
         packed: x_hat,
         bounds,
         fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
     } = pack_with_bounds(template);
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
