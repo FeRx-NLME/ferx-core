@@ -811,6 +811,28 @@ factor is about `0.01`, which keeps `R` invertible in floating point. A fit that
 reports rho sitting on this rail is telling you the two endpoints are carrying
 the same noise — treat it as a diagnostic, not an estimate.
 
+**The rail applies to an estimate, not to a declaration.** A `FIX`ed correlation
+is held exactly, at any `|rho| < 1` the parser accepts, and is never moved onto
+the `0.995` rail. That is the whole difference between the two spellings: a rail
+is an argument about what the optimizer may *search*, and `FIX` is not a search.
+An initial estimate for a **free** rho that is itself past the rail is clamped
+onto it before the first objective evaluation, and ferx says so
+(`W_INIT_NOT_REPRESENTABLE`); if the value you wrote is an assertion rather than
+a starting point, write `FIX`.
+
+::: {.callout-warning title="Changed in #1307"}
+Before this change the rail was applied to a `FIX`ed correlation too, so every
+declared `|rho|` above `0.995055` silently collapsed onto that one number and the
+fit scored a covariance the model file never wrote. Nothing reported it: the
+optimizer box for a `FIX`ed coordinate is pinned to the value the packer
+produced, so the start read as perfectly in-box. Measured on the
+`$SIGMA BLOCK(2) FIX` anchor `nonmem_anchor/correlated_residual_rho999.ctl`
+(everything fixed, `rho = -0.999`): NONMEM 442.272, ferx 442.138 now, and
+301.451 before — a 140.8 OFV error. If you have a fitted model with a `FIX`ed
+`block_sigma` above `|rho| = 0.995`, its old objective and estimates were
+computed at `0.995055` and need re-running.
+:::
+
 The reported standard error is on the natural `rho` scale, via the delta method:
 `SE(rho) = SE(z) * (1 - rho^2)`.
 

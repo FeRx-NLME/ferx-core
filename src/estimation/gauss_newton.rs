@@ -68,6 +68,8 @@ pub fn run_foce_gn(
         packed: mut x,
         bounds,
         fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
     } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let n_packed = x.len();

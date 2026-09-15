@@ -202,12 +202,53 @@ Three things the comparison deliberately does not do:
   clamps too; it just does not hold the clamped value through a search, and that
   stickiness is what the check is about.
 
-The comparison is against the **packed** start, which is not quite the same as
-"your initial estimates are inside your own bounds". `pack_params()` clamps
-before any box exists: a residual correlation is squeezed into
-$\pm\texttt{RHO\_Z\_BOUND}$ by `pack_rho`, and Theta / Omega diagonals / Sigma
-are floored at `1e-10`. Values moved by *those* clamps compare equal to their
-(identically floored) bounds and are invisible here.
+#### What the box cannot see: values the packer moved
+
+The comparison above is against the **packed** start, which is not the same
+question as "did my declared values reach the optimizer". `pack_params()` clamps
+*before* any box exists, and the box is then built from the already-moved value,
+so a coordinate the packer moved compares perfectly **in-box**. Two guards do
+this:
+
+- the `1e-10` **log floor**, on every log-packed segment — Theta, the Omega and
+  Omega_IOV Cholesky diagonals, Sigma, the `[mixture]` overrides. `ln` has no
+  value at or below 0, so the floor is structural rather than a policy choice
+  and cannot be lifted by declaring the parameter `FIX`: `ln(0)` is $-\infty$,
+  which the optimizer's magnitude scaling would then divide a coordinate by.
+- the Fisher-z **rail** on a residual correlation, $\pm 3$, i.e.
+  $|\rho| \le 0.995055$. This one *is* a policy choice — it bounds what the
+  optimizer may search — so since #1307 it applies to a **free** correlation
+  only. A `FIX`ed one is held exactly.
+
+A coordinate either guard moved is reported as `W_INIT_NOT_REPRESENTABLE`
+(category `init_not_representable`), naming the declared value and the value the
+optimizer actually sees. It carries its own code rather than reusing
+`init_outside_bounds` because the two support opposite conclusions: a silent
+`W_INIT_OUTSIDE_BOUNDS` does **not** mean your declared values survived the
+pack, which is exactly the inference the separate code exists to stop. Like the
+empty box, it is **not** exempt at `maxiter = 0` — an evaluation-only run scores
+the substituted value too, so there is no run of any length in which the
+declared number is used.
+
+It reports only coordinates the box walk above does not already claim, which
+makes the two complementary rather than two opinions on the same coordinate. A
+coordinate both would claim is moved *twice* — `sigma PROP_ERR ~ 0.0 (sd)` is
+floored to an SD of $10^{-10}$ and then clamped onto the $e^{-8} = 3.355\times
+10^{-4}$ rail — so the box message, which names the value the fit actually uses,
+is the more useful one and this check stands down. What is left over is
+precisely the set nothing else can see: a **`FIX`ed** coordinate, whose box is
+pinned to the moved value; a Theta whose declared lower bound is itself at or
+below the floor, where value and bound are floored identically; and a free
+correlation, which lands exactly *on* its rail rather than outside it.
+
+Over every `.ferx` file in this repository exactly **one** declaration is
+claimed: `theta TVBETA(0.0, FIX)` in `nonmem_anchor/ss_chz_const_fit.ferx`, the
+ferx spelling of NONMEM's `$THETA 0.0 FIX`. It runs at $10^{-10}$, which is
+numerically indistinguishable from zero inside that model's
+$\exp(\texttt{TVBETA} \cdot c)$ and is why the anchor was green without anyone
+noticing. If you need an exact zero on a log-packed Theta, declare a negative
+lower bound — `theta TVBETA(0.0, -5.0, 5.0) FIX` — which selects identity
+packing and holds the zero exactly.
 
 ## Where the packed space surfaces
 

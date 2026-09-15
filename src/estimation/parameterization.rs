@@ -32,13 +32,25 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 
-/// Smallest THETA value the log packing represents: `pack_params` floors at it
-/// and `compute_bounds` floors the declared *lower* bound at it, so a
+/// Smallest value the **log packing** represents: [`pack_params`] floors at it
+/// and `compute_bounds` floors a declared θ *lower* bound at it, so a
 /// declaration reaching below it arrives at the optimizer as this number.
-pub(crate) const THETA_PACK_FLOOR: f64 = 1e-10;
+///
+/// Every log-packed segment shares it — θ, the Ω and Ω_IOV Cholesky diagonals,
+/// Σ, and the `[mixture]` overrides — because they share the reason: `ln` has no
+/// value at 0 and no finite one below it. It was spelled `THETA_PACK_FLOOR`
+/// while only the θ box quoted it; the other five sites carried the bare literal
+/// and could not be reported on (#1307).
+///
+/// The floor is **not** removable by declaring the value `FIX`, and that is
+/// structural rather than a choice: `ln(0)` is `−inf`, which `compute_scale`
+/// would then divide a coordinate by. So a `FIX`-ed 0 is *reported* rather than
+/// represented — see [`PackGuard::ValueFloor`] — where a `FIX`-ed ρ, whose rail
+/// **is** a choice, is represented exactly ([`pack_rho_fixed`]).
+pub(crate) const LOG_PACK_FLOOR: f64 = 1e-10;
 
 /// Largest THETA value the log packing represents: `compute_bounds` ceilings
-/// the declared *upper* bound at it. Same story as [`THETA_PACK_FLOOR`] at the
+/// the declared *upper* bound at it. Same story as [`LOG_PACK_FLOOR`] at the
 /// other end.
 ///
 /// Both are spelled once here because three places read them — the packer, the
@@ -74,7 +86,7 @@ pub(crate) fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: 
     let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
     theta_packs_log(lower)
         && match side {
-            "lower" => lower <= THETA_PACK_FLOOR,
+            "lower" => lower <= LOG_PACK_FLOOR,
             "upper" => upper >= THETA_PACK_CEIL,
             _ => false,
         }
@@ -117,12 +129,35 @@ pub(crate) const RHO_Z_BOUND: f64 = 3.0;
 const RHO_CLAMP: f64 = 0.999_999;
 
 /// Pack a residual correlation `ρ ∈ (-1, 1)` as its Fisher-z coordinate
-/// `atanh(ρ)`, clamped into `[-RHO_Z_BOUND, RHO_Z_BOUND]`.
+/// `atanh(ρ)`, clamped into `[-RHO_Z_BOUND, RHO_Z_BOUND]` — the **estimated**
+/// spelling. A `FIX`-ed correlation goes through [`pack_rho_fixed`] instead.
 #[inline]
 pub(crate) fn pack_rho(rho: f64) -> f64 {
-    rho.clamp(-RHO_CLAMP, RHO_CLAMP)
-        .atanh()
-        .clamp(-RHO_Z_BOUND, RHO_Z_BOUND)
+    pack_rho_fixed(rho).clamp(-RHO_Z_BOUND, RHO_Z_BOUND)
+}
+
+/// Pack a **`FIX`-ed** residual correlation: `atanh(ρ)` with [`RHO_CLAMP`]
+/// guarding `atanh` against the unit boundary, and **no** [`RHO_Z_BOUND`] rail
+/// (#1307).
+///
+/// `RHO_Z_BOUND` is an argument about what the optimizer may *search* — a free ρ
+/// chasing `log|R| → −∞` is a degenerate optimum, not an estimate, and its own
+/// doc comment makes that case. A `FIX` is not a search. It is an assertion that
+/// `src/types.rs` documents as "holds it at the declared value" (#847), and
+/// applying an estimation rail to it silently rewrote the model: every declared
+/// ρ above `tanh(3) ≈ 0.995_055` collapsed onto that one number, so
+/// `block_sigma (E1, E2) = [0.04, 0.0299, 0.09] FIX` (ρ = 0.999) fit at 0.995055
+/// with nothing reported.
+///
+/// Dropping the rail here is safe precisely because the coordinate is pinned:
+/// [`pack_with_bounds`] sets `lower == upper == packed[i]`, so a ρ packed at
+/// `atanh(0.999) = 3.800` never moves, is never differentiated *against* the
+/// rail, and cannot walk the objective toward a singular `R`. What it can do is
+/// make `R` singular where the user asked for it to be — `1 − ρ²` is theirs to
+/// choose once they have written `FIX`.
+#[inline]
+pub(crate) fn pack_rho_fixed(rho: f64) -> f64 {
+    rho.clamp(-RHO_CLAMP, RHO_CLAMP).atanh()
 }
 
 /// Inverse of [`pack_rho`]: `ρ = tanh(z)`.
@@ -148,15 +183,115 @@ pub(crate) fn rho_chain(rho: f64) -> f64 {
 ///
 /// Theta packing depends on whether the user's `theta_lower[i]` allows
 /// negatives — see `theta_packs_log`.
+///
+/// This is the crate-internal `pack_params_with_moves` with its second result
+/// dropped. A caller that wants to know whether the pack *altered* any declared
+/// value — which is invisible downstream, because the box is built from the
+/// packed vector the guard already moved (#1307) — takes it from
+/// `pack_with_bounds` instead. Both are `pub(crate)`, so neither is a link here.
 pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
+    pack_params_with_moves(params).0
+}
+
+/// Which guard inside [`pack_params_with_moves`] altered a declared value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackGuard {
+    /// [`LOG_PACK_FLOOR`] — the log packing has no value at or below 0, so
+    /// every log-packed segment floors there.
+    ValueFloor,
+    /// [`RHO_Z_BOUND`] — the Fisher-z estimation rail on a **free** ρ. A
+    /// `FIX`-ed ρ no longer reaches this (#1307).
+    RhoRail,
+    /// [`RHO_CLAMP`] — `|ρ|` at the unit boundary, where `atanh` is `±inf`. The
+    /// parser rejects `|ρ| >= 1` at declaration time, so this is reachable only
+    /// from a hand-built [`ModelParameters`] or a covariance round-trip.
+    RhoUnit,
+}
+
+/// A declared value the **pack itself** altered, before any box existed.
+///
+/// Distinct from [`OutOfBox`], and the two are not alternatives: this one is
+/// structurally invisible to that one. `pack_params` clamps *first* and
+/// `unpinned_bounds` then applies the identical guard to the bound, so a moved
+/// coordinate compares **in-box** — and for a `FIX`-ed coordinate
+/// [`pack_with_bounds`] pins the box to the already-moved packed value, so
+/// `packed < lower || packed > upper` is false by construction. "Your packed
+/// start is inside its box" is true of every row in this list (#1307).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackMove {
+    /// Index into the packed vector.
+    pub(crate) index: usize,
+    /// Which guard bound.
+    pub(crate) guard: PackGuard,
+    /// What the model declared, on the scale [`coordinate_values`] reports —
+    /// a variance for an Ω / Ω_IOV / mixture-Ω diagonal, the SD-scale value for
+    /// Σ, ρ itself for a correlation, θ for a θ.
+    pub(crate) declared: f64,
+    /// What the optimizer will actually see, on that same scale.
+    pub(crate) represented: f64,
+}
+
+/// Apply the [`LOG_PACK_FLOOR`] guard to a value about to be log-packed,
+/// recording a [`PackMove`] when it binds.
+///
+/// `report` maps the packed-input scale onto the reporting scale — identity for
+/// θ / Σ, `x² ` for an Ω Cholesky diagonal, which the model declared as a
+/// variance.
+///
+/// The predicate is `!(value >= LOG_PACK_FLOOR)` and not `value < LOG_PACK_FLOOR`
+/// so a `NaN` is reported rather than swallowed: `f64::max` discards `NaN`
+/// (`NaN.max(1e-10)` is `1e-10`, verified), so the pack silently substitutes the
+/// floor for it, while `NaN < x` is false and the natural spelling would say
+/// nothing.
+fn floor_for_log(
+    moves: &mut Vec<PackMove>,
+    index: usize,
+    value: f64,
+    report: fn(f64) -> f64,
+) -> f64 {
+    if !(value >= LOG_PACK_FLOOR) {
+        moves.push(PackMove {
+            index,
+            guard: PackGuard::ValueFloor,
+            declared: report(value),
+            represented: report(LOG_PACK_FLOOR),
+        });
+        LOG_PACK_FLOOR
+    } else {
+        value
+    }
+}
+
+/// `x²` — the reporting map for an Ω / Ω_IOV / mixture-Ω Cholesky diagonal,
+/// which is an SD and was declared as a variance.
+fn as_variance(x: f64) -> f64 {
+    x * x
+}
+
+/// `x` — the reporting map for θ / Σ / a mixture Σ override, already on the
+/// scale they were declared on.
+fn as_declared(x: f64) -> f64 {
+    x
+}
+
+/// [`pack_params`], plus every declared value the pack's own guards altered.
+///
+/// One walk, not two: the guards are applied in exactly one place and record
+/// themselves there, so a mutation of the packing reddens the report with it.
+/// A second walk re-deriving "which coordinates would the guard bind on" is the
+/// two-implementations shape CLAUDE.md warns about — and it would be worse than
+/// usual here, since the thing being re-derived is a silent clamp.
+pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec<PackMove>) {
     let mut v = Vec::new();
+    let mut moves = Vec::new();
 
     // Theta: log-transformed when lower bound is non-negative; identity
     // otherwise (so negative-valued parameters like covariate exponents
     // can be expressed at all).
     for (i, &th) in params.theta.iter().enumerate() {
         if theta_packs_log(params.theta_lower[i]) {
-            v.push(th.max(THETA_PACK_FLOOR).ln());
+            let idx = v.len();
+            v.push(floor_for_log(&mut moves, idx, th, as_declared).ln());
         } else {
             v.push(th);
         }
@@ -175,7 +310,8 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     let n_eta = l.nrows();
     for (i, j) in lower_tri_iter(n_eta, params.omega.diagonal) {
         if i == j {
-            v.push(l[(i, j)].max(1e-10).ln());
+            let idx = v.len();
+            v.push(floor_for_log(&mut moves, idx, l[(i, j)], as_variance).ln());
         } else if params.omega.free_mask[(i, j)] {
             v.push(l[(i, j)]);
         } else {
@@ -184,8 +320,9 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     }
 
     // Sigma: log-transformed
-    for &s in &params.sigma.values {
-        v.push(s.max(1e-10).ln());
+    for &sig in &params.sigma.values {
+        let idx = v.len();
+        v.push(floor_for_log(&mut moves, idx, sig, as_declared).ln());
     }
 
     // IOV omega: diagonal elements as log; off-diagonal as-is (mirrors BSV omega).
@@ -193,7 +330,8 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
         let l = &iov.chol;
         for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
             if i == j {
-                v.push(l[(i, j)].max(1e-10).ln());
+                let idx = v.len();
+                v.push(floor_for_log(&mut moves, idx, l[(i, j)], as_variance).ln());
             } else if iov.free_mask[(i, j)] {
                 v.push(l[(i, j)]);
             } else {
@@ -210,10 +348,14 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     // segment so all existing offsets stay put.
     if let Some(ref mix) = params.mixture {
         for &(c, e) in &mix.omega_override_addr {
-            v.push(mix.omega[c].chol[(e, e)].max(1e-10).ln());
+            let idx = v.len();
+            let d = mix.omega[c].chol[(e, e)];
+            v.push(floor_for_log(&mut moves, idx, d, as_variance).ln());
         }
-        for &(c, s) in &mix.sigma_override_addr {
-            v.push(mix.sigma[c].values[s].max(1e-10).ln());
+        for &(c, si) in &mix.sigma_override_addr {
+            let idx = v.len();
+            let d = mix.sigma[c].values[si];
+            v.push(floor_for_log(&mut moves, idx, d, as_declared).ln());
         }
     }
 
@@ -223,11 +365,47 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     // `kappa_start`, the mixture segment start, …) keeps pointing at the same
     // coordinate. A `FIX`ed block is pinned by `compute_bounds` (lower == upper)
     // and flagged in `packed_fixed_mask`.
-    for corr in &params.residual_correlations {
-        v.push(pack_rho(corr.rho));
+    for (i, corr) in params.residual_correlations.iter().enumerate() {
+        let idx = v.len();
+        let fixed = params
+            .residual_correlation_fixed
+            .get(i)
+            .copied()
+            .unwrap_or(false);
+        // `RHO_CLAMP` guards `atanh` against the unit boundary on both
+        // spellings; `RHO_Z_BOUND` is the *estimation* rail and applies to the
+        // free one only (#1307).
+        let unit = corr.rho.clamp(-RHO_CLAMP, RHO_CLAMP);
+        if unit != corr.rho {
+            moves.push(PackMove {
+                index: idx,
+                guard: PackGuard::RhoUnit,
+                declared: corr.rho,
+                represented: unit,
+            });
+        }
+        // The unrailed coordinate both spellings would take, so the free branch
+        // below compares against it rather than re-deriving `atanh` and giving
+        // the rail test its own copy of the formula to drift from.
+        let unrailed = pack_rho_fixed(corr.rho);
+        let z = if fixed {
+            unrailed
+        } else {
+            let railed = pack_rho(corr.rho);
+            if railed != unrailed {
+                moves.push(PackMove {
+                    index: idx,
+                    guard: PackGuard::RhoRail,
+                    declared: unit,
+                    represented: unpack_rho(railed),
+                });
+            }
+            railed
+        };
+        v.push(z);
     }
 
-    v
+    (v, moves)
 }
 
 /// Unpack a flat unconstrained vector back into ModelParameters.
@@ -687,6 +865,12 @@ pub(crate) struct PackedStart {
     /// [`packed_fixed_mask`] of the template: every **held** coordinate — FIX,
     /// and since #1018 the structural-zero Ω / Ω_IOV entries — despite the name.
     pub(crate) fixed: Vec<bool>,
+    /// Every declared value the pack's own guards altered on the way in
+    /// (#1307). Usually empty. It rides here rather than being recomputed
+    /// because it *cannot* be recovered from the other three: the box is built
+    /// from the packed vector the guard already moved, so a move leaves no trace
+    /// in the box. See [`PackMove`].
+    pub(crate) moves: Vec<PackMove>,
 }
 
 /// Pack `template`, bound it, and mask its FIX coordinates in one **call**.
@@ -704,7 +888,7 @@ pub(crate) struct PackedStart {
 /// produce separately — [`compute_bounds`] is now this function with two of its
 /// three results dropped, so there is no second copy of the box to drift.
 pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
-    let packed = pack_params(template);
+    let (packed, moves) = pack_params_with_moves(template);
     let fixed = packed_fixed_mask(template);
     let mut bounds = unpinned_bounds(template);
 
@@ -726,6 +910,7 @@ pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
         packed,
         bounds,
         fixed,
+        moves,
     }
 }
 
@@ -872,7 +1057,7 @@ pub(crate) fn coordinates_outside_bounds<'a>(
 pub(crate) fn theta_representable_range(params: &ModelParameters, i: usize) -> (f64, f64) {
     let (lower, upper) = (params.theta_lower[i], params.theta_upper[i]);
     if theta_packs_log(lower) {
-        (lower.max(THETA_PACK_FLOOR), upper.min(THETA_PACK_CEIL))
+        (lower.max(LOG_PACK_FLOOR), upper.min(THETA_PACK_CEIL))
     } else {
         (lower, upper)
     }
@@ -896,7 +1081,7 @@ pub(crate) struct OutOfDeclaredRange {
 
 /// Every θ whose initial estimate is strictly outside its own **declared**
 /// range — the question [`coordinates_outside_bounds`] cannot answer, because
-/// the packer floors *both* the value and the bound at [`THETA_PACK_FLOOR`]
+/// the packer floors *both* the value and the bound at [`LOG_PACK_FLOOR`]
 /// before any box exists (#1309 review).
 ///
 /// The gap is not exotic. `theta TVCL(-5.0, 0.0, 10.0)` packs to
@@ -910,7 +1095,7 @@ pub(crate) struct OutOfDeclaredRange {
 ///
 /// On the declared sides this predicate is **strictly stronger** than the
 /// packed one and never weaker: for a log-packed θ with `theta_lower >
-/// THETA_PACK_FLOOR`, `packed < lower` holds exactly when `theta < theta_lower`
+/// LOG_PACK_FLOOR`, `packed < lower` holds exactly when `theta < theta_lower`
 /// up to `ln`'s rounding, which can only lose hits, never invent them. Measured
 /// over every `.ferx` in the tree at the time of writing — 154 that parse — it
 /// finds **zero** violations, the same answer the packed walk gives.
@@ -998,7 +1183,7 @@ pub(crate) struct InvertedBox {
 ///
 /// With `theta_lower <= theta_upper` the box still inverts in two ways, both
 /// from caps [`unpinned_bounds`] applies and the declaration does not mention:
-/// `theta_lower > `[`THETA_PACK_CEIL`] and `theta_upper < `[`THETA_PACK_FLOOR`].
+/// `theta_lower > `[`THETA_PACK_CEIL`] and `theta_upper < `[`LOG_PACK_FLOOR`].
 /// `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter — is the
 /// second, and it packs to `lower = -23.03` against `upper = -25.33`.
 pub(crate) fn coordinates_with_inverted_bounds<'a>(
@@ -1891,6 +2076,9 @@ mod tests {
                 upper: vec![1.0, 1.0, f64::NAN, f64::INFINITY, 1.0, 1.0],
             },
             fixed: vec![false; 6],
+            // Hand-built: this test is about the two box walks, and neither
+            // reads `moves`.
+            moves: Vec::new(),
         };
         let kinds = vec![PackedCoordKind::Theta; 6];
 
@@ -1916,6 +2104,251 @@ mod tests {
         // Disjoint, asserted rather than read off the two lists above.
         for (i, _) in &outside {
             assert!(!inverted.contains(i), "coordinate {i} claimed twice");
+        }
+    }
+
+    /// #1307. A `FIX`-ed `block_sigma` correlation is **held at the declared
+    /// value**, which is the contract `src/types.rs` documents for it — the
+    /// `RHO_Z_BOUND` estimation rail no longer applies to it.
+    ///
+    /// The four ρ here are the issue's own measured table. Before the fix the
+    /// last two both arrived as `tanh(3) = 0.995_055`: every declared ρ above
+    /// the rail collapsed onto that one number, so `[0.04, 0.0299, 0.09] FIX`
+    /// (ρ = 0.999) fit at 0.995055.
+    ///
+    /// The `straddle` assertion is what keeps this from becoming a tautology.
+    /// Two of the rows must pack **outside** `±RHO_Z_BOUND` — otherwise the fix
+    /// is untested by construction, since a ρ inside the rail is held whether
+    /// the rail is consulted or not, and a future edit to `RHO_Z_BOUND` could
+    /// quietly move every row inside it.
+    #[test]
+    fn a_fixed_rho_is_held_at_the_declared_value() {
+        let mut straddled = 0;
+        for &rho in &[0.99_f64, 0.995, 0.999, 0.9999, -0.9999] {
+            let t = make_rho_template(rho, true);
+            let start = pack_with_bounds(&t);
+            let idx = rho_packed_start(&t);
+
+            // Exactly, not to tolerance: `tanh(atanh(x))` is not the identity in
+            // floating point, but the claim here is about the *pack*, so it is
+            // checked in packed space where it is exact, and the round-trip is
+            // checked at the ULP scale it actually has.
+            assert_eq!(
+                start.packed[idx].to_bits(),
+                rho.atanh().to_bits(),
+                "a FIX-ed ρ = {rho} must pack as atanh(ρ) with no rail applied"
+            );
+            let seen = unpack_params(&start.packed, &t).residual_correlations[0].rho;
+            assert_relative_eq!(seen, rho, epsilon = 1e-12);
+
+            // The pin is the box, so the coordinate cannot move even where it
+            // sits outside the rail a free ρ would have carried.
+            assert_eq!(
+                start.bounds.lower[idx].to_bits(),
+                start.packed[idx].to_bits()
+            );
+            assert_eq!(
+                start.bounds.upper[idx].to_bits(),
+                start.packed[idx].to_bits()
+            );
+            assert!(start.fixed[idx]);
+
+            // Nothing to report: the declared value survived intact.
+            assert!(
+                start.moves.is_empty(),
+                "a held ρ = {rho} is represented exactly, so the pack moved nothing"
+            );
+
+            if start.packed[idx].abs() > RHO_Z_BOUND {
+                straddled += 1;
+            }
+        }
+        assert_eq!(
+            straddled, 3,
+            "three of the five rows must pack outside ±RHO_Z_BOUND, or this test \
+             cannot observe the rail being skipped"
+        );
+    }
+
+    /// #1307, the other half of the split: the rail is an argument about what
+    /// the optimizer may **search**, so a *free* ρ still takes it — and now says
+    /// so, where before it was silent.
+    ///
+    /// Deliberately the same ρ values as the FIX-ed test above, so the pair is a
+    /// differential on the one bit that changed. Both rows sit on opposite sides
+    /// of the predicate `pack_params_with_moves` branches on.
+    #[test]
+    fn a_free_rho_still_takes_the_estimation_rail_and_reports_it() {
+        let railed = unpack_rho(RHO_Z_BOUND);
+        for &rho in &[0.999_f64, 0.9999, -0.9999] {
+            let t = make_rho_template(rho, false);
+            let start = pack_with_bounds(&t);
+            let idx = rho_packed_start(&t);
+            assert_relative_eq!(start.packed[idx].abs(), RHO_Z_BOUND, epsilon = 1e-15);
+
+            assert_eq!(start.moves.len(), 1, "one move, for ρ = {rho}");
+            let mv = start.moves[0];
+            assert_eq!(mv.index, idx);
+            assert_eq!(mv.guard, PackGuard::RhoRail);
+            assert_relative_eq!(mv.declared, rho, epsilon = 1e-15);
+            assert_relative_eq!(mv.represented, railed.copysign(rho), epsilon = 1e-15);
+        }
+
+        // And a ρ *inside* the rail reports nothing, on either spelling — the
+        // report has to be about the rail, not about carrying a correlation.
+        for &fixed in &[false, true] {
+            let t = make_rho_template(0.99, fixed);
+            assert!(pack_with_bounds(&t).moves.is_empty(), "fixed = {fixed}");
+        }
+    }
+
+    /// #1307. Every log-packed segment floors at `LOG_PACK_FLOOR`, and every one
+    /// of them now reports the floor it applied — on the scale the value was
+    /// **declared** on, which is a variance for an Ω / Ω_IOV / mixture-Ω
+    /// diagonal and the stored value for θ / Σ.
+    ///
+    /// One segment at a time, from the same all-segments template, so a failure
+    /// names which segment lost its report rather than only that the count is
+    /// wrong. The `as_variance` half is the part a plain "did it report" check
+    /// would miss: an Ω diagonal packs its Cholesky diagonal, an SD, and
+    /// reporting `1e-10` for it would name a number that appears nowhere in the
+    /// model file — the declared variance floors at `1e-20`.
+    #[test]
+    fn the_pack_reports_every_log_floor_it_applied() {
+        // (packed index, how to zero that coordinate, declared reporting value)
+        type Zeroer = fn(&mut ModelParameters);
+        let cases: [(usize, Zeroer, f64); 5] = [
+            (0, |t| t.theta[0] = 0.0, 0.0),
+            (3, |t| t.omega.chol[(0, 0)] = 0.0, 0.0),
+            (9, |t| t.sigma.values[0] = 0.0, 0.0),
+            (
+                11,
+                |t| t.omega_iov.as_mut().unwrap().chol[(0, 0)] = 0.0,
+                0.0,
+            ),
+            (
+                13,
+                |t| t.mixture.as_mut().unwrap().omega[1].chol[(0, 0)] = 0.0,
+                0.0,
+            ),
+        ];
+        // Which of those report as a variance (`x²`) rather than verbatim.
+        let is_variance = |idx: usize| matches!(idx, 3 | 11 | 13);
+
+        for (idx, zero, declared) in cases {
+            let mut t = make_all_segments_template();
+            zero(&mut t);
+            let start = pack_with_bounds(&t);
+            assert_eq!(
+                start.moves.len(),
+                1,
+                "coordinate {idx}: exactly the one zeroed value must be reported"
+            );
+            let mv = start.moves[0];
+            assert_eq!(mv.index, idx, "the report must name the coordinate");
+            assert_eq!(mv.guard, PackGuard::ValueFloor);
+            assert_eq!(mv.declared, declared);
+            let want = if is_variance(idx) {
+                LOG_PACK_FLOOR * LOG_PACK_FLOOR
+            } else {
+                LOG_PACK_FLOOR
+            };
+            assert_relative_eq!(mv.represented, want, epsilon = 1e-30);
+            // The move is real: that is what the optimizer will see.
+            let seen = pack_with_bounds(&t).packed[idx].exp();
+            assert_relative_eq!(seen, LOG_PACK_FLOOR, epsilon = 1e-22);
+        }
+
+        // The mixture Σ override is the one log-packed segment that reports
+        // verbatim *and* sits after the mixture Ω block, so an off-by-one in the
+        // segment order would land on the wrong one. Checked separately because
+        // its index is the only one the table above cannot express without
+        // repeating the layout arithmetic.
+        let mut t = make_all_segments_template();
+        t.mixture.as_mut().unwrap().sigma[1].values[0] = 0.0;
+        let start = pack_with_bounds(&t);
+        assert_eq!(start.moves.len(), 1);
+        assert_eq!(start.moves[0].index, 16);
+        assert_eq!(start.moves[0].represented, LOG_PACK_FLOOR);
+    }
+
+    /// #1307. A `NaN` declared value is reported, and that needs saying because
+    /// the natural spelling would not have reported it: `f64::max` **discards**
+    /// `NaN` — `NaN.max(1e-10)` is `1e-10`, asserted here rather than recalled —
+    /// so the pack silently substitutes the floor, while `value < FLOOR` is
+    /// `false` for `NaN` and a `<` predicate would say nothing.
+    ///
+    /// This is the same shape CLAUDE.md names for folded accumulators: a
+    /// `f64::max` that swallows the one input most likely to mean something has
+    /// gone wrong.
+    #[test]
+    fn a_nan_declared_value_is_reported_rather_than_swallowed() {
+        assert_eq!(f64::NAN.max(LOG_PACK_FLOOR), LOG_PACK_FLOOR);
+        // `clippy::invalid_nan_comparisons` is exactly the point: the
+        // allow marks the comparison a `<` predicate would have made.
+        #[allow(invalid_nan_comparisons)]
+        {
+            assert!(!(f64::NAN < LOG_PACK_FLOOR));
+        }
+
+        let mut t = make_all_segments_template();
+        t.theta[0] = f64::NAN;
+        let start = pack_with_bounds(&t);
+        assert_eq!(start.moves.len(), 1);
+        assert_eq!(start.moves[0].index, 0);
+        assert!(start.moves[0].declared.is_nan());
+        assert_eq!(start.moves[0].represented, LOG_PACK_FLOOR);
+    }
+
+    /// #1307. `pack_params` is `pack_params_with_moves` with its second result
+    /// dropped — bit-for-bit, on a template exercising every segment, so
+    /// instrumenting the packer cannot have perturbed a single fit.
+    ///
+    /// Both the clean template and one where every guard binds at once, because
+    /// the guarded path is the one that was rewritten.
+    #[test]
+    fn instrumenting_the_packer_did_not_move_any_packed_value() {
+        let clean = make_all_segments_template();
+        let mut guarded = make_all_segments_template();
+        guarded.theta[0] = 0.0;
+        guarded.omega.chol[(0, 0)] = 0.0;
+        guarded.sigma.values[0] = 0.0;
+        guarded.residual_correlations[0].rho = 0.9999;
+
+        for t in [&clean, &guarded] {
+            let (with_moves, _) = pack_params_with_moves(t);
+            let plain = pack_params(t);
+            assert_eq!(with_moves.len(), plain.len());
+            for i in 0..plain.len() {
+                assert_eq!(with_moves[i].to_bits(), plain[i].to_bits(), "packed[{i}]");
+            }
+        }
+        assert!(pack_with_bounds(&clean).moves.is_empty());
+        assert_eq!(pack_with_bounds(&guarded).moves.len(), 4);
+    }
+
+    /// #1307. A ρ at the unit boundary has no Fisher-z coordinate at all
+    /// (`atanh(±1) = ±inf`), so `RHO_CLAMP` backs it off — on **both**
+    /// spellings, including the `FIX`-ed one whose estimation rail was removed.
+    ///
+    /// The parser rejects `|ρ| >= 1` at declaration time, so this is reachable
+    /// only from a hand-built `ModelParameters`; it is pinned because dropping
+    /// `RHO_CLAMP` along with `RHO_Z_BOUND` would have put `±inf` in the packed
+    /// vector, which `compute_scale` divides by.
+    #[test]
+    fn a_fixed_rho_at_the_unit_boundary_is_still_finite() {
+        for &fixed in &[false, true] {
+            let t = make_rho_template(1.0, fixed);
+            let start = pack_with_bounds(&t);
+            let idx = rho_packed_start(&t);
+            assert!(
+                start.packed[idx].is_finite(),
+                "fixed = {fixed}: atanh(1) is +inf and must not reach the optimizer"
+            );
+            assert!(start
+                .moves
+                .iter()
+                .any(|m| m.guard == PackGuard::RhoUnit && m.index == idx));
         }
     }
 
@@ -2420,8 +2853,13 @@ mod tests {
             packed,
             bounds,
             fixed,
+            moves,
         } = pack_with_bounds(&template);
         assert_eq!(fixed, held);
+        assert!(
+            moves.is_empty(),
+            "a structural-zero template declares nothing the packer has to move"
+        );
         for i in structural {
             assert!(
                 packed[i] == 0.0 && bounds.lower[i] == 0.0 && bounds.upper[i] == 0.0,

@@ -4019,6 +4019,8 @@ pub(crate) fn check_variance_init_rails(
         packed,
         bounds,
         fixed,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
     } = pack_with_bounds(init_params);
     let decls = variance_decl_by_coordinate(init_params);
     // Built only if something actually fires: `coordinate_names` allocates a
@@ -4311,6 +4313,19 @@ pub(crate) fn applies_parameter_priors(method: crate::types::EstimationMethod) -
 /// into that arm would silently drop bootstrap replicates.
 const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
 
+/// The `W_` token carried inside the message text of every *not representable*
+/// warning (#1307), so [`crate::types::classify_warning`] can recover
+/// [`crate::types::WarningCode::InitNotRepresentable`] from the flat string
+/// `fit()` stores.
+///
+/// A separate token from [`START_OUT_OF_BOX_TOKEN`] because the two answer
+/// different questions and a consumer must be able to tell them apart: that one
+/// fires on a start the box moved, this one on a value the packer moved before
+/// any box existed — and every coordinate this one names is, by construction,
+/// *inside* its box. `classify_warning` tests this token first, because the
+/// message below names the other one when it explains that silence.
+const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
+
 /// Report an initial estimate that packs **strictly outside** its own box, and
 /// is therefore silently moved by `clamp_to_bounds` before the first objective
 /// evaluation (#1251).
@@ -4324,6 +4339,7 @@ const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
 /// | coordinate | whose bound | verdict |
 /// |---|---|---|
 /// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
+/// | any coordinate the **packer itself** altered (#1307) | ferx's | warning, and not exempt at `maxiter = 0` |
 /// | θ strictly outside its **declared** lower / upper | the user's | **error** |
 /// | θ above the hidden `1e9` cap | ferx's | warning |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
@@ -4331,11 +4347,18 @@ const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
 /// | Ω off-diagonal, outside `±10` | ferx's | warning |
 /// | Σ, outside `[−8, 5]` | ferx's | warning |
 ///
-/// There is no row for the hidden `1e-10` **floor**, and that is a property of
-/// the packing rather than an omission: `packed = max(θ, 1e-10).ln()` is floored
+/// The hidden `1e-10` **floor** has no *box* row, and that is a property of the
+/// packing rather than an omission: `packed = max(θ, 1e-10).ln()` is floored
 /// identically to the bound, so a start below the floor compares *equal*, and a
 /// declared range lying entirely below it empties the box instead — the first
-/// row, not the third (#1309 review).
+/// row, not the fourth (#1309 review). It is the second row that reports it
+/// instead, and from the other side: not "where does this start sit in its box"
+/// but "did the declared number survive the pack at all" (#1307). The two are
+/// independent, so a coordinate may be reported by both.
+///
+/// That second row is why `W_INIT_OUTSIDE_BOUNDS` staying silent does **not**
+/// mean the declared values reached the optimizer. It carries its own token,
+/// `W_INIT_NOT_REPRESENTABLE`, precisely so a consumer can tell the two apart.
 ///
 /// That same flooring is why the **declared** θ row is judged on the natural
 /// scale and not the packed one. `theta TVCL(-5.0, 0.0, 10.0)` packs to
@@ -4382,8 +4405,8 @@ pub(crate) fn check_packed_start_in_box(
     use crate::estimation::parameterization::{
         coordinate_kinds, coordinate_names, coordinates_outside_bounds,
         coordinates_with_inverted_bounds, pack_with_bounds, theta_outside_declared_range,
-        theta_representable_range, BoxSide, PackedCoordKind, SIGMA_PACK_LOWER, SIGMA_PACK_UPPER,
-        THETA_PACK_CEIL, THETA_PACK_FLOOR,
+        theta_representable_range, BoxSide, PackGuard, PackedCoordKind, LOG_PACK_FLOOR,
+        RHO_Z_BOUND, SIGMA_PACK_LOWER, SIGMA_PACK_UPPER, THETA_PACK_CEIL,
     };
 
     let start = pack_with_bounds(init_params);
@@ -4444,10 +4467,10 @@ pub(crate) fn check_packed_start_in_box(
             } else {
                 format!(
                     "its declared range ({lo:e}, {hi:e}) lies entirely below ferx's internal \
-                     lower floor of {THETA_PACK_FLOOR:e}, which the packer substitutes for the \
+                     lower floor of {LOG_PACK_FLOOR:e}, which the packer substitutes for the \
                      declared lower, so the box has no representable value left. Rescale \
                      {name} — different units, or a factored-out constant — so its range \
-                     reaches above {THETA_PACK_FLOOR:e}"
+                     reaches above {LOG_PACK_FLOOR:e}"
                 )
             }
         } else {
@@ -4466,8 +4489,132 @@ pub(crate) fn check_packed_start_in_box(
             .with_block("parameters")
             .with_suggestion(format!(
                 "give {name} a non-empty range that ferx can represent \
-                 ({THETA_PACK_FLOOR:e}, {THETA_PACK_CEIL:e})"
+                 ({LOG_PACK_FLOOR:e}, {THETA_PACK_CEIL:e})"
             )),
+        );
+    }
+
+    // ── a declared value the PACK ALTERED, before any box existed ───────────
+    //
+    // Also not exempt at `maxiter = 0`, and for the stronger of the two reasons
+    // the empty-box arm above is not. A clamped start does not *stick* without a
+    // search — that is what the exemption below is for — but a packing guard is
+    // not a start that got moved, it is a value the packed space **cannot
+    // represent at all**. `evaluate_at_initial_params` unpacks the same vector,
+    // so an eval-only run reports the OFV of the substituted value; there is no
+    // run of any length in which the declared number is used (#1307).
+    //
+    // It reports only what the two walks below do **not** claim, which makes it
+    // exactly complementary to them rather than a second opinion. Two reasons,
+    // and the first is a correctness one:
+    //
+    // * A coordinate the box *also* moves is moved **twice** — `sigma X ~ 0.0
+    //   (sd)` floors to an SD of `1e-10` here and is then clamped onto the
+    //   `exp(-8) = 3.355e-4` rail — so a message naming this guard's output
+    //   would name a number the fit never uses. On an unclaimed coordinate the
+    //   packed value is inside its box by definition, the clamp is a no-op, and
+    //   `represented` really is what every objective evaluation sees.
+    // * What is left over is precisely the set nothing else can see: a **held**
+    //   coordinate, whose box `pack_with_bounds` pins to the already-moved value;
+    //   a θ whose declared lower is itself at or below the floor, where the
+    //   packer floors the value and the bound identically; and a free ρ, which
+    //   lands exactly *on* its rail rather than outside it. Those three are the
+    //   #1309 doc's list of what the box predicate is structurally blind to.
+    //
+    // The claimed set is taken from the same iterators the walks below use, so a
+    // coordinate cannot fall between the two.
+    let claimed: std::collections::BTreeSet<usize> = inverted
+        .iter()
+        .copied()
+        .chain(coordinates_outside_bounds(&start, &kinds).map(|h| h.index))
+        .chain(theta_outside_declared_range(init_params).map(|h| h.index))
+        .collect();
+    for mv in start.moves.iter().filter(|m| !claimed.contains(&m.index)) {
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(mv.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", mv.index));
+        let held = start.fixed.get(mv.index).copied().unwrap_or(false);
+        // What the user has to change, which depends on the guard and not on
+        // the coordinate: the floor is a property of `ln`, the ρ rail is a
+        // property of the estimator.
+        let (cause, remedy) = match mv.guard {
+            PackGuard::ValueFloor => (
+                format!(
+                    "ferx packs it on the log scale, and `ln` has no value at or below 0, so \
+                     the packer substitutes a floor of {LOG_PACK_FLOOR:e}"
+                ),
+                format!(
+                    "declare {name} at or above {LOG_PACK_FLOOR:e}, or — if it is meant to be \
+                     absent — remove it from the model rather than declaring it at zero"
+                ),
+            ),
+            PackGuard::RhoRail => (
+                format!(
+                    "an estimated residual correlation is bounded at |ρ| ≤ {:.6} (Fisher-z \
+                     |z| ≤ {RHO_Z_BOUND}) so the likelihood cannot chase `log|R| → −∞` through \
+                     a singular R",
+                    crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
+                ),
+                format!(
+                    "start {name} at a correlation inside (−{rail:.6}, {rail:.6}), or write the \
+                     block `FIX` if the declared correlation is an assertion rather than a \
+                     starting point — a `FIX`-ed correlation is held exactly, with no rail",
+                    rail = crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
+                ),
+            ),
+            PackGuard::RhoUnit => (
+                "a correlation of exactly ±1 has no Fisher-z coordinate (`atanh(±1)` is \
+                 infinite), so the packer backs it off the unit boundary"
+                    .to_string(),
+                format!("declare {name} strictly inside (−1, 1)"),
+            ),
+        };
+        // Why the *other* start-side check says nothing about this coordinate —
+        // the inference #1307 exists to stop. Only worth spelling out for a
+        // held coordinate, where the box is pinned to the moved value and the
+        // silence is total.
+        let box_note = if held {
+            format!(
+                " `{name}` is `FIX`ed, so its optimizer box is pinned to the value the packer \
+                 produced: it reads as perfectly in-box and {START_OUT_OF_BOX_TOKEN} cannot see \
+                 it."
+            )
+        } else {
+            String::new()
+        };
+        // The floor is one of ferx's own literals and `{:e}` round-trips it
+        // exactly (`1e-10`, `1e-20`); the ρ substitutes are *computed* and
+        // `{:e}` hands the user seventeen digits of a rail whose definition is
+        // `tanh(3)` — `9.950547536867305e-1`, measured. Same split #1309's
+        // review applied to the box messages, for the same reason.
+        let represented = match mv.guard {
+            PackGuard::ValueFloor => format!("{:e}", mv.represented),
+            PackGuard::RhoRail | PackGuard::RhoUnit => format!("{:.6e}", mv.represented),
+        };
+        // A held coordinate never moves again, so the substituted value is what
+        // the whole fit uses; a free one only *starts* there and the optimizer
+        // leaves it. Worth the two spellings: they are the difference between a
+        // broken `FIX` contract and a start the user may not care about.
+        let consequence = if held {
+            format!("{name} is held at {represented} for the whole fit, and never at the declared value")
+        } else {
+            format!("the search begins from {represented} rather than from the declared value")
+        };
+        diags.push(
+            Diagnostic::warning(
+                NOT_REPRESENTABLE_TOKEN,
+                format!(
+                    "{NOT_REPRESENTABLE_TOKEN}: {name} is declared as {:e} but the optimizer \
+                     sees {represented} — {cause}. Every objective evaluation, and every \
+                     estimate that depends on {name}, uses the value the optimizer sees, so \
+                     {consequence}.{box_note} {remedy}.",
+                    mv.declared,
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(remedy),
         );
     }
 
@@ -4484,7 +4631,7 @@ pub(crate) fn check_packed_start_in_box(
     //
     // Judged on the natural scale, not the packed one, and that is the whole
     // reason this is a separate walk: `pack_params` floors the value at
-    // `THETA_PACK_FLOOR` and `unpinned_bounds` floors the bound at the same
+    // `LOG_PACK_FLOOR` and `unpinned_bounds` floors the bound at the same
     // constant, so `theta TVCL(-5.0, 0.0, 10.0)` packs to `packed == lower`
     // and the packed comparison reports nothing at all. See
     // `theta_outside_declared_range` (#1309 review).
@@ -4509,7 +4656,7 @@ pub(crate) fn check_packed_start_in_box(
         // intersected with ferx's packing caps. Two things read it.
         //
         // Where the fit *begins*, which is not always the bound the user
-        // declared — for a declared lower at or below `THETA_PACK_FLOOR` the
+        // declared — for a declared lower at or below `LOG_PACK_FLOOR` the
         // box starts at the floor, so `theta TVCL(-5.0, 0.0, 10.0)` begins from
         // `1e-10` and not from `0`.
         //
@@ -4610,7 +4757,7 @@ pub(crate) fn check_packed_start_in_box(
                 ),
                 format!(
                     "start {name} inside ({:e}, {:e})",
-                    THETA_PACK_FLOOR, THETA_PACK_CEIL
+                    LOG_PACK_FLOOR, THETA_PACK_CEIL
                 ),
             ),
             PackedCoordKind::OmegaDiagonal => {
