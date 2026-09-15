@@ -16627,7 +16627,80 @@ fn error_model_form_list() -> String {
         .join(", ")
 }
 
+/// The `;`-comment message for an `[error_model]` block, when that is what the
+/// `;` is: nothing before it, or a **complete error model** before it.
+///
+/// Placement is the whole point, and it is the same lesson
+/// `fit_option_semicolon_hint` records. The first version of this gate lived in
+/// the plain statement regex's `None` arm, which three accepted forms never
+/// reach: `parse_selected_error_model` consumes the whole block before that arm
+/// exists, and `split_weight_modifier` peels its tail before it. So
+/// `DV ~ additive(A) weight = WT ; comment` reported ``magnitude `(A) * (WT ;
+/// comment)`: Unexpected character: ;`` and an if/else with a trailing `;`
+/// reported `unexpected content after covariate-selected if/else` — two forms
+/// `ERROR_MODEL_FORMS` advertises, and the docs promised the comment message for
+/// both (#1390 review). Measured, not reasoned.
+///
+/// One gate, hoisted above every path, rather than teaching each path the same
+/// rule: three copies of a predicate that reject the same inputs is a test hole,
+/// not belt-and-braces (CLAUDE.md, and #1229 is the case that made the rule).
+///
+/// The "is the head complete?" test is [`parse_error_model_inner`] itself — the
+/// real parser, so every form it accepts is covered by construction and a form
+/// added later needs no edit here. Same reuse-the-source-of-truth trick as the
+/// `apply_fit_option` probe. No recursion: the head contains no `;` by
+/// construction, and it is the *inner* parse that is called.
+///
+/// The straddle is preserved and load-bearing: `banana ; x` and
+/// `DV ~ additive; (ADD)` have an *incomplete* head, so they get the ordinary
+/// form-list message instead of being told about a comment they did not write.
+fn error_model_semicolon_hint(lines: &[String]) -> Option<String> {
+    // Comment-stripped, exactly as the parse below sees them, so a `;` sitting
+    // inside a `#` comment is not classified as anything.
+    let stripped: Vec<String> = lines
+        .iter()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .collect();
+    let at = stripped.iter().position(|l| l.contains(';'))?;
+    let (before, _) = stripped[at].split_once(';')?;
+    let before = before.trim();
+
+    // The offending line as the user wrote it, for the message.
+    let shown = stripped[at].as_str();
+
+    // Nothing before the `;` is a whole line commented out. This arm is not
+    // redundant with the one below and cannot be folded into it: deleting the
+    // tail of such a line leaves the block *shorter*, so a single-line block
+    // becomes empty and fails with "No error model found" rather than parsing.
+    if before.is_empty() {
+        return Some(semicolon_is_not_a_comment("error_model", shown));
+    }
+
+    // Otherwise: is this a *trailing* comment? The literal question — delete
+    // from the `;` to the end of that line and does the block parse? — is the
+    // test, so the answer is right for every form by construction.
+    //
+    // The offending line is truncated **in place**; the lines after it are kept.
+    // Taking `stripped[..at]` instead would judge the head of a block whose rest
+    // was thrown away, and `DV ~ proportional(P)` + `iiv_on_ruv = E ; c` would
+    // be scored on a block that had lost its statement.
+    let mut without_tail = stripped.clone();
+    without_tail[at] = before.to_string();
+    parse_error_model_inner(&without_tail)
+        .is_ok()
+        .then(|| semicolon_is_not_a_comment("error_model", shown))
+}
+
 fn parse_error_model(
+    lines: &[String],
+) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
+    if let Some(hint) = error_model_semicolon_hint(lines) {
+        return Err(hint);
+    }
+    parse_error_model_inner(lines)
+}
+
+fn parse_error_model_inner(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
     // Covariate-selected if/else form (issue #658) — detected and parsed first;
@@ -16726,24 +16799,13 @@ fn parse_error_model(
                 // are gone and which can therefore be a string appearing nowhere
                 // in the file (#1388 review made the same fix in `[parameters]`).
                 None => {
-                    // A `;` gets the named message only when the rest of the
-                    // line shows that is what it was — nothing before it, or a
-                    // complete statement before it. Guessing from the `;` alone
-                    // is how a message comes to name a problem the line does not
-                    // have (#1388 review round 3 #9); `DV ~ additive(A; B)` is an
-                    // argument-list error, not a comment.
-                    if let Some((head, _)) = trimmed.split_once(';') {
-                        let is_statement = |s: &str| {
-                            let s = s.trim();
-                            let s = cmt_re
-                                .captures(s)
-                                .map_or_else(|| s.to_string(), |c| c[2].trim().to_string());
-                            log_lhs_re.is_match(&s) || re.is_match(&s) || iiv_re.is_match(&s)
-                        };
-                        if head.trim().is_empty() || is_statement(head) {
-                            return Err(semicolon_is_not_a_comment("error_model", trimmed));
-                        }
-                    }
+                    // No `;` classification here: `error_model_semicolon_hint`
+                    // owns it, above every parse path, because three of the
+                    // accepted forms never reach this arm (#1390 review). A
+                    // second copy of the predicate here would reject exactly the
+                    // inputs that one already rejects, so deleting either would
+                    // leave the suite green and neither could be mutation-tested
+                    // — the #1229 shape.
                     return Err(format!(
                         "[error_model]: unrecognized line `{trimmed}`. Expected one of: {}. A \
                          statement must be the whole line — leading or trailing text is \

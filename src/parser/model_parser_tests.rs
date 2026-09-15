@@ -5203,22 +5203,51 @@ fn a_stray_line_beside_a_valid_error_model_statement_is_rejected() {
 }
 
 /// `;` in `[error_model]` gets the comment message only when the line looks like
-/// a comment — nothing before it, or a complete statement before it.
+/// a comment — nothing before it, or a complete error model before it.
 ///
 /// The straddle is the point: guessing from the `;` alone is how a message comes
 /// to name a problem the line does not have (#1388 review round 3 #9), so a `;`
 /// *inside* an argument list must fall through to the generic form list instead.
+///
+/// **Every form in `ERROR_MODEL_FORMS` is exercised, not a sample**, and that is
+/// the #1390-review finding: the gate first lived in the plain statement regex's
+/// `None` arm, which the `weight =` and covariate-selected forms never reach —
+/// `parse_selected_error_model` consumes the whole block before that arm exists
+/// and `split_weight_modifier` peels its tail before it. Both reported the
+/// *inner* parse failure instead (``magnitude `(A) * (WT ; c)`: Unexpected
+/// character: ;``, `unexpected content after covariate-selected if/else`) while
+/// the docs promised the comment message. Sampling three line-oriented forms was
+/// what let that through, so the loop below is driven off the array.
 #[test]
 fn a_semicolon_in_error_model_is_named_a_comment_only_when_it_is_one() {
-    for line in [
-        "; DV ~ proportional(PROP_ERR)",
-        "DV ~ proportional(PROP_ERR) ; 30% CV",
-        "iiv_on_ruv = ETA_RUV ; from the NONMEM control stream",
-    ] {
-        let err = parse_error_model(&[line.to_string()])
+    // Nothing before the `;`, and each advertised form followed by one. Driving
+    // this off `ERROR_MODEL_FORMS` rather than a hand-picked list means a form
+    // added later cannot quietly skip the gate.
+    let mut cases = vec!["; DV ~ proportional(PROP_ERR)".to_string()];
+    for (_, example) in ERROR_MODEL_FORMS {
+        cases.push(format!("{example} ; NONMEM comment"));
+    }
+    // The two the review found, spelled out so a future edit to the array cannot
+    // silently drop them (the array's `weight` example has no covariate in its
+    // tail, which is the shape that broke).
+    cases.push("DV ~ additive(ADD_ERR) weight = WT ; NONMEM comment".to_string());
+    cases.push(
+        "if (WT == 0) { DV ~ additive(ADD_ERR) } else { DV ~ additive(ADD_ERR) } ; NONMEM comment"
+            .to_string(),
+    );
+    cases.push(
+        "DV ~ proportional(PROP_ERR)\niiv_on_ruv = ETA_RUV ; from the NONMEM control stream"
+            .to_string(),
+    );
+
+    for case in &cases {
+        // An example may itself be multi-line (`iiv_on_ruv` needs a statement
+        // above it); the `;` lands on the last line either way.
+        let lines: Vec<String> = case.lines().map(|l| l.trim().to_string()).collect();
+        let err = parse_error_model(&lines)
             .err()
-            .unwrap_or_else(|| panic!("`{line}` must be rejected"));
-        assert!(err.contains("does not start a comment"), "`{line}`: {err}");
+            .unwrap_or_else(|| panic!("`{case}` must be rejected"));
+        assert!(err.contains("does not start a comment"), "`{case}`: {err}");
     }
 
     // The other side of the gate. `DV ~ combined(PROP; ADD)` is *not* the
@@ -5235,6 +5264,40 @@ fn a_semicolon_in_error_model_is_named_a_comment_only_when_it_is_one() {
         "a `;` with an incomplete statement before it is not a comment: {err}"
     );
     assert!(err.contains("unrecognized line"), "{err}");
+
+    // `banana ; x` is the same side of the gate, via a different route: deleting
+    // the tail leaves a line matching no form, so the form list is what the user
+    // needs to see.
+    let err = parse_error_model(&["banana ; x".to_string()])
+        .err()
+        .expect("rejected");
+    assert!(!err.contains("does not start a comment"), "{err}");
+
+    // The rule's boundary, pinned rather than assumed — and measured, because
+    // the first version of this assertion guessed the message and was wrong.
+    // `iiv_on_ruv` is a *modifier*: a block holding only one is not an error
+    // model whatever the `;` does, so deleting the tail does not make it parse
+    // and the comment message is correctly withheld. What comes out is the
+    // ordinary reject, which quotes the line and lists `iiv_on_ruv` among the
+    // forms — enough to see both that the `;` is not a comment and that a
+    // statement is missing.
+    let err = parse_error_model(&["iiv_on_ruv = ETA_RUV ; c".to_string()])
+        .err()
+        .expect("a block with no statement must be rejected");
+    assert!(!err.contains("does not start a comment"), "{err}");
+    assert!(err.contains("unrecognized line"), "{err}");
+    assert!(err.contains("iiv_on_ruv = ETA_NAME"), "{err}");
+
+    // Its paired form — the realistic one — *does* get the comment message; that
+    // case is in `cases` above. Asserted here too so the contrast between the
+    // two is visible in one place.
+    let err = parse_error_model(&[
+        "DV ~ proportional(PROP_ERR)".to_string(),
+        "iiv_on_ruv = ETA_RUV ; c".to_string(),
+    ])
+    .err()
+    .expect("rejected");
+    assert!(err.contains("does not start a comment"), "{err}");
 }
 
 /// End to end through `parse_full_model`: the issue's own reproduction.
