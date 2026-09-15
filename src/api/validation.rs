@@ -4690,6 +4690,21 @@ pub(crate) fn check_packed_start_in_box(
                     rail = crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
                 ),
             ),
+            // A free ρ that was inadmissible takes **both** guards: backed off
+            // the unit boundary, then railed. `pack_params_with_moves` records
+            // one move for the pair (the first guard to bind) and reports the
+            // final value, so the cause has to name the second step too or it
+            // will not explain the number it quotes. `held` is what tells the
+            // two apart — a FIX-ed ρ never meets the rail (#1307).
+            PackGuard::RhoUnit if !held => (
+                format!(
+                    "a correlation at or beyond ±1 has no Fisher-z coordinate (`atanh(±1)` is \
+                     infinite), so the packer backs it off the unit boundary, and the \
+                     estimation rail then bounds an estimated correlation at |ρ| ≤ {:.6}",
+                    crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
+                ),
+                format!("declare {name} strictly inside (−1, 1)"),
+            ),
             PackGuard::RhoUnit => (
                 "a correlation at or beyond ±1 has no Fisher-z coordinate (`atanh(±1)` is \
                  infinite), so the packer backs it off the unit boundary"

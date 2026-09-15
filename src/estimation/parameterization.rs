@@ -302,10 +302,33 @@ fn floor_for_log(
     }
 }
 
-/// `x²` — the reporting map for an Ω / Ω_IOV / mixture-Ω Cholesky diagonal,
-/// which is an SD and was declared as a variance.
+/// `x²` — the reporting map for a **diagonal** Ω / Ω_IOV / mixture-Ω entry,
+/// whose Cholesky diagonal is an SD and whose declared value is its square.
+///
+/// Only correct when the Ω is diagonal. On a **block** Ω the declared variance
+/// of eta `i` is `Σ_k L[i,k]²`, so `L[i,i]²` is what is *left* of that variance
+/// once the off-diagonals are accounted for, and quoting it as the declaration
+/// names a number that appears nowhere in the model file. That is the same trap
+/// #1309's review fixed in the box message's `block_omega` arm; see
+/// [`as_cholesky_diagonal`], which the block branch uses instead (#1307 review
+/// round 2).
 fn as_variance(x: f64) -> f64 {
     x * x
+}
+
+/// Identity — the reporting map for a **block** Ω / Ω_IOV Cholesky diagonal,
+/// which is reported as `L[i,i]` itself because its square is not the declared
+/// variance. See [`as_variance`].
+///
+/// Reaching it needs a declared block that is positive-definite (so
+/// `OmegaMatrix::from_matrix` does **not** apply its `1e-8` eigenvalue
+/// regularisation, which would lift every diagonal to `1e-4`) and yet has a
+/// Cholesky diagonal below `1e-10` — a block correlated to within `1e-20` of
+/// singularity that still survives `cholesky()`. Essentially unreachable
+/// through the parser; the branch exists so the message cannot be wrong rather
+/// than because the case is expected.
+fn as_cholesky_diagonal(x: f64) -> f64 {
+    x
 }
 
 /// `x` — the reporting map for θ / Σ / a mixture Σ override, already on the
@@ -348,10 +371,17 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
     // outside its own pinned box.
     let l = &params.omega.chol;
     let n_eta = l.nrows();
+    // A diagonal Ω reports its declared variance (`L²`); a block one cannot —
+    // see `as_variance` / `as_cholesky_diagonal` (#1307 review round 2).
+    let omega_report = if params.omega.diagonal {
+        as_variance
+    } else {
+        as_cholesky_diagonal
+    };
     for (i, j) in lower_tri_iter(n_eta, params.omega.diagonal) {
         if i == j {
             let idx = v.len();
-            v.push(floor_for_log(&mut moves, idx, l[(i, j)], as_variance).ln());
+            v.push(floor_for_log(&mut moves, idx, l[(i, j)], omega_report).ln());
         } else if params.omega.free_mask[(i, j)] {
             v.push(l[(i, j)]);
         } else {
@@ -368,10 +398,15 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
     // IOV omega: diagonal elements as log; off-diagonal as-is (mirrors BSV omega).
     if let Some(ref iov) = params.omega_iov {
         let l = &iov.chol;
+        let iov_report = if iov.diagonal {
+            as_variance
+        } else {
+            as_cholesky_diagonal
+        };
         for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
             if i == j {
                 let idx = v.len();
-                v.push(floor_for_log(&mut moves, idx, l[(i, j)], as_variance).ln());
+                v.push(floor_for_log(&mut moves, idx, l[(i, j)], iov_report).ln());
             } else if iov.free_mask[(i, j)] {
                 v.push(l[(i, j)]);
             } else {
@@ -387,6 +422,9 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
     // — they track the base Omega/Sigma segments above. Appended after the IOV
     // segment so all existing offsets stay put.
     if let Some(ref mix) = params.mixture {
+        // A mixture Ω override is a single **diagonal** scalar (#977), so its
+        // square is exactly the declared class variance and `as_variance`
+        // needs no block branch here.
         for &(c, e) in &mix.omega_override_addr {
             let idx = v.len();
             let d = mix.omega[c].chol[(e, e)];
@@ -415,33 +453,42 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
         // `rho_within_unit` guards `atanh` at the unit boundary on both
         // spellings, and binds only at `|ρ| >= 1`; `RHO_Z_BOUND` is the
         // *estimation* rail and applies to the free one only (#1307).
-        let unit = rho_within_unit(corr.rho);
-        if unit != corr.rho {
+        let unrailed = pack_rho_fixed(corr.rho);
+        let z = if fixed { unrailed } else { pack_rho(corr.rho) };
+
+        // Both predicates are exact and live in **packed** space, which is
+        // where a guard either applied or did not. Asking the natural-scale
+        // question instead — `unpack_rho(z) != corr.rho` — would report a move
+        // for every correlation in every model: `tanh(atanh(ρ))` is not the
+        // identity in floating point, so an untouched ρ = 0.5 comes back
+        // differing in the last ULP and the guard would fire on it.
+        let unit_bound = rho_within_unit(corr.rho) != corr.rho;
+        let rail_bound = z != unrailed;
+
+        // **At most one move per ρ**, and `declared` is always the value the
+        // model carried. Both guards can bind on the same coordinate — a free
+        // `ρ = 1.5` is backed off to `0.999999` and then railed to `0.995055` —
+        // and pushing one move each produced two warnings for one coordinate
+        // whose second claimed the model had declared `0.999999`, a number it
+        // never wrote (#1307 review round 2).
+        //
+        // The guard recorded is the **first** one to bind, because that is the
+        // one the remedy follows from: an inadmissible declaration is repaired
+        // by declaring an admissible one, whatever the rail then does to it.
+        // The value reported is the packer's final output, so the message
+        // quotes what the optimizer receives rather than an intermediate.
+        if unit_bound || rail_bound {
             moves.push(PackMove {
                 index: idx,
-                guard: PackGuard::RhoUnit,
+                guard: if unit_bound {
+                    PackGuard::RhoUnit
+                } else {
+                    PackGuard::RhoRail
+                },
                 declared: corr.rho,
-                represented: unit,
+                represented: unpack_rho(z),
             });
         }
-        // The unrailed coordinate both spellings would take, so the free branch
-        // below compares against it rather than re-deriving `atanh` and giving
-        // the rail test its own copy of the formula to drift from.
-        let unrailed = pack_rho_fixed(corr.rho);
-        let z = if fixed {
-            unrailed
-        } else {
-            let railed = pack_rho(corr.rho);
-            if railed != unrailed {
-                moves.push(PackMove {
-                    index: idx,
-                    guard: PackGuard::RhoRail,
-                    declared: unit,
-                    represented: unpack_rho(railed),
-                });
-            }
-            railed
-        };
         v.push(z);
     }
 
@@ -2250,9 +2297,11 @@ mod tests {
     /// One segment at a time, from the same all-segments template, so a failure
     /// names which segment lost its report rather than only that the count is
     /// wrong. The `as_variance` half is the part a plain "did it report" check
-    /// would miss: an Ω diagonal packs its Cholesky diagonal, an SD, and
+    /// would miss: a **diagonal** Ω packs its Cholesky diagonal, an SD, and
     /// reporting `1e-10` for it would name a number that appears nowhere in the
-    /// model file — the declared variance floors at `1e-20`.
+    /// model file — the declared variance floors at `1e-20`. A **block** Ω is
+    /// the opposite: there `L[i,i]²` is *not* the declared variance, so
+    /// squaring it would invent the number instead (#1307 review round 2).
     #[test]
     fn the_pack_reports_every_log_floor_it_applied() {
         // (packed index, how to zero that coordinate, declared reporting value)
@@ -2272,8 +2321,14 @@ mod tests {
                 0.0,
             ),
         ];
-        // Which of those report as a variance (`x²`) rather than verbatim.
-        let is_variance = |idx: usize| matches!(idx, 3 | 11 | 13);
+        // Which of those report as a variance (`x²`) rather than verbatim, and
+        // the split is the object of #1307 review round 2 rather than a detail:
+        // `make_all_segments_template`'s BSV Ω is a **block** (index 3), while
+        // its Ω_IOV (11) and mixture Ω override (13) are diagonal. On a block,
+        // `L[i,i]²` is what is *left* of the eta's variance once the
+        // off-diagonals are accounted for — not the declared variance — so it
+        // is reported as `L[i,i]` itself. This fixture covers both branches.
+        let is_variance = |idx: usize| matches!(idx, 11 | 13);
 
         for (idx, zero, declared) in cases {
             let mut t = make_all_segments_template();
@@ -2392,6 +2447,90 @@ mod tests {
         }
     }
 
+    /// #1307 review round 2. When **both** ρ guards bind — an inadmissible
+    /// `|ρ| >= 1` that is also *estimated*, so it is backed off the unit
+    /// boundary and then railed — the packer records **one** move, not two, and
+    /// its `declared` is the value the model actually carried.
+    ///
+    /// Two moves at the same index produced two warnings for one coordinate,
+    /// and the second announced a declaration of `0.999999` — the post-back-off
+    /// intermediate, a number the model never wrote.
+    ///
+    /// The `fixed` arm is the differential: the same ρ under `FIX` meets only
+    /// the unit guard, so it pins that "one move" is not simply the rail
+    /// swallowing the pair.
+    #[test]
+    fn an_inadmissible_rho_records_one_move_carrying_the_declared_value() {
+        for &(rho, fixed) in &[(1.5_f64, false), (1.5, true), (-1.5, false)] {
+            let t = make_rho_template(rho, fixed);
+            let start = pack_with_bounds(&t);
+            let idx = rho_packed_start(&t);
+
+            assert_eq!(
+                start.moves.len(),
+                1,
+                "ρ = {rho} (fixed = {fixed}) must record exactly one move, got {:#?}",
+                start.moves
+            );
+            let mv = start.moves[0];
+            assert_eq!(mv.index, idx);
+            // Never the `0.999999` intermediate.
+            assert_eq!(
+                mv.declared, rho,
+                "the move must carry what the model declared, not a step of the pack"
+            );
+            // The unit guard is the one reported, because it is the one the
+            // remedy follows from — even when the rail also bound.
+            assert_eq!(mv.guard, PackGuard::RhoUnit);
+            // And the value quoted is the packer's *final* output.
+            assert_relative_eq!(
+                mv.represented,
+                unpack_rho(start.packed[idx]),
+                epsilon = 1e-15
+            );
+            assert!(start.packed[idx].is_finite());
+        }
+
+        // The straddle: an admissible ρ past the rail takes the rail guard
+        // alone, so `RhoUnit` above is a real discrimination and not the only
+        // arm this code can produce.
+        let free = make_rho_template(0.999, false);
+        let m = pack_with_bounds(&free).moves;
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].guard, PackGuard::RhoRail);
+        assert_eq!(m[0].declared, 0.999);
+    }
+
+    /// #1307 review round 2. The guard predicates are exact and live in
+    /// **packed** space, so an untouched ρ never reports a move.
+    ///
+    /// The natural-scale spelling — `unpack_rho(z) != corr.rho` — is the
+    /// tempting one and is wrong for every model: `tanh(atanh(ρ))` is not the
+    /// identity in floating point. Asserted here rather than recalled, then the
+    /// consequence is asserted on the packer: a sweep of ordinary correlations
+    /// must record nothing at all.
+    #[test]
+    fn an_untouched_rho_records_no_move_although_the_round_trip_is_inexact() {
+        let mut inexact = 0;
+        for &rho in &[0.1_f64, 0.25, 0.5, -0.5, 0.62, 0.9, -0.93, 0.99] {
+            if unpack_rho(pack_rho_fixed(rho)) != rho {
+                inexact += 1;
+            }
+            for &fixed in &[false, true] {
+                let t = make_rho_template(rho, fixed);
+                assert!(
+                    pack_with_bounds(&t).moves.is_empty(),
+                    "ρ = {rho} (fixed = {fixed}) is inside every guard and must \
+                     record nothing"
+                );
+            }
+        }
+        assert!(
+            inexact > 0,
+            "the round trip must actually be inexact somewhere, or this test \
+             pins nothing — a natural-scale predicate would have been fine"
+        );
+    }
     /// A two-sigma template carrying one `block_sigma` off-diagonal (#847).
     fn make_rho_template(rho: f64, fixed: bool) -> ModelParameters {
         let mut t = make_template();
