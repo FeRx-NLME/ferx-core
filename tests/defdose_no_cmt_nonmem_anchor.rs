@@ -165,10 +165,19 @@ fn absent_cmt_column_keeps_its_objective_and_is_reported() {
         result.ofv
     );
     // And it is nowhere near NONMEM's — the miss this warning exists to announce.
+    //
+    // This is *not* a second gate on the same inputs as the assertion above. That
+    // one pins the measurement against a constant; this one pins the **constant**.
+    // If someone later "fixes" this test by retargeting
+    // `FERX_WRONG_COMPARTMENT_OFV` at the NONMEM value — the natural edit once a
+    // model-side `default_dose_cmt` lands — the first assertion goes green again
+    // while the fixture has silently stopped exercising the ambiguity. This one
+    // fails in exactly that case, and only that case.
     assert!(
         (result.ofv - NONMEM_OBJV).abs() > 1e4,
-        "the no-CMT arm must still disagree with NONMEM; if it agrees, the fixture \
-         stopped exercising the ambiguity"
+        "the no-CMT arm must still disagree with NONMEM; if it agrees, either the \
+         reference constant was retargeted or ferx grew a DEFDOSE equivalent — \
+         both mean this fixture no longer tests what it was written for"
     );
     let hit = result
         .warnings

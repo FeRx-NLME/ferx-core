@@ -2573,9 +2573,17 @@ fn float_formatted_cmt_cell_reads_as_its_integer() {
     // integer column once any cell in it is blank, so `2.0` is how a real export
     // spells compartment 2. Before the fix `parse::<usize>()` failed on it and
     // the dose landed in compartment 1 with no warning at all.
+    //
+    // Neither cell may be compartment **1**, and they must differ from each other.
+    // The first draft wrote `1.0` on the observation row and asserted
+    // `obs_cmts == [1]` — which the *broken* reader also produces, because the
+    // strict parse fails and `.unwrap_or(1)` lands on the same answer. Mutating
+    // the observation site alone left that assertion green, so the obs half of
+    // the fix was untested by the test written for it. Distinct non-1 values also
+    // mean a site-swap (obs reading the dose's cell, or vice versa) cannot pass.
     let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                1,0,.,1,100,2.0,1\n\
-               1,1,5.0,0,.,1.0,0\n";
+               1,1,5.0,0,.,3.0,0\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     assert_eq!(
@@ -2583,7 +2591,7 @@ fn float_formatted_cmt_cell_reads_as_its_integer() {
         2,
         "`2.0` is compartment 2, not the compartment-1 fallback"
     );
-    assert_eq!(pop.subjects[0].obs_cmts, vec![1], "`1.0` is compartment 1");
+    assert_eq!(pop.subjects[0].obs_cmts, vec![3], "`3.0` is compartment 3");
     // A cell the reader could read is not a cell it chose.
     assert!(
         !pop.warnings.iter().any(|w| w.contains("W_CMT_DEFAULTED")),
