@@ -673,6 +673,49 @@ mv dose_cmt_*.lst dose_cmt_*.tab results/
 > relative deviation, so the committed anchors are re-derivable rather than
 > taken on trust.
 
+## `DEFDOSE` vs a dataset that does not say (#1009)
+
+`defdose_no_cmt.ctl` / `defdose_cmt2.ctl` / `defdose_cmt2float.ctl` — three
+evaluation-only runs (`$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0`) on the same
+model and the same 10 warfarin subjects, differing only in how the dataset spells
+`CMT`. `ADVAN13 TOL=9`, `$MODEL COMP=(CENTRAL, DEFOBS) COMP=(DEPOT, DEFDOSE)` —
+the dosed compartment is the **second** one, which is the shape in which a
+missing `CMT` column is not recoverable. `$SIGMA 0.0004` = ferx
+`sigma PROP_ERR ~ 0.02 (sd)`. ferx twin: `defdose_depot_second_fit.ferx`
+(`states = [central, depot]`, `maxiter = 0`, `ode_reltol 1e-9 / ode_abstol 1e-11`).
+
+| run / dataset | `CMT` on dose rows | NONMEM doses | NONMEM OBJV | ferx doses |
+|---|---|---|---|---|
+| `defdose_cmt2` | `2` | DEPOT | **−182.66670816329514** | depot |
+| `defdose_cmt2float` | `2.0` | DEPOT | **−182.66670816329514** | depot — compartment 1 before #1009 |
+| `defdose_no_cmt` | *(no column)* | DEPOT (`DEFDOSE`) | **−182.66670816329514** | compartment 1 = central (OFV 154050.610450) |
+
+The point of the third row is that NM-TRAN resolves an undecorated dose against
+the model's declared `DEFDOSE`, and ferx has no such declaration — so the
+compartment really is ambiguous rather than merely unstated. #1009 fixes the
+*second* row (a float-formatted cell is now read as its integer) and makes the
+third audible (`W_CMT_DEFAULTED`) rather than silently resolved.
+
+Consumed by `tests/defdose_no_cmt_nonmem_anchor.rs`, ungated (`MAXEVAL = 0` on 10
+subjects is sub-second, so it runs on every PR). Realised |Δ OFV| against NONMEM
+on the two agreeing datasets: **4.084e-8**, relative 2.2e-10; the test's bound is
+`5e-7`.
+
+### Run it
+
+From this directory, then move the output into `results/`:
+
+```bash
+for f in defdose_no_cmt.ctl defdose_cmt2.ctl defdose_cmt2float.ctl; do nmfe76 "$f" "${f%.ctl}.lst"; done
+mv defdose_*.lst defdose_*.tab results/
+```
+
+> **Run status — DONE (#1009).** All three executed on NONMEM 7.6.0 via `nmfe76`;
+> `results/defdose_*.{lst,tab,ext}` are the verbatim output. The committed `.csv`
+> files are the exact bytes NONMEM read (CRLF line endings included), copied out
+> of the run directories rather than regenerated, so the ferx side is fed the same
+> dataset and not a re-export of it.
+
 ## Slow-accumulation steady-state anchors (#908)
 
 `ss_slow_advan1.ctl` / `ss_slow_advan2.ctl` — two evaluation-only runs pinning `SS=1` for a
