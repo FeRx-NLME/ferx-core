@@ -695,12 +695,34 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
 /// shape the model cannot have. Shared by `fit()` and `ferx check` so the two
 /// cannot disagree about which warnings a user sees.
 ///
-/// Currently one case: `W_NO_DOSES` on a compartment-free model (#811). The reader
-/// reads a dose-free dataset as a probable missing `AMT` column; for a model with
-/// no compartments that is its normal shape — every model-based meta-analysis
-/// dataset is dose-free — so the advice ("check that the dataset has an AMT
-/// column") is wrong rather than merely noisy.
+/// Two cases:
+///
+/// - `W_NO_DOSES` on a compartment-free model (#811). The reader reads a
+///   dose-free dataset as a probable missing `AMT` column; for a model with no
+///   compartments that is its normal shape — every model-based meta-analysis
+///   dataset is dose-free — so the advice ("check that the dataset has an AMT
+///   column") is wrong rather than merely noisy.
+/// - `W_CMT_DEFAULTED` on any model that addresses at most one state (#1009). The
+///   reader reports how many rows it had to pick a compartment for; picking is
+///   only a *guess* when there was something to choose between. An analytical
+///   `pk` model resolves compartment 1 to its own default channel
+///   (`pk::dose_needs_event_walk`: the depot on an oral model, the central
+///   compartment on an IV one) — ferx's analytic numbering is ferx's, not
+///   `$MODEL`'s, so a `CMT`-less dataset doses exactly what NONMEM's
+///   fixed-`DEFDOSE` ADVANs dose; measured on `examples/warfarin.ferx`, which is
+///   bit-identical with and without the column. A compartment-free model has no
+///   compartment at all, and a one-state `[odes]` model has no second one to miss.
+///
+/// The `n_states > 1` test deliberately counts the injected joint-PK-TTE
+/// `__chz_*` accumulators along with the PK states. They are not dose targets, but
+/// they exist only when an `[event_model]` does, and an event model routes its
+/// rows *by CMT* — so a dataset with no `CMT` column keys every row to
+/// compartment 1 and starves the endpoint. Counting them cannot produce a false
+/// positive for that reason, and excluding them would produce a false negative.
 pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) -> bool {
+    if warning.starts_with("W_CMT_DEFAULTED") {
+        return !model.ode_spec.as_ref().is_some_and(|s| s.n_states > 1);
+    }
     model.is_algebraic() && warning.starts_with("W_NO_DOSES")
 }
 
@@ -6384,6 +6406,8 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                         "W_ADDL_MISSING_II"
                     } else if w.starts_with("W_IOV_OCC_MISSING") {
                         "W_IOV_OCC_MISSING"
+                    } else if w.starts_with("W_CMT_DEFAULTED") {
+                        "W_CMT_DEFAULTED"
                     } else {
                         "W_DATA"
                     };

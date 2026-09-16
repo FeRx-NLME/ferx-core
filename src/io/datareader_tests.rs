@@ -2560,3 +2560,223 @@ fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
         "every CMT-3 row moves from the Gaussian grid to obs_records, none is lost"
     );
 }
+
+// ── #1009: the compartment the reader chooses when the dataset does not say ──
+// Three sites used to spell the fallback `.unwrap_or(1)` by hand, and a
+// float-formatted cell (`"2.0"`) fell through all three and silently dosed
+// compartment 1. `parse_cmt_cell` is now the single reader of the cell, and every
+// row the reader has to choose for is counted into one `W_CMT_DEFAULTED` summary.
+
+#[test]
+fn float_formatted_cmt_cell_reads_as_its_integer() {
+    // T1a. The #830 `L2` bug in a second column: pandas/R float-format a whole
+    // integer column once any cell in it is blank, so `2.0` is how a real export
+    // spells compartment 2. Before the fix `parse::<usize>()` failed on it and
+    // the dose landed in compartment 1 with no warning at all.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,2.0,1\n\
+               1,1,5.0,0,.,1.0,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(
+        pop.subjects[0].doses[0].cmt_1based(),
+        2,
+        "`2.0` is compartment 2, not the compartment-1 fallback"
+    );
+    assert_eq!(pop.subjects[0].obs_cmts, vec![1], "`1.0` is compartment 1");
+    // A cell the reader could read is not a cell it chose.
+    assert!(
+        !pop.warnings.iter().any(|w| w.contains("W_CMT_DEFAULTED")),
+        "a readable float cell must not be reported as defaulted, got {:?}",
+        pop.warnings
+    );
+}
+
+#[test]
+fn missing_and_unparseable_cmt_cells_default_to_1_and_are_counted() {
+    // T1b. With the column present, the summary separates the two causes and
+    // quotes the offending spellings — `-1` (NONMEM's observation off-switch),
+    // `2.5` (genuinely fractional, which must NOT be rounded to 2) and `x`.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,.,1\n\
+               1,1,.,1,100,,1\n\
+               1,2,.,1,100,NA,1\n\
+               1,3,.,1,100,-1,1\n\
+               1,4,.,1,100,2.5,1\n\
+               1,5,.,1,100,x,1\n\
+               1,6,5.0,0,.,1,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    // All six defaulted to compartment 1 — `2.5` included, which a rounding parse
+    // would have sent to 2.
+    assert_eq!(
+        pop.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.cmt_1based())
+            .collect::<Vec<_>>(),
+        vec![1; 6]
+    );
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(
+        w.contains("3 row(s) had a missing CMT cell"),
+        "missing-cell count must be 3 (`.`, blank, `NA`), got: {w}"
+    );
+    assert!(
+        w.contains("3 row(s) had a CMT cell that is not a compartment index"),
+        "unparseable count must be 3 (`-1`, `2.5`, `x`), got: {w}"
+    );
+    for quoted in ["\"-1\"", "\"2.5\"", "\"x\""] {
+        assert!(w.contains(quoted), "summary must quote {quoted}, got: {w}");
+    }
+    assert!(
+        w.contains("6 dose row(s) and 0 observation row(s)"),
+        "row split must be 6 dose / 0 obs, got: {w}"
+    );
+    // The column IS present, so the absent-column wording must not appear: the
+    // two causes are reported by different clauses and T1c pins the other one.
+    assert!(
+        !w.contains("no CMT column"),
+        "a present column must not be reported as absent, got: {w}"
+    );
+}
+
+#[test]
+fn absent_cmt_column_warns_once_with_dose_and_obs_counts() {
+    // T1c. The absent-column case, with a decoy `COMPT` header — the misspelling
+    // the issue was filed from. The per-row cause counters cannot tell an absent
+    // column from a column of missing cells (there is no cell to classify), so
+    // the summary reads `cmt_col` directly; this pins that wording.
+    let csv = "ID,TIME,DV,EVID,AMT,COMPT,MDV\n\
+               1,0,.,1,100,2,1\n\
+               1,1,5.0,0,.,1,0\n\
+               1,2,4.0,0,.,1,0\n\
+               2,0,.,1,100,2,1\n\
+               2,1,6.0,0,.,1,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let hits: Vec<&String> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .collect();
+    assert_eq!(hits.len(), 1, "one summary, not one per row: {hits:?}");
+    let w = hits[0];
+    assert!(
+        w.contains("the dataset has no CMT column"),
+        "must name the absent column, got: {w}"
+    );
+    assert!(
+        w.contains("2 dose row(s) and 3 observation row(s)"),
+        "counts must sum across subjects (2 doses, 3 obs), got: {w}"
+    );
+    // The remedy has to be actionable: both spellings of the fix, and the way to
+    // silence it deliberately.
+    assert!(w.contains("states = [...]"), "{w}");
+    assert!(w.contains("CMT = <header>"), "{w}");
+    assert!(w.contains("CMT=1"), "{w}");
+    // The decoy column is not a CMT column: its `2` must not have been read.
+    assert_eq!(pop.subjects[0].doses[0].cmt_1based(), 1);
+}
+
+#[test]
+fn explicit_integer_cmt_column_including_zero_warns_nothing() {
+    // T1d, control. A literal `CMT=0` is NONMEM's own "default compartment"
+    // spelling and `check_dose_compartments` accepts it for a bolus; counting it
+    // as defaulted would warn on `nonmem_anchor/dose_cmt_ss_cmt0.csv`. The
+    // reader reports what the *dataset* did not say, and this one said 0.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,0,1\n\
+               1,1,.,1,100,2,1\n\
+               1,2,5.0,0,.,1,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert!(
+        !pop.warnings.iter().any(|w| w.contains("W_CMT_DEFAULTED")),
+        "an explicit CMT column (0 included) is not a default, got {:?}",
+        pop.warnings
+    );
+    // `0` still resolves to compartment 1 downstream (#912); that convention is
+    // untouched here — only whether it is *reported* was at stake.
+    assert_eq!(pop.subjects[0].doses[0].cmt_1based(), 1);
+    assert_eq!(pop.subjects[0].doses[1].cmt_1based(), 2);
+}
+
+#[test]
+fn filter_context_cmt_resolves_like_the_dose_site() {
+    // T1e. The `[data]` selection filter built its `RowContext.cmt` with
+    // `parse_usize`, which maps both `.` and `2.0` to **0** — so `ignore = CMT ==
+    // 1` failed to drop a dotted row the dose arm assigns to compartment 1. One
+    // resolver now serves both, so the filter sees the compartment the row is
+    // actually given.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,2.0,1\n\
+               1,1,.,1,50,.,1\n\
+               1,2,5.0,0,.,2,0\n";
+    let f = write_csv(csv);
+    let filter = SelectionFilter::from_opts(&["CMT == 1".to_string()], &[], &[])
+        .unwrap_or_else(|e| panic!("filter: {e}"));
+    let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+    let cmts: Vec<usize> = pop.subjects[0]
+        .doses
+        .iter()
+        .map(|d| d.cmt_1based())
+        .collect();
+    assert_eq!(
+        cmts,
+        vec![2],
+        "the dotted dose resolves to 1 and is ignored; the `2.0` dose is compartment 2 and stays"
+    );
+    // The ignored row never became a dose, so it is not reported as one the
+    // reader routed — but the column is present and one cell was missing, so the
+    // *cause* wording still has to be the cell one if it fires at all.
+    assert!(
+        !pop.warnings.iter().any(|w| w.contains("no CMT column")),
+        "the column is present, got {:?}",
+        pop.warnings
+    );
+}
+
+#[test]
+fn emitted_cmt_defaulted_message_classifies_as_data_quality() {
+    // T1g. Classified against the string the reader *actually builds*, not a
+    // paraphrase: `classify_warning` is a long else-if chain of substring arms,
+    // and the summary quotes user cell text, so the only honest guard is to feed
+    // it the real message. Both spellings — absent column and bad cells — since
+    // they are different sentences.
+    let absent = write_csv(
+        "ID,TIME,DV,EVID,AMT,MDV\n\
+         1,0,.,1,100,1\n\
+         1,1,5.0,0,.,0\n",
+    );
+    let cells = write_csv(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+         1,0,.,1,100,.,1\n\
+         1,1,.,1,100,-1,1\n\
+         1,2,5.0,0,.,1,0\n",
+    );
+    for f in [&absent, &cells] {
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let w = pop
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+            .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+        let classified = crate::types::classify_warning(w);
+        assert_eq!(
+            classified.severity,
+            crate::types::WarningSeverity::Warning,
+            "message was: {w}"
+        );
+        assert_eq!(
+            classified.category.as_str(),
+            "data_quality",
+            "the emitted message must reach the DataQuality arm, not an earlier \
+             prose arm or the `general` fallback; message was: {w}"
+        );
+    }
+}

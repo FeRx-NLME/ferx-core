@@ -6453,6 +6453,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_missing_dv") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_cmt_defaulted") {
+        // #1009: rows whose compartment the reader chose because the dataset did
+        // not say. Matched on its `W_` token and placed with the other reader
+        // arms, ahead of the prose arm below — the message quotes offending cell
+        // spellings, so a future edit could grow a phrase a prose arm claims.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
