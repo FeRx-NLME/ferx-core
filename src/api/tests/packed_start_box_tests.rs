@@ -171,7 +171,7 @@ fn a_theta_start_strictly_outside_its_declared_range_is_an_error() {
 /// Regression: judging the declared question on the **packed** scale, which
 /// `pack_with_bounds` has already made unanswerable.
 ///
-/// `pack_params` floors the *value* at `THETA_PACK_FLOOR` and `unpinned_bounds`
+/// `pack_params` floors the *value* at `LOG_PACK_FLOOR` and `unpinned_bounds`
 /// floors the *bound* at the same constant, so `theta TVCL(-5.0, 0.0, 10.0)`
 /// arrives with `packed == lower == ln(1e-10)` and the packed comparison sees a
 /// start sitting exactly on its bound. Measured at `9ed38f6c`: **zero**
@@ -233,11 +233,22 @@ fn a_theta_below_a_declared_lower_bound_of_zero_is_still_an_error() {
         "the start is clamped into the packed box, whose lower is the floor and          not the declared 0 — {msg}"
     );
 
-    // Differential control: inside the declared range, and silent, although the
-    // floor moves it just the same.
+    // Differential control: inside the declared range, so **this** error does
+    // not fire. The floor still moves it, and since #1307 that is reported —
+    // by its own code, which is what keeps the two facts separable.
+    let control = box_diags(&params_with_theta("theta TVCL(1e-12, 0.0, 10.0)"));
     assert!(
-        box_diags(&params_with_theta("theta TVCL(1e-12, 0.0, 10.0)")).is_empty(),
-        "1e-12 is inside [0, 10]; the floor moving it to 1e-10 is #1307's          object, not this error's"
+        crate::diagnostics::first_error(&control).is_ok(),
+        "1e-12 is inside [0, 10]; nothing here is an error — {control:#?}"
+    );
+    assert_eq!(
+        control
+            .iter()
+            .map(|d| d.code.as_str())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["W_INIT_NOT_REPRESENTABLE"],
+        "the floor moving 1e-12 to 1e-10 is #1307's object, not this error's"
     );
 }
 
@@ -292,7 +303,7 @@ fn a_fixed_theta_outside_its_declared_range_is_left_alone() {
 /// `theta TVCL(0.05, 0.1, 1e12)` used to suggest `inside (1e-1, 1e12)`; obeying
 /// it with `1e10` then trips `W_INIT_OUTSIDE_BOUNDS` for exceeding the hidden
 /// `1e9` cap, so the remedy sent the user from one diagnostic to another. Every
-/// other arm already clamps its advice to `(THETA_PACK_FLOOR, THETA_PACK_CEIL)`.
+/// other arm already clamps its advice to `(LOG_PACK_FLOOR, THETA_PACK_CEIL)`.
 ///
 /// Asserted as a **straddle**: the same declaration with an upper below the cap
 /// keeps quoting the user's own number, so this cannot go green by the advice
@@ -356,9 +367,19 @@ fn a_theta_start_exactly_on_a_declared_bound_is_left_alone() {
             start.packed[0],
             bound
         );
+        // Nothing is moved *by the box*, so this check has nothing to report.
+        // Scoped to its own codes rather than `is_empty()`: the second arm's
+        // declared `0.0` is below the log floor, so since #1307 the packer
+        // reports it — a different fact, under a different code, and asserting
+        // emptiness here would have made this test fail for the right thing.
+        let diags = box_diags(&params);
         assert!(
-            box_diags(&params).is_empty(),
-            "{line}: nothing is moved, so there is nothing to report"
+            crate::diagnostics::first_error(&diags).is_ok(),
+            "{line}: nothing the box does here is an error — {diags:#?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == START_OUT_OF_BOX_TOKEN),
+            "{line}: the clamp is a no-op, so the box moves nothing — {diags:#?}"
         );
     }
 }
@@ -876,10 +897,18 @@ fn a_theta_whose_packed_box_is_empty_is_an_error_not_a_panic() {
     }
 
     // The differential half, on the arm closest to a working declaration: one
-    // number moved so the box is non-empty, and the check goes silent.
+    // number moved so the box is non-empty, and the **empty-box error** goes
+    // away. The start is still below the log floor, which #1307 reports as a
+    // warning under its own code — so this asserts the error is gone rather
+    // than that nothing at all is said, which would confuse the two.
+    let control = box_diags(&params_with_theta("theta TVCL(1e-12, 1e-13, 1e-9)"));
     assert!(
-        box_diags(&params_with_theta("theta TVCL(1e-12, 1e-13, 1e-9)")).is_empty(),
-        "an upper bound above the 1e-10 floor leaves a representable box"
+        crate::diagnostics::first_error(&control).is_ok(),
+        "an upper bound above the 1e-10 floor leaves a representable box — {control:#?}"
+    );
+    assert!(
+        !control.iter().any(|d| d.code == "E_INIT_BOUNDS_INVERTED"),
+        "{control:#?}"
     );
 }
 
@@ -1187,4 +1216,573 @@ fn clamping_into_an_empty_box_names_its_guarantor() {
              without the guarantor's name — got {msg:?}"
         );
     }
+}
+
+// ── T9: a value the PACKER moved, which the box predicate cannot see (#1307) ─
+
+/// A two-sigma model carrying a `block_sigma` line, spliced in whole. The
+/// one-eta helper above declares a single `sigma`, which cannot express a
+/// residual correlation at all.
+fn block_sigma_model(sigma_line: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n\
+         \x20 theta TVCL(5.0, 0.001, 100.0)\n\
+         \x20 theta TVV(50.0, 0.1, 500.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 {sigma_line}\n\
+         \n\
+         [individual_parameters]\n\
+         CL = TVCL * exp(ETA_CL)\n\
+         V  = TVV\n\
+         \n\
+         [structural_model]\n\
+         pk one_cpt_iv(cl=CL, v=V)\n\
+         \n\
+         [error_model]\n\
+         DV ~ combined(PROP_ERR, ADD_ERR)\n"
+    );
+    crate::parser::model_parser::parse_model_string(&src)
+        .unwrap_or_else(|e| panic!("model must parse: {e}\n--- source ---\n{src}"))
+}
+
+/// Regression: #1307's headline. A `block_sigma ... FIX` above ρ ≈ 0.995 was
+/// held at `tanh(3) = 0.995055` instead of the declared value, and **nothing**
+/// reported it.
+///
+/// The assertion is on the packed start rather than on a diagnostic, because
+/// after the fix there is no diagnostic to make: the declared ρ is represented
+/// exactly. The straddle — the same ρ free, which still takes the rail and now
+/// *does* warn — is what keeps this from passing for the wrong reason. Both
+/// arms declare the identical covariance; only `FIX` differs, so the pair is a
+/// differential on the one predicate `pack_params_with_moves` branches on, and
+/// under the old behaviour **both** arms landed on 0.995055.
+#[test]
+fn a_fixed_block_sigma_correlation_reaches_the_optimizer_unchanged() {
+    // [0.04, cov, 0.09] with cov = 0.999 * sqrt(0.04 * 0.09) = 0.05994.
+    const DECLARED_RHO: f64 = 0.999;
+    let line = "block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05994, 0.09]";
+
+    let held = block_sigma_model(&format!("{line} FIX"));
+    let free = block_sigma_model(line);
+    for m in [&held, &free] {
+        let declared = m.default_params.residual_correlations[0].rho;
+        assert!(
+            (declared - DECLARED_RHO).abs() < 1e-9,
+            "both arms must declare the same ρ; got {declared}"
+        );
+    }
+
+    // Held: exact, and no warning, because there is nothing to warn about.
+    let start = pack_with_bounds(&held.default_params);
+    let seen =
+        crate::estimation::parameterization::unpack_params(&start.packed, &held.default_params)
+            .residual_correlations[0]
+            .rho;
+    assert!(
+        (seen - DECLARED_RHO).abs() < 1e-9,
+        "a FIX-ed ρ must reach the optimizer as declared; got {seen}"
+    );
+    assert!(start.moves.is_empty());
+    assert!(
+        check_packed_start_in_box(&held.default_params, &FitOptions::default()).is_empty(),
+        "a value that survives the pack has nothing to report"
+    );
+
+    // Free: still railed — the rail is about what may be *searched* — and now
+    // says so where before it was silent.
+    let free_start = pack_with_bounds(&free.default_params);
+    let free_seen = crate::estimation::parameterization::unpack_params(
+        &free_start.packed,
+        &free.default_params,
+    )
+    .residual_correlations[0]
+        .rho;
+    assert!(
+        (free_seen - 0.995_054_753_686_730_5).abs() < 1e-12,
+        "a free ρ must still take the tanh(3) rail; got {free_seen}"
+    );
+    let diags = check_packed_start_in_box(&free.default_params, &FitOptions::default());
+    let msg = only_message(&diags);
+    assert_eq!(diags[0].code, "W_INIT_NOT_REPRESENTABLE");
+    assert!(msg.contains("9.99e-1"), "must quote the declared ρ — {msg}");
+    assert!(
+        msg.contains("FIX"),
+        "the remedy for a declared assertion is `FIX`, and must be named — {msg}"
+    );
+    assert!(
+        crate::diagnostics::first_error(&diags).is_ok(),
+        "a railed free ρ is a warning, not a refusal"
+    );
+}
+
+/// Regression: the `1e-10` log floor on a **held** coordinate — the half of
+/// #1307 that is structural (`ln(0)` is `−inf`, so the floor cannot simply be
+/// dropped the way the ρ rail was) and is therefore reported rather than fixed.
+///
+/// `theta TVBETA(0.0, FIX)` is NONMEM's `$THETA 0.0 FIX`, and it ships in this
+/// repo (`nonmem_anchor/ss_chz_const_fit.ferx`). It runs at `1e-10`, which is
+/// numerically immaterial in that model and wrong in principle; before #1307 no
+/// check said so, and the assertion below is that no *other* check says so now
+/// either — this one is the sole reporter.
+#[test]
+fn a_fixed_theta_at_zero_is_reported_because_the_log_packing_cannot_hold_it() {
+    let params = params_with_theta("theta TVCL(0.0, FIX)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    // The mechanism, asserted rather than assumed: the bare `theta X(v, FIX)`
+    // spelling takes a default lower bound of 1e-9, which selects log packing.
+    assert!(p.theta_fixed[0]);
+    assert_eq!(p.theta[0], 0.0);
+    assert!(crate::estimation::parameterization::theta_packs_log(
+        p.theta_lower[0]
+    ));
+
+    let start = pack_with_bounds(p);
+    assert_eq!(start.moves.len(), 1);
+    assert_eq!(start.packed[0], 1e-10f64.ln());
+
+    // Why nothing else can see it, asserted so a future change that *does* make
+    // one of the box walks claim this coordinate reddens here rather than
+    // silently turning this check off.
+    let kinds = coordinate_kinds(p);
+    assert_eq!(
+        coordinates_outside_bounds(&start, &kinds).count(),
+        0,
+        "the FIX pin puts the moved value exactly on its own bounds"
+    );
+    assert_eq!(
+        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
+        0,
+        "that walk skips a FIX-ed θ, deliberately"
+    );
+
+    let diags = box_diags(&params);
+    let msg = only_message(&diags);
+    assert_eq!(diags[0].code, "W_INIT_NOT_REPRESENTABLE");
+    assert!(msg.contains("TVCL"), "{msg}");
+    assert!(msg.contains("0e0"), "must quote the declared 0 — {msg}");
+    assert!(msg.contains("1e-10"), "must quote what is used — {msg}");
+    assert!(
+        msg.contains(START_OUT_OF_BOX_TOKEN),
+        "a held coordinate's message must say why the box check is silent — {msg}"
+    );
+    assert!(crate::diagnostics::first_error(&diags).is_ok());
+}
+
+/// Regression: the free-θ blind spot the #1309 doc records — `theta TVCL(0.0,
+/// 0.0, 10.0)` packs to `packed == lower == ln(1e-10)`, so the box comparison
+/// sees a start sitting exactly *on* its bound, and the declared-range walk
+/// sees `0 < 0` and says nothing, while the fit begins from `1e-10`.
+///
+/// Not a duplicate of the FIX case above: there the silence comes from the pin,
+/// here from the two floors landing on the same number. Both had to be checked,
+/// because a fix that only consulted the FIX mask would leave this one silent.
+#[test]
+fn a_free_theta_below_the_log_floor_is_reported_where_both_box_walks_are_blind() {
+    let params = params_with_theta("theta TVCL(0.0, 0.0, 10.0)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+    assert!(!p.theta_fixed[0], "this arm is the *free* one");
+
+    let start = pack_with_bounds(p);
+    let kinds = coordinate_kinds(p);
+    assert_eq!(
+        start.bounds.lower[0].to_bits(),
+        start.packed[0].to_bits(),
+        "the floor is applied to the value and to the bound identically — that \
+         equality is the blind spot"
+    );
+    assert_eq!(coordinates_outside_bounds(&start, &kinds).count(), 0);
+    assert_eq!(
+        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
+        0
+    );
+
+    let diags = box_diags(&params);
+    assert_eq!(only_message(&diags).is_empty(), false);
+    assert_eq!(diags[0].code, "W_INIT_NOT_REPRESENTABLE");
+}
+
+/// Regression: reporting a coordinate the **box** also moves, which would name
+/// a number the fit never uses.
+///
+/// `sigma PROP_ERR ~ 0.0 (sd)` is moved twice — floored to an SD of `1e-10` by
+/// the packer, then clamped onto the `exp(-8) = 3.355e-4` rail by the box — so
+/// the packer's output is not what any objective evaluation sees. The box
+/// check owns that coordinate and says the more useful thing; this one stands
+/// down, which is what makes the two a partition rather than two opinions.
+///
+/// The pair is the point: the same declaration is *reported* by the pack walk
+/// (`start.moves` is non-empty) and *not emitted*, so this stays green only
+/// because the skip is doing its job and not because the guard stopped firing.
+#[test]
+fn a_coordinate_the_box_also_moves_is_left_to_the_box_check() {
+    let params = params_with_sigma("sigma PROP_ERR ~ 0.0 (sd)");
+    let model = model_with_parameters(&params);
+    let start = pack_with_bounds(&model.default_params);
+    assert_eq!(
+        start.moves.len(),
+        1,
+        "the packer did floor it — the skip below must be a skip, not a miss"
+    );
+
+    let diags = box_diags(&params);
+    let msg = only_message(&diags);
+    assert_eq!(diags[0].code, START_OUT_OF_BOX_TOKEN);
+    assert!(
+        msg.contains("3.355e-4"),
+        "the surviving message must name the value the fit actually uses — {msg}"
+    );
+}
+
+/// Regression: the eval-only exemption swallowing this arm.
+///
+/// A start the box clamps does not *stick* without a search, which is what the
+/// exemption below the arm is for. A value the packer cannot represent is a
+/// different thing: `evaluate_at_initial_params` unpacks the same vector, so
+/// there is no run of any length — `outer_maxiter = 0` included — in which the
+/// declared number is used. Asserted as a straddle against a coordinate that
+/// *is* exempt, so it cannot pass by the predicate having stopped firing.
+#[test]
+fn a_value_the_packer_moved_is_reported_even_at_maxiter_zero() {
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+
+    let held_zero = model_with_parameters(&params_with_theta("theta TVCL(0.0, FIX)"));
+    let d = check_packed_start_in_box(&held_zero.default_params, &eval_only);
+    assert_eq!(d.len(), 1, "not exempt: the packer's substitution is used");
+    assert_eq!(d[0].code, "W_INIT_NOT_REPRESENTABLE");
+
+    // The straddle: an ordinary out-of-box start, which *is* exempt.
+    let railed = model_with_parameters(&params_with_omega("omega ETA_CL ~ 1e8"));
+    assert!(
+        check_packed_start_in_box(&railed.default_params, &eval_only).is_empty(),
+        "a clamped start stays exempt at maxiter = 0"
+    );
+    assert!(
+        !check_packed_start_in_box(&railed.default_params, &FitOptions::default()).is_empty(),
+        "…and fires with a search, or the arm above is not a straddle"
+    );
+}
+
+/// Regression: `classify_warning` reading the new token as the old one.
+///
+/// The two codes drive different conclusions — `InitOutsideBounds` means "your
+/// start was clamped into its box", `InitNotRepresentable` means "the box was
+/// built around a substituted value" — and `classify_warning` matches on
+/// **substrings**, while this message names the sibling token when it explains
+/// why the box check is silent. Ordered the wrong way the sibling arm claims it.
+#[test]
+fn the_not_representable_warning_classifies_as_its_own_code() {
+    use crate::types::{classify_warning, WarningCode};
+
+    let diags = box_diags(&params_with_theta("theta TVCL(0.0, FIX)"));
+    let msg = only_message(&diags);
+    assert!(
+        msg.contains(START_OUT_OF_BOX_TOKEN),
+        "the collision this test is about must actually be present — {msg}"
+    );
+    assert_eq!(
+        classify_warning(&msg).category,
+        WarningCode::InitNotRepresentable
+    );
+}
+
+/// Regression: this check becoming noise.
+///
+/// It fires on a *declaration*, not on a fit, so a rule that is a hair too
+/// broad warns on every run of every model that uses an idiom — and the
+/// idioms are easy to hit. `theta TVLAG(0.0, 0.0, 12.0)` ships in this repo:
+/// its declared `0` is below the log floor, and the fit really does start from
+/// `1e-10` — but it is **free**, and `theta_lower = 0` selects log packing, so
+/// there is no start it could have had instead. That one is reported; what
+/// must not happen is a rule that also claims, say, the identity-packed
+/// `theta THETA_WT(0.0, -5.0, 5.0) FIX`, whose declared `0` reaches the
+/// optimizer exactly.
+///
+/// Measured over the whole tree — 179 `.ferx` files that parse under
+/// `--features survival`, 161 under the default build — exactly **one**
+/// declaration is claimed. Asserted as a subset rather than an equality so the
+/// smaller default-build corpus passes too, plus a file count so "no files were
+/// checked" cannot masquerade as a clean result.
+#[test]
+fn only_one_shipped_model_file_declares_a_value_the_packer_cannot_hold() {
+    // `theta TVBETA(0.0, FIX)` — NONMEM's `$THETA 0.0 FIX`, the constant-hazard
+    // arm of the SS chained-hazard anchor. The fit runs it at `1e-10`, which is
+    // numerically indistinguishable from `0` in `exp(TVBETA · conc)` and is why
+    // the anchor was green without anyone noticing (#1307).
+    let allowed: std::collections::BTreeSet<String> =
+        ["./nonmem_anchor/ss_chz_const_fit.ferx::TVBETA".to_string()]
+            .into_iter()
+            .collect();
+
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if path.is_dir() {
+                if matches!(name.as_str(), "target" | ".git" | ".claude" | "_site") {
+                    continue;
+                }
+                collect(&path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("ferx") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(std::path::Path::new("."), &mut files);
+    files.sort();
+
+    let mut found = std::collections::BTreeSet::new();
+    let mut parsed_files = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(model) = crate::parser::model_parser::parse_model_string(&src) else {
+            continue;
+        };
+        parsed_files += 1;
+        let p = &model.default_params;
+        let names = crate::estimation::parameterization::coordinate_names(p);
+        for mv in &pack_with_bounds(p).moves {
+            let name = names
+                .get(mv.index)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", mv.index));
+            found.insert(format!("{}::{name}", path.display()));
+        }
+    }
+
+    assert!(
+        parsed_files > 100,
+        "the corpus walk found only {parsed_files} parseable model files — a clean \
+         result here would mean nothing"
+    );
+    let unexpected: Vec<_> = found.difference(&allowed).collect();
+    assert!(
+        unexpected.is_empty(),
+        "a shipped model declares a value the packer cannot represent: {unexpected:#?}"
+    );
+    // …and the known one is genuinely found, not merely allowed, whenever the
+    // build parses it. `survival` is what gates that file.
+    #[cfg(feature = "survival")]
+    assert_eq!(found.len(), 1, "{found:#?}");
+}
+
+/// Regression: the `RhoUnit` arm's message, which nothing had ever rendered.
+///
+/// `|ρ| = 1` has no Fisher-z coordinate at all (`atanh(±1)` is `±inf`), so
+/// `RHO_CLAMP` backs it off the unit boundary on **both** spellings — including
+/// the `FIX`ed one whose estimation rail #1307 removed. The parser rejects
+/// `|ρ| >= 1` at declaration time, so the only way in is a hand-built
+/// `ModelParameters`; this mutates a parsed one, which is the same thing a
+/// `ferx-tools` caller assembling parameters programmatically would produce.
+///
+/// Worth a test rather than an `unreachable!()`: dropping `RHO_CLAMP` along with
+/// `RHO_Z_BOUND` would have put `±inf` in the packed vector, which
+/// `compute_scale` divides a coordinate by. The Tier-1 twin
+/// (`a_fixed_rho_at_the_unit_boundary_is_still_finite`) pins the *packing*; this
+/// pins that the user is told.
+#[test]
+fn a_correlation_at_the_unit_boundary_is_reported_with_its_own_remedy() {
+    let model = block_sigma_model("block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05994, 0.09] FIX");
+    let mut params = model.default_params.clone();
+    params.residual_correlations[0].rho = 1.0;
+
+    // The premise: `FIX`ed, so the rail arm cannot also fire and this is a
+    // single-guard fixture. A free ρ = 1 would report the chain
+    // (1 → 0.999999 → 0.995055) as two moves, which is truthful but is not
+    // what this test is about.
+    assert_eq!(params.residual_correlation_fixed, vec![true]);
+
+    let start = pack_with_bounds(&params);
+    let idx = start.packed.len() - 1;
+    assert!(
+        start.packed[idx].is_finite(),
+        "atanh(1) is +inf and must not reach the optimizer"
+    );
+    assert_eq!(start.moves.len(), 1, "one guard, not the rail as well");
+
+    let diags = check_packed_start_in_box(&params, &FitOptions::default());
+    let msg = only_message(&diags);
+    assert_eq!(diags[0].code, "W_INIT_NOT_REPRESENTABLE");
+    assert!(msg.contains("1e0"), "must quote the declared ±1 — {msg}");
+    assert!(
+        msg.contains("no Fisher-z coordinate"),
+        "the cause is the unit boundary, not the estimation rail — {msg}"
+    );
+    assert!(
+        msg.contains("strictly inside (−1, 1)"),
+        "the remedy must be the unit-boundary one — {msg}"
+    );
+    // Not the rail's remedy: a `FIX` is already written here, so telling the
+    // user to write `FIX` would be advice they have already taken.
+    assert!(
+        !msg.contains("with no rail"),
+        "the rail remedy must not leak into the unit-boundary arm — {msg}"
+    );
+    assert!(crate::diagnostics::first_error(&diags).is_ok());
+}
+
+// ── #1307 review round 1: two gaps the first pass left ──────────────────────
+
+/// Regression: a **second**, much narrower rail on the path #1307 had just
+/// cleared. `pack_rho_fixed` kept `RHO_CLAMP = 0.999999` as an unconditional
+/// clamp, so a parser-accepted `ρ = 0.999_999_9` was held at `0.999_999` — and
+/// reported with the unit-boundary message, telling the user to declare it
+/// strictly inside `(-1, 1)`, which it already was.
+///
+/// The guarantee is the **whole** open interval the parser accepts, not most of
+/// it: a promise with an undocumented edge is a promise the user has to know the
+/// edge of. `atanh` is finite across all of `(-1, 1)` — `atanh` of the largest
+/// `f64` below 1 is 18.71, asserted below — so nothing short of `|ρ| = 1` needs
+/// backing off.
+///
+/// The `> RHO_CLAMP` assertion is what stops this becoming a tautology: at
+/// `0.999999` exactly the old clamp was a no-op and the test would pass either
+/// way.
+#[test]
+fn a_fixed_correlation_above_the_old_unit_clamp_is_still_held_exactly() {
+    // atanh is finite right up to the boundary, which is why only |ρ| = 1 is
+    // guarded. Measured, not recalled.
+    let largest_below_one = 1.0_f64 - f64::EPSILON / 2.0;
+    assert!(largest_below_one < 1.0);
+    assert!(largest_below_one.atanh().is_finite());
+
+    // 0.059999994 = 0.999_999_9 * sqrt(0.04 * 0.09) — the reviewer's repro.
+    const DECLARED_RHO: f64 = 0.999_999_9;
+    let model =
+        block_sigma_model("block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.059999994, 0.09] FIX");
+    let p = &model.default_params;
+    let declared = p.residual_correlations[0].rho;
+    assert!(
+        (declared - DECLARED_RHO).abs() < 1e-12,
+        "the parser must accept and store ρ = {DECLARED_RHO}; got {declared}"
+    );
+    assert!(
+        declared > 0.999_999,
+        "the fixture must sit above the old `RHO_CLAMP`, or this cannot fail"
+    );
+
+    let start = pack_with_bounds(p);
+    let idx = start.packed.len() - 1;
+    assert!(start.packed[idx].is_finite());
+    let seen = crate::estimation::parameterization::unpack_params(&start.packed, p)
+        .residual_correlations[0]
+        .rho;
+    assert!(
+        (seen - DECLARED_RHO).abs() < 1e-12,
+        "a FIX-ed ρ must be held exactly across the whole open interval; got {seen} \
+         (the pre-review value was 0.999999)"
+    );
+    assert!(
+        start.moves.is_empty(),
+        "an admissible ρ is not a guard hit: {:#?}",
+        start.moves
+    );
+    assert!(
+        check_packed_start_in_box(p, &FitOptions::default()).is_empty(),
+        "nothing was moved, so nothing is reported"
+    );
+}
+
+/// Regression: the `claimed` set suppressing this arm at `maxiter = 0` while
+/// producing nothing itself.
+///
+/// `claimed` was built unconditionally from the two walks that sit *after* the
+/// eval-only early return. `theta TVCL(-5.0, 0.0, 10.0)` has both a `ValueFloor`
+/// move and a declared-range violation, so at `maxiter = 0` the move was
+/// filtered as "someone else will report it" and then nobody did — `ferx check`
+/// and `fit()` said **nothing at all** about a run that scores `1e-10` rather
+/// than the declared `-5`. That is the precise guarantee the arm exists to make.
+///
+/// Asserted as a straddle: the same declaration with a search *is* claimed, and
+/// reports the declared-range error instead. Without that half this would pass
+/// for a check that had simply started double-reporting.
+#[test]
+fn a_doubly_claimed_coordinate_is_still_reported_when_the_other_walk_is_exempt() {
+    let params = params_with_theta("theta TVCL(-5.0, 0.0, 10.0)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    // Premise: this coordinate really is claimed by the declared-range walk, so
+    // the suppression path is the one under test.
+    assert_eq!(
+        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
+        1
+    );
+    assert_eq!(pack_with_bounds(p).moves.len(), 1);
+
+    // Eval-only: the other walk never runs, so this arm must speak.
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+    let d = check_packed_start_in_box(p, &eval_only);
+    assert_eq!(
+        d.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
+        ["W_INIT_NOT_REPRESENTABLE"],
+        "an eval-only run scores 1e-10 and must say so — {d:#?}"
+    );
+
+    // With a search: the declared-range error is emitted, so this arm stands
+    // down and the coordinate is reported exactly once.
+    let searching = check_packed_start_in_box(p, &FitOptions::default());
+    assert_eq!(
+        searching
+            .iter()
+            .map(|x| x.code.as_str())
+            .collect::<Vec<_>>(),
+        ["E_THETA_INIT_OUTSIDE_BOUNDS"],
+        "a searching run reports the declared violation, once — {searching:#?}"
+    );
+}
+
+/// Regression: naming the packer's intermediate rather than the value the fit
+/// uses, on a coordinate that is moved **twice**.
+///
+/// `sigma PROP_ERR ~ 0.0 (sd)` is floored to an SD of `1e-10` by the packer and
+/// then clamped onto the `exp(-8)` rail by the box. At `maxiter = 0` the box
+/// walk is exempt, so this arm now speaks — and it must quote that rail,
+/// **3.354626e-4** (the realised value, not the `3.355e-4` the prose elsewhere
+/// rounds it to), rather than the `1e-10` no objective evaluation ever sees. The number is
+/// taken by running the real unpacker over the clamped vector, so it cannot
+/// drift from the packing convention.
+#[test]
+fn a_double_move_names_the_value_the_fit_actually_uses() {
+    let params = params_with_sigma("sigma PROP_ERR ~ 0.0 (sd)");
+    let model = model_with_parameters(&params);
+    let p = &model.default_params;
+
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+    let d = check_packed_start_in_box(p, &eval_only);
+    let msg = only_message(&d);
+    assert_eq!(d[0].code, "W_INIT_NOT_REPRESENTABLE");
+    assert!(
+        msg.contains("3.354626e-4"),
+        "must quote the rail the fit lands on — {msg}"
+    );
+    assert!(
+        msg.contains("clamps to"),
+        "and must name the second move rather than blaming the floor for a \
+         number the floor did not produce — {msg}"
+    );
+    // The intermediate still appears, as the floor's own output, so the cause
+    // explains the chain instead of skipping a step.
+    assert!(msg.contains("floor of 1e-10"), "{msg}");
 }

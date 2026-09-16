@@ -1271,6 +1271,8 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
         packed,
         bounds,
         fixed,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
     } = pack_with_bounds(params);
     let names = coordinate_names(params);
     let estimates = coordinate_values(params);

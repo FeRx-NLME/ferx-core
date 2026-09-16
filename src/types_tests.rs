@@ -850,6 +850,11 @@ fn warning_code_tokens_are_stable() {
         (StalledAtInit, "stalled_at_init"),
         (EbeStartDependent, "ebe_start_dependent"),
         (General, "general"),
+        // #1307. Appended rather than filed next to `InitOutsideBounds`, which
+        // is where it belongs by subject: the match below returns each variant's
+        // *index in this list*, so inserting mid-list renumbers every arm after
+        // it and the diff stops being reviewable.
+        (InitNotRepresentable, "init_not_representable"),
     ];
     // The list is hand-maintained, and had silently fallen four variants behind
     // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
@@ -897,11 +902,12 @@ fn warning_code_tokens_are_stable() {
             StalledAtInit => 33,
             EbeStartDependent => 34,
             General => 35,
+            InitNotRepresentable => 36,
         }
     }
     assert_eq!(
         expected.len(),
-        36,
+        37,
         "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
     );
     for (i, (code, _)) in expected.iter().enumerate() {

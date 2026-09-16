@@ -2091,6 +2091,17 @@ pub struct SigmaVector {
 /// declared value. Which of the two applies is carried alongside the value in
 /// [`ModelParameters::residual_correlation_fixed`], not in this struct, so the
 /// serialized shape stays what `FitResult` consumers already parse.
+///
+/// "Holds it at the declared value" is exact, at any `|rho| < 1` the parser
+/// accepts, and that had to be repaired to be true: the packer applied the
+/// *estimation* rail — Fisher-z `|z| <= 3`, i.e. `|rho| <= 0.995_055` — to a
+/// `FIX`-ed correlation as well as to a free one, so every declaration above it
+/// collapsed onto that single value and the fit scored a covariance the model
+/// file never wrote, with nothing reported (#1307). The rail governs only the
+/// free case now. The free case keeps it, and it is not a defect there: a `rho`
+/// running to `-0.999_93` on a 12-observation fixture is a degenerate optimum,
+/// not an estimate — see `RHO_Z_BOUND`. A start past the rail is clamped onto it
+/// and reported as `W_INIT_NOT_REPRESENTABLE`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct ResidualCorrelation {
     pub sigma_i: usize,
@@ -6023,6 +6034,27 @@ pub enum WarningCode {
     /// candidates, under a failure line reading "estimate pinned to a declared
     /// bound: … *starts at* …".
     InitOutsideBounds,
+    /// One or more declared values could not be **represented** in the packed
+    /// space at all, so the optimizer started from a different number than the
+    /// model file declares (#1307).
+    ///
+    /// Deliberately **not** [`WarningCode::InitOutsideBounds`], and the two are
+    /// not degrees of the same thing. That one is a start the box moved, and its
+    /// coordinate is genuinely outside its box. This one is a start the *packer*
+    /// moved, before any box existed — `pack_params` applies its guard first and
+    /// the box is then built from the already-moved value, so every coordinate
+    /// reported here is perfectly **in-box**. A consumer that read the two as one
+    /// code would conclude from "no `init_outside_bounds`" that the declared
+    /// values reached the optimizer, which is exactly the inference #1307 exists
+    /// to stop.
+    ///
+    /// Reachable two ways, both of them log-packing limits rather than
+    /// modelling advice: a θ / Ω-diagonal / Σ / `[mixture]`-override value at or
+    /// below the log-packing floor of `1e-10`, where `ln` has nothing to
+    /// return, and a **free** residual correlation past the Fisher-z estimation
+    /// rail. A `FIX`-ed correlation is not among them: its rail was a choice
+    /// about what may be *searched*, and #1307 removed it.
+    InitNotRepresentable,
     /// The fit never left its initial estimates: **no** free θ, Ω or σ coordinate
     /// moved, so the reported OFV is the OFV *of the initial values* and says
     /// nothing about the model (#751's signature, surfaced as a warning by #997 §2).
@@ -6137,6 +6169,7 @@ impl WarningCode {
             WarningCode::BoundaryEstimate => "boundary_estimate",
             WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
             WarningCode::InitOutsideBounds => "init_outside_bounds",
+            WarningCode::InitNotRepresentable => "init_not_representable",
             WarningCode::StalledAtInit => "stalled_at_init",
             WarningCode::EbeStartDependent => "ebe_start_dependent",
             WarningCode::InflatedRse => "inflated_rse",
@@ -6250,6 +6283,18 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.contains("w_init_not_representable") {
+        // #1307: a declared value the *packer* altered before any box existed —
+        // a `1e-10` log floor, or the Fisher-z rail on a free ρ. Matched on its
+        // own `W_` token and placed with the other token arms.
+        //
+        // Ahead of `w_init_outside_bounds` below, and not merely for tidiness:
+        // `contains` is a substring test over the whole message, and this one
+        // names that sibling token when it explains why the box check stayed
+        // silent on the same coordinate. Ordered the other way, the sibling arm
+        // would claim this message and report a coordinate that is, by
+        // construction, inside its box.
+        (WarningSeverity::Warning, WarningCode::InitNotRepresentable)
     } else if lower.contains("w_init_outside_bounds") {
         // #1251: an initial estimate that packs outside its own box and is
         // clamped there before the first objective evaluation. Matched on its
@@ -6508,9 +6553,11 @@ pub struct FitResult {
     /// Residual-error correlations in force for this fit.
     ///
     /// A plain `block_sigma` estimates these alongside theta/omega/sigma (#847);
-    /// a `block_sigma ... FIX` block holds them at the declared value — see
-    /// `residual_correlation_fixed`. Together with `sigma`, they make the fitted
-    /// residual covariance reconstructible as `rho * sigma[i] * sigma[j]`.
+    /// a `block_sigma ... FIX` block holds them at the declared value — exactly,
+    /// at any `|rho| < 1`, which before #1307 was true only below `0.995_055`
+    /// (see [`ResidualCorrelation`]) — see `residual_correlation_fixed`.
+    /// Together with `sigma`, they make the fitted residual covariance
+    /// reconstructible as `rho * sigma[i] * sigma[j]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub residual_correlations: Vec<ResidualCorrelation>,
     /// FIX flags parallel to `residual_correlations` (#847). Empty for a fit
