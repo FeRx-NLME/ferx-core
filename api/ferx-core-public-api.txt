@@ -458,6 +458,7 @@ pub fn ferx_core::estimation::parameterization::coordinate_values(params: &ferx_
 pub fn ferx_core::estimation::parameterization::coordinate_values_raw(theta: &[f64], omega_mat: &nalgebra::base::alias::DMatrix<f64>, omega_diagonal: bool, sigma: &[f64], iov: core::option::Option<(&nalgebra::base::alias::DMatrix<f64>, bool)>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::parameterization::get_eta_init(n_eta: usize, warm_start: core::option::Option<&[f64]>, mu_refs: core::option::Option<&[f64]>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::parameterization::omega_structural_zero_mask(template: &ferx_core::ModelParameters) -> alloc::vec::Vec<bool>
+pub fn ferx_core::estimation::parameterization::omega_variance_at_or_below_rail(l_ii_squared: f64) -> bool
 pub fn ferx_core::estimation::parameterization::pack_params(params: &ferx_core::ModelParameters) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::parameterization::packed_fixed_mask(template: &ferx_core::ModelParameters) -> alloc::vec::Vec<bool>
 pub fn ferx_core::estimation::parameterization::packed_len(template: &ferx_core::ModelParameters) -> usize

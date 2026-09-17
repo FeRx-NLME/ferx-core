@@ -2,8 +2,40 @@
 
 use ferx_core::edit::{ModelEdit, ModelText};
 
-use super::{seed_from, MIN_SEED_VARIANCE};
+use super::{seed_from, MIN_CHOLESKY_VARIANCE, MIN_SEED_VARIANCE};
 use crate::search::test_support::{fixture_fit, MODEL};
+
+/// Regression: this crate carrying its own copy of the engine's rail.
+///
+/// `MIN_CHOLESKY_VARIANCE` is a seeding-policy number chosen as "the engine's
+/// rail with headroom", and until PR #1408 the rail half of that sentence was a
+/// private `const RAIL_VARIANCE = 6.144_212_353_328_21e-6` in `seed.rs` plus a
+/// `debug_assert` — a restatement that cannot be wrong at compile time and is
+/// not checked in release. Measured on that PR's review: moving
+/// `OMEGA_CHOL_PACKED_LOWER` to `-4.0` (rail variance 3.35e-4, **55x** this
+/// threshold) left all 602 tests in this crate green while every seeded child
+/// would have been refused by `fit()` with `E_OMEGA_INIT_AT_RAIL`.
+///
+/// Asking `ferx_core` is what makes a rail move red here. The second assertion
+/// is the headroom itself: a threshold merely *equal* to the rail seeds starts
+/// the engine refuses, since the gate is `<=`.
+#[test]
+fn min_cholesky_variance_still_clears_the_engine_rail() {
+    use ferx_core::estimation::parameterization::omega_variance_at_or_below_rail;
+
+    assert!(
+        !omega_variance_at_or_below_rail(MIN_CHOLESKY_VARIANCE),
+        "the seeder's threshold {MIN_CHOLESKY_VARIANCE:e} is at or below the \
+         engine's Omega Cholesky rail: every seeded child would be refused with \
+         E_OMEGA_INIT_AT_RAIL"
+    );
+    // ...and with room to spare, not by a ULP. The engine's gate is `<=`, so a
+    // threshold sitting exactly on the rail is already a refused start.
+    assert!(
+        !omega_variance_at_or_below_rail(MIN_CHOLESKY_VARIANCE * 0.9),
+        "no headroom left: {MIN_CHOLESKY_VARIANCE:e} is within 10% of the rail"
+    );
+}
 
 fn warfarin_text() -> ModelText {
     ModelText::parse(&std::fs::read_to_string(MODEL).expect("the warfarin model file"))

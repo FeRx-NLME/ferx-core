@@ -3871,11 +3871,6 @@ fn outer_search_runs(options: &FitOptions) -> bool {
     })
 }
 
-/// The largest **variance** whose packed coordinate still lands on the `-6`
-/// lower rail: `ln(√v) ≤ -6 ⇔ v ≤ e⁻¹²`. Quoted in the tiny-non-zero message so
-/// the user is told where the cliff is, not just that they are past it.
-const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6;
-
 /// Which declaration a flagged variance coordinate came from — the keyword the
 /// user has to go and edit.
 enum VarianceDecl {
@@ -4210,11 +4205,22 @@ pub(crate) fn check_variance_init_rails(
             // Everything else: a tiny-but-positive diagonal start, or a
             // regularised indefinite matrix. The declared value is not
             // recoverable, so only the coordinate is described.
+            // The cliff comes from `lo` — **this coordinate's** lower bound, out
+            // of the box `pack_with_bounds` built two dozen lines up — not from
+            // the rail constant and not from a decimal. It was
+            // `6.144_212_353_328_21e-6`, `exp(2·-6)` typed out in a different
+            // file from the `-6`, which is a message quoting a rail it has no
+            // link to (#1242). Reading `lo` is what makes the quoted figure and
+            // the bound the same number by construction rather than by
+            // agreement; `rail_variance_at` is only the conversion, and is
+            // pinned at non-default rails so it cannot be re-spelled as a
+            // constant either (PR #1408 review).
+            let cliff = crate::estimation::parameterization::rail_variance_at(lo);
             (
                 format!(
                     "{name} starts at a variance of {rail_variance:.3e} on the optimizer's \
                      scale (ln(L) = {p:.2}), at or below its lower bound of {lo:.1} — every \
-                     variance ≤ {RAIL_VARIANCE:.2e} lands on that rail — so the start is \
+                     variance ≤ {cliff:.2e} lands on that rail — so the start is \
                      clamped there and the coordinate cannot be estimated from it. Start \
                      {name} at ≥ 1e-5, or `FIX` it if it should carry no variability. NONMEM \
                      accepts such a start but collapses it to ≈ 1e-9, which is the same \
