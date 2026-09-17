@@ -168,8 +168,14 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         ..FitOptions::default()
     };
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &opts)
-        .expect("the unmapped TVFLAT must be detected and frozen");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("the unmapped TVFLAT must be detected and frozen");
     let idx = |name: &str| {
         model
             .default_params
@@ -1202,8 +1208,14 @@ fn preflight_freezes_flat_theta() {
     let mut options = FitOptions::default();
     options.interaction = false;
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
-        .expect("flat TVV must be detected");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &options,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("flat TVV must be detected");
     assert!(!frozen.theta_fixed[0], "active TVCL stays free");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
     assert!(
@@ -1223,7 +1235,14 @@ fn preflight_no_freeze_when_all_thetas_active() {
     let mut options = FitOptions::default();
     options.interaction = false;
     assert!(
-        freeze_flat_thetas(&model, &pop, &model.default_params, &options).is_none(),
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &options,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+        )
+        .is_none(),
         "no theta is flat — nothing to freeze"
     );
 }
@@ -1249,8 +1268,14 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
     let mut options = FitOptions::default();
     options.interaction = false;
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
-        .expect("flat TVV must be detected");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &options,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("flat TVV must be detected");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen");
     assert!(
         frozen.theta[1].is_finite() && frozen.theta[1] <= upper + 1e-6,
@@ -4181,25 +4206,28 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
     );
 }
 
-/// #1154 — the outer FD-fallback warning.
+/// #1154 — the outer FD-fallback diagnostic.
 ///
-/// A runtime per-subject decline of the analytic outer gradient is salvaged onto
-/// `subject_reconverged_fd_gradient`, which is correct but several times slower, and was
-/// invisible: no count, no code, and `build_info::gradient_method_outer` keeps reporting
-/// `analytic (Dual2)` because it reads a **model**-level predicate. These pin that
-/// [`outer_fd_fallback_warning`] sees the decline and names it.
+/// A per-subject decline of the analytic outer gradient is salvaged onto
+/// `subject_reconverged_fd_gradient`: correct, several times slower on that subject, and
+/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic (Dual2)`
+/// because it reads a **model**-level predicate.
 ///
-/// Fixture: warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
-/// infusion reshapes the dosing window in a way the closed-form walk cannot express, so
-/// `subject_sensitivities` declines that subject while every bolus-dosed one stays
-/// analytic (#419). Valid data, a model the report calls analytic, one subject quietly on
-/// FD — the shape this warning exists for. The subject ids differ so the "e.g. subject
-/// <id>" half of the message is pinned against the *declining* subject rather than
-/// whichever came first.
+/// These pin the *recording*, which is what makes the report honest. An earlier revision
+/// probed the provider at `η = 0` instead, and PR #1418's review showed that reports
+/// fallbacks that never happen: the provider's own declines are parameter-dependent
+/// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
+/// subject can decline at the probe point and be served at its EBE. Both halves of that
+/// are pinned below.
 mod outer_fd_fallback {
     use super::*;
     use std::path::Path;
 
+    /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
+    /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
+    /// so `subject_sensitivities` declines that subject while every bolus-dosed one stays
+    /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
+    /// a property of the records — which is what makes it a stable fixture.
     const WARFARIN_F: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -4252,11 +4280,29 @@ mod outer_fd_fallback {
         (model, analytic, declining)
     }
 
+    /// Run one real outer-gradient evaluation over `pop` through the same mixed assembly
+    /// the optimizer uses, and return the log it filled.
+    fn record_one_gradient_eval(model: &CompiledModel, pop: &Population) -> OuterFdDeclineLog {
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let _ = population_gradient_sens_mixed(&x, params, model, pop, &ehs, &bounds, &opts, &log);
+        log
+    }
+
     /// Fixture precondition, asserted rather than assumed: the two subjects must land on
-    /// *opposite* sides of the gate the warning probes — the sensitivity provider.
-    /// Without this the warning test below is satisfied by a population where both
-    /// subjects decline (or neither does); the straddle is what makes the count mean
-    /// anything.
+    /// *opposite* sides of the provider gate. Without this the warning test below is
+    /// satisfied by a population where both decline (or neither does).
     #[test]
     fn fixture_subjects_straddle_the_provider_gate() {
         let (model, analytic, declining) = analytic_and_declining();
@@ -4274,66 +4320,15 @@ mod outer_fd_fallback {
         );
     }
 
-    /// The boundary [`outer_fd_fallback_warning`]'s docs are built on, pinned as a test so
-    /// a future change that moves the probe onto the full assembly fails here rather than
-    /// starting to emit a false "4 of 10 subjects use FD" on the bundled warfarin fit.
-    ///
-    /// The provider serves every warfarin subject at `η = 0`; the *assembly* declines four
-    /// of them, because `prepare_stacked` needs the true inner Hessian to be PD and that
-    /// only holds near the EBE — the point every live gradient evaluation actually uses.
-    /// A mode-dependent decline is not a scope gap, so the warning must not count it.
-    #[test]
-    fn assembly_declines_at_the_prior_mode_where_the_provider_does_not() {
-        let model =
-            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
-                .expect("warfarin parses");
-        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
-            .expect("warfarin data loads");
-        let x = pack_params(&model.default_params);
-        let theta = &model.default_params.theta;
-        let zeros = vec![0.0; model.n_eta];
-        let served = pop
-            .subjects
-            .iter()
-            .filter(|s| {
-                crate::sens::provider::subject_sensitivities(&model, s, theta, &zeros).is_some()
-            })
-            .count();
-        let assembled = pop
-            .subjects
-            .iter()
-            .filter(|s| {
-                subject_analytic_outer_gradient(&model, s, &model.default_params, &x, &zeros, true)
-                    .is_some()
-            })
-            .count();
-        assert_eq!(
-            served,
-            pop.subjects.len(),
-            "every warfarin subject is inside the provider's scope"
-        );
-        assert!(
-            assembled < served,
-            "fixture precondition: the assembly must decline at the prior mode where the \
-             provider does not, or this test is not observing the boundary it pins \
-             (served = {served}, assembled = {assembled})"
-        );
-        // And the warning reports the provider's answer, not the assembly's.
-        assert!(
-            outer_fd_fallback_warning(&model, &pop, &model.default_params).is_none(),
-            "an unmodified warfarin population must not warn"
-        );
-    }
-
-    /// The warning counts the declining subjects and names one. Mutations that must redden
-    /// it: dropping the `n_fd` increment, or reporting the first subject id unconditionally
-    /// instead of the first *declining* one.
+    /// The warning counts the subjects the assembly actually salvaged, and names one.
+    /// Mutations that must redden it: dropping the `declines.record(i)` call, or reporting
+    /// the first subject rather than the first *declining* one.
     #[test]
     fn warns_with_count_and_example_subject() {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
-        let w = outer_fd_fallback_warning(&model, &pop, &model.default_params)
-            .expect("a declining subject must warn");
+        let log = record_one_gradient_eval(&model, &pop);
+        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
             w.contains("OUT_OF_SCOPE"),
@@ -4347,7 +4342,8 @@ mod outer_fd_fallback {
     fn silent_when_every_subject_is_analytic() {
         let (model, analytic, _) = analytic_and_declining();
         let pop = mk_pop(vec![analytic]);
-        assert!(outer_fd_fallback_warning(&model, &pop, &model.default_params).is_none());
+        let log = record_one_gradient_eval(&model, &pop);
+        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
     }
 
     /// The case the *inner* warning deliberately suppresses and this one must not: a
@@ -4369,9 +4365,26 @@ mod outer_fd_fallback {
              no mismatch to warn about"
         );
         let pop = mk_pop(vec![declining.clone(), declining]);
-        let w = outer_fd_fallback_warning(&model, &pop, &model.default_params)
-            .expect("an all-FD in-scope population must warn");
+        let log = record_one_gradient_eval(&model, &pop);
+        let w =
+            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
         assert!(w.contains("2 of 2"), "got: {w}");
+    }
+
+    /// A log nobody wrote to is silent. This is the property that makes every route gate
+    /// unnecessary: BOBYQA (including the mixture `Auto` downgrade), GN, trust-region,
+    /// `reconverge_gradient_interval = 1` and `outer_maxiter = 0` all reach the end
+    /// without touching the analytic branch, so there is nothing to report.
+    #[test]
+    fn an_untouched_log_says_nothing() {
+        let (_, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        assert!(
+            outer_fd_fallback_warning(&pop, &log).is_none(),
+            "a fit that never evaluated an analytic outer gradient must not warn — even \
+             with a subject the provider would decline"
+        );
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`

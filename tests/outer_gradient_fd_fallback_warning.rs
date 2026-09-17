@@ -5,19 +5,21 @@
 //! slower, and — before this — invisible: no warning code, no count, and
 //! `FitResult::gradient_method_outer` keeps reporting `analytic (Dual2)` because it reads a
 //! **model**-level predicate. The Tier-1 tests in
-//! `estimation::outer_optimizer::tests::outer_fd_fallback` pin the counting and the reason
-//! the probe stops at the provider; this pins the wiring — that `fit()` actually pushes
-//! the warning, and that it does so while the reported outer gradient method still says
-//! analytic, which is the mismatch the warning exists to reconcile.
+//! `estimation::outer_optimizer::tests::outer_fd_fallback` pin the recording; this pins the
+//! wiring — that the warning reaches `FitResult::warnings`, that it does so while the
+//! reported outer gradient method still says analytic, and that a fit which never
+//! evaluates an analytic outer gradient stays silent.
 //!
-//! Tier 2: `outer_maxiter = 0` returns after one objective evaluation, no convergence loop.
+//! Tier 2: `outer_maxiter = 1` runs one gradient evaluation and stops. It must not be `0`
+//! — that is the evaluation-only path, which computes no outer gradient at all, so there
+//! would be nothing to report and the test would pass for the wrong reason.
 
 use ferx_core::types::{
     CompiledModel, DoseEvent, EstimationMethod, FitOptions, Optimizer, Population, RateMode,
 };
 use std::path::Path;
 
-/// Warfarin with a bioavailability `F1 < 1`.
+/// Warfarin with a bioavailability `F < 1`.
 ///
 /// Under `F ≠ 1` a **rate-defined** (`RATE > 0`) infusion reshapes the dosing window —
 /// the rate is held and the window scaled to `F·dur` — which the closed-form walk cannot
@@ -25,7 +27,7 @@ use std::path::Path;
 /// bolus-dosed subject is unaffected, and the model as a whole stays inside the analytic
 /// outer scope. That combination is exactly the shape this warning exists for: valid data,
 /// a model the report calls analytic, and one subject that quietly runs FD.
-const WARFARIN_F1: &str = r#"
+const WARFARIN_F: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
   theta TVV(10.0, 0.1, 500.0)
@@ -42,7 +44,41 @@ const WARFARIN_F1: &str = r#"
   CL = TVCL * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
-  F = TVF
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// [`WARFARIN_F`] with a two-class `[mixture]`, so `optimizer = auto` resolves to BOBYQA
+/// via `resolve_outer_optimizer` while `gradient_method_outer` still reports analytic.
+const MIXTURE_F: &str = r#"
+[parameters]
+  theta TVCL1(0.15, 0.001, 10.0)
+  theta TVCL2(0.30, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  theta MIXL(0.0, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
 
 [structural_model]
   pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
@@ -60,21 +96,33 @@ fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
         .find(|w| w.contains("finite-difference outer gradients"))
 }
 
+/// The same population with subject 0's bolus replaced by a rate-defined infusion — the
+/// dose shape the provider declines under `F ≠ 1`. Replaced rather than added: the point
+/// is a data *shape* the provider declines, not a different amount of drug.
+fn make_subject_0_decline(population: &mut Population) -> String {
+    let declining = &mut population.subjects[0];
+    let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
+    dose.rate_mode = RateMode::Fixed;
+    declining.doses = vec![dose];
+    declining.id.clone()
+}
+
 fn fixture() -> (CompiledModel, Population) {
-    let model = ferx_core::parse_model_string(WARFARIN_F1).expect("model parses");
+    let model = ferx_core::parse_model_string(WARFARIN_F).expect("model parses");
     let population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
     (model, population)
 }
 
-fn eval_only_options() -> FitOptions {
+fn one_gradient_eval_options() -> FitOptions {
     FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
         // The analytic outer gradient is only dispatched for a gradient-driven optimizer;
         // derivative-free BOBYQA has no outer gradient to fall back from.
         optimizer: Optimizer::NloptLbfgs,
-        outer_maxiter: 0,
+        // One real gradient evaluation. NOT `0` — see the module docs.
+        outer_maxiter: 1,
         run_covariance_step: false,
         ..Default::default()
     }
@@ -89,9 +137,9 @@ fn in_scope_population_emits_no_outer_fd_warning() {
         &model,
         &population,
         &model.default_params,
-        &eval_only_options(),
+        &one_gradient_eval_options(),
     )
-    .expect("eval-only fit succeeds");
+    .expect("fit succeeds");
     assert_eq!(
         result.gradient_method_outer, "analytic (Dual2)",
         "fixture precondition: the model must report the analytic outer route"
@@ -112,23 +160,15 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     let (model, mut population) = fixture();
     let n_total = population.subjects.len();
     assert!(n_total > 1, "fixture precondition: need a mixed population");
-
-    let declining = &mut population.subjects[0];
-    let declining_id = declining.id.clone();
-    // Replace the subject's bolus with the same amount delivered as a rate-defined
-    // infusion, rather than adding a second dose: the point is a data *shape* the
-    // provider declines, not a different amount of drug.
-    let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
-    dose.rate_mode = RateMode::Fixed;
-    declining.doses = vec![dose];
+    let declining_id = make_subject_0_decline(&mut population);
 
     let result = ferx_core::fit(
         &model,
         &population,
         &model.default_params,
-        &eval_only_options(),
+        &one_gradient_eval_options(),
     )
-    .expect("eval-only fit succeeds");
+    .expect("fit succeeds");
 
     let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
         panic!(
@@ -149,5 +189,93 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
         result.gradient_method_outer, "analytic (Dual2)",
         "the reported outer method is model-level and must still read analytic — if it \
          ever reports the per-subject route instead, this warning's framing needs updating"
+    );
+}
+
+/// PR #1418 review, finding 2. A mixture model with `optimizer = auto` runs **BOBYQA**:
+/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`, a rule
+/// `build_info::gradient_method_outer` does not model — it still classifies the model as
+/// analytic. A derivative-free fit requests no outer gradient at all, so no subject can
+/// have taken an FD *outer* gradient and the warning must stay silent even with a subject
+/// the provider would decline.
+///
+/// This passes because the warning reads a runtime log rather than a model-level
+/// predicate; a gate written against `gradient_method_outer` would have emitted
+/// "1 of 2 ... use finite-difference outer gradients" here.
+#[test]
+fn a_derivative_free_mixture_auto_fit_does_not_warn() {
+    let model = ferx_core::parse_model_string(MIXTURE_F).expect("mixture model parses");
+    let mut population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        // The knob under test: `auto` on a mixture model resolves to BOBYQA.
+        optimizer: Optimizer::Auto,
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = ferx_core::fit(&model, &population, &model.default_params, &options)
+        .expect("mixture fit succeeds");
+
+    assert_eq!(
+        result.gradient_method_outer, "analytic (Dual2)",
+        "fixture precondition: the model-level label must claim analytic, or this test \
+         does not reproduce the reported mismatch"
+    );
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "a derivative-free fit computes no outer gradient, so no subject can have fallen \
+         back to an FD one; got {:?}",
+        result.warnings
+    );
+}
+
+/// An evaluation-only run (`outer_maxiter = 0`) short-circuits before any optimizer is
+/// built and computes no outer gradient, so it must not report outer FD fallbacks either.
+/// Same population and model as the warning test above, so the only difference is the
+/// number of iterations.
+#[test]
+fn an_evaluation_only_fit_does_not_warn() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        outer_maxiter: 0,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "an evaluation-only fit runs no outer gradient; got {:?}",
+        result.warnings
+    );
+}
+
+/// PR #1418 review, finding 1. `reconverge_gradient_interval = 1` is the documented
+/// escape hatch that forces the reconverged-FD outer gradient on **every** evaluation, so
+/// the analytic branch is never selected and no subject "fell outside the provider's
+/// scope". Attributing that fit's FD gradients to a scope gap would be a false cause even
+/// though the fit really is on FD throughout.
+#[test]
+fn forcing_the_reconverged_gradient_does_not_warn_about_scope() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        reconverge_gradient_interval: 1,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "`reconverge_gradient_interval = 1` bypasses the analytic branch for every \
+         subject, which is not a provider scope gap; got {:?}",
+        result.warnings
     );
 }

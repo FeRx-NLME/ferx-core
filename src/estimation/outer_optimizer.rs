@@ -225,6 +225,13 @@ pub fn optimize_population(
         };
         &owned_opts
     };
+    // Records which subjects actually take the per-subject reconverged-FD outer gradient
+    // (#1154). Created after the `runs_outer_optimizer` short-circuit above, so an
+    // evaluation-only run — which computes no outer gradient — cannot report one. The
+    // flat-theta pre-flight below is a real outer-gradient evaluation, so it writes here
+    // too.
+    let declines = OuterFdDeclineLog::new(population.subjects.len());
+
     // Pre-flight flat-theta guard (#826): a non-fixed theta whose outer gradient is
     // identically ~0 at the initial estimate never reaches the objective (typically
     // unmapped / dropped from the structural or scaling model). Left in the optimized
@@ -238,7 +245,7 @@ pub fn optimize_population(
     let (init_params, preflight_warnings) = if init_params.mixture.is_some() {
         (init_params, Vec::new())
     } else {
-        match freeze_flat_thetas(model, population, init_params, options) {
+        match freeze_flat_thetas(model, population, init_params, options, &declines) {
             Some((fp, w)) => {
                 frozen_params = fp;
                 (&frozen_params, w)
@@ -253,9 +260,9 @@ pub fn optimize_population(
         | Optimizer::NloptLbfgs
         | Optimizer::Mma
         | Optimizer::Bobyqa
-        | Optimizer::Auto => optimize_nlopt(model, population, init_params, options),
+        | Optimizer::Auto => optimize_nlopt(model, population, init_params, options, &declines),
         Optimizer::Bfgs | Optimizer::Lbfgs => {
-            optimize_bfgs(model, population, init_params, options)
+            optimize_bfgs(model, population, init_params, options, &declines)
         }
         Optimizer::TrustRegion => crate::estimation::trust_region::optimize_trust_region(
             model,
@@ -272,6 +279,13 @@ pub fn optimize_population(
         w.extend(preflight_warnings);
         w.append(&mut result.warnings);
         result.warnings = w;
+    }
+    // Per-subject outer FD fallbacks that actually happened (#1154). Emitted here, from
+    // the runtime log, rather than from a probe in `fit_inner`: only this scope knows
+    // which evaluations ran, and the log is empty for every route that never reaches the
+    // analytic branch — so no route gate is needed and none can go stale.
+    if let Some(w) = outer_fd_fallback_warning(population, &declines) {
+        result.warnings.push(w);
     }
     result
 }
@@ -295,6 +309,7 @@ fn freeze_flat_thetas(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
+    declines: &OuterFdDeclineLog,
 ) -> Option<(ModelParameters, Vec<String>)> {
     let n_theta = init_params.theta.len();
     // Nothing to freeze if every theta is already fixed.
@@ -340,6 +355,7 @@ fn freeze_flat_thetas(
         &bounds,
         options,
         &mut grad_eval_idx,
+        declines,
     );
 
     // Thetas are the first `n_theta` packed coordinates (see `pack_params`), so
@@ -2010,8 +2026,9 @@ fn optimize_nlopt(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
+    declines: &OuterFdDeclineLog,
 ) -> OuterResult {
-    let first = optimize_nlopt_once(model, population, init_params, options, false);
+    let first = optimize_nlopt_once(model, population, init_params, options, false, declines);
     // The attempts minimised the *penalized* objective (covariate-NN
     // regularization, parameter priors), so they are ranked on it too:
     // `result.ofv` is the clean −2LL, and comparing that alone would prefer the
@@ -2023,7 +2040,7 @@ fn optimize_nlopt(
         options.optimizer,
         options.verbose,
         first,
-        || optimize_nlopt_once(model, population, init_params, options, true),
+        || optimize_nlopt_once(model, population, init_params, options, true, declines),
         |result| {
             result.ofv
                 + nn_reg.penalty_value(&result.params.theta)
@@ -2080,6 +2097,7 @@ fn optimize_nlopt_once(
     init_params: &ModelParameters,
     options: &FitOptions,
     hold_cap_at_init: bool,
+    declines: &OuterFdDeclineLog,
 ) -> (OuterResult, bool) {
     let PackedStart {
         packed: mut x0,
@@ -2519,6 +2537,7 @@ fn optimize_nlopt_once(
                         options,
                         &mut state.n_grad_evals,
                         agq_evaluation,
+                        declines,
                     )
                 };
                 // Splice in the NN penalty gradient (computed above, in the same
@@ -3232,6 +3251,7 @@ fn optimize_bfgs(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
+    declines: &OuterFdDeclineLog,
 ) -> OuterResult {
     let PackedStart {
         packed: mut x,
@@ -3327,6 +3347,7 @@ fn optimize_bfgs(
             &bounds,
             options,
             grad_eval_idx,
+            declines,
         );
         // Penalized value + matching gradient fed to the optimizer (unregularized
         // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
@@ -4036,79 +4057,98 @@ fn subject_analytic_outer_gradient_iov(
     g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
-/// Warning when a subject's **data shape** falls out of the outer sensitivity provider's
-/// scope at runtime while the model-level report (`build_info::gradient_method_outer`)
-/// says the fit runs the exact analytic gradient. The outer twin of
-/// `inner_optimizer::fd_fallback_warning` (#1154).
+/// Which subjects actually took the per-subject **reconverged-FD** outer gradient during
+/// this fit, because [`subject_analytic_outer_gradient`] (or its IOV twin) declined them
+/// (#1154).
 ///
-/// The decline is per subject and, since #466, so is the salvage
-/// ([`subject_reconverged_fd_gradient`]) — so such a fit is correct, several times slower
-/// on those subjects, and was indistinguishable from a fit that is simply slow: no `W_*`
-/// code, no count, and a `gradient_method_outer` that keeps reporting `analytic (Dual2)`
-/// because it reads a **model**-level predicate. The mismatch is the whole signal, which
-/// is why the caller gates this on the model-level report saying analytic rather than on
-/// a *mixed* population (as the inner warning does): an in-scope model whose **every**
-/// subject declines is precisely the case the label gets wrong.
+/// One `AtomicBool` per subject, set on the fallback arm of the mixed assemblies. Recorded
+/// at the point the gradient is evaluated, so it says what *ran* rather than what a probe
+/// at some other parameter point predicts would run. That distinction is the whole reason
+/// this is a log and not a predicate:
 ///
-/// **Probes the provider, not the whole assembly**, and that boundary is measured, not
-/// assumed. The assembly is `subject_sensitivities(..)?` followed by `prepare(..)?`; only
-/// the first is a scope gate. `prepare_stacked` additionally requires the *true inner
-/// Hessian* to be positive-definite (`h_inner.cholesky()?`), which holds at the EBE — the
-/// point every live gradient evaluation uses — and routinely fails away from it: measured
-/// on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10 subjects
-/// (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider serves all
-/// 10, and all 10 are analytic at their EBEs. Probing the assembly here would therefore
-/// have reported "4 of 10 subjects use finite-difference outer gradients" on a fit that
-/// uses the analytic gradient for every subject. A `prepare`-level decline is genuinely
-/// mode-dependent and cannot be answered from a fixed probe point; a provider decline is
-/// a property of the subject's records (modeled-duration dose, out-of-scope ODE shape,
-/// the missing κ group of #1153), which is the class this issue is about.
+/// - **The provider's own declines are parameter-dependent.** `moving_bounds_separable`
+///   reads the *resolved* infusion durations and lag times, which are functions of θ and
+///   η. A subject whose two modeled `RATE=-2` windows coincide at `η = 0` declines there
+///   and is served at its EBE, where they no longer coincide — so a zero-η probe reports
+///   an FD fallback for a subject that never took one (PR #1418 review, finding 1).
+/// - **The outer *assembly* declines away from the mode for a second reason.**
+///   `prepare_stacked` needs the true inner Hessian to be positive-definite
+///   (`h_inner.cholesky()?`), which holds at the EBE and routinely fails elsewhere:
+///   measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10
+///   subjects (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider
+///   serves all 10 and all 10 are analytic at their EBEs.
 ///
-/// Probed at the prior mode (`η = 0`, `κ = 0`) and the initial estimates, like the inner
-/// warning.
-pub(crate) fn outer_fd_fallback_warning(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-) -> Option<String> {
-    let iov = crate::sens::provider::iov_sens_supported(model);
-    let n_total = population.subjects.len();
-    let mut n_fd = 0usize;
-    let mut first_id: Option<String> = None;
-    for subject in &population.subjects {
-        let served = if iov {
-            let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
-            let stacked = vec![0.0; model.n_eta + k * model.n_kappa];
-            crate::sens::provider::subject_sensitivities_iov(
-                model,
-                subject,
-                &init_params.theta,
-                &stacked,
-            )
-            .is_some()
-        } else {
-            let zeros = vec![0.0; model.n_eta];
-            crate::sens::provider::subject_sensitivities(model, subject, &init_params.theta, &zeros)
-                .is_some()
-        };
-        if !served {
-            n_fd += 1;
-            if first_id.is_none() {
-                first_id = Some(subject.id.clone());
-            }
+/// Recording instead of probing also removes every gate this diagnostic would otherwise
+/// need, because a decline can only be recorded on an evaluation that actually happened:
+/// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
+/// [`resolve_outer_optimizer`], which `build_info::gradient_method_outer` does not model),
+/// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
+/// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
+/// the end with an empty log and say nothing.
+pub(crate) struct OuterFdDeclineLog {
+    declined: Vec<std::sync::atomic::AtomicBool>,
+}
+
+impl OuterFdDeclineLog {
+    pub(crate) fn new(n_subjects: usize) -> Self {
+        Self {
+            declined: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
         }
     }
-    if n_fd == 0 {
+
+    /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
+    /// Called from the rayon workers, hence `Relaxed` — the log is read once, after
+    /// every gradient evaluation has been joined.
+    fn record(&self, i: usize) {
+        if let Some(flag) = self.declined.get(i) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn declined_indices(&self) -> Vec<usize> {
+        self.declined
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.load(Ordering::Relaxed))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+/// Warning naming the subjects that took the per-subject FD outer gradient during this
+/// fit, from the runtime [`OuterFdDeclineLog`]. `None` when every subject stayed on the
+/// exact analytic gradient — and, by construction, when no analytic outer gradient was
+/// ever evaluated (see the log's docs).
+///
+/// The outer twin of `inner_optimizer::fd_fallback_warning` (#1154). Since #466 the
+/// salvage is per subject, so such a fit is correct and several times slower on those
+/// subjects — and was indistinguishable from a fit that is simply slow: no `W_*` code, no
+/// count, and a `gradient_method_outer` that keeps reporting `analytic (Dual2)` because it
+/// reads a **model**-level predicate. Any non-empty log is therefore already a mismatch
+/// with that label: the analytic branch had to have been selected for a decline to be
+/// recordable at all.
+pub(crate) fn outer_fd_fallback_warning(
+    population: &Population,
+    log: &OuterFdDeclineLog,
+) -> Option<String> {
+    let declined = log.declined_indices();
+    if declined.is_empty() {
         return None;
     }
-    let example = first_id
-        .map(|id| format!(" (e.g. subject {id})"))
+    let n_fd = declined.len();
+    let n_total = population.subjects.len();
+    let example = declined
+        .first()
+        .and_then(|&i| population.subjects.get(i))
+        .map(|s| format!(" (e.g. subject {})", s.id))
         .unwrap_or_default();
     Some(format!(
-        "{n_fd} of {n_total} subjects fall outside the analytic sensitivity provider's \
-         scope{example} and use finite-difference outer gradients, although the model \
-         itself is in scope; their results are correct but slower. The reported outer \
-         gradient method is the model-level route, not the per-subject one."
+        "{n_fd} of {n_total} subjects fell outside the analytic sensitivity provider's \
+         scope during this fit{example} and used finite-difference outer gradients; their \
+         results are correct but slower. The reported outer gradient method is the \
+         model-level route, not the per-subject one."
     ))
 }
 
@@ -4132,6 +4172,7 @@ pub(crate) fn population_gradient_sens_mixed(
     ehs: &[DVector<f64>],
     bounds: &PackedBounds,
     options: &FitOptions,
+    declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     let np = x.len();
     let filled: Vec<Vec<f64>> = population
@@ -4152,15 +4193,18 @@ pub(crate) fn population_gradient_sens_mixed(
                 // Keep the exact analytic gradient for in-scope, finite subjects.
                 Some(g) => g,
                 // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
-                None => subject_reconverged_fd_gradient(
-                    x,
-                    init_params,
-                    model,
-                    subject,
-                    &ehs[i],
-                    bounds,
-                    options,
-                ),
+                None => {
+                    declines.record(i);
+                    subject_reconverged_fd_gradient(
+                        x,
+                        init_params,
+                        model,
+                        subject,
+                        &ehs[i],
+                        bounds,
+                        options,
+                    )
+                }
             }
         })
         .collect();
@@ -4197,6 +4241,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
+    declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     let np = x.len();
     let filled: Vec<Vec<f64>> = population
@@ -4217,15 +4262,18 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                 options.interaction,
             ) {
                 Some(g) => g,
-                None => subject_reconverged_fd_gradient_iov(
-                    x,
-                    init_params,
-                    model,
-                    subject,
-                    &ehs[i],
-                    bounds,
-                    options,
-                ),
+                None => {
+                    declines.record(i);
+                    subject_reconverged_fd_gradient_iov(
+                        x,
+                        init_params,
+                        model,
+                        subject,
+                        &ehs[i],
+                        bounds,
+                        options,
+                    )
+                }
             }
         })
         .collect();
@@ -4370,6 +4418,7 @@ pub(super) fn population_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
     grad_eval_idx: &mut usize,
+    declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     population_gradient_with_agq_evaluation(
         x,
@@ -4384,6 +4433,7 @@ pub(super) fn population_gradient(
         options,
         grad_eval_idx,
         None,
+        declines,
     )
 }
 
@@ -4401,6 +4451,7 @@ fn population_gradient_with_agq_evaluation(
     options: &FitOptions,
     grad_eval_idx: &mut usize,
     agq_evaluation: Option<crate::estimation::agq::PopulationEvaluation>,
+    declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
     let reconverge = reconverge_this_eval(options, *grad_eval_idx);
     *grad_eval_idx += 1;
@@ -4492,6 +4543,7 @@ fn population_gradient_with_agq_evaluation(
                 kappas,
                 bounds,
                 options,
+                declines,
             ))
         } else {
             // Non-IOV: assemble per subject — exact analytic for in-scope
@@ -4508,6 +4560,7 @@ fn population_gradient_with_agq_evaluation(
                 ehs,
                 bounds,
                 options,
+                declines,
             ))
         };
         if let Some(g) = g {

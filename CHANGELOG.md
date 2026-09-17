@@ -27,9 +27,11 @@ section of the SDLC for the versioning policy).
   finite-difference outer gradient, which is correct but several times slower on that subject.
   Nothing said so: there was no warning, no count, and `gradient_method_outer` kept reporting
   `analytic (Dual2)` because it reads a model-level predicate. The fit now warns with the count
-  and an example subject ID whenever at least one subject declines while the model-level report
-  says analytic — including when *every* subject declines, which is the case that label gets most
-  wrong. `gradient_method_outer` is documented as the model-level route it has always been (#1154).
+  and an example subject ID, recorded from the gradient evaluations that actually ran — so a
+  derivative-free, Gauss-Newton or evaluation-only fit, which computes no outer gradient at all,
+  stays silent, while an in-scope model whose every subject declines (the case that label gets
+  most wrong) does not. `gradient_method_outer` is documented as the model-level route it has
+  always been (#1154).
 
 - **`predict()` and `simulate()` now report the warnings they used to drop.** Every model/data
   finding ferx computes reached exactly two entry points (`fit()` and `ferx check`), and every

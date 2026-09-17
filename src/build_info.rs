@@ -93,15 +93,24 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// (A per-fit `reconverge_gradient_interval` override can still force FD; this
 /// reports the default in-scope route.)
 ///
-/// **This is the model-level route, not the per-subject one.** The scope predicates it
-/// reads take only `&CompiledModel`, so they answer "may this model use the analytic outer
-/// gradient", not "did it". A subject whose *data shape* falls out of the provider's scope
-/// at runtime is salvaged onto a per-subject reconverged-FD gradient
-/// (`population_gradient_sens_mixed` / `_iov_mixed`), and this keeps reporting `Analytic`
-/// — correctly, for the model. The per-subject truth is reconciled by
-/// `estimation::outer_optimizer::outer_fd_fallback_warning`,
-/// which counts the declining subjects and warns *because* this predicate reports analytic
-/// (#1154) — the same division of labour [`gradient_method_inner`] has with
+/// **This is the model-level route, not the per-subject one, and it does not model every
+/// optimizer-resolution rule.** The scope predicates it reads take only `&CompiledModel`,
+/// so they answer "may this model use the analytic outer gradient", not "did it":
+///
+/// - A subject the provider declines at runtime is salvaged onto a per-subject
+///   reconverged-FD gradient (`population_gradient_sens_mixed` / `_iov_mixed`) while this
+///   keeps reporting `Analytic` — correctly, for the model.
+/// - The `optimizer` argument is resolved through [`Optimizer::resolve_auto`], which has no
+///   `[mixture]` branch. `estimation::outer_optimizer::resolve_outer_optimizer` downgrades
+///   `Auto` to derivative-free BOBYQA for a mixture model, so a mixture fit left on `auto`
+///   is reported `Analytic` here and runs no outer gradient at all.
+/// - A `reconverge_gradient_interval` override forces the reconverged-FD gradient without
+///   changing this report, as the paragraph above already notes.
+///
+/// So this label must not be used as a gate for "did the analytic outer gradient run".
+/// `estimation::outer_optimizer::outer_fd_fallback_warning` answers that from a runtime log
+/// of the evaluations that actually happened, and reconciles the per-subject truth against
+/// this label (#1154) — the same division of labour [`gradient_method_inner`] has with
 /// `inner_optimizer::fd_fallback_warning`.
 pub fn gradient_method_outer(
     _build: &BuildInfo,

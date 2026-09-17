@@ -73,18 +73,18 @@ This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and
 
 The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
 
-The two can disagree. A subject whose *data shape* falls outside the provider's scope — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event — is salvaged individually onto a reconverged finite-difference gradient, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. The results are correct; the fit is just slower on those subjects. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+The two can disagree. A subject the provider declines — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event, two modeled infusion windows that happen to coincide at the current estimates — is salvaged individually onto a reconverged finite-difference gradient, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. The results are correct; the fit is just slower on those subjects. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
 
 ```
-1 of 32 subjects fall outside the analytic sensitivity provider's scope (e.g. subject 7)
-and use finite-difference outer gradients, although the model itself is in scope; their
-results are correct but slower. The reported outer gradient method is the model-level
-route, not the per-subject one.
+1 of 32 subjects fell outside the analytic sensitivity provider's scope during this fit
+(e.g. subject 7) and used finite-difference outer gradients; their results are correct
+but slower. The reported outer gradient method is the model-level route, not the
+per-subject one.
 ```
 
-The warning fires whenever at least one subject declines **and** the model-level report says analytic — including when *every* subject declines, which is the case the label gets most wrong. A model that already reports finite differences has nothing to reconcile and stays silent.
+The count is **recorded as the fit runs**, from the gradient evaluations that actually happened — not predicted by probing the provider at some chosen parameter point. That distinction is load-bearing, because a decline is not purely a property of the subject's records: the separability check on modeled infusion windows reads the *resolved* durations and lag times, so a subject can decline at `η = 0` and be served at its EBE. A probe would announce a fallback that never occurred.
 
-It counts declines by the sensitivity provider, which are a property of the subject's records. It does not count the outer *assembly* declining at a point away from the EBE — that is a property of where the objective is evaluated, not of the subject, and it resolves itself at the mode the optimizer actually uses.
+Recording also means the warning is self-gating. A derivative-free BOBYQA fit (including a `[mixture]` model left on `optimizer = auto`, which resolves to BOBYQA), a Gauss-Newton or trust-region fit, a `reconverge_gradient_interval = 1` fit that forces the reconverged gradient on every evaluation, and an `outer_maxiter = 0` evaluation-only run never select the analytic branch, so they have nothing to record and say nothing. Conversely, any recorded decline is by construction a mismatch with the model-level label — including when *every* subject declines, which is the case that label gets most wrong.
 
 ### Analytic scope: models and readouts {#analytic-scope-models-and-readouts}
 
