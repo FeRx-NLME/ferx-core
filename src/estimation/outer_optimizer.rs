@@ -2048,7 +2048,7 @@ fn optimize_nlopt(
     // the held-cap retry is the result being reported.
     let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
         let (result, outcome) =
-            optimize_nlopt_once(model, population, init, options, hold_cap_at_init);
+            optimize_nlopt_once(model, population, init, options, hold_cap_at_init, None);
         ((result, outcome.mid_descent_stall), outcome.left_init)
     };
     let (first, mid_descent_stall) = resolve_stall_retry(
@@ -2063,8 +2063,25 @@ fn optimize_nlopt(
         crate::cancel::is_cancelled(&options.cancel),
         (first, mid_descent_stall),
         |stalled| {
-            let (mut restarted, _) =
-                optimize_nlopt_once(model, population, &stalled.params, options, false);
+            // `escape_from = init_params`, not the point this leg starts at. The
+            // restart begins at the stalled estimates, so measuring the published
+            // escape verdict against *its own* start would report a fit that
+            // recovered thousands of OFV units as having never moved whenever the
+            // restart's own step is small — and `model_selection::stalled_at_init`
+            // prefers that flag over its `theta_init` comparison, so the recovered
+            // fit would carry `W_STALLED_AT_INIT` and be thrown out by the default
+            // `Strictness::reject_init_stall`. The question the published flag
+            // answers is "are the reported estimates still on top of the values the
+            // user supplied", and that reference does not move when the optimizer
+            // is restarted (#1277 review).
+            let (mut restarted, _) = optimize_nlopt_once(
+                model,
+                population,
+                &stalled.params,
+                options,
+                false,
+                Some(init_params),
+            );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
             // so the two legs add up.
@@ -2123,7 +2140,16 @@ fn resolve_mid_descent_restart<T>(
         return first;
     }
     let second = restart(&first);
-    if !(ofv_of(&second) < ofv_of(&first)) {
+    // `ofv_is_valid` before the comparison, not `<` alone. A strict `<` rejects
+    // `NaN` and `+inf` for free but **adopts `−inf`**, and a restart can return a
+    // non-finite objective the same way any run can — `gate_converged_on_objective`
+    // exists precisely because the final cold solve can hand back a `NaN` after a
+    // trace that looked fine. Demoting that run's `converged` does not stop it
+    // being ranked here, so without this guard a `−inf` successor would replace a
+    // finite incumbent and take its usable estimates and diagnostics with it
+    // (#1277 review).
+    let second_ofv = ofv_of(&second);
+    if !ofv_is_valid(second_ofv) || !(second_ofv < ofv_of(&first)) {
         return first;
     }
     if verbose {
@@ -2161,7 +2187,13 @@ fn resolve_stall_retry<T>(
         return first;
     }
     let (retry, retry_left_init) = retry();
-    if !retry_left_init || !(ofv_of(&retry) < ofv_of(&first)) {
+    // `ofv_is_valid` for the same reason as in [`resolve_mid_descent_restart`]:
+    // `<` alone adopts a `−inf` retry over a finite first attempt. Latent here
+    // rather than reported — this retry only runs on a fit that never left its
+    // start — but the two resolvers share one adoption rule and having only one
+    // of them screen the successor is how they drift (#1277 review).
+    let retry_ofv = ofv_of(&retry);
+    if !retry_left_init || !ofv_is_valid(retry_ofv) || !(retry_ofv < ofv_of(&first)) {
         return first;
     }
     if verbose {
@@ -2180,12 +2212,25 @@ fn resolve_stall_retry<T>(
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
 /// attempt on. `hold_cap_at_init` is the retry mode — see
 /// [`should_cap_gradient`].
+///
+/// `escape_from` separates **where this attempt starts** from **what its
+/// published escape verdict is measured against**, which are the same thing for
+/// every attempt but the #1277 restart. `None` means "this attempt's own start",
+/// the ordinary case. `Some(origin)` reports [`OuterResult::left_init`] relative
+/// to `origin` instead — the restart begins at a stalled fit's estimates, but the
+/// flag that reaches `model_selection::stalled_at_init` has to answer "are the
+/// reported estimates still on top of the values the *user* supplied". The two
+/// internal consumers of displacement keep this attempt's own start either way:
+/// the L-BFGS overshoot cap ("has the fit moved yet?") and
+/// [`failure_is_converged_plateau`] ("did it descend, or twitch and die?") are
+/// both questions about this leg, not about the pair.
 fn optimize_nlopt_once(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
     hold_cap_at_init: bool,
+    escape_from: Option<&ModelParameters>,
 ) -> (OuterResult, AttemptOutcome) {
     let PackedStart {
         packed: mut x0,
@@ -2287,6 +2332,22 @@ fn optimize_nlopt_once(
     // so the "how far has the fit moved from init?" tests below — the L-BFGS
     // overshoot cap and the plateau verdict — need their own copy.
     let x0_start_s: Vec<f64> = x0.clone();
+    // The reference for the *published* escape verdict — see `escape_from`. Packed
+    // and scaled through the same `bounds`/`scale` as `x0_start_s` so the two are
+    // compared in one consistent space; `scale` is derived from this attempt's own
+    // start, which is fine because `max_scaled_deviation` only needs both points in
+    // the same metric, not a canonical one.
+    let escape_start_s: Vec<f64> = match escape_from {
+        None => x0_start_s.clone(),
+        Some(origin) => {
+            let mut v = pack_params(origin);
+            clamp_to_bounds(&mut v, &bounds);
+            for i in 0..n {
+                v[i] /= scale[i];
+            }
+            v
+        }
+    };
 
     // Optional gradient-free global pre-search (NLopt CRS2-LM). Samples
     // within the parameter bounds and lets the local optimizer pick up
@@ -3003,6 +3064,14 @@ fn optimize_nlopt_once(
     // and the covariance step are built from. Feeds both the plateau verdict
     // below and the stall retry in `optimize_nlopt`.
     let left_init = max_scaled_deviation(&x0, &x0_start_s) >= INIT_ESCAPE_STEP_S;
+    // The verdict that leaves this function on `OuterResult`, measured against
+    // `escape_from` when the caller supplied one. Identical to `left_init` on every
+    // path but the #1277 restart, whose own start is a previous attempt's estimates
+    // rather than the user's initial values.
+    let published_left_init = match escape_from {
+        None => left_init,
+        Some(_) => max_scaled_deviation(&x0, &escape_start_s) >= INIT_ESCAPE_STEP_S,
+    };
 
     // The restored point in the scaled space the objective closure worked in, kept for
     // the #833 candidate check below: the incumbent EBE state may be scored only if it
@@ -3326,7 +3395,7 @@ fn optimize_nlopt_once(
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
-        left_init: Some(left_init),
+        left_init: Some(published_left_init),
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
     };
