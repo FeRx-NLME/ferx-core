@@ -2955,6 +2955,45 @@ mod tests {
         );
     }
 
+    /// Regression: the `<=` in [`omega_variance_at_or_below_rail`] weakened to
+    /// `<`, which is the whole of the #1229 gate's semantics — a start sitting
+    /// *exactly* on the rail is clamped there and cannot be estimated from, so
+    /// equality has to count as "at or below".
+    ///
+    /// It also gives the predicate a test in its **own** crate. It is public API
+    /// whose only consumer is `ferx-tools`, and a `ferx-core` item covered only
+    /// by another crate's suite is one the core coverage run never executes
+    /// (which is how it first landed with 88% patch coverage).
+    ///
+    /// The boundary row is the discriminating one: `rail_variance_at(lower)` is
+    /// exactly the largest variance the gate refuses, so `<` and `<=` disagree
+    /// on it and on nothing else.
+    #[test]
+    fn omega_variance_at_or_below_rail_includes_the_rail_itself() {
+        let rail = rail_variance_at(OMEGA_CHOL_PACKED_LOWER);
+
+        // Exactly on the rail — the `<` vs `<=` discriminator.
+        assert!(
+            omega_variance_at_or_below_rail(rail),
+            "a variance of exactly {rail:e} lands on the rail and must be refused"
+        );
+        // Below it.
+        assert!(omega_variance_at_or_below_rail(rail * 0.5));
+        assert!(omega_variance_at_or_below_rail(0.0));
+        // Above it — including the next representable f64, so the boundary is
+        // pinned from both sides rather than by a comfortable margin.
+        assert!(!omega_variance_at_or_below_rail(f64::from_bits(
+            rail.to_bits() + 1
+        )));
+        assert!(!omega_variance_at_or_below_rail(0.09));
+
+        // The consumer's contract, without depending on `ferx-tools`: its
+        // seeding threshold (`MIN_CHOLESKY_VARIANCE = 8e-6`) must be startable.
+        // `seed_tests::min_cholesky_variance_still_clears_the_engine_rail`
+        // asserts the same thing from the other side, against the real constant.
+        assert!(!omega_variance_at_or_below_rail(8e-6));
+    }
+
     #[test]
     fn test_compute_bounds_dimensions() {
         let template = make_template();
