@@ -2684,9 +2684,24 @@ fn absent_cmt_column_warns_once_with_dose_and_obs_counts() {
     );
     // The remedy has to be actionable: both spellings of the fix, and the way to
     // silence it deliberately.
-    assert!(w.contains("states = [...]"), "{w}");
+    assert!(w.contains("ordered like the model's compartments"), "{w}");
     assert!(w.contains("CMT = <header>"), "{w}");
     assert!(w.contains("CMT=1"), "{w}");
+    // The reader is model-blind, so one message reaches every model class this
+    // warning is shown to — and after review round 3 that includes analytical `pk`
+    // models. It must therefore not name anything only an `[odes]` model has. The
+    // earlier text said "ordered like the model's `states = [...]`" and blamed a
+    // NONMEM `DEFDOSE` that is not the first state; measured on
+    // `examples/schnider.ferx` (a `pk three_cpt_iv`, no `[odes]` block anywhere) that
+    // advice named a block the model does not have, and the DEFDOSE rationale is
+    // false there — ADVAN11's DEFDOSE *is* compartment 1.
+    for odes_only in ["states = [...]", "DEFDOSE"] {
+        assert!(
+            !w.contains(odes_only),
+            "the message reaches analytical models too, so it must not name \
+             `{odes_only}`: {w}"
+        );
+    }
     // The decoy column is not a CMT column: its `2` must not have been read.
     assert_eq!(pop.subjects[0].doses[0].cmt_1based(), 1);
 }
@@ -2980,9 +2995,18 @@ fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
         w.contains("p\u{fffd}q"),
         "it is replaced in place rather than dropped, so the cell stays recognisable: {w}"
     );
-    // The whole warning is one line. Asserted directly, because that is the
-    // property the escaping exists for and it holds however the escape is spelled.
-    assert_eq!(w.lines().count(), 1, "the warning must be one line: {w:?}");
+    // The property the escaping exists for: no character that breaks a line survives
+    // into the message. Asserted over the character set rather than via
+    // `w.lines().count()`, which cannot observe this fix at all — `str::lines` splits
+    // on `\n` only, so a raw U+2028 leaves the count at 1 and that assertion is green
+    // with or without the arm it was written to guard (review round 3).
+    for bad in ['\n', '\r', '\u{2028}', '\u{2029}', '\u{85}'] {
+        assert!(
+            !w.contains(bad),
+            "a line-breaking character U+{:04X} reached the warning: {w:?}",
+            bad as u32
+        );
+    }
 }
 
 #[test]

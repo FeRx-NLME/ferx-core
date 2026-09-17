@@ -271,13 +271,8 @@ fn csv_without_cmt() -> String {
 /// `validate_model_file` first rather than by catching a panic, so the reason is a
 /// diagnostic code rather than an unwind.
 fn try_preds(src: &str, dose_cmt: usize) -> Option<Vec<f64>> {
-    let m = temp(src, ".ferx");
+    reject_codes(src, dose_cmt).ok()?;
     let csv = csv_with_cmt(dose_cmt);
-    let d = temp(&csv, ".csv");
-    let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
-    if !report.valid {
-        return None;
-    }
     let model: CompiledModel = parse_full_model(src).expect("model parses").model;
     Some(
         predict(&model, &pop_of(&csv), &model.default_params)
@@ -285,6 +280,27 @@ fn try_preds(src: &str, dose_cmt: usize) -> Option<Vec<f64>> {
             .map(|p| p.pred)
             .collect(),
     )
+}
+
+/// `Ok(())` when the model accepts a dose into `dose_cmt`, `Err(codes)` with the
+/// error codes that rejected it otherwise.
+///
+/// Returning the codes rather than a bare bool is what lets the degenerate test
+/// assert *why* a compartment was refused. Checking only `report.valid` let a wrong
+/// claim about which code fires sit in a comment unchallenged.
+fn reject_codes(src: &str, dose_cmt: usize) -> Result<(), Vec<String>> {
+    let m = temp(src, ".ferx");
+    let d = temp(&csv_with_cmt(dose_cmt), ".csv");
+    let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
+    if report.valid {
+        return Ok(());
+    }
+    Err(report
+        .diagnostics
+        .iter()
+        .filter(|x| x.code.starts_with('E'))
+        .map(|x| x.code.clone())
+        .collect())
 }
 
 /// The compartment-1 baseline, which every topology must accept.
@@ -335,6 +351,15 @@ fn the_warning_fires_exactly_where_the_dose_compartment_is_observable() {
     let mut table: Vec<String> = Vec::new();
     for model in ALL {
         let case = case_for(model);
+        // Without this, a row whose probe list is empty reports `observable ==
+        // false` by having asked nothing, and agrees with a suppressed predicate for
+        // free. Verified by mutation: emptying `OneCptIv`'s list left both tests in
+        // this file green.
+        assert!(
+            !case.probe_cmts.is_empty(),
+            "{model:?}: probe list is empty, so `observable` would be false by \
+             default rather than by measurement"
+        );
         let base = base_preds(&case.src, model);
 
         // Measured, not declared: is *any* reachable compartment distinguishable
@@ -404,9 +429,14 @@ fn the_warning_fires_exactly_where_the_dose_compartment_is_observable() {
 /// "close". Either outcome means no dataset can lose the compartment silently,
 /// which is what earns these models their suppression.
 ///
-/// **Which arm is live, measured:** today all four reject every probe
-/// (`E_DOSE_CMT_OUT_OF_RANGE`), so the bit-identity comparison is a *guard* rather
-/// than an exercised path — worth knowing before trusting it. It exists because
+/// **Which arm is live, measured:** today all four reject every probe, so the
+/// bit-identity comparison is a *guard* rather than an exercised path — worth
+/// knowing before trusting it. The rejecting codes are `E_TRANSIT_UNSUPPORTED` and
+/// `E_IG_UNSUPPORTED`, asserted below rather than described: an earlier version of
+/// this comment claimed `E_DOSE_CMT_OUT_OF_RANGE`, which is what `one_cpt_iv` gives
+/// and is not one of these four models at all — `check_dose_compartments` bounds on
+/// `n_states`, and transit/IG have 2 or 3 of those, so the range rule cannot be what
+/// rejects them. It exists because
 /// "rejected" and "accepted but ignored" are the two ways to be safe here and only
 /// one of them is currently taken: if a change ever made a transit dose accepted,
 /// this reddens on an exact comparison rather than waiting for the difference to
@@ -430,7 +460,23 @@ fn a_topology_with_no_dose_channels_either_rejects_cmt_or_ignores_it_bit_for_bit
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         for &k in &case.probe_cmts {
             match try_preds(&case.src, k) {
-                None => outcomes.push(format!("{model:?} CMT={k}: rejected")),
+                None => {
+                    // Assert *why*, not just that. A comment here previously named
+                    // `E_DOSE_CMT_OUT_OF_RANGE`, which is what `one_cpt_iv` gives and
+                    // is not one of these models: `check_dose_compartments` bounds on
+                    // `n_states`, and transit/IG carry 2 or 3 of those, so the range
+                    // rule cannot be what refuses them. Only reading `report.valid`
+                    // let that wrong claim stand.
+                    let codes = reject_codes(&case.src, k).expect_err("just rejected");
+                    assert!(
+                        codes
+                            .iter()
+                            .any(|c| c == "E_TRANSIT_UNSUPPORTED" || c == "E_IG_UNSUPPORTED"),
+                        "{model:?} CMT={k}: refused, but not by the absorption-model rule \
+                         this test is about — got {codes:?}"
+                    );
+                    outcomes.push(format!("{model:?} CMT={k}: rejected by {codes:?}"));
+                }
                 Some(alt) => {
                     assert_eq!(
                         bits(&alt),

@@ -240,20 +240,34 @@ fn cmt_defaulted_is_reported_on_a_one_state_ode_model_with_per_cmt_error_models(
 }
 
 #[test]
-fn an_empty_per_cmt_error_map_is_not_treated_as_cmt_dispatch() {
-    // The deliberate decision behind the `!m.is_empty()` gate, asserted rather than
-    // left to the doc comment. `ErrorSpec::PerCmt({})` is what the parser hands
-    // every model with no `[error_model]` block — TTE-only, binary, categorical
-    // ("An empty PerCmt arises for TTE-only models", `model_parser.rs`) — and it
-    // dispatches nothing. Matching it would report every declared endpoint model,
-    // which is the case this predicate leaves to `E_ENDPOINT_NO_RECORDS`: a
-    // CMT-less dataset leaves such a model with no rows at all, and that error
-    // names the missing column rather than guessing at a compartment.
+fn an_empty_per_cmt_error_map_still_reports_because_endpoints_route_by_cmt() {
+    // A `!m.is_empty()` gate here was tried in review round 3 and **reverted**, and
+    // this test is the record of why. `ErrorSpec::PerCmt({})` is what the parser
+    // hands every model with no `[error_model]` block — TTE-only, binary,
+    // categorical — and it dispatches no *error model*. But such a model routes its
+    // rows to endpoints **by CMT**, so a compartment the reader invented still picks
+    // the endpoint.
+    //
+    // The gate's justification was that `E_ENDPOINT_NO_RECORDS` already names the
+    // missing column. That covers only the *absent-column* cause; `W_CMT_DEFAULTED`
+    // also fires for a missing or unparseable **cell**, where every endpoint keeps
+    // rows and that error's `routed.get(&cmt) == 0` condition cannot fire. Measured
+    // on the competing-risks example with endpoints at `cmt = 1` / `cmt = 2` and one
+    // event row spelled `x` instead of `2`: the event silently moves from `cause_b`
+    // to `cause_a`, OFV 27.8497 against 28.3610, and under the gate `ferx check`
+    // said `0 warning(s)` on both spellings.
+    //
+    // So the empty map reports, duplicating `E_ENDPOINT_NO_RECORDS` on the
+    // absent-column case. Duplication is cheaper than silence.
     let mut m = analytical(PkModel::OneCptIv);
-    m.error_spec = crate::types::ErrorSpec::PerCmt(std::collections::HashMap::new());
     assert!(
         reader_warning_suppressed(&m, MSG),
-        "an empty per-CMT map is the no-[error_model] shape, not a dispatcher"
+        "control: a 1-cpt IV model with a single error model is suppressed"
+    );
+    m.error_spec = crate::types::ErrorSpec::PerCmt(std::collections::HashMap::new());
+    assert!(
+        !reader_warning_suppressed(&m, MSG),
+        "an endpoint model routes rows by CMT, so a defaulted CMT picks the endpoint"
     );
 }
 

@@ -1115,12 +1115,14 @@ fn read_nonmem_csv_impl(
         };
         population_warnings.push(format!(
             "W_CMT_DEFAULTED: {cause}, so {n_dose} dose row(s){expanded} and {n_obs} observation \
-             row(s) were assigned compartment 1. On a model that addresses more than one state this is \
-             a guess rather than a default — a translated model whose NONMEM DEFDOSE is not the \
-             first state gets its drug in the wrong place, with no error. Give the dataset a \
-             1-based CMT column ordered like the model's `states = [...]`, or map an existing \
-             header onto it with `CMT = <header>` in the [data] block. Writing CMT=1 explicitly \
-             on every row silences this."
+             row(s) were assigned compartment 1. Wherever CMT selects something this is a guess \
+             rather than a default, and a wrong guess changes the numbers with no error: which \
+             compartment a dose lands in (an `[odes]` model with several states, or a `pk` model \
+             whose CMT=2 is a real target — an oral model's central bolus, a multi-compartment \
+             model's peripheral), and which readout, scale or error model an observation uses. \
+             Give the dataset a 1-based CMT column ordered like the model's compartments, or map \
+             an existing header onto it with `CMT = <header>` in the [data] block. Writing CMT=1 \
+             explicitly on every row silences this."
         ));
     }
 

@@ -785,13 +785,22 @@ fn addressable_dose_compartments(model: &CompiledModel) -> usize {
 /// `y[CMT=1] = central/V` and `y[CMT=2] = central/V*1000`, OFV **10028.0940** with the
 /// column and **0.0357** without, no warning either way.
 ///
-/// `ErrorSpec::PerCmt` is gated on a **non-empty** map. An empty one is what the
+/// `ErrorSpec::PerCmt` matches **any** map, empty included. An empty one is what the
 /// parser hands every model with no `[error_model]` block — TTE-only, binary,
 /// categorical (`model_parser.rs`: "An empty PerCmt arises for TTE-only models") —
-/// and it dispatches nothing. Matching it would report every declared endpoint
-/// model, which is the case this predicate deliberately leaves to
-/// `E_ENDPOINT_NO_RECORDS`: a `CMT`-less dataset leaves such a model with no rows at
-/// all, and that error names the missing column.
+/// so this reports every declared endpoint model, and on an absent `CMT` column that
+/// duplicates `E_ENDPOINT_NO_RECORDS`.
+///
+/// That duplication is deliberate, and a `!m.is_empty()` gate to remove it was tried
+/// and **reverted**: it reasoned about the absent-column cause only, while
+/// `W_CMT_DEFAULTED` also fires for a *missing* or *unparseable* cell. In those cases
+/// every endpoint keeps rows, so `E_ENDPOINT_NO_RECORDS`'s `routed.get(&cmt) == 0`
+/// condition cannot fire, and the defaulted row is silently re-routed between
+/// endpoints instead. Measured on the competing-risks example with its endpoints at
+/// `cmt = 1` / `cmt = 2` and one event row's cell spelled `x` rather than `2`: the
+/// event moves from `cause_b` to `cause_a`, OFV 27.8497 against 28.3610, and with the
+/// gate in place `ferx check` reported `0 warning(s)` on both. Duplicating a
+/// diagnostic is cheaper than silencing one.
 ///
 /// `ErrorSpec::Selected` is correctly absent: it resolves its branch from the
 /// covariate selector (`ErrorSpec::obs_keys` builds a synthetic index), never from
@@ -800,7 +809,7 @@ fn observation_is_cmt_dispatched(model: &CompiledModel) -> bool {
     if matches!(model.scaling, ScalingSpec::PerCmt(_)) {
         return true;
     }
-    if matches!(model.error_spec, ErrorSpec::PerCmt(ref m) if !m.is_empty()) {
+    if matches!(model.error_spec, ErrorSpec::PerCmt(_)) {
         return true;
     }
     let per_cmt = |r: &crate::ode::OdeReadout| matches!(r, crate::ode::OdeReadout::PerCmt(_));
