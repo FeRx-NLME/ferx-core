@@ -64,7 +64,7 @@
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
 //! | `W_ADDL_MISSING_II`       | ADDL > 0 on a dose row but II is zero or missing; additional doses not expanded |
 //! | `W_MISSING_DV`            | EVID=0 observation row with a missing DV and no MDV=1; skipped rather than scored as DV=0 |
-//! | `W_CMT_DEFAULTED`         | dose / observation rows assigned compartment 1 because the dataset has no `CMT` column, or the cell is missing or unparseable; reported when `CMT` addresses something — a multi-state `[odes]` model, or a per-CMT scaling / error model / readout on either engine |
+//! | `W_CMT_DEFAULTED`         | dose / observation rows assigned compartment 1 because the dataset has no `CMT` column, or the cell is missing or unparseable; reported when `CMT` selects something — more than one compartment a dose can reach (multi-state `[odes]`, or an analytical model whose `CMT=2` is a real target), or a per-CMT scaling / error model / readout on either engine |
 //! | `E_COVSTAT_UNRESOLVED`    | a `[covariate_model]` relation still needs data-derived statistics (`center = median`, `levels = auto`, or a form whose default bounds come from the data) |
 //! | `W_COVSTAT_UNBOUND`       | the same, reported without a `--data` file — the model is fine, it just cannot be built until a dataset is supplied |
 
