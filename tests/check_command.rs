@@ -1701,16 +1701,24 @@ ID,TIME,DV,EVID,AMT,COMPT,MDV
 
 #[test]
 fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
-    // T2b, control. An analytical `pk` model resolves compartment 1 to its own
-    // default channel, and that numbering is ferx's own — a CMT-less dataset
-    // doses exactly what a fixed-DEFDOSE ADVAN doses. Warning here would fire on
-    // three of the four in-tree CMT-less PK fixtures for nothing.
+    // T2b, control. `one_cpt_iv` is the analytical topology with exactly **one**
+    // compartment a dose can reach (`channels: [Some(Central)]`), so a CMT-less
+    // dataset takes the only route there is and there is nothing to report.
+    //
+    // This control used to be `one_cpt_oral`, on the argument that ferx's analytic
+    // numbering equals NONMEM's ADVAN numbering so a CMT-less dataset doses what a
+    // fixed-DEFDOSE ADVAN doses. That is true and it is not the question: an oral
+    // model's `CMT=2` is the depot-bypassing central bolus (#350), anchored against
+    // ADVAN2 in `tests/nonmem_dose_compartment_anchor.rs`, where computing it as a
+    // depot dose gives 1.19324 instead of 1.8097. A dataset that meant that and lost
+    // its column gets the wrong compartment silently, so `one_cpt_oral` now belongs
+    // on the *reported* side — see the test below.
     let model = temp_model(
         "cmt_defaulted_analytical",
         "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
-         theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
-         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n\n\
-         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
          [error_model]\n  DV ~ proportional(PROP_ERR)\n",
     );
     let data = temp_data("cmt_defaulted_analytical", NO_CMT_CSV);
@@ -1721,7 +1729,7 @@ fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("W_CMT_DEFAULTED")),
-        "an analytical model has no second compartment to have missed: {:?}",
+        "a 1-cpt IV model has exactly one compartment a dose can reach: {:?}",
         report
             .diagnostics
             .iter()
@@ -1744,6 +1752,69 @@ fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
             .iter()
             .any(|w| w.contains("W_CMT_DEFAULTED")),
         "fit() must suppress it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+/// T2c. The other side of the analytical straddle, and the case the first version
+/// of this predicate got wrong: an **oral** model has two compartments a dose can
+/// reach, so a CMT-less dataset chose one of them.
+///
+/// Asserted next to the `one_cpt_iv` control above and on the *same* dataset, so
+/// the only variable is the topology. Without this pair, "analytical models are
+/// suppressed" and "analytical models are reported" are both satisfied by a
+/// predicate that ignores the topology entirely.
+///
+/// The number that makes it a finding rather than a nag is committed in
+/// `tests/nonmem_dose_compartment_anchor.rs`: NONMEM `ADVAN2` with a `CMT=2` bolus
+/// reads 1.8097 at t = 1 h, while computing that same dose as a depot dose — which
+/// is exactly what dropping the column does — reads 1.19324.
+#[test]
+fn cmt_less_dataset_on_an_analytical_oral_model_is_reported() {
+    let model = temp_model(
+        "cmt_defaulted_analytical_oral",
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let data = temp_data("cmt_defaulted_analytical_oral", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "an oral model's CMT=2 is a central bolus, so compartment 1 was a choice: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Both surfaces, because they are wired separately: `ferx check` filters through
+    // the check-report path and `fit()` through its own warning assembly.
+    let parsed = parse_full_model_file(&model).expect("model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        "fit() must report it too: {:?}",
         result.warnings
     );
 

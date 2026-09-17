@@ -716,57 +716,101 @@ pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) ->
 /// Whether this model reads a row's `CMT` for anything, so that a `CMT` the reader
 /// had to invent could change a number (#1009).
 ///
-/// `CMT` addresses **two** channels, and the first review round of PR #1404 caught
-/// this predicate covering only one of them:
+/// `CMT` addresses exactly two channels — where a **dose** lands, and which readout,
+/// scale or error model an **observation** uses — so this asks one question of each
+/// and ORs them. Both rounds of review on PR #1404 found the same failure mode: a
+/// predicate written as a *list* of the model classes someone had thought of, which
+/// then missed the class on the other engine. So each half is now read off the
+/// engine's own routing table rather than restated from it — see
+/// [`addressable_dose_compartments`] and [`observation_is_cmt_dispatched`], where the
+/// measurements and the deliberate exclusions live.
 ///
-/// - **Which compartment a dose lands in.** Only an `[odes]` model with more than
-///   one state has a choice to get wrong. An analytical `pk` model resolves
-///   compartment 1 to its own default channel (`pk::dose_needs_event_walk`: the
-///   depot on an oral model, the central compartment on an IV one) — ferx's
-///   analytic numbering is ferx's, not `$MODEL`'s, so a `CMT`-less dataset doses
-///   exactly what NONMEM's fixed-`DEFDOSE` ADVANs dose; measured on
-///   `examples/warfarin.ferx`, which is bit-identical with and without the column.
-///
-/// - **Which readout, scale or error model an *observation* uses.** This one is
-///   engine-independent, and it is why the dose test alone is not enough: a
-///   per-CMT `[scaling]` block parses on an analytical model, and
-///   `pk::validate_per_cmt_scaling` only checks that the *observed* CMTs have
-///   entries — so a `CMT`-less dataset keys every row to 1, `{1}` is a subset of
-///   `{1, 2}`, and validation passes. Measured on a `pk one_cpt_iv` with
-///   `obs_scale[CMT=1] = 1000` / `obs_scale[CMT=2] = 1`: the same data spelled with
-///   `CMT=2` gives OFV **0.0357**, with the column dropped **6097015712.1246**, and
-///   before this predicate widened, neither arm warned.
-///
-/// The state test deliberately counts the injected joint-PK-TTE `__chz_*`
+/// The state count deliberately includes the injected joint-PK-TTE `__chz_*`
 /// accumulators along with the PK states. They are not dose targets, but they exist
 /// only when an `[event_model]` does, and an event model routes its rows *by CMT* —
 /// so a dataset with no `CMT` column keys every row to compartment 1 and starves
 /// the endpoint. Counting them cannot produce a false positive for that reason, and
 /// excluding them would produce a false negative.
-///
-/// Declared survival / discrete endpoints are deliberately **not** listed: a
-/// `CMT`-less dataset leaves them with no rows at all, which `E_ENDPOINT_NO_RECORDS`
-/// already reports as an error naming the missing column.
 fn cmt_defaulting_is_ambiguous(model: &CompiledModel) -> bool {
-    // Channel 1: more than one state to dose into.
-    if model.ode_spec.as_ref().is_some_and(|s| s.n_states > 1) {
-        return true;
+    addressable_dose_compartments(model) > 1 || observation_is_cmt_dispatched(model)
+}
+
+/// How many compartments a *dose* row's `CMT` can route to on whichever engine
+/// serves this model.
+///
+/// Read off each engine's own routing table rather than restated, so a model class
+/// added to one of those tables cannot quietly fall outside this predicate:
+/// `OdeSpec::n_states` for an `[odes]` model, and
+/// `PkTopology::addressable_dose_compartments` — the live entries of the very table
+/// `dose_needs_event_walk` dispatches on — for an analytical `pk` model.
+///
+/// The analytical arm is **not** a formality. `ONE_CPT_ORAL` is
+/// `channels: [Some(Depot), Some(Central)]`, so `CMT=2` on an oral model is the
+/// documented depot-bypass central bolus (#350), and `TWO_CPT_IV` routes `CMT=2`
+/// to the peripheral; `pk::dose_needs_event_walk` sends exactly those subjects to
+/// the event-driven walk, which is NONMEM-anchored for `ADVAN2` central and
+/// `ADVAN3`/`ADVAN4` peripheral boluses. A dataset that meant one of those and lost
+/// its `CMT` column silently gets a compartment-1 bolus instead — the same defect
+/// #1009 reports for `[odes]`, on the other engine.
+///
+/// `0` for an algebraic model (no compartments at all) and for the transit /
+/// inverse-Gaussian closed forms (every dose absorbs through the depot; `dose.cmt`
+/// is never read), so neither warns.
+fn addressable_dose_compartments(model: &CompiledModel) -> usize {
+    if let Some(spec) = model.ode_spec.as_ref() {
+        return spec.n_states;
     }
-    // Channel 2: an observation's CMT selects its scale, readout or error model.
+    if model.is_algebraic() {
+        return 0;
+    }
+    model.pk_model.topology().addressable_dose_compartments()
+}
+
+/// Whether an *observation* row's `CMT` selects its scale, readout or error model.
+///
+/// Engine-independent, and the reason the dose test alone is not enough: a per-CMT
+/// `[scaling]` block parses on an analytical model, and `pk::validate_per_cmt_scaling`
+/// only checks that the *observed* CMTs have entries — so a `CMT`-less dataset keys
+/// every row to 1, `{1} ⊆ {1, 2}`, and validation passes. Measured on a
+/// `pk one_cpt_iv` with `obs_scale[CMT=1] = 1000` / `obs_scale[CMT=2] = 1`: the same
+/// data spelled with `CMT=2` gives OFV **0.0357**, with the column dropped
+/// **6097015712.1246**, and before #1404 widened this predicate neither arm warned.
+///
+/// Both readouts are tested because `OdeReadout::PerCmt` is dispatched on
+/// `subject.obs_cmts` from **two** structs — `OdeSpec::readout` for an `[odes]` model
+/// (`ode::predictions::read_observable`, and `sens::ode_provider` for the `Dual2`
+/// twin) and `AnalyticReadout::readout` for an analytical one. The first round of
+/// this predicate covered only the second, which left exactly the one-state `[odes]`
+/// model with `y[CMT=N]` readouts unreported: measured on `d/dt(central)` with
+/// `y[CMT=1] = central/V` and `y[CMT=2] = central/V*1000`, OFV **10028.0940** with the
+/// column and **0.0357** without, no warning either way.
+///
+/// `ErrorSpec::PerCmt` is gated on a **non-empty** map. An empty one is what the
+/// parser hands every model with no `[error_model]` block — TTE-only, binary,
+/// categorical (`model_parser.rs`: "An empty PerCmt arises for TTE-only models") —
+/// and it dispatches nothing. Matching it would report every declared endpoint
+/// model, which is the case this predicate deliberately leaves to
+/// `E_ENDPOINT_NO_RECORDS`: a `CMT`-less dataset leaves such a model with no rows at
+/// all, and that error names the missing column.
+///
+/// `ErrorSpec::Selected` is correctly absent: it resolves its branch from the
+/// covariate selector (`ErrorSpec::obs_keys` builds a synthetic index), never from
+/// `obs_cmts`.
+fn observation_is_cmt_dispatched(model: &CompiledModel) -> bool {
     if matches!(model.scaling, ScalingSpec::PerCmt(_)) {
         return true;
     }
-    if matches!(model.error_spec, ErrorSpec::PerCmt(_)) {
+    if matches!(model.error_spec, ErrorSpec::PerCmt(ref m) if !m.is_empty()) {
         return true;
     }
-    if model
+    let per_cmt = |r: &crate::ode::OdeReadout| matches!(r, crate::ode::OdeReadout::PerCmt(_));
+    if model.ode_spec.as_ref().is_some_and(|s| per_cmt(&s.readout)) {
+        return true;
+    }
+    model
         .analytic_readout
         .as_ref()
-        .is_some_and(|ar| matches!(ar.readout, crate::ode::OdeReadout::PerCmt(_)))
-    {
-        return true;
-    }
-    false
+        .is_some_and(|ar| per_cmt(&ar.readout))
 }
 
 /// The *fatal* model-vs-population checks every `simulate()` entry point owes its
