@@ -2330,7 +2330,7 @@ pub fn parse_full_model_with(
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
     let blocks = &extracted.unnamed;
-    let name = extract_model_name(content);
+    let name = parse_model_name(content)?;
 
     // ── Required blocks ──
     let param_lines = blocks
@@ -13447,12 +13447,79 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
     Ok(())
 }
 
-fn extract_model_name(content: &str) -> String {
-    let re = Regex::new(r"(?m)^\s*model\s+(\w+)").unwrap();
-    re.captures(content)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| "Unnamed".to_string())
+/// The name a model carries when its file declares none. `api::run::set_model_name`
+/// and ferx-r both replace it with the file stem.
+pub(crate) const UNNAMED_MODEL: &str = "Unnamed";
+
+/// The one-line preamble line `model NAME` accepts, in the two spellings `ferx`
+/// settings use: the bare `model NAME` and the `KEY = value` form `model = NAME`.
+const MODEL_NAME_FORMS: &str = "`model NAME` or `model = NAME` (letters, digits and \
+                                 underscores), before the first `[block]` header";
+
+/// `line` with a trailing `#` / `//` comment removed. The block extractor and
+/// the preamble reader share one definition of "comment" so a `model` line and
+/// a `[block]` header cannot disagree on where a line ends.
+fn strip_line_comment(line: &str) -> &str {
+    match line.find('#').into_iter().chain(line.find("//")).min() {
+        Some(idx) => &line[..idx],
+        None => line,
+    }
+}
+
+/// The model's declared name, read from the **preamble** — the lines before the
+/// first `[block]` header — as `model NAME` or `model = NAME`; `UNNAMED_MODEL`
+/// when the preamble has no `model` line.
+///
+/// Both spellings are honoured because the `KEY = value` form is what every
+/// other ferx setting uses, and `model = NAME` used to be dropped in silence:
+/// the old regex needed whitespace after `model`, so the name fell back to the
+/// file stem with no diagnostic, and `ferx check --json` showed the stem for
+/// every spelling alike (#1395). A `model` line whose tail is neither form, or
+/// a second `model` line, is an error naming the accepted forms rather than a
+/// silent fallback — the #1377 rule for `[parameters]`, applied to the one line
+/// that lives outside every block. Only the preamble is read: a `model …` line
+/// inside a block is that block's line and is parsed (or rejected) as such,
+/// where the old scan would have taken the first `model <word>` anywhere in
+/// the file — including, say, an `[individual_parameters]` assignment to a
+/// parameter named `model` — as the name.
+fn parse_model_name(content: &str) -> Result<String, String> {
+    let header_re = Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap();
+    let model_re = Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap();
+    let mut name: Option<String> = None;
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = strip_line_comment(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if header_re.is_match(trimmed) {
+            break;
+        }
+        // The first token is `model`: `model NAME`, `model = NAME`, `model=NAME`,
+        // or a malformed line that still starts with the keyword.
+        let is_model_line = trimmed
+            .strip_prefix("model")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '=']));
+        if !is_model_line {
+            continue;
+        }
+        let Some(caps) = model_re.captures(trimmed) else {
+            return Err(format!(
+                "Malformed model name declaration `{trimmed}` (line {}) — expected \
+                 {MODEL_NAME_FORMS}.",
+                idx + 1
+            ));
+        };
+        if let Some(first) = &name {
+            return Err(format!(
+                "Model name declared twice: `{first}` and `{}` (line {}) — keep one \
+                 `model NAME` line.",
+                &caps[1],
+                idx + 1
+            ));
+        }
+        name = Some(caps[1].to_string());
+    }
+    Ok(name.unwrap_or_else(|| UNNAMED_MODEL.to_string()))
 }
 
 /// Extracted-block state: the original (unnamed) block map plus a second
@@ -13496,11 +13563,7 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     let mut headers: Vec<(String, Option<String>, usize)> = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
-        let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
-            Some(idx) => &line[..idx],
-            None => line,
-        };
-        let trimmed = without_comment.trim();
+        let trimmed = strip_line_comment(line).trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -13526,7 +13589,13 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             continue;
         }
 
-        if trimmed.starts_with("model ") || trimmed == "end" {
+        // `end` is a bare terminator, dropped wherever it appears. The `model NAME`
+        // line is *not* dropped here any more: `parse_model_name` reads it from the
+        // preamble (where `current` is `None` and the line is ignored below anyway),
+        // and inside a block it is that block's line, so the block's own parser
+        // sees it — a stray `model X` in `[parameters]` is rejected there (#1377)
+        // instead of being skipped in silence (#1395).
+        if trimmed == "end" {
             continue;
         }
 

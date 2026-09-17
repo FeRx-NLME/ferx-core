@@ -52,6 +52,26 @@ separate block predates that and has not been read for several releases. A file
 still carrying one is now rejected with `E_DEPRECATED_BLOCK` naming the
 replacement — delete the block.
 
+## Model name
+
+A file may name its model on one line **before the first `[block]` header**, in
+either spelling:
+
+```
+model warfarin_pk
+model = warfarin_pk
+```
+
+The name is what `fit$model_name`, the `-fit.yaml` header, `ferx run`'s
+summary and `ferx check --json`'s `model` field report; a file with no `model`
+line is named after its file stem (`warfarin_pk.ferx` → `warfarin_pk`). Names
+are letters, digits and underscores. A `model` line the parser cannot read
+(`model = two words`), or a second one, is an error naming the accepted forms —
+`model = NAME` used to be dropped in silence, leaving the stem in place with no
+diagnostic. Only the preamble is read: a `model …` line inside a block is that
+block's line and is parsed, or rejected, as such. Other non-comment preamble
+text is ignored.
+
 ## Minimal Example
 
 ```

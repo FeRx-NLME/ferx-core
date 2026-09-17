@@ -876,8 +876,11 @@ pub fn run_from_file(path: &str) -> Result<FitResult, String> {
     run_model_simulate(path).map(|(r, _)| r)
 }
 
-fn set_model_name(model: &mut CompiledModel, path: &str) {
-    if model.name == "Unnamed" {
+/// Give a model that declares no `model NAME` line the file stem as its name.
+/// Shared with `validate_model_file`, so a fit and a check report the same name
+/// for the same file (#1395: the check report used the stem unconditionally).
+pub(crate) fn set_model_name(model: &mut CompiledModel, path: &str) {
+    if model.name == crate::parser::model_parser::UNNAMED_MODEL {
         if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
             model.name = stem.to_string();
         }

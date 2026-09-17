@@ -25153,3 +25153,98 @@ fn covariate_mu_ref_flags_an_eta_a_second_typical_value_reads() {
     assert_eq!(g.len(), 1);
     assert!(g[0].eta_shared, "a conditional second consumer counts");
 }
+
+// ── `model NAME` preamble line (#1395) ─────────────────────────────────────
+
+/// The smallest model that parses, behind an arbitrary preamble.
+fn named_model(preamble: &str) -> String {
+    format!(
+        "{preamble}\n\
+         [parameters]\n  theta TVCL(1.0, 0.1, 10.0)\n  theta TVV(10.0, 1.0, 100.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma ADD ~ 1.0\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ additive(ADD)\n"
+    )
+}
+
+fn parsed_name(preamble: &str) -> String {
+    parse_full_model(&named_model(preamble))
+        .unwrap_or_else(|e| panic!("preamble {preamble:?} must parse: {e}"))
+        .model
+        .name
+}
+
+/// Both spellings name the model; the `KEY = value` one used to be dropped in
+/// silence (the old regex needed whitespace after `model`, so `model = X` fell
+/// back to `Unnamed`). Reverting to `(?m)^\s*model\s+(\w+)` fails the `=` arms.
+#[test]
+fn model_name_is_read_in_both_spellings() {
+    assert_eq!(parsed_name("model warfarin_pk"), "warfarin_pk");
+    assert_eq!(parsed_name("model = warfarin_pk"), "warfarin_pk");
+    assert_eq!(parsed_name("model=warfarin_pk"), "warfarin_pk");
+    assert_eq!(
+        parsed_name("  model =  warfarin_pk   # the name"),
+        "warfarin_pk"
+    );
+    assert_eq!(parsed_name(""), UNNAMED_MODEL);
+    assert_eq!(parsed_name("# model = commented_out"), UNNAMED_MODEL);
+}
+
+/// A `model` line whose tail is neither form is an error naming the accepted
+/// spellings, not a silent fallback to the file stem. A line is a `model` line
+/// when its first word is exactly `model` (`model:`, `modelled` are preamble
+/// prose, ignored like the rest of it).
+#[test]
+fn malformed_model_name_line_is_rejected_with_the_accepted_forms() {
+    for bad in ["model = my model", "model my-model", "model =", "model"] {
+        let err = parse_err(&named_model(bad));
+        assert!(
+            err.contains("Malformed model name declaration")
+                && err.contains("`model NAME` or `model = NAME`")
+                && err.contains("(line 1)"),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_second_model_name_line_is_rejected() {
+    let err = parse_err(&named_model("model first\nmodel = second"));
+    assert!(
+        err.contains("Model name declared twice")
+            && err.contains("`first`")
+            && err.contains("`second`")
+            && err.contains("(line 2)"),
+        "{err}"
+    );
+}
+
+/// Only the preamble names the model. Inside a block the line belongs to that
+/// block: `[parameters]` rejects it as unrecognised text (#1377) where the old
+/// extractor skipped every in-block `model ` line *and* took it as the name.
+/// The straddle (`model X` before the header names, after it rejects) is what
+/// pins "preamble only" — a scan of the whole file would pass the first arm and
+/// fail the second.
+#[test]
+fn a_model_line_inside_a_block_is_that_blocks_line_not_the_name() {
+    assert_eq!(parsed_name("model outside"), "outside");
+    let src = named_model("").replacen("[parameters]\n", "[parameters]\n  model inside\n", 1);
+    let err = parse_err(&src);
+    assert!(
+        err.contains("model inside") && !err.contains("Malformed model name"),
+        "an in-block `model` line must be the block's own rejection, got: {err}"
+    );
+}
+
+/// The preamble's other lines stay ignored — `tests/nonmem/covariate_cat.ferx`
+/// opens with NONMEM-style `;` prose above its first header — and a parameter
+/// that merely starts with the keyword (`modelled`) is not a `model` line.
+#[test]
+fn preamble_prose_and_model_prefixed_words_are_not_model_lines() {
+    assert_eq!(
+        parsed_name("; ferx side of the anchor\n; second line"),
+        UNNAMED_MODEL
+    );
+    assert_eq!(parsed_name("modelled = 3\nmodel real_name"), "real_name");
+}
