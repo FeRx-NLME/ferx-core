@@ -37,9 +37,15 @@ use std::time::Instant;
 
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
-/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
-/// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
-/// `population.warnings` before calling this function.
+/// Thin wrapper over [`predict_diag`] that discards the diagnostics
+/// ([`PredictionOutput::warnings`]). Use the `_diag` form when a model/data finding or an ODE
+/// solver diagnostic must be surfaced — this form returns the same rows with nothing attached,
+/// which is what #1280 / #1304 were filed about. It is kept because the R wrapper and every
+/// existing caller bind this signature.
+///
+/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here **or** by
+/// [`predict_diag`]; callers that obtained `population` via [`crate::read_nonmem_csv`] should
+/// inspect `population.warnings` before calling either.
 ///
 /// Subjects are evaluated in parallel when more than one worker is available.
 /// Calls made inside a [`PoolPlan`] reuse that enclosing pool; standalone calls
@@ -57,6 +63,53 @@ pub fn predict(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<PredictionResult> {
+    predict_diag(model, population, params).results
+}
+
+/// The rows [`predict`] returns, plus the diagnostics it discards.
+///
+/// `warnings` carries the same bundle `ferx check` prints and `fit()` pushes into
+/// [`FitResult::warnings`](crate::types::FitResult::warnings) — the model/data findings
+/// (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …) and, for an `[odes]` model, the
+/// ODE-solver diagnostics of this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a
+/// clean prediction on a well-formed model.
+///
+/// `#[non_exhaustive]` from the start (contrast `OdeSolverStats`, #1302): a structured-entry
+/// field alongside `warnings` is then an additive change rather than a breaking one.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct PredictionOutput {
+    /// One row per (subject, Gaussian observation), in population and observation order.
+    pub results: Vec<PredictionResult>,
+    /// Non-fatal model/data and ODE-solver findings for this pass. See the struct docs for
+    /// what the bundle contains.
+    pub warnings: Vec<String>,
+}
+
+/// [`predict`] with the diagnostics attached (#1280 / #1304) — the predict-side twin of
+/// [`crate::simulate_with_options_diag`].
+///
+/// Before this, every model/data warning ferx computes reached exactly two entry points
+/// (`fit()` and `ferx check`), and every ODE solver diagnostic reached one (`fit()`). A model
+/// `fit()` refuses to stay quiet about — an `SS=1` dose on an `[odes]` right-hand side reading
+/// `TAFD`, say — came back through `predict()` as a column of `NaN` with nothing said, and a
+/// segment that exhausted `ode_max_steps` came back as a column of *identical* finite numbers
+/// (#959), which is worse: it is plottable.
+///
+/// Returns exactly what [`predict`] returns in `results`; the rows are unchanged and no
+/// prediction moves by a ULP. The scope that collects the solver counters is opened per subject
+/// task and only on a model that integrates something, so a closed-form model takes the
+/// identical path it did before.
+///
+/// **Panics, not `Err`s, on a precondition.** The `assert_*` guards below are unchanged by this
+/// function and are the subject of #898, not of this one. Adding an eleventh assert is
+/// explicitly *not* how a warning-severity finding reaches `predict()`; that is what `warnings`
+/// is for.
+pub fn predict_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> PredictionOutput {
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
@@ -110,9 +163,30 @@ pub fn predict(
     );
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    let assemble = |subject_predictions: Vec<Vec<f64>>| {
+    // Whether there is anything for a `SolverStatsScope` to record. Entering a scope
+    // *activates* per-segment recording, so a closed-form model must not open one — it has no
+    // segments, and the tee would be pure overhead on the path that needs it least.
+    let collect_solver_stats = super::integrates_odes(model);
+    // One subject's predictions plus whatever its integrations deposited. The scope is
+    // **per subject task**, not one around the whole pass: it is thread-local, so a single
+    // scope opened on the calling thread would see only the subjects rayon happened to run
+    // there and report clean counters for the rest — the same trap `compute_subject_results`
+    // documents. Declared before the work so it is still open while that work runs, and read
+    // before it drops.
+    let predict_one = |subject: &Subject| -> (Vec<f64>, crate::ode::OdeSolverStats) {
+        let scope = collect_solver_stats.then(crate::ode::solver::SolverStatsScope::enter);
+        let preds = pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
+        let stats = scope.as_ref().map(|s| s.collected()).unwrap_or_default();
+        (preds, stats)
+    };
+    // Merged **in subject order**. The merge is over `usize` counters so the order does not
+    // change the sums; it is fixed anyway, so a future non-additive field cannot become
+    // worker-count dependent without this comment being wrong.
+    let assemble = |per_subject: Vec<(Vec<f64>, crate::ode::OdeSolverStats)>| {
         let mut results = Vec::with_capacity(population.n_obs());
-        for (subject, preds) in population.subjects.iter().zip(subject_predictions) {
+        let mut stats = crate::ode::OdeSolverStats::default();
+        for (subject, (preds, subject_stats)) in population.subjects.iter().zip(per_subject) {
+            stats.merge(&subject_stats);
             results.extend(preds.into_iter().enumerate().map(|(j, pred)| {
                 PredictionResult {
                     id: subject.id.clone(),
@@ -127,43 +201,17 @@ pub fn predict(
                 }
             }));
         }
-        results
+        (results, stats)
     };
-    let predict_subjects = || {
-        assemble(
-            population
-                .subjects
-                .par_iter()
-                .map(|subject| {
-                    pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta)
-                })
-                .collect(),
-        )
-    };
-    let predict_subjects_serial = || {
-        let mut results = Vec::with_capacity(population.n_obs());
-        for subject in &population.subjects {
-            let preds = pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
-            results.extend(preds.into_iter().enumerate().map(|(j, pred)| {
-                PredictionResult {
-                    id: subject.id.clone(),
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
-                    pred,
-                }
-            }));
-        }
-        results
-    };
+    let predict_subjects = || assemble(population.subjects.par_iter().map(predict_one).collect());
+    let predict_subjects_serial =
+        || assemble(population.subjects.iter().map(predict_one).collect());
 
     // A caller already running on a Rayon worker owns the thread budget (for
     // example `PoolPlan` around many predictions), so use that enclosing pool.
     // Standalone calls use ferx's persistent, capped, large-stack pool rather
     // than Rayon's process-global pool or a fresh pool per call.
-    if rayon::current_thread_index().is_some() {
+    let (results, stats) = if rayon::current_thread_index().is_some() {
         if rayon::current_num_threads() == 1 {
             predict_subjects_serial()
         } else {
@@ -176,6 +224,16 @@ pub fn predict(
             None if rayon::current_num_threads() > 1 => predict_subjects(),
             None => predict_subjects_serial(),
         }
+    };
+    PredictionOutput {
+        results,
+        warnings: super::non_fit_diagnostics(
+            model,
+            population,
+            params,
+            &stats,
+            super::SolverStatsPhase::Predict,
+        ),
     }
 }
 

@@ -4399,3 +4399,87 @@ fn from_spec_runs_the_shipped_tdm_example() {
         "every realized dose must respect dose_bounds [250, 2000]"
     );
 }
+
+// ── diagnostics on the adaptive path (#1280 / #1304) ─────────────────────────
+
+/// `[fit_options] ode_max_steps` starved to a handful of steps, so the driver's segments give
+/// up and freeze-pad their tails. Same structural model as `ODE_NO_IIV`.
+const ODE_STARVED_BUDGET: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_method = rk45
+  ode_max_steps = 2
+"#;
+
+/// `simulate_adaptive` opens a `SolverStatsScope`, so its runs carry the ODE-solver
+/// diagnostics (#1304 item 2) and the model/data bundle (#1280).
+///
+/// This is the entry point where a silent solver diagnostic matters most: the controller reads
+/// the simulated state to pick the next dose, so a freeze-padded segment does not merely
+/// mis-plot — it feeds the wrong signal into the next decision and the realized ledger
+/// inherits it. Before this, `ode_predictions_adaptive_impl` and `adaptive_frozen_replay_tv`
+/// recorded into an inactive sink on every path a user could take.
+///
+/// Regression this catches: no scope around the adaptive loop. Mutation — delete the
+/// `solver_stats_scope` binding from `simulate_adaptive` (or make it `None`) and this test
+/// fails while every other adaptive test stays green.
+///
+/// The straddle is the second arm: the identical call on the same model with an ordinary
+/// budget must come back silent, so the assertion is about the starved solve and not about a
+/// message the function always emits.
+#[test]
+fn simulate_adaptive_carries_the_solver_diagnostics_of_its_own_run() {
+    let decisions = vec![0.0, 24.0];
+    let obs = vec![6.0, 30.0, 54.0];
+    let pop = population(vec![subj("1", obs.clone(), vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.clone(),
+        // The frozen-replay verifier compares two freeze-padded trajectories on the starved
+        // model; it is not what is under test here and its outcome is not the assertion.
+        verify: false,
+        ..Default::default()
+    };
+
+    let starved = parse_model_string(ODE_STARVED_BUDGET).expect("parse starved-budget model");
+    let res = simulate_adaptive(
+        &starved,
+        &pop,
+        &starved.default_params,
+        1,
+        fixed_bolus,
+        &opts,
+    )
+    .expect("adaptive sim runs");
+    assert!(
+        res.warnings
+            .iter()
+            .any(|w| w.contains("W_ODE_SOLVER_DIAGNOSTICS")),
+        "a starved adaptive run must name its solver trouble: {:?}",
+        res.warnings
+    );
+
+    let ok = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
+    let clean = simulate_adaptive(&ok, &pop, &ok.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive sim runs");
+    assert!(
+        clean.warnings.is_empty(),
+        "and a clean one must stay silent: {:?}",
+        clean.warnings
+    );
+}

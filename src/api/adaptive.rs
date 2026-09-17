@@ -157,6 +157,16 @@ pub struct AdaptiveSimulationResult {
     /// re-integration). The population summary *with bands* rides with the
     /// uncertainty slice (S5), where bands carry meaning.
     pub metrics: Vec<AdaptiveSubjectMetrics>,
+    /// Non-fatal model/data findings and this run's ODE-solver diagnostics (#1280 / #1304) —
+    /// the same bundle `ferx check` prints, `fit()` reports, and
+    /// [`crate::SimulationOutput::warnings`] carries.
+    ///
+    /// Adaptive dosing is the path where a silent solver diagnostic matters most: the
+    /// controller reads the simulated state to choose the next dose, so a segment that
+    /// freeze-padded its tail does not merely mis-plot — it feeds the wrong signal into the
+    /// next decision, and the realized ledger inherits it. Empty for a clean run on a
+    /// well-formed model.
+    pub warnings: Vec<String>,
 }
 
 /// Simulate state-reactive ("adaptive" / feedback) dosing over a population
@@ -437,6 +447,18 @@ where
     // values are recomputed every iteration (η is redrawn); only the allocation is
     // reused. Unused on the constant path (`event_pk` stays `None`).
     let mut event_pk_buf = crate::pk::EventPkParams::default();
+
+    // ODE-solver diagnostics for this run (#1304). One scope around the whole (serial) loop:
+    // the sink is thread-local and this loop does not fan out, so it sees every integration.
+    // Held as a binding rather than through `with_solver_stats` because the loop body
+    // propagates `?` out of this function — an early return then just drops the scope, which
+    // is right: nothing is reported for a run that failed.
+    //
+    // This is what makes two of #1296's eight `abandoned_non_finite_timeline` recorders —
+    // the reactive driver (`ode_predictions_adaptive_impl`) and its frozen replay
+    // (`adaptive_frozen_replay_tv`) — reachable in production at all. Before it they recorded
+    // into an inactive sink on every path a user could take.
+    let stats_scope = super::solver_stats_scope(model);
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
@@ -737,11 +759,25 @@ where
         }
     }
 
+    // Read while the scope is still alive, then drop it.
+    let stats = stats_scope
+        .as_ref()
+        .map(|s| s.collected())
+        .unwrap_or_default();
+    drop(stats_scope);
+
     Ok(AdaptiveSimulationResult {
         trajectories,
         ledger,
         decisions,
         metrics,
+        warnings: super::non_fit_diagnostics(
+            model,
+            population,
+            params,
+            &stats,
+            super::SolverStatsPhase::SimulateAdaptive,
+        ),
     })
 }
 

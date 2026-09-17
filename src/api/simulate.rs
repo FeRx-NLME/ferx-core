@@ -344,9 +344,15 @@ pub fn simulate_with_options(
 /// simulation input; there is nothing to compute a posthoc eta from).
 ///
 /// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
-/// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
-/// degenerate recurrent stream skipped, #762). [`simulate_with_options`] is the thin
-/// wrapper that returns only the rows.
+/// rows and any non-fatal warnings. [`simulate_with_options`] is the thin wrapper that returns
+/// only the rows.
+///
+/// Three sources feed `warnings`, in this order: per-subject simulation diagnostics (a
+/// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), capped
+/// steady-state equilibrations (#867), and — new in #1280 / #1304 — the model/data warning
+/// bundle plus this pass's ODE-solver diagnostics. The last is the same bundle `ferx check`
+/// prints and `fit()` reports, unfiltered: before it, a model `fit()` refuses to stay quiet
+/// about served the same rows here with nothing attached.
 pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
@@ -449,18 +455,30 @@ pub fn simulate_with_options_diag(
         Some(m) => m,
         None => {
             let mut warnings = Vec::new();
-            let results = simulate_inner_with_draw(
+            // One scope around the whole pass, not one per subject: this loop is serial (the
+            // RNG draw order is part of `simulate`'s contract), so the thread-local scope sees
+            // every subject's integrations. #1304.
+            let (results, stats) = super::with_solver_stats(model, || {
+                simulate_inner_with_draw(
+                    model,
+                    population,
+                    params,
+                    n_sim,
+                    1,
+                    None,
+                    opts.horizon,
+                    &mut rng,
+                    &mut warnings,
+                )
+            });
+            warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+            warnings.extend(super::non_fit_diagnostics(
                 model,
                 population,
                 params,
-                n_sim,
-                1,
-                None,
-                opts.horizon,
-                &mut rng,
-                &mut warnings,
-            );
-            warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+                &stats,
+                super::SolverStatsPhase::Simulate,
+            ));
             return Ok(SimulationOutput { results, warnings });
         }
     };
@@ -530,18 +548,31 @@ pub fn simulate_with_options_diag(
 
     let omega_inv = &params.omega.inv;
     let mut warnings = Vec::new();
-    let results = simulate_inner_with_draw(
+    // Same scope the non-propensity branch opens. Both branches, not the shared chokepoint
+    // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty` calls
+    // once per draw, and a scope there would be entered per draw to feed a return type that
+    // has no warnings channel to put it in.
+    let (results, stats) = super::with_solver_stats(model, || {
+        simulate_inner_with_draw(
+            model,
+            population,
+            params,
+            n_sim,
+            1,
+            Some((&eta_hats, omega_inv, method)),
+            opts.horizon,
+            &mut rng,
+            &mut warnings,
+        )
+    });
+    warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+    warnings.extend(super::non_fit_diagnostics(
         model,
         population,
         params,
-        n_sim,
-        1,
-        Some((&eta_hats, omega_inv, method)),
-        opts.horizon,
-        &mut rng,
-        &mut warnings,
-    );
-    warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
+        &stats,
+        super::SolverStatsPhase::Simulate,
+    ));
     Ok(SimulationOutput { results, warnings })
 }
 
@@ -1151,10 +1182,20 @@ pub struct SimulationResult {
 /// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
 /// materialised (#762) — is handled *per subject* (censored / skipped, the run
 /// continues) and named here, instead of silently vanishing into the censored rows or
-/// aborting the whole run. Empty for a clean simulation. The simpler `simulate()` /
+/// aborting the whole run. Since #1280 / #1304 it also carries the model/data warning bundle
+/// (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …) and this pass's ODE-solver
+/// diagnostics (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean simulation of a well-formed
+/// model. The simpler `simulate()` /
 /// `simulate_with_seed()` entry points apply the same per-subject handling but return
 /// only the rows (no diagnostics channel) — use `simulate_with_options` when the
 /// warnings matter (e.g. a population VPC).
+///
+/// `simulate_with_uncertainty()` returns a flat row vec and so has no channel either; its
+/// per-draw findings are still collected internally (a skipped flip-flop draw, #786) and still
+/// dropped at the return. That is the one remaining silent simulate entry point, and
+/// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` /
+/// `the_row_only_entry_points_stay_silent_by_contract` pin the two lists so a new entry point
+/// cannot quietly join the silent one.
 #[derive(Debug, Clone, Default)]
 pub struct SimulationOutput {
     pub results: Vec<SimulationResult>,

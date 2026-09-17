@@ -21,6 +21,25 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
+- **`predict()` and `simulate()` now report the warnings they used to drop.** Every model/data
+  finding ferx computes reached exactly two entry points (`fit()` and `ferx check`), and every
+  ODE-solver diagnostic reached one (`fit()`), so a model `fit()` refuses to stay quiet about was
+  silently fine through the other doors. Measured on an `SS=1` dose whose `[odes]` right-hand side
+  reads `TAFD`: `fit()` named `W_STEADY_STATE_ABSOLUTE_TIME` and `W_ODE_SOLVER_DIAGNOSTICS`, while
+  `predict()` returned a column of `NaN` and `simulate_with_options_diag()` returned its rows with
+  an empty `warnings`. Worse on a budget-starved stiff model, where `predict()` returned
+  `49.98522138377198` at t = 0.5, 2, 8 **and** 24 — four identical numbers on a decaying curve,
+  finite and plottable. A new `predict_diag()` returns a `PredictionOutput` carrying both the rows
+  and the findings (`predict()` is now the thin wrapper that discards them, unchanged and
+  bit-identical), and `simulate_with_options_diag()` and `simulate_adaptive()` carry the same
+  bundle. It is the same unfiltered list `ferx check` prints; a message from a non-`fit()` entry
+  point says so, naming the pass and the parameters rather than "the final estimates", and reports
+  the `ode_method` the model actually runs at. `predict()`, `simulate()`, `simulate_with_seed()`,
+  `simulate_with_options()` and `simulate_with_uncertainty()` still return rows only — see
+  [Which entry points report warnings](https://ferx-nlme.github.io/ferx-core/warnings.html#entry-points)
+  ([#1280](https://github.com/FeRx-NLME/ferx-core/issues/1280),
+  [#1304](https://github.com/FeRx-NLME/ferx-core/issues/1304), residual of
+  [#959](https://github.com/FeRx-NLME/ferx-core/issues/959)).
 - **A warning when `gradient = fd` silently changes the optimizer too.** `optimizer = auto` resolves off the availability of the analytic gradient, so switching `gradient` from `auto` to `fd` and leaving `optimizer` alone moves two factors, not one — on the reported model that single line shifted the OFV by 4.98, of which only 0.38 was the gradient once BOBYQA was pinned in both arms. Such a fit now emits `W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT`, naming the optimizer that ran and the one the unforced arm would use, so a controlled one-variable comparison is caught before it is misread. The resolution itself is unchanged; the warning is silent whenever nothing was actually coupled (an explicitly pinned `optimizer`, a model already outside analytic scope, or one large enough that `auto` takes L-BFGS on a finite-difference gradient regardless) ([#1381](https://github.com/FeRx-NLME/ferx-core/issues/1381)).
 - **A gradient at the solution for derivative-free fits**, so `converged` is checkable on the runs where it matters most. When the outer optimizer supplies no gradient of its own — `bobyqa`, which is what `optimizer = auto` picks for ODE/PD, LTBS/SDE and `gradient = fd` models — ferx now computes a central finite-difference gradient of the same objective at the reported estimates and reports it as `final_gradient`, with a new `final_gradient_source` field (`"optimizer"` or `"finite_difference"`) saying which kind it is. Previously `final_gradient` was `NULL` for exactly the optimizer where a premature stop is most likely, so `converged = true` was unfalsifiable. The EBEs are re-solved inside the stencil, so it is the gradient of the marginal objective, not a fixed-EBE approximation. It is a reporting quantity only — it never steers the optimizer and the estimates are bit-identical either way — and costs `2 × n_free` objective evaluations, one gradient's worth. New `[fit_options]` key `report_final_gradient` (default `true`) turns it off ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997)).
 - **A `stalled_at_init` warning** when a fit never left its initial estimates — no free THETA, OMEGA or SIGMA coordinate moved — so the reported objective is the objective *of the initial values* and says nothing about the model. This most often arrives alongside `converged: true`, since a fit that never moved has a perfectly flat objective trace to plateau on, which is why it is its own warning code rather than a convergence one. The underlying predicate (`stalled_at_init`) already existed for model-selection strictness; it is now surfaced on every fit alongside `boundary_estimate` ([#997](https://github.com/FeRx-NLME/ferx-core/issues/997)).
