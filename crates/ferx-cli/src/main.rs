@@ -51,6 +51,8 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
 --threads N    use N rayon workers (N > 0)
 --threads 0    use the default worker count (available cores - 1, floored at 1, capped at 8)
 --threads auto alias for --threads 0
+               An explicit --threads (including 0/auto) overrides the model
+               file's [fit_options] threads, with a warning if they differ.
 
 --output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)
 --include-data embed the input --data CSV inside the .fitrx (off by default)
@@ -321,29 +323,33 @@ fn main() {
     // need is applied by fit()'s own fit-scoped pool (api::default_fit_pool), so the
     // global pool keeps the platform-default stack here rather than reserving a second
     // 32 MiB × N. Without --threads, fit() applies its own default (available cores - 1,
-    // floored at 1, capped at 8 — #707).
-    if let Some(n) = threads {
+    // floored at 1, capped at 8 — #707). `Some(0)` (`--threads 0` / `auto`) names the
+    // default rather than a width, so it sizes nothing here — but it is still carried in
+    // `RunOverrides` below, where it overrides a model file's `[fit_options] threads`.
+    if let Some(n) = threads.filter(|&n| n > 0) {
         if let Err(e) = ferx_core::configure_global_thread_pool(n) {
             eprintln!("Warning: {e}");
         }
     }
+    // Everything the command line named explicitly, which beats the model file's
+    // `[fit_options]` (#1416).
+    let overrides = ferx_core::RunOverrides {
+        inits_from_nca,
+        threads,
+    };
 
     let t_start = Instant::now();
     // Precedence: an explicit `--data` always wins (unchanged); `--simulate`
     // is checked next (unchanged); only when neither flag is given do we fall
-    // through to `run_model_with_data_inits(.., None, ..)`, which resolves the
+    // through to `run_model_with_overrides(.., None, ..)`, which resolves the
     // model's own optional `[data] path = ...` (#690) and errors if that's
     // absent too.
     let result = if data_path.is_some() {
-        ferx_core::run_model_with_data_inits(
-            model_path,
-            data_path.map(String::as_str),
-            inits_from_nca,
-        )
+        ferx_core::run_model_with_overrides(model_path, data_path.map(String::as_str), &overrides)
     } else if simulate {
-        ferx_core::run_model_simulate(model_path)
+        ferx_core::run_model_simulate_with_overrides(model_path, &overrides)
     } else {
-        ferx_core::run_model_with_data_inits(model_path, None, inits_from_nca)
+        ferx_core::run_model_with_overrides(model_path, None, &overrides)
     };
     let elapsed = t_start.elapsed();
 
@@ -715,11 +721,16 @@ fn parse_output_format(args: &[String]) -> EstimatesFormat {
     }
 }
 
-/// Parse the optional `--threads` flag. Returns `None` when the flag is
-/// absent, when its value is `0`, or when its value is `auto` — all of which
-/// mean "leave rayon's default pool alone". Exits the process on a missing
-/// value or any other non-parseable input so typos don't silently fall
-/// through to the default.
+/// Parse the optional `--threads` flag. Returns `None` only when the flag is
+/// **absent**; `0` and `auto` return `Some(0)`, the spelling of "the engine's own
+/// worker count". Exits the process on a missing value or any other
+/// non-parseable input so typos don't silently fall through to the default.
+///
+/// The `None` / `Some(0)` distinction is load-bearing (#1416): it is what lets
+/// `--threads auto` override a model file's `[fit_options] threads = 8` while an
+/// unmentioned flag leaves the file in charge. `Some(0)` is *not* a request to
+/// size the global pool — `configure_global_thread_pool` rejects `0` — it is a
+/// request that the model file not pin one either.
 fn parse_threads_flag(args: &[String]) -> Option<usize> {
     let idx = args.iter().position(|a| a == "--threads")?;
     let value = args.get(idx + 1).unwrap_or_else(|| {
@@ -727,7 +738,7 @@ fn parse_threads_flag(args: &[String]) -> Option<usize> {
         std::process::exit(1);
     });
     if value.eq_ignore_ascii_case("auto") || value == "0" {
-        return None;
+        return Some(0);
     }
     match value.parse::<usize>() {
         Ok(n) if n > 0 => Some(n),
@@ -1006,15 +1017,19 @@ mod tests {
         assert_eq!(parse_threads_flag(&args(&["--threads", "4"])), Some(4));
     }
 
+    // `Some(0)` rather than `None` for 0/auto (#1416): the flag was named, so it
+    // overrides the model file's `[fit_options] threads`; it just names the
+    // engine's own count rather than a width. `None` is reserved for an absent
+    // flag — see `absent_flag_is_none` above, the other half of the pair.
     #[test]
-    fn zero_means_default() {
-        assert_eq!(parse_threads_flag(&args(&["--threads", "0"])), None);
+    fn zero_means_the_default_was_asked_for_by_name() {
+        assert_eq!(parse_threads_flag(&args(&["--threads", "0"])), Some(0));
     }
 
     #[test]
-    fn auto_means_default() {
-        assert_eq!(parse_threads_flag(&args(&["--threads", "auto"])), None);
-        assert_eq!(parse_threads_flag(&args(&["--threads", "AUTO"])), None);
+    fn auto_means_the_default_was_asked_for_by_name() {
+        assert_eq!(parse_threads_flag(&args(&["--threads", "auto"])), Some(0));
+        assert_eq!(parse_threads_flag(&args(&["--threads", "AUTO"])), Some(0));
     }
 
     #[test]
