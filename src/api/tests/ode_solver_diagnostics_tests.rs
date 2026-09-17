@@ -103,7 +103,12 @@ fn a_clean_solve_produces_no_warning() {
         rejected_steps: 20,
         ..Default::default()
     };
-    assert!(ode_solver_diagnostics_warning(&stats, &FitOptions::default()).is_none());
+    assert!(ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions
+    )
+    .is_none());
 }
 
 #[test]
@@ -114,8 +119,12 @@ fn an_escalation_that_worked_is_reported_as_info() {
         auto_stiff_segments: 240,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a note");
     assert!(msg.contains("240"), "{msg}");
     assert_eq!(entry.severity, WarningSeverity::Info);
     assert_eq!(entry.category, WarningCode::OdeSolver);
@@ -138,8 +147,12 @@ fn a_mid_segment_switch_is_reported_on_the_escalation_note() {
         auto_switched_segments: 9,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a note");
     assert_eq!(entry.severity, WarningSeverity::Info);
     // Spelled out in full, not by fragment: a line-continuation left unescaped inside the
     // clause's literal collapses into a run of indentation that only the whole sentence sees.
@@ -174,8 +187,12 @@ fn a_switch_is_reported_alongside_an_unclean_solve() {
         auto_switched_segments: 9,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
     assert!(
         msg.contains(
@@ -205,8 +222,12 @@ fn a_rejected_escalation_is_a_warning_that_names_the_next_thing_to_try() {
         auto_stiff_rejected: 3,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
     assert_eq!(entry.category, WarningCode::OdeSolver);
     assert!(msg.contains("3 of 240"), "{msg}");
@@ -230,8 +251,12 @@ fn a_failed_explicit_fallback_reports_that_both_attempts_failed() {
         discarded_unfinished_segments: 1,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
     assert!(msg.contains("1 segment(s) had both attempts fail"), "{msg}");
     // Self-contained: the clause must not lean on the `rejected` clause happening to precede it.
@@ -254,7 +279,9 @@ fn an_unfinished_named_solve_is_warned_without_an_auto_rejection() {
         ode_method: crate::ode::OdeMethod::Rk45,
         ..Default::default()
     };
-    let (msg, entry) = ode_solver_diagnostics_warning(&stats, &opts).expect("a warning");
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::PostfitPredictions)
+            .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
     assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
     assert!(!msg.contains("stiff escalation"), "{msg}");
@@ -274,7 +301,9 @@ fn an_abandoned_segment_is_not_also_reported_as_an_unfinished_one() {
         ode_stiff_abort_after: Some(5),
         ..Default::default()
     };
-    let (msg, entry) = ode_solver_diagnostics_warning(&stats, &opts).expect("a warning");
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::PostfitPredictions)
+            .expect("a warning");
     assert!(msg.contains("3 segment(s) were abandoned early"), "{msg}");
     assert!(
         !msg.contains("returned segment(s) stopped"),
@@ -295,8 +324,12 @@ fn an_unfinished_segment_beyond_the_abandoned_ones_is_still_reported() {
         stiff_aborted_segments: 2,
         ..Default::default()
     };
-    let (msg, _) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, _) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
     assert!(msg.contains("ode_max_steps"), "{msg}");
 }
@@ -313,7 +346,9 @@ fn an_abort_names_the_budget_that_caused_it() {
         ode_stiff_abort_after: Some(2),
         ..Default::default()
     };
-    let (msg, entry) = ode_solver_diagnostics_warning(&stats, &opts).expect("a warning");
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::PostfitPredictions)
+            .expect("a warning");
     assert!(msg.contains("ode_stiff_abort_after = 2"), "{msg}");
     assert!(msg.contains("4 segment(s)"), "{msg}");
     // The method the user actually asked for is named, so the advice is not about `auto`.
@@ -337,8 +372,12 @@ fn a_rejected_escalations_clamps_do_not_claim_freeze_padding() {
         auto_stiff_rejected: 3,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert!(
         !msg.contains("clamped at the minimum step size"),
         "no clamp survived into a returned trajectory: {msg}"
@@ -355,8 +394,12 @@ fn a_rejected_escalations_clamps_do_not_claim_freeze_padding() {
         discarded_clamped_steps: 12,
         ..stats
     };
-    let (msg, _) =
-        ode_solver_diagnostics_warning(&with_kept, &FitOptions::default()).expect("a warning");
+    let (msg, _) = ode_solver_diagnostics_warning(
+        &with_kept,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert!(msg.contains("2 step(s) clamped"), "{msg}");
 }
 
@@ -368,8 +411,12 @@ fn the_escalation_note_keeps_its_severity_through_classification() {
         auto_stiff_segments: 7,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a note");
     assert_eq!(entry.severity, WarningSeverity::Info);
     let reclassified = classify_warning(&msg);
     assert_eq!(reclassified.severity, WarningSeverity::Info);
@@ -470,8 +517,12 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
         auto_fallback_failed: 2,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
     assert!(
         msg.contains("2 segment(s) of the analytic-sensitivity solve were discarded"),
@@ -506,8 +557,12 @@ fn a_jet_rejection_alone_is_a_warning_not_an_info_note() {
         auto_stiff_rejected_jets: 1,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning, "{msg}");
     assert!(msg.contains("analytic-sensitivity solve"), "{msg}");
 }
@@ -524,8 +579,12 @@ fn an_ordinary_rejection_carries_no_jet_clause() {
         discarded_clamped_steps: 5,
         ..Default::default()
     };
-    let (msg, entry) =
-        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    let (msg, entry) = ode_solver_diagnostics_warning(
+        &stats,
+        &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
+    )
+    .expect("a warning");
     assert!(!msg.contains("analytic-sensitivity solve"), "{msg}");
     assert!(msg.contains("rodas5p"), "{msg}");
     assert!(
@@ -1135,6 +1194,7 @@ fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
             ..Default::default()
         },
         &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
     )
     .expect("an abandoned walk is a warning");
     assert!(
@@ -1161,6 +1221,7 @@ fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
             ..Default::default()
         },
         &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
     )
     .expect("a clamped step is a warning");
     assert!(
@@ -1188,6 +1249,7 @@ fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
             ..Default::default()
         },
         &FitOptions::default(),
+        SolverStatsPhase::PostfitPredictions,
     )
     .expect("a warning");
     assert!(

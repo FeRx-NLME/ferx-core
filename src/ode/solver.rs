@@ -716,16 +716,28 @@ pub struct OdeSolverStats {
     /// dense / event-driven prediction walks, the adaptive driver and its frozen replay, the EKF
     /// walk, and `ode_solve_until_chz_threshold`'s event-time solve.
     ///
-    /// **Three of the eight cannot fire in production today, and that is scope, not an
-    /// oversight.** Outside tests, `SolverStatsScope::enter` appears in exactly two places in
-    /// the tree, both in `api::fit`; `simulate.rs`, `predict.rs` and `sim/adaptive.rs` open
-    /// none. So the adaptive driver, its frozen replay and the CHZ event-time solve — reached
-    /// only under `simulate()` — record into an inactive sink and contribute nothing to any
-    /// warning. They carry the recorder so that wiring a scope onto those paths is a one-line
-    /// change rather than a re-audit, and each is exercised in an explicit scope by its own
-    /// test. Nor is the CHZ one "the one silent hole" it was described as before this
-    /// correction: its sole production caller (`survival::draw_ode_tte_latent`) `panic!`s on
-    /// `SolveFailed`, which is the loudest outcome of the eight.
+    /// **All eight fire in production as of #1304.** They did not before it: outside tests,
+    /// `SolverStatsScope::enter` appeared in exactly two places, both reached only from
+    /// `fit()`'s post-fit pass, so the adaptive driver, its frozen replay and the CHZ
+    /// event-time solve — reached only under `simulate()` / `simulate_adaptive()` — recorded
+    /// into an inactive sink and contributed nothing to any warning. They carried the recorder
+    /// so that wiring a scope onto those paths would be a small change rather than a re-audit,
+    /// which is what it turned out to be. `api::predict_diag`, `api::simulate_with_options_diag`
+    /// and `api::simulate_adaptive` now open one (through `api::postfit::solver_stats_scope`,
+    /// the single gate), so this counter reaches a user on every entry point that has a
+    /// warnings channel to carry it.
+    ///
+    /// The CHZ site was never "the one silent hole" it was described as before that correction:
+    /// its sole production caller (`survival::draw_ode_tte_latent`) `panic!`s on `SolveFailed`,
+    /// which is the loudest outcome of the eight.
+    ///
+    /// What is still true of that site is narrower and lives in the *step* counters, not this
+    /// one: `ode_solve_until_chz_threshold` runs on `solve_ode_until_threshold`, its own driver,
+    /// which never tees into `STATS_SINK`. So with a scope open its `attempted_steps` read `0`
+    /// on a solve that crossed the threshold normally (measured, #1304 item 3), and on that
+    /// engine the step counters cannot serve as the "did anything integrate" discriminator they
+    /// are elsewhere. This counter is recorded directly by the guard, not through the driver,
+    /// so it is unaffected. Teeing that driver is #1304's remaining item.
     ///
     /// The two analytic-sensitivity walks (`sens::ode_provider`) carry the same predicate and
     /// deliberately do **not** bump this: their sweep is collected in its own scope from which
