@@ -3966,6 +3966,152 @@ fn subject_reconverged_fd_gradient_iov(
     central_diff_packed(x, &fixed, bounds, eval)
 }
 
+/// The exact analytic per-subject packed **outer** gradient for a non-IOV model, or
+/// `None` when this subject does not get one — either because the sensitivity provider
+/// (or the `prepare` assembly behind it) declined the subject's data shape at runtime,
+/// or because a component came back non-finite. Both cases route the subject to
+/// [`subject_reconverged_fd_gradient`], so they are one gate, not two.
+///
+/// The single gate [`population_gradient_sens_mixed`] dispatches on, extracted so the
+/// FOCE/FOCEI entry-point choice and the finiteness backstop live in one place rather
+/// than being spelled out at each call site (#1154). Note that
+/// [`outer_fd_fallback_warning`] deliberately does **not** ask this function — it probes
+/// the provider alone, for the reason recorded there.
+fn subject_analytic_outer_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    init_params: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    interaction: bool,
+) -> Option<Vec<f64>> {
+    let g = if interaction {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient(
+            model,
+            subject,
+            init_params,
+            x,
+            eta_hat,
+        )
+    } else {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
+            model,
+            subject,
+            init_params,
+            x,
+            eta_hat,
+        )
+    }?;
+    g.iter().all(|v| v.is_finite()).then_some(g)
+}
+
+/// IOV twin of [`subject_analytic_outer_gradient`]: takes the stacked `[η_bsv, κ₁..κ_K]`
+/// vector the IOV entry points consume, and is the single gate
+/// [`population_gradient_sens_iov_mixed`] dispatches on.
+fn subject_analytic_outer_gradient_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    init_params: &ModelParameters,
+    x: &[f64],
+    stacked: &[f64],
+    interaction: bool,
+) -> Option<Vec<f64>> {
+    let g = if interaction {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient_iov(
+            model,
+            subject,
+            init_params,
+            x,
+            stacked,
+        )
+    } else {
+        crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
+            model,
+            subject,
+            init_params,
+            x,
+            stacked,
+        )
+    }?;
+    g.iter().all(|v| v.is_finite()).then_some(g)
+}
+
+/// Warning when a subject's **data shape** falls out of the outer sensitivity provider's
+/// scope at runtime while the model-level report (`build_info::gradient_method_outer`)
+/// says the fit runs the exact analytic gradient. The outer twin of
+/// `inner_optimizer::fd_fallback_warning` (#1154).
+///
+/// The decline is per subject and, since #466, so is the salvage
+/// ([`subject_reconverged_fd_gradient`]) — so such a fit is correct, several times slower
+/// on those subjects, and was indistinguishable from a fit that is simply slow: no `W_*`
+/// code, no count, and a `gradient_method_outer` that keeps reporting `analytic (Dual2)`
+/// because it reads a **model**-level predicate. The mismatch is the whole signal, which
+/// is why the caller gates this on the model-level report saying analytic rather than on
+/// a *mixed* population (as the inner warning does): an in-scope model whose **every**
+/// subject declines is precisely the case the label gets wrong.
+///
+/// **Probes the provider, not the whole assembly**, and that boundary is measured, not
+/// assumed. The assembly is `subject_sensitivities(..)?` followed by `prepare(..)?`; only
+/// the first is a scope gate. `prepare_stacked` additionally requires the *true inner
+/// Hessian* to be positive-definite (`h_inner.cholesky()?`), which holds at the EBE — the
+/// point every live gradient evaluation uses — and routinely fails away from it: measured
+/// on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10 subjects
+/// (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider serves all
+/// 10, and all 10 are analytic at their EBEs. Probing the assembly here would therefore
+/// have reported "4 of 10 subjects use finite-difference outer gradients" on a fit that
+/// uses the analytic gradient for every subject. A `prepare`-level decline is genuinely
+/// mode-dependent and cannot be answered from a fixed probe point; a provider decline is
+/// a property of the subject's records (modeled-duration dose, out-of-scope ODE shape,
+/// the missing κ group of #1153), which is the class this issue is about.
+///
+/// Probed at the prior mode (`η = 0`, `κ = 0`) and the initial estimates, like the inner
+/// warning.
+pub(crate) fn outer_fd_fallback_warning(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Option<String> {
+    let iov = crate::sens::provider::iov_sens_supported(model);
+    let n_total = population.subjects.len();
+    let mut n_fd = 0usize;
+    let mut first_id: Option<String> = None;
+    for subject in &population.subjects {
+        let served = if iov {
+            let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
+            let stacked = vec![0.0; model.n_eta + k * model.n_kappa];
+            crate::sens::provider::subject_sensitivities_iov(
+                model,
+                subject,
+                &init_params.theta,
+                &stacked,
+            )
+            .is_some()
+        } else {
+            let zeros = vec![0.0; model.n_eta];
+            crate::sens::provider::subject_sensitivities(model, subject, &init_params.theta, &zeros)
+                .is_some()
+        };
+        if !served {
+            n_fd += 1;
+            if first_id.is_none() {
+                first_id = Some(subject.id.clone());
+            }
+        }
+    }
+    if n_fd == 0 {
+        return None;
+    }
+    let example = first_id
+        .map(|id| format!(" (e.g. subject {id})"))
+        .unwrap_or_default();
+    Some(format!(
+        "{n_fd} of {n_total} subjects fall outside the analytic sensitivity provider's \
+         scope{example} and use finite-difference outer gradients, although the model \
+         itself is in scope; their results are correct but slower. The reported outer \
+         gradient method is the model-level route, not the per-subject one."
+    ))
+}
+
 /// Non-IOV population gradient assembled **per subject**: the exact analytic
 /// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
 /// every subject inside the provider's scope, and a per-subject
@@ -3995,28 +4141,18 @@ pub(crate) fn population_gradient_sens_mixed(
         .map(|(i, subject)| {
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
-            let gi = if options.interaction {
-                crate::estimation::sens_outer_gradient::subject_packed_gradient(
-                    model,
-                    subject,
-                    init_params,
-                    x,
-                    ehs[i].as_slice(),
-                )
-            } else {
-                crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
-                    model,
-                    subject,
-                    init_params,
-                    x,
-                    ehs[i].as_slice(),
-                )
-            };
-            match gi {
+            match subject_analytic_outer_gradient(
+                model,
+                subject,
+                init_params,
+                x,
+                ehs[i].as_slice(),
+                options.interaction,
+            ) {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
-                Some(g) if g.iter().all(|v| v.is_finite()) => g,
+                Some(g) => g,
                 // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
-                _ => subject_reconverged_fd_gradient(
+                None => subject_reconverged_fd_gradient(
                     x,
                     init_params,
                     model,
@@ -4072,26 +4208,16 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             for kap in &kappas[i] {
                 stacked.extend(kap.iter().copied());
             }
-            let gi = if options.interaction {
-                crate::estimation::sens_outer_gradient::subject_packed_gradient_iov(
-                    model,
-                    subject,
-                    init_params,
-                    x,
-                    &stacked,
-                )
-            } else {
-                crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
-                    model,
-                    subject,
-                    init_params,
-                    x,
-                    &stacked,
-                )
-            };
-            match gi {
-                Some(g) if g.iter().all(|v| v.is_finite()) => g,
-                _ => subject_reconverged_fd_gradient_iov(
+            match subject_analytic_outer_gradient_iov(
+                model,
+                subject,
+                init_params,
+                x,
+                &stacked,
+                options.interaction,
+            ) {
+                Some(g) => g,
+                None => subject_reconverged_fd_gradient_iov(
                     x,
                     init_params,
                     model,

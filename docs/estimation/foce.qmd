@@ -45,6 +45,7 @@ The analytic route is the default (`gradient_method = auto`); one provider evalu
 What follows is the detail behind that one-line answer:
 
 - [Reading the resolved route](#reading-the-resolved-route) — what the startup banner tells you.
+- [The outer-loop route is reported as a warning](#outer-loop-fd-fallback) — why `gradient_method_outer` is model-level.
 - Analytic scope — [models and readouts](#analytic-scope-models-and-readouts),
   [likelihood and scaling](#analytic-scope-likelihood-and-scaling),
   [dose events](#analytic-scope-dose-events),
@@ -67,6 +68,23 @@ The startup banner reports the route **actually resolved** across the population
 When the population splits across routes, the banner shows per-route subject counts, e.g. `analytic (Dual2) ×118, FD ×3`.
 
 This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.qmd).
+
+### The outer-loop route is reported as a warning {#outer-loop-fd-fallback}
+
+The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
+
+The two can disagree. A subject whose *data shape* falls outside the provider's scope — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event — is salvaged individually onto a reconverged finite-difference gradient, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. The results are correct; the fit is just slower on those subjects. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+
+```
+1 of 32 subjects fall outside the analytic sensitivity provider's scope (e.g. subject 7)
+and use finite-difference outer gradients, although the model itself is in scope; their
+results are correct but slower. The reported outer gradient method is the model-level
+route, not the per-subject one.
+```
+
+The warning fires whenever at least one subject declines **and** the model-level report says analytic — including when *every* subject declines, which is the case the label gets most wrong. A model that already reports finite differences has nothing to reconcile and stays silent.
+
+It counts declines by the sensitivity provider, which are a property of the subject's records. It does not count the outer *assembly* declining at a point away from the EBE — that is a property of where the objective is evaluated, not of the subject, and it resolves itself at the mode the optimizer actually uses.
 
 ### Analytic scope: models and readouts {#analytic-scope-models-and-readouts}
 

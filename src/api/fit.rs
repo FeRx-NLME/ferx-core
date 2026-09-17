@@ -1290,6 +1290,46 @@ fn fit_inner(
         }
     }
 
+    // Outer-gradient FD-fallback notice (#1154). The inner warning above cannot see
+    // this: the two loops have separate scopes and separate providers, and a subject
+    // can be analytic in one and not the other. Gated on the **model-level** report
+    // saying `analytic (Dual2)` for the method/optimizer this fit actually resolves —
+    // that is the mismatch worth reporting, and it is the case that was invisible:
+    // a per-subject decline drops that subject onto the reconverged-FD gradient while
+    // `FitResult::gradient_method_outer` keeps reporting the model-level route. A fit
+    // already reporting FD (derivative-free BOBYQA, SAEM/IMP/Bayes, `gradient = fd`,
+    // GN) has nothing to reconcile, so the gate covers those too.
+    //
+    // Restricted to the methods that actually consume the outer sensitivity provider:
+    // FOCE/FOCEI through `population_gradient_sens_mixed`, and Laplace/AGQ through the
+    // fixed-η score (`agq::accumulate_fixed_eta_packed_gradient`). Those are different
+    // assemblies with different per-subject salvages, but both ask the *same* provider
+    // for `∂f/∂θ`, and the warning is about that shared scope gate — see
+    // `outer_fd_fallback_warning` on why it stops at the provider.
+    for m in chain.iter().copied().filter(|m| {
+        matches!(
+            m,
+            EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::Laplace
+        )
+    }) {
+        if crate::build_info::gradient_method_outer(
+            &crate::build_info::BUILD_INFO,
+            m,
+            options.optimizer,
+            model,
+        ) == crate::build_info::GradientMethodKind::Analytic
+        {
+            if let Some(w) = crate::estimation::outer_optimizer::outer_fd_fallback_warning(
+                model,
+                population,
+                init_params,
+            ) {
+                accumulated_warnings.push(w);
+            }
+            break;
+        }
+    }
+
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
