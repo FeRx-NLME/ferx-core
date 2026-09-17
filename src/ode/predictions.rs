@@ -5311,6 +5311,7 @@ pub(crate) fn verify_adaptive_frozen_replay(
             dose_f.extend(run.ledger.iter().map(|e| e.f_applied));
             adaptive_frozen_replay_tv(
                 ode,
+                pk_params_flat,
                 ev,
                 decision_pk,
                 eta_occ,
@@ -5391,6 +5392,11 @@ pub(crate) fn verify_adaptive_frozen_replay(
 #[allow(clippy::too_many_arguments)]
 fn adaptive_frozen_replay_tv(
     ode: &OdeSpec,
+    // The driver's frozen t=0 PK snapshot. Used ONLY to place the dose-driven break times
+    // (#1188) — route-lag onsets, `zero_order` window edges — from the identical snapshot
+    // the driver placed its own from; every integration below reads its segment's own
+    // per-event snapshot, never this one.
+    pk_params_flat: &[f64],
     event_pk: &crate::pk::EventPkParams,
     decision_pk: Option<&[PkParams]>,
     eta_occ: Option<&[Vec<f64>]>,
@@ -5467,7 +5473,11 @@ fn adaptive_frozen_replay_tv(
     let mut u = ode.initial_state(&init_pk.values);
     let mut predictions = vec![f64::NAN; n_obs];
 
-    // Injected doses carry no lag (a nonzero lag is rejected at injection).
+    // Injected doses carry no lag (a nonzero lag is rejected at injection); a *base* dose
+    // under a time-varying covariate / IOV is rejected upstream unless its compartment lag
+    // is zero (`ode_predictions_adaptive_impl`'s #930/#931 base-dose scope guard), so the
+    // driver's own `dose_lagtimes` — `base_lagtimes` followed by zeros — is all-zeros here
+    // too. Declared before the break-time build because that build reads it (below).
     let dose_lagtimes = vec![0.0; subject.doses.len()];
 
     // NB: PK slots are left NaN here (unlike `seed_ext_params`) — the replay
@@ -5491,13 +5501,39 @@ fn adaptive_frozen_replay_tv(
         .cloned()
         .fold(0.0_f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0, t_last];
-    for (i, d) in subject.doses.iter().enumerate() {
-        break_times.push(d.time);
-        if is_real_infusion(d) {
-            let (_, dur_eff) = d.bioavailable_infusion(dose_f[i]);
-            break_times.push(d.time + dur_eff);
-        }
-    }
+    // Every break a dose list contributes, through the SAME builder the reactive driver
+    // folds its base regimen in with (#1188). The hand-rolled loop this replaces pushed
+    // only `d.time` and a real infusion's F-scaled end, so it emitted neither a per-route
+    // absorption onset (`push_route_lag_break_times`) nor a `zero_order` window's edges
+    // (`push_zero_order_break_times`) — and `integrate_segment`'s `active_zero_order_inputs`
+    // admits a window's constant rate only for a segment the window *fully contains*. With
+    // neither edge bracketed the rate was dropped for every segment that straddled one, so
+    // the replay under-delivered the absorbed mass (measured on a lagged `zero_order(dur=2,
+    // lag=1.5)` two-dose subject: 0.0 against the static engine's 24.385 at the first
+    // in-window sample) and the verifier reported a dose-bookkeeping mismatch that was its
+    // own artifact. The two engines are required to agree bit for bit, so they share the
+    // builder rather than keeping two copies of the rule (#1171/#1174 fixed two other
+    // copies; this was the fifth).
+    //
+    // `pk_params_flat` is the driver's frozen t=0 snapshot, not a per-segment one — the
+    // same snapshot the driver placed its own base-regimen edges from, which is what keeps
+    // the pair bit-aligned when a route lag or `dur` is covariate-dependent.
+    //
+    // **Asymmetry, recorded here rather than shared away.** The driver runs this builder
+    // over its *base* regimen only (controller doses are appended reactively and get an
+    // infusion-end break from `insert_break` at injection); this runs it over base ∪
+    // ledger. That is wider only for a controller dose into an input-rate compartment,
+    // which `reject_unsupported_dose_compartment` refuses, so today the two sets coincide.
+    // A future widening of that guard must add the route-lag / zero-order edges at the
+    // injection site too, or the pair stops being bit-aligned.
+    collect_dose_break_times(
+        &mut break_times,
+        ode,
+        subject,
+        &dose_lagtimes,
+        dose_f,
+        pk_params_flat,
+    );
     break_times.extend(subject.obs_times.iter().cloned());
     break_times.extend(subject.pk_only_times.iter().cloned());
     // System-reset times (EVID=3, #716): the same reset breaks the reactive driver
