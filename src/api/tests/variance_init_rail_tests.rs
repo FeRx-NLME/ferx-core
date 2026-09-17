@@ -259,6 +259,51 @@ fn declared_zero_variance_arrives_at_the_regularisation_floor() {
     );
 }
 
+// ── the quoted cliff follows the rail (#1242) ───────────────────────────────
+
+/// Regression: the tiny-non-zero message used to quote the cliff as its own
+/// decimal literal — `6.144_212_353_328_21e-6`, which is `exp(2·-6)` typed out
+/// in a different file from the `-6`. A message whose number has no link to the
+/// rail it describes is a message that lies as soon as the rail moves, the same
+/// trap #1309 took out of the Σ diagnostic by naming `SIGMA_PACK_LOWER`.
+///
+/// The assertion compares two **independently produced** numbers: the text of
+/// the diagnostic, and the lower bound `compute_bounds` actually put under this
+/// coordinate on this very call. It is not a restatement of the constant — a
+/// `rail_variance_cliff` that read `exp(p)` instead of `exp(2p)`, or a
+/// re-hardcoded literal against a moved rail, both redden it, and neither is
+/// visible to any other test in this file (they all assert on the eta name, the
+/// code, or the `FIX` advice, none of which the cliff figure touches).
+#[test]
+fn the_quoted_cliff_is_the_variance_of_the_rail_the_box_carries() {
+    // A tiny-but-positive start, so the message is the "everything else" arm —
+    // the only one that quotes the cliff.
+    let line = "omega ETA_CL ~ 5e-6";
+    let diags = rails_for_omega(line);
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    let message = &diags[0].message;
+
+    let model = model_with_parameters(&params_with_omega(line));
+    let rail = omega_diagonal_rail(&model.default_params);
+    let expected = format!("{:.2e}", (2.0 * rail).exp());
+    assert!(
+        message.contains(&expected),
+        "the message must quote exp(2 × the box's own lower bound) = {expected}, \
+         computed from the rail this same model was bounded with ({rail}): {message}"
+    );
+
+    // And the figure must be the *cliff*, not this coordinate's own variance:
+    // the two are different numbers here (5e-6 declared against a 6.14e-6
+    // cliff), which is what makes the assertion above able to fail. A fixture
+    // declaring exactly `exp(2·rail)` would satisfy it either way.
+    let declared = format!("{:.2e}", 5e-6);
+    assert_ne!(
+        declared, expected,
+        "fixture went degenerate: the declared variance must differ from the \
+         cliff, or this test cannot tell the two apart"
+    );
+}
+
 // ── block omega ─────────────────────────────────────────────────────────────
 
 /// Regression: the predicate read from the declared variance rather than from

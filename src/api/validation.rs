@@ -3871,10 +3871,23 @@ fn outer_search_runs(options: &FitOptions) -> bool {
     })
 }
 
-/// The largest **variance** whose packed coordinate still lands on the `-6`
-/// lower rail: `ln(√v) ≤ -6 ⇔ v ≤ e⁻¹²`. Quoted in the tiny-non-zero message so
-/// the user is told where the cliff is, not just that they are past it.
-const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6;
+/// The largest **variance** whose packed coordinate still lands on the Ω
+/// Cholesky-diagonal lower rail: `ln(√v) ≤ lower ⇔ v ≤ exp(2·lower)`. Quoted in
+/// the tiny-non-zero message so the user is told where the cliff is, not just
+/// that they are past it.
+///
+/// Derived from
+/// [`crate::estimation::parameterization::OMEGA_CHOL_PACKED_LOWER`] rather than
+/// spelled as a decimal. It was `6.144_212_353_328_21e-6` — the value of
+/// `exp(-12)`, typed out — which is a message quoting a rail it has no link to:
+/// moving the rail would have left this number behind with nothing to catch it,
+/// the same trap #1309 took out of the Σ diagnostic by naming
+/// `SIGMA_PACK_LOWER` (#1242). Not a `const` because `f64::exp` is not
+/// `const fn`.
+#[inline]
+fn rail_variance_cliff() -> f64 {
+    (2.0 * crate::estimation::parameterization::OMEGA_CHOL_PACKED_LOWER).exp()
+}
 
 /// Which declaration a flagged variance coordinate came from — the keyword the
 /// user has to go and edit.
@@ -4210,11 +4223,12 @@ pub(crate) fn check_variance_init_rails(
             // Everything else: a tiny-but-positive diagonal start, or a
             // regularised indefinite matrix. The declared value is not
             // recoverable, so only the coordinate is described.
+            let cliff = rail_variance_cliff();
             (
                 format!(
                     "{name} starts at a variance of {rail_variance:.3e} on the optimizer's \
                      scale (ln(L) = {p:.2}), at or below its lower bound of {lo:.1} — every \
-                     variance ≤ {RAIL_VARIANCE:.2e} lands on that rail — so the start is \
+                     variance ≤ {cliff:.2e} lands on that rail — so the start is \
                      clamped there and the coordinate cannot be estimated from it. Start \
                      {name} at ≥ 1e-5, or `FIX` it if it should carry no variability. NONMEM \
                      accepts such a start but collapses it to ≈ 1e-9, which is the same \

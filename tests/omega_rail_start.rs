@@ -1,0 +1,203 @@
+//! What it costs a fit when a free Ω Cholesky diagonal **starts on one of its
+//! own rails** (#1242).
+//!
+//! The two rails behave differently, and the difference is measured rather than
+//! reasoned:
+//!
+//! * **Lower (`ln L = -6`, variance 6.144e-6).** Absorbing. With the
+//!   `E_OMEGA_INIT_AT_RAIL` gate bypassed, `omega ETA_CL ~ 6.144212353328210e-6`
+//!   on `examples/warfarin.ferx` + `data/warfarin.csv` leaves the coordinate
+//!   **bit-identical for the whole run** — 300+ evaluations whose gradient points
+//!   inward the entire time — ending at the rail with TVV 10× high and σ at 42%.
+//!   Moving *only* the rail to `-6.0000001`, identical start, recovers the base
+//!   optimum exactly. So the trap is the exact equality `packed_start == lower`.
+//!   It has no test here because it has no fixture: since #1246 every free
+//!   Ω / Ω_IOV / mixture-Ω diagonal at or below the rail is a hard
+//!   `E_OMEGA_INIT_AT_RAIL` error before any optimizer runs, so no accepted model
+//!   can reach the state. `api/tests/variance_init_rail_tests.rs` owns that gate.
+//! * **Upper (`ln L = +6`, variance 1.628e5).** Not absorbing — and nothing
+//!   rejects a start there, so unlike the lower rail this one is live. That is
+//!   what the test below pins.
+//!
+//! Tier 3: a full population fit run to convergence, gated behind `slow-tests`.
+
+use ferx_core::{fit, parse_model_file, read_nonmem_csv, EstimationMethod, FitOptions, FitResult};
+use std::path::Path;
+
+/// `OMEGA_CHOL_PACKED_UPPER` (`estimation::parameterization`), which is
+/// `pub(crate)` and so cannot be named from an integration test. The link is
+/// guarded on the library side: `test_compute_bounds_*` assert the box carries
+/// exactly this number on every Ω / Ω_IOV / mixture-Ω diagonal, so a rail that
+/// moves reddens there and the straddle assertion below stops holding here.
+const OMEGA_CHOL_PACKED_UPPER: f64 = 6.0;
+
+/// `exp(2 · 6)` — the variance whose packed coordinate `ln(√v)` is bit-exactly
+/// `OMEGA_CHOL_PACKED_UPPER`. Written as the decimal the packer sees rather than
+/// as `(2.0 * 6.0).exp()` so the fixture is inspectable;
+/// `the_upper_rail_fixture_starts_on_the_rail` below is what checks the two
+/// agree.
+const UPPER_RAIL_VARIANCE: f64 = 162_754.791_419_003_92;
+
+/// The warfarin base model, with `omega ETA_CL` spliced in.
+///
+/// Deliberately no `[fit_options]` block: the method, the iteration budget and
+/// the covariance switch are set on the `FitOptions` handed to `fit`, which is
+/// the only place they are guaranteed to arrive.
+fn warfarin_model(omega_cl: &str) -> String {
+    format!(
+        "[parameters]\n\
+         \x20 theta TVCL(0.2, 0.001, 10.0)\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.5, 0.01, 50.0)\n\
+         \n\
+         \x20 omega ETA_CL ~ {omega_cl}\n\
+         \x20 omega ETA_V  ~ 0.04\n\
+         \x20 omega ETA_KA ~ 0.30\n\
+         \n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n\
+         \n\
+         [individual_parameters]\n\
+         CL = TVCL * exp(ETA_CL)\n\
+         V  = TVV  * exp(ETA_V)\n\
+         KA = TVKA * exp(ETA_KA)\n\
+         \n\
+         [structural_model]\n\
+         pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         \n\
+         [error_model]\n\
+         DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// Fit the warfarin dataset with the given `omega ETA_CL` start.
+fn fit_warfarin(dir: &Path, omega_cl: &str) -> FitResult {
+    let model_path = dir.join(format!("warfarin_{}.ferx", omega_cl.replace('.', "_")));
+    std::fs::write(&model_path, warfarin_model(omega_cl)).unwrap();
+    let model = parse_model_file(&model_path).expect("model must parse");
+
+    let data_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/warfarin.csv");
+    let population = read_nonmem_csv(&data_path, None, None).expect("warfarin.csv must read");
+
+    let options = FitOptions {
+        method: EstimationMethod::Foce,
+        outer_maxiter: 300,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let init = model.default_params.clone();
+    fit(&model, &population, &init, &options).expect("fit must reach an Ok")
+}
+
+/// The fixture's own straddle: the declared variance must pack **onto or past**
+/// the upper rail, or the test below is a fit from an ordinary interior start
+/// and says nothing about rails at all.
+///
+/// Measured: `ln(√162754.79141900392) == 6.0` exactly (`packed == 6.0` is
+/// `true`), so the start is *on* the rail and `clamp_to_bounds` is a no-op on
+/// it. The assertion is `>=` rather than `==` because a future `f64` rounding
+/// change in `sqrt`/`ln` could put it a ULP above, which is still on the rail
+/// after the clamp — but a ULP *below* would silently make this an interior
+/// start, and that is what must redden.
+#[test]
+fn the_upper_rail_fixture_starts_on_the_rail() {
+    let packed = UPPER_RAIL_VARIANCE.sqrt().ln();
+    assert!(
+        packed >= OMEGA_CHOL_PACKED_UPPER,
+        "fixture no longer starts on the upper rail: ln(sqrt({UPPER_RAIL_VARIANCE})) = \
+         {packed} < {OMEGA_CHOL_PACKED_UPPER}"
+    );
+}
+
+/// Regression: an upper-rail twin of #1229's lower-rail gate, written on the
+/// assumption that the two rails are symmetric. They are not — measured here —
+/// and rejecting a start on the `+6` rail would refuse a model that fits
+/// perfectly well.
+///
+/// Also the regression for the rail itself becoming absorbing at the top, which
+/// is what the lower rail does: at `ln L = -6` the coordinate never moves again
+/// (see the module docs). Nothing rejects a start on `+6`, so if that ever
+/// happened the fit would come back silently wrong.
+///
+/// **Measured worst error** between the two arms on this fixture (10 subjects,
+/// FOCE, macOS/arm64 debug), printed from the run rather than assumed:
+///
+/// | quantity | realised |
+/// |---|---|
+/// | OFV, absolute | `5.35e-10` |
+/// | θ, relative (worst of three, `TVV`) | `1.37e-9` |
+/// | ω², relative (worst of three) | `7.30e-11` |
+///
+/// The bounds below are `1e-6`, i.e. 730× the worst realised error and 1 900×
+/// on the OFV. The headroom is for the libm split between macOS and the Linux
+/// CI container, which moves late digits on a converged FOCE fit; it is not a
+/// hedge about the rails, which agree to nine figures. The two arms are
+/// separate optimizer trajectories from starts 7.2 packed units apart, so
+/// bit-equality is not the right expectation — nine agreeing figures is.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn upper_omega_rail_start_still_reaches_the_base_optimum() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let base = fit_warfarin(dir.path(), "0.09");
+    let railed = fit_warfarin(dir.path(), &format!("{UPPER_RAIL_VARIANCE}"));
+
+    // Every comparand finite *before* anything folds it: a solve that returned
+    // `NaN` is the likeliest way to break what this test pins, and both
+    // `f64::max` and a bare `<` comparison would swallow it.
+    for (label, arm) in [("base", &base), ("upper rail", &railed)] {
+        assert!(
+            arm.ofv.is_finite(),
+            "{label} arm OFV is not finite: {}",
+            arm.ofv
+        );
+        for (name, v) in arm.theta_names.iter().zip(&arm.theta) {
+            assert!(v.is_finite(), "{label} arm {name} is not finite: {v}");
+        }
+        for (i, v) in arm.omega.diagonal().iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "{label} arm omega[{i},{i}] is not finite: {v}"
+            );
+        }
+    }
+
+    assert!(
+        (railed.ofv - base.ofv).abs() < 1e-6,
+        "a start on the +6 rail must reach the base optimum: OFV {} vs base {}",
+        railed.ofv,
+        base.ofv
+    );
+
+    for (i, name) in base.theta_names.iter().enumerate() {
+        let (b, r) = (base.theta[i], railed.theta[i]);
+        assert!(
+            (r - b).abs() <= 1e-6 * b.abs().max(1.0),
+            "{name}: {r} from the +6 rail vs {b} from the base start"
+        );
+    }
+
+    for i in 0..base.omega.nrows() {
+        let (b, r) = (base.omega[(i, i)], railed.omega[(i, i)]);
+        assert!(
+            (r - b).abs() <= 1e-6 * b.abs().max(1e-8),
+            "omega[{i},{i}]: {r} from the +6 rail vs {b} from the base start"
+        );
+    }
+
+    // The straddle, asserted rather than assumed: ETA_CL really did start 12
+    // packed units away from where the base arm started, so the agreement above
+    // is two trajectories meeting and not one fixture written twice.
+    // (measured: ln(√0.09) = -1.204 against the rail's +6.0, a gap of 7.204 out
+    // of the box's 12 units of width).
+    let base_start = 0.09_f64.sqrt().ln();
+    assert!(
+        UPPER_RAIL_VARIANCE.sqrt().ln() - base_start > 7.0,
+        "the two arms must start far apart in the box: base packs at {base_start}, \
+         the rail arm at {}",
+        UPPER_RAIL_VARIANCE.sqrt().ln()
+    );
+}

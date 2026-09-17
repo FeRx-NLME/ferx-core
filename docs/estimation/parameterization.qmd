@@ -161,6 +161,43 @@ which is the only scale on which they exist. Over every `.ferx` file in this
 repository the two predicates give the same answer — zero out-of-box thetas —
 so the stronger one costs nothing.
 
+#### Why the Omega lower rail traps and the upper one does not
+
+The two Omega rails are not symmetric, and the asymmetry is measured rather than
+argued. On `examples/warfarin.ferx` + `data/warfarin.csv` (10 subjects, FOCE,
+`covariance = false`), with `E_OMEGA_INIT_AT_RAIL` bypassed so the optimizer
+could be reached at all:
+
+| start | packs to | outcome |
+|---|---|---|
+| `omega ETA_CL ~ 6.144212353328210e-6` | $-6.0$ exactly | **trapped** — the coordinate is bit-identical for the whole run, ending at the rail with TVV 10x high and $\sigma$ at 42% |
+| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3640$, $\omega^2_{CL}$ 0.028595) |
+| `omega ETA_CL ~ 162754.79141900392` | $+6.0$ exactly | recovers the base optimum, under `lbfgs` and under `bobyqa` |
+| `omega ETA_CL ~ 1e8` | $+9.21$, clamped onto $+6.0$ | recovers the base optimum |
+
+So what traps a fit is the exact equality `packed_start == lower` — not the
+value, and not a basin of the objective, since one part in $10^7$ of slack is
+enough to recover the optimum to every printed digit. Nor is it a general
+property of starting on a bound: `theta TVCL(0.001, 0.001, 10.0)` and
+`theta TVKA(0.01, 0.01, 50.0)` both begin exactly on their own active lower
+bound on this dataset and converge normally.
+
+No accepted model can reach the trapped state. Every free Omega / Omega-IOV /
+mixture-Omega diagonal at or below the rail is an `E_OMEGA_INIT_AT_RAIL` error
+before any optimizer runs, and the upper rail — which nothing rejects — does not
+trap.
+
+That is also why the Omega **regularisation floor** sits *below* the rail rather
+than inside it. A declared `omega NAME ~ 0.0` is not positive-definite, so it is
+regularised with an eigenvalue floor of `1e-8`, giving $L_{ii} = 10^{-4}$ and a
+packed start of $-9.21$ — 3.2 units below the $-6$ the same model's box carries.
+Reading that as a defect and lifting the floor into the interior is exactly what
+would stop `omega ~ 0.0` being rejected, since the gate fires on
+`packed <= lower`. The floor answers "what can be factored" and the rail answers
+"what may be searched"; they are kept apart on purpose, and the invariant that
+matters is that a regularised zero is always *caught* rather than quietly
+clamped into the interior.
+
 #### When the box is empty
 
 A packed box can come out **empty** — `lower > upper` — and then there is no
