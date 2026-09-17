@@ -2721,12 +2721,18 @@ fn filter_context_cmt_resolves_like_the_dose_site() {
     // 1` failed to drop a dotted row the dose arm assigns to compartment 1. One
     // resolver now serves both, so the filter sees the compartment the row is
     // actually given.
+    // The ignore clause is narrowed to dose rows (`EVID == 1 && CMT == 1`) so a
+    // dotted *observation* survives — without a surviving defaulted row the warning never
+    // fires at all and any assertion about its wording passes by absence. The
+    // first revision of this test had that shape: it asserted
+    // `!contains("no CMT column")` on a population that emitted no warning
+    // whatsoever, so it survived deleting the entire summary block.
     let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                1,0,.,1,100,2.0,1\n\
                1,1,.,1,50,.,1\n\
-               1,2,5.0,0,.,2,0\n";
+               1,2,5.0,0,.,.,0\n";
     let f = write_csv(csv);
-    let filter = SelectionFilter::from_opts(&["CMT == 1".to_string()], &[], &[])
+    let filter = SelectionFilter::from_opts(&["EVID == 1 && CMT == 1".to_string()], &[], &[])
         .unwrap_or_else(|e| panic!("filter: {e}"));
     let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
     let cmts: Vec<usize> = pop.subjects[0]
@@ -2739,14 +2745,247 @@ fn filter_context_cmt_resolves_like_the_dose_site() {
         vec![2],
         "the dotted dose resolves to 1 and is ignored; the `2.0` dose is compartment 2 and stays"
     );
-    // The ignored row never became a dose, so it is not reported as one the
-    // reader routed — but the column is present and one cell was missing, so the
-    // *cause* wording still has to be the cell one if it fires at all.
+    // The surviving dotted *observation* is a defaulted row, so the summary does
+    // fire — and because the column is present it must use the cell wording, not
+    // the absent-column one. Both halves are now load-bearing.
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the surviving dotted observation must be reported, else the wording \
+                 assertion below is vacuous; got {:?}",
+                pop.warnings
+            )
+        });
     assert!(
-        !pop.warnings.iter().any(|w| w.contains("no CMT column")),
-        "the column is present, got {:?}",
-        pop.warnings
+        w.contains("0 dose row(s) and 1 observation row(s)"),
+        "the excluded dose row is not counted, the kept observation is: {w}"
     );
+    assert!(
+        !w.contains("no CMT column"),
+        "the column is present, so the cause must be the cell one: {w}"
+    );
+}
+
+#[test]
+fn cmt_less_dataset_routes_addl_and_evid_3_4_consistently() {
+    // Review follow-up: with no `CMT` column, do the *other* dose-bearing record
+    // kinds still work — ADDL expansion, EVID=4 (reset + dose), EVID=3 (pure
+    // reset)? They share one resolver with the plain dose row, so the answer
+    // should be yes, but "should" is not a measurement and the counting site moved
+    // during this review round.
+    //
+    // Two properties, and they are different: every dose the reader *produces*
+    // lands in compartment 1 (routing), while the summary counts dose **rows**
+    // (reporting). ADDL is exactly where those two numbers diverge.
+    let csv = "ID,TIME,DV,EVID,AMT,MDV,II,ADDL\n\
+               1,0,.,1,100,1,12,3\n\
+               1,1,5.0,0,.,0,0,0\n\
+               1,48,.,3,0,1,0,0\n\
+               1,48,.,4,100,1,0,0\n\
+               1,49,6.0,0,.,0,0,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let s = &pop.subjects[0];
+
+    // Routing: 1 primary + 3 ADDL + 1 EVID=4 dose = 5 doses, all compartment 1.
+    // A single mis-routed expansion would show up as a stray value here.
+    assert_eq!(
+        s.doses.iter().map(|d| d.cmt_1based()).collect::<Vec<_>>(),
+        vec![1; 5],
+        "every dose — ADDL expansions and the EVID=4 dose included — defaults alike"
+    );
+    // EVID=3 is a pure reset: it is neither dose nor observation, so it must not
+    // be counted as a compartment the reader chose.
+    assert_eq!(s.reset_times.len(), 2, "EVID=3 and EVID=4 both reset");
+
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    // Reporting: 2 dose *rows* (the ADDL parent and the EVID=4 row), but 5 dose
+    // *events*, because the parent carries `ADDL = 3`. Both numbers appear: the
+    // row count is how many cells to fix, the event count how much drug reached
+    // the guessed compartment. The EVID=3 reset is absent from both.
+    assert!(
+        w.contains("2 dose row(s) (5 doses after ADDL expansion) and 2 observation row(s)"),
+        "the row count and the ADDL-expanded dose count must both appear: {w}"
+    );
+}
+
+#[test]
+fn addl_expansion_note_is_absent_when_no_row_expands() {
+    // Control for the clause above: it must be a straddle, not decoration. With no
+    // ADDL column the event count equals the row count, and the parenthetical is
+    // suppressed entirely — otherwise every message would carry a redundant
+    // "(1 doses after ADDL expansion)".
+    let csv = "ID,TIME,DV,EVID,AMT,MDV\n\
+               1,0,.,1,100,1\n\
+               1,1,5.0,0,.,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(
+        w.contains("1 dose row(s) and 1 observation row(s)"),
+        "unexpanded rows read plainly: {w}"
+    );
+    assert!(
+        !w.contains("ADDL"),
+        "no ADDL note when nothing expanded: {w}"
+    );
+}
+
+#[test]
+fn negative_zero_is_reported_like_every_other_negative() {
+    // Review finding. `(0.0..=usize::MAX as f64).contains(&-0.0)` is `true` (IEEE
+    // `-0.0 == 0.0`) and `(-0.0f64) as usize` is `0`, so `-0` used to read as
+    // compartment 0 — the *default dose compartment*, silently accepted — while
+    // `-1` one row below was reported. The straddle is the point: all three
+    // spellings are negative, so all three must be reported alike, and the
+    // literal `0` control below must still not be.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,-0,1\n\
+               1,1,.,1,100,-0.0,1\n\
+               1,2,.,1,100,-1,1\n\
+               1,3,5.0,0,.,1,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(
+        w.contains("3 row(s) had a CMT cell that is not a compartment index"),
+        "all three negatives are reported, `-0` included: {w}"
+    );
+    for quoted in ["\"-0\"", "\"-0.0\"", "\"-1\""] {
+        assert!(w.contains(quoted), "must quote {quoted}: {w}");
+    }
+    assert_eq!(
+        pop.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.cmt_1based())
+            .collect::<Vec<_>>(),
+        vec![1; 3],
+        "and all three default to compartment 1 rather than to `0`"
+    );
+}
+
+#[test]
+fn a_capped_example_list_says_it_was_capped() {
+    // Five distinct unreadable spellings, three retained. Without the ellipsis the
+    // message reads `5 row(s) … ("a", "b", "c")`, presenting three spellings as if
+    // they were all five — a count and a list that contradict each other.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,aa,1\n\
+               1,1,.,1,100,bb,1\n\
+               1,2,.,1,100,cc,1\n\
+               1,3,.,1,100,dd,1\n\
+               1,4,.,1,100,ee,1\n\
+               1,5,5.0,0,.,1,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(w.contains("5 row(s) had a CMT cell"), "{w}");
+    assert!(
+        w.contains("\"aa\", \"bb\", \"cc\", …"),
+        "three examples then an ellipsis, so the list is not read as exhaustive: {w}"
+    );
+    // Straddle: the exactly-three case must NOT carry the ellipsis.
+    let csv3 = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+                1,0,.,1,100,aa,1\n\
+                1,1,.,1,100,bb,1\n\
+                1,2,.,1,100,cc,1\n\
+                1,3,5.0,0,.,1,0\n";
+    let f3 = write_csv(csv3);
+    let pop3 = read_nonmem_csv(f3.path(), None, None).unwrap();
+    let w3 = pop3
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap();
+    assert!(
+        w3.contains("\"aa\", \"bb\", \"cc\"") && !w3.contains('…'),
+        "a complete list must not claim to be truncated: {w3}"
+    );
+}
+
+#[test]
+fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
+    // The cell is arbitrary user text that reaches `FitResult.warnings`, the fit
+    // YAML and the check report. A mis-mapped free-text column would otherwise put
+    // a whole sentence in each, and a cell containing `"` would produce `"a"b"`.
+    let long = "x".repeat(60);
+    let csv = format!(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+         1,0,.,1,100,{long},1\n\
+         1,1,.,1,100,a\"b,1\n\
+         1,2,5.0,0,.,1,0\n"
+    );
+    let f = write_csv(&csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(
+        !w.contains(&long),
+        "the full 60-char cell must not reach the warning: {w}"
+    );
+    assert!(
+        w.contains(&format!("{}…", "x".repeat(24))),
+        "truncated at 24 chars with an ellipsis: {w}"
+    );
+    assert!(
+        !w.contains("a\"b"),
+        "an embedded quote must not survive verbatim: {w}"
+    );
+}
+
+#[test]
+fn a_row_shorter_than_its_header_is_a_missing_cell_not_an_absent_column() {
+    // The reader is `.flexible(true)`, so a ragged row is accepted and never
+    // padded. `row.get(cmt_col)` is then `None` on a dataset that *does* declare
+    // CMT. Treating that as `NoColumn` left both cause counters at zero while the
+    // summary picked its clause from `cmt_col.is_some()`, so the message came out
+    // as `W_CMT_DEFAULTED: , so 1 dose row(s) …` — an empty cause clause. The two
+    // sources of "why" must agree.
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100\n\
+               1,1,5.0,0,.,2,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(
+        w.contains("1 row(s) had a missing CMT cell"),
+        "a short row is a missing cell: {w}"
+    );
+    assert!(
+        !w.contains("no CMT column"),
+        "the header does declare CMT: {w}"
+    );
+    // The bug this pins is a *malformed* message, so assert its shape directly:
+    // no empty cause clause between the code and the counts.
+    assert!(!w.contains("W_CMT_DEFAULTED: ,"), "empty cause clause: {w}");
+    assert_eq!(pop.subjects[0].doses[0].cmt_1based(), 1);
 }
 
 #[test]

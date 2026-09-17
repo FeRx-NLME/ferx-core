@@ -1,7 +1,7 @@
-Wed Sep 16 05:20:22 PM UTC 2026
+Thu Sep 17 08:24:57 AM UTC 2026
 $PROBLEM ferx-core #1009 twin: 1-cpt oral ODE, DEFDOSE on compartment 2 (DEPOT declared second), dataset CMT cells float-formatted (2.0 / 1.0)
 $INPUT ID TIME DV EVID AMT CMT RATE MDV
-$DATA data.csv IGNORE=@
+$DATA defdose_cmt2float.csv IGNORE=@
 $SUBROUTINE ADVAN13 TOL=9
 $MODEL
   COMP=(CENTRAL, DEFOBS)
@@ -20,7 +20,7 @@ $THETA (0.001, 0.2, 10) (0.1, 10, 500) (0.01, 1.5, 50)
 $OMEGA 0.09 0.04 0.30
 $SIGMA 0.0004  ; ferx: sigma PROP_ERR ~ 0.02 (sd) = variance 0.0004
 $ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 PRINT=1 NOABORT
-$TABLE ID TIME PRED IPRED NOPRINT ONEHEADER FORMAT=s1PE15.8 FILE=run.tab
+$TABLE ID TIME PRED IPRED NOPRINT ONEHEADER FORMAT=s1PE15.8 FILE=defdose_cmt2float.tab
 
 NM-TRAN MESSAGES
   
@@ -34,8 +34,8 @@ Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
 
 License Registered to:  InsightRX
 Expiration Date:    14 AUG 2027
-Current Date:       16 SEP 2026
-Days until program expires : 333
+Current Date:       17 SEP 2026
+Days until program expires : 332
 1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
  ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
  CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
@@ -167,7 +167,7 @@ Days until program expires : 333
  EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
        IN SHRINKAGE (ETASTYPE):             NO
  NON-INFL. ETA CORRECTION (NONINFETA):      0
- RAW OUTPUT FILE (FILE): run.ext
+ RAW OUTPUT FILE (FILE): defdose_cmt2float.ext
  EXCLUDE TITLE (NOTITLE):                   NO
  EXCLUDE COLUMN LABELS (NOLABEL):           NO
  FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
@@ -197,8 +197,8 @@ Days until program expires : 333
  IPRD=IPREDI
  IRS=IRESI
 
- Elapsed evaluation time in seconds:     0.06
- Elapsed postprocess time in seconds:     0.07
+ Elapsed evaluation time in seconds:     0.05
+ Elapsed postprocess time in seconds:     0.06
 1
  
  
@@ -304,6 +304,6 @@ Days until program expires : 333
 +        2.00E-02
  
  Elapsed finaloutput time in seconds:     0.01
- #CPUT: Total CPU Time in Seconds,        0.174
+ #CPUT: Total CPU Time in Seconds,        0.148
 Stop Time:
-Wed Sep 16 05:20:24 PM UTC 2026
+Thu Sep 17 08:24:58 AM UTC 2026

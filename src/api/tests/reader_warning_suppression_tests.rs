@@ -87,6 +87,46 @@ fn cmt_defaulted_is_suppressed_on_a_compartment_free_model() {
 }
 
 #[test]
+fn cmt_defaulted_is_reported_on_an_analytical_model_with_per_cmt_scaling() {
+    // Review finding: the first version of this predicate tested only the *dose*
+    // channel, and the doc comment claimed an analytical `pk` model "has no second
+    // compartment to have missed". False — `CMT` also selects an observation's
+    // scale. `[scaling] obs_scale[CMT=N]` parses on an analytical model, and
+    // `pk::validate_per_cmt_scaling` only checks that the *observed* CMTs have
+    // entries, so a CMT-less dataset keys every row to 1, `{1} ⊆ {1,2}` passes,
+    // and nothing complains. Measured on `pk one_cpt_iv` with
+    // `obs_scale[CMT=1] = 1000` / `obs_scale[CMT=2] = 1`: the same data spelled
+    // with `CMT=2` gives OFV 0.0357, with the column dropped 6097015712.1246.
+    let mut m = analytical_model(GradientMethod::Fd);
+    assert!(
+        reader_warning_suppressed(&m, MSG),
+        "control: without per-CMT scaling this model is suppressed"
+    );
+    m.scaling = crate::types::ScalingSpec::PerCmt(std::collections::HashMap::from([
+        (1usize, crate::types::ScalingSpec::ScalarScale(1000.0)),
+        (2usize, crate::types::ScalingSpec::ScalarScale(1.0)),
+    ]));
+    assert!(
+        !reader_warning_suppressed(&m, MSG),
+        "an observation's CMT selects its scale, so a defaulted CMT can change the number"
+    );
+}
+
+#[test]
+fn cmt_defaulted_is_reported_on_an_analytical_model_with_a_per_cmt_error_model() {
+    // The same argument for the other observation-side dispatcher: `CMT=N:` error
+    // models. Asserted separately from the scaling case so a predicate that covers
+    // one and not the other reddens the arm it actually missed.
+    let mut m = analytical_model(GradientMethod::Fd);
+    assert!(reader_warning_suppressed(&m, MSG), "control");
+    m.error_spec = crate::types::ErrorSpec::PerCmt(std::collections::HashMap::new());
+    assert!(
+        !reader_warning_suppressed(&m, MSG),
+        "an observation's CMT selects its error model"
+    );
+}
+
+#[test]
 fn the_cmt_arm_does_not_swallow_the_no_doses_arm() {
     // Control for the shape of the predicate itself: the `W_CMT_DEFAULTED` early
     // return must not change how `W_NO_DOSES` is decided (#811). An algebraic

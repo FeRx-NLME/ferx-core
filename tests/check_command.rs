@@ -1637,6 +1637,69 @@ fn cmt_less_dataset_on_a_multi_state_ode_model_is_reported() {
 }
 
 #[test]
+fn the_remedy_the_warning_prints_actually_silences_it() {
+    // The message tells the user to "map an existing header onto it with
+    // `CMT = <header>` in the [data] block". That remedy leans on a separate
+    // subsystem (#730/#742 column mapping), and nothing pinned that it works — a
+    // message can be confidently wrong. Two properties, because silencing the
+    // warning without routing the dose would be worse than not silencing it:
+    // the warning is gone AND the dose lands in compartment 2.
+    // The compartment lives under a non-standard header, exactly the shape the
+    // remedy addresses.
+    let mapped_csv = "\
+ID,TIME,DV,EVID,AMT,COMPT,MDV
+1,0,.,1,100,2,1
+1,1,5.0,0,.,1,0
+1,2,7.0,0,.,1,0
+";
+    let mapped = temp_data("cmt_remedy_mapped", mapped_csv);
+    let model = temp_model(
+        "cmt_remedy",
+        &DEPOT_SECOND_ODE.replace(
+            "[parameters]",
+            &format!(
+                "[data]\n  path = {}\n  CMT = COMPT\n\n[parameters]",
+                mapped.display()
+            ),
+        ),
+    );
+
+    // Half 1: the warning is silenced.
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "mapping the column is the remedy the message prints; it must silence it: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Half 2: the dose actually lands in compartment 2. Silencing the warning
+    // without routing the dose would be strictly worse than not silencing it, and
+    // half 1 alone cannot tell the two apart — `prepare_run` is what applies the
+    // `[data]` map, so this reads the population the fit would.
+    let prepared = ferx_core::prepare_run(model.to_str().unwrap(), None).expect("prepare_run");
+    assert_eq!(
+        prepared.population.subjects[0].doses[0].cmt_1based(),
+        2,
+        "the mapped COMPT column must route the dose to the declared second state"
+    );
+    assert_eq!(
+        prepared.population.subjects[0].obs_cmts,
+        vec![1, 1],
+        "and the mapped column feeds the observation rows too"
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&mapped);
+}
+
+#[test]
 fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
     // T2b, control. An analytical `pk` model resolves compartment 1 to its own
     // default channel, and that numbering is ferx's own — a CMT-less dataset

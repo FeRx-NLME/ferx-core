@@ -706,15 +706,23 @@ on the two agreeing datasets: **4.084e-8**, relative 2.2e-10; the test's bound i
 From this directory, then move the output into `results/`:
 
 ```bash
-for f in defdose_no_cmt.ctl defdose_cmt2.ctl defdose_cmt2float.ctl; do nmfe76 "$f" "${f%.ctl}.lst"; done
-mv defdose_*.lst defdose_*.tab results/
+for f in defdose_no_cmt defdose_cmt2 defdose_cmt2float; do nmfe76 "$f.ctl" "$f.lst"; done
+mv defdose_*.lst defdose_*.tab defdose_*.ext defdose_*.phi results/
 ```
 
-> **Run status — DONE (#1009).** All three executed on NONMEM 7.6.0 via `nmfe76`;
-> `results/defdose_*.{lst,tab,ext}` are the verbatim output. The committed `.csv`
-> files are the exact bytes NONMEM read (CRLF line endings included), copied out
-> of the run directories rather than regenerated, so the ferx side is fed the same
-> dataset and not a re-export of it.
+> **Run status — DONE (#1009), re-derived.** Each `.ctl` names **its own** dataset
+> (`$DATA defdose_<case>.csv`) and its own `$TABLE FILE=`, so the loop above is the
+> whole recipe and each run's `.lst` records which dataset produced it. That
+> matters here more than usual: the three runs return the *same* OBJV by design, so
+> without per-run filenames the committed evidence could not distinguish "the float
+> dataset was run" from "the integer dataset was run twice" — and the float arm is
+> the one the fix is about. An earlier revision of this anchor had exactly that
+> hole (all three `$DATA data.csv`, no `data.csv` committed); it was caught in
+> review and all three runs were re-executed from the committed files on NONMEM
+> 7.6.0, each returning `-182.66670816329514`.
+>
+> The committed `.csv` files are the exact bytes NONMEM read (CRLF line endings
+> included), so the ferx side is fed the same dataset and not a re-export of it.
 
 ## Slow-accumulation steady-state anchors (#908)
 

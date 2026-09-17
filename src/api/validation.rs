@@ -702,28 +702,71 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
 ///   compartments that is its normal shape — every model-based meta-analysis
 ///   dataset is dose-free — so the advice ("check that the dataset has an AMT
 ///   column") is wrong rather than merely noisy.
-/// - `W_CMT_DEFAULTED` on any model that addresses at most one state (#1009). The
+/// - `W_CMT_DEFAULTED` on a model for which `CMT` addresses nothing (#1009). The
 ///   reader reports how many rows it had to pick a compartment for; picking is
-///   only a *guess* when there was something to choose between. An analytical
-///   `pk` model resolves compartment 1 to its own default channel
-///   (`pk::dose_needs_event_walk`: the depot on an oral model, the central
-///   compartment on an IV one) — ferx's analytic numbering is ferx's, not
-///   `$MODEL`'s, so a `CMT`-less dataset doses exactly what NONMEM's
-///   fixed-`DEFDOSE` ADVANs dose; measured on `examples/warfarin.ferx`, which is
-///   bit-identical with and without the column. A compartment-free model has no
-///   compartment at all, and a one-state `[odes]` model has no second one to miss.
-///
-/// The `n_states > 1` test deliberately counts the injected joint-PK-TTE
-/// `__chz_*` accumulators along with the PK states. They are not dose targets, but
-/// they exist only when an `[event_model]` does, and an event model routes its
-/// rows *by CMT* — so a dataset with no `CMT` column keys every row to
-/// compartment 1 and starves the endpoint. Counting them cannot produce a false
-/// positive for that reason, and excluding them would produce a false negative.
+///   only a *guess* when there was something to choose between. See
+///   [`cmt_defaulting_is_ambiguous`] for what counts.
 pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) -> bool {
     if warning.starts_with("W_CMT_DEFAULTED") {
-        return !model.ode_spec.as_ref().is_some_and(|s| s.n_states > 1);
+        return !cmt_defaulting_is_ambiguous(model);
     }
     model.is_algebraic() && warning.starts_with("W_NO_DOSES")
+}
+
+/// Whether this model reads a row's `CMT` for anything, so that a `CMT` the reader
+/// had to invent could change a number (#1009).
+///
+/// `CMT` addresses **two** channels, and the first review round of PR #1404 caught
+/// this predicate covering only one of them:
+///
+/// - **Which compartment a dose lands in.** Only an `[odes]` model with more than
+///   one state has a choice to get wrong. An analytical `pk` model resolves
+///   compartment 1 to its own default channel (`pk::dose_needs_event_walk`: the
+///   depot on an oral model, the central compartment on an IV one) — ferx's
+///   analytic numbering is ferx's, not `$MODEL`'s, so a `CMT`-less dataset doses
+///   exactly what NONMEM's fixed-`DEFDOSE` ADVANs dose; measured on
+///   `examples/warfarin.ferx`, which is bit-identical with and without the column.
+///
+/// - **Which readout, scale or error model an *observation* uses.** This one is
+///   engine-independent, and it is why the dose test alone is not enough: a
+///   per-CMT `[scaling]` block parses on an analytical model, and
+///   `pk::validate_per_cmt_scaling` only checks that the *observed* CMTs have
+///   entries — so a `CMT`-less dataset keys every row to 1, `{1}` is a subset of
+///   `{1, 2}`, and validation passes. Measured on a `pk one_cpt_iv` with
+///   `obs_scale[CMT=1] = 1000` / `obs_scale[CMT=2] = 1`: the same data spelled with
+///   `CMT=2` gives OFV **0.0357**, with the column dropped **6097015712.1246**, and
+///   before this predicate widened, neither arm warned.
+///
+/// The state test deliberately counts the injected joint-PK-TTE `__chz_*`
+/// accumulators along with the PK states. They are not dose targets, but they exist
+/// only when an `[event_model]` does, and an event model routes its rows *by CMT* —
+/// so a dataset with no `CMT` column keys every row to compartment 1 and starves
+/// the endpoint. Counting them cannot produce a false positive for that reason, and
+/// excluding them would produce a false negative.
+///
+/// Declared survival / discrete endpoints are deliberately **not** listed: a
+/// `CMT`-less dataset leaves them with no rows at all, which `E_ENDPOINT_NO_RECORDS`
+/// already reports as an error naming the missing column.
+fn cmt_defaulting_is_ambiguous(model: &CompiledModel) -> bool {
+    // Channel 1: more than one state to dose into.
+    if model.ode_spec.as_ref().is_some_and(|s| s.n_states > 1) {
+        return true;
+    }
+    // Channel 2: an observation's CMT selects its scale, readout or error model.
+    if matches!(model.scaling, ScalingSpec::PerCmt(_)) {
+        return true;
+    }
+    if matches!(model.error_spec, ErrorSpec::PerCmt(_)) {
+        return true;
+    }
+    if model
+        .analytic_readout
+        .as_ref()
+        .is_some_and(|ar| matches!(ar.readout, crate::ode::OdeReadout::PerCmt(_)))
+    {
+        return true;
+    }
+    false
 }
 
 /// The *fatal* model-vs-population checks every `simulate()` entry point owes its
