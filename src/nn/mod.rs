@@ -3218,6 +3218,11 @@ mod regularizer_fit_tests {
         // λ=5 4.03e-8, λ=100 5.92e-11 — worst realised 4.03e-8, so the bound
         // below carries ~2500x headroom. It still discriminates: #1277's own
         // λ=100 stall landed at 1.16e-3, an order of magnitude *above* it.
+        //
+        // The ubuntu/x86_64 *values* are not recorded here because a green
+        // `cargo test` captures this test's own trace; what is confirmed on that
+        // platform is the bound, on the `Slow regression tests (nn)` leg of run
+        // 35268862787. Print the trace with `--nocapture` before retuning it.
         const REGULARIZED_NORM_FLOOR: f64 = 1e-4;
         assert!(
             n_mid < REGULARIZED_NORM_FLOOR && n_big < REGULARIZED_NORM_FLOOR,
