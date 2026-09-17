@@ -850,7 +850,23 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // rebuild is idempotent — a pure function of `result.warnings` — so an empty
     // `sim_warnings` (the common case, and every non-survival build) just reproduces the
     // fit's structured list.
-    result.warnings.extend(sim_warnings);
+    //
+    // Appended **without exact duplicates**. Since #1280 `sim_warnings` also carries the
+    // model/data bundle, and this entry point simulates and then fits the *same* model, so
+    // every member of that bundle is produced a second time by `fit()` in identical wording —
+    // a user running `--simulate` would see each finding twice. Nothing that was in
+    // `sim_warnings` before #1280 could collide this way (a degenerate hazard draw has no
+    // `fit()` analogue), so the filter removes only the new duplication.
+    //
+    // Deliberately an *exact* string match, not a code match: the two
+    // `W_ODE_SOLVER_DIAGNOSTICS` messages describe different passes — the simulation's, at the
+    // template parameters, and the fit's, at the final estimates — carry different counters,
+    // and say which is which. Collapsing them by code would drop a real finding.
+    for w in sim_warnings {
+        if !result.warnings.contains(&w) {
+            result.warnings.push(w);
+        }
+    }
     rebuild_warnings_structured(&mut result);
     Ok((result, population))
 }

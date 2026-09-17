@@ -1052,6 +1052,7 @@ fn adaptive_tv_frozen_replay_readout_time_matches_the_driver() {
     let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
     let replay = adaptive_frozen_replay_tv(
         &ode,
+        &obs_pk[0].values,
         &event_pk,
         None,
         None,
@@ -1244,6 +1245,7 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
     let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
     let replay = adaptive_frozen_replay_tv(
         &ode,
+        &obs_pk[0].values,
         &event_pk,
         None,
         None,
@@ -1866,6 +1868,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
     let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
     let replay = adaptive_frozen_replay_tv(
         &ode,
+        &occ_pk[0].values,
         &event_pk,
         Some(&decision_pk),
         Some(&eta_occ),
@@ -12293,8 +12296,18 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
             vec![1.0, 4.0],
         );
         let scope = crate::ode::solver::SolverStatsScope::enter();
-        let preds =
-            adaptive_frozen_replay_tv(&ode, &event_pk, None, None, &[], &[], &subject, &[1.0], &[]);
+        let preds = adaptive_frozen_replay_tv(
+            &ode,
+            &pk_one(1.0, 10.0).values,
+            &event_pk,
+            None,
+            None,
+            &[],
+            &[],
+            &subject,
+            &[1.0],
+            &[],
+        );
         (scope.collected(), preds)
     };
 
@@ -12438,5 +12451,296 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
          zero for that walk, which is indistinguishable from a subject there was nothing to \
          integrate for. If the new call really is a non-recording site (the two `sens/` \
          gradient walks are), add it here with the reason."
+    );
+}
+
+// ---- #1188: the frozen-replay verifier's own break timeline ----------------
+//
+// `adaptive_frozen_replay_tv` used to build its dose breaks by hand — `d.time` plus a
+// real infusion's F-scaled end — so it pushed neither a per-route absorption onset nor a
+// `zero_order` window's edges. `integrate_segment`'s `active_zero_order_inputs` admits a
+// window's constant rate only for a segment the window FULLY CONTAINS, so an unbracketed
+// edge drops the rate for every segment that straddles it and the replay under-delivers
+// the absorbed mass. It now shares `collect_dose_break_times` with the reactive driver.
+//
+// The two tests below are a pair on purpose, because neither alone is sufficient:
+//
+//  * `frozen_replay_delivers_the_exact_zero_order_mass` anchors on a closed form that is
+//    OUTSIDE both engines, so it also sees a defect inside the shared builder.
+//  * `frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge` puts the route-lag
+//    break and the window edges at DIFFERENT times (the degeneracy #1174's fixtures all
+//    had, where a `zero_order` route's onset coincides with its own window start), but its
+//    oracle is the production static engine — which shares the builder, so it is blind to
+//    a defect inside it. That is what the first test covers.
+
+/// Single **pure accumulator** (`dy = 0`) fed by a lagged `zero_order(dur)` route, so the
+/// compartment's amount IS the delivered mass and the exact answer is a clamped ramp —
+/// a reference outside every ferx engine. Free slots: 20 = `dur`, 21 = the route lag.
+fn lagged_zero_order_accumulator_spec() -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = 0.0;
+        }),
+        n_states: 1,
+        state_names: vec!["depot".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: vec![InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::ZeroOrder,
+            arg_slots: vec![20],
+            frac_slot: None,
+            lag_slot: Some(21),
+        }],
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// #1188: the frozen-replay verifier must deliver a lagged `zero_order` route's **exact**
+/// mass, anchored on a closed form rather than on the engine it verifies.
+///
+/// Two doses, so the second window opens with the first dose's whole 100 still in the
+/// compartment — a single-dose fixture cannot see an incoming-side error, because the
+/// state is zero before the first arrival.
+///
+/// Regression this exists to catch: the replay building its own break list without
+/// `push_zero_order_break_times` / `push_route_lag_break_times`. Mutations measured, each
+/// naming this test in its failure:
+///  * restore the hand-rolled `d.time`-only loop → worst relative error **1.0e0** — the
+///    t=2 sample reads exactly 0.0 against an exact 25.0, the window's rate dropped
+///    wholesale because no segment is contained in an unbracketed `[1.5, 3.5]`;
+///  * delete `push_zero_order_break_times` from the shared `collect_dose_break_times`
+///    → **2.5e-1**. The engine-vs-engine sibling cannot see this one (both its sides run
+///    that helper and move together), which is why this closed-form anchor is separate.
+/// Realised error with the fix in: **1.42e-16** relative, i.e. the ramp is reproduced to
+/// the last bit. The bound is 1e-12 — ~7,000× the realised error and 2.5e11× below the
+/// smaller mutation — and it bounds *break placement*, not integration accuracy: `dy = 0`
+/// leaves the solver nothing to integrate but the injected constant.
+#[test]
+fn frozen_replay_delivers_the_exact_zero_order_mass() {
+    let ode = lagged_zero_order_accumulator_spec();
+    let (amt, dur, route_lag) = (100.0_f64, 2.0_f64, 1.5_f64);
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    pk.values[20] = dur;
+    pk.values[21] = route_lag;
+
+    // Windows [1.5, 3.5] and [7.5, 9.5]; the second opens on a full first dose.
+    let dose_times = [0.0_f64, 6.0];
+    let doses: Vec<DoseEvent> = dose_times
+        .iter()
+        .map(|&t| DoseEvent::new(t, amt, 1, 0.0, false, 0.0))
+        .collect();
+    // Samples before / inside / after each window, including one in the second window.
+    let obs_times: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 6.5, 8.0, 9.0, 10.0, 14.0];
+    let subject = make_subject(doses, obs_times.clone());
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk; 2],
+        obs: vec![pk; 9],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let decisions = [0.0, 6.0, 12.0];
+
+    let replay = adaptive_frozen_replay_tv(
+        &ode,
+        &pk.values,
+        &event_pk,
+        None,
+        None,
+        &[],
+        &[],
+        &subject,
+        &[1.0, 1.0],
+        &decisions,
+    );
+
+    let mut worst = 0.0_f64;
+    for (i, &t) in obs_times.iter().enumerate() {
+        // `is_finite` before the fold: `f64::max` DISCARDS a NaN, so a solve that
+        // returned NaN would leave `worst` at whatever the finite samples produced and
+        // the bound below would pass on their strength.
+        assert!(
+            replay[i].is_finite(),
+            "replay returned a non-finite amount at t={t}: {}",
+            replay[i]
+        );
+        // Exact delivered mass: each dose's window is a linear ramp over `[t0 + lag,
+        // t0 + lag + dur]`, clamped to `[0, amt]`, and a pure accumulator holds the sum.
+        let want: f64 = dose_times
+            .iter()
+            .map(|&t0| ((t - t0 - route_lag) / dur).clamp(0.0, 1.0) * amt)
+            .sum();
+        worst = worst.max((replay[i] - want).abs() / want.abs().max(1.0));
+    }
+    assert!(
+        worst <= 1e-12,
+        "frozen replay lost zero-order mass: worst relative error {worst:e} (measured \
+         1.42e-16 with the shared break builder; 1.0e0 with the hand-rolled one)"
+    );
+    // The straddle this fixture asserts rather than assumes: the second window really
+    // does open on a non-empty compartment, so the incoming side of that dose is live.
+    assert!(
+        replay[4] >= amt - 1e-9,
+        "t=6.5 must already hold the first dose's full mass (got {}), or the second \
+         window's incoming side is degenerate",
+        replay[4]
+    );
+}
+
+/// One-compartment disposition fed by **two routes that switch on at different times** —
+/// a lagged `zero_order` into `central` and a lagged `first_order` into `depot`, which
+/// then transfers into `central`. Free slots: 20 = `dur`, 21 = the zero-order route lag,
+/// 22 = the first-order route lag, 23 = the depot→central transfer rate.
+fn two_route_lagged_spec() -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            let ktr = p[23];
+            dy[0] = ktr * y[1] - ke * y[0];
+            dy[1] = -ktr * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["central".into(), "depot".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: vec![
+            InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::ZeroOrder,
+                arg_slots: vec![20],
+                frac_slot: None,
+                lag_slot: Some(21),
+            },
+            InputRateForcing {
+                cmt: 1,
+                kind: InputRateKind::FirstOrder,
+                arg_slots: vec![crate::types::PK_IDX_KA],
+                frac_slot: None,
+                lag_slot: Some(22),
+            },
+        ],
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// #1188: with a route lag and a `zero_order` window edge at **different** times, the
+/// frozen replay must walk the identical segmentation the production static engine does.
+///
+/// The fixture is deliberately not the shape #1174's were. There every fixture used a
+/// bare `zero_order`, where the route's onset coincides with the window's own start, so
+/// one break served both and a builder that emitted only one of the two passed. Here the
+/// first-order route switches on at 0.5 / 6.5 and the zero-order window spans
+/// [1.5, 3.5] / [7.5, 9.5]: six distinct edges, no two coincident. Both routes reach the
+/// readout (`central` is dosed directly by the zero-order route and refilled from
+/// `depot`), and the second dose arrives with the first still present.
+///
+/// Oracle: `ode_predictions_with_extra_breaks` handed the replay's own break set (the
+/// decisions plus every observation, which the replay breaks at and the dense engine
+/// records inside a segment). Given the same set the two are **bit-identical**, so any
+/// break the replay drops shows up as a different step sequence.
+///
+/// Regression: the replay segmenting the timeline differently from the engine it is
+/// supposed to reproduce. Mutations measured, each naming this test:
+///  * restore the hand-rolled `d.time`-only loop → worst relative error **4.096e-1**;
+///  * the *weaker* fix a reviewer would reach for first — keep the hand-rolled loop and
+///    add `push_zero_order_break_times` alone, which #1174's own note says is enough for
+///    zero-order segmentation → **1.311e-5**, and this is the only test that dies. That
+///    edit is the #1174 degeneracy itself, and it is why the fixture separates the
+///    first-order onset from the zero-order window rather than reusing a bare
+///    `zero_order`, where one break serves both and the weaker fix passes.
+///
+/// **What this cannot see**, stated rather than implied: the oracle runs the *same*
+/// `collect_dose_break_times`, so deleting a push from inside that helper moves both
+/// sides together and leaves this green (measured: 0.0). That mutation is caught by
+/// `frozen_replay_delivers_the_exact_zero_order_mass`, whose reference is a closed form.
+#[test]
+fn frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge() {
+    let ode = two_route_lagged_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 1.0;
+    pk.values[crate::types::PK_IDX_V] = 10.0;
+    pk.values[crate::types::PK_IDX_KA] = 1.1;
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    pk.values[20] = 2.0; // zero-order dur   → windows [1.5, 3.5], [7.5, 9.5]
+    pk.values[21] = 1.5; // zero-order lag
+    pk.values[22] = 0.5; // first-order lag  → onsets 0.5, 6.5
+    pk.values[23] = 0.7; // depot → central
+
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 2, 0.0, false, 0.0),
+    ];
+    let obs_times: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 6.5, 8.0, 9.0, 10.0, 14.0];
+    let subject = make_subject(doses, obs_times.clone());
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk; 4],
+        obs: vec![pk; 9],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let decisions = [0.0, 6.0, 12.0];
+
+    let replay = adaptive_frozen_replay_tv(
+        &ode,
+        &pk.values,
+        &event_pk,
+        None,
+        None,
+        &[],
+        &[],
+        &subject,
+        &[1.0; 4],
+        &decisions,
+    );
+    let mut aligned_breaks: Vec<f64> = decisions.to_vec();
+    aligned_breaks.extend(obs_times.iter().copied());
+    let statics =
+        ode_predictions_with_extra_breaks(&ode, &pk.values, &[], &[], &subject, &aligned_breaks);
+
+    let mut worst = 0.0_f64;
+    for (i, &t) in obs_times.iter().enumerate() {
+        // Both sides finite before the fold — `f64::max` swallows a NaN (see the sibling
+        // test), and a diverged solve is the likeliest way to break what this pins.
+        assert!(
+            replay[i].is_finite() && statics[i].is_finite(),
+            "non-finite prediction at t={t}: replay={} static={}",
+            replay[i],
+            statics[i]
+        );
+        worst = worst.max((replay[i] - statics[i]).abs() / statics[i].abs().max(1.0));
+    }
+    // Measured 0.0 (bit-identical). The bound is 1e-14 rather than 0.0 only so a future
+    // benign reordering inside the shared builder is not a false alarm; the *tightest*
+    // mutation above sits at 1.311e-5, nine orders above it.
+    assert!(
+        worst <= 1e-14,
+        "frozen replay walks a different segmentation from the static engine: worst \
+         relative error {worst:e} (measured 0.0 with the shared break builder)"
+    );
+    // The straddle, asserted rather than assumed: the first-order onset (6.5) and the
+    // zero-order window edges (7.5, 9.5) are distinct, and drug is present at the
+    // second dose — so neither route is degenerate on its incoming side.
+    assert!(
+        replay[4] > 100.0,
+        "t=6.5 must already carry the first dose's mass (got {}); a fixture whose second \
+         dose lands on an empty compartment cannot see an incoming-side error",
+        replay[4]
     );
 }

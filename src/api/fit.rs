@@ -2495,7 +2495,11 @@ fn fit_inner(
     // escalations, and escalations the guard discarded — none of which any production path
     // reported before. Emitted typed at source, at `Info` severity when the only thing to
     // report is that `auto` escalated and it worked.
-    if let Some((msg, entry)) = ode_solver_diagnostics_warning(&ode_solver_stats, options) {
+    if let Some((msg, entry)) = ode_solver_diagnostics_warning(
+        &ode_solver_stats,
+        options,
+        SolverStatsPhase::PostfitPredictions,
+    ) {
         warnings.push(msg);
         native_warnings.push(entry);
     }

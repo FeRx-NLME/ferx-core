@@ -68,13 +68,13 @@ pub(crate) use postfit::{
     compute_param_corr, compute_subject_results, cov_diagnostics, covariate_relation_estimates,
     eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
-    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
+    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning, non_fit_diagnostics,
     nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
     rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
-    runaway_guard_warning, sir_unavailable_warning, stalled_at_init_warning,
-    sweep_sensitivity_solver_stats,
+    runaway_guard_warning, sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
+    sweep_sensitivity_solver_stats, with_solver_stats, SolverStatsPhase,
 };
-pub use predict::{predict, PredictionResult};
+pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{
@@ -109,7 +109,7 @@ pub(crate) use pool::{cap_default_threads, default_thread_count, effective_defau
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,
-    theta_boundary_side, DiagStats,
+    solver_reporting_options, theta_boundary_side, DiagStats,
 };
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use predict::grid_median_from_cumhaz;
@@ -264,6 +264,10 @@ mod tests_param_corr;
 #[cfg(test)]
 #[path = "tests/ode_solver_diagnostics_tests.rs"]
 mod ode_solver_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "tests/non_fit_diagnostics_tests.rs"]
+mod non_fit_diagnostics_tests;
 
 #[cfg(test)]
 #[path = "tests/stalled_at_init_warning_tests.rs"]

@@ -13,6 +13,7 @@ pub ferx_core::api::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_co
 pub ferx_core::api::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::api::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
 pub ferx_core::api::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
+pub ferx_core::api::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::api::PoolPlan
 impl ferx_core::PoolPlan
 pub fn ferx_core::PoolPlan::apply_to(&self, options: &mut ferx_core::FitOptions)
@@ -25,6 +26,9 @@ pub fn ferx_core::PoolPlan::total_threads(&self) -> usize
 pub fn ferx_core::PoolPlan::worker_stack_size(&self) -> usize
 impl core::default::Default for ferx_core::PoolPlan
 pub fn ferx_core::PoolPlan::default() -> Self
+#[non_exhaustive] pub struct ferx_core::api::PredictionOutput
+pub ferx_core::api::PredictionOutput::results: alloc::vec::Vec<ferx_core::PredictionResult>
+pub ferx_core::api::PredictionOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::api::PredictionResult
 pub ferx_core::api::PredictionResult::id: alloc::string::String
 pub ferx_core::api::PredictionResult::pred: f64
@@ -83,6 +87,7 @@ pub fn ferx_core::api::fit(model: &ferx_core::CompiledModel, population: &ferx_c
 pub fn ferx_core::api::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::PredictionResult>
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::EndpointPredictionResult>
+pub fn ferx_core::api::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> ferx_core::PredictionOutput
 pub fn ferx_core::api::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> alloc::vec::Vec<ferx_core::SurvivalPredictionResult>
 pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
 pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
@@ -458,6 +463,7 @@ pub fn ferx_core::estimation::parameterization::coordinate_values(params: &ferx_
 pub fn ferx_core::estimation::parameterization::coordinate_values_raw(theta: &[f64], omega_mat: &nalgebra::base::alias::DMatrix<f64>, omega_diagonal: bool, sigma: &[f64], iov: core::option::Option<(&nalgebra::base::alias::DMatrix<f64>, bool)>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::parameterization::get_eta_init(n_eta: usize, warm_start: core::option::Option<&[f64]>, mu_refs: core::option::Option<&[f64]>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::parameterization::omega_structural_zero_mask(template: &ferx_core::ModelParameters) -> alloc::vec::Vec<bool>
+pub fn ferx_core::estimation::parameterization::omega_variance_at_or_below_rail(l_ii_squared: f64) -> bool
 pub fn ferx_core::estimation::parameterization::pack_params(params: &ferx_core::ModelParameters) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::parameterization::packed_fixed_mask(template: &ferx_core::ModelParameters) -> alloc::vec::Vec<bool>
 pub fn ferx_core::estimation::parameterization::packed_len(template: &ferx_core::ModelParameters) -> usize
@@ -3868,6 +3874,7 @@ pub ferx_core::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_core::s
 pub ferx_core::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
 pub ferx_core::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
+pub ferx_core::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct ferx_core::AdaptiveSubjectMetrics
 pub ferx_core::AdaptiveSubjectMetrics::auc_target_attainment: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::cumulative_dose: f64
@@ -4700,6 +4707,9 @@ pub ferx_core::PosteriorSummary::q025: f64
 pub ferx_core::PosteriorSummary::q975: f64
 pub ferx_core::PosteriorSummary::rhat: f64
 pub ferx_core::PosteriorSummary::sd: f64
+#[non_exhaustive] pub struct ferx_core::PredictionOutput
+pub ferx_core::PredictionOutput::results: alloc::vec::Vec<ferx_core::PredictionResult>
+pub ferx_core::PredictionOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::PredictionResult
 pub ferx_core::PredictionResult::id: alloc::string::String
 pub ferx_core::PredictionResult::pred: f64
@@ -4927,6 +4937,7 @@ pub fn ferx_core::parse_model_file(path: &std::path::Path) -> core::result::Resu
 pub fn ferx_core::parse_model_string(content: &str) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub fn ferx_core::predict(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::PredictionResult>
 pub fn ferx_core::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::EndpointPredictionResult>
+pub fn ferx_core::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> ferx_core::PredictionOutput
 pub fn ferx_core::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> alloc::vec::Vec<ferx_core::SurvivalPredictionResult>
 pub fn ferx_core::prepare_frem(model_path: &std::path::Path, data_path: &std::path::Path, covariates: &[alloc::string::String], categorical_covariates: core::option::Option<&[alloc::string::String]>, output_model_path: core::option::Option<&std::path::Path>, output_data_path: core::option::Option<&std::path::Path>, missing_value: core::option::Option<f64>, fit_init: core::option::Option<&ferx_core::frem::FremFitInit>) -> core::result::Result<ferx_core::frem::FremPrepareResult, alloc::string::String>
 pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>

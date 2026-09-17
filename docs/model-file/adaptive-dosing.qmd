@@ -278,7 +278,16 @@ result — never a silent wrong number.
 
 The replay reproduces the reactive driver's *segment structure* — the driver
 restarts the integrator at every decision time (holds included), so the replay
-feeds those same decision times back in as no-op breaks. Both engines then walk
+feeds those same decision times back in as no-op breaks. It builds the rest of
+that structure — a dose's lag-shifted arrival, an infusion's bioavailability-scaled
+end, a per-route absorption onset, and a `zero_order()` window's **two** edges —
+through the *same* break-time builder the driver folds its pre-scheduled base
+regimen in with, rather than a second copy of the rule (#1188). That matters
+because a `zero_order()` window's constant rate is only applied to a segment the
+window fully contains: a builder that failed to break at an edge would drop the
+rate for every segment straddling it, and the replay would then report a
+dose-bookkeeping mismatch that was its own artifact. One builder, so the two sides
+of the oracle cannot segment the timeline differently. Both engines then walk
 the same segments through the same integrator, so the comparison sits at the
 solver's true round-off floor (a small multiple of its error control) rather than
 a wide held-decision slack. A real bookkeeping bug — a dropped dose, wrong
