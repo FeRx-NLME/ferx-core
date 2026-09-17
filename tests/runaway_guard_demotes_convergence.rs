@@ -58,13 +58,20 @@ fn fit_demotes_converged_when_sigma_sits_on_the_internal_ceiling() {
 }
 
 /// #1328: the coordinate that ran away on the busulfan DCM subset was an Ω
-/// **off-diagonal** at the ±10 rail, not a Σ ceiling, and it reaches this check
-/// by a different path. The Σ arm above hands `fit()` a number it stores
-/// verbatim; a block Ω's rail lives on the raw Cholesky element `L[i,j]`, which
-/// `fit()` packs, clamps in scaled space, unpacks into a covariance matrix and
-/// re-reads at fit end. Nothing at Tier 1 crosses that round trip — the unit
-/// tests in `api/postfit`'s sibling build an `OmegaMatrix` and re-pack it in the
-/// same breath.
+/// **off-diagonal** at the ±10 rail, not a Σ ceiling. This pins the same wiring
+/// the Σ arm above does — that `fit()` applies the guard rule to the
+/// `FitResult` a consumer reads — for a *block* Ω, whose coordinate is the raw
+/// Cholesky element `L[i,j]` rather than a stored value, and whose severity,
+/// `details` payload and both-rails verdict therefore have their own arm.
+///
+/// **What this test does not cover, and where that lives.** The evaluation-only
+/// IMP stage it uses to reach the fit-end check without a convergence loop hands
+/// the inner loop its `stage_params` directly: no `pack_with_bounds` →
+/// `clamp_to_bounds` → `unpack_params` round trip happens on this path, so
+/// breaking the off-diagonal reconstruction in `unpack_params` leaves this file
+/// green (measured, PR #1406 review). That composition — which *every*
+/// estimating path does run — is pinned at Tier 1 by
+/// `a_block_omega_off_diagonal_at_the_rail_survives_pack_clamp_unpack`.
 ///
 /// Both rails are asserted because the side does not decide the verdict here
 /// (#1205): `L[i,j]` is bounded symmetrically, so −10 is the same runaway as
@@ -160,13 +167,15 @@ fn fit_demotes_converged_when_a_block_omega_off_diagonal_sits_on_either_rail() {
             if rail > 0.0 { "upper" } else { "lower" },
             "rail {rail}"
         );
-        // The round trip this test exists for: the coordinate `fit()` re-reads
-        // at the end is the literal rail, bit for bit, and not a Cholesky
-        // re-factorisation a few ULPs off it.
+        // The coordinate the fit-end walk reports is the literal rail, bit for
+        // bit — it re-reads the cached Cholesky factor rather than
+        // re-factorising the covariance matrix a few ULPs off it. (What it does
+        // *not* assert is that a pack/unpack round trip preserved it; see the
+        // doc comment.)
         assert_eq!(
             hit["packed_estimate"].as_f64().unwrap(),
             rail,
-            "rail {rail}: the packed coordinate must survive the fit round trip exactly"
+            "rail {rail}: the fit-end walk must report the literal rail"
         );
     }
 }
