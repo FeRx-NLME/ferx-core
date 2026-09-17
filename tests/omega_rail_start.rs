@@ -20,22 +20,24 @@
 //!   what the test below pins.
 //!
 //! Tier 3: a full population fit run to convergence, gated behind `slow-tests`.
+//! The fixture's *premise* — that the declared decimal packs bit-exactly onto
+//! the rail — is Tier 1 and lives in `estimation::parameterization`'s
+//! `upper_rail_variance_fixture_packs_onto_the_rail`, where the rail constant
+//! can be named rather than restated (PR #1408 review).
 
 use ferx_core::{fit, parse_model_file, read_nonmem_csv, EstimationMethod, FitOptions, FitResult};
 use std::path::Path;
 
-/// `OMEGA_CHOL_PACKED_UPPER` (`estimation::parameterization`), which is
-/// `pub(crate)` and so cannot be named from an integration test. The link is
-/// guarded on the library side: `test_compute_bounds_*` assert the box carries
-/// exactly this number on every Ω / Ω_IOV / mixture-Ω diagonal, so a rail that
-/// moves reddens there and the straddle assertion below stops holding here.
-const OMEGA_CHOL_PACKED_UPPER: f64 = 6.0;
-
 /// `exp(2 · 6)` — the variance whose packed coordinate `ln(√v)` is bit-exactly
-/// `OMEGA_CHOL_PACKED_UPPER`. Written as the decimal the packer sees rather than
-/// as `(2.0 * 6.0).exp()` so the fixture is inspectable;
-/// `the_upper_rail_fixture_starts_on_the_rail` below is what checks the two
-/// agree.
+/// the engine's upper Ω Cholesky-diagonal rail.
+///
+/// Written as the decimal the packer sees, because `OMEGA_CHOL_PACKED_UPPER` is
+/// `pub(crate)` and cannot be named from an integration test. The premise that
+/// this decimal really lands *on* the rail is not asserted here: it is pure
+/// arithmetic over a crate-private constant, so it belongs on the fast PR path
+/// and lives in `parameterization.rs`'s Tier-1
+/// `upper_rail_variance_fixture_packs_onto_the_rail`, which names the constant
+/// directly instead of restating it (PR #1408 review).
 const UPPER_RAIL_VARIANCE: f64 = 162_754.791_419_003_92;
 
 /// The warfarin base model, with `omega ETA_CL` spliced in.
@@ -89,26 +91,6 @@ fn fit_warfarin(dir: &Path, omega_cl: &str) -> FitResult {
     fit(&model, &population, &init, &options).expect("fit must reach an Ok")
 }
 
-/// The fixture's own straddle: the declared variance must pack **onto or past**
-/// the upper rail, or the test below is a fit from an ordinary interior start
-/// and says nothing about rails at all.
-///
-/// Measured: `ln(√162754.79141900392) == 6.0` exactly (`packed == 6.0` is
-/// `true`), so the start is *on* the rail and `clamp_to_bounds` is a no-op on
-/// it. The assertion is `>=` rather than `==` because a future `f64` rounding
-/// change in `sqrt`/`ln` could put it a ULP above, which is still on the rail
-/// after the clamp — but a ULP *below* would silently make this an interior
-/// start, and that is what must redden.
-#[test]
-fn the_upper_rail_fixture_starts_on_the_rail() {
-    let packed = UPPER_RAIL_VARIANCE.sqrt().ln();
-    assert!(
-        packed >= OMEGA_CHOL_PACKED_UPPER,
-        "fixture no longer starts on the upper rail: ln(sqrt({UPPER_RAIL_VARIANCE})) = \
-         {packed} < {OMEGA_CHOL_PACKED_UPPER}"
-    );
-}
-
 /// Regression: an upper-rail twin of #1229's lower-rail gate, written on the
 /// assumption that the two rails are symmetric. They are not — measured here —
 /// and rejecting a start on the `+6` rail would refuse a model that fits
@@ -145,13 +127,38 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
     let base = fit_warfarin(dir.path(), "0.09");
     let railed = fit_warfarin(dir.path(), &format!("{UPPER_RAIL_VARIANCE}"));
 
-    // Every comparand finite *before* anything folds it: a solve that returned
-    // `NaN` is the likeliest way to break what this test pins, and both
-    // `f64::max` and a bare `<` comparison would swallow it.
+    // Every comparand checked *before* anything folds it, and `is_finite()` is
+    // not the check. The inner objective clamps a blown-up value to a `1e20`
+    // sentinel and the outer objective doubles it, so a fit that was **repelled**
+    // rather than solved comes back as a perfectly finite `2e20` — and the
+    // differential below would then compare two repelled arms to each other and
+    // pass. Verified on PR #1408's review by overwriting both arms' `ofv` with
+    // `2e20`: the test stayed green. So each arm must have converged, and each
+    // OFV must sit below `DIVERGENCE_OFV` (`1e14`, the engine's own
+    // repelled-vs-solved cutoff, `estimation::outer_optimizer`) *and* on the
+    // real optimum.
+    //
+    // Realised margins on this fixture: the arms score -280.363962, which is
+    // 3.6e11 x below the 1e14 cutoff and 7.1e17 x below the 2e20 sentinel, so
+    // the bound separates a solved fit from a repelled one by eleven orders of
+    // magnitude rather than by a tolerance.
+    const DIVERGENCE_OFV: f64 = 1e14;
+    const BASE_OPTIMUM_OFV: f64 = -280.363_962;
     for (label, arm) in [("base", &base), ("upper rail", &railed)] {
         assert!(
-            arm.ofv.is_finite(),
-            "{label} arm OFV is not finite: {}",
+            arm.converged,
+            "{label} arm did not converge (OFV {})",
+            arm.ofv
+        );
+        assert!(
+            arm.ofv.is_finite() && arm.ofv < DIVERGENCE_OFV,
+            "{label} arm OFV {} is not a solved objective — at or above the \
+             {DIVERGENCE_OFV:e} repelled cutoff, or non-finite",
+            arm.ofv
+        );
+        assert!(
+            (arm.ofv - BASE_OPTIMUM_OFV).abs() < 1e-3,
+            "{label} arm OFV {} is not the base optimum {BASE_OPTIMUM_OFV}",
             arm.ofv
         );
         for (name, v) in arm.theta_names.iter().zip(&arm.theta) {
@@ -188,9 +195,9 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
         );
     }
 
-    // The straddle, asserted rather than assumed: ETA_CL really did start 12
-    // packed units away from where the base arm started, so the agreement above
-    // is two trajectories meeting and not one fixture written twice.
+    // The straddle, asserted rather than assumed: ETA_CL really did start far
+    // from where the base arm started, so the agreement above is two
+    // trajectories meeting and not one fixture written twice.
     // (measured: ln(√0.09) = -1.204 against the rail's +6.0, a gap of 7.204 out
     // of the box's 12 units of width).
     let base_start = 0.09_f64.sqrt().ln();

@@ -274,6 +274,55 @@ fn declared_zero_variance_arrives_at_the_regularisation_floor() {
 /// re-hardcoded literal against a moved rail, both redden it, and neither is
 /// visible to any other test in this file (they all assert on the eta name, the
 /// code, or the `FIX` advice, none of which the cliff figure touches).
+/// Regression: the conversion itself, pinned **away from the rail's current
+/// value** — which is the half the first version of this file did not have, and
+/// the reason it passed under the smallest edit that restores the bug.
+///
+/// Measured on PR #1408's review: with the production rail at `-6`, replacing
+/// the derivation with the decimal `6.144_212_353_328_21e-6` leaves
+/// `the_quoted_cliff_is_the_variance_of_the_rail_the_box_carries` **green**,
+/// because both sides then print `6.14e-6` and agree for the wrong reason. Only
+/// a rail the constant is not can tell a derivation from a restatement.
+///
+/// Expected values are hand-computed rather than re-derived from
+/// `rail_variance_at`: `exp(2·-7) = exp(-14)`, `exp(2·-4.5) = exp(-9)`,
+/// `exp(2·6) = exp(12)`, each written as the decimal an independent evaluation
+/// gives. The `-6` row is included last so the pair that does *not* discriminate
+/// is visible next to the pairs that do.
+#[test]
+fn rail_variance_at_non_default_rails() {
+    use crate::estimation::parameterization::{rail_variance_at, OMEGA_CHOL_PACKED_LOWER};
+
+    // (rail, exp(2 * rail)) — computed outside this crate.
+    let cases: [(f64, f64); 4] = [
+        (-7.0, 8.315287191035679e-7),
+        (-4.5, 1.2340980408667956e-4),
+        (6.0, 162_754.791_419_003_92),
+        (-6.0, 6.144_212_353_328_21e-6),
+    ];
+    for (rail, want) in cases {
+        let got = rail_variance_at(rail);
+        assert!(
+            (got - want).abs() <= 1e-13 * want.abs(),
+            "rail_variance_at({rail}) = {got:e}, want {want:e}"
+        );
+    }
+
+    // The straddle that makes the first three rows load-bearing: they are rails
+    // the production constant is not, so a `rail_variance_at` re-spelled as the
+    // current rail's decimal cannot satisfy them.
+    for (rail, _) in &cases[..3] {
+        assert_ne!(
+            *rail, OMEGA_CHOL_PACKED_LOWER,
+            "a discriminating row went degenerate: it now equals the production rail"
+        );
+    }
+}
+
+/// Regression: the message quoting a rail it has no link to. Kept alongside
+/// `rail_variance_at_non_default_rails`, which pins the conversion; this one
+/// pins that the **message** reads its cliff from the box rather than from
+/// anywhere else.
 #[test]
 fn the_quoted_cliff_is_the_variance_of_the_rail_the_box_carries() {
     // A tiny-but-positive start, so the message is the "everything else" arm —

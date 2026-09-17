@@ -111,11 +111,13 @@ pub(crate) const SIGMA_PACK_UPPER: f64 = 5.0;
 ///
 /// Named for the same reason [`SIGMA_PACK_LOWER`] is, and with more sites to
 /// keep honest: [`unpinned_bounds`] pushes it three times (BSV diagonal, Ω_IOV
-/// diagonal, `[mixture]` Ω override), and `api::validation`'s
+/// diagonal, `[mixture]` Ω override); `api::validation`'s
 /// `E_OMEGA_INIT_AT_RAIL` (#1229) both *compares against* it and quotes
 /// `exp(2·lower)` back at the user as the largest variance that lands on it —
-/// a number that was a hand-typed decimal literal until #1242. Six independent
-/// spellings of one rail, with a diagnostic whose whole job is to report it.
+/// a number that was a hand-typed decimal literal until #1242; and
+/// `ferx-tools`' search seeder carried a **seventh** copy of that same decimal,
+/// in a crate that cannot see this constant, until the same change gave it
+/// [`omega_variance_at_or_below_rail`] to ask instead.
 ///
 /// # Why the Ω regularisation floor sits **below** this rail, on purpose
 ///
@@ -181,6 +183,50 @@ pub(crate) const OMEGA_CHOL_OFFDIAG_PACKED_LOWER: f64 = -10.0;
 
 /// See [`OMEGA_CHOL_OFFDIAG_PACKED_LOWER`].
 pub(crate) const OMEGA_CHOL_OFFDIAG_PACKED_UPPER: f64 = 10.0;
+
+/// The largest `L_ii²` whose packed coordinate `ln(L_ii)` still lands at or
+/// below `rail`: `ln(√v) <= rail  ⇔  v <= exp(2·rail)`.
+///
+/// Takes the rail rather than reading [`OMEGA_CHOL_PACKED_LOWER`] so the
+/// **conversion** can be tested away from the rail's current value. That is not
+/// decoration: with the rail at `-6` and the conversion spelled as the decimal
+/// `6.144_212_353_328_21e-6`, every test comparing "what the code says" against
+/// "what the rail says" agrees for the wrong reason, and the smallest edit that
+/// restores the pre-#1242 duplicate — writing that literal back — stays green
+/// (verified on PR #1408 review). `rail_variance_at_non_default_rails` pins it
+/// at rails the current constant is not.
+#[inline]
+pub(crate) fn rail_variance_at(rail: f64) -> f64 {
+    (2.0 * rail).exp()
+}
+
+/// Would a **free** Ω / Ω_IOV / `[mixture]`-Ω Cholesky diagonal whose squared
+/// value is `l_ii_squared` start at or below the optimizer's lower rail — i.e.
+/// would `fit()` refuse it with `E_OMEGA_INIT_AT_RAIL` (#1229)?
+///
+/// The argument is `L_ii²`, which for a **diagonal** Ω is the declared variance
+/// and for a `block_omega` is what is left of it after the off-diagonals. The
+/// predicate is `<=`, matching the gate: at equality the start is clamped onto
+/// the rail and the coordinate cannot be estimated from there (#1242).
+///
+/// # Why this is public API
+///
+/// `ferx-tools` seeds a search child's Ω and must not hand the engine a start
+/// the engine will refuse. Before #1408's review it asked that question with its
+/// own copy of the answer — `const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6`
+/// in `search/seed.rs`, a *seventh* spelling of this rail, in a crate that
+/// cannot see a `pub(crate)` constant. Moving the rail left every `ferx-tools`
+/// test green (verified: at `OMEGA_CHOL_PACKED_LOWER = -4.0` the rail variance
+/// is 3.35e-4, 55x the seeder's own threshold, and 602 tests still passed) while
+/// every seeded candidate would have been refused by `fit()`.
+///
+/// A predicate rather than the constant, because the packed representation is
+/// ferx-core's business and a consumer only ever needs the yes/no. It is
+/// reachable from ferx-r on the same terms as every other item in this module.
+#[inline]
+pub fn omega_variance_at_or_below_rail(l_ii_squared: f64) -> bool {
+    l_ii_squared <= rail_variance_at(OMEGA_CHOL_PACKED_LOWER)
+}
 
 /// Unconstrained-space bound for a Fisher-z (`atanh ρ`) residual-correlation
 /// coordinate (#847). `tanh(3) ≈ 0.995_05`, so `1 − ρ² ≥ 9.9e-3`.
@@ -2873,6 +2919,40 @@ mod tests {
         assert_relative_eq!(bounds.upper[1], 3.0, epsilon = 1e-12);
         assert_relative_eq!(bounds.lower[2], -1.0, epsilon = 1e-12);
         assert_relative_eq!(bounds.upper[2], 1.0, epsilon = 1e-12);
+    }
+
+    /// The premise of `tests/omega_rail_start.rs`'s Tier-3 upper-rail arm: the
+    /// decimal that file declares must pack **onto or past** the upper rail, or
+    /// that fit is an ordinary interior start and says nothing about rails.
+    ///
+    /// It lives here rather than in the integration file for two reasons (#1408
+    /// review): it is pure arithmetic over a crate-private constant, so it
+    /// belongs on the fast PR path rather than behind `slow-tests`; and here it
+    /// can name [`OMEGA_CHOL_PACKED_UPPER`] instead of restating `6.0` as a
+    /// second literal, which is the duplication this whole change exists to
+    /// remove.
+    ///
+    /// Measured: `ln(√162754.79141900392) == 6.0` exactly. Asserted `>=` rather
+    /// than `==` because a ULP above is still on the rail after
+    /// [`clamp_to_bounds`], while a ULP below would silently turn the Tier-3
+    /// fixture into an interior start — which is the direction that must redden.
+    #[test]
+    fn upper_rail_variance_fixture_packs_onto_the_rail() {
+        // Kept byte-identical to `UPPER_RAIL_VARIANCE` in `tests/omega_rail_start.rs`.
+        const FIXTURE_VARIANCE: f64 = 162_754.791_419_003_92;
+        let packed = FIXTURE_VARIANCE.sqrt().ln();
+        assert!(
+            packed >= OMEGA_CHOL_PACKED_UPPER,
+            "the Tier-3 fixture no longer starts on the upper rail: \
+             ln(sqrt({FIXTURE_VARIANCE})) = {packed} < {OMEGA_CHOL_PACKED_UPPER}"
+        );
+        // And it is the *rail*, not merely a large number: the same decimal read
+        // back through the conversion is the rail's own variance.
+        assert_relative_eq!(
+            FIXTURE_VARIANCE,
+            rail_variance_at(OMEGA_CHOL_PACKED_UPPER),
+            epsilon = 1e-9
+        );
     }
 
     #[test]

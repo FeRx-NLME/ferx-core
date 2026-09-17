@@ -3871,24 +3871,6 @@ fn outer_search_runs(options: &FitOptions) -> bool {
     })
 }
 
-/// The largest **variance** whose packed coordinate still lands on the Ω
-/// Cholesky-diagonal lower rail: `ln(√v) ≤ lower ⇔ v ≤ exp(2·lower)`. Quoted in
-/// the tiny-non-zero message so the user is told where the cliff is, not just
-/// that they are past it.
-///
-/// Derived from
-/// [`crate::estimation::parameterization::OMEGA_CHOL_PACKED_LOWER`] rather than
-/// spelled as a decimal. It was `6.144_212_353_328_21e-6` — the value of
-/// `exp(-12)`, typed out — which is a message quoting a rail it has no link to:
-/// moving the rail would have left this number behind with nothing to catch it,
-/// the same trap #1309 took out of the Σ diagnostic by naming
-/// `SIGMA_PACK_LOWER` (#1242). Not a `const` because `f64::exp` is not
-/// `const fn`.
-#[inline]
-fn rail_variance_cliff() -> f64 {
-    (2.0 * crate::estimation::parameterization::OMEGA_CHOL_PACKED_LOWER).exp()
-}
-
 /// Which declaration a flagged variance coordinate came from — the keyword the
 /// user has to go and edit.
 enum VarianceDecl {
@@ -4223,7 +4205,17 @@ pub(crate) fn check_variance_init_rails(
             // Everything else: a tiny-but-positive diagonal start, or a
             // regularised indefinite matrix. The declared value is not
             // recoverable, so only the coordinate is described.
-            let cliff = rail_variance_cliff();
+            // The cliff comes from `lo` — **this coordinate's** lower bound, out
+            // of the box `pack_with_bounds` built two dozen lines up — not from
+            // the rail constant and not from a decimal. It was
+            // `6.144_212_353_328_21e-6`, `exp(2·-6)` typed out in a different
+            // file from the `-6`, which is a message quoting a rail it has no
+            // link to (#1242). Reading `lo` is what makes the quoted figure and
+            // the bound the same number by construction rather than by
+            // agreement; `rail_variance_at` is only the conversion, and is
+            // pinned at non-default rails so it cannot be re-spelled as a
+            // constant either (PR #1408 review).
+            let cliff = crate::estimation::parameterization::rail_variance_at(lo);
             (
                 format!(
                     "{name} starts at a variance of {rail_variance:.3e} on the optimizer's \

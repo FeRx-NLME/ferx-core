@@ -162,23 +162,28 @@ fn floor_matrix(
     changed.then_some(omega)
 }
 
-/// The engine's rail on a packed Cholesky diagonal, as a variance:
-/// `ln(L) = −6`, i.e. `L² = e⁻¹²`. A start at or below it is refused
-/// (`api/validation.rs`).
-const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6;
-
 /// The smallest Cholesky diagonal (squared) the block check accepts: the
-/// rail with headroom. Deliberately *below* [`MIN_SEED_VARIANCE`] — a block
-/// whose diagonals were just floored to 1e-5 and whose covariance is small
-/// has a Cholesky diagonal a hair under 1e-5, and is startable; nudging it
-/// again would move the declared variances for nothing.
+/// engine's rail with headroom. Deliberately *below* [`MIN_SEED_VARIANCE`] — a
+/// block whose diagonals were just floored to 1e-5 and whose covariance is
+/// small has a Cholesky diagonal a hair under 1e-5, and is startable; nudging
+/// it again would move the declared variances for nothing.
+///
+/// This is a **seeding-policy** number, and the engine's rail is not ours to
+/// copy: it used to sit next to `const RAIL_VARIANCE = 6.144_212_353_328_21e-6`
+/// here, a private restatement of `ferx_core`'s own rail in a crate that cannot
+/// see it. Moving the core rail left every test in this crate green — measured
+/// on PR #1408's review at `OMEGA_CHOL_PACKED_LOWER = -4.0`, where the real rail
+/// variance is 3.35e-4, **55x this threshold**, so every seeded child would have
+/// been refused by `fit()` with `E_OMEGA_INIT_AT_RAIL` while 602 tests passed.
+/// The relationship is now asserted against the engine itself, by
+/// [`omega_variance_at_or_below_rail`], in
+/// `seed_tests::min_cholesky_variance_still_clears_the_engine_rail`.
 const MIN_CHOLESKY_VARIANCE: f64 = 8e-6;
 
 /// Whether `omega` has a Cholesky factor whose every diagonal entry, squared,
 /// is above the rail with headroom ([`MIN_CHOLESKY_VARIANCE`]). A matrix
 /// that is not positive-definite has no factor and fails too.
 fn cholesky_above_rail(omega: &nalgebra::DMatrix<f64>) -> bool {
-    debug_assert!(MIN_CHOLESKY_VARIANCE > RAIL_VARIANCE);
     if omega.iter().any(|v| !v.is_finite()) {
         // Nothing to regularise: `SeedInits` skips a non-finite entry.
         return true;
