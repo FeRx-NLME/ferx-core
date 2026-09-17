@@ -2848,13 +2848,19 @@ fn negative_zero_is_reported_like_every_other_negative() {
     // `-0.0 == 0.0`) and `(-0.0f64) as usize` is `0`, so `-0` used to read as
     // compartment 0 — the *default dose compartment*, silently accepted — while
     // `-1` one row below was reported. The straddle is the point: all three
-    // spellings are negative, so all three must be reported alike, and the
-    // literal `0` control below must still not be.
+    // spellings are negative, so all three must be reported alike — while the
+    // literal `0` on row four must **not** be, even though it doses the same
+    // compartment they do. `CMT=0` is NONMEM's default dose compartment and
+    // resolves to 1 (#899, `DoseEvent::cmt_1based`), so the two cases are
+    // indistinguishable downstream and only the *report* separates them: the
+    // reader says what it had to guess at, and `0` was authored. Without this row
+    // the comment named a control the fixture did not contain (review round 2).
     let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                1,0,.,1,100,-0,1\n\
                1,1,.,1,100,-0.0,1\n\
                1,2,.,1,100,-1,1\n\
-               1,3,5.0,0,.,1,0\n";
+               1,3,.,1,100,0,1\n\
+               1,4,5.0,0,.,1,0\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let w = pop
@@ -2869,14 +2875,18 @@ fn negative_zero_is_reported_like_every_other_negative() {
     for quoted in ["\"-0\"", "\"-0.0\"", "\"-1\""] {
         assert!(w.contains(quoted), "must quote {quoted}: {w}");
     }
+    assert!(
+        !w.contains("\"0\""),
+        "the authored `0` is NONMEM's default dose compartment, not a guess: {w}"
+    );
     assert_eq!(
         pop.subjects[0]
             .doses
             .iter()
             .map(|d| d.cmt_1based())
             .collect::<Vec<_>>(),
-        vec![1; 3],
-        "and all three default to compartment 1 rather than to `0`"
+        vec![1; 4],
+        "all four dose compartment 1 — which is why only the report distinguishes them"
     );
 }
 
@@ -2929,11 +2939,19 @@ fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
     // YAML and the check report. A mis-mapped free-text column would otherwise put
     // a whole sentence in each, and a cell containing `"` would produce `"a"b"`.
     let long = "x".repeat(60);
+    // Row three carries U+2028 LINE SEPARATOR. `char::is_control()` is the Cc
+    // category only, so U+2028 passes that test — and this string lands in a
+    // one-line warning and in the fit YAML, either of which a line break would
+    // split (review round 2, nit 9).
+    //
+    // Exactly `MAX_CMT_EXAMPLES` distinct spellings: a fourth would be withheld and
+    // the assertion about it would pass for the wrong reason.
     let csv = format!(
         "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
          1,0,.,1,100,{long},1\n\
          1,1,.,1,100,a\"b,1\n\
-         1,2,5.0,0,.,1,0\n"
+         1,2,.,1,100,p\u{2028}q,1\n\
+         1,3,5.0,0,.,1,0\n"
     );
     let f = write_csv(&csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
@@ -2954,6 +2972,17 @@ fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
         !w.contains("a\"b"),
         "an embedded quote must not survive verbatim: {w}"
     );
+    assert!(
+        !w.contains('\u{2028}'),
+        "a Unicode line separator must not reach a one-line warning: {w}"
+    );
+    assert!(
+        w.contains("p\u{fffd}q"),
+        "it is replaced in place rather than dropped, so the cell stays recognisable: {w}"
+    );
+    // The whole warning is one line. Asserted directly, because that is the
+    // property the escaping exists for and it holds however the escape is spelled.
+    assert_eq!(w.lines().count(), 1, "the warning must be one line: {w:?}");
 }
 
 #[test]
@@ -3026,4 +3055,132 @@ fn emitted_cmt_defaulted_message_classifies_as_data_quality() {
              prose arm or the `general` fallback; message was: {w}"
         );
     }
+}
+
+/// Review round 2, finding 4: the observation count's *move* was untested.
+///
+/// The count used to sit before the endpoint branch behind
+/// `!skip_missing_dv || routing.tte.contains(&cmt)`; it now sits after all four
+/// arms, so "reaching this line" *is* "the row became an observation". The only
+/// behavioural difference between the two placements is a TTE row that the
+/// `TENTRY > TIME` guard drops as malformed — the old guard's `routing.tte`
+/// disjunct deliberately kept such a row, the new placement cannot. No fixture had
+/// a defaulted CMT on one, so the mutation that puts the count back survived the
+/// whole suite while this PR's own mutation table claimed it killed five tests.
+///
+/// The straddle is the point: the same two rows, differing only in `TENTRY`, must
+/// give different counts. Either half alone passes for an implementation that
+/// counts every `EVID=0` row.
+#[cfg(feature = "survival")]
+#[test]
+fn a_tte_row_dropped_for_entry_after_event_is_not_counted_as_an_observation() {
+    use std::collections::HashSet;
+    let tte: HashSet<usize> = [1].into_iter().collect();
+    let routing = ObsRouting::tte_and_discrete(&tte, &HashSet::new());
+
+    // `x` is unparseable, so every row defaults to compartment 1 *and* is reported.
+    let read = |tentry_first: &str| -> String {
+        let csv = format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,TENTRY\n\
+             1,20,1,0,.,x,0,{tentry_first}\n\
+             1,30,0,0,.,x,0,0\n"
+        );
+        let f = write_csv(&csv);
+        let (pop, _) = read_nonmem_csv_routed(f.path(), None, None, &[], None, None, &routing, &[])
+            .expect("fixture reads");
+        pop.warnings
+            .iter()
+            .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+            .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings))
+            .clone()
+    };
+
+    // Control: both rows are well-formed TTE observations, so both count.
+    let both_valid = read("0");
+    assert!(
+        both_valid.contains("0 dose row(s) and 2 observation row(s)"),
+        "control: two well-formed TTE rows are two observations: {both_valid}"
+    );
+
+    // TENTRY=50 > TIME=20: the reader warns about the row and `continue`s before it
+    // becomes an `obs_records` entry, so it is not a compartment the fit ever used.
+    let one_dropped = read("50");
+    assert!(
+        one_dropped.contains("0 dose row(s) and 1 observation row(s)"),
+        "a TENTRY > TIME row is dropped, so it is not counted: {one_dropped}"
+    );
+}
+
+/// The other half of the same move, on the Gaussian arm: a missing-DV row skipped
+/// under #258 routes nowhere and is already reported by `W_MISSING_DV`, so counting
+/// it here would report one row as two findings.
+///
+/// Separate from the TTE case because the two take different `continue`s — this one
+/// fires before the endpoint branch, that one inside it — so a placement that fixes
+/// only one reddens only one.
+#[test]
+fn a_missing_dv_row_skipped_by_the_reader_is_not_counted_as_an_observation() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,1,100,x,1\n\
+               1,1,.,0,.,x,0\n\
+               1,2,5.0,0,.,x,0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+    assert!(
+        pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+        "control: the skipped row is reported by its own code: {:?}",
+        pop.warnings
+    );
+    let w = pop
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+        .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings));
+    assert!(
+        w.contains("1 dose row(s) and 1 observation row(s)"),
+        "the missing-DV row is skipped, so only the scored row counts: {w}"
+    );
+}
+
+/// Review round 2, finding 5: the ellipsis compared **rows** against **spellings**.
+///
+/// `n_unparseable_cell > examples.len()` is true whenever one bad spelling repeats,
+/// so five rows all saying `x` printed `("x", …)` — implying spellings it had not
+/// withheld. The gate is now the cap itself, and these two halves differ in exactly
+/// the variable the old predicate could not see: the number of *rows* is 5 in both,
+/// which is why the earlier straddle (5 spellings vs 3) could not separate them.
+#[test]
+fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
+    let read = |cells: [&str; 5]| -> String {
+        let mut csv = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV\n");
+        for (i, c) in cells.iter().enumerate() {
+            csv.push_str(&format!("1,{},{}.0,0,.,{},0\n", i + 1, i + 1, c));
+        }
+        let f = write_csv(&csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        pop.warnings
+            .iter()
+            .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+            .unwrap_or_else(|| panic!("no W_CMT_DEFAULTED in {:?}", pop.warnings))
+            .clone()
+    };
+
+    // Five rows, one spelling. Nothing was withheld, so nothing may be implied.
+    let one_spelling = read(["x"; 5]);
+    assert!(
+        one_spelling.contains("(\"x\")"),
+        "one spelling is listed in full: {one_spelling}"
+    );
+    assert!(
+        !one_spelling.contains('…'),
+        "five rows of one spelling withhold nothing, so no ellipsis: {one_spelling}"
+    );
+
+    // Five rows, five spellings, cap of three. Two were withheld.
+    let five_spellings = read(["a", "b", "c", "d", "e"]);
+    assert!(
+        five_spellings.contains("(\"a\", \"b\", \"c\", …)"),
+        "a capped list says so: {five_spellings}"
+    );
 }

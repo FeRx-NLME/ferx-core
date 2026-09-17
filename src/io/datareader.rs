@@ -1077,7 +1077,11 @@ fn read_nonmem_csv_impl(
             n_obs,
             n_missing_cell,
             n_unparseable_cell,
+            // Both are the business of `example_list`, which owns the quoting and
+            // the "was anything withheld" decision; destructured exhaustively so a
+            // field added to `CmtDefaults` has to be answered for here.
             examples: _,
+            examples_capped: _,
         } = &total_cmt_defaults;
         // An `ADDL` row is one cell to fix but many doses delivered, so name both
         // when they differ — the row count alone understates how much drug went to
@@ -1341,6 +1345,13 @@ enum CmtCell {
 ///   then saturates to `usize::MAX`. The strict `<` rejects it. (`f as u64 as f64
 ///   == f` does **not** close this: the saturated `u64::MAX` rounds back to 2^64
 ///   and compares equal.)
+///
+/// That rounding makes the strict `<` reject `usize::MAX` written in float form too
+/// — `"18446744073709551615"` is `Value`, `"18446744073709551615.0"` is
+/// `Unparseable` — since the literal rounds to the same 2^64. Measured, and left
+/// as it is: the two spellings disagree only for a compartment index 1.8e19 past
+/// anything a model can declare, and both ends of the disagreement are reported
+/// rather than silently defaulted.
 fn parse_cmt_cell(s: &str) -> CmtCell {
     let t = s.trim();
     if is_missing_cell(t) {
@@ -1412,7 +1423,13 @@ fn truncate_example(cell: &str) -> String {
         .trim()
         .chars()
         .map(|c| {
-            if c == '"' || c.is_control() {
+            // `is_control` is the Cc category only, which leaves the Unicode line
+            // separators U+2028 / U+2029 intact — and this string lands in a
+            // one-line warning and in the fit YAML, both of which a line break
+            // would split. Named explicitly rather than widened to
+            // `!is_ascii_graphic()`, which would also mangle the non-ASCII cells
+            // the truncation test deliberately keeps legible.
+            if c == '"' || c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
                 '\u{fffd}'
             } else {
                 c
@@ -1452,17 +1469,31 @@ struct CmtDefaults {
     n_unparseable_cell: usize,
     /// Up to [`MAX_CMT_EXAMPLES`] distinct unparseable spellings, first seen first.
     examples: Vec<String>,
+    /// Whether a *distinct* spelling was seen that [`Self::examples`] had no room
+    /// for — the one thing that licenses the trailing `…`.
+    ///
+    /// Tracked rather than inferred from the counters. Comparing
+    /// `n_unparseable_cell` (a count of **rows**) against `examples.len()` (a count
+    /// of **spellings**) answers a different question, and gets it wrong in the
+    /// commonest case there is: five rows that all say `x` are one spelling, and the
+    /// row comparison printed `("x", …)` — claiming spellings it had not withheld.
+    examples_capped: bool,
 }
 
 impl CmtDefaults {
-    /// Remember one distinct offending spelling, up to the cap. The single owner of
-    /// that policy: `record` and `absorb` both route here, so raising the cap or
-    /// changing the ordering cannot land in the per-subject path and miss the
-    /// cross-subject one.
+    /// Remember one distinct offending spelling, up to the cap, and record whether
+    /// anything was turned away. The single owner of that policy: `record_*` and
+    /// `absorb` both route here, so raising the cap or changing the ordering cannot
+    /// land in the per-subject path and miss the cross-subject one.
     fn push_example(&mut self, text: &str) {
-        if self.examples.len() < MAX_CMT_EXAMPLES && !self.examples.iter().any(|e| e == text) {
-            self.examples.push(text.to_string());
+        if self.examples.iter().any(|e| e == text) {
+            return;
         }
+        if self.examples.len() >= MAX_CMT_EXAMPLES {
+            self.examples_capped = true;
+            return;
+        }
+        self.examples.push(text.to_string());
     }
 
     /// One dose row that produced `n_events` dose events (`1 + ADDL`).
@@ -1495,6 +1526,9 @@ impl CmtDefaults {
         self.n_obs += other.n_obs;
         self.n_missing_cell += other.n_missing_cell;
         self.n_unparseable_cell += other.n_unparseable_cell;
+        // A subject that already had to withhold a spelling keeps that fact when it
+        // is folded in, and pushing its examples can newly fill us up.
+        self.examples_capped |= other.examples_capped;
         for text in other.examples {
             self.push_example(&text);
         }
@@ -1504,9 +1538,10 @@ impl CmtDefaults {
         self.n_dose > 0 || self.n_obs > 0
     }
 
-    /// The offending spellings, quoted, with an ellipsis when the list was capped.
-    /// Without it a message reading `5 row(s) … ("-1", "2.5", "x")` presents three
-    /// spellings as if they were all five.
+    /// The offending spellings, quoted, with an ellipsis when a spelling was
+    /// withheld. Without it a message reading `9 row(s) … ("-1", "2.5", "x")`
+    /// presents three spellings as if they were all that occurred; with it keyed on
+    /// the row count instead, `5 row(s) … ("x", …)` invents two more.
     fn example_list(&self) -> String {
         let mut s = self
             .examples
@@ -1514,7 +1549,7 @@ impl CmtDefaults {
             .map(|e| format!("\"{e}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        if self.n_unparseable_cell > self.examples.len() {
+        if self.examples_capped {
             s.push_str(", …");
         }
         s
