@@ -1998,8 +1998,29 @@ impl SolverStatsPhase {
         }
     }
 
+    /// What paid for a discarded escalation *and* the re-solve that replaced it, as the
+    /// subject of "… paid for both solves".
+    ///
+    /// The clause used to say "the fit" unconditionally, which is false from every phase but
+    /// one — a `predict()` caller has not run a fit, and telling them one paid for something
+    /// invents a run that never happened. Split out rather than reworded into a passive
+    /// ("both solves were paid for") because *who* absorbed the cost is the actionable part:
+    /// on a `simulate()` it is this call, repeated per replicate.
+    fn payer(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => "the fit",
+            Self::Predict => "this predict() pass",
+            Self::Simulate => "this simulate() pass",
+            Self::SimulateAdaptive => "this simulate_adaptive() run",
+        }
+    }
+
     /// The sentence naming which pass produced the counters, so a reader can tell a
     /// one-per-subject sweep from an `n_sim`-replicate one.
+    ///
+    /// Attached to **both** severities. It was on the warning only at first, so the
+    /// informational escalation note — the more common message on a stiff model — named no pass
+    /// at all and its counters read as the fit's wherever they came from.
     fn provenance(self) -> &'static str {
         match self {
             Self::PostfitPredictions => {
@@ -2070,24 +2091,57 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
     }
 }
 
-/// Every diagnostic a non-`fit()` entry point can report: the model/data warning bundle
-/// (#1280) followed by the ODE-solver diagnostics of the pass that just ran (#1304).
+/// Every diagnostic a non-`fit()` entry point can report (#1280 / #1304).
 ///
 /// **One implementation, three callers.** `predict_diag`, `simulate_with_options_diag` and
-/// `simulate_adaptive` all report exactly this list, so a diagnostic added to
-/// [`crate::api::check_model_data_warnings`] reaches all three at once and none of them can
-/// carry a different subset than the others —
-/// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality on a
-/// fixture that trips both halves.
+/// `simulate_adaptive` all report exactly this list, so a diagnostic added to any source below
+/// reaches all three at once and none of them can carry a different subset than the others —
+/// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality across
+/// all three on a fixture that trips both halves.
 ///
-/// The bundle is **not** filtered per entry point. It is the same list `ferx check` prints and
-/// `fit()` pushes into [`FitResult::warnings`](crate::types::FitResult::warnings); dropping a
-/// code here because it reads oddly outside a fit is the special-case-on-shared-infrastructure
-/// arrangement that produced the "which entry point sees which finding" confusion #1280 was
-/// filed about. Two members are phrased for a fit (`W_ADDITIVE_INIT_SCALE` advises on optimizer
-/// basins; `W_MODELED_*_NONPOSITIVE` calls its values "initial estimates"), and they are still
-/// true of the numbers being served — a σ_add that cannot absorb the data is as visible in a
-/// simulated DV column as in a fit.
+/// # What is in it, and what is not
+///
+/// The rule is **a finding about the model or the data is carried; a finding about the fit's
+/// configuration or the optimizer's start is not** — because on these entry points there is no
+/// fit and no optimizer, so such a finding would be about something that is not happening.
+///
+/// Carried, in `fit()`'s own order (`api::fit`):
+///
+/// 1. [`CompiledModel::parse_warnings`](crate::types::CompiledModel::parse_warnings) — e.g.
+///    `W_ABSORPTION_TWIN_DECLINED`, which changes what a *prediction* does.
+/// 2. [`Population::warnings`](crate::types::Population::warnings), through the same
+///    `reader_warning_suppressed` filter `fit()` and `ferx check` use, so all three suppress
+///    exactly the same reader findings (`W_ADDL_MISSING_II`, `W_IOV_OCC_MISSING`).
+/// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
+///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` bundle.
+/// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
+///    experimental whichever door you use it through.
+/// 5. The ODE-solver diagnostics of the pass that just ran.
+///
+/// **Deliberately not carried**, and the reason is structural rather than editorial:
+///
+/// * The warning half of `check_model_options`. It takes a `&FitOptions` these entry points do
+///   not have, and synthesizing one would report findings about *defaults the caller never
+///   chose* — the same trap [`solver_reporting_options`] exists to avoid. Its subject is an
+///   estimator/optimizer combination that is not running (`W_GN_NO_RANDOM_EFFECTS` and
+///   friends).
+/// * The warning half of `check_packed_start_in_box` (#1251). Its subject is the packed vector
+///   the **outer optimizer** starts from; nothing is packed on a prediction or a simulation.
+/// * `fit()`'s operational notes — the FD-fallback count, the thread-count hint, the
+///   covariance-step cost estimate, the NLopt availability probe. All describe a run that is
+///   not happening.
+///
+/// `the_bundle_carries_every_model_and_data_source_fit_carries` pins (1)–(4) end to end, and
+/// `the_bundle_excludes_the_findings_that_are_about_a_fit` pins the exclusions, so this comment
+/// cannot quietly stop matching the code.
+///
+/// Within what it carries the list is **not** filtered per entry point: dropping a code because
+/// it reads oddly outside a fit is the special-case-on-shared-infrastructure arrangement that
+/// produced the "which entry point sees which finding" confusion #1280 was filed about. Two
+/// members are phrased for a fit (`W_ADDITIVE_INIT_SCALE` advises on optimizer basins;
+/// `W_MODELED_*_NONPOSITIVE` calls its values "initial estimates"), and they are still true of
+/// the numbers being served — a σ_add that cannot absorb the data is as visible in a simulated
+/// DV column as in a fit.
 ///
 /// `stats` is what the caller's [`crate::ode::solver::SolverStatsScope`] collected; pass
 /// `OdeSolverStats::default()` on a model that integrates nothing (no scope, no counters, no
@@ -2099,10 +2153,24 @@ pub(crate) fn non_fit_diagnostics(
     stats: &crate::ode::OdeSolverStats,
     phase: SolverStatsPhase,
 ) -> Vec<String> {
-    let mut out: Vec<String> = crate::api::check_model_data_warnings(model, population, params)
-        .into_iter()
-        .map(|d| d.message)
-        .collect();
+    let mut out: Vec<String> = model.parse_warnings.clone();
+    out.extend(
+        population
+            .warnings
+            .iter()
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .cloned(),
+    );
+    out.extend(
+        crate::api::check_model_data_warnings(model, population, params)
+            .into_iter()
+            .map(|d| d.message),
+    );
+    out.extend(
+        crate::api::check_experimental_features(model)
+            .into_iter()
+            .map(|d| d.message),
+    );
     if let Some((msg, _)) =
         ode_solver_diagnostics_warning(stats, &solver_reporting_options(model), phase)
     {
@@ -2392,10 +2460,12 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
              segment(s) to a stiff stepper {at}; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
-             size.{switched_info_clause} Informational — set ode_method = {explicit} to pin the \
-             explicit stepper, or name a stiff method to pin the other half.",
+             size.{switched_info_clause} {provenance} Informational — set ode_method = \
+             {explicit} to pin the explicit stepper, or name a stiff method to pin the other \
+             half.",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             at = phase.at_label(),
+            provenance = phase.provenance(),
         );
         let entry = WarningEntry {
             severity: WarningSeverity::Info,
@@ -2439,12 +2509,13 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
              discarded as unusable and re-solved with {explicit} — the stiffness probe was \
              right that those segments are stiff and wrong that the stiff method it picked \
-             could integrate them, and the fit paid for both solves (the {discarded} step(s) \
+             could integrate them, and {payer} paid for both solves (the {discarded} step(s) \
              those attempts clamped are not in the count above: the guard replaced the \
              trajectory they produced); naming ode_method = rodas5p (or rosenbrock23) \
              explicitly is the next thing to try",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
+            payer = phase.payer(),
         ));
     }
     if rejected_jets > 0 {

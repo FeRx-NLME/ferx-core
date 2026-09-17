@@ -32,9 +32,13 @@ section of the SDLC for the versioning policy).
   finite and plottable. A new `predict_diag()` returns a `PredictionOutput` carrying both the rows
   and the findings (`predict()` is now the thin wrapper that discards them, unchanged and
   bit-identical), and `simulate_with_options_diag()` and `simulate_adaptive()` carry the same
-  bundle. It is the same unfiltered list `ferx check` prints; a message from a non-`fit()` entry
-  point says so, naming the pass and the parameters rather than "the final estimates", and reports
-  the `ode_method` the model actually runs at. `predict()`, `simulate()`, `simulate_with_seed()`,
+  bundle: parse warnings, data-reader warnings, the model/data checks, experimental-feature
+  notices and the solver diagnostics, unfiltered. Findings whose subject is the *fit* stay out —
+  the estimator/optimizer option warnings and the packed-start rails describe an optimizer that is
+  not running, and these entry points take no fit options to report them against. A message from a
+  non-`fit()` entry point says which pass it describes, naming the parameters you passed rather
+  than "the final estimates", and reports the `ode_method` the model actually runs at.
+  `predict()`, `simulate()`, `simulate_with_seed()`,
   `simulate_with_options()` and `simulate_with_uncertainty()` still return rows only — see
   [Which entry points report warnings](https://ferx-nlme.github.io/ferx-core/warnings.html#entry-points)
   ([#1280](https://github.com/FeRx-NLME/ferx-core/issues/1280),

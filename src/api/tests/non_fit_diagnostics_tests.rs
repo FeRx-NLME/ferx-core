@@ -367,53 +367,162 @@ fn segment_count(warnings: &[String]) -> Option<usize> {
 
 // ── the shared bundle ────────────────────────────────────────────────────────
 
-/// One implementation, and the entry points prove it: on a fixture that trips **both** halves,
-/// `predict_diag` and `simulate_with_options_diag` report the same findings.
+/// One implementation, and **every** entry point proves it: on a fixture that trips both
+/// halves, `predict_diag`, `simulate_with_options_diag` (in *both* of its branches) and
+/// `simulate_adaptive` report the same findings.
 ///
 /// Regression this catches: a per-entry-point filter — the fix #1280 explicitly rules out —
-/// creeping back in. Mutation: drop any one code from either caller's list and the set
-/// equality fails.
+/// creeping back in. Mutation: drop any one code from any caller's list and the set equality
+/// for that caller fails, naming it.
+///
+/// **All four arms are here because two of them were missing and the gap was demonstrable.**
+/// With only `predict` + ordinary `simulate` compared, two named escape edits survived the
+/// whole suite: returning solver diagnostics *without* the model/data findings from
+/// `simulate_adaptive`, and discarding the collected solver stats in `simulate`'s propensity
+/// branch alone. Both are green on the two-arm version and red here, verified by running them.
 ///
 /// Compared on the `W_`/`E_` code tokens rather than on whole messages: `simulate()` also
 /// carries per-subject simulation diagnostics that `predict()` has no analogue for, and the
 /// solver clause's step counts legitimately differ (simulate integrates `n_sim` replicates of
-/// each subject). What must not differ is *which findings* are reported.
+/// each subject, and the adaptive driver runs its own engine). What must not differ is *which
+/// findings* are reported.
 #[test]
 fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
-    let mut m = ode_model(1e5, 20);
     // Both halves live: an `SS=1, II=0` dose (model/data) on a budget-starved stiff ODE
-    // (solver). Checked below rather than assumed — a fixture that trips only one half would
+    // (solver). Asserted below rather than assumed — a fixture that trips only one half would
     // make this a test of the other one alone.
-    m.default_params = m.default_params.clone();
+    let m = ode_model(1e5, 20);
     let p = pop_ss_bad_ii(2);
+    let opts = |mm| SimulateOptions {
+        seed: Some(11),
+        match_method: mm,
+        ..Default::default()
+    };
+
     let from_predict = codes(&predict_diag(&m, &p, &m.default_params).warnings);
-    let from_simulate = codes(
-        &simulate_with_options_diag(
-            &m,
-            &p,
-            &m.default_params,
-            1,
-            &SimulateOptions {
-                seed: Some(11),
-                ..Default::default()
-            },
-        )
-        .expect("sim")
-        .warnings,
-    );
     assert!(
         from_predict.contains(&SOLVER.to_string()),
-        "the fixture must trip the solver half on both sides: {from_predict:?}"
+        "the fixture must trip the solver half: {from_predict:?}"
     );
     assert!(
         from_predict.len() >= 2,
         "…and the model/data half too, or this compares one finding with itself: \
          {from_predict:?}"
     );
-    assert_eq!(
-        from_predict, from_simulate,
-        "predict and simulate must report the same findings; a per-entry-point filter is \
-         exactly what #1280 rules out"
+
+    for (label, got) in [
+        (
+            "simulate",
+            codes(
+                &simulate_with_options_diag(&m, &p, &m.default_params, 1, &opts(None))
+                    .expect("sim")
+                    .warnings,
+            ),
+        ),
+        (
+            "simulate (propensity)",
+            codes(
+                &simulate_with_options_diag(
+                    &m,
+                    &p,
+                    &m.default_params,
+                    1,
+                    &opts(Some(crate::propensity_match::MatchMethod::Nearest)),
+                )
+                .expect("sim")
+                .warnings,
+            ),
+        ),
+    ] {
+        assert_eq!(
+            from_predict, got,
+            "{label} must report the same findings predict does; a per-entry-point filter is \
+             exactly what #1280 rules out"
+        );
+    }
+}
+
+/// `simulate_adaptive` is the third caller and gets its own arm, because it cannot share the
+/// fixture above: it runs its own reactive engine on its own population shape (decision times,
+/// a controller, no pre-scheduled dose grid).
+///
+/// Regression this catches: the named escape edit "return solver diagnostics without model/data
+/// findings from adaptive simulation", which was green against the whole suite before this.
+/// Mutation, run: replace `non_fit_diagnostics` in `simulate_adaptive` with a bare
+/// `ode_solver_diagnostics_warning` and only this test dies.
+#[test]
+fn simulate_adaptive_reports_both_halves_of_the_bundle() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+
+    // Same starved-budget ODE the adaptive suite uses, plus an `SS=1, II=0` base dose so the
+    // model/data half is live alongside the solver half.
+    let m = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_method = rk45
+  ode_max_steps = 2
+"#,
+    )
+    .expect("parse");
+
+    let obs_times = vec![6.0, 30.0, 54.0];
+    let subject = Subject {
+        id: "1".into(),
+        // SS with II = 0 — the `W_STEADY_STATE_II` finding, model/data half.
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0)],
+        obs_times: obs_times.clone(),
+        observations: vec![0.0; obs_times.len()],
+        obs_cmts: vec![1; obs_times.len()],
+        cens: vec![0; obs_times.len()],
+        occasions: vec![1u32; obs_times.len()],
+        dose_occasions: vec![1u32],
+        ..Default::default()
+    };
+    let population = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 24.0],
+        // The frozen-replay verifier compares two freeze-padded trajectories here; it is not
+        // what is under test and its outcome is not the assertion.
+        verify: false,
+        ..Default::default()
+    };
+    let controller = || |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let res = simulate_adaptive(&m, &population, &m.default_params, 1, controller, &opts)
+        .expect("adaptive sim runs");
+
+    assert!(
+        has(&res.warnings, SS_II),
+        "the model/data half must reach simulate_adaptive: {:?}",
+        res.warnings
+    );
+    assert!(
+        has(&res.warnings, SOLVER),
+        "…alongside the solver half, or the fixture only tests one of them: {:?}",
+        res.warnings
     );
 }
 
@@ -771,4 +880,323 @@ fn the_production_scope_sites_are_the_phases_this_enum_lists() {
              defect again"
         );
     }
+}
+
+// ── what the bundle carries, and what it does not (review round 1) ───────────
+
+/// Every model-and-data source `fit()` seeds its warnings from reaches the non-`fit()` entry
+/// points too — asserted end to end, one arm per source.
+///
+/// Regression this catches: the shipped first version carried **only**
+/// `check_model_data_warnings`, while the rustdoc, `docs/warnings.qmd` and the changelog all
+/// said "the same bundle `fit()` reports". A reader-produced `W_ADDL_MISSING_II` was absent
+/// from `predict_diag` despite that contract. Mutation: delete any one `out.extend(...)` from
+/// `postfit::non_fit_diagnostics` and the matching arm below fails, naming the source.
+///
+/// Each arm carries a **control**: the same call on a model or population without that defect
+/// must not report it, so no arm can pass on an implementation that pushes a constant.
+#[test]
+fn the_bundle_carries_every_model_and_data_source_fit_carries() {
+    // (2) `Population::warnings` — the data reader's own findings.
+    let m = analytic_model();
+    let mut p = pop_ss_bad_ii(1);
+    p.warnings
+        .push("W_ADDL_MISSING_II: subject '1' has ADDL with no II".into());
+    let out = predict_diag(&m, &p, &m.default_params);
+    assert!(
+        has(&out.warnings, "W_ADDL_MISSING_II"),
+        "a reader warning must reach predict_diag — it is the example the review named: {:?}",
+        out.warnings
+    );
+    assert!(
+        !has(
+            &predict_diag(&m, &pop_ss_bad_ii(1), &m.default_params).warnings,
+            "W_ADDL_MISSING_II"
+        ),
+        "…and must not appear when the population carries none"
+    );
+
+    // (3) `check_model_data_warnings` — already covered above, re-asserted here so this test
+    // fails as a whole if the ordering of the four sources drops one.
+    assert!(has(&out.warnings, SS_II), "{:?}", out.warnings);
+
+    // (1) `CompiledModel::parse_warnings`. Asserted by injection: the parser produces these
+    // only for specific malformed inputs, and the property under test is that the *source* is
+    // read, not which strings that source can hold.
+    let mut with_parse_warning = ode_model(1.0, 10_000);
+    with_parse_warning
+        .parse_warnings
+        .push("W_TEST_PARSE: injected parse warning".into());
+    let with_parse = predict_diag(
+        &with_parse_warning,
+        &pop(1),
+        &with_parse_warning.default_params,
+    );
+    assert!(
+        has(&with_parse.warnings, "W_TEST_PARSE"),
+        "a parse warning must reach predict_diag — `W_ABSORPTION_TWIN_DECLINED` changes what \
+         a prediction does: {:?}",
+        with_parse.warnings
+    );
+    let clean = ode_model(1.0, 10_000);
+    assert!(
+        !has(
+            &predict_diag(&clean, &pop(1), &clean.default_params).warnings,
+            "W_TEST_PARSE"
+        ),
+        "…and must not appear on a model that carries none"
+    );
+
+    // (4) the experimental-feature notice, through the same call.
+    let (exp_model, exp_pop) = experimental_feature_fixture();
+    let exp = predict_diag(&exp_model, &exp_pop, &exp_model.default_params);
+    assert!(
+        has(&exp.warnings, "EXPERIMENTAL feature"),
+        "an experimental-feature notice must reach predict_diag — a feature is experimental \
+         whichever door it is used through: {:?}",
+        exp.warnings
+    );
+    assert!(
+        !has(
+            &predict_diag(&clean, &pop(1), &clean.default_params).warnings,
+            "EXPERIMENTAL feature"
+        ),
+        "…and a non-experimental model must not carry one"
+    );
+
+    // And all four reach `simulate` and not only `predict`, so the shared helper is what is
+    // being tested rather than one call site.
+    let sim = simulate_with_options_diag(
+        &m,
+        &p,
+        &m.default_params,
+        1,
+        &SimulateOptions {
+            seed: Some(4),
+            ..Default::default()
+        },
+    )
+    .expect("sim");
+    assert!(
+        has(&sim.warnings, "W_ADDL_MISSING_II"),
+        "{:?}",
+        sim.warnings
+    );
+    assert!(has(&sim.warnings, SS_II), "{:?}", sim.warnings);
+}
+
+/// A model that trips [`crate::api::check_experimental_features`], and a population for it.
+fn experimental_feature_fixture() -> (CompiledModel, Population) {
+    let m = parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(20.0, 0.001, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 \
+         (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = \
+         TVV\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
+         d/dt(central) = -(CL/V) * central\n[diffusion]\n  central ~ 0.01\n[error_model]\n  \
+         DV ~ proportional(PROP)\n",
+    )
+    .expect("parse");
+    assert!(
+        !crate::api::check_experimental_features(&m).is_empty(),
+        "the fixture must actually trip an experimental-feature notice"
+    );
+    (m, pop(1))
+}
+
+/// The findings that are about a **fit** stay out of the bundle, and the reason is structural.
+///
+/// Regression this catches: "aggregate everything `fit()` reports" taken literally, which would
+/// put the estimator/optimizer option warnings on `predict()` — findings about an estimator
+/// that is not running, served from a `FitOptions::default()` the caller never chose, which is
+/// the trap `solver_reporting_options` exists to avoid.
+///
+/// Asserted as a **straddle**: the same model raises the option warning through
+/// `check_model_options` and not through `predict_diag`. Without the first arm this would pass
+/// on a model that simply never raises it.
+#[test]
+fn the_bundle_excludes_the_findings_that_are_about_a_fit() {
+    let m = parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(20.0, 0.001, 500.0)\n  \
+         omega ETA_CL ~ 0.0 FIX\n  sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+         v=V)\n[error_model]\n  DV ~ proportional(PROP)\n",
+    )
+    .expect("parse");
+    // `vi_kl = mc` + `vi_omega_update = adam` → `W_VI_OMEGA_UNANCHORED`. Chosen because it is
+    // model-independent: the point is that an option *combination* warning has no business on
+    // an entry point that reads no options, and this one cannot be confused with a model defect.
+    let opts = FitOptions {
+        method: crate::types::EstimationMethod::Vi,
+        vi_kl: crate::types::ViKl::Mc,
+        vi_omega_update: crate::types::ViOmegaUpdate::Adam,
+        ..Default::default()
+    };
+    let option_diags = crate::api::check_model_options(&m, &opts);
+    let fit_only: Vec<String> = option_diags
+        .iter()
+        .filter(|d| !d.is_error())
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        !fit_only.is_empty(),
+        "the fixture must raise at least one option warning, or the exclusion below is \
+         vacuous: {option_diags:?}"
+    );
+    let out = predict_diag(&m, &pop(1), &m.default_params);
+    for w in &fit_only {
+        assert!(
+            !out.warnings.contains(w),
+            "an estimator-configuration warning must not reach predict(), which runs no \
+             estimator: {w}"
+        );
+    }
+}
+
+/// The **informational** escalation note names its pass too, and a discarded escalation does
+/// not tell a non-`fit()` caller that "the fit" paid for it.
+///
+/// Regression this catches: parameterising only the clauses the first round of tests happened
+/// to exercise. Measured before the fix, on `SolverStatsPhase::Predict`: the note read
+/// `"… to a stiff stepper at the supplied parameters; every other segment used rk45, no
+/// escalation was rejected …"` with **no** provenance sentence, and a `Simulate` rejection read
+/// `"… and the fit paid for both solves …"`. Both passed the round-1 tests, which checked
+/// provenance only on the unclean branch and `at the supplied parameters` only on the
+/// informational one — each defect hid in the clause the other test did not look at.
+///
+/// Every non-fit phase is asserted, not just one: the three share `at_label` but have distinct
+/// `provenance` and `payer` strings, so a phase that lost its own wording would otherwise be
+/// covered by its neighbours.
+#[test]
+fn the_informational_note_and_the_rejection_clause_name_their_pass_too() {
+    let o = FitOptions::default();
+    let escalation_only = crate::ode::OdeSolverStats {
+        attempted_steps: 400,
+        accepted_steps: 400,
+        auto_stiff_segments: 12,
+        ..Default::default()
+    };
+    let rejected = crate::ode::OdeSolverStats {
+        attempted_steps: 400,
+        accepted_steps: 380,
+        auto_stiff_segments: 12,
+        auto_stiff_rejected: 5,
+        ..Default::default()
+    };
+
+    for (phase, pass, payer) in [
+        (
+            SolverStatsPhase::Predict,
+            "from this predict() pass",
+            "this predict() pass paid for both solves",
+        ),
+        (
+            SolverStatsPhase::Simulate,
+            "from this simulate() pass",
+            "this simulate() pass paid for both solves",
+        ),
+        (
+            SolverStatsPhase::SimulateAdaptive,
+            "from this simulate_adaptive() pass",
+            "this simulate_adaptive() run paid for both solves",
+        ),
+    ] {
+        let (note, entry) = ode_solver_diagnostics_warning(&escalation_only, &o, phase)
+            .expect("an escalation is a note");
+        assert_eq!(entry.severity, WarningSeverity::Info, "{note}");
+        assert!(
+            note.contains(pass),
+            "{phase:?}: the informational note must name the pass its counters came from: \
+             {note}"
+        );
+        assert!(
+            !note.contains("post-fit prediction pass") && !note.contains("final estimates"),
+            "{phase:?}: …and must not claim to describe a fit: {note}"
+        );
+        assert!(
+            !note.contains("  "),
+            "no run of blank space may reach a user: {note}"
+        );
+
+        let (rej, _) =
+            ode_solver_diagnostics_warning(&rejected, &o, phase).expect("a rejection is a warning");
+        assert!(
+            rej.contains(payer),
+            "{phase:?}: a discarded escalation must name what actually paid for both solves: \
+             {rej}"
+        );
+        assert!(
+            !rej.contains("the fit paid"),
+            "{phase:?}: …and a caller who has not run a fit must not be told one paid: {rej}"
+        );
+    }
+
+    // The straddle: the post-fit phase keeps every word it had.
+    let (note, _) =
+        ode_solver_diagnostics_warning(&escalation_only, &o, SolverStatsPhase::PostfitPredictions)
+            .expect("a note");
+    assert!(
+        note.contains("at the final estimates")
+            && note.contains("Counters are from the post-fit prediction pass over all subjects."),
+        "{note}"
+    );
+    let (rej, _) =
+        ode_solver_diagnostics_warning(&rejected, &o, SolverStatsPhase::PostfitPredictions)
+            .expect("a warning");
+    assert!(rej.contains("the fit paid for both solves"), "{rej}");
+}
+
+/// Reader warnings pass through the **same suppression filter** `fit()` and `ferx check` use,
+/// so all three suppress exactly the same ones.
+///
+/// Regression this catches: extending `Population::warnings` unfiltered. That reads as
+/// harmless — it reports *more* — but the one warning the filter removes is
+/// `W_NO_DOSES` on a compartment-free (`is_algebraic`) model, where having no doses is not a
+/// defect but the whole point: the equation is the model. Reporting it would tell every
+/// `$PRED`-style regression that its data are malformed, on the entry point such a model is
+/// most likely to be used from. Measured: removing the filter left all 20 tests green before
+/// this one existed.
+///
+/// A **straddle on the filter's own predicate**: the identical warning on a compartment model
+/// must still be reported, so this cannot pass on an implementation that drops reader warnings
+/// altogether (which `the_bundle_carries_every_model_and_data_source_fit_carries` also guards
+/// from the other side).
+#[test]
+fn reader_warnings_go_through_the_same_suppression_filter_fit_uses() {
+    const NO_DOSES: &str = "W_NO_DOSES: no dose records found";
+
+    // Compartment-free: `is_algebraic()` is true, so `W_NO_DOSES` is suppressed.
+    let algebraic = parse_model_string(
+        "[parameters]\n  theta TVE0(8.0, 0.1, 100.0)\n  theta TVEMAX(4.0, 0.1, 100.0)\n  \
+         theta TVET50(1.0, 0.01, 100.0)\n  omega ETA_E0 ~ 0.04\n  sigma ADD ~ 1.0 \
+         (variance)\n[individual_parameters]\n  E0   = TVE0 * exp(ETA_E0)\n  EMAX = TVEMAX\n  \
+         ET50 = TVET50\n[structural_model]\n  EFF = EMAX * TIME / (ET50 + TIME)\n  y   = E0 - \
+         EFF\n[error_model]\n  DV ~ additive(ADD)\n",
+    )
+    .expect("parse");
+    assert!(
+        algebraic.is_algebraic(),
+        "the fixture must be the model class the filter is about, or this tests nothing"
+    );
+
+    let mut p = pop(1);
+    p.subjects[0].doses.clear();
+    p.warnings.push(NO_DOSES.into());
+
+    let suppressed = predict_diag(&algebraic, &p, &algebraic.default_params);
+    assert!(
+        !has(&suppressed.warnings, "W_NO_DOSES"),
+        "a compartment-free model has nothing to dose; telling it its data are malformed is \
+         exactly what the shared filter exists to prevent: {:?}",
+        suppressed.warnings
+    );
+
+    // The straddle: the same warning on a compartment model is a real finding and is reported.
+    let compartmental = analytic_model();
+    assert!(!compartmental.is_algebraic());
+    let reported = predict_diag(&compartmental, &p, &compartmental.default_params);
+    assert!(
+        has(&reported.warnings, "W_NO_DOSES"),
+        "…while on a model that does have compartments it is a real finding: {:?}",
+        reported.warnings
+    );
 }

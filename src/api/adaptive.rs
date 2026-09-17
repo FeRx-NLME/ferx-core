@@ -157,9 +157,10 @@ pub struct AdaptiveSimulationResult {
     /// re-integration). The population summary *with bands* rides with the
     /// uncertainty slice (S5), where bands carry meaning.
     pub metrics: Vec<AdaptiveSubjectMetrics>,
-    /// Non-fatal model/data findings and this run's ODE-solver diagnostics (#1280 / #1304) —
-    /// the same bundle `ferx check` prints, `fit()` reports, and
-    /// [`crate::SimulationOutput::warnings`] carries.
+    /// The shared non-fit diagnostics bundle (#1280 / #1304): parse warnings, data-reader
+    /// warnings, the model/data checks, experimental-feature notices, and this run's
+    /// ODE-solver diagnostics — the same list [`crate::SimulationOutput::warnings`] carries,
+    /// built once by `postfit::non_fit_diagnostics`, which documents what it leaves out.
     ///
     /// Adaptive dosing is the path where a silent solver diagnostic matters most: the
     /// controller reads the simulated state to choose the next dose, so a segment that

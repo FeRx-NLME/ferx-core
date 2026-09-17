@@ -68,11 +68,19 @@ pub fn predict(
 
 /// The rows [`predict`] returns, plus the diagnostics it discards.
 ///
-/// `warnings` carries the same bundle `ferx check` prints and `fit()` pushes into
-/// [`FitResult::warnings`](crate::types::FitResult::warnings) — the model/data findings
-/// (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …) and, for an `[odes]` model, the
-/// ODE-solver diagnostics of this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a
-/// clean prediction on a well-formed model.
+/// `warnings` carries the non-fit diagnostics bundle: parse warnings, data-reader warnings,
+/// the model/data checks (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …),
+/// experimental-feature notices, and — for an `[odes]` model — the ODE-solver diagnostics of
+/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean prediction on a
+/// well-formed model.
+///
+/// It is **not** everything `fit()` reports, and the difference is principled rather than a
+/// subset: findings whose subject is the *fit* — the estimator/optimizer option warnings, the
+/// packed-start rails, the covariance and shrinkage notes — stay out, because no optimizer is
+/// running here and this function takes no `FitOptions` to report them against. The exact list
+/// and the reasoning live on `api::postfit::non_fit_diagnostics` (internal; an intra-doc link
+/// would not resolve from public docs), and `docs/warnings.qmd#non-fit-bundle` is the
+/// user-facing version.
 ///
 /// `#[non_exhaustive]` from the start (contrast `OdeSolverStats`, #1302): a structured-entry
 /// field alongside `warnings` is then an additive change rather than a breaking one.

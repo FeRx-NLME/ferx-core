@@ -4477,9 +4477,33 @@ fn simulate_adaptive_carries_the_solver_diagnostics_of_its_own_run() {
     let ok = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
     let clean = simulate_adaptive(&ok, &pop, &ok.default_params, 1, fixed_bolus, &opts)
         .expect("adaptive sim runs");
+    // The straddle: same model source, same population, same controller — only the step budget
+    // differs, and a solve that finishes must say nothing *about the solver*.
+    //
+    // Not `is_empty()`. `ODE_NO_IIV` declares `ETA_CL` and never references it (deliberately —
+    // the bit-exact oracles in this file rely on the trajectory being η-invariant), so the
+    // model carries a parse warning, and since #1280 the bundle carries parse warnings. The
+    // assertion below is scoped to the property under test and the one about *everything else*
+    // is spelled out rather than dropped, so this stays a straddle instead of quietly widening
+    // into "anything goes".
     assert!(
-        clean.warnings.is_empty(),
-        "and a clean one must stay silent: {:?}",
+        !clean
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_ODE_SOLVER_DIAGNOSTICS")),
+        "and a clean one must carry no solver diagnostic: {:?}",
+        clean.warnings
+    );
+    assert_eq!(
+        clean.warnings.len(),
+        1,
+        "the only thing a clean run of this fixture may carry is its unreferenced-omega parse \
+         warning; a second entry means something else started firing: {:?}",
+        clean.warnings
+    );
+    assert!(
+        clean.warnings[0].contains("not referenced in any model expression"),
+        "{:?}",
         clean.warnings
     );
 }

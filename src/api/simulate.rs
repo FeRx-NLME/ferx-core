@@ -349,10 +349,12 @@ pub fn simulate_with_options(
 ///
 /// Three sources feed `warnings`, in this order: per-subject simulation diagnostics (a
 /// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), capped
-/// steady-state equilibrations (#867), and — new in #1280 / #1304 — the model/data warning
-/// bundle plus this pass's ODE-solver diagnostics. The last is the same bundle `ferx check`
-/// prints and `fit()` reports, unfiltered: before it, a model `fit()` refuses to stay quiet
-/// about served the same rows here with nothing attached.
+/// steady-state equilibrations (#867), and — new in #1280 / #1304 — the shared non-fit
+/// diagnostics bundle (parse warnings, data-reader warnings, the model/data checks,
+/// experimental-feature notices, and this pass's ODE-solver diagnostics). Before it, a model
+/// `fit()` refuses to stay quiet about served the same rows here with nothing attached.
+/// `postfit::non_fit_diagnostics` documents exactly what that bundle includes and what it
+/// deliberately leaves out (the findings whose subject is a fit).
 pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
@@ -1182,10 +1184,11 @@ pub struct SimulationResult {
 /// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
 /// materialised (#762) — is handled *per subject* (censored / skipped, the run
 /// continues) and named here, instead of silently vanishing into the censored rows or
-/// aborting the whole run. Since #1280 / #1304 it also carries the model/data warning bundle
-/// (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …) and this pass's ODE-solver
-/// diagnostics (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean simulation of a well-formed
-/// model. The simpler `simulate()` /
+/// aborting the whole run. Since #1280 / #1304 it also carries the shared non-fit diagnostics
+/// bundle: parse warnings, data-reader warnings, the model/data checks (`W_STEADY_STATE_*`,
+/// `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …), experimental-feature notices, and this pass's
+/// ODE-solver diagnostics (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean simulation of a
+/// well-formed model. The simpler `simulate()` /
 /// `simulate_with_seed()` entry points apply the same per-subject handling but return
 /// only the rows (no diagnostics channel) — use `simulate_with_options` when the
 /// warnings matter (e.g. a population VPC).
