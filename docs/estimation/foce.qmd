@@ -480,6 +480,37 @@ The outer loop terminates when any of:
 
 The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-5`, tight enough that residual EBE noise does not perturb the marginal objective the outer optimizer minimises — see [`fit-options.md`](../model-file/fit-options.qmd#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
 
+### When the optimizer stops without converging {#stopping-without-converging}
+
+NLopt has a fourth way to stop: a bare `Failure`, which its line search returns when it
+cannot make progress against the curvature estimate it has built up. That says nothing
+about *where* the fit is. It comes back both at a finished optimum — the objective is
+already flat to ~8 significant figures, so no step improves it — and at a point the fit was
+still descending through.
+
+ferx tells the two apart on the objective trace rather than on the gradient norm, which at
+these optima still reads O(1): the run must have a **flat tail** (several evaluations since
+the last real improvement), must have **moved off its initial estimates**, and a **cold
+re-solve** of the inner loop at the restored best point must reproduce the objective the
+optimizer saw. All three hold ⇒ the fit converged and is reported as converged
+([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)).
+
+When they do not, the optimizer is **restarted once from the best point it reached**
+([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)). That is what clears the
+curvature memory the failed line search was built on, and it usually costs nothing in the
+sense that matters: the restart is adopted only if it ends at a **strictly lower**
+objective, so it can never make a reported fit worse. On the two-compartment deep-compartment
+model in `tests/fixtures/two_cpt_dcm_regularized.ferx`, L-BFGS quit at evaluation 12 with the
+trace still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units
+lower (3209.81 → −676.77).
+
+Three cases are deliberately left alone. A run that spent its `maxiter` budget stops with
+NLopt's `MaxEvalReached`, not a `Failure`, so a restart can never hand a fit a second
+evaluation budget behind your back — raise `maxiter` instead. A **cancelled** run is not
+restarted. And a second stall is reported as a stall: you get `converged: false` and the
+`Outer optimization did not converge` warning, which is the honest signal and bounds the
+worst case at two optimizations.
+
 ## Warm Starting
 
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.

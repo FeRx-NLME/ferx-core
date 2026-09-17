@@ -1983,35 +1983,53 @@ impl BestPoint {
     }
 }
 
-/// Run the NLopt outer optimizer, retrying once if the fit never left its
-/// initial estimates.
+/// What one NLopt attempt did, beyond the estimates it produced — the two facts
+/// [`optimize_nlopt`] needs to decide whether to run another one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttemptOutcome {
+    /// The restored best point is more than [`INIT_ESCAPE_STEP_S`] away from
+    /// `x₀` in scaled space — the fit actually moved.
+    pub(crate) left_init: bool,
+    /// NLopt returned a bare `Failure`/`ForcedStop` *and*
+    /// [`failure_is_converged_plateau`] rejected it: the run quit while its OFV
+    /// trace was still descending, at a point that is not a minimum. See
+    /// [`resolve_mid_descent_restart`].
+    pub(crate) mid_descent_stall: bool,
+}
+
+/// Run the NLopt outer optimizer, with two guarded second attempts for the two
+/// ways a run can stop somewhere that is not a minimum.
 ///
 /// The first attempt is the default configuration: the identity-Hessian
 /// overshoot cap fires on L-BFGS's opening gradient eval only, because holding
 /// it on corrupts the `(s, y)` curvature pairs of a fit that is descending
 /// normally (#960 — measured at ~11 OFV units on `scaling_convergence`).
 ///
-/// When that attempt ends with the estimates still on top of the initial ones —
-/// the opening line search failed and the fit never recovered (#751: the
-/// user-ODE warfarin twin quit at eval 4, 0.03 OFV below its start and 35 short
-/// of the optimum, and reported the initial estimates plus their standard
-/// errors as the result) — it is re-run from the same start with the cap **held
-/// on until the fit escapes** `INIT_ESCAPE_STEP_S`. A fit that never moved has
-/// no curvature worth protecting, so the trade the default declines is exactly
-/// the right one here. The retry is adopted only when it *both* escaped the
-/// initial estimates and reached a lower OFV — a retry that stalled too keeps
-/// the first attempt even if its OFV reads lower, since a lower objective at a
-/// point the fit never actually reached is not an improvement to report.
+/// **Stall at the start** (#751). When that attempt ends with the estimates
+/// still on top of the initial ones — the opening line search failed and the fit
+/// never recovered (the user-ODE warfarin twin quit at eval 4, 0.03 OFV below
+/// its start and 35 short of the optimum, and reported the initial estimates
+/// plus their standard errors as the result) — it is re-run from the same start
+/// with the cap **held on until the fit escapes** `INIT_ESCAPE_STEP_S`. A fit
+/// that never moved has no curvature worth protecting, so the trade the default
+/// declines is exactly the right one here. The retry is adopted only when it
+/// *both* escaped the initial estimates and reached a lower OFV — a retry that
+/// stalled too keeps the first attempt even if its OFV reads lower, since a
+/// lower objective at a point the fit never actually reached is not an
+/// improvement to report. That retry is L-BFGS-only: SLSQP is already capped on
+/// every eval, and the derivative-free algorithms never take this step at all.
 ///
-/// The retry is L-BFGS-only: SLSQP is already capped on every eval, and the
-/// derivative-free algorithms never take this step at all.
+/// **Stall mid-descent** (#1277) — [`resolve_mid_descent_restart`]. A run that
+/// *did* leave its start can still die with a bare `Failure` while its OFV is
+/// dropping by hundreds per eval, and the existing retry, gated on `left_init`,
+/// never sees it. Then the optimizer is simply restarted from the best point it
+/// reached, which resets L-BFGS's `(s, y)` memory and the trust region with it.
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    let first = optimize_nlopt_once(model, population, init_params, options, false);
     // The attempts minimised the *penalized* objective (covariate-NN
     // regularization, parameter priors), so they are ranked on it too:
     // `result.ofv` is the clean −2LL, and comparing that alone would prefer the
@@ -2019,17 +2037,104 @@ fn optimize_nlopt(
     // no-op (`+ 0.0`) when neither penalty is on.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let priors = build_prior_set(model, init_params);
-    resolve_stall_retry(
+    let penalized = |result: &OuterResult| {
+        result.ofv
+            + nn_reg.penalty_value(&result.params.theta)
+            + priors.penalty(&pack_params(&result.params))
+    };
+    // `resolve_stall_retry` ranks on `(result, mid_descent_stall)` pairs so the
+    // winning attempt carries its own mid-descent verdict into the restart
+    // decision below — the first attempt's would be the wrong one to act on when
+    // the held-cap retry is the result being reported.
+    let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
+        let (result, outcome) =
+            optimize_nlopt_once(model, population, init, options, hold_cap_at_init);
+        ((result, outcome.mid_descent_stall), outcome.left_init)
+    };
+    let (first, mid_descent_stall) = resolve_stall_retry(
         options.optimizer,
         options.verbose,
-        first,
-        || optimize_nlopt_once(model, population, init_params, options, true),
-        |result| {
-            result.ofv
-                + nn_reg.penalty_value(&result.params.theta)
-                + priors.penalty(&pack_params(&result.params))
+        attempt(init_params, false),
+        || attempt(init_params, true),
+        |(result, _)| penalized(result),
+    );
+    resolve_mid_descent_restart(
+        options.verbose,
+        crate::cancel::is_cancelled(&options.cancel),
+        (first, mid_descent_stall),
+        |stalled| {
+            let (mut restarted, _) =
+                optimize_nlopt_once(model, population, &stalled.params, options, false);
+            // `n_iterations` reports the evaluations the fit spent, and the
+            // restart is a continuation of the same fit rather than a fresh one,
+            // so the two legs add up.
+            restarted.n_iterations += stalled.n_iterations;
+            restarted
         },
+        penalized,
     )
+}
+
+/// Restart a run that stopped mid-descent from the best point it reached, and
+/// report whichever attempt ended lower (#1277).
+///
+/// NLopt's `Failure` is ambiguous, and [`failure_is_converged_plateau`] already
+/// splits it: a flat tail plus a self-consistent cold re-solve is a finished
+/// fit, anything else is a genuine stall. This acts on the second half, which
+/// until now was only *reported* ("Outer optimization did not converge") and
+/// never acted on. Measured on the #1277 fixture — the two-cpt DCM in
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0` — L-BFGS quit at
+/// eval 12 with the trace still falling ~2600 OFV per eval; restarting from that
+/// point ran to convergence 3886 OFV units lower (3209.81 → −676.77). The
+/// mechanism is not NN-specific: the restart is what clears the `(s, y)` pairs
+/// whose curvature estimate the failed line search was built on.
+///
+/// Three things keep it from making any fit worse:
+///
+/// - it runs **only** on `mid_descent_stall`, so a converged fit, a plateaued
+///   `Failure`, and a run that spent its `maxiter` budget (a `MaxEvalReached`
+///   *success* state, not a `Failure`) are all untouched — the restart can never
+///   quietly hand a fit a second evaluation budget;
+/// - the restart is adopted only on a **strictly lower** penalized objective.
+///   Unlike the `left_init` retry above there is no second condition to check:
+///   this attempt starts *at* the reported point, so anywhere it ends is
+///   somewhere the fit genuinely reached; and
+/// - `cancelled` short-circuits it, because a cancelled run stops through the
+///   objective's 1e20 short-circuit rather than at a minimum and would look like
+///   a stall to every test here.
+///
+/// There is exactly one restart — a second stall reports as a stall, which is
+/// the honest signal and caps what this adds at one extra optimization. (The
+/// ceiling for the whole of [`optimize_nlopt`] is three, since the `left_init`
+/// retry can fire first and hand its own result here.)
+///
+/// Pulled out as a pure fn — `restart` is handed the stalled result and returns
+/// its successor — so every branch is unit-testable without driving two NLopt
+/// fits.
+fn resolve_mid_descent_restart<T>(
+    verbose: bool,
+    cancelled: bool,
+    first: (T, bool),
+    restart: impl FnOnce(&T) -> T,
+    ofv_of: impl Fn(&T) -> f64,
+) -> T {
+    let (first, mid_descent_stall) = first;
+    if !mid_descent_stall || cancelled {
+        return first;
+    }
+    let second = restart(&first);
+    if !(ofv_of(&second) < ofv_of(&first)) {
+        return first;
+    }
+    if verbose {
+        eprintln!(
+            "Fit stopped mid-descent (OFV = {:.6}); restarted the optimizer from that \
+             point and reached OFV = {:.6}.",
+            ofv_of(&first),
+            ofv_of(&second),
+        );
+    }
+    second
 }
 
 /// The stall-retry decision behind [`optimize_nlopt`], factored out of the fit
@@ -2070,17 +2175,18 @@ fn resolve_stall_retry<T>(
     retry
 }
 
-/// One NLopt outer-optimizer run. Returns the result and whether the fit left
-/// its initial estimates (by more than [`INIT_ESCAPE_STEP_S`] in scaled space),
-/// which is what [`optimize_nlopt`] retries on. `hold_cap_at_init` is the retry
-/// mode — see [`should_cap_gradient`].
+/// One NLopt outer-optimizer run. Returns the result and the
+/// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
+/// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
+/// attempt on. `hold_cap_at_init` is the retry mode — see
+/// [`should_cap_gradient`].
 fn optimize_nlopt_once(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
     hold_cap_at_init: bool,
-) -> (OuterResult, bool) {
+) -> (OuterResult, AttemptOutcome) {
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -3097,6 +3203,10 @@ fn optimize_nlopt_once(
             );
         }
     }
+    // Read *here*, before `gate_converged_on_objective` below can demote
+    // `converged` for an entirely different reason — see
+    // [`worth_restarting_mid_descent`], which is handed this and the objective.
+    let stalled_mid_descent = stationarity_check_pending && !converged;
 
     // A cold re-solve that does not reproduce the reported objective — whether it lands
     // materially above it or returns no usable number at all — says the EBEs at these
@@ -3220,7 +3330,30 @@ fn optimize_nlopt_once(
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
     };
-    (result, left_init)
+    (
+        result,
+        AttemptOutcome {
+            left_init,
+            mid_descent_stall: worth_restarting_mid_descent(stalled_mid_descent, final_ofv),
+        },
+    )
+}
+
+/// Whether a run that stopped mid-descent is worth restarting from its own best
+/// point (#1277).
+///
+/// `stalled_mid_descent` is the verdict read **before**
+/// [`gate_converged_on_objective`] runs, because that gate demotes `converged`
+/// for a different fact — the objective at the final estimates is not a number —
+/// and a run demoted for *that* must not be restarted: the estimates are
+/// wherever the objective went non-finite, and handing them back as a starting
+/// point re-runs the same poisoned fit. That is why the objective is a second
+/// argument here rather than folded into the boolean at the call site: written
+/// as one expression the two facts are separated only by statement order, and
+/// moving the read three lines down would silently turn every non-finite fit
+/// into a restart.
+fn worth_restarting_mid_descent(stalled_mid_descent: bool, final_ofv: f64) -> bool {
+    stalled_mid_descent && ofv_is_valid(final_ofv)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

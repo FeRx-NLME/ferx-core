@@ -3113,12 +3113,15 @@ mod regularizer_fit_tests {
     ///
     /// The robust, deterministic signal is the **fitted weight-block norm**: L2
     /// adds `2λw` to the weight gradient, so a heavier λ pulls the optimum's
-    /// weights closer to 0 (monotonically).
+    /// weights to the optimizer's floor. What is asserted is that floor and not
+    /// an ordering *between* the two λ > 0 fits — see the comment on
+    /// `REGULARIZED_NORM_FLOOR` below, which is the assertion #1277 reported
+    /// failing.
     ///
     /// The modulator variance is the *effect* being claimed, and it is only a
     /// meaningful check when the λ = 0 fit actually produces spread to remove. On
     /// this null-covariate dataset the unregularized fit invents a large spurious
-    /// CL modulator variance (~480 across subjects) — precisely the overfitting
+    /// CL modulator variance — precisely the overfitting
     /// `nn_l2` exists to suppress — and L2 collapses it to ~0. Asserting both ends
     /// keeps the oracle non-degenerate in the sense CLAUDE.md requires: an
     /// assertion that the regularized modulator is flat is worthless if the
@@ -3145,12 +3148,27 @@ mod regularizer_fit_tests {
     fn l2_shrinks_weights_and_modulator_variation() {
         let (model, options, population) = load();
 
+        // Every λ must run to convergence for its fitted weight norm to mean
+        // anything: #1277 was three fits whose weight norms were compared without
+        // anyone asking whether the optimizer had finished, and two of them had
+        // not — L-BFGS quit at eval 12 with the trace still falling ~2600 OFV per
+        // eval, so the "fitted" norms below were wherever the stall happened to
+        // land. Assert it here rather than reading it off the norms, which is a
+        // symptom and a weak one: the λ=0 stall reported ‖W‖² = 287.9 against a
+        // converged 15340.6, a difference no ordering check can distinguish from
+        // a second local optimum.
         let fit_at = |lambda: f64| -> Vec<f64> {
             let mut o = options.clone();
             o.nn_l2_lambda = lambda;
-            crate::fit(&model, &population, &model.default_params, &o)
-                .unwrap_or_else(|e| panic!("fit at λ={lambda} failed: {e}"))
-                .theta
+            let r = crate::fit(&model, &population, &model.default_params, &o)
+                .unwrap_or_else(|e| panic!("fit at λ={lambda} failed: {e}"));
+            assert!(
+                r.converged,
+                "fit at λ={lambda} must converge for its weight norm to be a fitted \
+                 quantity at all (OFV {:.4}); warnings: {:?}",
+                r.ofv, r.warnings
+            );
+            r.theta
         };
 
         let t0 = fit_at(0.0);
@@ -3167,43 +3185,70 @@ mod regularizer_fit_tests {
             cl_modulator_variance(&model, &population, &t_mid),
             cl_modulator_variance(&model, &population, &t_big),
         );
+        // Printed in scientific notation because the quantities that matter here
+        // are the *regularized* ones, and at ~1e-9 a fixed-point `{:.5}` renders
+        // every one of them as `0.00000` — which is how #1277's failure message
+        // came to read `2225.50764 → 0.00000 → 0.03844`, hiding that the two
+        // numbers being ordered were both at the optimizer's floor.
         eprintln!(
-            "weight ‖W‖²: λ=0 {n0:.5}, λ=5 {n_mid:.5}, λ=100 {n_big:.5}\n\
-             CL modulator var: λ=0 {v0:.6}, λ=5 {v_mid:.6}, λ=100 {v_big:.6}"
+            "weight ‖W‖²: λ=0 {n0:e}, λ=5 {n_mid:e}, λ=100 {n_big:e}\n\
+             CL modulator var: λ=0 {v0:e}, λ=5 {v_mid:e}, λ=100 {v_big:e}"
         );
 
-        // Decisive signal: the fitted weight norm shrinks strongly and
-        // monotonically with λ (observed here ~2159 → ~0.004 → ~0.003). This is
-        // the guaranteed mechanism by which L2 flattens the covariate→modulator
-        // map.
+        // The baseline must have weights worth shrinking. Measured: 1.534e4.
         assert!(
-            n_mid <= n0 + 1e-9 && n_big <= n_mid + 1e-9,
-            "weight norm must be non-increasing in λ (‖W‖²: {n0:.5} → {n_mid:.5} → {n_big:.5})"
-        );
-        assert!(
-            n_big < n0 * 0.5,
-            "heavy L2 (λ=100) must more than halve the fitted weight norm \
-             ({n_big:.5} vs λ=0 {n0:.5})"
+            n0 > 1.0,
+            "the λ=0 fit must leave a weight block for L2 to shrink \
+             (‖W‖² {n0:e}); a baseline already at zero makes every check below \
+             vacuous"
         );
 
-        // The unregularized fit must actually overfit — otherwise the flatness
-        // check below passes against a baseline that was already flat and proves
-        // nothing.
+        // Decisive signal: heavy L2 drives the fitted weight norm to the
+        // optimizer's floor — twelve orders of magnitude below the λ=0 baseline.
+        //
+        // **Not** asserted as an ordering `n_big <= n_mid`, which is what #1277
+        // reported failing (`0.00000 → 0.03844`). Both regularized norms sit at
+        // that floor, so which of the two is smaller is set by the path BOBYQA
+        // and L-BFGS happen to take, not by λ, and the comparison flips between
+        // platforms while saying nothing about the regularizer. The floor itself
+        // is the stronger claim and the stable one: it implies both orderings
+        // against `n0` and survives either sign of the noise.
+        //
+        // Measured (macOS/arm64, all three fits converged): λ=0 1.534e4,
+        // λ=5 4.03e-8, λ=100 5.92e-11 — worst realised 4.03e-8, so the bound
+        // below carries ~2500x headroom. It still discriminates: #1277's own
+        // λ=100 stall landed at 1.16e-3, an order of magnitude *above* it.
+        const REGULARIZED_NORM_FLOOR: f64 = 1e-4;
         assert!(
-            v0 > 1.0,
-            "the λ=0 fit must invent real spurious CL spread for this test to have \
-             a baseline to remove (var {v0:.6}); a near-zero unregularized variance \
-             means the fixture is degenerate, not that L2 worked"
+            n_mid < REGULARIZED_NORM_FLOOR && n_big < REGULARIZED_NORM_FLOOR,
+            "L2 must drive the fitted weight norm to ~0 at both λ > 0 \
+             (‖W‖²: {n0:e} → {n_mid:e} → {n_big:e}, floor {REGULARIZED_NORM_FLOOR:e})"
         );
 
-        // The effect: L2 collapses that spurious spread toward a constant map.
+        // The effect: L2 collapses the spurious spread toward a constant map.
         // Both regularized fits must be flat; their ordering *relative to each
-        // other* is not asserted, because at ~1e-9 the difference between them is
-        // float noise rather than an effect of λ.
+        // other* is not asserted, for the same reason as the norms above — at
+        // ~1e-23 the difference between them is float noise rather than λ.
+        const FLAT_VAR_MAX: f64 = 1e-3;
         assert!(
-            v_mid < 1e-3 && v_big < 1e-3,
+            v_mid < FLAT_VAR_MAX && v_big < FLAT_VAR_MAX,
             "L2 must collapse the spurious CL modulator spread \
-             ({v0:.6} → {v_mid:.6} → {v_big:.6})"
+             ({v0:e} → {v_mid:e} → {v_big:e})"
+        );
+
+        // ...and the unregularized fit must actually overfit, or the flatness
+        // check above passes against a baseline that was already flat and proves
+        // nothing. Stated relative to `FLAT_VAR_MAX` rather than as a bare `> 1.0`:
+        // the λ=0 optimum on this null-covariate dataset is one of several the
+        // optimizer can reach, so its absolute spread moves between platforms
+        // (1.245 measured here against the ~480 the fixture was written on) while
+        // the gap to the regularized fits does not — those sit at 1e-23, twenty
+        // orders below either. 100x leaves ~12x headroom on the realised 1.245.
+        assert!(
+            v0 > 100.0 * FLAT_VAR_MAX,
+            "the λ=0 fit must invent real spurious CL spread for this test to have \
+             a baseline to remove (var {v0:e}); a near-zero unregularized variance \
+             means the fixture is degenerate, not that L2 worked"
         );
     }
     /// Each λ must act alone. `nn_l2` on its own is the likeliest real

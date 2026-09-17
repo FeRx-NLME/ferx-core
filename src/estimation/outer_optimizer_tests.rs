@@ -2144,6 +2144,117 @@ fn test_stall_retry_keeps_the_better_attempt() {
     );
 }
 
+/// [`resolve_mid_descent_restart`] decides whether a run that quit while still
+/// descending is restarted from the point it reached, and which of the two
+/// attempts is reported (#1277). Driven with `T = f64` (the penalized objective
+/// itself) so every branch runs without two NLopt fits.
+///
+/// The regression each assertion exists to catch, since a restart that fires too
+/// eagerly costs a whole extra optimization and one that fires too rarely leaves
+/// the #1277 fit 3886 OFV units short:
+/// - a converged / plateaued fit must not pay for a restart at all — the
+///   `restart` closure panics, so a gate that lets one through is a failure, not
+///   a silently slower suite;
+/// - a cancelled run must not be restarted, however stalled it looks: it stopped
+///   through the objective's 1e20 short-circuit, not at a minimum; and
+/// - the restart is adopted only on a *strictly* lower objective, so it can
+///   never make the reported fit worse, and a tie leaves the first attempt (with
+///   its warnings) standing.
+#[test]
+fn test_mid_descent_restart_only_fires_for_a_live_stall() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+
+    // Not a mid-descent stall (converged, or a `Failure` the plateau check
+    // accepted): no second optimization.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            false,
+            (-286.0042, false),
+            |_: &f64| panic!("restart must not run for a fit that did not stall mid-descent"),
+            ofv,
+        ),
+        -286.0042
+    );
+
+    // Stalled mid-descent, but the user cancelled: still no second optimization.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            true,
+            (3209.8087, true),
+            |_: &f64| panic!("restart must not run on a cancelled fit"),
+            ofv,
+        ),
+        3209.8087
+    );
+}
+
+#[test]
+fn test_mid_descent_restart_keeps_the_better_attempt() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+
+    // The #1277 case, measured on `tests/fixtures/two_cpt_dcm_regularized.ferx`
+    // at `nn_l2 = 0`: L-BFGS quit at eval 12 with the trace still falling, and a
+    // restart from that point ran to convergence 3886 OFV units lower. The
+    // restart is handed the stalled result — here the objective itself — so the
+    // assertion also pins that it starts from the reported point rather than
+    // from `x₀`. `verbose = true` covers the reporting line.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            true,
+            false,
+            (3209.8087, true),
+            |stalled: &f64| {
+                assert_eq!(
+                    *stalled, 3209.8087,
+                    "restart must start from the stalled point"
+                );
+                -676.7746
+            },
+            ofv,
+        ),
+        -676.7746
+    );
+
+    // A restart that lands worse keeps the first attempt.
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| 3209.8087, ofv),
+        -676.7746
+    );
+
+    // Ties do not displace the first attempt.
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| -676.7746, ofv),
+        -676.7746
+    );
+}
+
+/// [`worth_restarting_mid_descent`] is the guard that keeps the #1277 restart off
+/// a run demoted by [`gate_converged_on_objective`] instead of by a stall.
+///
+/// Without it, every fit whose objective goes non-finite reads as a mid-descent
+/// stall — `converged` is false and the NLopt `Failure` verdict was deferred —
+/// and pays for a second optimization from the very estimates that poisoned the
+/// objective. The `NaN`/`±inf` rows are the ones that fail if the objective
+/// argument is dropped.
+#[test]
+fn test_mid_descent_restart_skips_a_non_finite_objective() {
+    use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
+
+    assert!(worth_restarting_mid_descent(true, 3209.8087));
+    assert!(worth_restarting_mid_descent(true, -676.7746));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN));
+    assert!(!worth_restarting_mid_descent(true, f64::INFINITY));
+    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY));
+    // A finite objective is not on its own a reason to restart.
+    assert!(!worth_restarting_mid_descent(false, 3209.8087));
+}
+
 /// [`max_scaled_deviation`] is the L∞ "how far has the fit moved?" measure both
 /// the cap gate and the plateau verdict key off.
 #[test]
