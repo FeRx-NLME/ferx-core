@@ -1074,3 +1074,114 @@ fn globalsearch_runs_an_exhaustive_search_and_writes_its_files() {
     let models = std::fs::read_to_string(run.join("models.csv")).unwrap();
     assert_eq!(models.lines().count(), 1 + 1 + 8, "{models}");
 }
+
+// ── --threads beats [fit_options] threads, through the real binary (#1416) ───
+
+/// `examples/one_cpt_iv.ferx` with `threads = FILE_THREADS` added to its
+/// `[fit_options]` and the iteration count cut to keep the run fast.
+const FILE_THREADS: usize = 2;
+
+fn model_pinned_to_two_threads(dir: &std::path::Path) -> PathBuf {
+    let src = std::fs::read_to_string(repo_root().join("examples/one_cpt_iv.ferx"))
+        .expect("read one_cpt_iv.ferx");
+    let text = src.replace(
+        "[fit_options]\n  method  = focei\n  maxiter = 300",
+        &format!(
+            "[fit_options]\n  method  = focei\n  maxiter = 1\n  covariance = false\n  \
+             checkpoint = false\n  threads = {FILE_THREADS}"
+        ),
+    );
+    assert!(
+        text.contains(&format!("threads = {FILE_THREADS}")),
+        "the [fit_options] block moved — this fixture no longer pins a thread count"
+    );
+    let path = dir.join("pinned.ferx");
+    std::fs::write(&path, text).expect("write model");
+    path
+}
+
+/// Run the binary on that model with the given extra args, returning
+/// (stderr, the fit YAML).
+fn run_pinned(extra: &[&str]) -> (String, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = model_pinned_to_two_threads(tmp.path());
+    let data = repo_root().join("data/one_cpt_iv.csv");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg(&model)
+        .arg("--data")
+        .arg(&data)
+        .args(extra)
+        .output()
+        .expect("run ferx fit");
+    assert!(
+        out.status.success(),
+        "fit should succeed; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let yaml = std::fs::read_to_string(tmp.path().join("pinned-fit.yaml")).expect("fit yaml");
+    (stderr, yaml)
+}
+
+/// The defect in #1416, through the CLI rather than the library: the flag is
+/// parsed, reaches `RunOverrides`, reaches the entry point, and reaches the
+/// pool the fit runs on. The parser tests in `main.rs` stop at the parse and the
+/// library tests start after it, so without this one an edit that dropped
+/// `threads` on the way into `RunOverrides` — or routed the fit back through the
+/// override-less entry point — would leave every other test green.
+#[test]
+fn an_explicit_threads_flag_beats_the_model_files_thread_count() {
+    // Control: the model file's count is honoured when the flag is absent. This
+    // is the arm that passed under the old behaviour, and it is what makes the
+    // override arm below mean something.
+    let (stderr, yaml) = run_pinned(&[]);
+    assert!(
+        stderr.contains(&format!("on {FILE_THREADS} threads")),
+        "the model file's thread count must still be honoured with no flag: {stderr}"
+    );
+    assert!(
+        yaml.contains(&format!("n_threads_used: {FILE_THREADS}")),
+        "{yaml}"
+    );
+    assert!(
+        !stderr.contains("thread count overridden"),
+        "no flag, no override warning: {stderr}"
+    );
+
+    // The bug as reported.
+    let (stderr, yaml) = run_pinned(&["--threads", "1"]);
+    assert!(
+        stderr.contains("on 1 thread"),
+        "`--threads 1` must reach the pool the fit runs on: {stderr}"
+    );
+    assert!(yaml.contains("n_threads_used: 1"), "{yaml}");
+    assert!(
+        stderr.contains(&format!(
+            "thread count overridden: using 1 instead of the model's \
+             `[fit_options] threads = {FILE_THREADS}`"
+        )),
+        "the override must announce itself on the console: {stderr}"
+    );
+}
+
+/// `--threads 0` / `auto` is the *other* half of the merge rule and the one a
+/// well-meaning simplification breaks: it names the engine's own worker count,
+/// so it must override a pinned `threads = 2` rather than read as an absent
+/// flag. Asserted on the warning rather than on `n_threads_used`, because the
+/// engine default is a property of the host's core count and could coincide with
+/// the file's 2 on a small machine — the warning fires iff the override landed.
+#[test]
+fn an_explicitly_requested_default_also_beats_the_model_files_thread_count() {
+    for spelling in ["0", "auto"] {
+        let (stderr, _) = run_pinned(&["--threads", spelling]);
+        assert!(
+            stderr.contains(&format!(
+                "thread count overridden: using the default worker count instead of \
+                 the model's `[fit_options] threads = {FILE_THREADS}`"
+            )),
+            "`--threads {spelling}` must override the file's pinned count: {stderr}"
+        );
+    }
+}

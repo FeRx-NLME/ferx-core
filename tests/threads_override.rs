@@ -130,6 +130,43 @@ fn the_data_path_honours_an_explicit_thread_count_over_the_model_file() {
     );
 }
 
+/// The other half of the merge rule, per caller: `Some(0)` is `--threads 0` /
+/// `auto`, a caller naming the engine's own worker count. A caller that filtered
+/// it to `None` on the way in — the obvious "simplification", since `Some(0)`
+/// and `None` mean the same thing to `FitOptions` — would silently let the model
+/// file's pinned count stand, and every `Some(1)` assertion above would stay
+/// green. Asserted on the warning rather than on `n_threads_used`: the engine
+/// default is a property of the host's core count and could coincide with the
+/// file's 2 on a small machine, whereas the warning fires iff the override
+/// landed.
+#[test]
+fn an_explicitly_requested_default_overrides_the_model_file_on_both_callers() {
+    let overrides = RunOverrides {
+        threads: Some(0),
+        ..Default::default()
+    };
+
+    let (_dir, path) = model_file("threads_zero_data");
+    let (fitted, _) =
+        run_model_with_overrides(&path, Some(DATA), &overrides).expect("data-path fit");
+    let warning = override_warning(&fitted.warnings)
+        .expect("`Some(0)` must override the data path's model file too");
+    assert!(
+        warning.contains("the default worker count")
+            && warning.contains(&format!("threads = {FILE_THREADS}")),
+        "{warning}"
+    );
+
+    let (_dir, path) = model_file("threads_zero_sim");
+    let (simulated, _) =
+        run_model_simulate_with_overrides(&path, &overrides).expect("simulate fit");
+    assert!(
+        override_warning(&simulated.warnings).is_some(),
+        "`Some(0)` must override the simulate path's model file too: {:?}",
+        simulated.warnings
+    );
+}
+
 #[test]
 fn simulate_honours_an_explicit_thread_count_over_the_model_file() {
     // `--simulate` reaches `fit()` through a different entry point, which built
