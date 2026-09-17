@@ -225,6 +225,35 @@ optimizer concluded. The check is deliberately all-or-nothing — it fires only 
 per-parameter version would be worse than useless: an initial estimate close to the truth is one a good
 optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
 
+### An L-BFGS abort mid-fit is resumed, not reported {#lbfgs-abort-resumed}
+
+NLopt's L-BFGS can also give up *after* leaving the initial estimates. Its line search is capped at ten
+step reductions and ten step extrapolations, and a failed line search on the first iteration — or on any
+iteration where the algorithm has just restarted — ends the whole run with a bare `Failure`, discarding
+every point it accepted on the way there. Both caps are ordinary events on a FOCE objective, and neither
+is tunable from outside. Measured on the `[covariate_nn]` fixture that reopened #1277:
+
+- The opening-step rescale described above shrank the first gradient by $1.7 \times 10^5$, so the first
+  line search saw a tiny predicted slope next to a huge real decrease at every trial point and
+  extrapolated: eleven improving evaluations, OFV 18759 → 7975, then the tenth extrapolation and
+  `Failure` — no further evaluation. The fit was reported at that point, `converged = false`, some 9000
+  OFV units above where the same model converges. Its sibling fit needed nine extrapolations and
+  converged normally; the two were one extrapolation apart.
+- Later in the same fixture one subject switched EBE mode, the L-BFGS curvature estimate went degenerate,
+  and the next line search burned its ten reductions without finding a decrease — at a gradient norm of
+  17.7, nowhere near an optimum.
+
+Neither abort says anything about the fit, and ferx already owns the test that does: the plateau
+verdict it applies to every bare `Failure` (is the best OFV flat over the last evaluations, and does a
+cold re-solve of the EBEs at the best point reproduce it?). Since #1277 a `Failure` that verdict refuses
+to call converged is **resumed** — L-BFGS is started again from the best point seen, with a fresh
+identity Hessian and the opening-step rescale re-armed, on whatever evaluation budget is left. A
+`Failure` at a plateaued, cold-consistent point is still reported converged exactly as before, and a
+launch that resumes and makes no progress is not resumed again. A resumed fit carries a warning saying
+how many times it was resumed; one that exhausts `outer_maxiter` before finishing is reported as a spent
+budget ("increase maxiter"), not as a stall. On the fixture above both fits converge — the second to
+`XtolReached` at gradient norm 0.008.
+
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 
 `converged` reports that an optimizer's stopping rule was met. For the gradient-based optimizers the

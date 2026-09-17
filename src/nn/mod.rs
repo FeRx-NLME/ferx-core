@@ -3168,22 +3168,32 @@ mod regularizer_fit_tests {
             cl_modulator_variance(&model, &population, &t_big),
         );
         eprintln!(
-            "weight ‖W‖²: λ=0 {n0:.5}, λ=5 {n_mid:.5}, λ=100 {n_big:.5}\n\
+            "weight ‖W‖²: λ=0 {n0:.5e}, λ=5 {n_mid:.5e}, λ=100 {n_big:.5e}\n\
              CL modulator var: λ=0 {v0:.6}, λ=5 {v_mid:.6}, λ=100 {v_big:.6}"
         );
 
         // Decisive signal: the fitted weight norm shrinks strongly and
-        // monotonically with λ (observed here ~2159 → ~0.004 → ~0.003). This is
-        // the guaranteed mechanism by which L2 flattens the covariate→modulator
-        // map.
+        // monotonically with λ. This is the guaranteed mechanism by which L2
+        // flattens the covariate→modulator map.
+        //
+        // Both regularized norms sit at the optimizer's resolution floor, not at
+        // a λ-determined value: measured 9.16e-10 (λ = 5) and 2.28e-9 (λ = 100)
+        // against 2.65e4 unregularized, i.e. every weight is ~1e-5 and the
+        // remaining norm is where L-BFGS's `xtol` stopped, so their ordering is
+        // float noise — the same reason the variance check below does not order
+        // the two regularized fits. `WEIGHT_NORM_FLOOR` is ~40× the larger of
+        // the two and eleven orders below `n0`, so it separates "collapsed" from
+        // "shrunk" and nothing else. The first assertion still carries the
+        // monotonicity that matters (2.65e4 → ~1e-9).
+        const WEIGHT_NORM_FLOOR: f64 = 1e-7;
         assert!(
-            n_mid <= n0 + 1e-9 && n_big <= n_mid + 1e-9,
-            "weight norm must be non-increasing in λ (‖W‖²: {n0:.5} → {n_mid:.5} → {n_big:.5})"
+            n_mid <= n0 + WEIGHT_NORM_FLOOR && n_big <= n_mid + WEIGHT_NORM_FLOOR,
+            "weight norm must be non-increasing in λ (‖W‖²: {n0:.5e} → {n_mid:.5e} → {n_big:.5e})"
         );
         assert!(
             n_big < n0 * 0.5,
             "heavy L2 (λ=100) must more than halve the fitted weight norm \
-             ({n_big:.5} vs λ=0 {n0:.5})"
+             ({n_big:.5e} vs λ=0 {n0:.5e})"
         );
 
         // The unregularized fit must actually overfit — otherwise the flatness
@@ -3274,5 +3284,49 @@ mod regularizer_fit_tests {
         for k in w_lo..w_hi {
             assert_relative_eq!(g_both[k], g_l2[k] + g_smooth[k], max_relative = 1e-9);
         }
+    }
+
+    /// The abort behind #1277's reopen, caught on a 44-eval budget (#1277).
+    ///
+    /// This fixture's λ = 0 fit starts with a scaled gradient of norm 1.7e5, so
+    /// the identity-Hessian cap shrinks L-BFGS's opening step by that factor
+    /// and its first line search extrapolates — eleven improving evaluations,
+    /// 18759 → 7975 — until Luksan's ten-extrapolation cap returns `Failure` on
+    /// eval 12 with no further evaluation. Before the resume in
+    /// `outer_optimizer::resume_descent`, that was the whole fit: reported at
+    /// OFV 7902 (the cold re-solve of the eval-12 point), `converged = false`,
+    /// with `l2_shrinks_weights_and_modulator_variation` failing on the ‖W‖²
+    /// it produced. The resumed run reaches −540.59 by eval 44 (and −786 by
+    /// the end of the same fixture's Tier-3 run).
+    ///
+    /// `maxiter = 1` is a 44-eval budget (`outer_maxiter × (n + 1)`, n = 43):
+    /// enough to abort at eval 12, resume once, and descend well past the
+    /// abort point, so the test runs in ~6 s. Mutation (run): make
+    /// `resume_descent` return `Stop` — the fit returns OFV 7901.99, no resume
+    /// warning, and both assertions fail.
+    #[test]
+    fn first_line_search_abort_is_resumed_not_reported() {
+        let (model, options, population) = load();
+        let mut o = options.clone();
+        o.nn_l2_lambda = 0.0;
+        o.outer_maxiter = 1;
+        let fit = crate::fit(&model, &population, &model.default_params, &o)
+            .unwrap_or_else(|e| panic!("fit failed: {e}"));
+        assert!(
+            fit.warnings
+                .iter()
+                .any(|w| w.contains("was resumed from the best point seen")),
+            "the eval-12 abort must be resumed, not reported; warnings: {:?}",
+            fit.warnings
+        );
+        // Abort point measured at 7974.86 (best-seen) / 7901.99 (reported);
+        // the resumed run reads −540.59 at eval 44. Zero sits 540 above the
+        // measurement and 7900 below the failure it exists to catch.
+        assert!(
+            fit.ofv < 0.0,
+            "a resumed fit must get well below the abort point it was resumed \
+             from (reported {:.3}, abort 7901.99, measured resumed −540.59)",
+            fit.ofv
+        );
     }
 }

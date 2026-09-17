@@ -683,6 +683,22 @@ fn classify_warning_simulation_beats_optimizer_health_degenerate() {
 }
 
 #[test]
+fn classify_warning_lbfgs_resume_is_optimizer_health() {
+    // The #1277 resume notice (`outer_optimizer::resume_descent`) is an
+    // optimizer-health event, not a convergence verdict: the fit went on and its
+    // own `converged` says how it ended. It contains neither "did not converge"
+    // nor "degenerate", so it needs its own key. Proxy of the emitter's string;
+    // the key phrase is the one the emitter and the fast nn regression test share.
+    let w = classify_warning(
+        "Outer optimizer (Lbfgs) aborted 1 time(s) before reaching a converged plateau and \
+         was resumed from the best point seen each time; the reported estimates are from \
+         the resumed run.",
+    );
+    assert_eq!(w.category, WarningCode::OptimizerHealth);
+    assert_eq!(w.severity, WarningSeverity::Warning);
+}
+
+#[test]
 fn classify_warning_flip_flop_beats_optimizer_health() {
     // Both absorption flip-flop warnings — the twin-carrying heads-up (#776) and
     // the twin-less EBE warning (#785) — say "flip-flop regime". The EBE message

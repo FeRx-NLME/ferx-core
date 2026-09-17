@@ -802,6 +802,8 @@ fn fresh_state() -> NloptState {
         best_ofv: 0.0,
         n_evals: 0,
         n_grad_evals: 0,
+        launch: 0,
+        grad_evals_at_launch: 0,
         prev_x: Vec::new(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
@@ -3133,6 +3135,129 @@ fn short_descending_tail_is_not_converged() {
         -100.0,
         true,
     ));
+}
+
+// ── #1277: resuming a bare L-BFGS `Failure` that stopped a fit short ──────────
+//
+// `resume_descent` is the pure decision behind relaunching NLopt from the
+// best-seen point. Signature: (algo, last_sig_feasible_eval,
+// feasible_evals_at_launch, plateau_converged, remaining_evals). The verdict
+// closure stands in for a cold inner solve, so each test also pins whether it
+// was *called* — the cheap gates must reject before it runs.
+
+/// Tracks whether the lazy plateau verdict was consulted.
+fn verdict(value: bool, called: &std::cell::Cell<bool>) -> impl FnOnce() -> bool + '_ {
+    move || {
+        called.set(true);
+        value
+    }
+}
+
+/// The #1277 λ = 0 shape: eleven improving points then `Failure` on eval 12 (the
+/// last significant improvement *is* the last feasible eval), not a plateau,
+/// budget left. Resumed on the remaining budget.
+#[test]
+fn resume_descent_relaunches_a_cut_short_descent() {
+    use nlopt::Algorithm;
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_descent(Algorithm::Lbfgs, 12, 0, verdict(false, &called), 2188),
+        ResumeVerdict::Resume { remaining: 2188 }
+    );
+    assert!(
+        called.get(),
+        "the plateau verdict is what separates this from a finished fit"
+    );
+}
+
+/// The #1277 λ = 100 shape: progress at eval 154, ten failed reductions pad the
+/// tail to 165, and the cold re-solve disagrees with best-seen. The *trace* says
+/// plateau; the verdict (with its cold solve) says no — and it is the verdict
+/// that decides. Mutation: replace `plateau_converged()` with a flat-tail test
+/// and this resumes nothing.
+#[test]
+fn resume_descent_follows_the_plateau_verdict_not_the_flat_tail() {
+    use nlopt::Algorithm;
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_descent(Algorithm::Lbfgs, 154, 0, verdict(false, &called), 2035),
+        ResumeVerdict::Resume { remaining: 2035 }
+    );
+    assert!(called.get());
+    // Same trace, verdict says converged: a finished fit is left alone.
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_descent(Algorithm::Lbfgs, 154, 0, verdict(true, &called), 2035),
+        ResumeVerdict::Stop
+    );
+    assert!(called.get());
+}
+
+/// A launch that made no progress is not resumed, and the cold solve behind the
+/// verdict is never paid for: the eval-1 stall (baseline only, owned by the
+/// held-cap retry), and a resumed launch whose best improvement predates it
+/// (`last_sig_feasible_eval <= feasible_evals_at_launch`).
+#[test]
+fn resume_descent_stops_without_progress_and_skips_the_cold_solve() {
+    use nlopt::Algorithm;
+    for (last_sig, at_launch) in [(1, 0), (0, 0), (12, 12), (12, 20)] {
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            resume_descent(
+                Algorithm::Lbfgs,
+                last_sig,
+                at_launch,
+                verdict(false, &called),
+                100
+            ),
+            ResumeVerdict::Stop,
+            "last_sig={last_sig} at_launch={at_launch}"
+        );
+        assert!(
+            !called.get(),
+            "no progress → no cold solve (last_sig={last_sig})"
+        );
+    }
+    // One past the launch boundary is progress.
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_descent(Algorithm::Lbfgs, 13, 12, verdict(false, &called), 100),
+        ResumeVerdict::Resume { remaining: 100 }
+    );
+}
+
+/// An unfinished fit with nothing left to run on is a spent budget, not a stall
+/// — and a finished one with nothing left is simply finished (verdict first).
+#[test]
+fn resume_descent_reports_a_spent_budget_only_when_unfinished() {
+    use nlopt::Algorithm;
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_descent(Algorithm::Lbfgs, 12, 0, verdict(false, &called), 0),
+        ResumeVerdict::BudgetExhausted
+    );
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        resume_descent(Algorithm::Lbfgs, 12, 0, verdict(true, &called), 0),
+        ResumeVerdict::Stop
+    );
+    assert!(called.get());
+}
+
+/// L-BFGS only: the same trace under every other algorithm stops, and the cold
+/// solve is never run for them.
+#[test]
+fn resume_descent_is_lbfgs_only() {
+    use nlopt::Algorithm;
+    for algo in [Algorithm::Slsqp, Algorithm::Bobyqa, Algorithm::Mma] {
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            resume_descent(algo, 12, 0, verdict(false, &called), 100),
+            ResumeVerdict::Stop,
+            "{algo:?}"
+        );
+        assert!(!called.get(), "{algo:?} must not pay for a cold solve");
+    }
 }
 
 // ── #833: which of the final inner loop's EBE candidates is reported ──────────

@@ -679,7 +679,9 @@ pub(crate) fn cap_scaled_gradient(g: &mut [f64], lower_s: &[f64], upper_s: &[f64
 ///
 /// `n_grad_evals` is the running count of gradient evaluations *including this
 /// one* (`population_gradient` increments it before returning), so the first
-/// gradient eval is `n_grad_evals == 1`.
+/// gradient eval is `n_grad_evals == 1`. It counts from the start of the current
+/// NLopt *launch*, not of the run: a resumed launch (`resume_descent`) restarts
+/// L-BFGS from an identity Hessian and takes the overshoot step again.
 ///
 /// - **SLSQP** — cap every eval. Its QP re-solves from the current quasi-Newton
 ///   Hessian each step, so rescaling the gradient never corrupts stored
@@ -1075,6 +1077,14 @@ struct NloptState {
     /// also counts objective-only line-search probes); drives the
     /// `reconverge_gradient_interval` schedule.
     n_grad_evals: usize,
+    /// The NLopt launch this state last saw (see `resume_descent`), and
+    /// `n_grad_evals` as it stood when that launch began. Their difference is
+    /// the per-launch gradient count that [`should_cap_gradient`] reads: each
+    /// launch starts L-BFGS from an identity Hessian, so the overshoot cap has
+    /// to fire on the first gradient of *every* launch, not only the first of
+    /// the run.
+    launch: usize,
+    grad_evals_at_launch: usize,
     /// Previous parameter vector — used to compute step_norm for the trace.
     prev_x: Vec<f64>,
     last_improvement_eval: usize,
@@ -1209,6 +1219,8 @@ fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
         best_ofv: f64::INFINITY,
         n_evals: 0,
         n_grad_evals: 0,
+        launch: 0,
+        grad_evals_at_launch: 0,
         prev_x: x0.to_vec(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
@@ -1885,6 +1897,101 @@ fn failure_is_converged_plateau(
     made_progress && plateaued && consistent && left_init
 }
 
+/// A cold inner solve at one outer point: `(η̂, H, κ̂, −2LL)` with the inner loop
+/// started from the prior mean. See `cold_solve_at` in [`optimize_nlopt_once`].
+type ColdSolve = (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    f64,
+);
+
+/// What to do with a bare NLopt `Failure` — see [`resume_descent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeVerdict {
+    /// Relaunch from the best-seen point with this many evaluations left.
+    Resume { remaining: u32 },
+    /// The fit was not finished but has no evaluations left to resume on.
+    BudgetExhausted,
+    /// Leave the failure to the plateau verdict / stall retry.
+    Stop,
+}
+
+/// Resume a bare L-BFGS `Failure` that stopped a fit short, or leave it alone?
+///
+/// NLopt's L-BFGS (Luksan's `plis`) aborts a run — discarding every point it
+/// accepted along the way and returning `NLOPT_FAILURE` — whenever one line
+/// search fails while the algorithm is already in its restart state, which on
+/// iteration 1 is always. A line search fails after ten reductions *or* ten
+/// extrapolations (`mred = 10`, neither exposed nor tunable), and both are
+/// ordinary events on a FOCE objective; measured on the `[covariate_nn]` fixture
+/// of #1277, `tests/fixtures/two_cpt_dcm_regularized.ferx`:
+///
+/// * **Extrapolation cap, eval 12.** The identity-Hessian overshoot cap
+///   ([`cap_scaled_gradient`]) shrank the opening gradient by 1.7e5, so the first
+///   line search saw a tiny predicted slope and a huge real decrease at every
+///   trial point and extrapolated: eleven improving points, 18759 → 7975, then
+///   `iters = -1` on the tenth extrapolation and `Failure` with no further
+///   evaluation. The fit was reported at that point, `converged = false`, 9000
+///   OFV units above where the fixture converges. The sibling λ = 5 fit needed
+///   nine extrapolations and converged — one extrapolation apart.
+/// * **Reduction cap, eval 165.** One subject switched EBE mode at eval 154 and
+///   the L-BFGS curvature pair went degenerate (`s·y` ≈ 1e-5), so the next
+///   direction was ~1e17 long; ten reductions could not shorten it into a
+///   decrease and NLopt quit at gradient norm 17.7. The ten probes pad the
+///   flat tail to 11, so this abort cannot be told from a plateau by the trace
+///   alone — the cold re-solve can (−99 against a best-seen −113).
+///
+/// Neither abort is a verdict on the *fit*, and the engine already owns the
+/// verdict that is: [`failure_is_converged_plateau`] (#751) decides whether a
+/// bare `Failure` sits on a plateaued, cold-consistent optimum. Until now that
+/// verdict only labelled the result; a `Failure` it refused to call converged was
+/// reported as-is. Now it is acted on: the fit is relaunched from the best point
+/// seen, with a fresh identity Hessian and the overshoot cap re-armed (the
+/// per-launch gradient count behind [`should_cap_gradient`]), on whatever
+/// evaluation budget is left. Both fixture fits above converge that way — the
+/// second to `XtolReached` at gradient norm 0.008.
+///
+/// `plateau_converged` is taken lazily because it costs a cold inner solve: the
+/// cheap gates run first, and a `Failure` they reject never pays for it.
+///
+/// * L-BFGS only: the mechanism is Luksan's line search. SLSQP is capped on
+///   every eval and stalls differently, and the derivative-free algorithms
+///   never take a line search at all.
+/// * Progress must have landed *in the launch that just failed*
+///   (`last_sig_feasible_eval > feasible_evals_at_launch`, and past the eval-1
+///   baseline). A launch that resumed and made none would only repeat itself; it
+///   also means the eval-1 stall that [`optimize_nlopt`]'s held-cap retry owns
+///   (`last_sig_feasible_eval == 1`) is never resumed here.
+/// * A plateaued, cold-consistent point is a finished fit: `Stop`, and the
+///   post-optimization block reports it `converged`.
+/// * `remaining_evals` must be non-zero — a resume runs on the run's own
+///   budget, never beyond it. A fit that exhausts the budget unfinished is
+///   reported as such (`BudgetExhausted` → the "increase maxiter" warning), not
+///   as a stall.
+pub(crate) fn resume_descent(
+    algo: nlopt::Algorithm,
+    last_sig_feasible_eval: usize,
+    feasible_evals_at_launch: usize,
+    plateau_converged: impl FnOnce() -> bool,
+    remaining_evals: u32,
+) -> ResumeVerdict {
+    if !matches!(algo, nlopt::Algorithm::Lbfgs) {
+        return ResumeVerdict::Stop;
+    }
+    let progressed_this_launch =
+        last_sig_feasible_eval >= 2 && last_sig_feasible_eval > feasible_evals_at_launch;
+    if !progressed_this_launch || plateau_converged() {
+        return ResumeVerdict::Stop;
+    }
+    if remaining_evals == 0 {
+        return ResumeVerdict::BudgetExhausted;
+    }
+    ResumeVerdict::Resume {
+        remaining: remaining_evals,
+    }
+}
+
 /// The best point an optimizer has seen so far — a run's single source of truth
 /// for "where the fit actually is".
 ///
@@ -2215,6 +2322,12 @@ fn optimize_nlopt_once(
     let n_evals_outer = Arc::new(AtomicUsize::new(0));
     let n_evals_cl = Arc::clone(&n_evals_outer);
 
+    // Which NLopt launch is running (see `resume_descent`). Bumped by the driver
+    // before every `optimize()` call; the closure notices the change and
+    // re-arms the per-launch gradient count behind `should_cap_gradient`.
+    let launch: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let launch_cl = Arc::clone(&launch);
+
     // Best-seen accumulator (issue #59). NLopt returns the last evaluated
     // point, not the best one — when the stagnation guard short-circuits
     // by returning `best_ofv` with zero gradient, the optimizer can drift
@@ -2318,6 +2431,13 @@ fn optimize_nlopt_once(
             state.n_evals += 1;
             n_evals_cl.fetch_add(1, Ordering::Relaxed);
             return state.best_ofv;
+        }
+        // A new launch (`resume_descent`) restarts L-BFGS from an identity
+        // Hessian, so the gradient count the overshoot cap reads starts over.
+        let current_launch = launch_cl.load(Ordering::Relaxed);
+        if current_launch != state.launch {
+            state.launch = current_launch;
+            state.grad_evals_at_launch = state.n_grad_evals;
         }
         // Unscale from optimizer space to real (log/Cholesky) space.
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
@@ -2560,7 +2680,8 @@ fn optimize_nlopt_once(
                 }
                 let hold_cap =
                     hold_cap_at_init && max_scaled_deviation(xs, &x0_start_s) < INIT_ESCAPE_STEP_S;
-                if should_cap_gradient(algo, state.n_grad_evals, hold_cap) {
+                let launch_grad_evals = state.n_grad_evals - state.grad_evals_at_launch;
+                if should_cap_gradient(algo, launch_grad_evals, hold_cap) {
                     cap_scaled_gradient(g, &lower_s, &upper_s);
                 }
                 // Gate on the global best (same tracker as the `best_seen` update
@@ -2717,10 +2838,43 @@ fn optimize_nlopt_once(
         ofv
     };
 
+    // A cold inner solve at a scaled point: `(η̂, H, κ̂, −2LL)` with the inner loop
+    // started from the prior mean. Read by the resume loop below (its plateau
+    // verdict) and by the final inner loop after it (#833's candidate set) — one
+    // definition, so the two cannot drift on what "cold" means. Mixture models
+    // have no cold/warm split (#977); their K-fold objective is returned with
+    // empty EBE vectors, which the final block never reads on that path.
+    let cold_solve_at = |xs: &[f64]| -> ColdSolve {
+        let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+        let params = unpack_params(&x, init_params);
+        if params.mixture.is_some() {
+            let m =
+                crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
+            return (Vec::new(), Vec::new(), Vec::new(), m.ofv);
+        }
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            model,
+            population,
+            &params,
+            options.inner_maxiter,
+            options.inner_tol,
+            None,
+            Some(&mu_k),
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+        );
+        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+        (ehs, hms, kappas, 2.0 * nll)
+    };
+
     // Create NLopt optimizer with state (operates in scaled xs space)
     let mut opt = nlopt::Nlopt::new(algo, n, objective, nlopt::Target::Minimize, state);
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
+    // The whole run's evaluation budget; a resumed launch (`resume_descent`) gets
+    // whatever of it is left, so resuming never spends more than one launch could.
+    let maxeval_total: u32;
     if matches!(algo, nlopt::Algorithm::Bobyqa) {
         // BOBYQA is derivative-free: each eval is one objective call, not
         // n+1 (gradient methods FD the gradient inside one outer iter).
@@ -2730,6 +2884,7 @@ fn optimize_nlopt_once(
         // 2n+1 evals before any movement.
         let bobyqa_maxeval =
             (options.outer_maxiter as u32).saturating_mul(n as u32 + 1) + 40 * (n as u32 + 1);
+        maxeval_total = bobyqa_maxeval;
         opt.set_maxeval(bobyqa_maxeval).unwrap();
         // BOBYQA's xtol_rel controls rho_end / rho_start — i.e. how much
         // it must shrink the trust radius to declare success. 1e-12 is
@@ -2761,8 +2916,8 @@ fn optimize_nlopt_once(
             .collect();
         opt.set_initial_step(&init_step).unwrap();
     } else {
-        opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
-            .unwrap();
+        maxeval_total = options.outer_maxiter as u32 * (n as u32 + 1);
+        opt.set_maxeval(maxeval_total).unwrap();
         if options.agq_nodes().is_some() {
             // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
             // term and the posterior Hessian are both central differences, so the gradient
@@ -2800,8 +2955,87 @@ fn optimize_nlopt_once(
         );
     }
 
-    // Run optimization
-    let result = opt.optimize(&mut x0);
+    // Run optimization. A bare L-BFGS `Failure` at a point the plateau verdict
+    // will not call converged is a verdict on one line search, not on the fit;
+    // resume from the best-seen point instead of reporting wherever the abort
+    // left it (#1277, see `resume_descent`).
+    let mut result = opt.optimize(&mut x0);
+    // Plateau-tracker `(last_sig_feasible_eval, feasible_evals)` at the end of the
+    // last launch that made progress. A resumed launch that then makes none has
+    // only re-evaluated the best point, and that eval must not pad the flat tail
+    // the plateau verdict reads — see `resume_descent`.
+    let mut plateau_at_last_progress: Option<(usize, usize)> = None;
+    let mut budget_exhausted_mid_descent = false;
+    let mut n_resumes = 0usize;
+    // The cold solve the resume loop ran at the best-seen point, keyed by that
+    // point, so the final inner loop below can reuse it instead of solving twice
+    // when the fit stops here.
+    let mut cold_solve_cache: Option<(Vec<f64>, ColdSolve)> = None;
+    while matches!(result, Err((nlopt::FailState::Failure, _))) {
+        if crate::cancel::is_cancelled(&options.cancel) {
+            break;
+        }
+        let (best_x, best_ofv_clean) = {
+            let tracker = best_seen.lock().unwrap();
+            let Some(best) = tracker.get() else { break };
+            (best.x.clone(), best.ofv_clean)
+        };
+        let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
+        let feasible_at_launch = plateau_at_last_progress.map_or(0, |(_, feasible)| feasible);
+        let evals_used = n_evals_outer.load(Ordering::Relaxed) as u32;
+        // The same verdict the post-optimization block reaches for a `Failure`
+        // that is *not* resumed: a plateaued, cold-consistent best point is a
+        // finished fit and is left alone.
+        let mut cold_ofv_here = f64::NAN;
+        let plateau_converged = || {
+            let cold = cold_solve_at(&best_x);
+            cold_ofv_here = cold.3;
+            let converged = failure_is_converged_plateau(
+                feasible_evals,
+                last_sig_feasible_eval,
+                Some(best_ofv_clean),
+                cold.3,
+                max_scaled_deviation(&best_x, &x0_start_s) >= INIT_ESCAPE_STEP_S,
+            );
+            cold_solve_cache = Some((best_x.clone(), cold));
+            converged
+        };
+        let remaining = match resume_descent(
+            algo,
+            last_sig_feasible_eval,
+            feasible_at_launch,
+            plateau_converged,
+            maxeval_total.saturating_sub(evals_used),
+        ) {
+            ResumeVerdict::Resume { remaining } => remaining,
+            ResumeVerdict::BudgetExhausted => {
+                budget_exhausted_mid_descent = true;
+                break;
+            }
+            ResumeVerdict::Stop => break,
+        };
+        if options.verbose {
+            eprintln!(
+                "NLopt {algo:?} quit after {evals_used} evals at a point that is not a \
+                 converged plateau (best-seen OFV {best_ofv_clean:.6}, cold re-solve \
+                 {cold_ofv_here:.6}); resuming from the best-seen point with {remaining} \
+                 evals left.",
+            );
+        }
+        n_resumes += 1;
+        plateau_at_last_progress = Some((last_sig_feasible_eval, feasible_evals));
+        x0.copy_from_slice(&best_x);
+        launch.fetch_add(1, Ordering::Relaxed);
+        opt.set_maxeval(remaining).unwrap();
+        result = opt.optimize(&mut x0);
+    }
+    if n_resumes > 0 {
+        warnings.push(format!(
+            "Outer optimizer ({algo:?}) aborted {n_resumes} time(s) before reaching a \
+             converged plateau and was resumed from the best point seen each time; the \
+             reported estimates are from the resumed run.",
+        ));
+    }
 
     // `max_eval_reached` distinguishes a spent evaluation budget from other
     // non-convergence: it gets its own warning ("increase maxiter") rather than
@@ -2847,6 +3081,10 @@ fn optimize_nlopt_once(
     };
 
     drop(opt);
+
+    // A run that quit mid-descent with no evaluations left to resume it on has
+    // spent its budget just as surely as one NLopt stopped itself.
+    max_eval_reached |= budget_exhausted_mid_descent;
 
     // A spent evaluation budget gets a targeted "increase maxiter" warning; every
     // other non-convergence falls through to the generic "did not converge"
@@ -2976,7 +3214,10 @@ fn optimize_nlopt_once(
             // The cold solve is kept for its own sake: `failure_is_converged_plateau`
             // reads it as the warm-start-artifact probe (#751), and that check is only
             // worth anything while the number it reads is genuinely cold.
-            let (cold_ehs, cold_hms, cold_kappas, cold) = solve_at(None);
+            let (cold_ehs, cold_hms, cold_kappas, cold) = match cold_solve_cache.take() {
+                Some((xs, solve)) if xs == restored_xs => solve,
+                _ => cold_solve_at(&restored_xs),
+            };
             cold_ofv = Some(cold);
 
             // #833: the cold EBEs are not automatically the ones the optimizer's own
@@ -3071,7 +3312,15 @@ fn optimize_nlopt_once(
     // true by construction and the check would stop rejecting warm-start artifacts).
     let consistency_ofv = cold_ofv.unwrap_or(final_ofv);
     if stationarity_check_pending {
-        let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
+        let (_, last_sig_feasible_eval, mut feasible_evals) = *plateau_tracker.lock().unwrap();
+        // A resumed launch that made no progress only re-evaluated the point it
+        // was resumed from: read the trace as it stood before that launch, so the
+        // re-evaluation cannot pad the flat tail into a plateau.
+        if let Some((sig_before, feasible_before)) = plateau_at_last_progress {
+            if last_sig_feasible_eval == sig_before {
+                feasible_evals = feasible_before;
+            }
+        }
         if failure_is_converged_plateau(
             feasible_evals,
             last_sig_feasible_eval,
