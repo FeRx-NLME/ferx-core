@@ -5515,9 +5515,21 @@ fn adaptive_frozen_replay_tv(
     // builder rather than keeping two copies of the rule (#1171/#1174 fixed two other
     // copies; this was the fifth).
     //
-    // `pk_params_flat` is the driver's frozen t=0 snapshot, not a per-segment one — the
-    // same snapshot the driver placed its own base-regimen edges from, which is what keeps
-    // the pair bit-aligned when a route lag or `dur` is covariate-dependent.
+    // `pk_params_flat` is the driver's frozen t=0 snapshot, not a per-segment one, for one
+    // reason only: it is the snapshot the driver placed its own base-regimen edges from
+    // (`ode_predictions_adaptive_impl`'s `collect_dose_break_times` call), and bit-alignment
+    // with the driver is the property this engine exists to establish. It is NOT a claim
+    // that the frozen snapshot is the physically right one to place an edge from — if a
+    // route lag or `dur` ever becomes covariate-dependent on this path, BOTH engines place
+    // their break from the frozen snapshot while `integrate_segment` recomputes the window
+    // for containment from the SEGMENT's snapshot, so the edge and the containment boundary
+    // move apart and mass is dropped. That inconsistency is pre-existing, symmetric across
+    // the two engines (so this verifier cannot see it), and latent: the #930/#931 base-dose
+    // guard refuses an input-rate dose under a time-varying covariate, which is the only way
+    // to reach it. It belongs to whichever change lifts that guard — recorded here because
+    // no test distinguishes the two snapshots today (every fixture's per-event PK is
+    // constant, so they are equal; swapping this argument for `init_pk.values` leaves the
+    // whole lib suite green, measured).
     //
     // **Asymmetry, recorded here rather than shared away.** The driver runs this builder
     // over its *base* regimen only (controller doses are appended reactively and get an
