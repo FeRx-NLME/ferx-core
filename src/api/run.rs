@@ -1027,6 +1027,26 @@ pub(crate) fn build_selection_filter_merged(
     model_opts: &FitOptions,
     call_opts: &FitOptions,
 ) -> Result<Option<SelectionFilter>, String> {
+    let (ignore, accept, subjects) = merge_selection_exprs(model_opts, call_opts);
+    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
+}
+
+/// The merged `[data_selection]` expression strings — the model file's plus the
+/// caller's, de-duplicated — that [`build_selection_filter_merged`] compiles.
+///
+/// Split out so the *strings* can be had without the compiled filter (#1409 review).
+/// `fit_from_files` reads its population through the merged filter but hands `fit()`
+/// the caller's options alone, so `CmtConsumer::DataSelectionFilter` was asked about
+/// an empty clause list while the fit had in fact been filtered on a defaulted `CMT`.
+/// One implementation of the merge answers both questions, so the filter that runs
+/// and the filter the warning reasons about cannot come apart.
+pub(crate) fn merge_selection_exprs(
+    model_opts: &FitOptions,
+    call_opts: &FitOptions,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     // Merge by accumulating unique strings from both sources.
     let mut ignore = model_opts.ignore_exprs.clone();
     let mut accept = model_opts.accept_exprs.clone();
@@ -1058,10 +1078,7 @@ pub(crate) fn build_selection_filter_merged(
             subjects.push(t);
         }
     }
-    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
-        return Ok(None);
-    }
-    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
+    (ignore, accept, subjects)
 }
 
 /// The non-Gaussian row routing a dataset needs for `model`: every CMT the model
@@ -1140,6 +1157,16 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
+}
+
+/// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
+///
+/// Derived from [`obs_routing_for`] — the only place a routing set is built from a
+/// model — rather than restated, so an endpoint family added there is in scope for
+/// `W_CMT_DEFAULTED` without a second edit. The missing-DV policy does not enter the
+/// question, so the fitting policy is passed and the answer is the same either way.
+pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
+    obs_routing_for(model, MissingDvPolicy::Skip).routes_by_cmt()
 }
 
 /// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`

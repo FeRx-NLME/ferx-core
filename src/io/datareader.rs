@@ -60,6 +60,22 @@ impl SelectionFilter {
         cols
     }
 
+    /// True when any ignore/accept clause reads `col` (case-insensitive; standard
+    /// NONMEM columns included).
+    ///
+    /// `api::validation` asks this for `cmt`: the filter's `RowContext` is fed the
+    /// compartment the reader *resolved*, so on a dataset with no usable `CMT` cell
+    /// a clause naming `CMT` selects rows on an invented value and `W_CMT_DEFAULTED`
+    /// has to fire (#1409). `ignore_subject_ids` is not consulted — it compares
+    /// `Subject::id` and reads no row column at all.
+    pub(crate) fn references_column(&self, col: &str) -> bool {
+        self.ignore
+            .iter()
+            .chain(self.accept.iter())
+            .flat_map(|c| c.columns())
+            .any(|c| c.eq_ignore_ascii_case(col))
+    }
+
     /// True when any ignore/accept clause compares a covariate column as a raw
     /// string, so the reader must build the per-row `str_covariates` map. Lets a
     /// purely numeric filter (the common case) skip that per-row allocation.
@@ -78,24 +94,80 @@ impl SelectionFilter {
     /// first rule that excludes it. A rule that only ever matches records already
     /// removed by an earlier rule therefore never appears in the fired-condition
     /// summary — see `docs/model-file/data-selection.qmd`.
+    ///
+    /// A thin wrapper over the crate-internal `first_excluding_rule`, which is also
+    /// what the reader asks "did a `CMT`-reading rule remove this row" — one
+    /// implementation of the ordering, two questions, so the two cannot come to
+    /// disagree about which rule fired (#1409 review). Inline code rather than an
+    /// intra-doc link on purpose: the target is `pub(crate)` and this method is not,
+    /// so a link would render with its brackets intact and fail the `Rustdoc` gate.
     pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
+        match self.first_excluding_rule(ctx) {
+            None => (false, None),
+            Some(rule) => (true, Some(rule.source(ctx.id))),
+        }
+    }
+
+    /// The first rule that excludes this record, in the documented order, or `None`
+    /// when the record survives.
+    pub(crate) fn first_excluding_rule(&self, ctx: &RowContext<'_>) -> Option<Excluder<'_>> {
         // 1. ignore_subjects shorthand.
         if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {
-            return (true, Some(format!("ignore_subjects: {}", ctx.id)));
+            return Some(Excluder::Subject);
         }
         // 2. ignore clauses (any match → excluded).
         for clause in &self.ignore {
             if clause.eval(ctx) {
-                return (true, Some(format!("ignore: {}", clause.source)));
+                return Some(Excluder::Ignore(clause));
             }
         }
         // 3. accept clauses (all must pass → if any fails, excluded).
         for clause in &self.accept {
             if !clause.eval(ctx) {
-                return (true, Some(format!("accept: {}", clause.source)));
+                return Some(Excluder::Accept(clause));
             }
         }
-        (false, None)
+        None
+    }
+}
+
+/// Which rule removed a record — the answer [`SelectionFilter::first_excluding_rule`]
+/// gives, carried as the rule itself rather than as its rendered message so a caller
+/// can ask what the rule *reads* as well as what it says (#1409).
+pub(crate) enum Excluder<'a> {
+    /// The `ignore_subjects` shorthand: an `ID` match, which reads no row column.
+    Subject,
+    /// An `ignore` clause that matched.
+    Ignore(&'a FilterClause),
+    /// An `accept` clause that failed.
+    Accept(&'a FilterClause),
+}
+
+impl Excluder<'_> {
+    /// Whether the rule that fired reads `col` (case-insensitive).
+    ///
+    /// Asked for `cmt`: a record the filter removed *on the strength of a compartment
+    /// the reader had to invent* is a record the dataset's silence deleted from the
+    /// fit, and the `W_CMT_DEFAULTED` summary has to count it — it never reaches the
+    /// dose / observation arms that do the counting. Scoped to the rule that actually
+    /// fired, so an exclusion decided by `DV < 0.001` stays silent even when some
+    /// other clause in the same block does read `CMT`.
+    pub(crate) fn reads_column(&self, col: &str) -> bool {
+        match self {
+            Excluder::Subject => false,
+            Excluder::Ignore(c) | Excluder::Accept(c) => {
+                c.columns().any(|x| x.eq_ignore_ascii_case(col))
+            }
+        }
+    }
+
+    /// The fired-condition string the exclusion summary logs.
+    fn source(&self, id: &str) -> String {
+        match self {
+            Excluder::Subject => format!("ignore_subjects: {id}"),
+            Excluder::Ignore(c) => format!("ignore: {}", c.source),
+            Excluder::Accept(c) => format!("accept: {}", c.source),
+        }
     }
 }
 
@@ -437,6 +509,20 @@ impl ObsRouting {
     pub(crate) fn with_missing_dv(mut self, policy: MissingDvPolicy) -> Self {
         self.missing_dv = policy;
         self
+    }
+
+    /// Whether **any** observation row's endpoint is chosen by its `CMT` — i.e.
+    /// whether this routing is something other than "every row is Gaussian".
+    ///
+    /// The empty-sets default means the reader takes the Gaussian parallel-Vec path
+    /// for every row and never consults the routing tables, so a compartment it had
+    /// to invent cannot move a row between endpoints. Any non-empty set and it can:
+    /// this is what `api::validation::CmtConsumer::EndpointRouting` asks, so the
+    /// `W_CMT_DEFAULTED` scope rests on the routing sets themselves rather than on
+    /// the side-effect of an endpoint-only model carrying an empty `ErrorSpec` map
+    /// (#1409).
+    pub(crate) fn routes_by_cmt(&self) -> bool {
+        !self.tte.is_empty() || !self.discrete.is_empty() || !self.count.is_empty()
     }
 
     /// The integer-coded non-Gaussian endpoint kind (discrete-state or count) a
@@ -1075,6 +1161,7 @@ fn read_nonmem_csv_impl(
             n_dose,
             n_dose_events,
             n_obs,
+            n_filtered,
             n_missing_cell,
             n_unparseable_cell,
             // Both are the business of `example_list`, which owns the quoting and
@@ -1113,9 +1200,24 @@ fn read_nonmem_csv_impl(
             }
             parts.join(" and ")
         };
+        // Rows the filter deleted are named separately rather than folded into the
+        // dose / observation counts: "assigned compartment 1" is true of them, but
+        // the consequence is the opposite one — they are not in the fit at all, so a
+        // reader who fixes the cells gets *more* data rather than differently-placed
+        // data. Silent when no `[data_selection]` rule reads CMT, which is the usual
+        // case.
+        let filtered = if *n_filtered > 0 {
+            format!(
+                ", and {n_filtered} row(s) were removed from the fit by a [data_selection] \
+                 condition that reads CMT — had the compartment been written out, those rows \
+                 would have been kept"
+            )
+        } else {
+            String::new()
+        };
         population_warnings.push(format!(
             "W_CMT_DEFAULTED: {cause}, so {n_dose} dose row(s){expanded} and {n_obs} observation \
-             row(s) were assigned compartment 1. Wherever CMT selects something this is a guess \
+             row(s) were assigned compartment 1{filtered}. Wherever CMT selects something this is a guess \
              rather than a default, and a wrong guess changes the numbers with no error: which \
              compartment a dose lands in (an `[odes]` model with several states, or a `pk` model \
              whose CMT=2 is a real target — an oral model's central bolus, a multi-compartment \
@@ -1464,6 +1566,24 @@ struct CmtDefaults {
     n_dose_events: usize,
     /// Scored observation rows (EVID=0, MDV=0) likewise.
     n_obs: usize,
+    /// Rows a `[data_selection]` rule **removed** on the strength of the compartment
+    /// the reader chose (#1409 review).
+    ///
+    /// Counted separately, and at the filter rather than in the dose / observation
+    /// arms, because such a row never reaches those arms: the filter's `continue`
+    /// runs first, so `n_dose`/`n_obs` cannot see it and a dataset whose *only*
+    /// defaulted row is the one the filter deleted would produce no warning at all.
+    /// That is the mirror of the case #1409 was filed for — there the defaulted
+    /// compartment made a clause stop matching and the row was wrongly **kept**
+    /// (and so counted normally); here it makes a clause start matching and the row
+    /// is wrongly **dropped**.
+    ///
+    /// Every record type is counted here, `EVID` 2/3 included, unlike `n_dose` /
+    /// `n_obs`. Those two deliberately count only rows the fit actually uses, and a
+    /// kept `EVID=2` row changes nothing about which compartment anything lands in;
+    /// a *deleted* one removes a covariate-change marker from the fit, which is a
+    /// number the guessed compartment moved.
+    n_filtered: usize,
     /// Of the rows counted above, those whose `CMT` cell was present but missing.
     /// Zero when the column is absent — there is no cell to blame.
     n_missing_cell: usize,
@@ -1511,6 +1631,12 @@ impl CmtDefaults {
         self.note_cause(cause);
     }
 
+    /// One row a `CMT`-reading `[data_selection]` rule removed.
+    fn record_filtered(&mut self, cause: &CmtDefaultCause) {
+        self.n_filtered += 1;
+        self.note_cause(cause);
+    }
+
     fn note_cause(&mut self, cause: &CmtDefaultCause) {
         match cause {
             CmtDefaultCause::NoColumn => {}
@@ -1526,6 +1652,7 @@ impl CmtDefaults {
         self.n_dose += other.n_dose;
         self.n_dose_events += other.n_dose_events;
         self.n_obs += other.n_obs;
+        self.n_filtered += other.n_filtered;
         self.n_missing_cell += other.n_missing_cell;
         self.n_unparseable_cell += other.n_unparseable_cell;
         // A subject that already had to withhold a spelling keeps that fact when it
@@ -1537,7 +1664,7 @@ impl CmtDefaults {
     }
 
     fn any(&self) -> bool {
-        self.n_dose > 0 || self.n_obs > 0
+        self.n_dose > 0 || self.n_obs > 0 || self.n_filtered > 0
     }
 
     /// The offending spellings, quoted, with an ellipsis when a spelling was
@@ -2019,10 +2146,11 @@ fn parse_subject(
                 .unwrap_or(f64::NAN);
             // Resolved exactly as the dose and observation arms below resolve it,
             // so a `select`/`ignore` on CMT filters the same compartment the row
-            // is actually assigned (#1009). The cause is dropped here: the filter
-            // sees every record, including the EVID 2/3 rows the summary does not
-            // count, and the row may yet be excluded.
-            let (cmt_for_ctx, _) = resolve_row_cmt(row, cmt_col);
+            // is actually assigned (#1009). The cause is **kept**: if a CMT-reading
+            // rule then deletes the row, this is the only place that can count it —
+            // the arms that call `record_dose`/`record_obs` are past the `continue`
+            // below (#1409 review).
+            let (cmt_for_ctx, cmt_cause_for_filter) = resolve_row_cmt(row, cmt_col);
             let rate_for_ctx = rate_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64_or_nan(s))
@@ -2070,11 +2198,19 @@ fn parse_subject(
                 covariates: &locf_state,
                 str_covariates: &str_covariates,
             };
-            let (excluded, which) = sel.should_exclude(&ctx);
-            if excluded {
-                if let Some(src) = which {
-                    if !excl_fired.contains(&src) {
-                        excl_fired.push(src);
+            if let Some(rule) = sel.first_excluding_rule(&ctx) {
+                let src = rule.source(id);
+                if !excl_fired.contains(&src) {
+                    excl_fired.push(src);
+                }
+                // The row is about to vanish. If the rule that removed it reads CMT
+                // and the reader had to choose that CMT, this is the last point at
+                // which the choice can be reported (#1409 review). Scoped to the
+                // rule that actually fired, so an exclusion decided by another
+                // column stays silent even when a CMT clause sits beside it.
+                if let Some(cause) = &cmt_cause_for_filter {
+                    if rule.reads_column("cmt") {
+                        cmt_defaults.record_filtered(cause);
                     }
                 }
                 // Count by record type for the summary. The catch-all `other`

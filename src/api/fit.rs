@@ -87,6 +87,23 @@ pub fn fit_from_files(
     // legacy auto-detect when both are absent).
     let opts = options.unwrap_or_default();
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
+    // The file's `[fit_options]` are ignored here by design, but its
+    // `[data_selection]` is **not** — `build_selection_filter_merged` just applied it
+    // to the read above. So the options handed to `fit()` have to carry the merged
+    // clauses too, or `CmtConsumer::DataSelectionFilter` is asked about an empty list
+    // and withholds `W_CMT_DEFAULTED` on a fit that really was filtered on a
+    // compartment the reader invented (#1409 review). Only the selection strings are
+    // merged; every other key still comes from the caller.
+    let opts = {
+        let (ignore_exprs, accept_exprs, ignore_subjects) =
+            crate::api::run::merge_selection_exprs(&parsed.fit_options, &opts);
+        FitOptions {
+            ignore_exprs,
+            accept_exprs,
+            ignore_subjects,
+            ..opts
+        }
+    };
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
     let data_path = data_path.as_str();
     let (mut population, covariate_table) = read_population_for(
@@ -1265,7 +1282,7 @@ fn fit_inner(
         population
             .warnings
             .iter()
-            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, options, w))
             .cloned(),
     );
 

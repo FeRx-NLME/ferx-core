@@ -2148,7 +2148,11 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `reader_warning_suppressed` filter `fit()` and `ferx check` use, so all three suppress
 ///    exactly the same reader findings. `W_CMT_DEFAULTED` is the one that filter
 ///    actually withholds — from a model where `CMT` selects nothing (#1009);
-///    `W_ADDL_MISSING_II` and `W_IOV_OCC_MISSING` pass through it unchanged.
+///    `W_ADDL_MISSING_II` and `W_IOV_OCC_MISSING` pass through it unchanged. One
+///    qualification since #1409: that filter takes a `&FitOptions` for the one
+///    `W_CMT_DEFAULTED` channel that lives on the options rather than on the model — a
+///    `[data_selection]` clause comparing `CMT` — and these entry points have none, so it is
+///    passed a default. See the call site.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
 ///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` bundle.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
@@ -2191,11 +2195,20 @@ pub(crate) fn non_fit_diagnostics(
     phase: SolverStatsPhase,
 ) -> Vec<String> {
     let mut out: Vec<String> = model.parse_warnings.clone();
+    // No `[data_selection]` clauses: these entry points are handed a `Population` the
+    // caller already read, so whether a filter consumed the resolved `CMT` on the way
+    // in is not visible from here. Every other `W_CMT_DEFAULTED` channel is a property
+    // of the model and is answered in full; only `CmtConsumer::DataSelectionFilter` is
+    // dark on this path, for the same structural reason `check_model_options` is
+    // excluded wholesale — there is no `&FitOptions` to read, and synthesizing one
+    // would report on defaults the caller never chose (#1409). Built once rather than
+    // inside the closure, which would rebuild it per warning.
+    let no_selection = FitOptions::default();
     out.extend(
         population
             .warnings
             .iter()
-            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, &no_selection, w))
             .cloned(),
     );
     out.extend(
