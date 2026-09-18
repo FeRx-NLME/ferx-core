@@ -1703,6 +1703,7 @@ fn run_mcem(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = out;
     warnings.extend(cov_warnings);
 
@@ -1798,6 +1799,7 @@ fn run_mcem(
         h_matrices,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
@@ -2694,6 +2696,7 @@ fn run_mcem_mixture(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = cov_out;
     warnings.extend(cov_warnings);
 
@@ -2716,6 +2719,7 @@ fn run_mcem_mixture(
         h_matrices,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,

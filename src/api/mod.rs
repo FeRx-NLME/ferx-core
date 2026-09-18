@@ -255,6 +255,10 @@ mod extract_se_tests;
 mod tests_cov_diagnostics;
 
 #[cfg(test)]
+#[path = "tests/covariance_method_label_tests.rs"]
+mod covariance_method_label_tests;
+
+#[cfg(test)]
 #[path = "tests/tests_sir_fallback.rs"]
 mod tests_sir_fallback;
 

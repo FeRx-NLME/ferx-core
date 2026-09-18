@@ -21,6 +21,22 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
+- **Standard errors, eigenvalues and condition numbers now say which estimator produced them.**
+  `FitResult` carried `cov_condition_number` and `cov_eigenvalues` and printed standard errors,
+  but recorded nothing about whether they came from `R⁻¹`, `S⁻¹` or the `R⁻¹SR⁻¹` sandwich —
+  `covariance_method` lived on `FitOptions`, which a fit object, a `{model}-fit.yaml` or a
+  `.fitrx` bundle does not carry. One fit measured a condition number of 1.42e8 under the
+  sandwich and 3.68e5 under `covariance_method = s`, both correct for their estimator and
+  indistinguishable in the output — which matters the moment the figure is compared against
+  NONMEM, whose `$COVARIANCE` default is `RSR` and ferx's is `R`. A new
+  `FitResult::covariance_method` records the estimator that actually **ran**, which is not always
+  the one requested (above 100 free parameters a defaulted `r` is routed onto the cross-product),
+  and it is reported next to the `SE` column, on the `Covariance:` and `Condition number:` lines,
+  in the fit YAML/JSON, in the `.fitrx` bundle and in the `condition_number` /
+  `covariance_failed` / `covariance_regularized` warning `details` payloads — everywhere as the
+  same `r` / `s` / `rsr` token `[fit_options]` accepts. `None` when no covariance matrix was
+  produced (#1382).
+
 - **A fit now says when subjects fall out of the analytic outer-gradient scope.** A subject whose
   data shape the sensitivity provider declines at runtime — a rate-defined infusion under `F ≠ 1`,
   an out-of-scope ODE dose event, a missing occasion group — is salvaged onto a per-subject

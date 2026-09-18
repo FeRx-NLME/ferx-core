@@ -301,6 +301,7 @@ fn run_covariance_scoped(
         wall_time_secs: covariance_wall_time_secs,
         warnings: new_warnings,
         sir_fallback_proposal: _,
+        method: covariance_method,
     } = run_covariance_step_inner(
         &x_hat,
         &params,
@@ -333,6 +334,11 @@ fn run_covariance_scoped(
     out.se_residual_correlations = se_residual_correlations;
     out.cov_eigenvalues = cov_eigenvalues;
     out.cov_condition_number = cov_condition_number;
+    // #1382: overwrite, never merge. `out` is a clone of the incoming fit, so a
+    // label left over from that fit's own covariance step would outlive the
+    // matrix it described — and this step may well have routed differently (a
+    // caller re-running with `covariance_method = s`, say).
+    out.covariance_method = covariance_method;
     out.covariance_status = covariance_status;
     out.covariance_wall_time_secs = covariance_wall_time_secs;
     out.warnings.extend(new_warnings);
