@@ -59,6 +59,10 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
         .collect()
 }
 
+#[cfg(test)]
+#[path = "tests/dw_autocorrelation_warning_tests.rs"]
+mod dw_autocorrelation_warning_tests;
+
 #[cfg(all(test, feature = "nn"))]
 #[path = "tests/nn_info_tests.rs"]
 mod nn_info_tests;
@@ -176,6 +180,44 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
          above {}) costs O(n) finite-difference passes instead.",
         crate::types::BOBYQA_MAX_DIM
     ))
+}
+
+/// The pooled-IWRES autocorrelation warning for a Durbin-Watson statistic, or
+/// `None` when `dw` is non-finite or inside the `[1.5, 2.5]` band.
+///
+/// A free function rather than an inline block so the exact text is reachable
+/// from a unit test without running a fit (the suffix dropped below outlived
+/// #1285 precisely because nothing tested it), and deliberately independent of
+/// the model: it used to append " For ODE models, SDE process noise may also
+/// help." whenever `model.ode_spec` was present. `[diffusion]` is not that
+/// remedy. The EKF propagates the state covariance and never corrects the state
+/// mean with the observed data (#1285), so the fitted object is the
+/// deterministic ODE mean with an inflated residual variance: it re-weights the
+/// fit rather than supplying the missing dynamics the statistic is reporting.
+/// Measured on a 2-cpt population fitted as 1-cpt, one variable changed:
+/// adding `central ~ 0.01` moved DW from 0.40 to 0.77 — still below the
+/// threshold, so the warning fires again — while CL moved from 0.99 to 2.49
+/// against a truth of 1.0. The hint returns with the mean update.
+pub(crate) fn dw_autocorrelation_warning(dw: f64) -> Option<String> {
+    if !dw.is_finite() {
+        return None;
+    }
+    if dw < 1.5 {
+        Some(format!(
+            "Positive IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
+             Structural model may be missing dynamics. Consider a transit \
+             absorption model, additional compartment, or IOV on ka/F.",
+            dw
+        ))
+    } else if dw > 2.5 {
+        Some(format!(
+            "Negative IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
+             Possible over-parameterization or misspecified error model.",
+            dw
+        ))
+    } else {
+        None
+    }
 }
 
 /// Perturb initial parameters for multi-start optimisation.
@@ -2609,25 +2651,8 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    if dw_statistic.is_finite() {
-        if dw_statistic < 1.5 {
-            let mut msg = format!(
-                "Positive IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
-                Structural model may be missing dynamics. Consider a transit \
-                absorption model, additional compartment, or IOV on ka/F.",
-                dw_statistic
-            );
-            if model.ode_spec.is_some() {
-                msg.push_str(" For ODE models, SDE process noise may also help.");
-            }
-            warnings.push(msg);
-        } else if dw_statistic > 2.5 {
-            warnings.push(format!(
-                "Negative IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
-                Possible over-parameterization or misspecified error model.",
-                dw_statistic
-            ));
-        }
+    if let Some(msg) = dw_autocorrelation_warning(dw_statistic) {
+        warnings.push(msg);
     }
 
     // Reported outer optimizer. For the FOCE/FOCEI path with the default `auto`,

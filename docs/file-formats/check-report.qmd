@@ -206,7 +206,7 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 
 | Code | Severity | Meaning |
 |------|----------|---------|
-| `W_EXPERIMENTAL_SDE` | warning | The model uses stochastic differential equations (`[diffusion]`), an [experimental](../maturity.qmd) feature. |
+| `W_EXPERIMENTAL_SDE` | warning | The model uses stochastic differential equations (`[diffusion]`), an [experimental](../maturity.qmd) feature. The filter is covariance-only — the state mean is never corrected by the data — so see [What the filter does not do](../model-file/diffusion.qmd#what-the-filter-does-not-do). |
 | `W_EXPERIMENTAL_NN` | warning | The model uses neural-network components (`[covariate_nn]`), an [experimental](../maturity.qmd) feature. |
 | `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
 | `W_ABSORPTION_TWIN_DECLINED` | warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model stays closed-form with no ODE fallback. Subjects needing the fallback (time-varying covariates, a `TIME`-dependent parameter, IOV, SS or infusion doses, the flip-flop regime) are then rejected with an explicit error. The message carries the twin parser's own reason — most often an individual parameter named after a twin state (`CENTRAL`, `PERIPH`). See [#1008](https://github.com/FeRx-NLME/ferx-core/issues/1008). |

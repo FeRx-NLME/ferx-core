@@ -25,15 +25,24 @@ where `dW` is a vector of independent Wiener increments.  The diagonal entries
 `σ_w` are the *diffusion standard deviations*; their squares `σ²_w` are the
 **diffusion variances** declared in `[diffusion]`.
 
-ferx-core estimates the diffusion variances with an Extended Kalman Filter (EKF):
-the state covariance matrix `P` is propagated alongside the ODE trajectory and
-updated at each observation.  The total observation variance is:
+ferx-core estimates the diffusion variances with an Extended Kalman Filter (EKF).
+What is implemented today is the *covariance* half of that filter: the state
+covariance matrix `P` is propagated alongside the ODE trajectory and shrunk at
+each observation, while the state **mean** stays the deterministic ODE solution
+and is never corrected by the observed values.  The total observation variance
+is:
 
 ```
 V_total = P_ekf[obs_cmt, obs_cmt]  +  V_residual
 ```
 
 where `V_residual` is the variance from the `[error_model]` (sigma-based).
+
+So the residual actually scored is the ordinary ODE residual `DV - IPRED`, and
+the inflation `P` depends on the parameters, the sampling times and the residual
+variance — but on nothing the subject observed.  Read
+[What the filter does not do](#what-the-filter-does-not-do) below before
+interpreting a `[diffusion]` fit.
 
 ## Declaring diffusion variances
 
@@ -65,9 +74,53 @@ loop, or a covariate effect).
 
 ## When to use SDE models
 
-The primary signal is residual autocorrelation.  If the IWRES Durbin-Watson
-statistic is low (< 1.5) in a fitted ODE model, adding a diffusion term on the
-slow-varying compartment often absorbs the systematic drift.
+`[diffusion]` buys one extra parameter per state: how much unexplained variance
+accumulates along the trajectory.  That is worth asking for when you want to
+*quantify* how far a mechanistically committed ODE is from the data — a large
+`DIFF_<STATE>` relative to sigma says the structure is missing something — and
+when the competing structural models are not identifiable from the design.
+
+It is **not** a remedy for residual autocorrelation, and ferx no longer suggests
+it as one.  With the state mean uncorrected the likelihood factorises over
+observations, with inflations that do not depend on what was observed, so a
+diffusion term cannot follow a subject's drift — it re-weights the fit instead.
+Measured on a two-compartment population fitted as one compartment (40 subjects
+× 14 observations, 5 % proportional error; one variable changed, the
+`[diffusion]` block):
+
+| Model | OFV | Durbin-Watson | Fitted CL (truth 1.0) |
+|---|---|---|---|
+| ODE | 692.67 | 0.403 | 0.99 |
+| ODE + `central ~ 0.01` | 23.30 | 0.766 | 2.49 |
+
+The objective improves by 669 for one parameter, the Durbin-Watson statistic
+still trips its threshold, and CL moves 2.5× away from the value the ODE fit had
+recovered.  Fit the missing compartment, not the noise.
+
+## What the filter does not do
+
+Three consequences of the uncorrected state mean, all structural rather than a
+matter of tolerance — tracked as
+[issue #1285](https://github.com/FeRx-NLME/ferx-core/issues/1285):
+
+- **No state correction.** At an observation the filter applies the posterior
+  covariance update but not the mean update `x += K * (y - y_pred)`.  The next
+  interval integrates from the open-loop ODE state, not from a corrected one.
+- **No filtered `IPRED`, no posterior trajectory.** `IPRED`, sdtab and
+  `[derived]` compartment states all come from the ordinary ODE pass.  A
+  zero-drift state carrying a parameter (`d/dt(lkel) = 0` together with
+  `[diffusion] lkel ~ 0.01`) parses and fits, but that state never moves — only
+  its variance grows — so it cannot be read as a time course of the parameter.
+- **sdtab `IWRES` is over-dispersed.** `IWRES` is scaled by the residual error
+  alone; the process variance the objective adds never reaches it.  On the
+  misspecified fixture above the mean square of `IWRES` is 1e10 on the SDE fit
+  against 0.94 on the ODE fit, because sigma collapses to 0.0165 to absorb what
+  the inflation already explained.  Do not read `IWRES`, `CWRES` or a residual
+  plot from a `[diffusion]` fit as a goodness-of-fit summary.
+
+The `W_EXPERIMENTAL_SDE` warning repeats all three points on every
+fit.  The mean update is planned; until it lands, read `DIFF_<STATE>` as a
+variance-inflation parameter and nothing more.
 
 ## Unit convention (important)
 
