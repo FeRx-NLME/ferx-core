@@ -136,7 +136,7 @@ const EIGENSOLVE_MAX_ITERATIONS: usize = 1000;
 /// hand ("`rodas5p` at `ode_reltol ≤ 1e-9`"). It was `1e-8` here, which put a model on
 /// `ode_reltol = 1e-8` on a *different* stepper than the docs would have sent its author to —
 /// a gratuitous way for `auto` and a hand-written control stream to disagree.
-const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
+pub(crate) const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
     if opts.reltol <= 1e-9 {
         OdeMethod::Rodas5P
     } else {

@@ -3684,7 +3684,16 @@ mod tests {
         let bad = DVector::from_column_slice(&eta)
             + std::f64::consts::SQRT_2 * anchor.node_scale() * DVector::from_column_slice(&tail);
         assert!(
-            node_jet(&model, &s, p, bad.as_slice()).is_none(),
+            node_jet(
+                &model,
+                &s,
+                p,
+                bad.as_slice(),
+                &mut Vec::new(),
+                &mut DVector::zeros(model.n_eta),
+                &mut DVector::zeros(model.n_eta),
+            )
+            .is_none(),
             "tail fixture must be outside the provider's scope"
         );
         // Include a zero-weight tail before AND after the live node to pin alignment.
@@ -3867,7 +3876,16 @@ mod tests {
             // identical plain fixture must remain supported.
             let supported = magnitude.is_none();
             assert_eq!(
-                node_jet(&model, &subject, params, &eta).is_some(),
+                node_jet(
+                    &model,
+                    &subject,
+                    params,
+                    &eta,
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                )
+                .is_some(),
                 supported
             );
             assert_eq!(
@@ -3962,7 +3980,16 @@ mod tests {
         params.theta = theta;
         let eta = precise_ebe(&model, &subject, &params);
 
-        let jet = node_jet(&model, &subject, &params, &eta).expect("warfarin is in scope");
+        let jet = node_jet(
+            &model,
+            &subject,
+            &params,
+            &eta,
+            &mut Vec::new(),
+            &mut DVector::zeros(model.n_eta),
+            &mut DVector::zeros(model.n_eta),
+        )
+        .expect("warfarin is in scope");
 
         // Stationarity: the mode's inner gradient vanishes, to the inner tolerance.
         for i in 0..model.n_eta {

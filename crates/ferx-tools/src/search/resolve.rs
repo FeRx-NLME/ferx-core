@@ -414,8 +414,13 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                         let kind = ctx.covariate_kind(cov);
                         let effect_list: Vec<CovariateEffect> = match effects {
                             // Pharmpy expands `*` to the continuous forms; on a
-                            // declared categorical covariate the only form that
-                            // can apply is `cat`.
+                            // declared categorical covariate ferx expands it to
+                            // `cat`. Since #1312 `cat2` is a second categorical
+                            // form, but it stays out of the wildcard: Pharmpy's
+                            // own expansion never reaches it, and adding it here
+                            // would silently double every categorical pair's
+                            // candidate count on an existing search space. Ask
+                            // for it by name.
                             Modes::Wildcard => match kind {
                                 Some(CovariateKind::Categorical) => vec![CovariateEffect::Cat],
                                 _ => CovariateEffect::CONTINUOUS.to_vec(),
@@ -534,6 +539,25 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
             effects: Modes::List(effects),
             op,
         }));
+    }
+
+    // ferx can express the `+` operator (#1313) but not with Pharmpy's
+    // arithmetic: Pharmpy reuses the multiplicative template, so its additive
+    // linear effect adds `1 + θ·(COV − c)` and a covariate at its centre adds
+    // `1` to the parameter; ferx drops that leading `1`, so the effect is null
+    // at θ = 0. Both fit, and the difference is a constant on the parameter —
+    // exactly the kind of divergence that is invisible unless it is said, so a
+    // space that asks for `+` says it once.
+    if covariate_effects.iter().any(|e| e.op == CovariateOp::Add) {
+        notes.push(
+            "COVARIATE(..., +): ferx's additive covariate effect is null at theta = 0 — \
+             `theta*(COV - centre)` for lin, `exp(...) - 1` for exp, `(COV/c)^theta - 1` for \
+             pow, `theta_k` per level for cat. Pharmpy reuses the multiplicative template \
+             under `+`, so its additive effect adds `1 + theta*(COV - centre)` and shifts the \
+             parameter by 1 even at theta = 0. A model translated from Pharmpy with `+` will \
+             therefore not reproduce Pharmpy's equations."
+                .to_string(),
+        );
     }
 
     Ok(Resolved {
@@ -661,7 +685,7 @@ fn check_effect_kind(
     match kind {
         Some(CovariateKind::Categorical) if !effect.is_categorical() => Err(format!(
             "search space: in `{feature}`: `{cov}` is declared categorical, and `{}` is a \
-             continuous form; use `cat`",
+             continuous form; use `cat` or `cat2`",
             effect.label()
         )),
         Some(CovariateKind::Continuous) if effect.is_categorical() => Err(format!(

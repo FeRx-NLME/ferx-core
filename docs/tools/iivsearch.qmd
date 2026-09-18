@@ -243,26 +243,28 @@ through NONMEM 7.5.1 (`pharmpy_iivsearch.json`) for all three algorithms.
 The same seven-plus-one candidates in the same numbering, the same winner
 at each step, the same final model to three decimals. Bottom-up from `[CL]`
 follows the same path (`[CL]+[V]` 697.411, `[CL,V]` 666.086). The
-simultaneous algorithm agrees on step one (`[CL,V]` from `[CL]`) and parts
-on step two, for the reason below: its `[CL,V]+[KA]` candidate is a mixed
-ω, which ferx's FOCEI fits as the full block `[CL,V,KA]` (#1018) — OFV
-647.73 against NONMEM's 655.47 for the model as declared (a fit that
-terminated with unreportable significant digits) — and ferx ends on it
-where Pharmpy ends on `[CL,V]`. The anchor asserts that divergence by name,
-so the fix of #1018 turns it red and says what to flip; the search itself
-carries a note naming #1018 on the run.
+simultaneous algorithm agrees on step one (`[CL,V]` from `[CL]`) and on the
+mixed-ω candidate as well: its `[CL,V]+[KA]` model is fitted as declared, at
+OFV 655.02 against NONMEM's 655.47 for the same model — a fit that
+terminated with unreportable significant digits, which is why the anchor
+asks for agreement within an OFV unit rather than equality. Before #1018
+ferx fitted that candidate as the full block `[CL,V,KA]` (OFV 647.73) and
+ended the search on it, where Pharmpy ends on `[CL,V]`.
 
-## Known limitation: mixed ω under FOCE / FOCEI (#1018)
+## Mixed ω candidates
 
-FOCE / FOCEI estimate the **full lower triangle** of a `block_omega` that
-sits beside a standalone `omega`: the cross-block covariances the model
-declares absent are fitted as free parameters, and the reported parameter
-count and BIC do not include them. SAEM, Gauss-Newton and VI honour the
-declared structure. Until #1018 is fixed, a block-stage candidate with a
-block beside another η — every 2-block on a three-η model — is, under
-FOCE / FOCEI, a larger block than its description says. The search adds a
-note whenever it generates one under those methods; read its rank with
-that in mind, or run the search with `method = saem` or `gn`.
+A block-stage candidate can place a block beside another η — every 2-block
+on a three-η model does. Such a mixed ω declares no covariance between the
+block and the standalone η, and every estimator holds those covariances at
+exactly 0 (#1018), so the candidate is fitted as the model it describes and
+its parameter count and BIC match that model.
+
+Before #1018, FOCE and FOCEI estimated the full lower triangle of such an ω:
+the cross-block covariances were fitted as free parameters while the
+reported parameter count and BIC excluded them, so a mixed-ω row ranked on a
+larger block than its description (SAEM and VI honoured the structure, as
+did Gauss-Newton on its analytic gradient path). The search used to add a
+note whenever it generated such a candidate; that note is gone with the bug.
 
 The BIC(iiv) itself is anchored to `pharmpy.modeling.calculate_bic` in
 core (#1177); the trajectory above re-asserts it end to end.

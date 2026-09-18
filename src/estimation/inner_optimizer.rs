@@ -1,9 +1,10 @@
 use crate::pk;
-#[cfg(test)]
-use crate::stats::likelihood::individual_nll_iov;
 use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov_with_scratch, iov_occasion_groups,
+    individual_nll_into_prepared_with_schedule, individual_nll_iov_with_scratch,
+    iov_occasion_groups,
 };
+#[cfg(test)]
+use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
@@ -486,6 +487,48 @@ pub struct InnerLoopStats {
     pub n_start_rejected: usize,
 }
 
+/// The non-IOV inner-EBE cold seed: η = 0, except that every FREM covariate
+/// pseudo-observation eta starts at its data-implied mode `cov_obs − TV`.
+///
+/// Those etas are pinned by their pseudo-observations (precision ≫ prior), so the
+/// shift is essentially their exact posterior mode. Starting them at 0 instead
+/// leaves them ~±40 off, and the block-Ω⁻¹ PK↔covariate coupling turns that error
+/// into a large spurious force on the PK etas — which is what sent a handful of
+/// subjects' PK etas running away (V≈e⁻⁹, MAT≈e¹¹) and produced modes with obs-NLL
+/// ~1e7–1e8 that wrecked the IMP proposal (issue #406).
+///
+/// It is a *function* rather than an inline block at the one cold start because the
+/// Nelder–Mead fallback needs the same seed (#1349): NM's initial simplex step is
+/// `0.05·|ηᵢ|`, or `0.00025` at `ηᵢ = 0`, so a restart from a plain zero vector
+/// cannot travel the ±40 a FREM covariate eta needs — it returns a point whose
+/// covariate etas are still at zero and whose PK etas have absorbed the resulting
+/// force. Returns plain zeros for a non-FREM model, so every non-FREM caller is
+/// bit-identical.
+fn cold_eta_seed(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    n_eta: usize,
+) -> Vec<f64> {
+    let mut eta = vec![0.0; n_eta];
+    if let Some(fc) = model.frem_config.as_ref() {
+        for (j, &ft) in subject.fremtype.iter().enumerate() {
+            if ft == 0 {
+                continue;
+            }
+            if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                if eta_idx < n_eta
+                    && theta_idx < params.theta.len()
+                    && j < subject.observations.len()
+                {
+                    eta[eta_idx] = subject.observations[j] - params.theta[theta_idx];
+                }
+            }
+        }
+    }
+    eta
+}
+
 /// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
 /// BFGS reports non-convergence. Keeps the lower-objective of the BFGS partial and a single
 /// Nelder–Mead restart, so a `false`-on-a-converged search (gradient-noise floor / line-
@@ -495,16 +538,21 @@ pub struct InnerLoopStats {
 ///
 /// The restart seeds from the BFGS `partial` when `ebe_warm_start` is set (it sits on the
 /// steep prior slope, so NM reaches the mode in fewer steps), else from `cold_seed` (η=0
-/// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). Exactly **one** NM solve
-/// runs, so enabling `ebe_warm_start` is never slower than leaving it off.
+/// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). One NM solve runs when
+/// the restart wins or under `ebe_warm_start`; a second, started from the partial, runs
+/// only when a cold restart loses to the partial (see below).
 ///
-/// Returns `(eta, nm_converged)`. The **value** is the lower-objective of the BFGS partial
+/// Returns `(eta, converged)`. The **value** is the lower-objective of the BFGS partial
 /// and the NM restart — the substantive #555 fix: the previous code overwrote `eta` with the
 /// NM restart unconditionally, discarding a correct partial that BFGS had reached but not
-/// gnorm-verified. `nm_converged` is the Nelder–Mead convergence flag (as the pre-#555 code
-/// reported), so the per-subject convergence/diagnostic semantics are unchanged; the η̂
-/// *value* fed to the FOCEI gradient is what improves. A non-finite `obj(partial)` (NaN/∞)
-/// makes the partial unusable so the NM result is taken.
+/// gnorm-verified. `converged` is the Nelder–Mead flag **of the run that ended at the
+/// returned point** (PR #1337 review): when the restart wins it is that restart's flag;
+/// when the partial wins, the partial — which its own BFGS run did *not* certify — is
+/// polished by an NM started from it, and that run's end point and flag are returned (the
+/// end point is never worse than the partial). Returning the restart's flag with the
+/// partial's point reported a converged EBE whenever NM had converged in a *worse* basin,
+/// which bypassed `max_unconverged_frac` and AGQ's per-subject acceptance. A non-finite
+/// `obj(partial)` (NaN/∞) makes the partial unusable so the NM result is taken.
 fn argmin_inner_fallback(
     obj: &dyn Fn(&[f64]) -> f64,
     partial: &[f64],
@@ -527,12 +575,31 @@ fn argmin_inner_fallback(
     // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
     // partial is kept.
     let nm_strictly_better = f_nm < partial_f;
-    let best = if partial_usable && !nm_strictly_better {
-        partial.to_vec()
+    if !partial_usable || nm_strictly_better {
+        return (eta_nm, nm_ok);
+    }
+    // The partial wins on objective. Its own BFGS run did not certify it, and `nm_ok`
+    // describes a point we are not returning (NM may well have *converged* — in a worse
+    // basin), so it must not be reported as this point's status: `EbeResult.converged`
+    // feeds `max_unconverged_frac` and AGQ's per-subject acceptance (PR #1337 review).
+    // Certify the partial the same derivative-free way NM certifies its own result: a
+    // second NM started *from the partial*. Its end point is what is returned (never
+    // worse than the partial, NM keeps its best vertex) and its flag is the flag — a
+    // genuine mode collapses the simplex within `tol` in a few iterations, a
+    // non-stationary partial keeps descending and reports `false` when the budget ends.
+    // Under `ebe_warm_start` the single NM above already ran from the partial and ended
+    // at its value, so that run is the certification and nothing is re-run.
+    if warm {
+        return (partial.to_vec(), nm_ok);
+    }
+    let mut polished = partial.to_vec();
+    let polished_ok = nelder_mead_minimize(obj, &mut polished, n, max_iter * 5, tol);
+    let f_polished = obj(&polished);
+    if f_polished.is_finite() && f_polished <= partial_f {
+        (polished, polished_ok)
     } else {
-        eta_nm
-    };
-    (best, nm_ok)
+        (partial.to_vec(), false)
+    }
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
@@ -737,6 +804,72 @@ pub fn find_ebe(
     mu_k: Option<&[f64]>,
     restarts: usize,
 ) -> EbeResult {
+    let schedule = cacheable_schedule(model, subject);
+    find_ebe_impl(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        schedule.as_ref(),
+    )
+}
+
+/// Same as [`find_ebe`], but takes an already-resolved [`EventSchedule`](pk::event_driven::EventSchedule)
+/// instead of rebuilding one via [`cacheable_schedule`] on every call.
+///
+/// `cacheable_schedule`'s result depends only on `model` + `subject` — never on `params`/`eta`
+/// — so it is identical on every outer-loop evaluation of the same subject, not just across the
+/// BFGS steps of one `find_ebe` call. A caller that re-solves the same subject many times over a
+/// fit (the FOCEI/AGQ/Laplace outer hot loop) builds a `Vec<Option<EventSchedule>>` once via
+/// [`build_schedule_cache`] and passes each subject's entry here instead of paying the merged
+/// dose/event-timeline rebuild on every one of those calls.
+pub(crate) fn find_ebe_cached(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> EbeResult {
+    find_ebe_impl(
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule,
+    )
+}
+
+/// Build the per-subject [`EventSchedule`](pk::event_driven::EventSchedule) cache once per
+/// fit, for reuse across every outer-loop evaluation via [`find_ebe_cached`]. Mirrors the
+/// once-per-population `schedules` cache `bayes.rs`'s chain loop already builds — the schedule
+/// is fit-invariant (see [`cacheable_schedule`]'s own doc for the staleness analysis), so
+/// building it once here instead of once per `find_ebe` call is always sound.
+pub(crate) fn build_schedule_cache(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Option<pk::event_driven::EventSchedule>> {
+    population
+        .subjects
+        .iter()
+        .map(|subject| cacheable_schedule(model, subject))
+        .collect()
+}
+
+fn find_ebe_impl(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> EbeResult {
     let n_eta = model.n_eta;
 
     if inner_profile_enabled() {
@@ -764,35 +897,10 @@ pub fn find_ebe(
     let _ = mu_k;
     let mut eta: Vec<f64> = match eta_init {
         Some(warm) => warm.to_vec(),
-        None => vec![0.0; n_eta],
+        // The cold seed is FREM-aware; see [`cold_eta_seed`]. A warm start already
+        // carries good covariate etas.
+        None => cold_eta_seed(model, subject, params, n_eta),
     };
-
-    // FREM-aware cold-start: initialise each covariate pseudo-obs eta at its
-    // data-implied mode `cov_obs − TV`. These etas are pinned by their
-    // pseudo-observations (precision ≫ prior), so this is essentially their
-    // exact posterior mode. Starting them at 0 instead leaves them ~±40 off,
-    // and the block-Ω⁻¹ PK↔covariate coupling turns that error into a large
-    // spurious force on the PK etas — which is what sent a handful of subjects'
-    // PK etas running away (V≈e⁻⁹, MAT≈e¹¹) and produced modes with obs-NLL
-    // ~1e7–1e8 that wrecked the IMP proposal (issue #406). Only on a cold start;
-    // a warm start already carries good covariate etas.
-    if eta_init.is_none() {
-        if let Some(fc) = model.frem_config.as_ref() {
-            for (j, &ft) in subject.fremtype.iter().enumerate() {
-                if ft == 0 {
-                    continue;
-                }
-                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
-                    if eta_idx < n_eta
-                        && theta_idx < params.theta.len()
-                        && j < subject.observations.len()
-                    {
-                        eta[eta_idx] = subject.observations[j] - params.theta[theta_idx];
-                    }
-                }
-            }
-        }
-    }
 
     // Diagonal preconditioner for the inner BFGS. FREM posteriors are extremely
     // multi-scale: PK etas have curvature ~1e2 and scale ~0.1, covariate
@@ -829,19 +937,44 @@ pub fn find_ebe(
     //
     // Event parameter storage is allocated lazily by per-event prediction paths.
     // The schedule is built only when cacheable_schedule permits reuse; a static
-    // fast path needs neither event storage nor a merged schedule.
+    // fast path needs neither event storage nor a merged schedule. It is now a
+    // parameter (see `find_ebe_cached`/`build_schedule_cache`) rather than being
+    // rebuilt here on every call.
     let pk_scratch_cell = RefCell::new(pk::EventPkParams::default());
-    let schedule = cacheable_schedule(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here — not inside `agrad`, which BFGS calls on
     // every inner step (and every line-search trial) — instead of re-walking
     // every magnitude expression on each of those calls (#486 review).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    // #658: per-observation residual endpoint keys — η-independent, same hoist as
+    // `mult` (a `Selected` error spec's `obs_keys` allocates a fresh `Vec<usize>`,
+    // so this avoids re-allocating it on every inner BFGS step).
+    let err_keys = model.error_spec.obs_keys(subject);
+    // Per-subject `ObsGrad` buffer, reused across every inner BFGS step the same
+    // way `pk_scratch_cell` is: `analytic_eta_nll_gradient_with_schedule` takes its
+    // previous contents as a reuse hint and stores the fresh result back, so the
+    // light sensitivity provider's closed-form path overwrites its `ObsGrad`s'
+    // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
+    // observation on every call.
+    let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
+    let pred_recycle = RefCell::new(Vec::<f64>::new());
+    // `obj`'s own scratch.
+    let eta_work = RefCell::new(DVector::zeros(n_eta));
+    let prior_work = RefCell::new(DVector::zeros(n_eta));
+    // `agrad`'s scratch for its analytic-gradient call, kept separate from `obj`'s above.
+    // The `match analytic_eta_nll_gradient_with_schedule(...) { ... }` below has its
+    // scrutinee's `&mut …borrow_mut()` temporaries live for the *whole* match — including
+    // the `None` arm, which calls `gradient_fd(&obj, ..)` and so re-enters `obj` while
+    // those borrows are still outstanding. Sharing one RefCell pair between `obj` and
+    // `agrad` would panic there with "already borrowed"; separate cells keep the fallback
+    // re-entrant.
+    let grad_eta_work = RefCell::new(DVector::zeros(n_eta));
+    let grad_prior_work = RefCell::new(DVector::zeros(n_eta));
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
-        individual_nll_into_with_schedule(
+        individual_nll_into_prepared_with_schedule(
             model,
             subject,
             &params.theta,
@@ -854,7 +987,12 @@ pub fn find_ebe(
             // search at the declared correlation while the outer loop moved it.
             &params.residual_correlations,
             &mut scratch,
-            schedule.as_ref(),
+            schedule,
+            err_keys.as_ref(),
+            mult.as_deref(),
+            &mut pred_recycle.borrow_mut(),
+            &mut eta_work.borrow_mut(),
+            &mut prior_work.borrow_mut(),
         )
     };
 
@@ -891,8 +1029,12 @@ pub fn find_ebe(
             // Live ρ (#847) — the same value `obj` above scores, so the BFGS
             // gradient and objective can never disagree about the residual R.
             &params.residual_correlations,
-            schedule.as_ref(),
+            schedule,
             mult.as_deref(),
+            err_keys.as_ref(),
+            &mut obs_grad_recycle.borrow_mut(),
+            &mut grad_eta_work.borrow_mut(),
+            &mut grad_prior_work.borrow_mut(),
         ) {
             Some(g) => {
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -938,7 +1080,7 @@ pub fn find_ebe(
     let bfgs_converged = result;
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
-        let cold = vec![0.0; n_eta];
+        let cold = cold_eta_seed(model, subject, params, n_eta);
         if enable_stall {
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
             eta = best;
@@ -946,8 +1088,11 @@ pub fn find_ebe(
         } else if model.frem_config.is_some() {
             // FREM: the BFGS partial can be a *non-stationary*, merely-low-objective point (run
             // out along a covariate pseudo-obs flat direction) that would mis-center the
-            // FREM/IMP proposal. Re-center with NM from η=0 and take it unconditionally — the
-            // prior-release behaviour for the exact path.
+            // FREM/IMP proposal, so the restart is what re-centers it. The restart itself now
+            // starts from the FREM-aware `cold` seed rather than a plain zero vector (#1349) —
+            // NM cannot travel the ±40 a covariate eta needs from η=0, so the "re-centred"
+            // point it returned had its covariate etas still at zero and its PK etas carrying
+            // the resulting block-Ω⁻¹ force.
             let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
             eta = if warm { partial } else { cold };
             let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
@@ -1144,7 +1289,7 @@ pub fn find_ebe(
                 &params.theta,
                 &eta_true,
                 &mut scratch,
-                schedule.as_ref(),
+                schedule,
             );
             GRADIENT_TIMINGS.record_jac_fd(t0.elapsed().as_nanos() as u64);
             j
@@ -1331,26 +1476,31 @@ fn find_ebe_iov(
         None,
         enable_stall,
     );
-    // On BFGS failure, recover with the same ODE-gated policy as the non-IOV `find_ebe`
-    // (cold seed = prior mode `bsv_psi = μ`, κ = 0): for ODE objectives keep the
-    // lower-objective of {BFGS partial, NM restart} so a correct η̂ floored above `tol` by
-    // solver noise is never discarded (#555); for exact objectives recover with NM from the
-    // cold seed, as prior releases, so a non-stationary low-objective partial can't be kept.
+    // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
+    // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
+    // (`argmin_inner_fallback`). This holds for ODE objectives (#555, a gradient-noise floor
+    // blocks certification at a genuine mode) AND for exact objectives (#378 for the non-IOV
+    // path; #1327 here): a closed-form BFGS started far from the mode routinely arrives at it
+    // and stalls at a gradient norm just above `tol` (busulfan DCM+IOV subject 261: partial
+    // at the mode, NLL 94.6, |g| ≈ 7e-5 > 1e-5). Until #1327 this branch then replaced that
+    // partial *unconditionally* with an 11-dimensional Nelder–Mead from the cold seed, which
+    // stops at NLL ≈ 5030 with κ tens of prior SDs out — so every cold-started evaluation
+    // (the final inner loop, an `outer_maxiter = 0` re-evaluation) scored a handful of
+    // subjects thousands of −2LL units too high, while the warm-started trajectory (whose
+    // BFGS converges within `tol` from the previous mode) never saw it. The reported OFV
+    // sat 9 300 above the value the optimizer had minimised. IOV + FREM is unsupported
+    // (`foce_subject_nll_iov` returns a sentinel for it), so the FREM-only "take NM
+    // unconditionally to re-center the proposal" arm of the non-IOV path has no twin here.
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
         if skip_ode_iov_nm_fallback(model) {
             (false, false)
-        } else if enable_stall {
+        } else {
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
             x = best;
             (ok, true)
-        } else {
-            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
-            x = if warm { partial } else { cold };
-            let nm_ok = nelder_mead_minimize(&obj, &mut x, n_flat, max_iter * 5, tol);
-            (nm_ok, true)
         }
     } else {
         (false, false)
@@ -2149,6 +2299,8 @@ pub(crate) fn analytic_eta_nll_gradient(
     // one-off caller like this can just compute it inline (unlike `find_ebe`'s
     // per-BFGS-step closure, which hoists it — see `analytic_eta_nll_gradient_with_schedule`).
     let mult = model.ruv_obs_mult(subject, theta);
+    // #658: per-observation residual endpoint keys — η-independent, same hoist as `mult`.
+    let err_keys = model.error_spec.obs_keys(subject);
     analytic_eta_nll_gradient_with_schedule(
         model,
         subject,
@@ -2160,6 +2312,10 @@ pub(crate) fn analytic_eta_nll_gradient(
         &model.residual_correlations,
         None,
         mult.as_deref(),
+        err_keys.as_ref(),
+        &mut Vec::new(),
+        &mut DVector::zeros(model.n_eta),
+        &mut DVector::zeros(model.n_eta),
     )
 }
 
@@ -2172,6 +2328,21 @@ pub(crate) fn analytic_eta_nll_gradient(
 /// closure (`find_ebe`'s `agrad`) can compute it **once** outside the loop instead
 /// of re-walking every magnitude expression on every inner iteration (#486 review).
 /// `None` when no magnitude is active.
+///
+/// `err_keys` is the subject's per-observation residual endpoint dispatch keys
+/// (#658, [`ErrorSpec::obs_keys`](crate::types::ErrorSpec::obs_keys)) — likewise
+/// η-independent and caller-supplied for the same reason as `mult`: for a
+/// `Selected` (covariate-selector) error spec, `obs_keys` allocates a fresh
+/// `Vec<usize>`, so recomputing it inside this per-BFGS-step function would
+/// re-allocate on every inner iteration instead of once per subject.
+///
+/// `obs_grad_recycle` is a per-subject scratch slot, owned by the caller and
+/// reused across every inner BFGS step: this function hands its previous
+/// contents in as [`subject_eta_grad_with_schedule`]'s reuse hint, then stores
+/// the freshly computed `Vec<ObsGrad>` back before returning, so the next call
+/// for the same subject can overwrite its `ObsGrad`s in place instead of
+/// allocating a fresh one per observation (mirrors the `pk_scratch_cell`
+/// pattern `find_ebe` already uses for `EventPkParams`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     model: &CompiledModel,
@@ -2183,6 +2354,10 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     residual_correlations: &[crate::types::ResidualCorrelation],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
+    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
 ) -> Option<Vec<f64>> {
     // The inner NLL is `½(η'Ω⁻¹η + log|Ω| + data_gauss + 2·data_nonGaussian)`, so its
     // η-gradient is a plain **sum** of term gradients. Assemble the non-Gaussian block
@@ -2206,10 +2381,11 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // model for the provider to evaluate. The gradient is prior + non-Gaussian; return it
     // directly rather than asking a provider that has nothing to compute.
     if subject.obs_times.is_empty() {
-        let eta_v = nalgebra::DVector::from_column_slice(eta);
+        eta_work.as_mut_slice().copy_from_slice(eta);
+        prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
         // `mut` is only exercised by the markov CTMM fold below.
         #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
-        let mut grad: Vec<f64> = (&omega.inv * &eta_v).as_slice().to_vec();
+        let mut grad: Vec<f64> = prior_work.as_slice().to_vec();
         #[cfg(feature = "markov")]
         if let Some(g) = &ctmm_grad {
             for (acc, gi) in grad.iter_mut().zip(g.iter()) {
@@ -2221,12 +2397,14 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
+    let hint = std::mem::take(obs_grad_recycle);
     let sens = crate::sens::provider::subject_eta_grad_with_schedule(
         model,
         subject,
         theta,
         eta,
         cached_schedule,
+        hint,
     )?;
     // Fold the non-Gaussian block into whichever Gaussian branch runs below.
     #[cfg(feature = "markov")]
@@ -2244,17 +2422,22 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
     if !residual_correlations.is_empty() {
-        return dense_residual_inner_gradient(
+        let result = dense_residual_inner_gradient(
             model,
             subject,
-            theta,
             eta,
             omega,
             sigma,
             residual_correlations,
             &sens,
+            mult,
+            err_keys,
+            eta_work,
+            prior_work,
         )
         .map(add_nongaussian);
+        *obs_grad_recycle = sens;
+        return result;
     }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
@@ -2274,8 +2457,6 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     };
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
     // FREM covariate pseudo-observations: the objective scores these rows against the
     // dedicated `EPSCOV` variance, not `error_spec.variance_at(f)`. The provider has
     // already corrected their `f` and `∂f/∂η` (`apply_frem_pseudo_obs_grad`); this is the
@@ -2319,12 +2500,14 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         grad[r] += ruv_grad;
     }
     // Prior: ∂/∂η ½ η'Ω⁻¹η = Ω⁻¹η.
-    let eta_v = nalgebra::DVector::from_column_slice(eta);
-    let prior = &omega.inv * &eta_v;
+    eta_work.as_mut_slice().copy_from_slice(eta);
+    prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
     for (k, g) in grad.iter_mut().enumerate() {
-        *g += prior[k];
+        *g += prior_work[k];
     }
-    Some(add_nongaussian(grad))
+    let result = Some(add_nongaussian(grad));
+    *obs_grad_recycle = sens;
+    result
 }
 
 /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual
@@ -2348,28 +2531,27 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 fn dense_residual_inner_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
     residual_correlations: &[crate::types::ResidualCorrelation],
     sens: &[crate::sens::provider::ObsGrad],
+    mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
     let n_eta = model.n_eta;
-    let eta_v = DVector::from_column_slice(eta);
-    let prior = &omega.inv * &eta_v;
+    eta_work.as_mut_slice().copy_from_slice(eta);
+    prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
     let n_obs = sens.len();
     if n_obs == 0 {
-        return Some(prior.as_slice().to_vec());
+        return Some(prior_work.as_slice().to_vec());
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
     let corr = residual_correlations;
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-    // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
-    let r = match ruv_mult.as_deref() {
+    let r = match mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,
             &ipreds,
@@ -2415,7 +2597,7 @@ fn dense_residual_inner_gradient(
         &subject.obs_l2,
         sigma,
         corr,
-        ruv_mult.as_deref(),
+        mult,
     );
     let mut grad = vec![0.0f64; n_eta];
     for k in 0..n_eta {
@@ -2441,7 +2623,7 @@ fn dense_residual_inner_gradient(
         }
         // sᵀ ∂R/∂η_k s.
         let quad = s.dot(&(&dr_k * &s));
-        grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior[k];
+        grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior_work[k];
     }
     Some(grad)
 }
@@ -2771,6 +2953,7 @@ fn lbfgs_core(
     let mut rho_hist: Vec<f64> = Vec::new();
     let mut g = grad(x);
     let mut f_cur = obj(x);
+    let mut line_search_point = vec![0.0; n];
     // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): for ODE
     // objectives whose gradient norm is floored above `tol` by solver noise, a search that
     // reached the mode declares convergence rather than spinning to `max_iter`. Gated on
@@ -2806,7 +2989,8 @@ fn lbfgs_core(
             };
         }
 
-        let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+        let (alpha, f_new) =
+            backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -2866,6 +3050,15 @@ fn dense_bfgs_core(
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
+    let mut g_vec = DVector::zeros(n);
+    let mut d_vec = DVector::zeros(n);
+    let mut d = vec![0.0; n];
+    let mut s = vec![0.0; n];
+    let mut y = vec![0.0; n];
+    let mut s_vec = DVector::zeros(n);
+    let mut y_vec = DVector::zeros(n);
+    let eye = DMatrix::identity(n, n);
+    let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
     let mut f_cur = obj(x);
@@ -2900,9 +3093,9 @@ fn dense_bfgs_core(
             return true;
         }
 
-        let g_vec = DVector::from_column_slice(&g);
-        let d_vec = -&h_inv * &g_vec;
-        let d: Vec<f64> = d_vec.iter().copied().collect();
+        g_vec.as_mut_slice().copy_from_slice(&g);
+        d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
+        d.copy_from_slice(d_vec.as_slice());
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         if dg >= 0.0 {
@@ -2910,8 +3103,10 @@ fn dense_bfgs_core(
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
             h_inv = init_h_inv(n, precond);
-            let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
-            let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+            d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
+            d.copy_from_slice(d_vec.as_slice());
+            let (alpha, f_new) =
+                backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
             // Even steepest descent found no sufficient-decrease step: report
             // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
@@ -2930,15 +3125,16 @@ fn dense_bfgs_core(
             continue;
         }
 
-        let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
+        let (alpha, f_new) =
+            backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
 
-        let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
         for i in 0..n {
+            s[i] = alpha * d[i];
             x[i] += s[i];
         }
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
@@ -2949,14 +3145,15 @@ fn dense_bfgs_core(
         }
 
         let g_new = grad(x);
-        let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
+        for i in 0..n {
+            y[i] = g_new[i] - g[i];
+        }
 
-        let s_vec = DVector::from_column_slice(&s);
-        let y_vec = DVector::from_column_slice(&y);
+        s_vec.as_mut_slice().copy_from_slice(&s);
+        y_vec.as_mut_slice().copy_from_slice(&y);
         let sy = s_vec.dot(&y_vec);
         if sy > 1e-12 {
             let rho = 1.0 / sy;
-            let eye = DMatrix::identity(n, n);
             let s_yt = rho * &s_vec * y_vec.transpose();
             let y_st = rho * &y_vec * s_vec.transpose();
             let s_st = rho * &s_vec * s_vec.transpose();
@@ -2996,9 +3193,17 @@ fn nelder_mead_minimize(
     }
 
     let mut fvals: Vec<f64> = simplex.iter().map(|p| obj(p)).collect();
+    let mut indices: Vec<usize> = (0..=n).collect();
+    let mut centroid = vec![0.0; n];
+    let mut reflected = vec![0.0; n];
+    let mut expanded = vec![0.0; n];
+    let mut contracted = vec![0.0; n];
+    let mut best_point = vec![0.0; n];
 
     for _iter in 0..max_iter {
-        let mut indices: Vec<usize> = (0..=n).collect();
+        for (i, index) in indices.iter_mut().enumerate() {
+            *index = i;
+        }
         // NaN-safe: a non-finite objective (e.g. an ODE prediction that blew
         // up at a simplex vertex) sorts as worst rather than panicking on the
         // `None` that `partial_cmp` returns for NaN. See issue #97.
@@ -3018,7 +3223,7 @@ fn nelder_mead_minimize(
             return true;
         }
 
-        let mut centroid = vec![0.0; n];
+        centroid.fill(0.0);
         for &idx in &indices[..n] {
             for j in 0..n {
                 centroid[j] += simplex[idx][j];
@@ -3029,43 +3234,43 @@ fn nelder_mead_minimize(
         }
 
         // Reflection
-        let reflected: Vec<f64> = (0..n)
-            .map(|j| centroid[j] + alpha * (centroid[j] - simplex[worst][j]))
-            .collect();
+        for j in 0..n {
+            reflected[j] = centroid[j] + alpha * (centroid[j] - simplex[worst][j]);
+        }
         let fr = obj(&reflected);
 
         if fr < fvals[second_worst] && fr >= fvals[best] {
-            simplex[worst] = reflected;
+            std::mem::swap(&mut simplex[worst], &mut reflected);
             fvals[worst] = fr;
             continue;
         }
 
         if fr < fvals[best] {
-            let expanded: Vec<f64> = (0..n)
-                .map(|j| centroid[j] + gamma * (reflected[j] - centroid[j]))
-                .collect();
+            for j in 0..n {
+                expanded[j] = centroid[j] + gamma * (reflected[j] - centroid[j]);
+            }
             let fe = obj(&expanded);
             if fe < fr {
-                simplex[worst] = expanded;
+                std::mem::swap(&mut simplex[worst], &mut expanded);
                 fvals[worst] = fe;
             } else {
-                simplex[worst] = reflected;
+                std::mem::swap(&mut simplex[worst], &mut reflected);
                 fvals[worst] = fr;
             }
             continue;
         }
 
-        let contracted: Vec<f64> = (0..n)
-            .map(|j| centroid[j] + rho * (simplex[worst][j] - centroid[j]))
-            .collect();
+        for j in 0..n {
+            contracted[j] = centroid[j] + rho * (simplex[worst][j] - centroid[j]);
+        }
         let fc = obj(&contracted);
         if fc < fvals[worst] {
-            simplex[worst] = contracted;
+            std::mem::swap(&mut simplex[worst], &mut contracted);
             fvals[worst] = fc;
             continue;
         }
 
-        let best_point = simplex[best].clone();
+        best_point.copy_from_slice(&simplex[best]);
         for i in 0..=n {
             if i != best {
                 for j in 0..n {
@@ -3221,8 +3426,8 @@ fn backtracking_line_search(
     x: &[f64],
     d: &[f64],
     g: &[f64],
-    n: usize,
     f0: f64,
+    x_new: &mut [f64],
 ) -> (f64, f64) {
     let c1 = 1e-4;
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
@@ -3236,9 +3441,8 @@ fn backtracking_line_search(
     }
 
     let mut alpha = 1.0;
-    let mut x_new = vec![0.0; n];
     for _ in 0..MAX_LINE_SEARCH_TRIALS {
-        for i in 0..n {
+        for i in 0..x.len() {
             x_new[i] = x[i] + alpha * d[i];
         }
         let f_new = obj(&x_new);
@@ -3397,6 +3601,43 @@ pub fn run_inner_loop_warm(
     (etas, h_matrices, stats, kappas)
 }
 
+/// Same as [`run_inner_loop_warm`], but reuses a [`build_schedule_cache`] built once per
+/// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
+/// outer-loop evaluation. See [`find_ebe_cached`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_inner_loop_warm_cached(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map_cached(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        schedules,
+        |_, _| (),
+    );
+    (etas, h_matrices, stats, kappas)
+}
+
 /// Finish subject-local work on the same worker immediately after its EBE solve,
 /// before the population barrier. The FOCE outer loop uses this to score the
 /// marginal without launching another subject pass. Results retain subject order.
@@ -3419,6 +3660,79 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
     Vec<Vec<DVector<f64>>>,
     Vec<T>,
 ) {
+    run_inner_loop_warm_map_impl(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        None,
+        finish_subject,
+    )
+}
+
+/// Same as [`run_inner_loop_warm_map`], but reuses a [`build_schedule_cache`] built once per
+/// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
+/// outer-loop evaluation. See [`find_ebe_cached`].
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: &[Option<pk::event_driven::EventSchedule>],
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
+    run_inner_loop_warm_map_impl(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        Some(schedules),
+        finish_subject,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn run_inner_loop_warm_map_impl<T: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
     use rayon::prelude::*;
 
     let results: Vec<(EbeResult, T)> = population
@@ -3427,7 +3741,20 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            let ebe = find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts);
+            let ebe = match schedules {
+                Some(cache) => find_ebe_cached(
+                    model,
+                    subject,
+                    params,
+                    max_iter,
+                    tol,
+                    init,
+                    mu_k,
+                    restarts,
+                    cache[i].as_ref(),
+                ),
+                None => find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts),
+            };
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })

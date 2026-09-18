@@ -33,9 +33,18 @@
 //!
 //! NPDE also requires `K > n_obs` replicates per subject for a full-rank
 //! simulated covariance; with too few replicates the covariance is singular and
-//! NPDE is `NaN` (NPD is still computed). IOV (`kappa`) models reuse the
-//! simulation path's convention of holding kappas at zero, so NPDE/NPD on IOV
-//! models omit the inter-occasion component of the predictive variance.
+//! NPDE is `NaN` (NPD is still computed).
+//!
+//! ## Inter-occasion variability (IOV)
+//!
+//! For an IOV (`kappa`) model the reference distribution draws one independent
+//! `κ ~ N(0, Ω_IOV)` **per occasion** and routes the replicate through
+//! [`crate::pk::predict_iov`], mirroring what `simulate()` does (#723 / #734).
+//! Holding every κ at zero — the pre-#734 behaviour — left the reference
+//! distribution without its inter-occasion component, so the scores came out
+//! over-dispersed (the diagnostic understated its own spread) for exactly the
+//! models IOV was declared on. Non-IOV models keep the unchanged fast path and
+//! draw no extra randoms, so their scores are byte-identical.
 
 use crate::stats::special::normal_inv_cdf;
 use crate::types::{CompiledModel, ModelParameters, Population};
@@ -76,6 +85,14 @@ pub struct SubjectNpde {
 /// Subjects are simulated in parallel, each with its own RNG seeded from
 /// `seed + subject_index`, so the result is independent of the rayon schedule
 /// and reproducible for a fixed `seed`.
+///
+/// For an IOV model the reference distribution draws one independent occasion
+/// `κ ~ N(0, Ω_IOV)` per occasion group (#734). That needs `params.omega_iov`,
+/// which every fitted or parsed `ModelParameters` of a `kappa` model carries; a
+/// caller that *rebuilds* the parameters and drops it (the #1019 failure mode on
+/// the R bridge) gets the κ = 0 reference instead of a panic — a post-fit
+/// diagnostic is the wrong place to abort a completed fit. Use
+/// `fitted_params_from_result` to keep the IOV block.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,
@@ -103,6 +120,23 @@ pub fn compute_npde_npd(
             // only), so build the per-observation multiplier matrix once and
             // reuse it across all replicates.
             let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+            // IOV (#734): the per-occasion κ draw needs the subject's occasion
+            // groups in the exact order `predict_iov` indexes its `kappas`
+            // argument by. A function of the subject alone, so this side builds
+            // it once instead of once per replicate. `predict_iov` still builds
+            // its own copy (plus the `occ_to_k` map) on every call — the group
+            // walk is not part of its signature — so the reference costs two
+            // builds per replicate, not one; only the second is hoistable from
+            // here. Worth plumbing through only if the walk ever shows up in a
+            // profile, since the estimation hot path pays the same duplicate.
+            // Empty when the subject carries no occasion labels, in which case
+            // `predict_iov` falls back to κ = 0 (matching the fit-time
+            // no-occasion diagnostic).
+            let iov: Option<(&crate::types::OmegaMatrix, Vec<(u32, Vec<usize>)>)> = params
+                .omega_iov
+                .as_ref()
+                .filter(|_| model.n_kappa > 0)
+                .map(|om| (om, crate::stats::likelihood::iov_occasion_groups(subject)));
             for k in 0..nsim {
                 // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                 let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
@@ -110,15 +144,44 @@ pub fn compute_npde_npd(
                 let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                 eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-                // TV-covariate-aware dispatcher, matching simulate()/predict()
-                // (#506): a per-event covariate snapshot must drive NPDE IPREDs,
-                // not the baseline-only `pk_param_fn(subject.covariates)`.
-                let ipreds = crate::pk::compute_predictions_with_tv(
-                    model,
-                    subject,
-                    &params.theta,
-                    &eta_slice,
-                );
+                // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
+                // occasion through the occasion-aware `predict_iov`, mirroring
+                // `simulate()`'s `emit_subject_rows` (#723). Holding κ at zero
+                // would leave the reference distribution without its
+                // inter-occasion component and over-disperse every score.
+                // Non-IOV models take the TV-covariate-aware dispatcher
+                // unchanged — matching simulate()/predict() (#506): a per-event
+                // covariate snapshot must drive NPDE IPREDs, not the
+                // baseline-only `pk_param_fn(subject.covariates)` — and draw no
+                // extra randoms, so their sims are byte-identical.
+                let ipreds = match &iov {
+                    Some((omega_iov, occ_groups)) => {
+                        let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+                            .map(|_| {
+                                let z: Vec<f64> = (0..model.n_kappa)
+                                    .map(|_| normal.sample(&mut rng))
+                                    .collect();
+                                (&omega_iov.chol * DVector::from_column_slice(&z))
+                                    .iter()
+                                    .copied()
+                                    .collect()
+                            })
+                            .collect();
+                        crate::pk::predict_iov(
+                            model,
+                            subject,
+                            &params.theta,
+                            &eta_slice[..n_eta],
+                            &kappas,
+                        )
+                    }
+                    None => crate::pk::compute_predictions_with_tv(
+                        model,
+                        subject,
+                        &params.theta,
+                        &eta_slice,
+                    ),
+                };
 
                 // IIV on residual error (#409): the simulated eta draw includes
                 // the residual-error eta, so scale the residual variance by
@@ -451,5 +514,196 @@ mod tests {
         // Second row censored → whole subject's NPDE is NaN (decorrelation invalid).
         let out = npde_scores(&[10.0, 20.0], &[0, 1], &sims);
         assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    /// Log-scale SD of the one-row reference distribution in
+    /// [`iov_npde_model_and_population`] when the occasion κ is sampled:
+    /// `sqrt(ω²_V + ω²_κ) = sqrt(0.01 + 0.04)`. Holding κ at zero (the pre-#734
+    /// behaviour) leaves `sqrt(ω²_V) = 0.1`.
+    const IOV_REF_SD: f64 = 0.223_606_797_749_979;
+    /// The κ-less spread the same fixture collapses to.
+    const BSV_ONLY_SD: f64 = 0.1;
+
+    /// One-subject IOV fixture for the κ-draw tests below.
+    ///
+    /// A bolus at `t = 0` with a single observation at the same time, so the
+    /// prediction is exactly `AMT / V` (ferx applies a dose before an
+    /// observation at equal TIME) and
+    /// `log IPRED = log(AMT/TVV) − η_V − κ_V`. The reference distribution of
+    /// that row is therefore log-normal about `log(10)` with SD
+    /// [`IOV_REF_SD`] — closed form, not a second engine — plus a deliberately
+    /// negligible residual (`σ = 1e-4` proportional). The observation is placed
+    /// exactly `IOV_REF_SD` above the median on the log scale, so a correct
+    /// reference gives `NPD ≈ Φ⁻¹(Φ(1)) = 1` and the *implied* spread
+    /// `IOV_REF_SD / NPD` is directly comparable to the truth.
+    fn iov_npde_model_and_population() -> (CompiledModel, Population) {
+        use crate::types::{DoseEvent, Subject};
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_V ~ 0.01
+  kappa KAPPA_V ~ 0.04
+  sigma PROP ~ 0.0001 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV * exp(ETA_V + KAPPA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("IOV npde fixture parses");
+        assert_eq!(model.n_eta, 1, "one BSV eta");
+        assert_eq!(model.n_kappa, 1, "one occasion kappa");
+
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.0],
+            observations: vec![10.0 * IOV_REF_SD.exp()],
+            obs_cmts: vec![1],
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            ..Default::default()
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        (model, population)
+    }
+
+    /// The log-scale spread the NPD score implies for the fixture's single row:
+    /// the observation sits `IOV_REF_SD` above the reference median, so
+    /// `NPD ≈ IOV_REF_SD / sd` and `sd ≈ IOV_REF_SD / NPD`.
+    fn implied_reference_sd(out: &[SubjectNpde]) -> f64 {
+        assert_eq!(out.len(), 1);
+        let npd = out[0].npd[0];
+        assert!(npd.is_finite(), "NPD must be finite, got {npd}");
+        IOV_REF_SD / npd
+    }
+
+    /// **Regression for #734: the NPDE/NPD reference distribution must sample the
+    /// occasion κ.**
+    ///
+    /// `compute_npde_npd` built its reference with every κ held at zero, so for an
+    /// IOV model the reference carried no inter-occasion component and the scores
+    /// came out over-dispersed — the diagnostic understating its own spread, the
+    /// same bug class #723 fixed one path over in `simulate()`.
+    ///
+    /// The pair straddles the fix. Both arms run the *same* RNG stream (the κ
+    /// draws happen either way; the control merely scales them by a zero
+    /// `Ω_IOV`), so the only difference is the κ magnitude. Under the old code
+    /// both arms return the κ-less spread and the first assertion fails; the
+    /// control arm is asserted too, so the test cannot silently become a
+    /// tautology if the reference stops depending on `Ω_IOV`.
+    ///
+    /// Tolerances are measured, not argued. At `K = 20_000`, swept over six
+    /// seeds, the realised implied SDs span 0.22149–0.22644 (truth 0.223607;
+    /// worst deviation 1.3%) and 0.09857–0.10084 (truth 0.1; worst 1.4%) — the
+    /// Monte-Carlo SE of the score is ≈1% of the implied SD, and this fixture's
+    /// seed (734) lands at 0.22259 / 0.09871. The 3% bands below are ≈2× the
+    /// worst realised deviation, tight enough that a dropped κ (a 2.2× error on
+    /// the first arm) or a wrong-scale draw cannot pass either way.
+    #[test]
+    fn npde_reference_spread_includes_occasion_kappa() {
+        let (model, population) = iov_npde_model_and_population();
+        let params = model.default_params.clone();
+        assert!(
+            params.omega_iov.is_some(),
+            "fixture must carry a fitted Ω_IOV"
+        );
+        let nsim = 20_000;
+        let seed = Some(734);
+
+        let with_iov = compute_npde_npd(&model, &population, &params, nsim, seed);
+        let sd_with = implied_reference_sd(&with_iov);
+
+        // Control: Ω_IOV forced to zero. The per-occasion κ draws still happen
+        // (RNG stays aligned), but scale to zero — the pre-#734 reference.
+        let mut zero_iov = params.clone();
+        {
+            let om = zero_iov.omega_iov.as_mut().expect("Ω_IOV present");
+            om.chol.fill(0.0);
+            om.matrix.fill(0.0);
+        }
+        let without_iov = compute_npde_npd(&model, &population, &zero_iov, nsim, seed);
+        let sd_without = implied_reference_sd(&without_iov);
+
+        eprintln!(
+            "#734 implied reference SD: with Ω_IOV = {sd_with:.5} (target {IOV_REF_SD:.5}), \
+             zero Ω_IOV = {sd_without:.5} (target {BSV_ONLY_SD:.5})"
+        );
+        assert!(
+            (sd_with / IOV_REF_SD - 1.0).abs() < 0.03,
+            "NPDE reference spread {sd_with:.5} does not recover sqrt(ω²_V + ω²_κ) = \
+             {IOV_REF_SD:.5} — occasion κ dropped from the reference distribution?"
+        );
+        // The straddle: the same fixture, with Ω_IOV = 0, must land on the
+        // κ-less spread. If this drifts up to IOV_REF_SD the arms no longer
+        // straddle the fix and the assertion above proves nothing.
+        assert!(
+            (sd_without / BSV_ONLY_SD - 1.0).abs() < 0.03,
+            "zero-Ω_IOV control spread {sd_without:.5} is not the κ-less \
+             {BSV_ONLY_SD:.5} — the two arms no longer straddle the #734 fix"
+        );
+    }
+
+    /// A caller-rebuilt `ModelParameters` that drops the IOV block (the #1019
+    /// failure mode on the R bridge) must not panic the diagnostic: the
+    /// reference falls back to κ = 0 — documented on `compute_npde_npd`, and the
+    /// same spread the zero-`Ω_IOV` control above produces, reached by the other
+    /// branch (no κ draws at all, so the RNG stream differs).
+    #[test]
+    fn npde_without_omega_iov_falls_back_to_zero_kappa() {
+        let (model, population) = iov_npde_model_and_population();
+        let mut params = model.default_params.clone();
+        params.omega_iov = None;
+        let out = compute_npde_npd(&model, &population, &params, 20_000, Some(734));
+        let sd = implied_reference_sd(&out);
+        assert!(
+            (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,
+            "missing Ω_IOV must fall back to κ = 0 (spread {BSV_ONLY_SD:.5}), got {sd:.5}"
+        );
+    }
+
+    /// An IOV model whose data carries **no occasion labels** routes through
+    /// `predict_iov` with an empty `kappas` (κ = 0 everywhere) instead of the
+    /// non-IOV dispatcher it used before #734. That swap must not change the
+    /// prediction: `predict_iov` applied the divisive `[scaling]` block inside
+    /// its per-occasion loop and so returned *unscaled* predictions on
+    /// occasion-less data until #723's review caught it. The reference here is
+    /// the κ-less spread, and it is reached over an unlabelled subject — the
+    /// same path that bug lived on.
+    #[test]
+    fn npde_iov_without_occasion_labels_matches_the_kappa_less_reference() {
+        let (model, mut population) = iov_npde_model_and_population();
+        population.subjects[0].occasions.clear();
+        population.subjects[0].dose_occasions.clear();
+        let out = compute_npde_npd(
+            &model,
+            &population,
+            &model.default_params,
+            20_000,
+            Some(734),
+        );
+        let sd = implied_reference_sd(&out);
+        assert!(
+            (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,
+            "an occasion-less IOV subject must score against the κ-less reference \
+             (spread {BSV_ONLY_SD:.5}), got {sd:.5} — a prediction-scale regression on \
+             `predict_iov`'s empty-occasion path would land here"
+        );
     }
 }

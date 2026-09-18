@@ -7,7 +7,10 @@
 //! infusion's end time and adding `+rate` to the corresponding compartment's
 //! derivative for the duration of the infusion via an RHS wrapper.
 
-use crate::ode::solver::{solve_ode, solve_ode_dense, OdeSolverOptions, OdeSolverStats};
+use crate::ode::solver::{
+    solve_ode, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
+    OdeSolverStats,
+};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
     assay_standard_normal, AdaptiveMonitor, AdaptiveRun, AssayNoise, ControllerCtx,
@@ -271,6 +274,42 @@ pub(crate) fn timeline_has_non_finite(break_times: &[f64]) -> bool {
 #[inline]
 pub(crate) fn times_have_non_finite(mut times: impl Iterator<Item = f64>) -> bool {
     times.any(|t| !t.is_finite())
+}
+
+/// **The engine guard: `true` when this walk must be abandoned, and the abandonment recorded.**
+///
+/// The predicate and the counter are deliberately one call (#1234). Nothing about
+/// [`timeline_has_non_finite`] makes recording structural, and the counter is only worth
+/// having if every abandoning engine bumps it: a ninth guard written as a bare predicate would
+/// compile, run, and put the diagnostic back to `0/0/0` for that walk — indistinguishable from
+/// a subject there was nothing to integrate for, which is the whole defect. Going through here
+/// makes forgetting impossible rather than conventional, and
+/// `the_bare_timeline_predicates_are_not_called_outside_this_guard` fails if a new call site
+/// takes the bare spelling.
+///
+/// `times` is an iterator so the dense builders (`break_times.iter().copied()`) and the
+/// event-driven ones (`timeline.iter().map(|e| e.0)`) share one definition; `stats` is the
+/// caller's out-parameter where it has one — `Some` only in
+/// `ode_predictions_with_extra_breaks_and_stats`, whose public wrapper
+/// [`ode_predictions_with_solver_stats`] returns it. See
+/// [`crate::ode::solver::record_abandoned_non_finite_timeline`] for why both channels are fed.
+///
+/// **Deliberately not used by the two `sens/ode_provider.rs` walks**, which carry the same
+/// predicate and do *not* record: their sweep is collected in its own scope from which
+/// `fit_inner` copies one unrelated field, so a gradient-solve event deposited here would be
+/// discarded or fire a prediction-shaped warning clause. That exclusion is the guard test's
+/// only allowance, and it is stated there.
+#[inline]
+pub(crate) fn abandon_non_finite_timeline(
+    times: impl Iterator<Item = f64>,
+    stats: Option<&mut crate::ode::solver::OdeSolverStats>,
+) -> bool {
+    if times_have_non_finite(times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline(stats);
+        true
+    } else {
+        false
+    }
 }
 
 // Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a neutral
@@ -652,7 +691,7 @@ where
 /// observation; see the note at the top of that function for why the other half is the
 /// walk's anchor and not this one.
 #[inline]
-fn ss_run_in_params(
+pub(crate) fn ss_run_in_params(
     pk_params_flat: &[f64],
     pulse_at: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
@@ -1066,6 +1105,11 @@ where
     FUnf: Fn(&[T]) -> Option<Vec<T>>,
     FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
+    // A top-level entry in its own right: `sens::ode_provider` calls this directly for the dual
+    // SS equilibration, not only through `equilibrate_ss_pk_state`. Neither arm below ever
+    // reaches `note_ss_nonconvergence_if_capped`, so clear the warning observation here too or
+    // that caller reads an earlier capped run's `true` (#1289, PR #1392 review).
+    crate::dosing::record_ss_nonconvergence_warned(false);
     // `&F` still implements `Fn` when `F: Fn`, so borrowing lets the linear attempt and the
     // Anderson fallback share the same two closures without moving them.
     if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
@@ -1140,6 +1184,10 @@ fn equilibrate_ss_pk_state(
     // the previous call's value — see `crate::dosing::SsBranch`. Every completing path
     // overwrites it; every bail-out is then honestly reported as "no branch ran".
     crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::None);
+    // Same reasoning for the warning observation (#1289): the exact affine fixed point and the
+    // input-rate closed form below return without ever reaching `note_ss_nonconvergence_if_capped`,
+    // so without this an earlier capped run's `true` would be reported as *this* call's answer.
+    crate::dosing::record_ss_nonconvergence_warned(false);
     let n = ode.n_states;
     let chz = &ode.chz_state_slots[..];
     // The model's own RHS with the accumulator derivatives held at zero. Everything the
@@ -1874,7 +1922,10 @@ pub(crate) fn infusion_contributes(
     d: &DoseEvent,
     n_states: usize,
 ) -> bool {
-    if !is_real_infusion(d) || d.cmt_raw() == 0 {
+    // The `CMT=0` half is [`crate::dosing::infusion_has_rate_channel`] rather than a
+    // local `cmt_raw() == 0`, so this resolver and the analytic sensitivity walk cannot
+    // spell it differently — which is exactly what they did through #1077.
+    if !is_real_infusion(d) || !crate::dosing::infusion_has_rate_channel(d) {
         return false;
     }
     // One binding, so the range test and the forcing test provably ask about the same
@@ -2501,11 +2552,12 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// `[0, II)` as though virtual doses had arrived at `t_dose + k·II`, so a caller whose
 /// state was *not* built from such a train gets an anchor its own dose history does not
 /// justify — measured on #1263 as a 24.1% `ipred` divergence for one `SS=1` infusion
-/// whose end break lands past a virtual pulse. Since #1126 that also covers the pre-arrival
-/// window of a *seeded* SS dose, whose state comes from `ss_state_at_phase`; a caller that
-/// does not perform that seed must not consume this anchor there either. Callers that do
-/// not equilibrate an `SS` dose at all must warn (`W_SDE_STEADY_STATE`) rather than
-/// quietly consume it.
+/// whose end break lands past a virtual pulse, back when the EKF applied the record as a
+/// single dose (since #1260 it expands the train too, `ode::ekf::equilibrate_ss_ekf`).
+/// Since #1126 that also covers the pre-arrival window of a *seeded* SS dose, whose state
+/// comes from `ss_state_at_phase`; a caller that does not perform that seed must not
+/// consume this anchor there either. A caller that does not equilibrate an `SS` dose at
+/// all must warn rather than quietly consume it.
 #[inline]
 pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start: f64) -> f64 {
     // `.get(..).unwrap_or(0.0)`, not `dose_lagtimes[i]`: a short slice means "no lag on
@@ -2557,6 +2609,48 @@ fn subject_dose_attrs(
         .map(|d| ode.dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
         .collect();
     (dose_lagtimes, dose_f_bio)
+}
+
+/// Per-dose lagtimes only — the half of [`subject_dose_attrs`] that
+/// [`rhs_ext_params_at`] needs. Callers that read `H`/`h` at many `times` for the same
+/// subject (the TTE hazard readouts, #1261) compute this once and reuse it, rather than
+/// re-walking the dose list — and recomputing the unused `F`/bioavailability half — on
+/// every timepoint.
+#[cfg(feature = "survival")]
+#[inline]
+pub(crate) fn dose_lagtimes_for(
+    subject: &Subject,
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+) -> Vec<f64> {
+    subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_params_flat))
+        .collect()
+}
+
+/// Build the extended parameter slice required for a standalone RHS read at `t`, from
+/// a dose-lagtime vector and first-dose time the caller has already computed (via
+/// [`dose_lagtimes_for`] / [`earliest_dose_time`]) — once per subject, not once per `t`.
+///
+/// Integrating prediction paths keep this slice live and update its TAD anchor at
+/// each segment boundary. Readout-only callers (the TTE hazard derivative) do not
+/// own that walk, so they must derive both anchors from the same dose-time helpers
+/// instead of passing a bare [`PkParams::values`](crate::types::PkParams::values)
+/// array to the RHS (#1261).
+#[cfg(feature = "survival")]
+#[inline]
+pub(crate) fn rhs_ext_params_at(
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    first_dose_time: f64,
+    pk_params_flat: &[f64],
+    t: f64,
+) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
+    let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor_for(doses, dose_lagtimes, t);
+    ext_params
 }
 
 /// Earliest dose record time, or `+∞` when there are no doses.
@@ -2835,6 +2929,7 @@ fn integrate_segment(
     obs_map: &HashMap<u64, Vec<usize>>,
     predictions: &mut [f64],
     stats: Option<&mut OdeSolverStats>,
+    auto_state: &mut OdeAutoSwitchState,
     // #570: soft (Hermite-interpolated) sample times within this segment — e.g. TTE
     // event/censor times — read off the *same* integration as the observations,
     // without clamping the step sequence. The returned observation predictions and
@@ -2909,7 +3004,7 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     );
-    let (sol, soft) = solve_ode_dense(
+    let (sol, soft) = solve_ode_dense_with_auto_state(
         &wrapped_rhs,
         u,
         (t_start, t_end),
@@ -2918,6 +3013,7 @@ fn integrate_segment(
         chz_times,
         &opts,
         stats,
+        auto_state,
     );
 
     // Extract predictions and update state
@@ -3393,7 +3489,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // Ordered **before** the #1223 fill below, deliberately: on a broken timeline every record
     // must be repelled, and filling first would hand a pre-start `TENTRY` the seeded state — a
     // scored `H = 0` — on a subject whose integration never happened.
-    if timeline_has_non_finite(&break_times) {
+    if abandon_non_finite_timeline(break_times.iter().copied(), stats.as_deref_mut()) {
         return (predictions, chz_states);
     }
 
@@ -3438,6 +3534,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // per subject rather than one per break.
     let obs_index = RecordIndex::new(&subject.obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
+    let mut auto_state = OdeAutoSwitchState::default();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -3560,6 +3657,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 &obs_map,
                 &mut predictions,
                 stats.as_deref_mut(),
+                &mut auto_state,
                 &seg_chz,
             );
             // Place each soft sample at its global `chz_times` index (NaN slots left for
@@ -4436,7 +4534,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // it uses that rather than returning a NaN run the caller must re-diagnose. Placed
     // before the #700 exact-bit guards below, whose message would otherwise name the
     // wrong cause for a `NaN` time.
-    if timeline_has_non_finite(&break_times) {
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return Err(
             "ode_predictions_adaptive: a non-finite break time (NaN/infinite dose lagtime, \
              route lag, or infusion duration) — the subject's timeline cannot be ordered"
@@ -4523,6 +4621,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let obs_index = RecordIndex::new(&shadow.obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
     let mut k = 0;
+    let mut auto_state = OdeAutoSwitchState::default();
     while k < break_times.len() {
         let t_start = break_times[k];
 
@@ -5072,6 +5171,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &obs_map,
                 &mut predictions,
                 None,
+                &mut auto_state,
                 &[],
             );
 
@@ -5212,6 +5312,7 @@ pub(crate) fn verify_adaptive_frozen_replay(
             dose_f.extend(run.ledger.iter().map(|e| e.f_applied));
             adaptive_frozen_replay_tv(
                 ode,
+                pk_params_flat,
                 ev,
                 decision_pk,
                 eta_occ,
@@ -5292,6 +5393,11 @@ pub(crate) fn verify_adaptive_frozen_replay(
 #[allow(clippy::too_many_arguments)]
 fn adaptive_frozen_replay_tv(
     ode: &OdeSpec,
+    // The driver's frozen t=0 PK snapshot. Used ONLY to place the dose-driven break times
+    // (#1188) — route-lag onsets, `zero_order` window edges — from the identical snapshot
+    // the driver placed its own from; every integration below reads its segment's own
+    // per-event snapshot, never this one.
+    pk_params_flat: &[f64],
     event_pk: &crate::pk::EventPkParams,
     decision_pk: Option<&[PkParams]>,
     eta_occ: Option<&[Vec<f64>]>,
@@ -5368,7 +5474,11 @@ fn adaptive_frozen_replay_tv(
     let mut u = ode.initial_state(&init_pk.values);
     let mut predictions = vec![f64::NAN; n_obs];
 
-    // Injected doses carry no lag (a nonzero lag is rejected at injection).
+    // Injected doses carry no lag (a nonzero lag is rejected at injection); a *base* dose
+    // under a time-varying covariate / IOV is rejected upstream unless its compartment lag
+    // is zero (`ode_predictions_adaptive_impl`'s #930/#931 base-dose scope guard), so the
+    // driver's own `dose_lagtimes` — `base_lagtimes` followed by zeros — is all-zeros here
+    // too. Declared before the break-time build because that build reads it (below).
     let dose_lagtimes = vec![0.0; subject.doses.len()];
 
     // NB: PK slots are left NaN here (unlike `seed_ext_params`) — the replay
@@ -5392,13 +5502,51 @@ fn adaptive_frozen_replay_tv(
         .cloned()
         .fold(0.0_f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0, t_last];
-    for (i, d) in subject.doses.iter().enumerate() {
-        break_times.push(d.time);
-        if is_real_infusion(d) {
-            let (_, dur_eff) = d.bioavailable_infusion(dose_f[i]);
-            break_times.push(d.time + dur_eff);
-        }
-    }
+    // Every break a dose list contributes, through the SAME builder the reactive driver
+    // folds its base regimen in with (#1188). The hand-rolled loop this replaces pushed
+    // only `d.time` and a real infusion's F-scaled end, so it emitted neither a per-route
+    // absorption onset (`push_route_lag_break_times`) nor a `zero_order` window's edges
+    // (`push_zero_order_break_times`) — and `integrate_segment`'s `active_zero_order_inputs`
+    // admits a window's constant rate only for a segment the window *fully contains*. With
+    // neither edge bracketed the rate was dropped for every segment that straddled one, so
+    // the replay under-delivered the absorbed mass (measured on a lagged `zero_order(dur=2,
+    // lag=1.5)` two-dose subject: 0.0 against the static engine's 24.385 at the first
+    // in-window sample) and the verifier reported a dose-bookkeeping mismatch that was its
+    // own artifact. The two engines are required to agree bit for bit, so they share the
+    // builder rather than keeping two copies of the rule (#1171/#1174 fixed two other
+    // copies; this was the fifth).
+    //
+    // `pk_params_flat` is the driver's frozen t=0 snapshot, not a per-segment one, for one
+    // reason only: it is the snapshot the driver placed its own base-regimen edges from
+    // (`ode_predictions_adaptive_impl`'s `collect_dose_break_times` call), and bit-alignment
+    // with the driver is the property this engine exists to establish. It is NOT a claim
+    // that the frozen snapshot is the physically right one to place an edge from — if a
+    // route lag or `dur` ever becomes covariate-dependent on this path, BOTH engines place
+    // their break from the frozen snapshot while `integrate_segment` recomputes the window
+    // for containment from the SEGMENT's snapshot, so the edge and the containment boundary
+    // move apart and mass is dropped. That inconsistency is pre-existing, symmetric across
+    // the two engines (so this verifier cannot see it), and latent: the #930/#931 base-dose
+    // guard refuses an input-rate dose under a time-varying covariate, which is the only way
+    // to reach it. It belongs to whichever change lifts that guard — recorded here because
+    // no test distinguishes the two snapshots today (every fixture's per-event PK is
+    // constant, so they are equal; swapping this argument for `init_pk.values` leaves the
+    // whole lib suite green, measured).
+    //
+    // **Asymmetry, recorded here rather than shared away.** The driver runs this builder
+    // over its *base* regimen only (controller doses are appended reactively and get an
+    // infusion-end break from `insert_break` at injection); this runs it over base ∪
+    // ledger. That is wider only for a controller dose into an input-rate compartment,
+    // which `reject_unsupported_dose_compartment` refuses, so today the two sets coincide.
+    // A future widening of that guard must add the route-lag / zero-order edges at the
+    // injection site too, or the pair stops being bit-aligned.
+    collect_dose_break_times(
+        &mut break_times,
+        ode,
+        subject,
+        &dose_lagtimes,
+        dose_f,
+        pk_params_flat,
+    );
     break_times.extend(subject.obs_times.iter().cloned());
     break_times.extend(subject.pk_only_times.iter().cloned());
     // System-reset times (EVID=3, #716): the same reset breaks the reactive driver
@@ -5415,7 +5563,7 @@ fn adaptive_frozen_replay_tv(
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     // A non-finite break time makes the subject non-finite (#1189); `predictions` is
     // NaN-prefilled, matching what the driver this verifies now reports as an `Err`.
-    if timeline_has_non_finite(&break_times) {
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return predictions;
     }
     if break_times.len() < 2 {
@@ -5436,6 +5584,7 @@ fn adaptive_frozen_replay_tv(
     // Records read *at* the current break (#1226) — sorted once, hoisted, as in the driver.
     let obs_index = RecordIndex::new(&subject.obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
+    let mut auto_state = OdeAutoSwitchState::default();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -5570,6 +5719,7 @@ fn adaptive_frozen_replay_tv(
                 &obs_map,
                 &mut predictions,
                 None,
+                &mut auto_state,
                 &[],
             );
 
@@ -6000,7 +6150,7 @@ pub fn ode_predictions_event_driven(
     // dispatches typed events by index and so never re-applies a dose, but a `NaN` time
     // still sorts to the end and its event is silently never reached — the same silent
     // drop the dense engines get, reported the same way (`predictions` is NaN-prefilled).
-    if times_have_non_finite(timeline.iter().map(|e| e.0)) {
+    if abandon_non_finite_timeline(timeline.iter().map(|e| e.0), None) {
         return predictions;
     }
 
@@ -6060,6 +6210,7 @@ pub fn ode_predictions_event_driven(
     // Most-recent system-reset time (EVID=3/4); `NEG_INFINITY` until the
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
+    let mut auto_state = OdeAutoSwitchState::default();
 
     for (i, &(t_event, kind, idx)) in timeline.iter().enumerate() {
         // PK params for the segment [cur_t, t_event] are evaluated AT the record
@@ -6154,13 +6305,16 @@ pub fn ode_predictions_event_driven(
                 &zero_order,
             );
             let saveat = vec![t_event];
-            let sol = solve_ode(
+            let (sol, _) = solve_ode_dense_with_auto_state(
                 &wrapped_rhs,
                 &u,
                 (cur_t, t_event),
                 &ext_params_ed,
                 &saveat,
+                &[],
                 &opts,
+                None,
+                &mut auto_state,
             );
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
@@ -6538,7 +6692,7 @@ pub fn ode_predictions_with_states(
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     // A non-finite break time makes the subject non-finite (#1189); both outputs are
     // NaN-prefilled, so this returns exactly that.
-    if timeline_has_non_finite(&break_times) {
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return (predictions, states);
     }
 
@@ -7106,7 +7260,7 @@ pub fn ode_dense_solve_states(
     // A non-finite break time makes the subject non-finite (#1189); `result` is
     // NaN-prefilled, so the caller's finiteness guard sees a diverged solve rather than
     // a plausible-looking trajectory with the NaN-lagged dose silently missing.
-    if timeline_has_non_finite(&break_times) {
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return result;
     }
 
@@ -7350,7 +7504,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
     // code: the walk would proceed on a timeline the bad dose had been deleted from,
     // never apply it, and return a finite crossing time — the silent-wrong-number
     // outcome, on the one engine whose typed failure was supposed to make it loud.
-    if timeline_has_non_finite(&break_times) {
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return ThresholdOutcome::SolveFailed("non-finite break time".to_string());
     }
     break_times.retain(|&t| t <= horizon + 1e-15);

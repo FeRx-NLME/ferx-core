@@ -23,8 +23,8 @@ pub(crate) use validation::{
     assert_endpoint_routing, assert_modeled_doses_supported, check_absorption_closed_form_support,
     check_absorption_dosing, check_absorption_flip_flop_no_twin, check_analytic_readout_support,
     check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
-    check_modeled_dose_rates, check_residual_magnitude, check_simulation_data,
-    check_variance_init_rails,
+    check_modeled_dose_rates, check_packed_start_in_box, check_residual_magnitude,
+    check_simulation_data, check_variance_init_rails,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
@@ -57,7 +57,7 @@ pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{configure_global_thread_pool, PoolPlan, FIT_RAYON_STACK_SIZE};
-pub(crate) use pool::{install_on_fit_pool, with_fit_ode_scope};
+pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_ode_scope};
 // Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
 // private to `api`, so a test elsewhere in the crate needs the re-export.
 #[cfg(test)]
@@ -68,12 +68,13 @@ pub(crate) use postfit::{
     compute_param_corr, compute_subject_results, cov_diagnostics, covariate_relation_estimates,
     eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
-    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
-    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
-    sir_unavailable_warning, sweep_sensitivity_solver_stats,
+    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning, non_fit_diagnostics,
+    nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
+    rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
+    runaway_guard_warning, sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
+    sweep_sensitivity_solver_stats, with_solver_stats, SolverStatsPhase,
 };
-pub use predict::{predict, PredictionResult};
+pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
 pub(crate) use run::{
@@ -81,8 +82,9 @@ pub(crate) use run::{
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
-    resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
-    run_model_with_data_inits, PreparedRun,
+    resolve_data_path, run_from_file, run_model_simulate, run_model_simulate_with_overrides,
+    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, PreparedRun,
+    RunOverrides,
 };
 pub(crate) use simulate::obs_row_time;
 pub use simulate::{
@@ -100,16 +102,15 @@ pub(crate) use adaptive::{
 };
 #[cfg(test)]
 pub(crate) use fit::{
-    multistart_prefers, perturb_init, saem_non_mu_referenced_individual_params_warning,
+    multistart_prefers, perturb_init, saem_active_covariate_group_etas,
+    saem_non_mu_referenced_individual_params_warning,
 };
-#[cfg(test)]
-pub(crate) use output_columns::build_indiv_map;
 #[cfg(test)]
 pub(crate) use pool::{cap_default_threads, default_thread_count, effective_default_threads};
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,
-    theta_boundary_side, DiagStats,
+    solver_reporting_options, theta_boundary_side, DiagStats,
 };
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use predict::grid_median_from_cumhaz;
@@ -175,20 +176,32 @@ const OUTPUT_MANDATORY: &[&str] = &[
 mod multistart_prefers_tests;
 
 #[cfg(test)]
-#[path = "tests/build_indiv_map_tests.rs"]
-mod build_indiv_map_tests;
+#[path = "tests/indiv_param_values_tests.rs"]
+mod indiv_param_values_tests;
 
 #[cfg(test)]
 #[path = "tests/quiet_fit_tests.rs"]
 mod quiet_fit_tests;
 
 #[cfg(test)]
+#[path = "tests/auto_optimizer_gradient_coupling_tests.rs"]
+mod auto_optimizer_gradient_coupling_tests;
+
+#[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/threads_override_tests.rs"]
+mod threads_override_tests;
+
+#[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/reader_warning_suppression_tests.rs"]
+mod reader_warning_suppression_tests;
 
 #[cfg(test)]
 #[path = "tests/scaling_undefined_tests.rs"]
@@ -246,6 +259,10 @@ mod extract_se_tests;
 mod tests_cov_diagnostics;
 
 #[cfg(test)]
+#[path = "tests/covariance_method_label_tests.rs"]
+mod covariance_method_label_tests;
+
+#[cfg(test)]
 #[path = "tests/tests_sir_fallback.rs"]
 mod tests_sir_fallback;
 
@@ -256,6 +273,18 @@ mod tests_param_corr;
 #[cfg(test)]
 #[path = "tests/ode_solver_diagnostics_tests.rs"]
 mod ode_solver_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "tests/non_fit_diagnostics_tests.rs"]
+mod non_fit_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "tests/stalled_at_init_warning_tests.rs"]
+mod stalled_at_init_warning_tests;
+
+#[cfg(test)]
+#[path = "tests/nonfinite_objective_tests.rs"]
+mod nonfinite_objective_tests;
 
 #[cfg(test)]
 #[path = "tests/ode_solver_options_tests.rs"]

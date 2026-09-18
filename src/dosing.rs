@@ -390,10 +390,51 @@ thread_local! {
     static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
         const { std::cell::Cell::new(SsBranch::None) };
 
+    /// Whether the most recent [`note_ss_nonconvergence_if_capped`] call on this thread
+    /// produced a warning — a **test-only** observation, and the only way to ask that question
+    /// without reading the process-global sink (#1289).
+    ///
+    /// The sink is one `Mutex<BTreeSet<String>>` for the whole process, and
+    /// [`SS_WARN_SINK_READER_GUARD`] serializes only its *readers*. That is enough for a test
+    /// asserting its own warning is present, and not enough for one asserting the sink is
+    /// **empty**: any concurrently-running test that caps an SS equilibration inserts through
+    /// [`note_ss_nonconvergence_if_capped`], which never touches the guard, so the reader fails
+    /// on a warning it did not produce. Nothing about the guard can prevent that. This cell is
+    /// per-thread, so "did *my* equilibration warn" has a correct answer regardless of what
+    /// else is running — the same arrangement [`LAST_SS_EQUILIBRATION_CYCLES`] already uses,
+    /// and it carries the same caveat: it reports whichever call ran *last* on this thread, so
+    /// assert it only from a test that calls the equilibration helpers directly.
+    static LAST_SS_NONCONVERGENCE_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
     /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
     /// equilibration (#532 review #4).
     static FORCE_FULL_SS_EQUILIBRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the most recent SS equilibration on this thread warned (test observation; see
+/// [`LAST_SS_NONCONVERGENCE_WARNED`]). Prefer this to draining the sink whenever the question
+/// is about *this* call rather than about the message text (#1289).
+#[cfg(test)]
+pub(crate) fn last_ss_equilibration_warned() -> bool {
+    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.get())
+}
+
+/// Record whether this SS equilibration warned (test observation; see
+/// [`LAST_SS_NONCONVERGENCE_WARNED`]).
+///
+/// Called with `false` at the **top of every top-level equilibration** and with the real answer
+/// by [`note_ss_nonconvergence_if_capped`]. The up-front `false` is what makes
+/// [`last_ss_equilibration_warned`] mean "did *this* call warn" rather than "did any call on
+/// this thread ever warn": the paths that succeed without ever reaching the capped fallback —
+/// the exact affine fixed point, the input-rate closed form, and the `II <= 0` /
+/// out-of-range-compartment bail-outs — return without noting anything, so without the reset a
+/// warning-producing capped run followed by an exact one would still report `true`. That is
+/// deterministic on a reused harness thread, not a race, and it is the same stale-state class
+/// the [`SsBranch::None`] reset exists for (PR #1392 review).
+#[cfg(test)]
+pub(crate) fn record_ss_nonconvergence_warned(warned: bool) {
+    LAST_SS_NONCONVERGENCE_WARNED.with(|c| c.set(warned));
 }
 
 #[cfg(test)]
@@ -497,6 +538,12 @@ pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_branch(_b: SsBranch) {}
 
+/// The warning observation's non-test counterpart — same signature, so the reset at the top of
+/// each top-level equilibration is unconditional and costs nothing outside tests.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn record_ss_nonconvergence_warned(_warned: bool) {}
+
 /// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
 /// non-converged (#867). The pulse-train equilibration
 /// (`crate::ode::predictions::equilibrate_ss_state`) is a geometric contraction with per-cycle
@@ -560,7 +607,13 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     abs_last: f64,
     mag: f64,
 ) {
-    if let Some(msg) = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag) {
+    let warning = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag);
+    // Recorded on EVERY call, not only the warning ones, so a capped run that converges clears
+    // a `true` left by an earlier capped run on the same harness thread (#1289). The paths that
+    // never reach here at all are covered by the up-front `false` each top-level equilibration
+    // records — see `record_ss_nonconvergence_warned`.
+    record_ss_nonconvergence_warned(warning.is_some());
+    if let Some(msg) = warning {
         if let Ok(mut set) = ss_nonconvergence_sink().lock() {
             set.insert(msg);
         }
@@ -797,6 +850,36 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
+/// Whether a zero-order input into this dose's compartment has a rate channel at all —
+/// the compartment half of "this infusion contributes a `+rate`", spelled **once** for
+/// every engine (#1077).
+///
+/// `CMT=0` is NONMEM's *default dose compartment*: defined for a bolus, where both
+/// engines resolve it to state index 0 (#899), and **not** defined for a zero-order
+/// input, which has no default target. `check_dose_compartments` rejects such a row
+/// outright (`E_DOSE_CMT_NOT_INFUSABLE`, both engines), so this is reachable only from a
+/// hand-built spec that runs no validation — but *there* every engine has to read it the
+/// same way, which is the whole reason it is one function.
+///
+/// Two callers, and #1077 is both of them disagreeing in turn. The value path
+/// ([`crate::ode::predictions::infusion_contributes`]) once had no compartment test at
+/// all and delivered such an infusion while the analytic sensitivity walk
+/// (`sens/ode_provider.rs`) dropped it — a *value* divergence, closed by #1196 step 3
+/// giving the value path this test. What that left was the walk disagreeing with
+/// **itself**: four rate-*on* sites spelled `cmt_raw() >= 1` and the rate-*off* saltation
+/// at `K_INF_END` did not, so a lagged `CMT=0` infusion delivered nothing (`f ≡ 0`, both
+/// engines) yet moved `∂f/∂η_LAG` by `+1.8878965164` at the first observation past the
+/// window end, where central FD of the predictor is exactly `0.0`.
+///
+/// Deliberately **not** folded into [`is_real_infusion`]: that predicate answers "are
+/// this row's `rate`/`duration` usable", the break-time builders ask it about every
+/// infusion including a `CMT=0` one (they must still break at its window end for the
+/// segment structure to line up), and only the *forcing* sites ask this.
+#[inline]
+pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
+    d.cmt_raw() != 0
+}
+
 // ---------------------------------------------------------------------------
 // Where a lagged steady-state dose loads, and what the previous cycle leaves
 // running across the dose record (#1121).
@@ -828,6 +911,27 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 /// the one thing the `check_vs_production` parity tests cannot forgive.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
     dose.ss && dose.ii > 0.0 && lag > 0.0
+}
+
+/// Whether this seeded steady-state dose is the **bolus** case the dual event walk
+/// serves analytically (#1311) — the subset of [`ss_seeded_at_record`] with no
+/// previous-cycle infusion rate still running across the record.
+///
+/// Spelled once, deliberately. `sens::propagate`'s dual walk reads it twice per dose —
+/// at the `DoseRecord`, to seed the periodic state at phase [`ss_seed_phase`], and again
+/// at the `Dose`, to *suppress* the arrival-time re-equilibration that would otherwise
+/// discard what the walk just propagated. Two differently-spelled copies that drifted
+/// would make the walk either seed and then throw the seed away, or never load a state
+/// at all; neither is a compile error and both are wrong in *value*.
+///
+/// `rate <= 0.0` is the bolus half, and it nests inside the FD decline that
+/// `sens::provider::ss_lagtime_walk_unsupported` applies with
+/// [`DoseEvent::is_infusion`]: `{rate > 0} ⊆ {is_infusion}`, and a
+/// `rate <= 0 ∧ is_infusion` dose (a modeled-duration window) is declined to FD upstream,
+/// so the walk is never handed one. That containment is what makes this predicate the
+/// bolus test rather than merely a rate test — assert it, do not re-derive it.
+pub(crate) fn ss_bolus_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
+    dose.rate <= 0.0 && ss_seeded_at_record(dose, lag)
 }
 
 /// Cycle phase the dose **record** sits at, for a steady-state dose seeded there.
@@ -1385,5 +1489,45 @@ mod tad_referent_tests {
             Some(17.0),
             "no wrap without an interval"
         );
+    }
+}
+
+#[cfg(test)]
+mod infusion_rate_channel_tests {
+    use super::*;
+
+    /// The convention, stated once: `CMT=0` is the default dose *bolus* compartment
+    /// (`cmt_idx() == 0`, same state as `CMT=1`), and it is **not** a zero-order input
+    /// target. So the two resolved accessors deliberately disagree with this predicate on
+    /// `CMT=0`, and that disagreement is the whole content of the function — a version
+    /// that returned `d.cmt_idx() < n` or `d.cmt_1based() >= 1` would be `true`
+    /// everywhere and silently re-open #1077 on all six call sites at once.
+    #[test]
+    fn only_cmt_zero_lacks_a_rate_channel() {
+        let cmt0 = DoseEvent::new(0.0, 100.0, 0, 40.0, false, 0.0);
+        let cmt1 = DoseEvent::new(0.0, 100.0, 1, 40.0, false, 0.0);
+        let cmt3 = DoseEvent::new(0.0, 100.0, 3, 40.0, false, 0.0);
+
+        assert!(!infusion_has_rate_channel(&cmt0));
+        assert!(infusion_has_rate_channel(&cmt1));
+        assert!(infusion_has_rate_channel(&cmt3));
+
+        // `CMT=0` and `CMT=1` are the same *state*: the predicate is about the dose's
+        // spelling, not about where the compartment is, which is why it cannot be derived
+        // from either resolved accessor.
+        assert_eq!(cmt0.cmt_idx(), cmt1.cmt_idx());
+        assert_eq!(cmt0.cmt_1based(), cmt1.cmt_1based());
+    }
+
+    /// Orthogonal to `is_real_infusion`, on purpose: the break-time builders ask *that*
+    /// about every infusion — including a `CMT=0` one, whose window end must still break
+    /// the timeline for the segment structure to line up — and only the forcing sites ask
+    /// this. Folding the two would delete a break and change segment geometry.
+    #[test]
+    fn it_is_independent_of_whether_the_row_is_a_real_infusion() {
+        let bolus_cmt0 = DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0);
+        let inf_cmt0 = DoseEvent::new(0.0, 100.0, 0, 40.0, false, 0.0);
+        assert!(!is_real_infusion(&bolus_cmt0) && !infusion_has_rate_channel(&bolus_cmt0));
+        assert!(is_real_infusion(&inf_cmt0) && !infusion_has_rate_channel(&inf_cmt0));
     }
 }

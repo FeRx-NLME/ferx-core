@@ -74,6 +74,7 @@ pub(crate) fn rebuild_warnings_structured(result: &mut FitResult) {
         shrinkage_eps: result.shrinkage_eps,
         cov_condition_number: result.cov_condition_number,
         cov_eigenvalues: result.cov_eigenvalues.as_deref(),
+        covariance_method: result.covariance_method,
         shrinkage_eta: &result.shrinkage_eta,
         eta_names: &result.eta_names,
     };
@@ -103,6 +104,9 @@ pub(crate) struct DiagStats<'a> {
     pub(crate) shrinkage_eps: f64,
     pub(crate) cov_condition_number: Option<f64>,
     pub(crate) cov_eigenvalues: Option<&'a [f64]>,
+    /// Which estimator produced the two above (#1382). `None` when no covariance
+    /// matrix was produced, in which case neither statistic exists either.
+    pub(crate) covariance_method: Option<crate::types::CovarianceMethod>,
     pub(crate) shrinkage_eta: &'a [f64],
     pub(crate) eta_names: &'a [String],
 }
@@ -160,27 +164,58 @@ pub(crate) fn diagnostic_details(
                 }))
             }
         }
+        // #1382: the condition number goes out with the estimator that produced
+        // it. `docs/warnings.qmd` listed this payload as `condition_number` alone,
+        // which is not enough to act on — 1.42e8 under `rsr` and 3.68e5 under `s`
+        // are the same fit, and only one of them is comparable to a NONMEM run.
+        // The key is omitted, not `null`, when there is no matrix to label.
         WarningCode::ConditionNumber => match s.cov_condition_number {
-            Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
+            Some(c) if c.is_finite() => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("condition_number".to_string(), serde_json::json!(c));
+                insert_covariance_method(&mut obj, s.covariance_method);
+                Some(serde_json::Value::Object(obj))
+            }
             _ => None,
         },
-        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => {
-            covariance_details(s.cov_condition_number, s.cov_eigenvalues)
-        }
+        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => covariance_details(
+            s.cov_condition_number,
+            s.cov_eigenvalues,
+            s.covariance_method,
+        ),
         _ => None,
     }
 }
 
-/// `details` for the covariance-step warning codes: the condition number and,
-/// when the covariance matrix was produced (so eigenvalues exist — typically
-/// the regularized case, not a hard failure), the smallest eigenvalue and the
-/// count of negative ones (which diagnose a non-PD Hessian). Non-finite values
-/// are skipped; returns `None` if nothing usable is available.
+/// Add the `covariance_method` token to a `details` object when there is one
+/// (#1382). Absent — not `null` — when no covariance matrix was produced, which
+/// is the `CovarianceFailed` case: naming an estimator for a matrix that does not
+/// exist would invite a reader to compare a number that was never computed.
+fn insert_covariance_method(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    covariance_method: Option<crate::types::CovarianceMethod>,
+) {
+    if let Some(m) = covariance_method {
+        obj.insert(
+            "covariance_method".to_string(),
+            serde_json::json!(m.label()),
+        );
+    }
+}
+
+/// `details` for the covariance-step warning codes: the estimator that produced
+/// the matrix (#1382), the condition number and, when the covariance matrix was
+/// produced (so eigenvalues exist — typically the regularized case, not a hard
+/// failure), the smallest eigenvalue and the count of negative ones (which
+/// diagnose a non-PD Hessian). Non-finite values are skipped; returns `None` if
+/// nothing usable is available.
 fn covariance_details(
     cov_condition_number: Option<f64>,
     cov_eigenvalues: Option<&[f64]>,
+    covariance_method: Option<crate::types::CovarianceMethod>,
 ) -> Option<serde_json::Value> {
     let mut obj = serde_json::Map::new();
+    insert_covariance_method(&mut obj, covariance_method);
     if let Some(c) = cov_condition_number {
         if c.is_finite() {
             obj.insert("condition_number".to_string(), serde_json::json!(c));
@@ -580,6 +615,27 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
 /// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
 /// OFV) for every subject the fit assigned to another class.
+///
+/// # Parallel over subjects, and why the stats come back as a value (#1329)
+///
+/// Each subject is independent — one prediction sweep, no cross-subject term and
+/// no reduction — so this runs on the fit's own pool and the results keep their
+/// subject order. Nothing is reassociated, so no output moves by a ULP.
+///
+/// `collect_solver_stats` is the one thing that could not simply be
+/// `par_iter`-ed. [`crate::ode::solver::SolverStatsScope`] is **thread-local**:
+/// a scope the caller opens around this function sees the caller's thread only,
+/// so fanning out without moving the scope inside would have silently reported
+/// zero `min_dt` clamps and zero `auto` escalations — the counters reading clean
+/// for exactly the integrations they exist to surface. Each subject task
+/// therefore opens its own scope, and the per-subject counters are merged here,
+/// **in subject order**, before returning. The merge is over `usize` counters so
+/// the order does not change the sums; it is fixed anyway, so a future
+/// non-additive field cannot become worker-count dependent without this comment
+/// being wrong.
+///
+/// Pass `false` on a model that integrates nothing: entering a scope *activates*
+/// per-segment recording, and a closed-form model has no segments to record.
 pub(crate) fn compute_subject_results(
     model: &CompiledModel,
     population: &Population,
@@ -589,12 +645,17 @@ pub(crate) fn compute_subject_results(
     kappas_per_subject: &[Vec<DVector<f64>>],
     interaction: bool,
     mixest: Option<&[usize]>,
-) -> Vec<SubjectResult> {
-    population
+    collect_solver_stats: bool,
+) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
+    let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> = population
         .subjects
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(i, subject)| {
+            // Declared before the mixture guard so it is dropped *after* it: the
+            // scope must still be open while this subject's integrations run.
+            let stats_scope =
+                collect_solver_stats.then(crate::ode::solver::SolverStatsScope::enter);
             // Hold this subject's fitted class for the whole per-subject block.
             let _mix_guard = mixest
                 .and_then(|m| m.get(i))
@@ -752,7 +813,7 @@ pub(crate) fn compute_subject_results(
                 )
             };
 
-            SubjectResult {
+            let subject_result = SubjectResult {
                 id: subject.id.clone(),
                 eta: eta.clone(),
                 ipred,
@@ -782,9 +843,21 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
-            }
+            };
+            // Read while the scope is still open; dropping it restores whatever
+            // scope (usually none) this worker had before.
+            let stats = stats_scope.map(|s| s.collected()).unwrap_or_default();
+            (subject_result, stats)
         })
-        .collect()
+        .collect();
+
+    let mut solver_stats = crate::ode::solver::OdeSolverStats::default();
+    let mut subjects = Vec::with_capacity(per_subject.len());
+    for (subject_result, stats) in per_subject {
+        solver_stats.merge(&stats);
+        subjects.push(subject_result);
+    }
+    (subjects, solver_stats)
 }
 
 /// Per-kappa weight of the *median* subject-occasion in this dataset (#1031),
@@ -1111,6 +1184,7 @@ pub(crate) fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&
 /// Free (non-fixed) theta estimates pinned to an optimizer bound, as
 /// `(name, estimate, effective_bound, side)` per hit.
 fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'static str)> {
+    use crate::estimation::parameterization::theta_guard_is_internal;
     let mut hits = Vec::new();
     for i in 0..params.theta.len() {
         if params.theta_fixed.get(i).copied().unwrap_or(false) {
@@ -1146,20 +1220,6 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
         }
     }
     hits
-}
-
-/// Whether a THETA bound reported by `compute_bounds` is an implementation cap
-/// rather than the user's effective declared limit.
-fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
-    use crate::estimation::parameterization::theta_packs_log;
-    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
-    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
-    theta_packs_log(lower)
-        && match side {
-            "lower" => lower <= 1e-10,
-            "upper" => upper >= 1e9,
-            _ => false,
-        }
 }
 
 /// A free parameter coordinate pinned to one of the internal packed-space
@@ -1237,14 +1297,18 @@ pub(crate) fn packed_guard_side(
 /// hidden 1e-10 / 1e9 cap for the declared range; every later coordinate is an
 /// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
 fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
+    use crate::estimation::parameterization::theta_guard_is_internal;
     use crate::estimation::parameterization::{
-        compute_bounds, coordinate_kinds, coordinate_names, coordinate_values, pack_params,
-        packed_fixed_mask,
+        coordinate_kinds, coordinate_names, coordinate_values, pack_with_bounds, PackedStart,
     };
 
-    let packed = pack_params(params);
-    let bounds = compute_bounds(params);
-    let fixed = packed_fixed_mask(params);
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
+    } = pack_with_bounds(params);
     let names = coordinate_names(params);
     let estimates = coordinate_values(params);
     let kinds = coordinate_kinds(params);
@@ -1411,6 +1475,68 @@ pub(crate) fn boundary_estimate_warning(
             serde_json::json!({ "parameters": params_json })
         },
     )
+}
+
+/// **The user-facing half of #1303's gate.** Demote `converged` when the OFV
+/// `fit()` is about to publish is not a reportable objective, and build the
+/// typed warning saying why — `None` when the objective is sound.
+///
+/// This is not a second copy of the estimators' gate; it is the same
+/// [`gate_converged_on_objective`](crate::estimation::outer_optimizer::gate_converged_on_objective)
+/// applied to a *different number*. Each estimator gates the objective **it**
+/// reports (`OuterResult::ofv`, the clean −2 log L); `FitResult::ofv` is
+/// `ofv_data + ofv_prior`, and the parameter-prior penalty (#254) is evaluated
+/// here, after the last optimizer has returned. So a finite −2 log L plus a
+/// non-finite penalty — a prior whose density is zero at the estimate, an
+/// overflowing log-normal prior on a runaway θ — produces a `FitResult` whose
+/// published `ofv` no estimator ever saw. The chained case is the same shape:
+/// `methods = vi, focei` reports the last stage's objective, and a multi-start
+/// splice re-homes warnings across runs.
+///
+/// Severity is [`WarningSeverity::Critical`] and the code is
+/// [`WarningCode::Convergence`], matching the other verdict-demoting warnings
+/// (`W_VI_BAD_BASIN`, the runaway-guard hit): every quantity derived from the
+/// objective — OFV, AIC, BIC, the standard errors, any likelihood-ratio test —
+/// is meaningless, so this is not an advisory.
+///
+/// **Why a warning and not an `Err`** (the question #1303 asks to decide): the
+/// diagnostics a user needs to *find* the bad subject all live on the
+/// `FitResult` this would throw away — `W_ODE_SOLVER_DIAGNOSTICS`' abandoned-walk
+/// count (#1296), the per-subject sdtab rows, the EBEs that show which subject
+/// diverged. An `Err(String)` carries one line of prose and deletes the rest.
+/// Nor is the sentinel case an error in any useful sense: a repelled fit has
+/// real, finite parameter estimates and is exactly the "scored but rejected"
+/// candidate `ferx-tools`' model-space search expects from
+/// [`crate::model_selection::Strictness::require_converged`] — turning it into
+/// an exception would abort a search instead of stepping past one candidate.
+/// The place to *error* on this population is the front door, where
+/// `check_model_data` can name the offending record before a fit is paid for
+/// (#1235/#1286 own that); a back-door `Err` after four outer iterations tells
+/// the user strictly less. So: the boolean carries the verdict, the warning
+/// carries the reason, and `Err` stays for inputs that can be rejected up front.
+pub(crate) fn nonfinite_objective_warning(
+    converged: &mut bool,
+    ofv: f64,
+    method: EstimationMethod,
+    options: &FitOptions,
+) -> Option<(String, WarningEntry)> {
+    if crate::estimation::outer_optimizer::publishes_no_objective(method, options) {
+        return None;
+    }
+    let msg = crate::estimation::outer_optimizer::gate_converged_on_objective(converged, ofv)?;
+    let details = serde_json::json!({
+        "ofv": if ofv.is_finite() { serde_json::json!(ofv) } else { serde_json::json!(ofv.to_string()) },
+        "reason": crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv),
+        "divergence_cutoff": crate::estimation::outer_optimizer::DIVERGENCE_OFV,
+        "method": method.label(),
+    });
+    let entry = warning_entry_with_severity(
+        WarningSeverity::Critical,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
 }
 
 /// Build the warning for parameter estimates pinned to an internal
@@ -1673,6 +1799,98 @@ pub(crate) fn high_correlation_warning(result: &FitResult) -> Option<(String, Wa
     )
 }
 
+/// Build the human message + native structured entry for a fit that never left
+/// its initial estimates, or `None` when it did (or when there is nothing to
+/// judge by).
+///
+/// Surfaces [`crate::stalled_at_init`] — which already existed as a public
+/// predicate (#751) but was reachable only by a caller who thought to ask — as a
+/// warning on the result, alongside `boundary_estimate` (#997 §2).
+///
+/// **Why this is not the ratio test the issue proposed.** #997 §2 asked for a
+/// warning on `theta / theta_init ≈ 1`, and its own author then withdrew the
+/// suggestion: on his anchor model the data were simulated at `KON = 1000` and
+/// started there, so the *correct* arm left `KON` at 0.999 of its initial value
+/// and a per-parameter ratio test fired hardest on the arm that was right. The
+/// predicate here is not that test. It asks whether **any** free coordinate
+/// moved, over θ, Ω and σ together, and it prefers the optimizer's own
+/// scaled-space escape verdict when the run recorded one. A well-chosen start
+/// that one parameter stays at is not a stall; a fit where nothing at all moved
+/// is, whatever the start was worth.
+///
+/// `converged` is deliberately left alone — unlike
+/// [`runaway_guard_warning`], which demotes it. A runaway hit is by construction
+/// not an interior optimum; a stall at the start *can* be one (the initial
+/// estimates may simply be the optimum, the degenerate but real case of a fit
+/// restarted from its own output). What the warning asserts is that the OFV is
+/// the OFV of the initial values and so carries no information about the model —
+/// a judgement for the caller, and one `Strictness::reject_init_stall` already
+/// makes for search harnesses that want it fatal.
+pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
+    // An evaluation-only run (`outer_maxiter = 0`, NONMEM `MAXEVAL=0`) reports the
+    // objective at the initial estimates *by request*. The predicate is perfectly
+    // correct there and the warning tells the caller nothing they did not ask for,
+    // so it is suppressed — the one case where "the estimates are the initial
+    // values" is the answer rather than a symptom.
+    if result.outer_maxiter == 0 {
+        return None;
+    }
+    if crate::model_selection::stalled_at_init(result) != Some(true) {
+        return None;
+    }
+    // Which reading fired, so the message can quote the tolerance that applies.
+    // `stalled_at_init` prefers `left_init` whenever the result carries it.
+    let from_optimizer = result.left_init.is_some();
+    let free_thetas: Vec<(String, f64, f64)> = result
+        .theta_names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !result.theta_fixed.get(*i).copied().unwrap_or(false))
+        .filter_map(|(i, name)| {
+            Some((
+                name.clone(),
+                *result.theta.get(i)?,
+                *result.theta_init.get(i)?,
+            ))
+        })
+        .collect();
+    let list = free_thetas
+        .iter()
+        .map(|(name, est, init)| format!("{name} ({init:.4} → {est:.4})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let basis = if from_optimizer {
+        "the optimizer's own escape test (no packed coordinate moved by 1% of its scaled range)"
+    } else {
+        "a comparison against the initial estimates (no free THETA, OMEGA or SIGMA moved by 1%)"
+    };
+    let msg = format!(
+        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. The reported \
+         objective is the objective *of the initial values* and says nothing about the model, \
+         even though `converged` may be true — a fit that never moved has a flat objective \
+         trace to plateau on. Unmoved free THETA: {list}. Check the optimizer's own diagnostics \
+         (`final_gradient`), try different initial estimates, or a gradient-based \
+         `optimizer` if this fit used a derivative-free one."
+    );
+    let entry = warning_entry(
+        WarningCode::StalledAtInit,
+        msg.clone(),
+        Some(serde_json::json!({
+            "verdict_source": if from_optimizer { "optimizer_escape_test" } else { "natural_scale" },
+            "n_free_parameters": result.n_parameters,
+            "theta": free_thetas
+                .iter()
+                .map(|(name, est, init)| serde_json::json!({
+                    "parameter": name,
+                    "estimate": est,
+                    "init": init,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    );
+    Some((msg, entry))
+}
+
 /// Build the human message + native structured entry for a **twin-less** transit /
 /// IG absorption closed form whose *fitted* per-subject EBE crosses into the
 /// flip-flop regime, or `None`.
@@ -1764,6 +1982,97 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 /// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
 const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";
 
+/// Which pass deposited the [`crate::ode::OdeSolverStats`] a solver-diagnostics message is
+/// built from (#1304).
+///
+/// The counters are the same on every pass; what differs is what the message may claim about
+/// them. `fit()`'s post-fit sweep runs at the *final estimates* over every subject once;
+/// `predict()` / `simulate()` run at whatever parameters the caller passed, and `simulate()`
+/// integrates `n_sim` replicates of each subject rather than one. Hard-coding the post-fit
+/// wording and then reusing the function from the other entry points would have told a
+/// `predict()` caller their *fit* had a problem — at parameters no fit ever visited.
+///
+/// The variants are exactly the entry points that open a
+/// [`crate::ode::solver::SolverStatsScope`], and
+/// `the_production_scope_sites_are_the_phases_this_enum_lists` pins that correspondence against
+/// the source — so a new scope cannot be opened without choosing a phase for it, which is the
+/// #1304 defect in reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SolverStatsPhase {
+    /// `fit()`'s post-fit prediction sweep (plus the one sensitivity-sweep counter).
+    PostfitPredictions,
+    /// One [`crate::api::predict_diag`] pass.
+    Predict,
+    /// One [`crate::api::simulate_with_options_diag`] pass.
+    Simulate,
+    /// One [`crate::api::simulate_adaptive`] pass.
+    SimulateAdaptive,
+}
+
+impl SolverStatsPhase {
+    /// The `phase` field of the warning's structured `details` payload.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => "postfit_predictions",
+            Self::Predict => "predict",
+            Self::Simulate => "simulate",
+            Self::SimulateAdaptive => "simulate_adaptive",
+        }
+    }
+
+    /// Where in parameter space the counters were collected, as a prepositional phrase the
+    /// message drops in after "the ODE solver …".
+    ///
+    /// Only the post-fit sweep may say "final estimates": it is the only phase that runs after
+    /// an optimizer. Everywhere else the parameters are the caller's argument, and a fit may
+    /// never have happened at all.
+    fn at_label(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => "at the final estimates",
+            Self::Predict | Self::Simulate | Self::SimulateAdaptive => "at the supplied parameters",
+        }
+    }
+
+    /// What paid for a discarded escalation *and* the re-solve that replaced it, as the
+    /// subject of "… paid for both solves".
+    ///
+    /// The clause used to say "the fit" unconditionally, which is false from every phase but
+    /// one — a `predict()` caller has not run a fit, and telling them one paid for something
+    /// invents a run that never happened. Split out rather than reworded into a passive
+    /// ("both solves were paid for") because *who* absorbed the cost is the actionable part:
+    /// on a `simulate()` it is this call, repeated per replicate.
+    fn payer(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => "the fit",
+            Self::Predict => "this predict() pass",
+            Self::Simulate => "this simulate() pass",
+            Self::SimulateAdaptive => "this simulate_adaptive() run",
+        }
+    }
+
+    /// The sentence naming which pass produced the counters, so a reader can tell a
+    /// one-per-subject sweep from an `n_sim`-replicate one.
+    ///
+    /// Attached to **both** severities. It was on the warning only at first, so the
+    /// informational escalation note — the more common message on a stiff model — named no pass
+    /// at all and its counters read as the fit's wherever they came from.
+    fn provenance(self) -> &'static str {
+        match self {
+            Self::PostfitPredictions => {
+                "Counters are from the post-fit prediction pass over all subjects."
+            }
+            Self::Predict => "Counters are from this predict() pass over all subjects.",
+            Self::Simulate => {
+                "Counters are from this simulate() pass over all subjects and replicates."
+            }
+            Self::SimulateAdaptive => {
+                "Counters are from this simulate_adaptive() pass over all subjects and \
+                 replicates."
+            }
+        }
+    }
+}
+
 /// The token for the *informational* half — `auto` escalated and it worked.
 ///
 /// A separate token rather than a shared one because severity has to survive the round trip:
@@ -1782,6 +2091,182 @@ const ODE_SOLVER_INFO_TOKEN: &str = "W_ODE_SOLVER_ESCALATION_NOTE";
 /// exactly those rerouted subjects clamp, escalate, or abort with nothing reported.
 pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
     model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some()
+}
+
+/// The `FitOptions` view [`ode_solver_diagnostics_warning`] reads, for an entry point that has
+/// no `FitOptions` at all (#1304).
+///
+/// `predict()` / `simulate()` / `simulate_adaptive()` take no fit options: the solver settings
+/// they run at are the ones stamped onto the model's [`OdeSpec`](crate::ode::predictions::OdeSpec)
+/// at parse time (`sync_ode_solver_opts`), so the message must name *those*, not
+/// `FitOptions::default()`'s. Naming the defaults would tell a user running
+/// `ode_method = rodas5p` from their model file that `ode_method = auto` had misbehaved.
+///
+/// Only two fields are read back out — `ode_method` and `ode_stiff_abort_after` — and that is
+/// asserted, not assumed: `the_solver_warning_reads_only_the_two_options_this_view_carries`
+/// scans the function's source, so a third `options.` read fails the test rather than silently
+/// reporting a default through this view.
+///
+/// A closed-form model with an [`AbsorptionOdeEquivalent`](crate::types::AbsorptionOdeEquivalent)
+/// carries no `ode_spec` of its own but integrates the twin (#814), so the twin's settings are
+/// the fallback. A model that integrates nothing never reaches here — the caller gates on
+/// [`integrates_odes`] before opening a scope at all.
+pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
+    let spec = model.ode_spec.as_ref().or_else(|| {
+        model
+            .absorption_ode_equivalent
+            .as_ref()
+            .and_then(|eq| eq.built().ode_spec.as_ref())
+    });
+    let solver = spec.map(|s| s.effective_solver_opts()).unwrap_or_default();
+    FitOptions {
+        ode_method: solver.method,
+        ode_stiff_abort_after: solver.stiff_abort_after,
+        ..Default::default()
+    }
+}
+
+/// Every diagnostic a non-`fit()` entry point can report (#1280 / #1304).
+///
+/// **One implementation, three callers.** `predict_diag`, `simulate_with_options_diag` and
+/// `simulate_adaptive` all report exactly this list, so a diagnostic added to any source below
+/// reaches all three at once and none of them can carry a different subset than the others —
+/// `every_diagnostic_carrying_entry_point_reports_the_same_bundle` asserts that equality across
+/// all three on a fixture that trips both halves.
+///
+/// # What is in it, and what is not
+///
+/// The rule is **a finding about the model or the data is carried; a finding about the fit's
+/// configuration or the optimizer's start is not** — because on these entry points there is no
+/// fit and no optimizer, so such a finding would be about something that is not happening.
+///
+/// Carried, in `fit()`'s own order (`api::fit`):
+///
+/// 1. [`CompiledModel::parse_warnings`](crate::types::CompiledModel::parse_warnings) — e.g.
+///    `W_ABSORPTION_TWIN_DECLINED`, which changes what a *prediction* does.
+/// 2. [`Population::warnings`](crate::types::Population::warnings), through the same
+///    `reader_warning_suppressed` filter `fit()` and `ferx check` use, so all three suppress
+///    exactly the same reader findings. `W_CMT_DEFAULTED` is the one that filter
+///    actually withholds — from a model where `CMT` selects nothing (#1009);
+///    `W_ADDL_MISSING_II` and `W_IOV_OCC_MISSING` pass through it unchanged. One
+///    qualification since #1409: that filter takes a `&FitOptions` for the one
+///    `W_CMT_DEFAULTED` channel that lives on the options rather than on the model — a
+///    `[data_selection]` clause comparing `CMT` — and these entry points have none, so it is
+///    passed a default. See the call site.
+/// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
+///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` bundle.
+/// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
+///    experimental whichever door you use it through.
+/// 5. The ODE-solver diagnostics of the pass that just ran.
+///
+/// **Deliberately not carried**, and the reason is structural rather than editorial:
+///
+/// * The warning half of `check_model_options`. It takes a `&FitOptions` these entry points do
+///   not have, and synthesizing one would report findings about *defaults the caller never
+///   chose* — the same trap [`solver_reporting_options`] exists to avoid. Its subject is an
+///   estimator/optimizer combination that is not running (`W_GN_NO_RANDOM_EFFECTS` and
+///   friends).
+/// * The warning half of `check_packed_start_in_box` (#1251). Its subject is the packed vector
+///   the **outer optimizer** starts from; nothing is packed on a prediction or a simulation.
+/// * `fit()`'s operational notes — the FD-fallback count, the thread-count hint, the
+///   covariance-step cost estimate, the NLopt availability probe. All describe a run that is
+///   not happening.
+///
+/// `the_bundle_carries_every_model_and_data_source_fit_carries` pins (1)–(4) end to end, and
+/// `the_bundle_excludes_the_findings_that_are_about_a_fit` pins the exclusions, so this comment
+/// cannot quietly stop matching the code.
+///
+/// Within what it carries the list is **not** filtered per entry point: dropping a code because
+/// it reads oddly outside a fit is the special-case-on-shared-infrastructure arrangement that
+/// produced the "which entry point sees which finding" confusion #1280 was filed about. Two
+/// members are phrased for a fit (`W_ADDITIVE_INIT_SCALE` advises on optimizer basins;
+/// `W_MODELED_*_NONPOSITIVE` calls its values "initial estimates"), and they are still true of
+/// the numbers being served — a σ_add that cannot absorb the data is as visible in a simulated
+/// DV column as in a fit.
+///
+/// `stats` is what the caller's [`crate::ode::solver::SolverStatsScope`] collected; pass
+/// `OdeSolverStats::default()` on a model that integrates nothing (no scope, no counters, no
+/// warning — `ode_solver_diagnostics_warning` returns `None` on an all-zero payload).
+pub(crate) fn non_fit_diagnostics(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    stats: &crate::ode::OdeSolverStats,
+    phase: SolverStatsPhase,
+) -> Vec<String> {
+    let mut out: Vec<String> = model.parse_warnings.clone();
+    // No `[data_selection]` clauses: these entry points are handed a `Population` the
+    // caller already read, so whether a filter consumed the resolved `CMT` on the way
+    // in is not visible from here. Every other `W_CMT_DEFAULTED` channel is a property
+    // of the model and is answered in full; only `CmtConsumer::DataSelectionFilter` is
+    // dark on this path, for the same structural reason `check_model_options` is
+    // excluded wholesale — there is no `&FitOptions` to read, and synthesizing one
+    // would report on defaults the caller never chose (#1409). Built once rather than
+    // inside the closure, which would rebuild it per warning.
+    let no_selection = FitOptions::default();
+    out.extend(
+        population
+            .warnings
+            .iter()
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, &no_selection, w))
+            .cloned(),
+    );
+    out.extend(
+        crate::api::check_model_data_warnings(model, population, params)
+            .into_iter()
+            .map(|d| d.message),
+    );
+    out.extend(
+        crate::api::check_experimental_features(model)
+            .into_iter()
+            .map(|d| d.message),
+    );
+    if let Some((msg, _)) =
+        ode_solver_diagnostics_warning(stats, &solver_reporting_options(model), phase)
+    {
+        out.push(msg);
+    }
+    out
+}
+
+/// The one place a non-`fit()` entry point decides whether to open a
+/// [`crate::ode::solver::SolverStatsScope`] (#1304).
+///
+/// `None` when the model integrates nothing: entering a scope *activates* per-segment
+/// recording, and a closed-form model has no segments to record — so the tee would be pure
+/// overhead on the path that needs it least. Gating in one place is what keeps `predict()`,
+/// `simulate()` and `simulate_adaptive()` from drifting into three different answers to "does
+/// this model have solver statistics".
+///
+/// Read the counters with `scope.as_ref().map(|s| s.collected()).unwrap_or_default()` **while
+/// the scope is still alive**; dropping it restores whatever scope was open outside.
+pub(crate) fn solver_stats_scope(
+    model: &CompiledModel,
+) -> Option<crate::ode::solver::SolverStatsScope> {
+    integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter)
+}
+
+/// Run `f` inside [`solver_stats_scope`], returning what it produced together with the counters
+/// it deposited.
+///
+/// For the **serial** non-fit passes. `simulate()` and `simulate_adaptive()` both walk their
+/// subjects in a plain `for` loop, because the RNG draw order is part of their contract, so one
+/// scope covers the whole pass. A *parallel* pass cannot use this: the scope is thread-local,
+/// so a scope opened here would see only the calling thread's work and report clean counters
+/// for exactly the integrations it exists to surface. `predict()` therefore opens one scope per
+/// subject task and merges, the same shape [`compute_subject_results`] uses.
+///
+/// `simulate_adaptive` uses [`solver_stats_scope`] directly rather than this wrapper: its loop
+/// propagates `?` out of the enclosing function, which a closure cannot do. An early return
+/// there simply drops the scope, which is right — nothing is reported on a run that failed.
+pub(crate) fn with_solver_stats<T>(
+    model: &CompiledModel,
+    f: impl FnOnce() -> T,
+) -> (T, crate::ode::OdeSolverStats) {
+    let scope = solver_stats_scope(model);
+    let out = f();
+    let stats = scope.as_ref().map(|s| s.collected()).unwrap_or_default();
+    (out, stats)
 }
 
 /// Re-run the analytic **sensitivity** solve once per subject at the final estimates, for its
@@ -1817,34 +2302,57 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
 /// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
 /// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
 /// observe.
+///
+/// Like [`compute_subject_results`], this runs one independent task per subject on the fit's
+/// own pool and **returns** its counters rather than depositing them in a scope the caller
+/// opened (#1329): [`crate::ode::solver::SolverStatsScope`] is thread-local, so a caller-side
+/// scope would have come back empty and `auto_stiff_rejected_jets` — the one counter no `f64`
+/// pass can ever produce — would have been permanently zero again, which is the dead
+/// diagnostic #1080 existed to remove.
 pub(crate) fn sweep_sensitivity_solver_stats(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     mixest: Option<&[usize]>,
-) {
+) -> crate::ode::solver::OdeSolverStats {
+    let mut merged = crate::ode::solver::OdeSolverStats::default();
     if !crate::sens::provider::ode_inner_grad_supported_model(model)
         || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
     {
-        return;
+        return merged;
     }
     let second_order = crate::sens::provider::analytic_outer_gradient_available(model);
-    for (i, subject) in population.subjects.iter().enumerate() {
-        let Some(eta) = eta_hats.get(i) else { continue };
-        // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to its
-        // winning class, so evaluating it under the class-1 default would integrate a
-        // trajectory the fit never reported.
-        let _mix_guard = mixest
-            .and_then(|m| m.get(i))
-            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
-        let (theta, eta) = (&params.theta, eta.as_slice());
-        if second_order {
-            let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
-        } else {
-            let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
-        }
+    let per_subject: Vec<crate::ode::solver::OdeSolverStats> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let Some(eta) = eta_hats.get(i) else {
+                return crate::ode::solver::OdeSolverStats::default();
+            };
+            let stats_scope = crate::ode::solver::SolverStatsScope::enter();
+            // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to
+            // its winning class, so evaluating it under the class-1 default would integrate a
+            // trajectory the fit never reported.
+            let _mix_guard = mixest
+                .and_then(|m| m.get(i))
+                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+            let (theta, eta) = (&params.theta, eta.as_slice());
+            if second_order {
+                let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+            } else {
+                let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+            }
+            stats_scope.collected()
+        })
+        .collect();
+    // In subject order, so a future non-additive counter cannot become
+    // worker-count dependent.
+    for stats in &per_subject {
+        merged.merge(stats);
     }
+    merged
 }
 
 /// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080
@@ -1860,9 +2368,11 @@ pub(crate) fn sweep_sensitivity_solver_stats(
 /// Two severities, because the two things being reported are not the same kind of event:
 ///
 /// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, its explicit
-///   fallback also failed, a segment ended before its requested horizon, or a segment was cut
-///   short by `ode_stiff_abort_after`. Each means part of some subject's trajectory was
-///   freeze-padded or re-solved, i.e. the integration was not clean.
+///   fallback also failed, a segment ended before its requested horizon, a segment was cut
+///   short by `ode_stiff_abort_after`, or a walk was abandoned before integrating because its
+///   timeline could not be ordered (#1234). Each means part of some subject's trajectory was
+///   freeze-padded, re-solved, or — in the last case — never produced at all, i.e. the
+///   integration was not clean.
 /// * **Info** — `auto` escalated and everything worked. Routine on a stiff model (the TMDD
 ///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
 ///   the user never asked for and could not otherwise see.
@@ -1886,6 +2396,7 @@ pub(crate) fn sweep_sensitivity_solver_stats(
 pub(crate) fn ode_solver_diagnostics_warning(
     stats: &crate::ode::OdeSolverStats,
     options: &FitOptions,
+    phase: SolverStatsPhase,
 ) -> Option<(String, WarningEntry)> {
     // Clamps taken inside escalations the guard discarded describe a trajectory nobody
     // received — the explicit re-solve replaced it — so they must not drive the freeze-padding
@@ -1919,6 +2430,15 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // *steps*, so it cannot collide with a segment count the same way; its own segment-level
     // overlap is described in the wording below.)
     let unfinished_other = unfinished_kept.saturating_sub(aborted);
+    // Walks abandoned before a driver was ever called, because the timeline could not be
+    // ordered (#1189, counted since #1234). Disjoint from every counter above by construction:
+    // those all describe a segment that *started*, and here none did — which is exactly why it
+    // needs its own clause. Without it this is the one damaged outcome that leaves the whole
+    // stats block at zero and so reads identical to a subject there was nothing to integrate
+    // for. It is not part of the `unfinished_kept` roll-up either — an abandoned walk has no
+    // segments at all, so folding it in would report it as a segment that started and stopped,
+    // which is a different (and less alarming) failure than the one that happened.
+    let abandoned = stats.abandoned_non_finite_timeline;
     let escalated = stats.auto_stiff_segments;
     // Segments whose stepper changed part-way through (#1080 Part C). Reported as a clause on
     // the escalation note rather than as a warning of its own: a mid-segment switch is `auto`
@@ -1947,18 +2467,23 @@ pub(crate) fn ode_solver_diagnostics_warning(
     } else {
         String::new()
     };
-    let unclean = clamped > 0
+    // Split in two (#1234 review §2). Every counter but `abandoned` describes an integration
+    // that *ran* and came back inaccurate; `abandoned` describes one that never started. The
+    // difference decides both the lead-in verb and whether the solver-knob advice applies, so
+    // the two cannot share one flag.
+    let unclean_integration = clamped > 0
         || rejected > 0
         || rejected_jets > 0
         || fallback_failed > 0
         || unfinished_kept > 0
         || aborted > 0;
+    let unclean = unclean_integration || abandoned > 0;
     if !unclean && escalated == 0 {
         return None;
     }
 
     let details = Some(serde_json::json!({
-        "phase": "postfit_predictions",
+        "phase": phase.as_str(),
         "ode_method": options.ode_method.as_str(),
         "attempted_steps": stats.attempted_steps,
         "accepted_steps": stats.accepted_steps,
@@ -1976,17 +2501,21 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "discarded_unfinished_segments": stats.discarded_unfinished_segments,
         "kept_unfinished_segments": unfinished_kept,
         "stiff_aborted_segments": aborted,
+        "abandoned_non_finite_timeline": abandoned,
     }));
 
     if !unclean {
         // Escalation only: the probe fired, the stiff method coped, nothing was discarded.
         let msg = format!(
             "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
-             segment(s) to a stiff stepper at the final estimates; every other segment used \
+             segment(s) to a stiff stepper {at}; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
-             size.{switched_info_clause} Informational — set ode_method = {explicit} to pin the \
-             explicit stepper, or name a stiff method to pin the other half.",
+             size.{switched_info_clause} {provenance} Informational — set ode_method = \
+             {explicit} to pin the explicit stepper, or name a stiff method to pin the other \
+             half.",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+            at = phase.at_label(),
+            provenance = phase.provenance(),
         );
         let entry = WarningEntry {
             severity: WarningSeverity::Info,
@@ -1999,6 +2528,23 @@ pub(crate) fn ode_solver_diagnostics_warning(
     }
 
     let mut parts: Vec<String> = Vec::new();
+    // First, because it is the only clause here that reports predictions which are `NaN` rather
+    // than merely inaccurate: every other outcome returns a finite trajectory that was
+    // freeze-padded or re-solved, and this one returns no trajectory at all.
+    if abandoned > 0 {
+        parts.push(format!(
+            "{abandoned} solver walk(s) were abandoned before integrating because the \
+             subject's timeline could not be ordered — a NaN or infinite dose time, lagtime, \
+             route lag, or infusion duration {at} — so those subjects' \
+             predictions are NaN by construction, and they contributed nothing to any other \
+             counter in this payload because nothing was integrated for them. This counts \
+             walks, not subjects: one subject reaches more than one engine in this pass (its \
+             predictions and its [odes] state readout are separate walks), so it contributes \
+             more than one. Check the dose records and any exponential covariate model on ALAG \
+             / F / D / R for a value that overflows at typical covariates",
+            at = phase.at_label(),
+        ));
+    }
     if clamped > 0 {
         parts.push(format!(
             "{clamped} step(s) clamped at the minimum step size — the local-error test failed \
@@ -2013,12 +2559,13 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
              discarded as unusable and re-solved with {explicit} — the stiffness probe was \
              right that those segments are stiff and wrong that the stiff method it picked \
-             could integrate them, and the fit paid for both solves (the {discarded} step(s) \
+             could integrate them, and {payer} paid for both solves (the {discarded} step(s) \
              those attempts clamped are not in the count above: the guard replaced the \
              trajectory they produced); naming ode_method = rodas5p (or rosenbrock23) \
              explicitly is the next thing to try",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
+            payer = phase.payer(),
         ));
     }
     if rejected_jets > 0 {
@@ -2073,14 +2620,41 @@ pub(crate) fn ode_solver_diagnostics_warning(
         ));
     }
 
+    // The lead-in has to survive the abandoned-only case: "did not integrate cleanly"
+    // understates a walk that never integrated at all and whose predictions are every one
+    // `NaN`.
+    let lead = if unclean_integration {
+        "did not integrate cleanly"
+    } else {
+        "did not produce a usable integration"
+    };
+    // #1234 review §2: the solver-knob advice is about an integration that ran badly, and
+    // saying it unconditionally contradicted this PR's own `docs/model-file/ode-models.qmd`
+    // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
+    // sentence of the message and the only one naming concrete knobs. So it is attached to
+    // the counters it is true of, and an abandoned walk gets the advice that applies to it.
+    let solver_knob_advice = if unclean_integration {
+        " For the segments that did integrate, consider a different ode_method, a looser \
+         ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
+         dynamics."
+    } else {
+        ""
+    };
+    let abandoned_advice = if abandoned > 0 {
+        " The abandoned walk(s) are not an ode_method or tolerance problem — nothing was \
+         integrated for them, so no solver setting changes the outcome; fix the record or \
+         the parameter that produces the non-finite time."
+    } else {
+        ""
+    };
     let msg = format!(
-        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver did not integrate cleanly at the final \
-         estimates (ode_method = {method}): {body}. Counters are from the post-fit prediction \
-         pass over all subjects; consider a different ode_method, a looser ode_reltol / \
-         ode_abstol, or checking the parameter estimates that produce these dynamics.\
-         {switched_warn_clause}",
+        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver {lead} {at} \
+         (ode_method = {method}): {body}. {provenance}\
+         {solver_knob_advice}{abandoned_advice}{switched_warn_clause}",
+        at = phase.at_label(),
         method = options.ode_method.as_str(),
         body = parts.join("; "),
+        provenance = phase.provenance(),
     );
     let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), details);
     Some((msg, entry))

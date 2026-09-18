@@ -736,7 +736,15 @@ pub(crate) fn compute_covariance(
             initial_eps
         ));
     }
-    let bounds = compute_bounds(template);
+    // One walk for the box and the FIX mask (#1252) — `compute_bounds` builds
+    // the mask internally to pin FIX-ed coordinates, so taking it here costs
+    // nothing and saves the second walk this function used to do further down.
+    // The packed start is dropped: `x_hat` is the caller's, not the template's.
+    let PackedStart {
+        bounds,
+        fixed: fixed_mask,
+        ..
+    } = pack_with_bounds(template);
     // Mixture models (#983 Phase 6) build the FD Hessian on the K-fold mixture
     // objective and skip the single-population reconvergence / analytic R-matrix
     // (both single-population-only). Gated on `template.mixture`.
@@ -921,20 +929,15 @@ pub(crate) fn compute_covariance(
 
     // FIX parameters contribute no information — skip their FD stencils and,
     // after inverting the Hessian of the free block, leave their covariance
-    // rows/cols at zero (→ SE = 0 downstream).
-    let fixed_mask = packed_fixed_mask(template);
-    // Structural-zero Ω off-diagonals (the cross-block elements of a mixed
-    // block+diagonal Ω, where `free_mask[(i,j)] == false`) are not estimated
-    // parameters — the analytical population gradient zeroes them, so their
-    // Hessian diagonal is flat. Exclude them from the free set exactly like FIX
-    // parameters; otherwise the ill-conditioning guard below rejects the entire
-    // covariance step. (Before #243 the omega-prior add-back iterated all
-    // lower-triangle entries and gave these a spurious non-zero curvature, which
-    // masked the issue for the FOCE path; FOCEI never had that mask.)
-    let structural_zero = omega_structural_zero_mask(template);
-    let free_idx: Vec<usize> = (0..n)
-        .filter(|&i| !fixed_mask[i] && !structural_zero[i])
-        .collect();
+    // rows/cols at zero (→ SE = 0 downstream). `fixed_mask` came from the same
+    // `pack_with_bounds` walk as `bounds`, at the top of this function.
+    // It also holds the structural-zero Ω off-diagonals (the cross-block
+    // elements of a mixed block+diagonal Ω, where `free_mask[(i,j)] == false`):
+    // they are not estimated parameters and their Hessian diagonal is flat, so
+    // without the exclusion the ill-conditioning guard below rejects the entire
+    // covariance step (#243). Since #1018 the optimizer holds them through the
+    // same mask, so there is one gate, not a second structural filter here.
+    let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
 
     let f0 = base_ofv;
 
@@ -1133,6 +1136,28 @@ pub(crate) fn compute_covariance(
             }
         }
     }
+
+    // ── Parameter-prior curvature (#254) ─────────────────────────────────────
+    //
+    // The reported SE is the curvature of the objective that was *minimised*, and
+    // under a prior that objective is `OFV_data + Σ((x−m)/s)²`. Leaving the prior
+    // out here would report the unpenalized curvature — wrong in exactly the
+    // regime the feature exists for, since a sparse fit's whole reason for
+    // carrying a prior is that the data alone does not identify the direction,
+    // and that is also where the unpenalized Hessian goes flat (rejected just
+    // below as "zero diagonal — flat objective") or non-PD.
+    //
+    // Added here rather than inside `cov_ofv` for two reasons: the penalty's
+    // second derivative is the exact constant `2/s²` (no stencil, no extra
+    // objective evaluations, no FD noise), and adding it post-assembly covers the
+    // analytic R-matrix route and the FD stencil route with one line instead of
+    // one each. It lands before the ill-conditioning diagnosis on purpose — a
+    // coordinate the prior identifies must read as curved, not as flat.
+    //
+    // Name it in the SE report, not just here: these are penalized-ML / MAP
+    // standard errors, not posterior SDs.
+    let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
+    cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
 
     // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate
     // cause labels — post-hoc checks on `hess` would always read 0 (finite) because
@@ -1458,6 +1483,32 @@ pub(crate) struct CovStepOutcome {
     pub wall_time_secs: f64,
     pub warnings: Vec<String>,
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
+    /// Which estimator produced `matrix` (#1382) — the **routed** one, which is
+    /// not always the requested one (see [`scale_routed_covariance_method`]).
+    /// `None` exactly when `matrix` is `None`; see
+    /// [`published_covariance_method`].
+    pub method: Option<crate::types::CovarianceMethod>,
+}
+
+/// The estimator label to publish alongside a covariance matrix: `Some(routed)`
+/// when a matrix was produced, `None` otherwise (#1382).
+///
+/// `routed` is the post-[`scale_routed_covariance_method`] choice — the one
+/// `compute_covariance` was actually configured with — never
+/// `FitOptions::covariance_method`, which is what was *asked for*. The two
+/// differ whenever a defaulted `r` is routed onto the cross-product above
+/// [`crate::types::COV_HESSIAN_MAX_DIM`] free parameters, and a label that
+/// reported the request there would be wrong precisely on the fits where the
+/// user could not have predicted the answer.
+///
+/// The `None`-without-a-matrix half is the other invariant: a failed, skipped or
+/// SIR-fallback step publishes no matrix, no standard errors, no eigenvalues and
+/// no condition number, so there is nothing for an estimator name to describe.
+pub(crate) fn published_covariance_method(
+    matrix: Option<&DMatrix<f64>>,
+    routed: crate::types::CovarianceMethod,
+) -> Option<crate::types::CovarianceMethod> {
+    matrix.map(|_| routed)
 }
 
 /// Which covariance estimator to actually assemble at `n` free coordinates, and
@@ -1478,9 +1529,30 @@ pub(crate) fn scale_routed_covariance_method(
     n: usize,
     requested: CovarianceMethod,
     explicitly_set: bool,
+    has_priors: bool,
 ) -> (CovarianceMethod, Option<String>) {
     if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
         return (requested, None);
+    }
+    // #254: `S` is a sum of per-*subject* score cross-products, and a parameter
+    // prior has no subject decomposition — it contributes one score for the whole
+    // population, not N of them — so `S` cannot carry the prior's information at
+    // all. Auto-routing a priored fit onto it would silently report unpenalized
+    // standard errors for a penalized fit, which is the one thing the covariance
+    // wiring exists to prevent. Stay on `R` (which does carry the prior) and say
+    // why it will be slow, rather than being quietly wrong and fast.
+    if has_priors {
+        let stencil = n * (n + 1) / 2;
+        return (
+            requested,
+            Some(format!(
+                "covariance_method = r with {n} free parameters and parameter priors \
+                 declared: the R matrix is a finite-difference Hessian needing {stencil} \
+                 re-converged objective evaluations. The usual large-problem fallback \
+                 (`covariance_method = s`) cannot represent a prior, so it was not used. \
+                 Set `covariance = false` if this does not finish."
+            )),
+        );
     }
     let stencil = n * (n + 1) / 2;
     if explicitly_set {
@@ -1538,6 +1610,7 @@ pub(crate) fn run_covariance_step_inner(
         model.free_packed_dim(),
         options.covariance_method,
         options.covariance_method_set,
+        !model.priors.is_empty(),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -1574,6 +1647,12 @@ pub(crate) fn run_covariance_step_inner(
         }
     };
     CovStepOutcome {
+        // `routed`, not `options.covariance_method` as it arrived: the two are the
+        // same binding by construction here (`options` is rebound to
+        // `scaled_options` exactly when they differ), but naming `routed` is what
+        // makes it read as the estimator `compute_covariance` was configured with
+        // rather than the one the caller asked for (#1382).
+        method: published_covariance_method(matrix.as_ref(), routed),
         matrix,
         wall_time_secs: cov_timer.elapsed().as_secs_f64(),
         warnings,
@@ -1608,6 +1687,8 @@ pub(crate) fn run_covariance_step(
             wall_time_secs: 0.0,
             warnings: Vec::new(),
             sir_fallback_proposal: None,
+            // No step ran, so no estimator to name (#1382).
+            method: None,
         }
     }
 }
@@ -1618,8 +1699,67 @@ mod tests {
     // (they reach the moved symbols via the cross-module import added there). The
     // `run_covariance_step` gate + match is exercised end-to-end by every
     // estimator finalizer's integration/lib tests.
-    use super::{diagnostic_omega, packed_param_label, scale_routed_covariance_method};
+    use super::{
+        diagnostic_omega, packed_param_label, published_covariance_method,
+        scale_routed_covariance_method,
+    };
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
+    use nalgebra::DMatrix;
+
+    // ── #1382: the estimator label published alongside the matrix ────────────
+
+    /// **L1 — the label names the estimator that ran, not the one requested.**
+    ///
+    /// This is the composition the whole field exists for. At scale a *defaulted*
+    /// `covariance_method = r` is routed onto the cross-product (#1064), so a
+    /// label read back off `FitOptions::covariance_method` would report `r` for
+    /// SEs that came out of `S⁻¹`. The two are asserted to disagree first, so the
+    /// case cannot quietly become one where both spellings are the same answer.
+    ///
+    /// Composed here rather than driven through `run_covariance_step_inner`, for
+    /// the same reason the routing tests above are: reaching the branch needs a
+    /// fit with several hundred free parameters.
+    ///
+    /// Mutation: label from `requested` instead of `routed` → the second
+    /// assertion fires.
+    #[test]
+    fn the_published_label_names_the_routed_estimator_not_the_requested_one() {
+        let requested = CovarianceMethod::Hessian;
+        let (routed, _warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM + 1,
+            requested,
+            /* explicitly_set */ false,
+            /* has_priors */ false,
+        );
+        assert_ne!(
+            routed, requested,
+            "the premise: this input must be one where the router actually swaps the \
+             estimator, or the assertion below is satisfied by either spelling"
+        );
+
+        let matrix = DMatrix::<f64>::identity(2, 2);
+        assert_eq!(
+            published_covariance_method(Some(&matrix), routed),
+            Some(CovarianceMethod::CrossProduct),
+            "the label must describe the matrix that was produced (S⁻¹), not the \
+             estimator the caller asked for (R⁻¹)"
+        );
+    }
+
+    /// **L2 — no matrix, no estimator.** A failed, skipped or SIR-fallback step
+    /// publishes no SEs, no eigenvalues and no condition number, so there is
+    /// nothing for a name to describe; labelling one would invite a reader to
+    /// compare a figure that was never computed.
+    #[test]
+    fn a_step_that_produced_no_matrix_publishes_no_estimator() {
+        for m in [
+            CovarianceMethod::Hessian,
+            CovarianceMethod::CrossProduct,
+            CovarianceMethod::Sandwich,
+        ] {
+            assert_eq!(published_covariance_method(None, m), None, "{m:?}");
+        }
+    }
 
     // ── #1064: routing the covariance step away from `R` at scale ───────────
     //
@@ -1635,7 +1775,7 @@ mod tests {
         ] {
             for explicit in [false, true] {
                 let (routed, warning) =
-                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit);
+                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit, false);
                 assert_eq!(routed, method);
                 assert!(
                     warning.is_none(),
@@ -1648,7 +1788,8 @@ mod tests {
     #[test]
     fn a_defaulted_hessian_routes_to_the_cross_product_at_scale() {
         let n = COV_HESSIAN_MAX_DIM + 1;
-        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, false);
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, false);
         assert_eq!(routed, CovarianceMethod::CrossProduct);
         let warning = warning.expect("the substitution must be reported");
         assert!(warning.contains("score cross-product"), "{warning}");
@@ -1663,7 +1804,8 @@ mod tests {
     #[test]
     fn an_explicit_hessian_is_honoured_at_scale_but_warned_about() {
         let n = COV_HESSIAN_MAX_DIM + 1;
-        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, true);
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, true, false);
         assert_eq!(
             routed,
             CovarianceMethod::Hessian,
@@ -1673,12 +1815,65 @@ mod tests {
         assert!(warning.contains("covariance_method = r"), "{warning}");
     }
 
+    /// A priored fit at scale stays on `R` instead of being auto-routed to the
+    /// cross-product (#254).
+    ///
+    /// `S` is a sum of per-*subject* scores and a prior has no subject
+    /// decomposition, so the usual large-problem fallback would silently report
+    /// unpenalized standard errors for a penalized fit. The straddle is the
+    /// pair: identical `n` and identical `explicitly_set`, differing only in
+    /// `has_priors`, so the two arms land on *different* methods. Without both
+    /// sides this passes on an implementation that never routes at all.
+    #[test]
+    fn a_priored_fit_stays_on_the_hessian_at_scale() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+
+        let (routed, warning) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, true);
+        assert_eq!(
+            routed,
+            CovarianceMethod::Hessian,
+            "a prior must keep the covariance step on R"
+        );
+        let warning = warning.expect("staying on the slow estimator must be reported");
+        // The message has to say *why* the usual fallback was skipped, or the
+        // user reads it as the plain large-problem warning and switches to `s`
+        // by hand — which is the outcome this branch exists to prevent.
+        assert!(warning.contains("parameter priors"), "{warning}");
+        assert!(warning.contains("cannot represent a prior"), "{warning}");
+        // And the cost, as in the other two arms.
+        assert!(
+            warning.contains(&(n * (n + 1) / 2).to_string()),
+            "message must name the stencil size: {warning}"
+        );
+
+        // The straddle: same n, same `explicitly_set`, no prior — routed away.
+        let (unpriored, _) =
+            scale_routed_covariance_method(n, CovarianceMethod::Hessian, false, false);
+        assert_eq!(
+            unpriored,
+            CovarianceMethod::CrossProduct,
+            "without a prior the same inputs must still route to S"
+        );
+
+        // Below the threshold the prior changes nothing: the guard is about
+        // scale, and a small priored fit is not warned at all.
+        let (small, small_warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM,
+            CovarianceMethod::Hessian,
+            false,
+            true,
+        );
+        assert_eq!(small, CovarianceMethod::Hessian);
+        assert!(small_warning.is_none(), "{small_warning:?}");
+    }
+
     #[test]
     fn a_non_hessian_request_is_never_rerouted() {
         // `s` and `rsr` already cost one pass; the guard has nothing to say.
         for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
             let (routed, warning) =
-                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false);
+                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false, false);
             assert_eq!(routed, method);
             assert!(warning.is_none());
         }

@@ -30,7 +30,6 @@ use ferx_core::{
     fit, CancelFlag, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix,
     Population, PreparedRun, SigmaVector, Strictness, WarningCode,
 };
-use rayon::prelude::*;
 
 pub mod journal;
 pub mod manifest;
@@ -1157,15 +1156,19 @@ pub fn run_bootstrap_with_progress(
         .cloned()
         .collect();
 
-    let mut replicates = match options.threads {
-        Some(n) if n > 1 => rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .map_err(|e| format!("failed to build the bootstrap thread pool: {e}"))?
-            .install(|| todo.par_iter().filter_map(run_one).collect::<Vec<_>>()),
-        Some(_) => todo.iter().filter_map(run_one).collect(),
-        None => todo.par_iter().filter_map(run_one).collect(),
-    };
+    // Exactly `width` replicates are live at once (#1329). The previous shape —
+    // a `par_iter` over `todo` on a `width`-worker pool — bounded the *workers*
+    // and not the fits: every replicate pins `threads = 1` and enters its own
+    // inner pool, and an outer Rayon worker blocked on that nested `install`
+    // keeps stealing draws, so a 200-replicate run at width 4 held far more than
+    // four live fits and four fits' worth of peak RSS. The hand-built
+    // `ThreadPoolBuilder` also inherited Rayon's 2 MiB worker stack, which the
+    // lanes replace with `FIT_RAYON_STACK_SIZE`.
+    //
+    // Resolve the ambient Rayon width before spawning lanes so `None` preserves
+    // the caller's pool configuration, including `RAYON_NUM_THREADS`.
+    let width = replicate_lane_width(options.threads, todo.len());
+    let mut replicates = crate::lanes::run_in_lanes(width, todo.len(), |k| run_one(&todo[k]))?;
 
     // The journal's handles must be closed before `write_all` truncates the
     // same paths below, and this is where a write failure inside the parallel
@@ -1190,12 +1193,14 @@ pub fn run_bootstrap_with_progress(
             "--dofv needs the original fit's OFV as its reference; it cannot be combined with \
              --no-run-base-model",
         )?;
+        let dofv_width = replicate_lane_width(options.threads, replicates.len());
         compute_delta_ofv(
             prepared,
             template,
             base.ofv,
             &base_options,
             &mut replicates,
+            dofv_width,
             progress,
             &cancel,
         )?;
@@ -1359,12 +1364,16 @@ pub fn resummarize(
 /// [`BootstrapResult::n_estimated_parameters`] degrees of freedom; if it does
 /// not, the PsN guide's advice applies — prefer another uncertainty method such
 /// as SIR.
+// Eight after the lane width joined (#1329). Grouping them into a struct would
+// name the same values once more for one call site.
+#[allow(clippy::too_many_arguments)]
 fn compute_delta_ofv(
     prepared: &PreparedRun,
     template: &ModelParameters,
     ofv_original: f64,
     base_options: &FitOptions,
     replicates: &mut [ReplicateResult],
+    width: usize,
     progress: Option<ProgressFn<'_>>,
     cancel: &Option<CancelFlag>,
 ) -> Result<(), String> {
@@ -1374,36 +1383,57 @@ fn compute_delta_ofv(
 
     let total = replicates.len();
     let done = AtomicUsize::new(0);
-    let deltas: Vec<(usize, Option<f64>)> = replicates
-        .par_iter()
-        .map(|r| {
-            let out = if is_cancelled(cancel) || r.error.is_some() || r.estimates.is_empty() {
-                (r.index, None)
-            } else {
-                let params = params_from_estimates(template, &r.estimates);
-                let ofv = fit(&prepared.parsed.model, &prepared.population, &params, &eval)
-                    .map(|f| f.ofv)
-                    .ok();
-                (r.index, ofv.map(|o| o - ofv_original))
-            };
-            // A skipped replicate is counted too: the bar tracks the sweep, and
-            // the sweep is over every replicate whether or not it has estimates
-            // worth evaluating.
-            if let Some(sink) = progress {
-                sink(BootstrapEvent::DeltaOfvDone {
-                    completed: done.fetch_add(1, Ordering::Relaxed) + 1,
-                    total,
-                });
-            }
-            out
-        })
-        .collect();
+    // Lanes for the same reason the replicate loop uses them (#1329): each entry
+    // here is a full `fit()` on its own inner pool, so a `par_iter` admitted more
+    // concurrent evaluations than the width asked for. One `MAXEVAL=0` evaluation
+    // is cheaper than a replicate but holds the same population and solver state.
+    //
+    // `rows` is a shared reborrow, so the lane closure is `Sync` — `&&mut [T]` is
+    // not — and it ends before the `iter_mut` that writes the results back.
+    let rows: &[ReplicateResult] = replicates;
+    let deltas: Vec<(usize, Option<f64>)> = crate::lanes::run_in_lanes(width, total, |k| {
+        let r = &rows[k];
+        let out = if is_cancelled(cancel) || r.error.is_some() || r.estimates.is_empty() {
+            (r.index, None)
+        } else {
+            let params = params_from_estimates(template, &r.estimates);
+            let ofv = fit(&prepared.parsed.model, &prepared.population, &params, &eval)
+                .map(|f| f.ofv)
+                .ok();
+            (r.index, ofv.map(|o| o - ofv_original))
+        };
+        // A skipped replicate is counted too: the bar tracks the sweep, and
+        // the sweep is over every replicate whether or not it has estimates
+        // worth evaluating.
+        if let Some(sink) = progress {
+            sink(BootstrapEvent::DeltaOfvDone {
+                completed: done.fetch_add(1, Ordering::Relaxed) + 1,
+                total,
+            });
+        }
+        Some(out)
+    })?;
 
     let by_index: HashMap<usize, Option<f64>> = deltas.into_iter().collect();
     for r in replicates.iter_mut() {
         r.delta_ofv = by_index.get(&r.index).copied().flatten();
     }
     Ok(())
+}
+
+/// How many replicates are admitted at once: [`BootstrapOptions::threads`] when
+/// the caller pinned it, otherwise the ambient Rayon pool's width.
+///
+/// Resolve this on the caller before spawning lanes: the old `todo.par_iter()`
+/// used that pool, which can differ from the engine's capped fit default or
+/// from the global Rayon pool when the caller installed a custom pool.
+///
+/// `Some(0)` is one lane rather than none, matching the old `Some(_)` arm, which
+/// ran the replicates serially.
+fn replicate_lane_width(threads: Option<usize>, n_todo: usize) -> usize {
+    threads
+        .unwrap_or_else(rayon::current_num_threads)
+        .clamp(1, n_todo.max(1))
 }
 
 /// Non-fixed parameters — the chi-square degrees of freedom for the Δofv

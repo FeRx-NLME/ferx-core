@@ -21,6 +21,8 @@ use std::collections::HashMap;
 /// Caller supplies `derived_exprs`.
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "test_session".into(),
         pk_model: PkModel::OneCptIv,
@@ -61,6 +63,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: Some(Box::new(|_t, _c| vec![])),
         pk_indices: Vec::new(),

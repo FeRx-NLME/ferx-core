@@ -315,6 +315,134 @@ fn single_endpoint_sigma_order_mismatch_is_reported_as_its_own_code() {
     let _ = std::fs::remove_file(&model);
 }
 
+/// #1377. `(sd)` on a block used to be dropped in silence: the file validated
+/// clean, every entry was read as a variance, and an SD of 0.2646 fitted as a
+/// variance -- a 3.8x error in the initial estimate with nothing to notice.
+///
+/// Its own code rather than `E_PARSE` because the repair is mechanical (square
+/// each diagonal entry), and -- like #993 and #1001 -- the mapping keys off a
+/// prose substring, so without this test a reworded message silently downgrades
+/// every case to `E_PARSE`.
+#[test]
+fn block_sd_tag_is_reported_as_its_own_code() {
+    // Derived from the bundled example by appending the tag and changing nothing
+    // else, so this test is literally the issue's reproducer.
+    let base = std::fs::read_to_string("examples/warfarin_block_omega.ferx")
+        .expect("read the bundled block-omega example");
+    let untagged = "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]";
+    assert!(
+        base.contains(untagged),
+        "the example's block line moved; update this test"
+    );
+    let model = temp_model(
+        "block_sd_tag",
+        &base.replace(untagged, &format!("{untagged} (sd)")),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    // Assert the count before indexing, so a regression that reports nothing
+    // fails here rather than with an opaque index-out-of-bounds panic.
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY");
+    // The message already opens with the block, so attaching one too would print
+    // it twice -- the renderer prefixes whatever `block` it is given.
+    assert_eq!(d.block, None);
+    assert!(
+        d.message.starts_with("[parameters]") && d.message.contains("block_omega"),
+        "{}",
+        d.message
+    );
+    // The repair is the reason this shape has a code of its own, so it must be
+    // readable as a field and not only out of the prose (#1388 review).
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("square each SD into a variance and write the off-diagonals as covariances"),
+        "the `(sd)` repair must ride along in `suggestion`"
+    );
+    let _ = std::fs::remove_file(&model);
+
+    // ...and it must be the repair for the tag that was actually written. A
+    // `(variance)` author already wrote variances: squaring them would break a
+    // model that was numerically correct, so the only thing to change is the
+    // tag. Reddens if the suggestion goes back to one unconditional sentence.
+    let model = temp_model(
+        "block_variance_tag",
+        &base.replace(untagged, &format!("{untagged} (variance)")),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid);
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_BLOCK_VARIANCE_ONLY");
+    let s = d
+        .suggestion
+        .as_deref()
+        .expect("a `(variance)` tag must carry a suggestion too");
+    assert!(
+        s.contains("delete the tag") && !s.contains("square"),
+        "a `(variance)` author must not be told to square anything: {s}"
+    );
+    let _ = std::fs::remove_file(&model);
+
+    // The control the widening rests on: the untouched example is still valid.
+    let report = validate_model_file("examples/warfarin_block_omega.ferx", None);
+    assert!(
+        report.valid,
+        "the untagged example must stay valid: {:?}",
+        report.diagnostics
+    );
+}
+
+/// #1377. Trailing text on *any* `[parameters]` line is an error now; before
+/// 0.4.0 it was ignored. Only the block scale tag earns a dedicated code -- the
+/// rest stay `E_PARSE`, because there is no mechanical repair to offer for
+/// arbitrary trailing text beyond deleting it.
+#[test]
+fn trailing_text_in_parameters_is_e_parse() {
+    let base = std::fs::read_to_string("examples/warfarin_block_omega.ferx")
+        .expect("read the bundled block-omega example");
+    let clean = "omega ETA_KA ~ 0.30";
+    assert!(
+        base.contains(clean),
+        "the example's diagonal omega line moved; update this test"
+    );
+    let model = temp_model(
+        "trailing_text",
+        &base.replace(clean, &format!("{clean} banana")),
+    );
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "trailing text must not validate clean: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(
+        report.diagnostics.len(),
+        1,
+        "expected exactly one diagnostic, got: {:?}",
+        report.diagnostics
+    );
+    let d = &report.diagnostics[0];
+    assert_eq!(d.code, "E_PARSE");
+    assert!(
+        d.message.contains("unrecognized line") && d.message.contains("omega ETA_KA ~ 0.30 banana"),
+        "the message must quote the offending line so the repair is one edit: {}",
+        d.message
+    );
+    let _ = std::fs::remove_file(&model);
+}
+
 #[test]
 fn no_data_means_no_covariate_check() {
     // Same model, but without --data the covariate check does not run, so the
@@ -1072,4 +1200,624 @@ fn an_eval_only_fit_reports_the_rail_not_the_declared_zero() {
 
     let _ = std::fs::remove_file(&model_path);
     let _ = std::fs::remove_file(&fixed_path);
+}
+
+// ── #1251: a start strictly outside its own box ────────────────────────────
+
+/// `rail_model_src` with the `theta TVCL` line substituted instead of the omega.
+fn box_model_src(theta_line: &str) -> String {
+    format!(
+        "[parameters]\n\
+         \x20 {theta_line}\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.5, 0.01, 50.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n\
+         \n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV\n\
+         \x20 KA = TVKA\n\
+         \n\
+         [structural_model]\n\
+         \x20 pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         \n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// T11 (#1251). `ferx check` with **no `--data`** reports a θ whose start is
+/// outside its own declared range, and `fit()` refuses it with the identical
+/// string — the predicate is a property of the initial parameters alone, so it
+/// cannot become data-dependent without this failing.
+#[test]
+fn theta_start_outside_its_declared_range_is_reported_by_check_and_refused_by_fit() {
+    let src = box_model_src("theta TVCL(0.05, 0.1, 10.0)");
+    let model_path = temp_model("box_theta_below", &src);
+
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    assert!(!report.valid, "{:?}", report.diagnostics);
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS")
+        .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
+    assert_eq!(d.block.as_deref(), Some("parameters"));
+    assert_eq!(d.line, Some(1));
+    assert!(d.message.contains("TVCL"), "{}", d.message);
+    assert!(d.suggestion.is_some());
+    let json = serde_json::to_string(&report).expect("report serialises");
+    assert!(json.contains("E_THETA_INIT_OUTSIDE_BOUNDS"), "{json}");
+
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("a start outside its own declared range must be refused");
+    assert_eq!(d.message, err, "check and fit must agree byte for byte");
+
+    // The differential half: the same declaration with the start moved inside
+    // its range is silent, so the two assertions above cannot be passing on a
+    // blanket rejection of this model shape.
+    let ok_path = temp_model(
+        "box_theta_inside",
+        &box_model_src("theta TVCL(0.2, 0.1, 10.0)"),
+    );
+    let ok_report = validate_model_file(ok_path.to_str().unwrap(), None);
+    assert!(
+        !ok_report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
+        "{:?}",
+        ok_report.diagnostics
+    );
+
+    let _ = std::fs::remove_file(&model_path);
+    let _ = std::fs::remove_file(&ok_path);
+}
+
+/// The warning half reaches **both** channels (#1251, and the #1033 shape).
+///
+/// `first_error` discards warnings and `accumulated_warnings` is declared ~50
+/// lines after the check runs, so the check has to be evaluated once into a
+/// local and fed to both. Get that wrong and `ferx check` reports every one of
+/// these while `fit()` drops them silently — which is exactly what this asserts
+/// against, by requiring the same message from both sides.
+///
+/// Tier 2: one outer iteration, so the run returns immediately. It must be at
+/// least one — an eval-only run is exempt from the check by design.
+#[test]
+fn a_start_past_the_hidden_theta_cap_warns_from_both_check_and_fit() {
+    let src = box_model_src("theta TVCL(1e11, 0.001, 1e12)");
+    let model_path = temp_model("box_theta_cap", &src);
+
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "W_INIT_OUTSIDE_BOUNDS")
+        .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
+    // A warning, so the model still validates.
+    assert!(report.valid, "{:?}", report.diagnostics);
+
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let res = fit(&model, &pop, &model.default_params, &opts)
+        .expect("a hidden-cap start is a warning, not a refusal");
+
+    assert!(
+        res.warnings.iter().any(|w| *w == d.message),
+        "the same message must reach `FitResult.warnings`; got {:?}",
+        res.warnings
+    );
+    // …and it is typed as a *start*-side finding, not as a boundary estimate:
+    // `estimate_near_boundary` reads that category and drives bootstrap's
+    // default-on replicate filter (and `Strictness::reject_on_boundary`, and
+    // ferx-r's `check_strictness`).
+    //
+    // Asserted as "no `boundary_estimate` entry carries this token", not as
+    // `!estimate_near_boundary(&res)`: this fixture starts CL at 1e9, which is
+    // nonsense on warfarin data, so the fit legitimately ends with **TVV**
+    // pinned at its declared lower bound of 0.1 and `estimate_near_boundary`
+    // true for a reason that has nothing to do with the start-side check.
+    // (TVCL itself routes to `parameter_at_runaway_guard`, which is the
+    // pre-existing hidden-cap behaviour working as designed.) The property this
+    // test owns is the *discriminator*; `types_tests.rs` pins the classifier
+    // itself, fixture-free.
+    let entry = res
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains("W_INIT_OUTSIDE_BOUNDS"))
+        .expect("structured entry present");
+    assert_eq!(entry.category.as_str(), "init_outside_bounds");
+    assert!(
+        !res.warnings_structured
+            .iter()
+            .any(|w| w.category.as_str() == "boundary_estimate"
+                && w.message.contains("W_INIT_OUTSIDE_BOUNDS")),
+        "a clamped *start* must not be filed as a boundary estimate; entries: {:#?}",
+        res.warnings_structured
+            .iter()
+            .map(|w| (w.category.as_str(), &w.message))
+            .collect::<Vec<_>>()
+    );
+    // The cap is quoted as the number the box actually used. `ln(1e9).exp()` is
+    // `9.999999999999993e8`, which is what this message printed before
+    // `theta_internal_cap` existed.
+    assert!(
+        entry.message.contains("cap of 1e9"),
+        "the message must quote the literal cap: {}",
+        entry.message
+    );
+
+    let _ = std::fs::remove_file(&model_path);
+}
+
+/// #1309 review. An **empty** packed box reaches `fit()` as an `Err`, not as a
+/// process abort.
+///
+/// This is the assertion the unit tests cannot make. `clamp_to_bounds` calls
+/// `f64::clamp`, which panics on `min > max`, and every optimizer entry clamps
+/// the start before its first objective evaluation — so before the fix this
+/// declaration took the process down with `min > max, or either was NaN` from
+/// `core/src/num/f64.rs` rather than returning anything. `expect_err` passing
+/// *is* the proof that the diagnostic now runs first; a regression re-panics
+/// and the test binary dies rather than failing quietly.
+///
+/// Both non-typo causes are exercised, because they are reached by different
+/// arithmetic: a range wholly above ferx's `1e9` cap, and one wholly below its
+/// `1e-10` floor. The second is an ordinary declaration of a small parameter.
+#[test]
+fn a_theta_with_an_empty_packed_box_is_refused_rather_than_aborting_the_fit() {
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+
+    for (tag, theta_line, cause) in [
+        (
+            "swapped",
+            "theta TVCL(1.0, 5.0, 2.0)",
+            "declared range is empty",
+        ),
+        ("above_cap", "theta TVCL(5e9, 2e9, 1e12)", "entirely above"),
+        (
+            "below_floor",
+            "theta TVCL(1e-12, 1e-13, 1e-11)",
+            "entirely below",
+        ),
+    ] {
+        let model_path = temp_model(&format!("box_empty_{tag}"), &box_model_src(theta_line));
+
+        // `fit()` **first**, deliberately. If the report assertion came first
+        // it would fail on the missing code and return before ever calling
+        // `fit()` — so a regression would look like an ordinary assertion
+        // failure rather than like the abort this test exists to prevent.
+        // In this order the mutation that removes the check reproduces the
+        // original defect: the binary dies in `clamp_to_bounds` with
+        // `min > max, or either was NaN`.
+        let model = parse_full_model_file(&model_path).unwrap().model;
+        let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+            .expect_err("an empty box must be refused, not clamped into");
+
+        // …and at `maxiter = 0`, which is where the abort was reachable even
+        // though every other start-side check is exempt there:
+        // `evaluate_at_initial_params` clamps before it evaluates.
+        let eval_only = FitOptions {
+            outer_maxiter: 0,
+            ..FitOptions::default()
+        };
+        let err0 = fit(&model, &pop, &model.default_params, &eval_only)
+            .expect_err("the empty-box error is not exempt at maxiter = 0");
+        assert_eq!(err0, err, "{tag}: same refusal at maxiter = 0");
+
+        let report = validate_model_file(model_path.to_str().unwrap(), None);
+        assert!(!report.valid, "{tag}: {:?}", report.diagnostics);
+        let d = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "E_INIT_BOUNDS_INVERTED")
+            .unwrap_or_else(|| panic!("{tag}: code absent: {:?}", report.diagnostics));
+        assert!(d.message.contains(cause), "{tag}: {}", d.message);
+        assert_eq!(
+            d.message, err,
+            "{tag}: check and fit must agree byte for byte"
+        );
+
+        let _ = std::fs::remove_file(&model_path);
+    }
+
+    // The differential half: one number moved so the box is non-empty, and the
+    // same model fits. Without it the three arms above would pass for a check
+    // that rejected every model it saw.
+    let ok_path = temp_model(
+        "box_empty_control",
+        &box_model_src("theta TVCL(1e-12, 1e-13, 1e-9)"),
+    );
+    let ok_report = validate_model_file(ok_path.to_str().unwrap(), None);
+    assert!(
+        !ok_report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_INIT_BOUNDS_INVERTED"),
+        "an upper bound above the 1e-10 floor leaves a representable box: {:?}",
+        ok_report.diagnostics
+    );
+    let _ = std::fs::remove_file(&ok_path);
+}
+
+/// #1390, the issue's own reproduction, through the tool the user actually runs.
+///
+/// `method saem` — the `=` left out — used to leave `ferx check` printing
+/// `ok: … — no errors (0 warning(s))`, and the fit then ran the **default
+/// estimator**. That is a different algorithm, not a perturbed start: the
+/// objective the user reads is not comparable to the one they asked for, and
+/// the `-fit.yaml` records the method that actually ran, which they have no
+/// reason to re-read.
+///
+/// The control below is the load-bearing half. Without it these arms are
+/// satisfied by a check that rejects every model it sees — and the *same*
+/// control also pins what the reject arm must not do: `method = saem` still
+/// parses and still selects SAEM.
+#[test]
+fn a_fit_option_or_error_model_line_that_matches_nothing_fails_the_check() {
+    let base = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+";
+
+    // The control: `=` present, check passes, and the method asked for is the
+    // method parsed.
+    let ok = temp_model(
+        "fit_option_equals_control",
+        &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n\n[fit_options]\n  method = saem\n"),
+    );
+    let report = validate_model_file(ok.to_str().unwrap(), None);
+    assert!(report.valid, "control model: {:?}", report.diagnostics);
+    let parsed = parse_full_model_file(&ok).expect("control model parses");
+    assert_eq!(
+        format!("{:?}", parsed.fit_options.method),
+        "Saem",
+        "the control must actually select SAEM, or the arms below prove nothing"
+    );
+    let _ = std::fs::remove_file(&ok);
+
+    // The defect: one character removed.
+    let bad = temp_model(
+        "fit_option_missing_equals",
+        &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n\n[fit_options]\n  method saem\n  maxiter 42\n"),
+    );
+    let report = validate_model_file(bad.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "`method saem` must not report VALID: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("method = saem")),
+        "the diagnostic must name the repair: {:?}",
+        report.diagnostics
+    );
+    let _ = std::fs::remove_file(&bad);
+
+    // The same for `[error_model]`.
+    let bad = temp_model(
+        "error_model_stray_line",
+        &format!("{base}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  banana\n"),
+    );
+    let report = validate_model_file(bad.to_str().unwrap(), None);
+    assert!(
+        !report.valid,
+        "a stray `[error_model]` line must not report VALID: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("banana")),
+        "the diagnostic must quote the offending line: {:?}",
+        report.diagnostics
+    );
+    let _ = std::fs::remove_file(&bad);
+}
+
+// ── #1009: the CMT-less dataset, through both surfaces ───────────────────────
+
+/// A two-state `[odes]` model whose **dosed** state is declared second, so the
+/// dataset has to say `CMT=2` on its dose rows. The shape the issue was filed
+/// from: a NONMEM model whose `DEFDOSE` is not compartment 1.
+const DEPOT_SECOND_ODE: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central, depot])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// A CMT-less dataset: two subjects, one dose and two observations each.
+const NO_CMT_CSV: &str = "\
+ID,TIME,DV,EVID,AMT,MDV
+1,0,.,1,100,1
+1,1,5.0,0,.,0
+1,2,7.0,0,.,0
+2,0,.,1,100,1
+2,1,4.0,0,.,0
+2,2,6.5,0,.,0
+";
+
+#[test]
+fn cmt_less_dataset_on_a_multi_state_ode_model_is_reported() {
+    // T2a. Both surfaces, because they are wired separately: `ferx check` maps the
+    // warning prefix to a diagnostic code, `fit()` extends `FitResult.warnings`,
+    // and each has its own way to lose the finding. Asserting only one lets the
+    // other regress silently — the #811 precedent two tests up.
+    let model = temp_model("cmt_defaulted_ode", DEPOT_SECOND_ODE);
+    let data = temp_data("cmt_defaulted_ode", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    let hits: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("W_CMT_DEFAULTED"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one W_CMT_DEFAULTED from `ferx check`, got: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+    // The code, not the `W_DATA` fallback: a consumer branches on this.
+    assert_eq!(hits[0].code, "W_CMT_DEFAULTED");
+    assert!(
+        hits[0]
+            .message
+            .contains("2 dose row(s) and 4 observation row(s)"),
+        "counts are per-population totals, not per-subject (2 doses, 4 obs), got: {}",
+        hits[0].message
+    );
+
+    // The same pair through `fit()` — the agreement this test is about.
+    let parsed = parse_full_model_file(&model).expect("probe model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("probe data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "fit() must carry it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+#[test]
+fn the_remedy_the_warning_prints_actually_silences_it() {
+    // The message tells the user to "map an existing header onto it with
+    // `CMT = <header>` in the [data] block". That remedy leans on a separate
+    // subsystem (#730/#742 column mapping), and nothing pinned that it works — a
+    // message can be confidently wrong. Two properties, because silencing the
+    // warning without routing the dose would be worse than not silencing it:
+    // the warning is gone AND the dose lands in compartment 2.
+    // The compartment lives under a non-standard header, exactly the shape the
+    // remedy addresses.
+    let mapped_csv = "\
+ID,TIME,DV,EVID,AMT,COMPT,MDV
+1,0,.,1,100,2,1
+1,1,5.0,0,.,1,0
+1,2,7.0,0,.,1,0
+";
+    let mapped = temp_data("cmt_remedy_mapped", mapped_csv);
+    let model = temp_model(
+        "cmt_remedy",
+        &DEPOT_SECOND_ODE.replace(
+            "[parameters]",
+            &format!(
+                "[data]\n  path = {}\n  CMT = COMPT\n\n[parameters]",
+                mapped.display()
+            ),
+        ),
+    );
+
+    // Half 1: the warning is silenced.
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "mapping the column is the remedy the message prints; it must silence it: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Half 2: the dose actually lands in compartment 2. Silencing the warning
+    // without routing the dose would be strictly worse than not silencing it, and
+    // half 1 alone cannot tell the two apart — `prepare_run` is what applies the
+    // `[data]` map, so this reads the population the fit would.
+    let prepared = ferx_core::prepare_run(model.to_str().unwrap(), None).expect("prepare_run");
+    assert_eq!(
+        prepared.population.subjects[0].doses[0].cmt_1based(),
+        2,
+        "the mapped COMPT column must route the dose to the declared second state"
+    );
+    assert_eq!(
+        prepared.population.subjects[0].obs_cmts,
+        vec![1, 1],
+        "and the mapped column feeds the observation rows too"
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&mapped);
+}
+
+#[test]
+fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
+    // T2b, control. `one_cpt_iv` is the analytical topology with exactly **one**
+    // compartment a dose can reach (`channels: [Some(Central)]`), so a CMT-less
+    // dataset takes the only route there is and there is nothing to report.
+    //
+    // This control used to be `one_cpt_oral`, on the argument that ferx's analytic
+    // numbering equals NONMEM's ADVAN numbering so a CMT-less dataset doses what a
+    // fixed-DEFDOSE ADVAN doses. That is true and it is not the question: an oral
+    // model's `CMT=2` is the depot-bypassing central bolus (#350), anchored against
+    // ADVAN2 in `tests/nonmem_dose_compartment_anchor.rs`, where computing it as a
+    // depot dose gives 1.19324 instead of 1.8097. A dataset that meant that and lost
+    // its column gets the wrong compartment silently, so `one_cpt_oral` now belongs
+    // on the *reported* side — see the test below.
+    let model = temp_model(
+        "cmt_defaulted_analytical",
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let data = temp_data("cmt_defaulted_analytical", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "a 1-cpt IV model has exactly one compartment a dose can reach: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    let parsed = parse_full_model_file(&model).expect("control model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("control data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        "fit() must suppress it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+/// T2c. The other side of the analytical straddle, and the case the first version
+/// of this predicate got wrong: an **oral** model has two compartments a dose can
+/// reach, so a CMT-less dataset chose one of them.
+///
+/// Asserted next to the `one_cpt_iv` control above and on the *same* dataset, so
+/// the only variable is the topology. Without this pair, "analytical models are
+/// suppressed" and "analytical models are reported" are both satisfied by a
+/// predicate that ignores the topology entirely.
+///
+/// The number that makes it a finding rather than a nag is committed in
+/// `tests/nonmem_dose_compartment_anchor.rs`: NONMEM `ADVAN2` with a `CMT=2` bolus
+/// reads 1.8097 at t = 1 h, while computing that same dose as a depot dose — which
+/// is exactly what dropping the column does — reads 1.19324.
+#[test]
+fn cmt_less_dataset_on_an_analytical_oral_model_is_reported() {
+    let model = temp_model(
+        "cmt_defaulted_analytical_oral",
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let data = temp_data("cmt_defaulted_analytical_oral", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "an oral model's CMT=2 is a central bolus, so compartment 1 was a choice: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Both surfaces, because they are wired separately: `ferx check` filters through
+    // the check-report path and `fit()` through its own warning assembly.
+    let parsed = parse_full_model_file(&model).expect("model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        "fit() must report it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
 }

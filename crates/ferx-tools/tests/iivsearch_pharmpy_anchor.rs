@@ -270,7 +270,7 @@ fn bottom_up_stepwise_follows_pharmpys_trajectory() {
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn simultaneous_stepwise_agrees_on_step_one_and_diverges_on_the_mixed_omega() {
+fn simultaneous_stepwise_follows_pharmpy_on_the_mixed_omega() {
     let reference = reference();
     let variant = &reference.variants["sim"];
     let mfl = "IIV(CL,EXP);IIV?([V,KA],EXP);COVARIANCE?(IIV,@IIV)";
@@ -289,11 +289,13 @@ fn simultaneous_stepwise_agrees_on_step_one_and_diverges_on_the_mixed_omega() {
         .unwrap();
     assert_eq!(result.steps[0].best, ferx_id(&step1.model));
     assert_eq!(step1.description, "[CL,V]");
-    // Step 2: `[CL,V]+[KA]` is a mixed ω. NONMEM's fit of the declared model
-    // terminated at 655.47 with unreportable significant digits; ferx's
-    // FOCEI fits it with the cross-block covariances free (#1018) and lands
-    // lower — the divergence must be there, or #1018 is fixed and this
-    // test's premise is gone.
+    // Step 2: `[CL,V]+[KA]` is a mixed ω. Before ferx-core #1018 the outer
+    // optimizer fitted it with the cross-block covariances free — the full
+    // `[CL,V,KA]` block, 647.73 against NONMEM's 655.47 — and the search ended
+    // on it where Pharmpy ends on `[CL,V]`. With the structural zeros held,
+    // ferx fits the model as declared: 655.02 against that NONMEM run, which
+    // itself terminated with unreportable significant digits, so the anchor is
+    // "within 1 OFV unit of a non-converged reference", not equality.
     let run5 = result.row("run5").expect("run5");
     assert_eq!(run5.structure.description(), "[CL,V]+[KA]");
     assert!(run5.structure.is_partial_block());
@@ -303,25 +305,25 @@ fn simultaneous_stepwise_agrees_on_step_one_and_diverges_on_the_mixed_omega() {
         .find(|m| m.model == "iivsearch_run5")
         .unwrap();
     assert_eq!(pharmpy_run5.minimization_successful, Some(false));
+    let gap = run5.ofv.unwrap() - pharmpy_run5.ofv;
     assert!(
-        run5.ofv.unwrap() < pharmpy_run5.ofv - 1.0,
-        "ferx run5 {} vs NONMEM {}: the #1018 divergence is not there",
+        gap.abs() < 1.0,
+        "ferx run5 {} vs NONMEM {} (gap {gap:.3}): the declared model should now \
+         fit within an OFV unit of NONMEM's own non-converged run",
         run5.ofv.unwrap(),
         pharmpy_run5.ofv
     );
+    // The run no longer carries the #1018 caveat: nothing is fitted as a larger
+    // block than its description.
     assert!(
-        result.notes.iter().any(|n| n.contains("#1018")),
+        !result.notes.iter().any(|n| n.contains("#1018")),
         "{:?}",
         result.notes
     );
-    // …and the search ends on it, where Pharmpy ends on `[CL,V]`. The
-    // strictness gate does not catch it: the ω_KA that collapses is an
-    // internal-guard warning, not a declared bound. When #1018 lands, this
-    // assertion flips to `variant.final_description`.
-    assert_eq!(result.final_id, "run5");
-    assert_ne!(
+    // …and the search ends where Pharmpy ends.
+    assert_eq!(variant.final_description, "[CL,V]");
+    assert_eq!(
         result.final_structure.description(),
         variant.final_description
     );
-    assert_eq!(variant.final_description, "[CL,V]");
 }

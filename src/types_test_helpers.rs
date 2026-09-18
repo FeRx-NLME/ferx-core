@@ -13,6 +13,8 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "test".into(),
         pk_model: PkModel::OneCptOral,
@@ -53,6 +55,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         // Analytical models populate tv_fn; ODE models leave it None.
         tv_fn: if with_ode {
@@ -142,6 +145,8 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "tv_cov_iv".into(),
         pk_model: PkModel::OneCptIv,
@@ -172,6 +177,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -251,6 +257,9 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
 /// ```
 pub(crate) fn empty_fit_result() -> FitResult {
     FitResult {
+        ofv_data: 0.0,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         covariate_relations: Vec::new(),
         restored_from_checkpoint: false,
         method: EstimationMethod::FoceI,
@@ -321,6 +330,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         covariance_status: CovarianceStatus::NotRequested,
+        covariance_method: None,
         shrinkage_eta: Vec::new(),
         cond_dist: None,
         shrinkage_eps: f64::NAN,
@@ -348,6 +358,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         sigma_init: Vec::new(),
         obs_time_range: None,
         final_gradient: None,
+        final_gradient_source: None,
         optimizer: String::new(),
         n_starts: 1,
         multi_start_seed: None,
@@ -380,6 +391,9 @@ pub(crate) fn empty_fit_result() -> FitResult {
 pub(crate) fn minimal_fit_result() -> FitResult {
     let n_eta = 2;
     FitResult {
+        ofv_data: 0.0,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         residual_correlation_fixed: Vec::new(),
         se_residual_correlations: None,
         covariate_relations: Vec::new(),
@@ -450,6 +464,10 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         covariance_status: CovarianceStatus::Computed,
+        // This fixture carries a covariance matrix, so it carries the estimator
+        // that produced it — the `Some(matrix) ⟺ Some(method)` pairing #1382
+        // introduced holds for hand-built fixtures too.
+        covariance_method: Some(crate::types::CovarianceMethod::Hessian),
         shrinkage_eta: vec![0.1, 0.15],
         cond_dist: None,
         shrinkage_eps: 0.05,
@@ -495,6 +513,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         sigma_init: vec![0.05],
         obs_time_range: Some((0.25, 24.0)),
         final_gradient: None,
+        final_gradient_source: None,
         optimizer: "slsqp".to_string(),
         n_starts: 1,
         multi_start_seed: None,

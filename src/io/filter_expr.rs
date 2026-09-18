@@ -291,10 +291,20 @@ impl FilterClause {
     /// map. Used by the reader to ensure a filtered covariate column is read
     /// even when a `[covariates]` block did not declare it.
     pub fn covariate_columns(&self) -> impl Iterator<Item = &str> {
-        self.exprs
-            .iter()
-            .map(|e| e.col.as_str())
-            .filter(|c| !is_standard_column(c))
+        self.columns().filter(|c| !is_standard_column(c))
+    }
+
+    /// **Every** column this clause reads, lowercased — the standard NONMEM columns
+    /// included, unlike [`Self::covariate_columns`].
+    ///
+    /// Asked by `api::validation`'s `W_CMT_DEFAULTED` scope, which needs to know
+    /// whether a `[data_selection]` clause compares `CMT` — a standard column, and
+    /// one the filter is handed *after* the reader has defaulted it (#1409).
+    /// Reading it off the parsed sub-expressions means the `&&` split, the
+    /// case-folding and the bare-identifier `IGNORE=C` shorthand are all answered by
+    /// the parser rather than re-spelled by the caller.
+    pub(crate) fn columns(&self) -> impl Iterator<Item = &str> {
+        self.exprs.iter().map(|e| e.col.as_str())
     }
 
     /// True when any sub-expression compares a covariate column as a raw string

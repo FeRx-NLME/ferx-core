@@ -55,8 +55,8 @@ use crate::search::fitter::{RunnerFitter, StepFitter};
 use crate::search::mfl::{Feature, Mode, Modes, Operand, VariabilityEffect, VariabilityLevel};
 use crate::search::seed::seed_from;
 use crate::search::{
-    BaseModel, Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, RankType,
-    RunReport, SearchConfig,
+    BaseModel, Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, Penalties,
+    RankType, RunReport, SearchConfig,
 };
 
 mod report;
@@ -141,6 +141,8 @@ pub struct IovsearchOptions {
     /// `[rank] cutoff`: the improvement over the parent a candidate must
     /// show to replace it.
     pub cutoff: Option<f64>,
+    /// `[rank.penalties]`, read behind a `penalized` rank type (#1185).
+    pub penalties: Penalties,
 }
 
 impl Default for IovsearchOptions {
@@ -153,6 +155,7 @@ impl Default for IovsearchOptions {
             starts: crate::search::RunOptions::default().n_starts,
             rank: RankType::BicRandom,
             cutoff: None,
+            penalties: Penalties::default(),
         }
     }
 }
@@ -179,6 +182,7 @@ impl IovsearchOptions {
                 Some(other) => other,
             },
             cutoff: config.rank.cutoff,
+            penalties: config.rank.penalties(),
         };
         options.validate()?;
         Ok(options)
@@ -226,15 +230,13 @@ impl IovsearchOptions {
         if self.starts == 0 {
             return Err("[run] retries: the starts per candidate must be at least 1".into());
         }
-        self.rank.criterion()?;
+        self.penalties.validate()?;
         Ok(())
     }
 
     /// The runner criterion this ranks on.
     pub fn criterion(&self) -> Criterion {
-        self.rank
-            .criterion()
-            .expect("validated: the rank type has a criterion")
+        self.rank.criterion_with(self.penalties)
     }
 
     /// The starts a candidate whose largest κ block has `block_size` κ gets.
@@ -888,6 +890,7 @@ pub fn run_iovsearch(
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base, &options)?;
     let result = search(&fitter, space, &options, run.progress)?;

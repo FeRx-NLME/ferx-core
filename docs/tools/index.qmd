@@ -48,3 +48,11 @@ whose search space is written in Pharmpy's Model Feature Language (MFL).
 - **[Automatic model development](amd.qmd)** — Pharmpy `amd`: the searches
   above run in order from one `.ferxsearch` file, each seeded from the model
   the last one selected, reported as one object.
+
+## Global search
+
+- **[Global model search](global-search.qmd)** — pyDarwin's genetic
+  algorithm or exhaustive enumeration over one grid of structural and
+  covariate choices, ranked on pyDarwin's penalized fitness; for the model
+  spaces whose axes interact, where a stepwise search can lock in a local
+  optimum.

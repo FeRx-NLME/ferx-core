@@ -7,7 +7,7 @@
 //! is exactly the information an edit must not have to supply.
 
 use crate::pk::ode_template::{EliminationForm, InputForm};
-use crate::types::{CovariateForm, CovariateRelation, CovariateStat, FitResult};
+use crate::types::{CovariateForm, CovariateOp, CovariateRelation, CovariateStat, FitResult};
 
 /// One transformation of a [`ModelText`](super::ModelText).
 ///
@@ -673,11 +673,14 @@ impl SigmaDecl {
 /// found in the parent model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Relation {
-    /// The `[individual_parameters]` name the factor multiplies into, e.g. `CL`.
+    /// The `[individual_parameters]` name the effect acts on, e.g. `CL`.
     pub parameter: String,
     /// The `[covariates]` column, e.g. `WT`.
     pub covariate: String,
     pub form: CovariateForm,
+    /// Whether the effect is a factor (`*`, the default) or an added term
+    /// (`+`). Rendered as the trailing operator token on the line.
+    pub op: CovariateOp,
     /// `center = …` / `breakpoint = …` / `ref = …`. `None` writes no keyword
     /// and takes the block's default (the covariate's median, or its mode for
     /// `categorical`); `none` and `expr(...)` take no constant at all.
@@ -704,6 +707,7 @@ impl From<&CovariateRelation> for Relation {
             parameter: r.parameter.clone(),
             covariate: r.covariate.clone(),
             form: r.form.clone(),
+            op: r.op,
             center: r.center,
             fix: r.fix,
             thetas: r
@@ -721,7 +725,11 @@ impl From<&CovariateRelation> for Relation {
 }
 
 impl Relation {
-    /// `PARAM ~ COV form(kwargs) [=> THETA(init, lower, upper), …]`.
+    /// `PARAM ~ COV form(kwargs) [+] [=> THETA(init, lower, upper), …]`.
+    ///
+    /// The operator is written only when it is `+`: `*` is the default, and
+    /// emitting it on every line would rewrite every existing
+    /// `[covariate_model]` an edit passes through.
     pub(crate) fn render(&self) -> String {
         let mut line = format!(
             "{} ~ {} {}",
@@ -729,6 +737,9 @@ impl Relation {
             self.covariate,
             self.form_src()
         );
+        if self.op == CovariateOp::Add {
+            line.push_str(" +");
+        }
         if !self.thetas.is_empty() {
             let clause: Vec<String> = self
                 .thetas
@@ -759,7 +770,7 @@ impl Relation {
         }
         let keyword = match self.form {
             CovariateForm::Hockey => "breakpoint",
-            CovariateForm::Categorical => "ref",
+            CovariateForm::Categorical | CovariateForm::Categorical2 => "ref",
             _ => "center",
         };
         let mut args: Vec<String> = Vec::new();

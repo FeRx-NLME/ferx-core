@@ -85,6 +85,21 @@ struct FitWire {
     method_chain: Vec<String>,
     converged: bool,
     ofv: f64,
+    /// Parameter-prior split (#254). `Option` so an artifact written before the
+    /// split still loads: `None` means "this file predates priors", and the
+    /// loader reconstructs `ofv_data = ofv`, which is right for every such file
+    /// because no prior could have been applied when it was written.
+    ///
+    /// A *priored* fit must write these. Storing only `ofv` — the penalized
+    /// total — and reconstructing `ofv_data` from it on load would relabel the
+    /// penalized objective as the data likelihood, drop every prior row, and
+    /// break the `aic == ofv_data + 2k` invariant that `aic` was computed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ofv_data: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ofv_prior: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prior_summary: Vec<crate::types::PriorSummary>,
     aic: f64,
     bic: f64,
     n_obs: usize,
@@ -106,6 +121,12 @@ struct FitWire {
     gradient_method_outer: String,
     nlopt_missing_algorithms: Vec<String>,
     covariance_status: String,
+    /// `r` / `s` / `rsr` — which estimator produced `covariance_matrix` (#1382).
+    /// Absent on bundles written before the field existed; those load as `None`,
+    /// which is the honest answer (the bundle does not record it) and is what an
+    /// unlabelled condition number meant all along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    covariance_method: Option<String>,
     covariance_n_evals_estimated: Option<usize>,
     trace_path: Option<String>,
     ebe_convergence_warnings: u32,
@@ -178,6 +199,8 @@ struct FitWire {
     obs_time_range: Option<(f64, f64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_gradient_source: Option<String>,
     // ── Run settings ─────────────────────────────────────────────────────────
     #[serde(default)]
     optimizer: String,
@@ -572,6 +595,11 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             .collect(),
         converged: r.converged,
         ofv: r.ofv,
+        // Written only for a priored fit, so an unpriored artifact stays
+        // byte-identical to a pre-#254 one.
+        ofv_data: (!r.prior_summary.is_empty()).then_some(r.ofv_data),
+        ofv_prior: (!r.prior_summary.is_empty()).then_some(r.ofv_prior),
+        prior_summary: r.prior_summary.clone(),
         aic: r.aic,
         bic: r.bic,
         n_obs: r.n_obs,
@@ -589,6 +617,10 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         gradient_method_outer: r.gradient_method_outer.clone(),
         nlopt_missing_algorithms: r.nlopt_missing_algorithms.clone(),
         covariance_status: covariance_status_to_str(&r.covariance_status).into(),
+        // `CovarianceMethod::label` rather than a second `str_enum_map!` table:
+        // the bundle stores the same `r`/`s`/`rsr` token the model file writes and
+        // the YAML reports, so there is one spelling to keep in step (#1382).
+        covariance_method: r.covariance_method.map(|m| m.label().to_string()),
         covariance_n_evals_estimated: r.covariance_n_evals_estimated,
         trace_path: r.trace_path.clone(),
         ebe_convergence_warnings: r.ebe_convergence_warnings,
@@ -691,6 +723,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
+        final_gradient_source: r.final_gradient_source.clone(),
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
@@ -1875,6 +1908,14 @@ fn wire_to_fit_result(
         covariance_wall_time_secs: w.covariance_wall_time_secs,
         converged: w.converged,
         ofv: w.ofv,
+        // #254. An artifact written before the split carries no `ofv_data`, and
+        // for those `ofv` *is* the data likelihood — no prior could have been
+        // applied. A priored artifact carries both halves and they are restored
+        // as written, so `ofv == ofv_data + ofv_prior` and `aic == ofv_data + 2k`
+        // survive the round trip.
+        ofv_data: w.ofv_data.unwrap_or(w.ofv),
+        ofv_prior: w.ofv_prior.unwrap_or(0.0),
+        prior_summary: std::mem::take(&mut w.prior_summary),
         aic: w.aic,
         bic: w.bic,
         theta: w.theta.estimates,
@@ -1945,6 +1986,17 @@ fn wire_to_fit_result(
         max_unconverged_subjects: w.max_unconverged_subjects,
         total_ebe_fallbacks: w.total_ebe_fallbacks,
         covariance_status: covariance_status_from_str(&w.covariance_status)?,
+        // Absent key → `None` (a pre-#1382 bundle simply did not record it);
+        // present-but-unrecognised → `Corrupt`, the same verdict every other
+        // enum on this wire gets, rather than silently degrading to `None`.
+        covariance_method: w
+            .covariance_method
+            .as_deref()
+            .map(|s| {
+                crate::types::CovarianceMethod::from_label(s)
+                    .ok_or_else(|| FitrxError::Corrupt(format!("unknown covariance_method {s:?}")))
+            })
+            .transpose()?,
         shrinkage_eta: w.omega.shrinkage,
         // Populated by `load_fit` from conddist.csv when present (#675);
         // fit.json/FitWire carries no cond_dist field of its own.
@@ -1975,6 +2027,7 @@ fn wire_to_fit_result(
         sigma_init: w.sigma_init,
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
+        final_gradient_source: w.final_gradient_source,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
@@ -2697,6 +2750,53 @@ mod tests {
         );
     }
 
+    /// `final_gradient_source` has to survive the checkpoint alongside the vector
+    /// it labels (#997 §1). A bundle that kept the gradient and dropped the label
+    /// is worse than one that kept neither: the reader then has a plausible vector
+    /// and no way to tell an optimizer's own stationarity claim from an
+    /// after-the-fact finite-difference check on a run that had none.
+    ///
+    /// Pinned with `"finite_difference"` rather than `"optimizer"` — the label a
+    /// `Default`-ing or hard-coded mutation would not produce by accident.
+    #[test]
+    fn final_gradient_and_its_source_round_trip_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grad.fitrx");
+        let mut r = minimal_fit_result();
+        r.final_gradient = Some(vec![0.25, -1.5, 3.0]);
+        r.final_gradient_source = Some("finite_difference".to_string());
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let l = load_fit(&path).unwrap().fit;
+        assert_eq!(l.final_gradient, Some(vec![0.25, -1.5, 3.0]));
+        assert_eq!(
+            l.final_gradient_source.as_deref(),
+            Some("finite_difference")
+        );
+    }
+
+    /// A bundle written before #997 carries no `final_gradient_source` key at all.
+    /// It must load as `None` rather than default to a label it cannot support —
+    /// an old BOBYQA bundle has no gradient, and an old L-BFGS one has a gradient
+    /// whose provenance the file never recorded.
+    #[test]
+    fn fit_wire_missing_final_gradient_source_defaults_to_none() {
+        let mut r = minimal_fit_result();
+        r.final_gradient = Some(vec![1.0, 2.0]);
+        r.final_gradient_source = Some("optimizer".to_string());
+        let wire = build_fit_wire(&r);
+        let mut value = serde_json::to_value(&wire).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        assert!(
+            obj.remove("final_gradient_source").is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert_eq!(reloaded.final_gradient_source, None);
+        assert_eq!(reloaded.final_gradient, Some(vec![1.0, 2.0]));
+    }
+
     /// A bundle saved before #1177 has neither key: the tally defaults to all
     /// zero, for which `bic()` reports NaN rather than a wrong penalty, and the
     /// stall predicate falls back to comparing against the initial estimates.
@@ -3287,6 +3387,156 @@ mod tests {
         assert!(
             omega_init.iter().any(|&v| v != 0.0),
             "omega_init must not be all zeros"
+        );
+    }
+
+    /// #1382: a bundle that stores a covariance matrix must also store which
+    /// estimator built it, as the same `r` / `s` / `rsr` token `[fit_options]`
+    /// accepts — a runlog reader can then paste the value straight back.
+    ///
+    /// `rsr`, not the default: a round trip through `Hessian` is also a round
+    /// trip through `CovarianceMethod::default()`, so a loader that dropped the
+    /// field and fell back to the default would pass.
+    ///
+    /// Mutation: drop `covariance_method` from `FitWire`, or write
+    /// `format!("{m:?}")` instead of `m.label()` → this fires (as `None` and as a
+    /// `Corrupt` load error respectively).
+    #[test]
+    fn covariance_method_roundtrips_as_the_fit_option_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cov-method.fitrx");
+        let mut r = minimal_fit_result();
+        r.covariance_method = Some(CovarianceMethod::Sandwich);
+        assert_ne!(
+            Some(CovarianceMethod::default()),
+            r.covariance_method,
+            "premise: this must not be the default, or a dropped field round-trips \
+             by accident"
+        );
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        // The stored token is the model-file spelling, not a Rust variant name.
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let wire: serde_json::Value = {
+            use std::io::Read as _;
+            let mut f = archive.by_name("fit.json").unwrap();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        };
+        assert_eq!(wire["covariance_method"], serde_json::json!("rsr"));
+
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(
+            loaded.fit.covariance_method,
+            Some(CovarianceMethod::Sandwich)
+        );
+    }
+
+    /// #1382: a bundle written before the field existed loads as `None`, never as
+    /// a guessed estimator.
+    ///
+    /// "This file does not record it" is the honest answer, and it is exactly what
+    /// an unlabelled condition number meant all along. Defaulting to `Hessian`
+    /// would fabricate a provenance, and would be wrong for every pre-existing
+    /// bundle written under `covariance_method = s` or `rsr` — the runs whose
+    /// numbers most need the label.
+    #[test]
+    fn a_bundle_predating_covariance_method_loads_without_an_estimator() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-cov-method.fitrx");
+        let mut r = minimal_fit_result();
+        r.covariance_method = Some(CovarianceMethod::CrossProduct);
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut removed = false;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                removed = v
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("covariance_method")
+                    .is_some();
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        assert!(
+            removed,
+            "premise: the key must have been present to be stripped — otherwise this \
+             test passes on a bundle that never carried it"
+        );
+        let patched = dir.path().join("no-cov-method-patched.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let loaded = load_fit(&patched).unwrap();
+        assert_eq!(
+            loaded.fit.covariance_method, None,
+            "an absent key must load as `None`, not as a default estimator"
+        );
+    }
+
+    /// #1382: an unrecognised token is `Corrupt`, the same verdict every other
+    /// enum on this wire gets — not a silent degrade to `None`, which would turn
+    /// a damaged bundle into one that merely looks unlabelled.
+    #[test]
+    fn an_unknown_covariance_method_token_is_corrupt() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-cov-method.fitrx");
+        let mut r = minimal_fit_result();
+        r.covariance_method = Some(CovarianceMethod::Hessian);
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                v.as_object_mut().unwrap().insert(
+                    "covariance_method".into(),
+                    serde_json::json!("Hessian"), // the Rust variant name, not the token
+                );
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        let patched = dir.path().join("bad-cov-method-patched.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let err = load_fit(&patched).expect_err("an unknown token must not load");
+        assert!(
+            format!("{err:?}").contains("covariance_method"),
+            "the error must name the offending field: {err:?}"
         );
     }
 

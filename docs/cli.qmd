@@ -17,6 +17,7 @@ ferx summary <run.fitrx> [<run2.fitrx> ...]
 ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
 ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume] [--reuse-from DIR]
 ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
@@ -151,6 +152,33 @@ closed form and are generated as
 [`[odes]` candidates](tools/modelsearch.qmd#the-odes-candidates), which cost
 an order of magnitude more per fit and are scheduled and multi-started
 accordingly.
+
+### Global Model Search (`globalsearch`)
+
+```bash
+ferx globalsearch warfarin.ferxsearch --directory warfarin-globalsearch --threads 8
+```
+
+pyDarwin in ferx: a genetic algorithm (or, with `algorithm = "exhaustive"`,
+every point) over **one grid** whose axes are the structural categories and
+the `COVARIATE?` pairs of a [`.ferxsearch` file](tools/search.qmd), ranked on
+pyDarwin's **penalized fitness** (`[rank] type = "penalized"`: OFV + 10 per
+estimated parameter + 100 per failure, `[rank.penalties]` overlaying any
+charge). A `[globalsearch]` section picks the algorithm and, under
+`[globalsearch.ga]`, the population size, generations, seed and the
+crossover / mutation / niche knobs. Every batch is fitted in parallel through
+the shared runner and judged by the strictness gate; a gene that changes
+nothing, a point no template can build, and a fit the gate refused are
+charged on top so the search is steered without selecting them. Prints a
+model table with every candidate's genome, criterion, fitness, rank,
+convergence status and fit time, and the GA's per-generation trajectory;
+writes `models.csv`, `generations.csv`, `final.ferx`, `final-fit.yaml` and
+every candidate under `models/` into the directory, plus one journalled
+runner directory per batch, so `--resume` on the seeded GA refits nothing.
+`--reuse-from DIR` re-scores fits another search (a modelsearch or covsearch
+run) already made rather than repeating them. See
+[Global model search](tools/global-search.qmd), including when a global
+search beats the stepwise tools and when it does not.
 
 ### Residual-Error Search (`ruvsearch`)
 
@@ -387,6 +415,42 @@ Elapsed: 0.496s
 argument right after `check`/`summary` (`ferx check --help`, `ferx summary
 --help`); it prints usage to stdout and exits `0` (usage-error paths print the
 same text to stderr and exit `1`/`2`).
+
+## Tool name or model file?
+
+The first argument is either a tool (`covsearch`, `bootstrap`, …) or the model
+to fit, decided in this order:
+
+1. a tool name (`check`, `summary`, `bootstrap`, `gam`, `covsearch`,
+   `allometry`, `modelsearch`, `ruvsearch`, `iivsearch`, `iovsearch`, `amd`,
+   `globalsearch`) runs that tool — these names are reserved, so a *file*
+   called `check` in the working directory is not reachable as a model under
+   that name (give it a path: `ferx ./check`);
+2. an argument starting with `-` is a flag, not a model;
+3. otherwise a file that is there is the model, whatever it is called — an
+   extension-less model file works;
+4. otherwise a bare word is read as a tool name, and anything carrying a `.`
+   or a path separator as a file path.
+
+That last split decides which error you get when the argument resolves to
+nothing:
+
+```bash
+$ ferx covsearch run1.ferxsearch      # on a build without covsearch
+Error: tool `covsearch` not recognized.
+Available tools: check, summary, bootstrap, gam, ...
+To fit a model, give its file path: ferx run1.ferx --data data.csv
+
+$ ferx run1.ferx --data data.csv      # run1.ferx is not in this directory
+Error: the model `run1.ferx` was not found at this location. Please check folder and file names.
+```
+
+A tool name within two edits of a real one also gets a `Did you mean ...?`
+line. Both cases exit `1`.
+
+A path the filesystem cannot answer for — an unreadable parent directory, a
+symlink loop — is not reported as missing: it goes to the fit path, which
+opens it and reports the OS error.
 
 ## Examples
 

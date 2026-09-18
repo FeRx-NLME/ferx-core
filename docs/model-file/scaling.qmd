@@ -414,6 +414,12 @@ expression the DSL parses — `[scaling]`, `[individual_parameters]`, `[odes]`,
 `if (a >= b) a else b`), so they differentiate and compile exactly like the
 hand-written form.
 
+The set of callable names is closed, and the same in every one of those blocks —
+see [Supported Operators and
+Functions](individual-parameters.qmd#supported-operators-and-functions). Anything
+outside it is a parse error rather than the silent identity it used to be
+([#1332](https://github.com/FeRx-NLME/ferx-core/issues/1332)).
+
 The desugaring puts **both** arguments in the guard *and* in a branch, so each one
 appears twice in the compiled tree, and the duplication multiplies through nesting:
 `min(max(x, 0.01), 0.99)` contains four copies of `x`, and reading that clamp from

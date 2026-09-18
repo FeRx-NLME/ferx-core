@@ -733,9 +733,18 @@ pub(crate) fn ode_cumhaz_hazard(
     // state (dose forcings touch PK compartments, not CHZ). One buffer, reused — only the
     // `chz_state` slot is read, and the RHS always writes it.
     let mut du = vec![0.0; ode.n_states];
+    let dose_lagtimes = crate::ode::predictions::dose_lagtimes_for(subject, ode, &pk.values);
+    let first_dose_time = crate::ode::predictions::earliest_dose_time(&subject.doses);
     for (i, &t) in times.iter().enumerate() {
         cum[i] = states[i][chz_state];
-        (ode.rhs)(&states[i], &pk.values, t, &mut du);
+        let rhs_params = crate::ode::predictions::rhs_ext_params_at(
+            &subject.doses,
+            &dose_lagtimes,
+            first_dose_time,
+            &pk.values,
+            t,
+        );
+        (ode.rhs)(&states[i], &rhs_params, t, &mut du);
         haz[i] = du[chz_state];
     }
     (cum, haz)

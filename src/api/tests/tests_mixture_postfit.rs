@@ -64,6 +64,8 @@ fn subject_results_use_the_fitted_mixture_class() {
     let h_matrices = vec![DMatrix::zeros(TIMES.len(), 1)];
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
 
+    // `false`: a closed-form mixture model integrates nothing, so there are no
+    // solver statistics to collect and the second half of the pair is empty.
     let run = |mixest: Option<&[usize]>| {
         compute_subject_results(
             &model,
@@ -74,7 +76,9 @@ fn subject_results_use_the_fitted_mixture_class() {
             &kappas,
             true,
             mixest,
+            false,
         )
+        .0
     };
 
     // No mixture posteriors (non-mixture caller): the class-1 default stands.
@@ -126,7 +130,7 @@ fn derived_columns_use_the_fitted_mixture_class() {
     let h_matrices = vec![DMatrix::zeros(TIMES.len(), 1)];
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
 
-    let mut subjects = compute_subject_results(
+    let (mut subjects, _no_ode_stats) = compute_subject_results(
         &model,
         &population,
         params,
@@ -135,6 +139,7 @@ fn derived_columns_use_the_fitted_mixture_class() {
         &kappas,
         true,
         Some(&[1]),
+        false,
     );
     compute_extra_output_columns(
         &model,

@@ -307,6 +307,174 @@ fn fit_with_missing_files_errors() {
     );
 }
 
+// ── the first argument: tool name vs model path (#1396) ──────────────────────
+
+/// A bare word that is not a tool this build has: the CLI used to read it as a
+/// model path and report `Failed to read model file: No such file or directory`,
+/// which says nothing about the real mistake.
+#[test]
+fn an_unknown_tool_name_is_named_as_a_tool_not_as_a_missing_file() {
+    let out = ferx()
+        .args(["covsearchx", "covsearch.ferxsearch"])
+        .output()
+        .expect("run ferx with an unknown tool name");
+    assert_eq!(out.status.code(), Some(1), "unknown tool → exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tool `covsearchx` not recognized"),
+        "expected the unknown-tool error: {stderr}"
+    );
+    // The regression this exists to catch: the old model-file reading.
+    assert!(
+        !stderr.contains("Failed to read model file"),
+        "a tool name must not be reported as a model file: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `covsearch`?"),
+        "expected a suggestion for a one-edit typo: {stderr}"
+    );
+    assert!(
+        stderr.contains("Available tools:"),
+        "expected the tool list: {stderr}"
+    );
+}
+
+/// The other half of #1396: an argument that *is* a path gets a readable
+/// not-found message instead of the raw io error.
+#[test]
+fn a_missing_model_file_is_reported_by_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["run1.ferx", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on a missing model");
+    assert_eq!(out.status.code(), Some(1), "missing model → exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the model `run1.ferx` was not found at this location"),
+        "expected the not-found message: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not recognized"),
+        "a path must not be reported as a tool: {stderr}"
+    );
+}
+
+/// An extension-less file that exists is still a model: it must reach the fit
+/// path, not the unknown-tool arm. Pins the `exists` half of the rule — without
+/// it, classification could key on the extension alone and pass every other
+/// test here.
+#[test]
+fn an_extensionless_model_file_that_exists_is_fitted_not_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = tmp.path().join("mymodel");
+    std::fs::write(&model, "not a valid model\n").expect("write model");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["mymodel", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on an extension-less model");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // It fails — the contents are not a model — but as a *parse* failure from
+    // the fit path, not as an unrecognized tool.
+    assert!(
+        !stderr.contains("not recognized") && !stderr.contains("was not found at this location"),
+        "an existing file must reach the fit path: {stderr}"
+    );
+}
+
+/// The documented precedence: a tool name is reserved, so a *file* of that
+/// name in the working directory does not shadow the tool. Pins the
+/// qualification in `docs/cli.qmd` — `ferx check` runs the checker even with a
+/// file called `check` next to it, and the file needs a path to be fitted.
+#[test]
+fn a_file_named_like_a_tool_does_not_shadow_the_tool() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("check"), "not a valid model\n").expect("write file");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg("check")
+        .output()
+        .expect("run ferx check with a file of that name present");
+    // `check` with no model is the checker's own usage error (2), not a fit of
+    // the file and not an unknown-tool error.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected the checker's usage error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A path the filesystem cannot answer for is not a missing model: the OS
+/// error has to survive. Pins the `try_exists` call site — `Path::exists`
+/// folds `ELOOP` into `false` and would answer "was not found", hiding the
+/// real problem. A symlink loop is the portable way to force the probe to
+/// fail: unlike an unreadable directory, it errors for root too.
+#[cfg(unix)]
+#[test]
+fn a_probe_error_keeps_the_os_error_instead_of_claiming_not_found() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::os::unix::fs::symlink("loop_b.ferx", tmp.path().join("loop_a.ferx")).expect("link a");
+    std::os::unix::fs::symlink("loop_a.ferx", tmp.path().join("loop_b.ferx")).expect("link b");
+    // Precondition: the probe really does fail here, so a green assertion
+    // below cannot come from a plain missing file.
+    assert!(
+        tmp.path().join("loop_a.ferx").try_exists().is_err(),
+        "the symlink loop should make the existence probe fail"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .args(["loop_a.ferx", "--data", "nope.csv"])
+        .output()
+        .expect("run ferx on a symlink loop");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("was not found at this location"),
+        "a probe error is not an absent file: {stderr}"
+    );
+    assert!(
+        stderr.contains("Too many levels of symbolic links") || stderr.contains("os error"),
+        "expected the underlying OS error: {stderr}"
+    );
+}
+
+/// `main` looks the word up in the subcommand table before classifying it, so
+/// no shipped tool can be reported as unrecognized. Every name is a bare word,
+/// so this ordering is the only thing keeping them out of that arm.
+#[test]
+fn every_listed_tool_still_dispatches() {
+    // The list printed by the unknown-tool error — the same table `main`
+    // dispatches from, read back out of the binary so the two cannot drift.
+    let out = ferx()
+        .arg("definitely-not-a-tool-name")
+        .output()
+        .expect("run ferx with an unknown tool");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let listed = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("Available tools: "))
+        .expect("the error lists the available tools")
+        .trim_end_matches('.')
+        .split(", ")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(listed.len() >= 12, "expected every tool listed: {listed:?}");
+    for tool in listed {
+        let out = ferx()
+            .args([&tool, "--help"])
+            .output()
+            .unwrap_or_else(|e| panic!("run ferx {tool} --help: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("not recognized"),
+            "`{tool}` is advertised but not dispatched: {stderr}"
+        );
+    }
+}
+
 // ── ferx bootstrap (#1140) ───────────────────────────────────────────────────
 
 #[test]
@@ -810,4 +978,210 @@ fn modelsearch_runs_a_search_and_writes_its_files() {
     assert!(run.join("candidates/candidates.csv").exists());
     let models = std::fs::read_to_string(run.join("models.csv")).unwrap();
     assert_eq!(models.lines().count(), 5, "{models}");
+}
+
+// ── ferx globalsearch (#1185) ───────────────────────────────────────────────
+
+#[test]
+fn globalsearch_help_usage_and_a_file_meant_for_another_tool() {
+    let out = ferx()
+        .args(["globalsearch", "--help"])
+        .output()
+        .expect("run ferx globalsearch --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for word in [
+        "genetic algorithm",
+        "exhaustive",
+        "penalized",
+        "population_size",
+        "generations",
+        "max_models",
+        "--directory",
+        "--resume",
+    ] {
+        assert!(stdout.contains(word), "help does not mention {word}");
+    }
+    let out = ferx().args(["globalsearch"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx globalsearch"));
+
+    // A variability file is refused by name, before the dataset is read.
+    let out = ferx()
+        .args(["globalsearch", "examples/warfarin_iivsearch.ferxsearch"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not an axis globalsearch lays out"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Data:"), "{stderr}");
+}
+
+/// A whole global search from the command line, on evaluations
+/// (`maxiter = 0`) so it is seconds: the input, an eight-point grid over a
+/// structural and a covariate axis, and the files a user reads afterwards.
+#[test]
+fn globalsearch_runs_an_exhaustive_search_and_writes_its_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("wt.ferx"), ONE_CPT_WT).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let config = format!(
+        "base = \"wt.ferx\"\ndata = \"{}\"\n[space]\n\
+         mfl = \"PERIPHERALS(0..1); LAGTIME([OFF,ON]); COVARIATE?(CL, WT, pow)\"\n\
+         [globalsearch]\nalgorithm = \"exhaustive\"\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
+
+    let out = ferx()
+        .args([
+            "globalsearch",
+            &dir.path().join("wt.ferxsearch").to_string_lossy(),
+        ])
+        .output()
+        .expect("run ferx globalsearch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        stderr.contains("Grid:       8 points over 3 axes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Algorithm:  exhaustive, ranked on penalized"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("candidates: fitting 8 new models of 8 proposed"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("CL-WT: none | power"), "{stdout}");
+    assert!(stdout.contains("SELECTED"), "{stdout}");
+    assert!(stdout.contains("Final model:"), "{stdout}");
+
+    let run = dir.path().join("wt-globalsearch");
+    assert!(run.join("models.csv").exists(), "{stderr}");
+    assert!(run.join("generations.csv").exists());
+    assert!(run.join("final.ferx").exists());
+    assert!(run.join("final-fit.yaml").exists());
+    assert!(run.join("input/candidates.csv").exists());
+    assert!(run.join("candidates/candidates.csv").exists());
+    let models = std::fs::read_to_string(run.join("models.csv")).unwrap();
+    assert_eq!(models.lines().count(), 1 + 1 + 8, "{models}");
+}
+
+// ── --threads beats [fit_options] threads, through the real binary (#1416) ───
+
+/// `examples/one_cpt_iv.ferx` with `threads = FILE_THREADS` added to its
+/// `[fit_options]` and the iteration count cut to keep the run fast.
+const FILE_THREADS: usize = 2;
+
+fn model_pinned_to_two_threads(dir: &std::path::Path) -> PathBuf {
+    let src = std::fs::read_to_string(repo_root().join("examples/one_cpt_iv.ferx"))
+        .expect("read one_cpt_iv.ferx");
+    let text = src.replace(
+        "[fit_options]\n  method  = focei\n  maxiter = 300",
+        &format!(
+            "[fit_options]\n  method  = focei\n  maxiter = 1\n  covariance = false\n  \
+             checkpoint = false\n  threads = {FILE_THREADS}"
+        ),
+    );
+    assert!(
+        text.contains(&format!("threads = {FILE_THREADS}")),
+        "the [fit_options] block moved — this fixture no longer pins a thread count"
+    );
+    let path = dir.join("pinned.ferx");
+    std::fs::write(&path, text).expect("write model");
+    path
+}
+
+/// Run the binary on that model with the given extra args, returning
+/// (stderr, the fit YAML).
+fn run_pinned(extra: &[&str]) -> (String, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = model_pinned_to_two_threads(tmp.path());
+    let data = repo_root().join("data/one_cpt_iv.csv");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg(&model)
+        .arg("--data")
+        .arg(&data)
+        .args(extra)
+        .output()
+        .expect("run ferx fit");
+    assert!(
+        out.status.success(),
+        "fit should succeed; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let yaml = std::fs::read_to_string(tmp.path().join("pinned-fit.yaml")).expect("fit yaml");
+    (stderr, yaml)
+}
+
+/// The defect in #1416, through the CLI rather than the library: the flag is
+/// parsed, reaches `RunOverrides`, reaches the entry point, and reaches the
+/// pool the fit runs on. The parser tests in `main.rs` stop at the parse and the
+/// library tests start after it, so without this one an edit that dropped
+/// `threads` on the way into `RunOverrides` — or routed the fit back through the
+/// override-less entry point — would leave every other test green.
+#[test]
+fn an_explicit_threads_flag_beats_the_model_files_thread_count() {
+    // Control: the model file's count is honoured when the flag is absent. This
+    // is the arm that passed under the old behaviour, and it is what makes the
+    // override arm below mean something.
+    let (stderr, yaml) = run_pinned(&[]);
+    assert!(
+        stderr.contains(&format!("on {FILE_THREADS} threads")),
+        "the model file's thread count must still be honoured with no flag: {stderr}"
+    );
+    assert!(
+        yaml.contains(&format!("n_threads_used: {FILE_THREADS}")),
+        "{yaml}"
+    );
+    assert!(
+        !stderr.contains("thread count overridden"),
+        "no flag, no override warning: {stderr}"
+    );
+
+    // The bug as reported.
+    let (stderr, yaml) = run_pinned(&["--threads", "1"]);
+    assert!(
+        stderr.contains("on 1 thread"),
+        "`--threads 1` must reach the pool the fit runs on: {stderr}"
+    );
+    assert!(yaml.contains("n_threads_used: 1"), "{yaml}");
+    assert!(
+        stderr.contains(&format!(
+            "thread count overridden: using 1 instead of the model's \
+             `[fit_options] threads = {FILE_THREADS}`"
+        )),
+        "the override must announce itself on the console: {stderr}"
+    );
+}
+
+/// `--threads 0` / `auto` is the *other* half of the merge rule and the one a
+/// well-meaning simplification breaks: it names the engine's own worker count,
+/// so it must override a pinned `threads = 2` rather than read as an absent
+/// flag. Asserted on the warning rather than on `n_threads_used`, because the
+/// engine default is a property of the host's core count and could coincide with
+/// the file's 2 on a small machine — the warning fires iff the override landed.
+#[test]
+fn an_explicitly_requested_default_also_beats_the_model_files_thread_count() {
+    for spelling in ["0", "auto"] {
+        let (stderr, _) = run_pinned(&["--threads", spelling]);
+        assert!(
+            stderr.contains(&format!(
+                "thread count overridden: using the default worker count instead of \
+                 the model's `[fit_options] threads = {FILE_THREADS}`"
+            )),
+            "`--threads {spelling}` must override the file's pinned count: {stderr}"
+        );
+    }
 }

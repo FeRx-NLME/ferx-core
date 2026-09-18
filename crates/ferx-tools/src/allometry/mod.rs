@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use ferx_core::edit::{ModelEdit, ModelText, Relation, RelationTheta};
-use ferx_core::{CancelFlag, CovariateForm, CovariateStat};
+use ferx_core::{CancelFlag, CovariateForm, CovariateOp, CovariateStat};
 use serde::Deserialize;
 
 use crate::search::{
@@ -181,6 +181,8 @@ impl Scaling {
             parameter: self.parameter.clone(),
             covariate: options.covariate.clone(),
             form: CovariateForm::Power,
+            // Allometric scaling is multiplicative by definition.
+            op: CovariateOp::Multiply,
             center: Some(CovariateStat::Literal(options.reference)),
             fix: self.fixed.then_some(self.exponent),
             thetas: match &self.theta {

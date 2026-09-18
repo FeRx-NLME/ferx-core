@@ -386,9 +386,10 @@ fn write_line(out: &mut File, record: &CandidateRecord) -> Result<(), String> {
 /// same candidate fitted to different data is a different fit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchManifest {
-    /// [`Criterion::label`](super::Criterion::label) — stable across a refactor
-    /// of the enum, and readable when a user opens the file to see why their
-    /// resume was refused.
+    /// [`Criterion::manifest_key`](super::Criterion::manifest_key) — the
+    /// label (stable across a refactor of the enum, and readable when a user
+    /// opens the file to see why their resume was refused), with the whole
+    /// schedule appended for a penalized criterion.
     pub criterion: String,
     /// The **run-wide** start count ([`RunOptions::n_starts`]). A candidate
     /// that overrides it ([`Candidate::n_starts`](super::Candidate::n_starts))
@@ -417,7 +418,7 @@ pub struct SearchManifest {
 impl SearchManifest {
     pub fn new(options: &RunOptions, data: &Population) -> Self {
         Self {
-            criterion: options.criterion.label().to_string(),
+            criterion: options.criterion.manifest_key(),
             n_starts: options.n_starts.max(1),
             strictness: options.strictness.clone(),
             n_subjects: data.subjects.len(),
@@ -498,6 +499,64 @@ impl SearchManifest {
             );
         }
         Ok(())
+    }
+
+    /// Whether another run's cached **fits** are this run's fits: the same
+    /// dataset, the same start count and the same fit settings (#1185). The
+    /// criterion and the strictness gate are deliberately *not* compared —
+    /// both are functions of a finished `FitResult`, so a fit another tool
+    /// made under a different ranking is re-scored under this one rather
+    /// than refitted. What cannot be re-scored is a journal row without its
+    /// fit; [`check_compatible`](Self::check_compatible) is the test for
+    /// trusting those.
+    pub fn same_fits(&self, disk: &SearchManifest, dir: &Path) -> Result<(), String> {
+        let refuse = |field: &str, disk: String, now: String| {
+            Err(format!(
+                "not reusing fits from `{}`: {field} differs (there: {disk}, here: {now})",
+                dir.display()
+            ))
+        };
+        if disk.n_starts != self.n_starts {
+            return refuse(
+                "the number of starts per candidate",
+                disk.n_starts.to_string(),
+                self.n_starts.to_string(),
+            );
+        }
+        if disk.fit_options_fingerprint != self.fit_options_fingerprint {
+            let describe = |f: &Option<String>| match f {
+                Some(hash) => hash.clone(),
+                None => "the candidates' own `[fit_options]`".to_string(),
+            };
+            return refuse(
+                "the fit settings",
+                describe(&disk.fit_options_fingerprint),
+                describe(&self.fit_options_fingerprint),
+            );
+        }
+        if disk.data_fingerprint != self.data_fingerprint
+            || disk.n_subjects != self.n_subjects
+            || disk.n_observations != self.n_observations
+        {
+            return refuse(
+                "the dataset",
+                format!(
+                    "{} subjects / {} observations",
+                    disk.n_subjects, disk.n_observations
+                ),
+                format!(
+                    "{} subjects / {} observations",
+                    self.n_subjects, self.n_observations
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a journal row's *score* under the other run means the same
+    /// here: [`same_fits`](Self::same_fits) plus the criterion and the gate.
+    pub fn same_scores(&self, disk: &SearchManifest) -> bool {
+        disk.criterion == self.criterion && disk.strictness == self.strictness
     }
 }
 

@@ -291,7 +291,7 @@ fn censored_marginal_foce_grad(
     })
 }
 
-fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
+pub(crate) fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
     let inv_r = 1.0 / r;
     let inv_r2 = inv_r * inv_r;
     let inv_r3 = inv_r2 * inv_r;
@@ -540,7 +540,7 @@ fn corr_residual_diag(
 /// σ-block's central FD (`d2` is not needed there). Diagonals of the same builders
 /// as [`corr_residual_diag`]; the diagonal guard is already applied there so this
 /// reads the diagonal directly.
-fn corr_residual_rd_at_sigma(
+pub(crate) fn corr_residual_rd_at_sigma(
     model: &CompiledModel,
     subject: &Subject,
     ipreds: &[f64],
@@ -1524,7 +1524,7 @@ pub fn subject_sigma_gradient(
 /// underflows the floor (near a near-zero residual error) the central difference
 /// is corrupted; shrinking the step near `σ = 0` keeps `∂/∂σ` well-defined
 /// (PR #381 review #6). For an ordinary σ the `1e-6·(1+|σ|)` step is unchanged.
-fn sigma_fd_step(sigma_k: f64) -> f64 {
+pub(crate) fn sigma_fd_step(sigma_k: f64) -> f64 {
     let h = 1e-6 * (1.0 + sigma_k.abs());
     if sigma_k > 0.0 && h >= sigma_k {
         0.5 * sigma_k
@@ -1743,7 +1743,7 @@ fn sigma_block(
 /// `prepare_stacked` bail to FD through `corr_residual_diag` when any off-diagonal
 /// survives, so ρ can only reach here through the within-observation `combined`
 /// cross term.
-fn rho_rd_terms(
+pub(crate) fn rho_rd_terms(
     model: &CompiledModel,
     subject: &Subject,
     sens: &SubjectSens,
@@ -2567,7 +2567,7 @@ pub fn population_gradient_sens_foce(
 /// θ→packed chain rule `∂θ/∂x`: `θ` when the parameter packs in log-space,
 /// else `1.0`. Shared by every θ-loop of the packed-gradient / eta-dx functions.
 #[inline]
-fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize) -> f64 {
+pub(crate) fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize) -> f64 {
     if theta_packs_log(template.theta_lower[m]) {
         theta[m]
     } else {

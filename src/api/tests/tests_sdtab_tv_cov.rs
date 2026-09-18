@@ -49,6 +49,8 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "tv_cov_sdtab_regression".into(),
         pk_model: PkModel::OneCptIv,
@@ -84,6 +86,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -229,7 +232,9 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &kappas,
         true,
         None,
-    );
+        false,
+    )
+    .0;
     assert_eq!(results.len(), 1);
     let sdtab_ipred = &results[0].ipred;
     assert_eq!(sdtab_ipred.len(), 3);
@@ -357,7 +362,9 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         &kappas,
         false,
         None,
-    );
+        false,
+    )
+    .0;
 
     let f = ipred[0];
     let expected_v = (f * 0.2).powi(2) + 1.0 + 2.0 * f * 0.5 * 0.2;
@@ -396,6 +403,8 @@ fn test_simulate_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "tv_cov_sim_regression".into(),
         pk_model: PkModel::OneCptIv,
@@ -426,6 +435,7 @@ fn test_simulate_honours_tv_covariates() {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],

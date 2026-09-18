@@ -1,0 +1,51 @@
+# #1009 — the ferx side of the DEFDOSE anchor.
+#
+# A 1-cpt oral model written as `[odes]` with the **dosed** state declared
+# SECOND, so the dataset has to say `CMT=2` on its dose rows. The NONMEM twin is
+# `defdose_cmt2.ctl`:
+#
+#   $MODEL COMP=(CENTRAL, DEFOBS)
+#          COMP=(DEPOT,   DEFDOSE)
+#
+# which is the shape a translated model routinely has, and the shape in which a
+# missing `CMT` column is not recoverable: NONMEM sends an undecorated dose to
+# DEPOT (its declared `DEFDOSE`), ferx to compartment 1 — here `central`.
+#
+# `central` carries concentration (the `/V` is in the depot term), matching the
+# twin's `DADT(1) = KA*A(2)/V - (CL/V)*A(1)` and `IPRED = A(1)`.
+#
+# Tolerances are tightened to 1e-9 / 1e-11 so the solver is not the thing being
+# measured: the anchor compares an objective to 14 digits of NONMEM's, and
+# ADVAN13 runs at TOL=9.
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)   # NONMEM $SIGMA 0.0004
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[central, depot])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei          # NONMEM $ESTIMATION METHOD=1 INTERACTION
+  maxiter    = 0              # NONMEM MAXEVAL=0
+  covariance = false
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

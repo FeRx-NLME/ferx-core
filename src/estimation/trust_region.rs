@@ -9,10 +9,10 @@ use rayon::prelude::*;
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
-    ofv_is_valid, pop_nll_opts, resolve_outer_ftol, OuterResult,
+    gate_converged_on_objective, pop_nll_opts, resolve_outer_ftol, OuterResult,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
+    clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
 use crate::types::{CompiledModel, FitOptions, ModelParameters, Population};
 
@@ -44,6 +44,9 @@ struct FoceiProblem<'a> {
     /// optimizer objective (`cost`/`ofv_fixed`), gradient and Hessian, not to
     /// the final reported OFV, which reuses a clean `pop_nll_opts`.
     nn_reg: crate::estimation::nn_reg::NnRegularizer,
+    /// Parameter priors (#254). Same contract as `nn_reg`: in the optimizer
+    /// objective, gradient and Hessian; out of the reported OFV.
+    priors: crate::estimation::priors::PriorSet,
 }
 
 impl FoceiProblem<'_> {
@@ -83,7 +86,7 @@ impl FoceiProblem<'_> {
             self.options,
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
-        let raw = 2.0 * nll + self.nn_reg.penalty_value(&params.theta);
+        let raw = 2.0 * nll + self.nn_reg.penalty_value(&params.theta) + self.priors.penalty(x);
         if raw.is_finite() {
             raw
         } else {
@@ -230,6 +233,9 @@ impl Gradient for FoceiProblem<'_> {
         // maps 1:1 into `g`. Its curvature goes into `hessian()` below.
         let params = unpack_params(p, self.init_params);
         self.nn_reg.add_packed_gradient(&params.theta, &mut g);
+        // Parameter priors (#254) are defined on the packed vector directly, so
+        // `p` is already the right space.
+        self.priors.add_gradient(p, &mut g);
         Ok(g)
     }
 }
@@ -264,6 +270,12 @@ impl Hessian for FoceiProblem<'_> {
         let params = unpack_params(p, self.init_params);
         self.nn_reg
             .add_packed_hessian(&params.theta, &mut |i, j, v| h[i][j] += v);
+        // Parameter-prior curvature (#254): the exact `2/s²` diagonal, not an
+        // approximation. Same reason it has to be here as the NN term — the
+        // gradient carries the prior's pull, so a quadratic model without its
+        // curvature would read every priored direction as flat and shrink the
+        // radius on steps that were fine. PSD, so the BHHH model stays PSD.
+        self.priors.add_hessian(&mut |i, j, v| h[i][j] += v);
         Ok(h)
     }
 }
@@ -652,8 +664,11 @@ pub fn optimize_trust_region(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    let bounds = compute_bounds(init_params);
-    let mut x0 = pack_params(init_params);
+    let PackedStart {
+        packed: mut x0,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
 
     let mut warnings = Vec::new();
@@ -663,6 +678,13 @@ pub fn optimize_trust_region(
 
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let nn_reg_active = nn_reg.is_active();
+    // The post-run clamp below needs the box after `problem` has taken it and
+    // argmin has swallowed `problem`. Two `Vec<f64>` copies, against a second
+    // `compute_bounds` walk of the same unchanged template (#1252).
+    let post_run_bounds = PackedBounds {
+        lower: bounds.lower.clone(),
+        upper: bounds.upper.clone(),
+    };
     let problem = FoceiProblem {
         model,
         population,
@@ -671,6 +693,7 @@ pub fn optimize_trust_region(
         bounds,
         cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
         grad_cache: std::sync::Mutex::new(None),
+        priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
         nn_reg,
     };
 
@@ -724,7 +747,14 @@ pub fn optimize_trust_region(
             // clamped vector. Taking the gradient at the raw point would report a
             // ‖∂OFV/∂x‖ that belongs to a different parameter vector than the
             // estimates it is printed next to.
-            clamp_to_bounds(&mut vec, &compute_bounds(init_params));
+            //
+            // The box the run started from, not a second `compute_bounds` of the
+            // same template (#1252): the box is a property of `init_params`,
+            // which has not moved. `problem` owns the original and argmin does
+            // not hand it back, so the two vectors were copied aside before the
+            // move — cheaper than rebuilding the box, which allocates these two
+            // *and* re-walks the packed vector and the FIX mask to build them.
+            clamp_to_bounds(&mut vec, &post_run_bounds);
             // Gradient at the returned point, for `FitResult.final_gradient` and
             // so the non-convergence warning can quote how far from stationary
             // the fit stopped. Reuses the executor's problem, and with it the
@@ -797,12 +827,16 @@ pub fn optimize_trust_region(
     // other diverged value. `is_finite()` is *not* enough — the sentinel is
     // finite — so this uses the same validity cutoff the multi-start ranking
     // applies (`DIVERGENCE_OFV`).
-    let converged = converged && ofv_is_valid(final_ofv);
-    if !converged && warnings.is_empty() {
-        warnings.push(format!(
-            "Trust-region did not converge: the final OFV ({final_ofv:.4e}) is not a valid \
-             population objective — the fit diverged."
-        ));
+    //
+    // #1303 moved the demotion itself into the shared gate, so this engine, the
+    // NLopt and built-in descents, Gauss–Newton, the MCEM family and `fit()`'s
+    // own assembly all apply one rule and emit one message. The local
+    // `warnings.is_empty()` guard the reason used to sit behind went with it: a
+    // trust region that both stalled *and* landed on a `NaN` said only the first,
+    // and the second is the one that invalidates every derived quantity.
+    let mut converged = converged;
+    if let Some(w) = gate_converged_on_objective(&mut converged, final_ofv) {
+        warnings.push(w);
     }
 
     let out = crate::estimation::covariance::run_covariance_step(
@@ -821,6 +855,7 @@ pub fn optimize_trust_region(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = out;
     warnings.extend(cov_warnings);
 
@@ -837,6 +872,7 @@ pub fn optimize_trust_region(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
@@ -844,6 +880,7 @@ pub fn optimize_trust_region(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        final_gradient_source: final_gradient.as_ref().map(|_| "optimizer".to_string()),
         final_gradient,
         sir_fallback_proposal,
         impmap_trace: None,
@@ -864,6 +901,10 @@ pub fn optimize_trust_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Production code goes through `pack_with_bounds` (#1252); these two are
+    // still the clearest way for a test to build a box or a packed vector on
+    // its own, so they are imported here rather than at module scope.
+    use crate::estimation::parameterization::{compute_bounds, pack_params};
 
     #[test]
     fn test_adaptive_steihaug_budget() {
@@ -947,6 +988,10 @@ mod tests {
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
+            priors: crate::estimation::outer_optimizer::build_prior_set(
+                &model,
+                &model.default_params,
+            ),
         };
 
         // 1. Before cost(): cache is None.
@@ -1242,6 +1287,7 @@ mod tests {
                     population.subjects.len()
                 ]),
                 grad_cache: std::sync::Mutex::new(None),
+                priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
                     &model,
                     &population,
@@ -1336,6 +1382,7 @@ mod tests {
                 ]),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
+                priors: crate::estimation::outer_optimizer::build_prior_set(model, init),
             }
         }
         assert!(fresh(&model, &population, init, &options)

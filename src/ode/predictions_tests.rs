@@ -824,6 +824,7 @@ fn integrate_segment_zero_length_is_a_noop() {
     let mut u = vec![10.0];
     let mut predictions = vec![f64::NAN; subject.obs_times.len()];
     let obs_map = obs_index_map(&subject.obs_times);
+    let mut auto_state = crate::ode::solver::OdeAutoSwitchState::default();
 
     integrate_segment(
         &ode,
@@ -841,6 +842,7 @@ fn integrate_segment_zero_length_is_a_noop() {
         &obs_map,
         &mut predictions,
         None,
+        &mut auto_state,
         &[],
     );
 
@@ -864,6 +866,7 @@ fn integrate_segment_advances_state_and_records_obs() {
     let mut u = vec![10.0];
     let mut predictions = vec![f64::NAN; subject.obs_times.len()];
     let obs_map = obs_index_map(&subject.obs_times);
+    let mut auto_state = crate::ode::solver::OdeAutoSwitchState::default();
 
     integrate_segment(
         &ode,
@@ -881,6 +884,7 @@ fn integrate_segment_advances_state_and_records_obs() {
         &obs_map,
         &mut predictions,
         None,
+        &mut auto_state,
         &[],
     );
 
@@ -1048,6 +1052,7 @@ fn adaptive_tv_frozen_replay_readout_time_matches_the_driver() {
     let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
     let replay = adaptive_frozen_replay_tv(
         &ode,
+        &obs_pk[0].values,
         &event_pk,
         None,
         None,
@@ -1240,6 +1245,7 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
     let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
     let replay = adaptive_frozen_replay_tv(
         &ode,
+        &obs_pk[0].values,
         &event_pk,
         None,
         None,
@@ -1862,6 +1868,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
     let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
     let replay = adaptive_frozen_replay_tv(
         &ode,
+        &occ_pk[0].values,
         &event_pk,
         Some(&decision_pk),
         Some(&eta_occ),
@@ -4095,6 +4102,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
     let mut u = vec![100.0]; // pre-loaded with the bolus amount
     let mut predictions = vec![f64::NAN; subject.obs_times.len()];
     let obs_map = obs_index_map(&subject.obs_times);
+    let mut auto_state = crate::ode::solver::OdeAutoSwitchState::default();
 
     integrate_segment(
         &ode,
@@ -4112,6 +4120,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
         &obs_map,
         &mut predictions,
         None,
+        &mut auto_state,
         &[],
     );
 
@@ -6718,11 +6727,6 @@ fn bolus_ss_reference(ode: &OdeSpec, pk: &[f64], dose: &DoseEvent, max_cycles: u
 /// warning. Proves the exact-solve short-circuit does not swallow a genuinely nonlinear model.
 #[test]
 fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
-    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::dosing::clear_ss_nonconvergence_warnings();
-
     let mut ode = mm_disposition_spec();
     ode.solver_opts.reltol = 1e-10;
     ode.solver_opts.abstol = 1e-12;
@@ -6740,8 +6744,17 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
     );
     let reference = bolus_ss_reference(&ode, &pk.values, &dose, 500);
     assert_relative_eq!(trough[0], reference[0], max_relative = 1e-6);
+    // Read this equilibration's OWN answer, not the process-global sink (#1289). The sink is
+    // shared by every thread in the test binary and its reader guard serializes only readers,
+    // so `take_ss_nonconvergence_warnings().is_empty()` — what this line used to be — failed
+    // whenever any concurrently-running test capped an SS equilibration between the clear and
+    // the take. Reproducible on the first iteration of `cargo test --lib --features ci -- ss_`.
+    //
+    // The `true` half of this differential pair is `ss_nonlinear_over_capacity_bolus_caps_and_warns`
+    // below, on the same helper: without it a flag that was never written would satisfy this
+    // assertion vacuously, since a fresh harness thread starts at `false`.
     assert!(
-        crate::dosing::take_ss_nonconvergence_warnings().is_empty(),
+        !crate::dosing::last_ss_equilibration_warned(),
         "a converging nonlinear SS must not warn"
     );
 }
@@ -6770,6 +6783,14 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
         SS_EQUILIBRATION_CYCLES,
         "an over-capacity (no-SS) nonlinear disposition must run the full capped budget"
     );
+    // The `true` half of the #1289 differential pair — this equilibration's own answer, read
+    // per-thread. The sink assertion further down cannot serve that role: every writer emits
+    // the same deduplicated message, so `.any(|w| w.contains(…))` passes just as happily on a
+    // foreign test's warning as on this one's.
+    assert!(
+        crate::dosing::last_ss_equilibration_warned(),
+        "an over-capacity bolus must record a non-convergence warning for its own equilibration"
+    );
     assert!(trough.iter().all(|x| x.is_finite()));
 
     let subj = make_subject(vec![ss], vec![1.0, 4.0, 7.9]);
@@ -6785,6 +6806,87 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
             .any(|w| w.contains("Steady-state (SS=1) equilibration")),
         "an over-capacity bolus must surface a non-convergence warning; got: {warnings:?}"
     );
+}
+
+/// #1289 / PR #1392 review: `last_ss_equilibration_warned()` must mean "did **this**
+/// equilibration warn", not "has anything on this thread ever warned".
+///
+/// The observation is written by `note_ss_nonconvergence_if_capped`, and the paths that
+/// succeed never reach it — the exact affine fixed point returns from `equilibrate_ss_pk_state`
+/// before either capped train, and `equilibrate_ss_state_event_driven` has the same shape. So a
+/// warning-producing run followed by an exact one on the **same thread** left the accessor
+/// reporting the exact run as having warned. That is deterministic rather than a race, and it is
+/// the same stale-state class the observer was added to remove, so it gets its own test rather
+/// than riding on the two tests that read the flag for their own purposes.
+///
+/// Each engine has its own top-level entry and therefore its own reset, and a mutation of one
+/// leaves the other green — so they are pinned separately. This is the ODE entry,
+/// `equilibrate_ss_pk_state`; the analytical one is
+/// `pk::event_driven`'s `an_exact_event_driven_ss_clears_a_previous_runs_warning_flag`, next to
+/// the private function it has to call.
+#[test]
+fn an_exact_ss_equilibration_clears_a_previous_runs_warning_flag() {
+    let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::dosing::clear_ss_nonconvergence_warnings();
+
+    // 1. Produce a warning: the over-capacity MM disposition (mean input 6.25 > Vmax 5) has no
+    //    periodic steady state, so the capped train runs the full budget and notes it.
+    let mm = mm_disposition_spec();
+    let mut mm_pk = PkParams::default();
+    mm_pk.values[crate::types::PK_IDX_CL] = 5.0; // Vmax
+    mm_pk.values[crate::types::PK_IDX_V] = 8.0; // Km
+    let over = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0);
+    let _ = equilibrate_ss_state(&mm, &mm_pk.values, &over, &mm.solver_opts, &[]);
+    assert!(
+        crate::dosing::last_ss_equilibration_warned(),
+        "the fixture must actually warn first, or this test cannot observe a stale flag"
+    );
+
+    // 2. ODE side: a linear disposition takes the exact affine fixed point and returns from
+    //    `equilibrate_ss_pk_state` without ever calling `note_ss_nonconvergence_if_capped`.
+    let lin = one_cpt_ode_spec();
+    let mut lin_pk = PkParams::default();
+    lin_pk.values[crate::types::PK_IDX_CL] = 5.0;
+    lin_pk.values[crate::types::PK_IDX_V] = 80.0;
+    let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    let trough = equilibrate_ss_state(&lin, &lin_pk.values, &ss, &lin.solver_opts, &[]);
+    assert!(trough[0] > 0.0, "the linear equilibration must have run");
+    assert!(
+        !crate::dosing::last_ss_equilibration_warned(),
+        "the ODE reset in `equilibrate_ss_pk_state` is missing: an exact linear equilibration \
+         reports the PREVIOUS capped run's warning as its own"
+    );
+
+    // 3. The other entry point the flag can go stale through is the input-rate closed form,
+    //    which `sens::ode_provider` calls directly rather than via `equilibrate_ss_pk_state`.
+    //    Reached here through the MM absorption spec at a rate the Anderson solve *can* settle.
+    let _ = equilibrate_ss_state(&mm, &mm_pk.values, &over, &mm.solver_opts, &[]);
+    assert!(crate::dosing::last_ss_equilibration_warned());
+    let ir = mm_ss_absorption_spec();
+    let mut ir_pk = PkParams::default();
+    ir_pk.values[crate::types::PK_IDX_CL] = 50.0; // Vmax ≫ mean input
+    ir_pk.values[crate::types::PK_IDX_V] = 30.0; // Km
+    ir_pk.values[4] = 0.5; // ka
+    ir_pk.values[crate::types::PK_IDX_F] = 1.0;
+    let in_cap = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
+    let prepared = prepare_input_rates(&ir, &ir_pk.values);
+    assert!(
+        equilibrate_ss_input_rate(&ir, &ir_pk.values, &in_cap, 1.0, &ir.solver_opts, &prepared)
+            .is_some(),
+        "this fixture must take the input-rate solve, not decline to the capped train"
+    );
+    assert!(
+        !crate::dosing::last_ss_equilibration_warned(),
+        "the reset in `equilibrate_ss_input_rate_g` is missing: a converging input-rate solve \
+         reports the PREVIOUS capped run's warning as its own — the shape `sens::ode_provider` \
+         hits, since it calls that helper directly"
+    );
+
+    // Housekeeping: this test deliberately fills the sink, so drain it rather than leaving the
+    // entries for whichever reader runs next.
+    let _ = crate::dosing::take_ss_nonconvergence_warnings();
 }
 
 #[test]
@@ -7882,6 +7984,14 @@ fn ss_input_rate_no_steady_state_warns() {
     // A warning must fire (both the ρ ≥ 1 "no steady state" text and the near-ρ = 1 "below the
     // true periodic steady state" text are valid here — the capped drift can estimate ρ either
     // side of 1 — so assert on the shared prefix rather than one branch).
+    //
+    // The per-thread flag first (#1289): it pins that *this* prediction pass warned, which the
+    // sink `.any(…)` below cannot, since every writer emits the same deduplicated message and a
+    // concurrently-running test's warning satisfies it identically.
+    assert!(
+        crate::dosing::last_ss_equilibration_warned(),
+        "the input-rate train must record a non-convergence warning for its own equilibration"
+    );
     let warnings = crate::dosing::take_ss_nonconvergence_warnings();
     assert!(
         warnings
@@ -10320,6 +10430,114 @@ mod break_collision_1186 {
         }
     }
 
+    /// **#1234 — each of the four engines records its own abandoned walk.**
+    ///
+    /// The test above pins the *outcome* (non-finite predictions) across all four at once;
+    /// this pins the *diagnostic*, per engine, in its own `SolverStatsScope`. Per engine
+    /// because each has its own guard and its own return, so a shared assertion would be
+    /// satisfied by any one of them — and the failure message has to name which recorder
+    /// stopped recording, or the mutation cannot be attributed (CLAUDE.md: mutate each side
+    /// of a twin separately).
+    ///
+    /// The straddle is the second half of each arm: the same engine on the same fixture with
+    /// a finite lag must record nothing and must actually integrate. Without it a recorder
+    /// that fired unconditionally would pass.
+    ///
+    /// Mutation (run): revert any one engine's `abandon_non_finite_timeline` to the bare
+    /// `timeline_has_non_finite` → that engine's arm fires by name and the other three stay
+    /// green.
+    #[test]
+    fn every_dense_engine_records_its_own_abandoned_walk() {
+        let ode = spec();
+        let obs = vec![8.2001, 12.0];
+        let bad = pk(f64::NAN, 0.3);
+        let good = pk(7.9, 0.3);
+        let s = make_subject(doses(8.2), obs.clone());
+        let mk = |v: &[f64]| PkParams {
+            values: v.try_into().unwrap(),
+        };
+
+        // One closure per engine, so each recorder is exercised alone. `stats_in_scope`
+        // returns what the thread-local sink saw while exactly that engine ran.
+        let stats_in_scope = |f: &dyn Fn(&[f64]) -> Vec<f64>, pkv: &[f64]| {
+            let scope = crate::ode::solver::SolverStatsScope::enter();
+            let out = f(pkv);
+            (scope.collected(), out)
+        };
+        let dense = |pkv: &[f64]| ode_predictions(&ode, pkv, &[], &[], &s);
+        let with_states = |pkv: &[f64]| {
+            ode_predictions_with_states(&ode, pkv, &[], &[], &s)
+                .1
+                .iter()
+                .map(|u| u[1])
+                .collect::<Vec<f64>>()
+        };
+        let dense_states = |pkv: &[f64]| {
+            ode_dense_solve_states(&ode, pkv, &[], &[], &s, &obs)
+                .iter()
+                .map(|u| u[1])
+                .collect::<Vec<f64>>()
+        };
+        let event_driven = |pkv: &[f64]| {
+            let pk_d: Vec<PkParams> = s.doses.iter().map(|_| mk(pkv)).collect();
+            let pk_o: Vec<PkParams> = s.obs_times.iter().map(|_| mk(pkv)).collect();
+            ode_predictions_event_driven(&ode, &s, &[], &[], &pk_d, &pk_o, &[], &[])
+        };
+        // Aliased rather than written inline: the bare `&dyn Fn(&[f64]) -> Vec<f64>` array type
+        // trips `clippy::type_complexity`.
+        type EngineFn<'a> = &'a dyn Fn(&[f64]) -> Vec<f64>;
+        let engines: [(&str, EngineFn); 4] = [
+            (ENGINES[0], &dense),
+            (ENGINES[1], &with_states),
+            (ENGINES[2], &dense_states),
+            (ENGINES[3], &event_driven),
+        ];
+
+        for (name, f) in engines {
+            let (stats, out) = stats_in_scope(f, &bad);
+            // `.all()` is vacuously true on an empty `out`, and an abandoned walk returning
+            // nothing at all is a plausible future state — so the length comes first.
+            assert_eq!(
+                out.len(),
+                obs.len(),
+                "[{name}] the engine must return one value per observation: {out:?}"
+            );
+            assert!(
+                out.iter().all(|g| !g.is_finite()),
+                "[{name}] the fixture must actually be abandoned, got {out:?}"
+            );
+            assert_eq!(
+                stats.abandoned_non_finite_timeline, 1,
+                "[{name}] this engine's guard must record the abandoned walk: {stats:?}"
+            );
+            assert_eq!(
+                stats.attempted_steps, 0,
+                "[{name}] nothing was integrated, so the step counters must stay zero — that \
+                 is why the abandoned counter has to exist: {stats:?}"
+            );
+
+            let (clean, out) = stats_in_scope(f, &good);
+            assert_eq!(
+                out.len(),
+                obs.len(),
+                "[{name}] the control must return one value per observation: {out:?}"
+            );
+            assert!(
+                out.iter().all(|g| g.is_finite()),
+                "[{name}] the control fixture must actually integrate, got {out:?}"
+            );
+            assert_eq!(
+                clean.abandoned_non_finite_timeline, 0,
+                "[{name}] a finite lag is not an abandoned walk: {clean:?}"
+            );
+            assert!(
+                clean.attempted_steps > 0,
+                "[{name}] the control must actually integrate, or it separates nothing: \
+                 {clean:?}"
+            );
+        }
+    }
+
     /// A long timeline through every ODE engine, with a non-finite lag.
     ///
     /// Two distinct traps live here. `partial_cmp(..).unwrap()` — what these builders
@@ -10395,12 +10613,54 @@ mod break_collision_1186 {
         ] {
             let pkv = pk(route_lag, alag1);
             let s = make_subject(doses(8.2), obs.clone());
+            // In a scope so the #1234 recorder on this engine is observable: this is the
+            // event-time search, reached in production only from `simulate()`'s latent-event
+            // draw, and nothing else in the suite can see its counter.
+            let scope = crate::ode::solver::SolverStatsScope::enter();
             let got = ode_solve_until_chz_threshold(&ode, &pkv, &s, 1, 0.5, 24.0);
+            let stats = scope.collected();
             assert!(
                 matches!(got, ThresholdOutcome::SolveFailed(_)),
                 "[{label}] a non-finite timeline must be a typed SolveFailed, got {got:?}"
             );
+            // Mutation: revert this engine's `abandon_non_finite_timeline` to the bare
+            // predicate → this fires and the `SolveFailed` assert above stays green, which
+            // is the point: the typed failure and the counter are separate obligations.
+            assert_eq!(
+                stats.abandoned_non_finite_timeline, 1,
+                "[{label}] the CHZ event-time search must record its abandoned walk: {stats:?}"
+            );
         }
+
+        // The straddle, on the engine's own control: a finite timeline must solve and record
+        // nothing. Without it a recorder that fired on every call would pass above.
+        let s = make_subject(doses(8.2), obs.clone());
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let got = ode_solve_until_chz_threshold(&ode, &pk(7.9, 0.3), &s, 1, 0.5, 24.0);
+        let clean = scope.collected();
+        assert!(
+            !matches!(got, ThresholdOutcome::SolveFailed(_)),
+            "the control must actually solve, got {got:?}"
+        );
+        assert_eq!(
+            clean.abandoned_non_finite_timeline, 0,
+            "a finite timeline is not an abandoned walk: {clean:?}"
+        );
+        // No `attempted_steps > 0` here, and the reason is a property of *this* engine worth
+        // recording: the threshold search runs on `solver::solve_ode_until_threshold`, its own
+        // driver, which does not go through `integrate_resolved_g`'s `STATS_SINK` tee — so its
+        // step counters never reach the scope and read `0` on a solve that worked (measured).
+        // The proof that the control actually ran is therefore the outcome asserted above, not
+        // the counters. It also means that on this one engine the step counters cannot serve as
+        // the "abandoned vs nothing to integrate" discriminator the way they do everywhere
+        // else; the new counter is the only thing that separates them here.
+        assert_eq!(
+            clean.attempted_steps, 0,
+            "this engine's own driver does not tee into the stats sink, so its step counters \
+             stay zero even on a solve that worked. If this is now non-zero the tee has been \
+             widened and the comment above (and the control's proof of life) needs revisiting: \
+             {clean:?}"
+        );
     }
 
     /// The control for the test above: the *same* engine on the *same* fixture with a
@@ -11921,4 +12181,566 @@ fn ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice() {
             "segment {m}: anchor {with_empty}, expected the pulse at {seg_start}"
         );
     }
+}
+
+// ── #1234: every engine that abandons an unorderable timeline must say so ────────────
+//
+// The counter (`OdeSolverStats::abandoned_non_finite_timeline`) is only worth having if
+// *every* abandoning walk bumps it: a walk that returns `NaN` predictions while leaving the
+// whole stats block at zero is indistinguishable from a subject there was nothing to
+// integrate for, which is the reading #1234 exists to remove. The four dense / event-driven
+// engines are covered next to their own guards in `break_collision_1186`; the two adaptive
+// walks are here, where the driver and its frozen replay are already driven directly.
+
+/// The **reactive driver**'s guard (`ode_predictions_adaptive_impl`) records too.
+///
+/// Its own site, and reachable from nowhere else in the test suite: the driver runs only
+/// under `simulate()`, which opens no `SolverStatsScope`, so nothing in the fit-level sweep
+/// can observe it. Driving it here in an explicit scope is what makes the recorder
+/// mutation-visible at all.
+///
+/// The straddle is the second half: the *same* driver on the *same* fixture with a finite
+/// dose time must record nothing, so this cannot pass on a counter that fires on every run.
+///
+/// Mutation: delete the record at `ode_predictions_adaptive_impl`'s guard (route it through
+/// the bare `timeline_has_non_finite` again) → the abandoned arm reads 0 and the first
+/// assert fires naming the driver; no other test in the tree moves.
+#[test]
+fn the_adaptive_driver_records_an_abandoned_walk() {
+    let ode = one_cpt_ode_spec();
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk_one(1.0, 10.0)],
+        obs: vec![pk_one(1.0, 10.0); 2],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+        actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+        rule: None,
+    };
+    let run_at = |dose_time: f64, decide: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision| {
+        let base = make_subject(
+            vec![DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 4.0],
+        );
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let out = ode_predictions_adaptive_impl(
+            &ode,
+            &event_pk.obs[0].values,
+            Some(&event_pk),
+            None,
+            None,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            decide,
+            100,
+            None,
+        );
+        (scope.collected(), out)
+    };
+
+    let (stats, out) = run_at(f64::NAN, &mut decide);
+    let err = out.expect_err("a NaN dose time must be the driver's typed error");
+    assert!(
+        err.contains("cannot be ordered"),
+        "the driver must reject it for the timeline, not for something else: {err}"
+    );
+    assert_eq!(
+        stats.abandoned_non_finite_timeline, 1,
+        "the adaptive driver must record its abandoned walk — its guard is its own site and \
+         no other test drives it: {stats:?}"
+    );
+    assert_eq!(
+        stats.attempted_steps, 0,
+        "adaptive driver: nothing was integrated, so the step counters must stay zero: \
+         {stats:?}"
+    );
+
+    // The straddle: same engine, same fixture, orderable timeline.
+    let (clean, out) = run_at(0.0, &mut decide);
+    out.expect("the control fixture must actually run");
+    assert_eq!(
+        clean.abandoned_non_finite_timeline, 0,
+        "a finite dose time is not an abandoned walk: {clean:?}"
+    );
+    assert!(
+        clean.attempted_steps > 0,
+        "the control must actually integrate, or it does not separate anything: {clean:?}"
+    );
+}
+
+/// The **frozen-schedule replay verifier**'s guard (`adaptive_frozen_replay_tv`) records too.
+///
+/// A separate site from the driver's, in a separate function, returning a NaN-prefilled
+/// `Vec<f64>` rather than an `Err` — and the replay is only ever reached from
+/// `verify_adaptive_frozen_replay`, i.e. under `simulate()` in a debug build. Nothing else in
+/// the suite can see this recorder.
+///
+/// Mutation: delete the record at `adaptive_frozen_replay_tv`'s guard → the first assert
+/// fires naming the replay; `the_adaptive_driver_records_an_abandoned_walk` stays green.
+#[test]
+fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
+    let ode = one_cpt_ode_spec();
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk_one(1.0, 10.0)],
+        obs: vec![pk_one(1.0, 10.0); 2],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let replay_at = |dose_time: f64| {
+        let subject = make_subject(
+            vec![DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 4.0],
+        );
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let preds = adaptive_frozen_replay_tv(
+            &ode,
+            &pk_one(1.0, 10.0).values,
+            &event_pk,
+            None,
+            None,
+            &[],
+            &[],
+            &subject,
+            &[1.0],
+            &[],
+        );
+        (scope.collected(), preds)
+    };
+
+    let (stats, preds) = replay_at(f64::NAN);
+    // Length first: `.all()` on an empty `preds` asserts nothing.
+    assert_eq!(
+        preds.len(),
+        2,
+        "the replay must return both observations: {preds:?}"
+    );
+    assert!(
+        preds.iter().all(|p| p.is_nan()),
+        "the replay must come back NaN-prefilled on an unorderable timeline, got {preds:?}"
+    );
+    assert_eq!(
+        stats.abandoned_non_finite_timeline, 1,
+        "the frozen replay must record its abandoned walk — its own guard, its own return: \
+         {stats:?}"
+    );
+    assert_eq!(
+        stats.attempted_steps, 0,
+        "frozen replay: nothing was integrated, so the step counters must stay zero: {stats:?}"
+    );
+
+    let (clean, preds) = replay_at(0.0);
+    assert_eq!(
+        preds.len(),
+        2,
+        "the control must return both observations: {preds:?}"
+    );
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "the control fixture must actually integrate, got {preds:?}"
+    );
+    assert_eq!(
+        clean.abandoned_non_finite_timeline, 0,
+        "a finite dose time is not an abandoned walk: {clean:?}"
+    );
+    assert!(
+        clean.attempted_steps > 0,
+        "the control must actually integrate, or it does not separate anything: {clean:?}"
+    );
+}
+
+/// **The pairing is structural, not conventional (#1234 §5).**
+///
+/// `timeline_has_non_finite` / `times_have_non_finite` decide *whether* a walk is abandoned;
+/// [`abandon_non_finite_timeline`](crate::ode::predictions::abandon_non_finite_timeline) also
+/// *records* it. Nothing in the type system stops a ninth guard from taking the bare
+/// predicate — it would compile, run, and silently put the diagnostic back to `0/0/0` for
+/// that walk, which is exactly the defect the counter exists to remove. Per-site tests cannot
+/// close that: they can only cover sites that already exist.
+///
+/// So the call sites are pinned. The bare predicates may be called from **two** places, and
+/// this lists both rather than allowing a directory:
+///
+/// * `src/ode/predictions.rs` — twice, and both inside the shared helpers themselves
+///   (`timeline_has_non_finite`'s one-line body, and `abandon_non_finite_timeline`'s test).
+///   A third would be a guard that bypassed the recorder.
+/// * `src/sens/ode_provider.rs` — twice, the two analytic-sensitivity walks, which carry the
+///   same predicate and deliberately do **not** record: their sweep is collected in a
+///   separate scope from which `fit_inner` copies one unrelated field, so an event deposited
+///   there would be discarded or fire a prediction-shaped warning clause. Documented at both
+///   guards and on the counter's own field doc.
+///
+/// Exact counts, not a floor: a removed allowance has to be re-stated here too, so the
+/// exclusion cannot quietly widen or vanish.
+///
+/// Mutation (run): revert any one of the eight engine guards to
+/// `timeline_has_non_finite(&break_times)` → `src/ode/predictions.rs` reads 3 and this fires
+/// naming the file. Adding a bare call in a new file fires with that file named.
+#[test]
+fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("readable directory") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&root.join("src"), &mut files);
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "the scan found only {} files under src/ — it is measuring the walk, not the code",
+        files.len()
+    );
+
+    let mut seen_name: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut calls: BTreeMap<String, usize> = BTreeMap::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("readable source");
+        let rel = file
+            .strip_prefix(&root)
+            .expect("under the manifest dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        for line in text.lines() {
+            // Comments are where these names legitimately appear everywhere — the guards'
+            // own prose, the mutation notes, the field doc. Only code counts.
+            let code = line.split("//").next().unwrap_or("");
+            for name in ["timeline_has_non_finite", "times_have_non_finite"] {
+                // `fn <name>(` is the definition, not a call.
+                let defined = code.contains(&format!("fn {name}("));
+                if code.contains(&format!("{name}(")) && !defined {
+                    *seen_name.entry(name).or_default() += 1;
+                    *calls.entry(rel.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    // Non-degeneracy: a rename that made the scan match nothing would otherwise pass.
+    assert_eq!(
+        seen_name.len(),
+        2,
+        "both predicate names must still be called somewhere, or this test is scanning for \
+         strings that no longer exist: {seen_name:?}"
+    );
+
+    let expected: BTreeMap<String, usize> = [
+        ("src/ode/predictions.rs".to_string(), 2),
+        ("src/sens/ode_provider.rs".to_string(), 2),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        calls, expected,
+        "the bare non-finite-timeline predicates are called somewhere new. An engine guard \
+         must go through `abandon_non_finite_timeline`, which records the abandoned walk as \
+         well as detecting it — a bare call compiles and runs but leaves the #1234 counter at \
+         zero for that walk, which is indistinguishable from a subject there was nothing to \
+         integrate for. If the new call really is a non-recording site (the two `sens/` \
+         gradient walks are), add it here with the reason."
+    );
+}
+
+// ---- #1188: the frozen-replay verifier's own break timeline ----------------
+//
+// `adaptive_frozen_replay_tv` used to build its dose breaks by hand — `d.time` plus a
+// real infusion's F-scaled end — so it pushed neither a per-route absorption onset nor a
+// `zero_order` window's edges. `integrate_segment`'s `active_zero_order_inputs` admits a
+// window's constant rate only for a segment the window FULLY CONTAINS, so an unbracketed
+// edge drops the rate for every segment that straddles it and the replay under-delivers
+// the absorbed mass. It now shares `collect_dose_break_times` with the reactive driver.
+//
+// The two tests below are a pair on purpose, because neither alone is sufficient:
+//
+//  * `frozen_replay_delivers_the_exact_zero_order_mass` anchors on a closed form that is
+//    OUTSIDE both engines, so it also sees a defect inside the shared builder.
+//  * `frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge` puts the route-lag
+//    break and the window edges at DIFFERENT times (the degeneracy #1174's fixtures all
+//    had, where a `zero_order` route's onset coincides with its own window start), but its
+//    oracle is the production static engine — which shares the builder, so it is blind to
+//    a defect inside it. That is what the first test covers.
+
+/// Single **pure accumulator** (`dy = 0`) fed by a lagged `zero_order(dur)` route, so the
+/// compartment's amount IS the delivered mass and the exact answer is a clamped ramp —
+/// a reference outside every ferx engine. Free slots: 20 = `dur`, 21 = the route lag.
+fn lagged_zero_order_accumulator_spec() -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+            dy[0] = 0.0;
+        }),
+        n_states: 1,
+        state_names: vec!["depot".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: vec![InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::ZeroOrder,
+            arg_slots: vec![20],
+            frac_slot: None,
+            lag_slot: Some(21),
+        }],
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// #1188: the frozen-replay verifier must deliver a lagged `zero_order` route's **exact**
+/// mass, anchored on a closed form rather than on the engine it verifies.
+///
+/// Two doses, so the second window opens with the first dose's whole 100 still in the
+/// compartment — a single-dose fixture cannot see an incoming-side error, because the
+/// state is zero before the first arrival.
+///
+/// Regression this exists to catch: the replay building its own break list without
+/// `push_zero_order_break_times` / `push_route_lag_break_times`. Mutations measured, each
+/// naming this test in its failure:
+///  * restore the hand-rolled `d.time`-only loop → worst relative error **1.0e0** — the
+///    t=2 sample reads exactly 0.0 against an exact 25.0, the window's rate dropped
+///    wholesale because no segment is contained in an unbracketed `[1.5, 3.5]`;
+///  * delete `push_zero_order_break_times` from the shared `collect_dose_break_times`
+///    → **2.5e-1**. The engine-vs-engine sibling cannot see this one (both its sides run
+///    that helper and move together), which is why this closed-form anchor is separate.
+/// Realised error with the fix in: **1.42e-16** relative, i.e. the ramp is reproduced to
+/// the last bit. The bound is 1e-12 — ~7,000× the realised error and 2.5e11× below the
+/// smaller mutation — and it bounds *break placement*, not integration accuracy: `dy = 0`
+/// leaves the solver nothing to integrate but the injected constant.
+#[test]
+fn frozen_replay_delivers_the_exact_zero_order_mass() {
+    let ode = lagged_zero_order_accumulator_spec();
+    let (amt, dur, route_lag) = (100.0_f64, 2.0_f64, 1.5_f64);
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    pk.values[20] = dur;
+    pk.values[21] = route_lag;
+
+    // Windows [1.5, 3.5] and [7.5, 9.5]; the second opens on a full first dose.
+    let dose_times = [0.0_f64, 6.0];
+    let doses: Vec<DoseEvent> = dose_times
+        .iter()
+        .map(|&t| DoseEvent::new(t, amt, 1, 0.0, false, 0.0))
+        .collect();
+    // Samples before / inside / after each window, including one in the second window.
+    let obs_times: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 6.5, 8.0, 9.0, 10.0, 14.0];
+    let subject = make_subject(doses, obs_times.clone());
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk; 2],
+        obs: vec![pk; 9],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let decisions = [0.0, 6.0, 12.0];
+
+    let replay = adaptive_frozen_replay_tv(
+        &ode,
+        &pk.values,
+        &event_pk,
+        None,
+        None,
+        &[],
+        &[],
+        &subject,
+        &[1.0, 1.0],
+        &decisions,
+    );
+
+    let mut worst = 0.0_f64;
+    for (i, &t) in obs_times.iter().enumerate() {
+        // `is_finite` before the fold: `f64::max` DISCARDS a NaN, so a solve that
+        // returned NaN would leave `worst` at whatever the finite samples produced and
+        // the bound below would pass on their strength.
+        assert!(
+            replay[i].is_finite(),
+            "replay returned a non-finite amount at t={t}: {}",
+            replay[i]
+        );
+        // Exact delivered mass: each dose's window is a linear ramp over `[t0 + lag,
+        // t0 + lag + dur]`, clamped to `[0, amt]`, and a pure accumulator holds the sum.
+        let want: f64 = dose_times
+            .iter()
+            .map(|&t0| ((t - t0 - route_lag) / dur).clamp(0.0, 1.0) * amt)
+            .sum();
+        worst = worst.max((replay[i] - want).abs() / want.abs().max(1.0));
+    }
+    assert!(
+        worst <= 1e-12,
+        "frozen replay lost zero-order mass: worst relative error {worst:e} (measured \
+         1.42e-16 with the shared break builder; 1.0e0 with the hand-rolled one)"
+    );
+    // The straddle this fixture asserts rather than assumes: the second window really
+    // does open on a non-empty compartment, so the incoming side of that dose is live.
+    assert!(
+        replay[4] >= amt - 1e-9,
+        "t=6.5 must already hold the first dose's full mass (got {}), or the second \
+         window's incoming side is degenerate",
+        replay[4]
+    );
+}
+
+/// One-compartment disposition fed by **two routes that switch on at different times** —
+/// a lagged `zero_order` into `central` and a lagged `first_order` into `depot`, which
+/// then transfers into `central`. Free slots: 20 = `dur`, 21 = the zero-order route lag,
+/// 22 = the first-order route lag, 23 = the depot→central transfer rate.
+fn two_route_lagged_spec() -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: Vec::new(),
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            let ktr = p[23];
+            dy[0] = ktr * y[1] - ke * y[0];
+            dy[1] = -ktr * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["central".into(), "depot".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: vec![
+            InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::ZeroOrder,
+                arg_slots: vec![20],
+                frac_slot: None,
+                lag_slot: Some(21),
+            },
+            InputRateForcing {
+                cmt: 1,
+                kind: InputRateKind::FirstOrder,
+                arg_slots: vec![crate::types::PK_IDX_KA],
+                frac_slot: None,
+                lag_slot: Some(22),
+            },
+        ],
+        init_fn: None,
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+    }
+}
+
+/// #1188: with a route lag and a `zero_order` window edge at **different** times, the
+/// frozen replay must walk the identical segmentation the production static engine does.
+///
+/// The fixture is deliberately not the shape #1174's were. There every fixture used a
+/// bare `zero_order`, where the route's onset coincides with the window's own start, so
+/// one break served both and a builder that emitted only one of the two passed. Here the
+/// first-order route switches on at 0.5 / 6.5 and the zero-order window spans
+/// [1.5, 3.5] / [7.5, 9.5]: six distinct edges, no two coincident. Both routes reach the
+/// readout (`central` is dosed directly by the zero-order route and refilled from
+/// `depot`), and the second dose arrives with the first still present.
+///
+/// Oracle: `ode_predictions_with_extra_breaks` handed the replay's own break set (the
+/// decisions plus every observation, which the replay breaks at and the dense engine
+/// records inside a segment). Given the same set the two are **bit-identical**, so any
+/// break the replay drops shows up as a different step sequence.
+///
+/// Regression: the replay segmenting the timeline differently from the engine it is
+/// supposed to reproduce. Mutations measured, each naming this test:
+///  * restore the hand-rolled `d.time`-only loop → worst relative error **4.096e-1**;
+///  * the *weaker* fix a reviewer would reach for first — keep the hand-rolled loop and
+///    add `push_zero_order_break_times` alone, which #1174's own note says is enough for
+///    zero-order segmentation → **1.311e-5**, and this is the only test that dies. That
+///    edit is the #1174 degeneracy itself, and it is why the fixture separates the
+///    first-order onset from the zero-order window rather than reusing a bare
+///    `zero_order`, where one break serves both and the weaker fix passes.
+///
+/// **What this cannot see**, stated rather than implied: the oracle runs the *same*
+/// `collect_dose_break_times`, so deleting a push from inside that helper moves both
+/// sides together and leaves this green (measured: 0.0). That mutation is caught by
+/// `frozen_replay_delivers_the_exact_zero_order_mass`, whose reference is a closed form.
+#[test]
+fn frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge() {
+    let ode = two_route_lagged_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 1.0;
+    pk.values[crate::types::PK_IDX_V] = 10.0;
+    pk.values[crate::types::PK_IDX_KA] = 1.1;
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    pk.values[20] = 2.0; // zero-order dur   → windows [1.5, 3.5], [7.5, 9.5]
+    pk.values[21] = 1.5; // zero-order lag
+    pk.values[22] = 0.5; // first-order lag  → onsets 0.5, 6.5
+    pk.values[23] = 0.7; // depot → central
+
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 2, 0.0, false, 0.0),
+    ];
+    let obs_times: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 6.5, 8.0, 9.0, 10.0, 14.0];
+    let subject = make_subject(doses, obs_times.clone());
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk; 4],
+        obs: vec![pk; 9],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let decisions = [0.0, 6.0, 12.0];
+
+    let replay = adaptive_frozen_replay_tv(
+        &ode,
+        &pk.values,
+        &event_pk,
+        None,
+        None,
+        &[],
+        &[],
+        &subject,
+        &[1.0; 4],
+        &decisions,
+    );
+    let mut aligned_breaks: Vec<f64> = decisions.to_vec();
+    aligned_breaks.extend(obs_times.iter().copied());
+    let statics =
+        ode_predictions_with_extra_breaks(&ode, &pk.values, &[], &[], &subject, &aligned_breaks);
+
+    let mut worst = 0.0_f64;
+    for (i, &t) in obs_times.iter().enumerate() {
+        // Both sides finite before the fold — `f64::max` swallows a NaN (see the sibling
+        // test), and a diverged solve is the likeliest way to break what this pins.
+        assert!(
+            replay[i].is_finite() && statics[i].is_finite(),
+            "non-finite prediction at t={t}: replay={} static={}",
+            replay[i],
+            statics[i]
+        );
+        worst = worst.max((replay[i] - statics[i]).abs() / statics[i].abs().max(1.0));
+    }
+    // Measured 0.0 (bit-identical). The bound is 1e-14 rather than 0.0 only so a future
+    // benign reordering inside the shared builder is not a false alarm; the *tightest*
+    // mutation above sits at 1.311e-5, nine orders above it.
+    assert!(
+        worst <= 1e-14,
+        "frozen replay walks a different segmentation from the static engine: worst \
+         relative error {worst:e} (measured 0.0 with the shared break builder)"
+    );
+    // The straddle, asserted rather than assumed: the first-order onset (6.5) and the
+    // zero-order window edges (7.5, 9.5) are distinct, and drug is present at the
+    // second dose — so neither route is degenerate on its incoming side.
+    assert!(
+        replay[4] > 100.0,
+        "t=6.5 must already carry the first dose's mass (got {}); a fixture whose second \
+         dose lands on an empty compartment cannot see an incoming-side error",
+        replay[4]
+    );
 }

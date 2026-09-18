@@ -1442,6 +1442,165 @@ const THREECPT_ORAL: &str = r#"
 
 /// Third-order sensitivities (#436) — the blocks the analytic covariance Hessian consumes.
 ///
+/// The η-only sweep (#1342) must produce the *same* two third-order blocks as the full
+/// `(θ, η)` sweep, at `1 + 2·n_eta` evaluations instead of `1 + 2(n_theta + n_eta)`.
+///
+/// This is the oracle for that change, and it is a comparison of the quantity being changed
+/// against the code being replaced — not a second transcription of the formula. Both sides are
+/// production functions; only the FD direction differs.
+///
+/// `third_order_sensitivities_layouts_and_values` already established that the two directions
+/// agree (its point 2 recomputes `∂³f/∂η²∂θ` by differencing `∂²f/∂η∂θ` along `η` and asserts
+/// `1e-5` relative against the shipped `∂/∂θ` route). That test validates the *arithmetic*; this
+/// one validates that `ThirdOrderAxes::EtaOnly` actually assembles it into the right slots, with
+/// the right symmetrisation, for the real consumer.
+///
+/// Three things are asserted, and the third is the one a careless implementation fails:
+///
+/// 1. `d3f_deta3` agrees — it is differenced along η in both variants, so this should be
+///    **bit-identical**, and asserting equality rather than a tolerance is what would catch the
+///    η axes being swept with a different step or offset.
+/// 2. `d3f_deta2_dtheta` agrees to FD tolerance. It cannot be bit-identical: the two sides
+///    difference different blocks along different axes.
+/// 3. The two θ-swept blocks come back **empty**, not zeroed. A zero-filled tensor would pass
+///    every length check in `laplace_h_deriv` and contract silently into a wrong Hessian; an
+///    empty one trips that check loudly. This is the safety property of the partial result.
+#[test]
+fn the_eta_only_sweep_matches_the_full_sweep_on_the_blocks_laplace_reads() {
+    let m = parse_model_string(ONECPT_IV_2ETA).expect("parse");
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.25, 11.0];
+    let eta = [0.13, -0.09];
+    let (n_theta, n_eta) = (theta.len(), eta.len());
+
+    let full = subject_sensitivities_cov(&m, &s, &theta, &eta).expect("in scope");
+    let lean = subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta, None).expect("in scope");
+    assert_eq!(full.obs.len(), lean.obs.len());
+
+    let mut worst = 0.0f64;
+    for (j, (f, l)) in full.obs.iter().zip(lean.obs.iter()).enumerate() {
+        // The base jet must be identical — same base evaluation, untouched by either sweep.
+        assert_eq!(f.f, l.f, "obs {j}: base prediction");
+        assert_eq!(f.d2f_deta2, l.d2f_deta2, "obs {j}: base ∂²f/∂η²");
+        assert_eq!(
+            f.d2f_deta_dtheta, l.d2f_deta_dtheta,
+            "obs {j}: base ∂²f/∂η∂θ"
+        );
+
+        // (1) Same axes, same steps ⟹ bit-identical.
+        assert_eq!(
+            f.d3f_deta3, l.d3f_deta3,
+            "obs {j}: ∂³f/∂η³ is differenced along η by both sweeps, so it must be identical"
+        );
+
+        // (3) The θ-swept blocks are absent, not zero.
+        assert!(
+            l.d2f_dtheta2.is_empty(),
+            "obs {j}: the η-only sweep must leave d2f_dtheta2 EMPTY, not zero-filled — a \
+             zero-filled tensor passes a length check and contracts into a wrong Hessian"
+        );
+        assert!(
+            l.d3f_deta_dtheta2.is_empty(),
+            "obs {j}: the η-only sweep must leave d3f_deta_dtheta2 EMPTY, not zero-filled"
+        );
+        // …and the full sweep must still fill them, or this test is passing because the
+        // covariance caller was broken too.
+        assert_eq!(f.d2f_dtheta2.len(), n_theta * n_theta);
+        assert_eq!(f.d3f_deta_dtheta2.len(), n_eta * n_theta * n_theta);
+
+        // (2) Same mixed partial, different FD direction.
+        assert_eq!(l.d3f_deta2_dtheta.len(), n_eta * n_eta * n_theta);
+        let scale = f
+            .d3f_deta2_dtheta
+            .iter()
+            .fold(1e-6f64, |acc, v| acc.max(v.abs()));
+        for idx in 0..n_eta * n_eta * n_theta {
+            let (a, b) = (f.d3f_deta2_dtheta[idx], l.d3f_deta2_dtheta[idx]);
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "obs {j}: non-finite ∂³f/∂η²∂θ at {idx} ({a}, {b}); the relative fold below \
+                 would absorb it"
+            );
+            worst = worst.max((a - b).abs() / scale);
+        }
+    }
+    // **Measured**, not guessed: the worst realised relative discrepancy across every
+    // observation and tensor slot is `1.126e-10` (printed below). The bound is that with ~90×
+    // headroom.
+    //
+    // Deliberately *not* the `1e-5` that `third_order_sensitivities_layouts_and_values` uses
+    // for the arithmetic form of this comparison, which would be five orders too loose here and
+    // would pass on a sweep that had silently lost most of its precision. It can be this tight
+    // because both sides are first central differences of **exact** `Dual2` second-order
+    // quantities, so the discrepancy is the difference of two small truncation errors rather
+    // than either one of them.
+    println!("worst realised eta-only vs full ∂³f/∂η²∂θ relative error: {worst:.3e}");
+    assert!(
+        worst < 1e-8,
+        "the η-only sweep must reproduce ∂³f/∂η²∂θ to finite-difference tolerance; worst \
+         relative error was {worst:.3e}"
+    );
+}
+
+/// `subject_sensitivities_cov_eta_only`'s `base` parameter (#1344 item 2) exists so a caller
+/// that already holds the jet at `(theta, eta)` — `agq::score_core_at` builds exactly this for
+/// the anchor — can hand it over instead of paying for the identical `subject_sensitivities`
+/// call again. Supplying it must be a pure optimisation: the result has to be bit-identical to
+/// letting the sweep recompute it itself, since a correctly-supplied base *is* the same
+/// evaluation, not an approximation of it.
+///
+/// Regression coverage for the PR #1346 review's testing suggestion (2026-09-11): every other
+/// test of this sweep, including the one directly above, only ever calls with `base = None`, so
+/// a defect confined to the `Some(base)` arm — the one release builds actually take — could ship
+/// with the rest of the suite green. `debug_assert_base_matches` catches a base from the *wrong*
+/// point in debug builds, but says nothing about whether accepting a *correct* one changes the
+/// result, which is what this pins.
+#[test]
+fn the_supplied_base_jet_reproduces_the_recomputed_one() {
+    let m = parse_model_string(ONECPT_IV_2ETA).expect("parse");
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 2.0, 6.0, 12.0],
+    );
+    let theta = [0.25, 11.0];
+    let eta = [0.13, -0.09];
+
+    // The exact call `agq::score_core_at` makes to build the jet it then hands to
+    // `subject_h_inner_dx` as `base_jet`.
+    let base = subject_sensitivities(&m, &s, &theta, &eta).expect("in scope");
+
+    let recomputed =
+        subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta, None).expect("in scope");
+    let supplied =
+        subject_sensitivities_cov_eta_only(&m, &s, &theta, &eta, Some(base)).expect("in scope");
+
+    assert_eq!(recomputed.obs.len(), supplied.obs.len());
+    for (j, (r, sup)) in recomputed.obs.iter().zip(supplied.obs.iter()).enumerate() {
+        assert_eq!(r.f, sup.f, "obs {j}: f");
+        assert_eq!(r.df_deta, sup.df_deta, "obs {j}: df/deta");
+        assert_eq!(r.d2f_deta2, sup.d2f_deta2, "obs {j}: d2f/deta2");
+        assert_eq!(r.df_dtheta, sup.df_dtheta, "obs {j}: df/dtheta");
+        assert_eq!(
+            r.d2f_deta_dtheta, sup.d2f_deta_dtheta,
+            "obs {j}: d2f/deta_dtheta"
+        );
+        assert_eq!(r.d3f_deta3, sup.d3f_deta3, "obs {j}: d3f/deta3");
+        assert_eq!(
+            r.d3f_deta2_dtheta, sup.d3f_deta2_dtheta,
+            "obs {j}: d3f/deta2_dtheta"
+        );
+        // Both empty under `EtaOnly`, whichever arm built them — asserted rather than assumed.
+        assert_eq!(r.d2f_dtheta2, sup.d2f_dtheta2, "obs {j}: d2f/dtheta2");
+        assert_eq!(
+            r.d3f_deta_dtheta2, sup.d3f_deta_dtheta2,
+            "obs {j}: d3f/deta_dtheta2"
+        );
+    }
+}
+
 /// `subject_sensitivities_cov` differences the **exact** `Dual2` jet along each `(θ, η)` axis,
 /// so the arithmetic is easy; what is easy to get *wrong* is the row-major index layout of
 /// four differently-shaped tensors. A transposed slice still produces plausible finite
@@ -2199,6 +2358,115 @@ fn provider_modeled_duration_inner_matches_outer() {
     }
 }
 
+const ONECPT_IV_LOGNORMAL: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The closed-form log-normal fallback's light η-only derivative
+/// (`lognormal_eta_derivatives_only`) must match the η-block of the full
+/// `lognormal_param_derivatives` bit-for-bit: it is a strict subset of the same
+/// `pk_i·sel_ik` formula, not a second implementation, and the inner EBE loop
+/// consumes only this block. Catches a mutation that silently drifts the two
+/// apart, or that reintroduces the discarded `dp_dtheta`/`d2p_deta2`/
+/// `d2p_detadtheta` computation `lognormal_eta_derivatives_only` exists to skip.
+#[test]
+fn lognormal_eta_derivatives_only_matches_full_dp_deta() {
+    let model = parse_model_string(ONECPT_IV_LOGNORMAL).expect("parse");
+    let subject = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[1.0, 4.0, 12.0],
+    );
+    let theta = [10.0_f64, 50.0];
+    let eta = [0.15_f64, -0.10];
+    let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+
+    let light = lognormal_eta_derivatives_only(&model, &pk);
+    let full = lognormal_param_derivatives(&model, &subject, &theta, &pk);
+
+    assert_eq!(light.len(), full.dp_deta.len());
+    for (l_row, f_row) in light.iter().zip(full.dp_deta.iter()) {
+        assert_eq!(l_row, f_row);
+    }
+}
+
+/// The closed-form light provider's per-subject `ObsGrad` scratch (`hint`) must
+/// never leak stale content into the result: handing back a corrupted,
+/// hint must reproduce exactly what a fresh `Vec::new()` call returns. Exercises
+/// both a differently-sized hint and the same-sized buffer used by ordinary BFGS
+/// iterations. Catches a reuse-in-place bug that forgets to overwrite a slot,
+/// forgets to re-zero `df_deta` before accumulating into it, or mishandles a
+/// hint longer than the subject's current observation count.
+#[test]
+fn subject_eta_grad_with_schedule_hint_reuse_is_bit_identical() {
+    let model = parse_model_string(ONECPT_IV_LOGNORMAL).expect("parse");
+    let subject = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[1.0, 4.0, 12.0],
+    );
+    let theta = [10.0_f64, 50.0];
+    let eta = [0.15_f64, -0.10];
+
+    let fresh = subject_eta_grad_with_schedule(&model, &subject, &theta, &eta, None, Vec::new())
+        .expect("closed-form light provider in scope");
+
+    // A corrupted, oversized hint: wrong values, wrong `df_deta` length, and one
+    // extra trailing `ObsGrad` past the subject's real observation count.
+    let mut dirty_hint = fresh.clone();
+    for o in dirty_hint.iter_mut() {
+        o.f = -999.0;
+        let n = o.df_deta.len();
+        o.df_deta = vec![-999.0; n + 3];
+    }
+    dirty_hint.push(ObsGrad {
+        f: 12345.0,
+        df_deta: vec![6789.0],
+    });
+
+    let reused = subject_eta_grad_with_schedule(&model, &subject, &theta, &eta, None, dirty_hint)
+        .expect("closed-form light provider in scope");
+
+    assert_eq!(fresh.len(), reused.len());
+    for (a, b) in fresh.iter().zip(reused.iter()) {
+        assert_eq!(a.f, b.f);
+        assert_eq!(a.df_deta, b.df_deta);
+    }
+
+    // The steady-state reuse path keeps every `df_deta` at exactly `n_eta`, so
+    // poison that same-length buffer and evaluate at a different eta. This
+    // specifically exercises `reset_zeroed`'s in-place zeroing branch and makes
+    // stale accumulation visible even when the prediction itself has changed.
+    let eta_next = [-0.20_f64, 0.25];
+    let fresh_next =
+        subject_eta_grad_with_schedule(&model, &subject, &theta, &eta_next, None, Vec::new())
+            .expect("closed-form light provider in scope");
+    let mut same_len_hint = reused;
+    for o in &mut same_len_hint {
+        o.f = -999.0;
+        o.df_deta.fill(-999.0);
+    }
+    let reused_next =
+        subject_eta_grad_with_schedule(&model, &subject, &theta, &eta_next, None, same_len_hint)
+            .expect("closed-form light provider in scope");
+
+    assert_eq!(fresh_next.len(), reused_next.len());
+    for (a, b) in fresh_next.iter().zip(reused_next.iter()) {
+        assert_eq!(a.f, b.f);
+        assert_eq!(a.df_deta, b.df_deta);
+    }
+}
+
 /// **Bit-parity cross-check vs the ODE twin.** The closed-form modeled-duration
 /// walk and the ODE `[odes]` modeled-duration walk (already analytic + NONMEM-
 /// anchored via #630/#635) are two independent implementations of the same
@@ -2721,6 +2989,81 @@ fn provider_modeled_distinct_slot_coincident_ends_decline() {
     );
 }
 
+/// **The provider's decline is parameter-dependent, so no fixed probe point can predict
+/// it** (#1154 / PR #1418 review, finding 1).
+///
+/// `provider_modeled_distinct_slot_coincident_ends_decline` above already shows the θ
+/// half: `TVD2 = 2` declines, `TVD2 = 3` is served. This pins the **η** half, which is the
+/// one that bites a diagnostic: with `D2 = TVD2 * exp(ETA_V1)` and `TVD1 = TVD2 = 2`, the
+/// two infusion ends coincide exactly at the prior mode `η = 0` and separate at any
+/// non-zero `ETA_V1` — so a subject that declines at `η = 0` is served at its EBE.
+///
+/// The consequence for #1154 is the whole reason
+/// `outer_optimizer::OuterFdDeclineLog` records declines at the evaluated point instead of
+/// probing: a zero-η probe would report "this subject used a finite-difference outer
+/// gradient" for a subject that never took one.
+#[test]
+fn provider_modeled_decline_depends_on_eta_not_only_on_the_records() {
+    const TWOCPT_IV_D2_ETA: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  theta TVD2(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  D1 = TVD1
+  D2 = TVD2 * exp(ETA_V1)
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = parse_model_string(TWOCPT_IV_D2_ETA).expect("parse");
+    let doses = vec![
+        DoseEvent::modeled(
+            0.0,
+            1000.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        ),
+        DoseEvent::modeled(
+            0.0,
+            800.0,
+            2,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        ),
+    ];
+    // Same obs times as the sibling test, for the same reason: never on a window end.
+    let subject = subject_with_doses_and_resets(doses, &[0.5, 1.5, 3.5], Vec::new());
+    let theta = [10.0, 50.0, 5.0, 100.0, 2.0, 2.0];
+
+    // η = 0 — `D2 = 2·exp(0) = 2 = D1`, both ends at t = 2, distinct slots ⇒ decline.
+    assert!(
+        subject_sensitivities(&model, &subject, &theta, &[0.0, 0.0]).is_none(),
+        "at the prior mode the two modeled windows coincide and the provider must decline"
+    );
+    // The same records at a non-zero `ETA_V1` — `D2 = 2·exp(0.4) ≈ 2.98`, ends separate
+    // ⇒ served. Nothing about the subject's data changed; only where it is evaluated.
+    assert!(
+        subject_sensitivities(&model, &subject, &theta, &[0.0, 0.4]).is_some(),
+        "away from the prior mode the ends separate and the provider must serve the SAME \
+         subject — a decline is therefore not a property of the records"
+    );
+}
+
 #[test]
 fn provider_2cpt_steady_state_matches_production() {
     // SS bolus (II=12) and SS oral (II=24) — exercises the *_ss_g branches.
@@ -3143,7 +3486,12 @@ fn provider_1cpt_reset_midinfusion_matches_production() {
 /// for an LTBS model the production predictor returns `ln(f)`, and the provider
 /// applies the matching `g = ln(f)` jet transform, so the same FD check covers
 /// the log-scale value, gradient, and Hessian.
-fn check_full_provider_vs_fd(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+pub(super) fn check_full_provider_vs_fd(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) {
     check_full_provider_vs_fd_with_step(model, subject, theta, eta, 1e-4);
 }
 
@@ -3271,6 +3619,43 @@ fn provider_matches_fd_of_production_predictor() {
     let model = parse_model_string(WARFARIN).expect("parse");
     let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
     check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+}
+
+/// A model with **no θ at all** on the TV-cov walk: the chunked outer walk (#1300) seeds
+/// its θ columns in chunks, and an empty column set must still run exactly one chunk of
+/// width `n_eta` — not zero chunks, which would return no `SubjectSens` and drop the
+/// subject to FD for no reason. Pinned against FD of the production predictor.
+#[test]
+fn tvcov_zero_theta_model_walks_one_empty_chunk() {
+    const NO_THETA: &str = r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = 0.2 * (WT / 70) * exp(ETA_CL)
+  V = 10 * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = parse_model_string(NO_THETA).expect("parse");
+    assert_eq!(model.n_theta, 0, "fixture must declare no theta");
+    let mut subject = oral_subject(&[1.0, 4.0, 8.0, 24.0]);
+    subject.covariates = HashMap::from([("WT".to_string(), 70.0)]);
+    subject.obs_covariates = [70.0, 80.0, 90.0, 95.0]
+        .iter()
+        .map(|&w| HashMap::from([("WT".to_string(), w)]))
+        .collect();
+    subject.dose_covariates = vec![HashMap::from([("WT".to_string(), 70.0)])];
+    assert!(subject.has_tv_covariates());
+    assert!(subject_routes_to_event_walk(&model, &subject));
+    assert!(
+        subject_sensitivities(&model, &subject, &[], &[0.1, -0.05]).is_some(),
+        "an empty θ set must still walk one chunk"
+    );
+    check_full_provider_vs_fd(&model, &subject, &[], &[0.1, -0.05]);
 }
 
 // ── #860 Phase A6: closed-form MR analytic gradient ──────────────────────────
@@ -4049,7 +4434,7 @@ fn synthetic_readout_params_stay_out_of_user_facing_output() {
             }),
             "[{label}] a parser-internal parameter must not reach FitResult.eta_param_info"
         );
-        if let Some(w) = crate::api::saem_non_mu_referenced_individual_params_warning(&m) {
+        if let Some(w) = crate::api::saem_non_mu_referenced_individual_params_warning(&m, &[]) {
             assert!(
                 !w.contains("__ferx_ro_"),
                 "[{label}] the mu-referencing warning must not name a parameter the user \
@@ -4890,6 +5275,35 @@ fn provider_lagtime_matches_production() {
     }
 }
 
+/// A closed-form event walk must carry a lagged SS bolus's previous-cycle tail
+/// from the dose record to its arrival while WT changes inside that window. This
+/// makes the record-time phase seed and the following event-walk propagation both
+/// live, so agreement covers the value, gradient, and Hessian rather than the
+/// flat-covariate cancellation case.
+#[test]
+fn closed_form_event_walk_ss_bolus_lag_matches_production() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
+    let subject = tvcov_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+        &[70.0],
+        &[0.25, 0.5, 1.0, 2.0, 6.0],
+        &[70.0, 76.0, 84.0, 66.0, 92.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+
+    assert!(subject.has_tv_covariates());
+    assert!(subject_routes_to_event_walk(&model, &subject));
+    assert!(!ss_lagtime_walk_unsupported(&model, &subject));
+    check_full_provider_vs_fd(
+        &model,
+        &subject,
+        &[0.22, 11.0, 1.4, 0.75, 0.8],
+        &[0.12, -0.08, 0.15, 0.10],
+    );
+}
+
 /// Reset + lagtime: a dose recorded *before* a reset but *arriving after* it
 /// (via lagtime) must contribute to the post-reset segment, exactly as the
 /// production event-driven walk applies it. The reset exclusion keys on the
@@ -5560,25 +5974,28 @@ fn lagtime_with_fixed_infusion_matches_fd_of_production() {
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
-/// **SS × lagtime still declines to FD**, per-subject. Production loads the periodic
-/// trough at the dose *record*, at phase `II − ALAG`, and lets the walk carry it to the
-/// lagged arrival (#1121, `ss_state_at_phase_event_driven` at `EventKind::DoseRecord`);
-/// the closed-form dual walk has no twin of that seed and still equilibrates at the
-/// arrival, so serving this would disagree with production in *value*, not just in
-/// derivative. Deliberately a hard decline, not an approximation — a lagged non-SS
-/// subject on the same model stays analytic.
+/// **SS bolus × lagtime × live TV covariate is analytic.** Production loads the periodic
+/// state at the dose record and the dual walk mirrors that seed, then propagates it under
+/// each subsequent WT snapshot until the lagged arrival. This is the non-flat-covariate
+/// route the old FD fallback protected.
 ///
-/// The decline predates #1121 and survives it: before, production patched the
-/// pre-arrival *predictions* in a post-hoc pass the dual had no twin for; now it seeds
-/// the *state* and the dual has no twin for that. Same gap, different construct.
+/// The observations **straddle** the lagged arrival deliberately, and the straddle is
+/// asserted so it cannot decay into a tautology. For `lag <= II` the seed-then-flow is
+/// algebraically the identity with re-equilibrating at the arrival
+/// (`dosing::ss_arrival_is_trough`), so a purely post-arrival sample set would pass
+/// unchanged under the *old* behaviour and only the two `is_some()` assertions could fail.
+/// `t = 0.3` sits inside the pre-arrival tail, where the seed is the whole answer. Measured:
+/// with the pre-#1311 path restored (no record seed, re-equilibrate at the arrival) the
+/// post-arrival-only sample set `[1.0, 4.0, 9.0]` passes green and only the `is_some()`
+/// assertions could fail; adding `0.3` turns the same mutation red.
 #[test]
-fn lagtime_with_ss_dose_declines_to_fd() {
+fn lagtime_with_ss_bolus_uses_analytic_sensitivities() {
     let model = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
     let ss = tvcov_subject(
         vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
         &[70.0],
-        &[1.0, 4.0, 9.0],
-        &[70.0, 74.0, 78.0],
+        &[0.3, 1.0, 4.0, 9.0],
+        &[70.0, 72.0, 74.0, 78.0],
         Vec::new(),
         Vec::new(),
         &[],
@@ -5586,14 +6003,52 @@ fn lagtime_with_ss_dose_declines_to_fd() {
     assert!(ss.doses.iter().any(|d| d.ss));
     let theta = [0.22, 11.0, 1.4, 0.7, 0.8];
     let eta = [0.12, -0.08, 0.15, 0.10];
+    let lag = theta[3] * eta[3].exp();
     assert!(
-        subject_sensitivities(&model, &ss, &theta, &eta).is_none(),
-        "SS + lagtime on the walk must decline to FD (no dual twin of the SS record-time seed)"
+        ss.obs_times[0] < lag && *ss.obs_times.last().unwrap() > lag,
+        "fixture must straddle the lagged arrival at {lag}: pre-arrival samples are the \
+         only ones that can see the record-time seed"
     );
     assert!(
-        subject_eta_grad(&model, &ss, &theta, &eta).is_none(),
-        "inner must decline in lockstep with the outer (no split scope)"
+        lag <= ss.doses[0].ii,
+        "this fixture is the unclamped branch; the clamp has its own test"
     );
+    assert!(
+        subject_sensitivities(&model, &ss, &theta, &eta).is_some(),
+        "SS bolus + lagtime on the walk must use the record-time dual seed"
+    );
+    assert!(
+        subject_eta_grad(&model, &ss, &theta, &eta).is_some(),
+        "inner must use the same SS-bolus route as the outer provider"
+    );
+    check_full_provider_vs_fd(&model, &ss, &theta, &eta);
+}
+
+/// Production clamps a lagged SS record phase to zero for `ALAG ≥ II`, retaining the
+/// post-pulse peak rather than flowing the system backward. The live WT snapshots keep the
+/// event walk non-flat, and the lag is well above II so central FD does not straddle the kink.
+#[test]
+fn ss_bolus_lag_at_least_interval_matches_production() {
+    let source = ONECPT_ORAL_LAG_TVCOV.replace("TVLAG(0.75, 0.01, 5.0)", "TVLAG(15.0, 0.01, 30.0)");
+    let model = parse_model_string(&source).expect("parse long-lag TV-cov model");
+    let subject = tvcov_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+        &[70.0],
+        &[0.25, 2.0, 6.0, 11.0, 14.0, 18.0],
+        &[70.0, 76.0, 84.0, 66.0, 92.0, 80.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    let theta = [0.22, 11.0, 1.4, 15.0, 0.8];
+    let eta = [0.12, -0.08, 0.15, 0.0];
+    let lag = theta[3] * eta[3].exp();
+    assert!(
+        lag > subject.doses[0].ii,
+        "fixture must take the clamped phase branch"
+    );
+    assert!(subject_sensitivities(&model, &subject, &theta, &eta).is_some());
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
 /// An observation sampled **exactly at a lagged bolus arrival** gets the one-sided analytic
@@ -5730,6 +6185,141 @@ const ONECPT_TRANSIT_MODEL: &str = r#"
 [fit_options]
   method = focei
 "#;
+
+/// The mixed analytic closed-form walk must retain every output bit from the
+/// full `Dual2` walk. The program orders rows alphabetically (`CL, MTT, NTR, V`),
+/// so the two IIV rows (`CL`, `V`) require the non-trivial permutation
+/// `[0, 2, 3, 1]`; this exercises both retained η-η and η-θ Hessian blocks while
+/// dropping the IIV-free `MTT/NTR` square block (issue #829).
+#[test]
+fn analytic_transit_mixed_matches_full_dual2_bit_for_bit() {
+    let model = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
+    let subject = subject_with_doses_and_resets(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 80.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.5, 2.0, 8.0, 12.5, 16.0, 24.0],
+        Vec::new(),
+    );
+    let theta = [5.0, 50.0, 1.0, 3.0];
+    let eta = [0.1, -0.05];
+    let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+    let (pd, slots) = resolve_param_derivs(&model, &subject, &theta, &eta, &pk).expect("pd");
+    assert_eq!(slots.len(), 4);
+
+    let full_seed = seed_dim_from_slots(&slots);
+    let full = run_obs::<4, 4, false>(
+        &full_seed,
+        &pk,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        None,
+        &subject,
+        &pd,
+        None,
+        model.n_eta,
+        model.n_theta,
+        None,
+    );
+
+    let mut is_iiv = [false; 4];
+    for i in 0..4 {
+        is_iiv[i] = pd.dp_deta[i].iter().any(|&v| v != 0.0);
+    }
+    assert_eq!(is_iiv, [true, false, false, true]);
+    let axis_of = [0, 2, 3, 1];
+    let mixed_seed = seed_dim_from_slots_with_axes(&slots, &axis_of);
+    let mixed = run_obs::<2, 4, true>(
+        &mixed_seed,
+        &pk,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        None,
+        &subject,
+        &pd,
+        Some((&axis_of, &is_iiv)),
+        model.n_eta,
+        model.n_theta,
+        None,
+    );
+    MIXED_ANALYTIC_RUNS.with(|runs| runs.set(0));
+    subject_sensitivities(&model, &subject, &theta, &eta).expect("dispatcher serves transit");
+    MIXED_ANALYTIC_RUNS.with(|runs| {
+        assert_eq!(runs.get(), 1);
+    });
+
+    assert_eq!(full.len(), mixed.len());
+    for (obs_i, (a, b)) in full.iter().zip(&mixed).enumerate() {
+        let assert_bits = |lhs: &[f64], rhs: &[f64], field: &str| {
+            assert_eq!(
+                lhs.len(),
+                rhs.len(),
+                "{field} length at observation {obs_i}"
+            );
+            for (i, (&x, &y)) in lhs.iter().zip(rhs).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{field}[{i}] at observation {obs_i}: {x:.17e} != {y:.17e}"
+                );
+            }
+        };
+        assert_eq!(a.f.to_bits(), b.f.to_bits(), "f at observation {obs_i}");
+        assert_bits(&a.df_deta, &b.df_deta, "df_deta");
+        assert_bits(&a.d2f_deta2, &b.d2f_deta2, "d2f_deta2");
+        assert_bits(&a.df_dtheta, &b.df_dtheta, "df_dtheta");
+        assert_bits(&a.d2f_deta_dtheta, &b.d2f_deta_dtheta, "d2f_deta_dtheta");
+    }
+}
+
+/// A lagtime disables the hand-written explicit kernel, so this ordinary oral
+/// model exercises the broadened generic-walk eligibility rather than the
+/// transit/IG-specific route that originally motivated issue #829.
+#[test]
+fn analytic_lagtime_generic_walk_uses_mixed_hessian() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.4, 0.0, 4.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+  LAGTIME = TVLAG
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+    )
+    .expect("parse lagtime model");
+    let subject = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[0.5, 1.0, 2.0, 4.0, 8.0],
+    );
+
+    MIXED_ANALYTIC_RUNS.with(|runs| runs.set(0));
+    subject_sensitivities(&model, &subject, &[5.0, 50.0, 1.0, 0.4], &[0.1, -0.05])
+        .expect("lagtime generic walk is analytic");
+    MIXED_ANALYTIC_RUNS.with(|runs| assert_eq!(runs.get(), 1));
+}
 
 /// A `one_cpt_transit` subject with time-varying covariates is served by the model's ODE
 /// `transit()` equivalent (`effective_for` routes it there), NOT the closed form — the
@@ -6199,6 +6789,87 @@ fn lagtime_iov_walk_matches_fd_of_predict_iov() {
         &[0.22, 11.0, 1.4, 0.7],
         &[0.12, -0.08, 0.06, -0.09],
     );
+}
+
+/// An IOV subject whose **first dose is a steady-state bolus** with a lagtime, sampled on
+/// both sides of that dose's lagged arrival. `t = 0.3` is inside the pre-arrival tail (the
+/// occasion-1 lag is `0.7·e^{0.06} ≈ 0.743`), which is the only place the record-time seed
+/// is observable on its own: for `lag <= II` seeding then flowing to the arrival is the
+/// identity with re-equilibrating there (`dosing::ss_arrival_is_trough`).
+fn ss_bolus_lag_iov_subject() -> Subject {
+    let obs_times = vec![0.3, 1.0, 6.0, 25.0, 30.0, 36.0];
+    let occasions = vec![1u32, 1, 1, 2, 2, 2];
+    let n = obs_times.len();
+    Subject {
+        id: "1".to_string(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times,
+        obs_raw_times: Vec::new(),
+        observations: vec![1.0; n],
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions,
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// **SS bolus × lagtime on the IOV walk** (#1311). `ss_lagtime_walk_unsupported` guards all
+/// four walk entry points, so widening it admits `subject_sensitivities_iov` /
+/// `subject_eta_grad_iov_analytical` alongside the TV-covariate pair — and the IOV arm is
+/// the one where `pk_at_dose[k]` is an *occasion* snapshot rather than a covariate one,
+/// which is exactly the class of defect #1079 was. The TV-cov fixtures cannot observe it:
+/// they never enter this walk.
+///
+/// The κ sits on the lag itself, so the seed phase `II − ALAG` carries an occasion-specific
+/// jet and occasion 2's dose arrives at a different offset than occasion 1's.
+///
+/// **What this fixture can and cannot observe** (measured, not assumed). Disabling the
+/// `DoseRecord` seed reddens it — that is the regression it exists to catch, and the reason
+/// `t = 0.3` is sampled. Dropping the *arrival-side* suppression does **not** redden it, and
+/// cannot: this subject has flat covariates, so `dosing::ss_arrival_is_trough` makes
+/// re-equilibrating at the arrival algebraically identical to flowing the seed there, and the
+/// pre-arrival sample is taken before that event either way. That half of the shared
+/// `dosing::ss_bolus_seeded_at_record` predicate is covered by the three TV-covariate tests
+/// above, where a live WT snapshot breaks the identity — all three redden on it.
+#[test]
+fn ss_bolus_lagtime_iov_walk_matches_fd_of_predict_iov() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_IOV).expect("parse IOV + lag");
+    let subject = ss_bolus_lag_iov_subject();
+    assert_eq!(model.n_kappa, 1);
+    assert!(model.has_lagtime());
+    let ss_dose = &subject.doses[0];
+    assert!(
+        ss_dose.ss && ss_dose.ii > 0.0 && ss_dose.rate <= 0.0,
+        "fixture must be the SS *bolus* case the dual seed serves"
+    );
+    assert!(
+        !ss_lagtime_walk_unsupported(&model, &subject),
+        "an SS bolus + lagtime must no longer decline the IOV walk to FD"
+    );
+    assert!(iov_analytical_supported(&model));
+    // stacked = [η_cl, η_v, κ_lag(occ1), κ_lag(occ2)].
+    let theta = [0.22, 11.0, 1.4, 0.7];
+    let stacked = [0.12, -0.08, 0.06, -0.09];
+    let lag_occ1 = theta[3] * stacked[2].exp();
+    assert!(
+        subject.obs_times[0] < lag_occ1 && lag_occ1 < ss_dose.ii,
+        "fixture must sample the pre-arrival tail on the unclamped branch (lag {lag_occ1})"
+    );
+    check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
 }
 
 // 1-cpt IV closed-form IOV with an `init(central) = TVC0·V` baseline (#486, branch
@@ -9337,7 +10008,6 @@ fn ode_iov_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
   theta TVF(0.7, 0.05, 1.0)
   omega ETA_CL ~ 0.09
   omega ETA_V ~ 0.09
-  iov_column OCC
   kappa KAPPA_CL ~ 0.04
   sigma PROP_ERR ~ 0.04 (sd)
 [individual_parameters]
@@ -9353,6 +10023,7 @@ fn ode_iov_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
+  iov_column = OCC
   ode_reltol = 1e-10
   ode_abstol = 1e-12
 "#;
@@ -9529,7 +10200,6 @@ fn ode_iov_ss_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
   theta TVF(0.7, 0.05, 1.0)
   omega ETA_CL ~ 0.09
   omega ETA_V ~ 0.09
-  iov_column OCC
   kappa KAPPA_CL ~ 0.04
   sigma PROP_ERR ~ 0.04 (sd)
 [individual_parameters]
@@ -9545,6 +10215,7 @@ fn ode_iov_ss_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
+  iov_column = OCC
   ode_reltol = 1e-10
   ode_abstol = 1e-12
 "#;
@@ -12009,4 +12680,162 @@ fn provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose() {
     );
 
     check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+}
+
+// ── #1339: θ-column chunking on the closed-form IOV outer walk ───────────────
+//
+// `subject_sensitivities_iov` walks its θ columns in chunks of
+// `MAX_TVCOV_AXES − n_stacked` (the IOV twin of the #1300 TV-cov chunking). The three
+// tests below pin the non-NN faces of that: a wide plain IOV model that needs two chunks
+// (the loop and the column merge, against FD), the stacked block filling the cap on its
+// own (no room for a θ column → decline), and a model with no θ at all (exactly one
+// empty chunk, not zero chunks).
+
+/// 2-cpt oral with κ on every PK parameter: `n_eff = 2 + 5`, so a subject with `K`
+/// occasions stacks `2 + 5K` axes next to 5 θ columns — 27 for `K = 4` (two chunks),
+/// 27 stacked alone for `K = 5` (no room for a θ column).
+const TWOCPT_ORAL_FIVE_KAPPA_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV1(10.0, 0.1, 500.0)
+  theta TVQ(0.1, 0.001, 10.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  kappa KAPPA_V1 ~ 0.02
+  kappa KAPPA_Q ~ 0.02
+  kappa KAPPA_V2 ~ 0.02
+  kappa KAPPA_KA ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V1 = TVV1 * exp(ETA_V1 + KAPPA_V1)
+  Q  = TVQ  * exp(KAPPA_Q)
+  V2 = TVV2 * exp(KAPPA_V2)
+  KA = TVKA * exp(KAPPA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+/// `k` occasions 24 h apart, one oral bolus and two observations each — every later dose
+/// lands with residual drug present.
+fn iov_subject_with_occasions(k: usize) -> Subject {
+    let mut doses = Vec::with_capacity(k);
+    let mut obs_times = Vec::with_capacity(2 * k);
+    let mut occasions = Vec::with_capacity(2 * k);
+    let mut dose_occasions = Vec::with_capacity(k);
+    for g in 0..k {
+        let t0 = 24.0 * g as f64;
+        doses.push(DoseEvent::new(t0, 100.0, 1, 0.0, false, 0.0));
+        obs_times.push(t0 + 2.0);
+        obs_times.push(t0 + 8.0);
+        occasions.push((g + 1) as u32);
+        occasions.push((g + 1) as u32);
+        dose_occasions.push((g + 1) as u32);
+    }
+    let n = obs_times.len();
+    Subject {
+        id: "1".to_string(),
+        doses,
+        obs_times,
+        obs_raw_times: Vec::new(),
+        observations: vec![1.0; n],
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions,
+        obs_l2: Vec::new(),
+        dose_occasions,
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// A plain (no-network) IOV model whose `n_theta + n_stacked` exceeds the 24-axis walk is
+/// served in two θ-column chunks and matches FD of `predict_iov` on all four blocks.
+/// Before #1339 this subject fell to FD (`const_dispatch!` miss at width 27).
+#[test]
+fn iov_walk_chunks_theta_columns_for_a_wide_plain_model() {
+    let model = parse_model_string(TWOCPT_ORAL_FIVE_KAPPA_IOV).expect("parse");
+    assert_eq!((model.n_theta, model.n_eta, model.n_kappa), (5, 2, 5));
+    assert!(iov_analytical_supported(&model));
+    let subject = iov_subject_with_occasions(4);
+    let n_st = model.n_eta + 4 * model.n_kappa;
+    assert!(
+        model.n_theta + n_st > MAX_TVCOV_AXES,
+        "fixture must exceed the single-chunk width"
+    );
+    let stacked: Vec<f64> = (0..n_st)
+        .map(|i| 0.15 * ((i as f64) * 0.9 + 0.4).sin())
+        .collect();
+    check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0, 0.1, 20.0, 1.5], &stacked);
+}
+
+/// When the stacked `[η, κ]` block alone fills the cap there is no room for a θ column:
+/// the walk declines (→ FD for that subject) rather than dispatch a zero-width chunk.
+#[test]
+fn iov_walk_declines_when_the_stacked_block_fills_the_cap() {
+    let model = parse_model_string(TWOCPT_ORAL_FIVE_KAPPA_IOV).expect("parse");
+    let subject = iov_subject_with_occasions(5);
+    let n_st = model.n_eta + 5 * model.n_kappa;
+    assert!(
+        n_st >= MAX_TVCOV_AXES,
+        "fixture must fill the cap with stacked axes"
+    );
+    assert!(
+        subject_sensitivities_iov(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.1, 20.0, 1.5],
+            &vec![0.0; n_st]
+        )
+        .is_none(),
+        "no θ column fits beside {n_st} stacked axes; the walk must decline"
+    );
+}
+
+/// A model with **no θ at all** on the IOV walk: the empty column set must still run
+/// exactly one chunk of width `n_stacked`, not zero chunks. Pinned against FD.
+#[test]
+fn iov_zero_theta_model_walks_one_empty_chunk() {
+    const NO_THETA_IOV: &str = r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = 0.2 * exp(ETA_CL + KAPPA_CL)
+  V  = 10 * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+    let model = parse_model_string(NO_THETA_IOV).expect("parse");
+    assert_eq!(model.n_theta, 0, "fixture must declare no theta");
+    assert!(iov_analytical_supported(&model));
+    let subject = iov_subject();
+    assert!(
+        subject_sensitivities_iov(&model, &subject, &[], &[0.1, -0.05, 0.04, -0.03]).is_some(),
+        "an empty θ set must still walk one chunk"
+    );
+    check_iov_provider_vs_fd(&model, &subject, &[], &[0.1, -0.05, 0.04, -0.03]);
 }

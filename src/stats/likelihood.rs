@@ -27,28 +27,6 @@ fn model_predictions(
     pk::compute_predictions_with_tv(model, subject, theta, eta)
 }
 
-/// Caller-owned-scratch variant of [`model_predictions`] that also
-/// accepts an optional pre-built
-/// [`pk::event_driven::EventSchedule`]. Used by FOCE inner-loop callers
-/// (BFGS line search, post-convergence eval) that build the schedule
-/// once per `find_ebe` call and reuse it across many `(theta, eta)`
-/// evaluations of the same subject. SAEM and other callers pass `None`
-/// — the no-TV fast path doesn't consume the schedule, and the
-/// dispatcher falls back to building one on demand on the TV path.
-#[inline]
-fn model_predictions_into_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-) -> Vec<f64> {
-    pk::compute_predictions_with_tv_into_with_schedule(
-        model, subject, theta, eta, scratch, schedule,
-    )
-}
-
 #[inline]
 pub(crate) fn m3_logcdf(limit: f64, f: f64, sd: f64, cens: i8) -> f64 {
     let z = if cens < 0 {
@@ -221,6 +199,9 @@ pub(crate) struct JointPkTteSolve {
     chz_states: Vec<Vec<f64>>,
     /// PK-parameter snapshot used for the solve — reused to evaluate `h = dCHZ/dt`.
     pk_values: Vec<f64>,
+    /// Extended parameter snapshots aligned to `times`, including the dose-time anchors
+    /// the RHS reads when evaluating `h = dCHZ/dt` (#1261).
+    rhs_params: Vec<[f64; crate::types::MAX_PK_PARAMS + 2]>,
 }
 
 /// Build the shared joint PK-TTE solve, but only when it is provably equivalent to
@@ -317,6 +298,20 @@ fn try_joint_pktte_shared_solve(
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let (mut preds, chz_states) =
         crate::ode::ode_predictions_and_chz(ode, &pk.values, theta, eta, subject, &times);
+    let dose_lagtimes = crate::ode::predictions::dose_lagtimes_for(subject, ode, &pk.values);
+    let first_dose_time = crate::ode::predictions::earliest_dose_time(&subject.doses);
+    let rhs_params = times
+        .iter()
+        .map(|&t| {
+            crate::ode::predictions::rhs_ext_params_at(
+                &subject.doses,
+                &dose_lagtimes,
+                first_dose_time,
+                &pk.values,
+                t,
+            )
+        })
+        .collect();
     // Apply exactly the post-processing the standalone no-TV ODE prediction path does
     // (compute_predictions_with_tv_into_with_schedule): init impulse, [scaling], LTBS.
     // No-op for Form-C / no-init / linear-scale models; FREM is excluded by the guard.
@@ -329,6 +324,7 @@ fn try_joint_pktte_shared_solve(
         times,
         chz_states,
         pk_values: pk.values.to_vec(),
+        rhs_params,
     })
 }
 
@@ -357,7 +353,7 @@ fn tte_ode_nll_from_shared(
             continue;
         }
         cum[i] = st[chz_state];
-        (ode.rhs)(st, &share.pk_values, t, &mut du);
+        (ode.rhs)(st, &share.rhs_params[i], t, &mut du);
         haz[i] = du[chz_state];
     }
     let tol = crate::survival::MonoTol::from_solver(&ode.effective_solver_opts());
@@ -495,6 +491,49 @@ pub fn individual_nll_into_with_schedule(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
+    let err_keys = model.error_spec.obs_keys(subject);
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let mut pred_recycle = Vec::new();
+    let mut eta_work = DVector::zeros(eta.len());
+    let mut prior_work = DVector::zeros(eta.len());
+    individual_nll_into_prepared_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        residual_correlations,
+        scratch,
+        schedule,
+        err_keys.as_ref(),
+        ruv_mult.as_deref(),
+        &mut pred_recycle,
+        &mut eta_work,
+        &mut prior_work,
+    )
+}
+
+/// Inner-loop form of [`individual_nll_into_with_schedule`] with subject-static
+/// residual dispatch and magnitude inputs prepared by the caller, plus a
+/// caller-owned prediction vector reused across objective evaluations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_into_prepared_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    err_keys: &[usize],
+    ruv_mult: Option<&[Vec<f64>]>,
+    pred_recycle: &mut Vec<f64>,
+    eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>,
+) -> f64 {
     // Ω⁻¹ and log|Ω| are pre-computed in `OmegaMatrix::from_matrix_*`.
     // Hot-path users (FOCE inner BFGS, SAEM MH) call this 100s–1000s of
     // times per subject per outer iter — recomputing Cholesky+inverse
@@ -504,12 +543,10 @@ pub fn individual_nll_into_with_schedule(
     }
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-
     // Eta prior: eta' * Omega_inv * eta
-    let eta_vec = DVector::from_column_slice(eta);
-    let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
+    eta_work.as_mut_slice().copy_from_slice(eta);
+    prior_work.gemv(1.0, omega_inv, eta_work, 0.0);
+    let eta_prior = eta_work.dot(prior_work);
 
     // #570: a joint PK-TTE subject otherwise integrates the augmented PK+CHZ system
     // twice per eval (Gaussian preds, then `ode_cumhaz_hazard` for `H`/`h`). When the
@@ -523,11 +560,27 @@ pub fn individual_nll_into_with_schedule(
     // on the no-TV fast path).
     #[cfg(feature = "survival")]
     let preds = match &joint_share {
-        Some(s) => s.preds.clone(),
-        None => model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule),
+        Some(s) => {
+            pred_recycle.clear();
+            pred_recycle.extend_from_slice(&s.preds);
+            pred_recycle
+        }
+        None => {
+            let hint = std::mem::take(pred_recycle);
+            *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+                model, subject, theta, eta, scratch, schedule, hint,
+            );
+            pred_recycle
+        }
     };
     #[cfg(not(feature = "survival"))]
-    let preds = model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule);
+    let preds = {
+        let hint = std::mem::take(pred_recycle);
+        *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+            model, subject, theta, eta, scratch, schedule, hint,
+        );
+        pred_recycle
+    };
     // For SDE models, compute per-observation EKF process-noise variance and
     // add it to the residual variance to form V_total.
     let p_obs = if model.is_sde() {
@@ -540,10 +593,6 @@ pub fn individual_nll_into_with_schedule(
     // Does not touch FREM covariate pseudo-observations (handled below before
     // this factor is applied) or the EKF process noise `p_obs`.
     let ruv_scale = model.residual_var_scale(eta);
-    // Per-observation custom residual magnitude (#484), evaluated once here (it
-    // is η-independent) and shared with the diagonal and dense paths so the EBE
-    // objective matches the outer OFV's variance.
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
     let mut data_ll = 0.0;
     let has_censored_m3 =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
@@ -557,7 +606,7 @@ pub fn individual_nll_into_with_schedule(
             residual_correlations,
             ruv_scale,
             &p_obs,
-            ruv_mult.as_deref(),
+            ruv_mult,
         ) {
             Some(term) => data_ll += term,
             None => return 1e20,
@@ -599,7 +648,7 @@ pub fn individual_nll_into_with_schedule(
                 err_keys[j],
                 f_pred,
                 sigma_values,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ruv_mult.and_then(|m| m.get(j)).map(Vec::as_slice),
             ) * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
@@ -897,11 +946,6 @@ fn ekf_p_obs(
         |f_pred| crate::stats::residual_error::residual_variance(error_model, f_pred, sigma_values),
     );
     p_obs
-}
-
-/// Log-determinant of Omega via Cholesky: log|Omega| = 2 * sum(log(L_ii))
-fn omega_log_det(omega: &OmegaMatrix) -> f64 {
-    chol_log_det(&omega.chol)
 }
 
 /// FOCE per-subject negative log-likelihood.
@@ -2498,12 +2542,12 @@ pub fn individual_nll_iov(
 /// Inner-loop sibling that retains per-event PK buffer capacity across trial
 /// eta/kappa values. The public convenience function keeps its original API.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn individual_nll_iov_with_scratch(
+pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-    kappas: &[Vec<f64>],
+    kappas: &[K],
     omega: &OmegaMatrix,
     omega_iov: Option<&OmegaMatrix>,
     sigma_values: &[f64],
@@ -2514,29 +2558,30 @@ pub(crate) fn individual_nll_iov_with_scratch(
     }
 
     // BSV eta prior
-    let omega_inv = match omega.matrix.clone().cholesky() {
-        Some(chol) => chol.inverse(),
-        None => return 1e20,
-    };
-    let log_det_omega = omega_log_det(omega);
+    let omega_inv = &omega.inv;
+    let log_det_omega = omega.log_det;
     let eta_vec = DVector::from_column_slice(eta);
-    let eta_prior = eta_vec.dot(&(&omega_inv * &eta_vec));
+    let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
 
     // Kappa priors and IOV log-det
     let (iov_inv, log_det_iov) = if let Some(iov) = omega_iov {
-        let inv = match iov.matrix.clone().cholesky() {
-            Some(chol) => chol.inverse(),
-            None => return 1e20,
-        };
-        (inv, omega_log_det(iov))
+        (&iov.inv, iov.log_det)
     } else {
-        (DMatrix::identity(1, 1), 0.0) // unreachable when kappas non-empty
+        // Guaranteed unreachable: the only caller path that admits `omega_iov: None` is
+        // `kappas.is_empty()`, which returns above before this point. `1e20` is a defensive
+        // sentinel, not a real score — loud in debug/test builds so a future caller that
+        // violates the invariant fails here rather than silently scoring a fabricated NLL.
+        debug_assert!(
+            false,
+            "individual_nll_iov_with_scratch: omega_iov is None with kappas non-empty"
+        );
+        return 1e20;
     };
 
     let mut kappa_prior = 0.0;
     for kap in kappas {
-        let kap_vec = DVector::from_column_slice(kap);
-        kappa_prior += kap_vec.dot(&(&iov_inv * &kap_vec));
+        let kap_vec = DVector::from_column_slice(kap.as_ref());
+        kappa_prior += kap_vec.dot(&(iov_inv * &kap_vec));
     }
     let k_occasions = kappas.len();
 
@@ -2635,6 +2680,8 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
+            priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "test".into(),
             pk_model: PkModel::OneCptIv,
@@ -2678,6 +2725,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
             eta_map: vec![0],
@@ -2790,6 +2838,54 @@ mod tests {
         let nonmem_ofv = 0.691_015_142_109_431_8;
         let ferx_ofv = -4.0 * upper;
         assert!((ferx_ofv - nonmem_ofv).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prepared_inner_nll_reuse_is_bit_identical() {
+        let model = make_model();
+        let subject = make_simple_subject();
+        let theta = [5.0, 50.0];
+        let eta = [0.17];
+        let omega = make_omega(0.09);
+        let sigma = [0.05];
+        let expected = individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            &theta,
+            &eta,
+            &omega,
+            &sigma,
+            &[],
+            &mut pk::EventPkParams::default(),
+            None,
+        );
+
+        let err_keys = model.error_spec.obs_keys(&subject);
+        let mult = model.ruv_obs_mult(&subject, &theta);
+        let mut event_scratch = pk::EventPkParams::default();
+        let mut predictions = vec![-999.0; subject.obs_times.len()];
+        let mut eta_work = DVector::from_element(model.n_eta, -999.0);
+        let mut prior_work = DVector::from_element(model.n_eta, -999.0);
+        let reused = individual_nll_into_prepared_with_schedule(
+            &model,
+            &subject,
+            &theta,
+            &eta,
+            &omega,
+            &sigma,
+            &[],
+            &mut event_scratch,
+            None,
+            err_keys.as_ref(),
+            mult.as_deref(),
+            &mut predictions,
+            &mut eta_work,
+            &mut prior_work,
+        );
+
+        assert_eq!(expected.to_bits(), reused.to_bits());
+        assert_eq!(predictions.len(), subject.obs_times.len());
+        assert!(predictions.iter().all(|v| v.is_finite()));
     }
 
     #[test]
@@ -3051,6 +3147,19 @@ mod tests {
             Some(&omega_iov),
             &sigma,
         );
+        let borrowed: Vec<&[f64]> = kappas.iter().map(Vec::as_slice).collect();
+        let reused = individual_nll_iov_with_scratch(
+            &model,
+            &subj,
+            &theta,
+            &eta,
+            &borrowed,
+            &omega,
+            Some(&omega_iov),
+            &sigma,
+            &mut pk::EventPkParams::default(),
+        );
+        assert_eq!(iov.to_bits(), reused.to_bits());
         // Kappa prior is positive → IOV NLL should differ from base
         assert!(
             (iov - base).abs() > 1e-6,
@@ -4151,6 +4260,43 @@ mod tests {
         .expect("joint PK-TTE model must parse")
     }
 
+    /// Plain no-TV `[odes]` block (does not itself read `TAD`) plus an `OdeAccumulated`
+    /// hazard that does — the exact model shape `try_joint_pktte_shared_solve`'s
+    /// `model_uses_time_anywhere` guard admits to the #570 shared solve, since that
+    /// check is scoped to the PK program and does not inspect the injected
+    /// `d/dt(__chz_*)` hazard line. Shared by the two tests below: one exercising
+    /// `tte_endpoint_nll` / `ode_cumhaz_hazard` directly, the other the production
+    /// `individual_nll_into_with_schedule` entry point FOCE/FOCEI actually calls.
+    #[cfg(feature = "survival")]
+    fn tad_hazard_two_dose_model() -> CompiledModel {
+        use crate::parser::model_parser::parse_model_string;
+        parse_model_string(
+            r"
+[parameters]
+theta TVCL(1.0, 0.01, 100.0)
+theta TVV(10.0, 0.1, 500.0)
+theta TVH0(0.1, 0.001, 10.0)
+theta TVKT(0.01, 0.0001, 1.0)
+sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+CL = TVCL
+V = TVV
+H0 = TVH0
+KT = TVKT
+[structural_model]
+ode(obs_cmt=central, states=[central])
+[odes]
+d/dt(central) = -CL / V * central
+[event_model]
+cmt = 3
+hazard = H0 * (1.0 + KT * TAD)
+[error_model]
+DV ~ proportional(PROP_ERR)
+",
+        )
+        .expect("TAD-reading ODE hazard must parse")
+    }
+
     /// A joint PK-TTE subject whose first record is a dose at **t = 10** — so the
     /// integration starts at 10 and a TTE time below it is genuinely pre-start.
     ///
@@ -4160,6 +4306,185 @@ mod tests {
     /// `t_last ≥ subject_integration_start` and so routes the pre-start read through the
     /// engines' pre-first-break **fill** rather than through the `k = 0` boundary visit
     /// that covers a degenerate every-time-before-the-dose timeline (#1218).
+    /// #1261: a TTE hazard readout must receive the dose-time anchors the ODE
+    /// integration used. A bare `PkParams::values` slice made TAD NaN, which the
+    /// scorer converted into its finite 1e20 rejection sentinel.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_hazard_readout_uses_the_current_tad_anchor() {
+        use crate::types::{EventType, ObsRecord};
+
+        let model = tad_hazard_two_dose_model();
+        let (chz_state, hazard) = match model.endpoints.get(&3) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => (*chz_state, h),
+            _ => panic!("expected ODE-accumulated endpoint"),
+        };
+        let mut subject = make_simple_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.obs_times = vec![30.0];
+        subject.observations = vec![0.0];
+        subject.obs_cmts = vec![1];
+        subject.cens = vec![0];
+        subject.occasions = vec![1];
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 30.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        let p = &model.default_params;
+        let eta = [];
+        let nll = tte_endpoint_nll(
+            &model,
+            &subject,
+            hazard,
+            crate::types::TteRecurrence::Single,
+            &subject.obs_records,
+            &p.theta,
+            &eta,
+        );
+
+        // H(30) = .1 * [integral_0^12(1 + .01t) + integral_12^30(1 + .01(t - 12))] = 3.234.
+        // h(30) = .1 * (1 + .01 * 18) = .118. Two doses prevent TAD and TAFD aliasing.
+        // The 1e10 guard is ten orders below the old 2e20 sentinel and nine orders above
+        // this roughly 5.37 objective, so it rejects the masked NaN without overfitting
+        // to solver-level round-off.
+        let expected = 3.234_f64 - 0.118_f64.ln();
+        assert_relative_eq!(nll, expected, epsilon = 2e-4);
+        assert!(
+            nll < 1e10,
+            "the old NaN path returns the finite 1e20 sentinel, not an infinite NLL; got {nll}"
+        );
+
+        let (cum, haz) = crate::survival::ode_cumhaz_hazard(
+            &model,
+            &subject,
+            chz_state,
+            &p.theta,
+            &eta,
+            &[30.0],
+        );
+        assert_relative_eq!(cum[0], 3.234, epsilon = 2e-4);
+        assert_relative_eq!(haz[0], 0.118, epsilon = 2e-6);
+    }
+
+    /// #1261 code-review follow-up: the sibling test above calls `tte_endpoint_nll` and
+    /// `ode_cumhaz_hazard` directly, never the dispatcher FOCE/FOCEI's inner loop
+    /// actually calls. `individual_nll_into_with_schedule` builds `joint_share` for this
+    /// exact model shape (plain no-TV `[odes]` + an `OdeAccumulated` hazard reading
+    /// `TAD`) and routes the TTE term through `tte_ode_nll_from_shared` /
+    /// `share.rhs_params[i]` instead — the #1261 fix's real call site
+    /// (`src/stats/likelihood.rs`, the `(ode.rhs)(st, &share.rhs_params[i], t, &mut du)`
+    /// line). A revert there would go uncaught by every other test in this file.
+    ///
+    /// Isolate the TTE contribution by subtracting a PK-only sibling model/subject that
+    /// drops `[event_model]` and the CMT-3 record entirely: both share the identical
+    /// `[odes]` block, doses, and PK observation, so the Gaussian data term is the same
+    /// between the two calls and cancels in the difference — the #570 shared solve's own
+    /// invariant is that its predictions are bit-identical to the standalone no-TV path
+    /// the PK-only sibling takes (`try_joint_pktte_shared_solve` returns `None` for it,
+    /// since it declares no TTE endpoint to share).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn hot_path_individual_nll_reads_the_shared_solve_tad_anchor() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        let model = tad_hazard_two_dose_model();
+        let pk_only_model = parse_model_string(
+            r"
+[parameters]
+theta TVCL(1.0, 0.01, 100.0)
+theta TVV(10.0, 0.1, 500.0)
+sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+CL = TVCL
+V = TVV
+[structural_model]
+ode(obs_cmt=central, states=[central])
+[odes]
+d/dt(central) = -CL / V * central
+[error_model]
+DV ~ proportional(PROP_ERR)
+",
+        )
+        .expect("PK-only sibling model must parse");
+
+        let mut subject = make_simple_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.obs_times = vec![30.0];
+        subject.observations = vec![0.0];
+        subject.obs_cmts = vec![1];
+        subject.cens = vec![0];
+        subject.occasions = vec![1];
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 30.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        let mut pk_only_subject = subject.clone();
+        pk_only_subject.obs_records = Vec::new();
+
+        let eta = [];
+
+        // The fixture must actually reach the shared solve — otherwise this test would
+        // silently exercise the pre-#570 fallback the sibling test already covers,
+        // rather than the `tte_ode_nll_from_shared` dispatch under review here.
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &model.default_params.theta, &eta)
+                .is_some(),
+            "fixture must qualify for the #570 shared solve"
+        );
+
+        let mut scratch = crate::pk::EventPkParams::default();
+        let p = &model.default_params;
+        let nll_full = individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            &p.theta,
+            &eta,
+            &p.omega,
+            &p.sigma.values,
+            &model.residual_correlations,
+            &mut scratch,
+            None,
+        );
+
+        let pk_p = &pk_only_model.default_params;
+        let nll_pk_only = individual_nll_into_with_schedule(
+            &pk_only_model,
+            &pk_only_subject,
+            &pk_p.theta,
+            &eta,
+            &pk_p.omega,
+            &pk_p.sigma.values,
+            &pk_only_model.residual_correlations,
+            &mut scratch,
+            None,
+        );
+
+        // Same H(30) = 3.234, h(30) = .118 as the sibling test — the isolated TTE term
+        // the shared solve must have contributed.
+        let expected_tte = 3.234_f64 - 0.118_f64.ln();
+        assert_relative_eq!(nll_full - nll_pk_only, expected_tte, epsilon = 2e-4);
+        assert!(
+            nll_full < 1e10,
+            "the old NaN-TAD path returns the finite 1e20 sentinel through this exact \
+             dispatcher; got {nll_full}"
+        );
+    }
+
+    /// Construct a subject with a positive pre-start TTE time and later PK observations.
     #[cfg(feature = "survival")]
     fn late_start_joint_subject(records: Vec<ObsRecord>) -> Subject {
         let mut subject = make_simple_subject();
@@ -4339,7 +4664,7 @@ mod tests {
             }
             // `H` and `h` read exactly as `tte_ode_nll_from_shared` reads them.
             let mut du = vec![0.0; ode.n_states];
-            (ode.rhs)(st, &share.pk_values, t_pre, &mut du);
+            (ode.rhs)(st, &share.rhs_params[i], t_pre, &mut du);
             let (share_cum, share_haz) = (st[chz_state], du[chz_state]);
 
             // Engine 2 — the dedicated two-solve arm.

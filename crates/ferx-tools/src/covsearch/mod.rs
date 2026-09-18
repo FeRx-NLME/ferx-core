@@ -413,6 +413,7 @@ pub fn run_covsearch(
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base)?;
     let result = search(&fitter, space, &options, run.progress)?;
@@ -479,6 +480,7 @@ impl Space {
                             parameter: r.parameter.clone(),
                             covariate: r.covariate.clone(),
                             form: r.form.clone(),
+                            op: r.op,
                         },
                         origin: Origin::Base,
                     })

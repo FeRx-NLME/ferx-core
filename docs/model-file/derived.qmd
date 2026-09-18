@@ -28,7 +28,7 @@ where `name` becomes a new sdtab column and `expression` is evaluated for every 
 
 | Name | Meaning |
 |------|---------|
-| Individual-parameter names (`CL`, `V`, …) | EBE-derived value for the subject |
+| Individual-parameter names (`CL`, `V`, …) | EBE-derived value for the subject — **every** name in `[individual_parameters]`, including an intermediate the `[structural_model]` line does not bind (`TVCL = THCL * 3`) and a modeled-dose `D{n}` / `R{n}`. Each is re-evaluated per row with that row's η, covariates and `TIME` |
 | Theta names (`TVCL`, `TVV`, …) | Final population estimate |
 | Eta names (`ETA_CL`, …) | Subject EBE |
 | Covariate names (`WT`, `AGE`, …) | Subject covariate |

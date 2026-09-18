@@ -121,6 +121,9 @@ pub(crate) struct ScriptedFitter {
     /// there turns a cancellation into an error, which is what this exists
     /// to catch.
     pub cancel_empty_after: Option<usize>,
+    /// Returned as every report's `warnings` — what the runner would say
+    /// about, e.g., a reuse directory it could not read.
+    pub warnings: Vec<String>,
     calls: std::sync::Mutex<Vec<(String, Vec<Candidate>)>>,
 }
 
@@ -135,6 +138,7 @@ impl ScriptedFitter {
             erroring: Vec::new(),
             cancel_after: None,
             cancel_empty_after: None,
+            warnings: Vec::new(),
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -260,7 +264,7 @@ impl crate::search::fitter::StepFitter for ScriptedFitter {
             fitted: candidates.len(),
             reused: 0,
             deduped: 0,
-            warnings: vec![],
+            warnings: self.warnings.clone(),
         })
     }
 }

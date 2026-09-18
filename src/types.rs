@@ -78,6 +78,11 @@ pub enum InfusionDef {
 /// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
 /// a `NaN` input also returns `floor`. The explicit comparison (not `f64::max`)
 /// is what makes the `NaN`-to-`floor` behaviour deliberate rather than incidental.
+///
+/// **A caller that must not treat a non-finite input as a small positive one
+/// tests for that first** — see [`DoseEvent::resolve_rate`], which repels the
+/// subject instead (#1284). The clamp answers "`x` is on the wrong side of the
+/// wall, pull it back"; `NaN` is not a side.
 #[inline]
 pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
     if x > floor {
@@ -162,18 +167,61 @@ impl DoseEvent {
     /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
     /// [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]: far below any
     /// realistic duration, so it never perturbs a converged fit — it only keeps
-    /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
-    /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
+    /// a transient `D ≤ 0` from turning `amt / D` into a non-finite rate. A
+    /// **non-finite** `D` is not clamped here — it repels the subject
+    /// ([`Self::non_finite`], #1284).
     pub(crate) const DURATION_FLOOR: f64 = 1e-8;
 
     /// Domain floor for a modeled infusion `rate` (`RATE = -1` → `R{cmt}`), the
-    /// mirror of [`Self::DURATION_FLOOR`]. A transient `R ≤ 0` (or `NaN`)
-    /// mid-search would otherwise make `amt / R` (the implied duration)
-    /// non-finite; clamping `R` to this floor keeps it finite (delivering the
-    /// dose over a very long duration) without perturbing a converged fit, whose
-    /// optimum is interior. `NaN` falls to the floor (every `>` is false for
-    /// `NaN`).
+    /// mirror of [`Self::DURATION_FLOOR`]. A transient `R ≤ 0` mid-search would
+    /// otherwise make `amt / R` (the implied duration) non-finite; clamping `R`
+    /// to this floor keeps it finite (delivering the dose over a very long
+    /// duration) without perturbing a converged fit, whose optimum is interior.
+    /// A **non-finite** `R` is not clamped here — it repels the subject
+    /// ([`Self::non_finite`], #1284).
     pub(crate) const RATE_FLOOR: f64 = 1e-8;
+
+    /// The resolved dose for a modeled `D{n}` / `R{n}` that came back
+    /// **non-finite** — the out-of-domain outcome, not a clamped one (#1284).
+    ///
+    /// Every field the engines derive a number from is `NaN`, **including
+    /// `time`**, and the `time` is the operative one. The `(rate, duration)`
+    /// pair alone cannot carry non-finiteness past
+    /// [`crate::dosing::is_real_infusion`]: that predicate requires
+    /// `rate > 0 && duration > 0 && duration.is_finite()`, and no assignment to
+    /// the pair satisfies it while being non-finite — a `NaN` rate already fails
+    /// [`Self::is_infusion`]'s `rate > 0.0`. So the dose falls to the **bolus**
+    /// branch, which reads only `amt`, and the whole excursion is served as a
+    /// finite instantaneous bolus: measured 2.03× high at one elimination
+    /// half-time on a 1-cpt model, with no diagnostic on any channel.
+    ///
+    /// A `NaN` `time` instead lands where every engine already looks. It is the
+    /// same shape a `NaN` `ALAG` produces (`dose.time + lag`), so the #1189
+    /// machinery absorbs it unchanged: each walk pushes `d.time` onto its
+    /// timeline, [`crate::ode::predictions::timeline_has_non_finite`] /
+    /// `EventSchedule::non_finite_event_time` sees it, and the subject comes
+    /// back `NaN` — which the estimation guards already read as a diverged solve
+    /// and the optimizer as a wall. One repulsion channel for every non-finite
+    /// dose attribute, rather than a second one threaded through four walks.
+    ///
+    /// The two **superposition** walks build no timeline, so they carry the same
+    /// predicate spelled for them, once, in
+    /// [`crate::pk::superposition_arrival_non_finite`] — read by the value twin
+    /// (`predict_concentration`) and the state twin (`analytical_state_at_times`)
+    /// alike. Guarding only the first is what let a repelled subject still report
+    /// a drug-free compartment amount (#1399 review).
+    ///
+    /// `amt`, `cmt`, `ss` and `ii` are kept: nothing derives a *time* from them,
+    /// and preserving them keeps the event recognisable in a debug dump.
+    fn non_finite(&self) -> DoseEvent {
+        DoseEvent {
+            time: f64::NAN,
+            rate: f64::NAN,
+            duration: f64::NAN,
+            rate_mode: RateMode::Fixed,
+            ..self.clone()
+        }
+    }
 
     /// Resolve a modeled-`RATE` dose into a concrete ([`RateMode::Fixed`]) dose
     /// for this iteration's per-dose `PkParams` (`params` = `PkParams::values`).
@@ -195,7 +243,9 @@ impl DoseEvent {
     /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
     /// or rate here would drop its `∂/∂η`, so no `Dual` twin is ever needed. A
     /// transient `D ≤ 0` is clamped to [`Self::DURATION_FLOOR`]; a transient
-    /// `R ≤ 0` to [`Self::RATE_FLOOR`].
+    /// `R ≤ 0` to [`Self::RATE_FLOOR`]. A **non-finite** `D`/`R` is a different
+    /// case and gets a different answer — [`Self::non_finite`] (#1284), not the
+    /// floor.
     pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
         match self.rate_mode {
             RateMode::Fixed => self.clone(),
@@ -207,6 +257,9 @@ impl DoseEvent {
                     .indexed_slot(DoseAttr::Duration, self.cmt)
                     .expect("modeled-duration dose slot validated by check_model_data");
                 let d_raw = params.get(slot).copied().unwrap_or(0.0);
+                if !d_raw.is_finite() {
+                    return self.non_finite();
+                }
                 let duration = clamp_above_floor(d_raw, Self::DURATION_FLOOR);
                 DoseEvent {
                     rate: self.amt / duration,
@@ -223,6 +276,9 @@ impl DoseEvent {
                     .indexed_slot(DoseAttr::Rate, self.cmt)
                     .expect("modeled-rate dose slot validated by check_model_data");
                 let r_raw = params.get(slot).copied().unwrap_or(0.0);
+                if !r_raw.is_finite() {
+                    return self.non_finite();
+                }
                 let rate = clamp_above_floor(r_raw, Self::RATE_FLOOR);
                 DoseEvent {
                     rate,
@@ -367,11 +423,13 @@ impl DoseEvent {
 ///   7: V3      (peripheral volume 2, 3-cmt only)
 ///   8: LAGTIME (dose/absorption lagtime, default 0.0; equivalent to NONMEM ALAG)
 ///
-/// Slots 0–8 are the named PK parameters above. Slots 9.. are spare capacity
-/// for ODE models, whose `[individual_parameters]` may declare additional
-/// "structural" parameters (rate constants, Emax/EC50, baselines, …) beyond the
-/// named PK slots. `ode_param_slots` routes canonical names to slots 0–8 and
-/// structural names to the remaining free slots, while keeping slots
+/// Slots 0–8 are the named PK parameters above. Slots 9–12 hold the analytic
+/// transit / inverse-Gaussian parameters (`PK_IDX_N`, `PK_IDX_MTT`,
+/// `PK_IDX_MAT`, `PK_IDX_CV2`); for an ODE model they, like every higher slot,
+/// are spare capacity for additional "structural" parameters (rate constants,
+/// Emax/EC50, baselines, …). `ode_param_slots` routes any name
+/// `PkParams::name_to_index` recognises to its fixed slot and structural names
+/// to the lowest remaining free slots, while keeping slots
 /// `PK_IDX_F` and `PK_IDX_LAGTIME` reserved so an undeclared F/lagtime keeps its
 /// default rather than being aliased by a structural parameter (issue #122).
 /// The headroom here therefore bounds how many structural parameters an ODE
@@ -590,7 +648,6 @@ impl DoseAttr {
     /// ODE-only) and on the compartment existing. `alag` and `lagtime` both map
     /// to [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
     pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
-        let lower = name.to_ascii_lowercase();
         // The prefixes are mutually exclusive — no name starts with two of them,
         // and none is a prefix of another (`lagtime`/`alag`/`f`/`d`/`r` all differ
         // in their first byte except the two lag aliases, which are disjoint) — so
@@ -602,7 +659,11 @@ impl DoseAttr {
             ("d", DoseAttr::Duration),
             ("r", DoseAttr::Rate),
         ] {
-            if let Some(suffix) = lower.strip_prefix(prefix) {
+            let Some(head) = name.get(..prefix.len()) else {
+                continue;
+            };
+            if head.eq_ignore_ascii_case(prefix) {
+                let suffix = &name[prefix.len()..];
                 // The suffix must be a pure positive integer; `f_bio`, `cl`, etc.
                 // (non-numeric or empty suffixes) are not attributes.
                 if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
@@ -1492,10 +1553,19 @@ impl CovariateDecl {
 /// | 5 `power` | [`CovariateForm::Power`] |
 /// | arbitrary `[code]` | [`CovariateForm::Expr`] |
 ///
-/// [`CovariateForm::LinearRelative`] has no PsN state number: it is an exact
-/// reparameterization of `Linear` (`θ_rel = c·θ_abs`) that makes θ
-/// dimensionless, so the two give the same OFV on the same data and differ only
-/// in the scale θ and its SE are reported on.
+/// [`CovariateForm::LinearRelative`] and [`CovariateForm::Categorical2`] have
+/// no PsN state number: each is an exact reparameterization of the state above
+/// it — `θ_rel = c·θ_abs` for the former, `θ_cat2 = 1 + θ_cat` for the latter —
+/// so the pair gives the same OFV on the same data and differs only in the
+/// scale θ and its SE are reported on. `Categorical2` is Pharmpy MFL's `cat2`.
+/// `#[non_exhaustive]`: adding a variant to a public enum breaks any downstream
+/// exhaustive `match`, which is what made #1312's `Categorical2` a breaking
+/// change rather than an additive one. Level grouping (`groups = [[1,2],[3,4]]`,
+/// the out-of-scope note on that issue) is the next variant, so the attribute
+/// goes in with the release that already breaks — from here on a new form is
+/// genuinely additive. Variants stay constructible; only downstream exhaustive
+/// matching is forbidden, so a caller writes a `_` arm.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CovariateForm {
@@ -1516,6 +1586,12 @@ pub enum CovariateForm {
     Hockey,
     /// `1 + θ_k` at each non-reference level, `1` at the reference level.
     Categorical,
+    /// `θ_k` at each non-reference level, `1` at the reference level — Pharmpy
+    /// MFL's `cat2`. Same degrees of freedom as [`CovariateForm::Categorical`]
+    /// (one θ per non-reference level) and an exact reparameterization of it
+    /// (`θ_cat2 = 1 + θ_cat`); what moves is the **null**, from `θ = 0` to
+    /// `θ = 1`, and with it the reading of `fix = v`.
+    Categorical2,
     /// Verbatim ferx expression, the equivalent of PsN's `[code]` escape hatch.
     /// The string is the expression source with the surrounding quotes removed.
     Expr(String),
@@ -1532,6 +1608,7 @@ impl CovariateForm {
             CovariateForm::Power => "power",
             CovariateForm::Hockey => "hockey",
             CovariateForm::Categorical => "categorical",
+            CovariateForm::Categorical2 => "categorical2",
             CovariateForm::Expr(_) => "expr",
         }
     }
@@ -1542,7 +1619,67 @@ impl CovariateForm {
     /// rather than silently producing a factor keyed on a level that does not
     /// exist.
     pub fn is_categorical(&self) -> bool {
-        matches!(self, CovariateForm::Categorical)
+        matches!(
+            self,
+            CovariateForm::Categorical | CovariateForm::Categorical2
+        )
+    }
+}
+
+/// How a relation's effect combines with the parameter it acts on (#1313).
+///
+/// The default, and everything the block could express before, is
+/// [`CovariateOp::Multiply`]: the effect is a factor on a top-level product.
+/// [`CovariateOp::Add`] makes it a term added to the parameter instead —
+/// `CL = TVCL * exp(ETA_CL) + θ·(WT − 70)`, the MFL `COVARIATE(CL, WT, lin, +)`
+/// operator.
+///
+/// # ferx's additive effect is null-at-zero; Pharmpy's is not
+///
+/// Pharmpy reuses the *multiplicative* template under `+`, so its additive
+/// linear effect adds `1 + θ·(WT − median)`: a covariate sitting at its centre
+/// adds `1` to the parameter, and `θ = 0` is not "no effect". ferx drops that
+/// leading `1` — `θ·(COV − c)` for `linear`, `exp(θ·(COV − c)) − 1` for
+/// `exponential`, `(COV/c)^θ − 1` for `power`, `θ_k` per non-reference level
+/// for `categorical` — so that θ = 0, a covariate at its centre and a *missing*
+/// covariate all mean the same thing: no effect. The units work out too, which
+/// they do not when a dimensionless `1` is added to a clearance.
+///
+/// The cost is that a model translated from Pharmpy with `+` does **not**
+/// round-trip to the same equations; the two differ by a constant `1` on the
+/// parameter. The MFL coverage check says so out loud rather than translating
+/// silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CovariateOp {
+    /// `param * effect` — a factor on a top-level product, and the default.
+    #[default]
+    Multiply,
+    /// `param + effect` — a term added to the parameter, null at `θ = 0`.
+    Add,
+}
+
+impl CovariateOp {
+    /// The spelling used in the `[covariate_model]` block and in output: `*`
+    /// or `+`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CovariateOp::Multiply => "*",
+            CovariateOp::Add => "+",
+        }
+    }
+
+    /// The value a relation contributes for a subject whose covariate is
+    /// missing: `1` for a factor, `0` for an added term.
+    ///
+    /// Sharing one neutral element across both operators is the bug this
+    /// method exists to prevent — a missing covariate under `+` would
+    /// otherwise silently add `1` to the parameter.
+    pub fn neutral(&self) -> f64 {
+        match self {
+            CovariateOp::Multiply => 1.0,
+            CovariateOp::Add => 0.0,
+        }
     }
 }
 
@@ -1614,11 +1751,16 @@ pub struct CovariateTheta {
 /// dropping one is a pure line insert/delete.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CovariateRelation {
-    /// The `[individual_parameters]` name the factor multiplies into, e.g. `CL`.
+    /// The `[individual_parameters]` name the effect acts on, e.g. `CL`.
     pub parameter: String,
     /// The `[covariates]` column, e.g. `WT`.
     pub covariate: String,
     pub form: CovariateForm,
+    /// How the effect combines with the parameter — a factor (`*`, the
+    /// default and the spelling every relation had before #1313) or an added
+    /// term (`+`). Written as a trailing token on the block line.
+    #[serde(default)]
+    pub op: CovariateOp,
     /// `center = …` / `breakpoint = …` / `ref = …`, as written. `None` for
     /// `none` and `expr(...)`, which take no constant.
     pub center: Option<CovariateStat>,
@@ -1787,6 +1929,23 @@ pub struct OmegaMatrix {
     /// Used by the SAEM M-step to zero sampling correlations that bleed into
     /// structurally-absent entries via `(1/N) Σ ηη^T`.
     pub free_mask: DMatrix<bool>,
+    /// Per-eta: was this eta **declared inside** a `block_omega` /
+    /// `block_kappa` line, rather than on its own `omega` / `kappa` line?
+    ///
+    /// Declaration provenance, which `free_mask` cannot supply: a **one-eta**
+    /// `block_omega (ETA_CL) = [0.09]` is accepted, and has no off-diagonal, so
+    /// it is indistinguishable from a standalone `omega ETA_CL` by covariance
+    /// structure alone (#1394). Only a diagnostic that quotes the user's own
+    /// spelling back at them needs this; every numerical path reads `free_mask`
+    /// and `diagonal`, which are unchanged.
+    ///
+    /// Empty, or all-`false`, means "no block declaration is recorded" — which
+    /// is the honest answer for every `OmegaMatrix` rebuilt from a bare matrix
+    /// (`from_matrix`, and so the ferx-r entry points): there the caller passed
+    /// numbers, not a declaration, so there is no spelling to preserve.
+    /// `pub(crate)` on purpose: it is a diagnostic-wording aid, not public API,
+    /// and nothing outside the crate builds an `OmegaMatrix` by struct literal.
+    pub(crate) block_declared: Vec<bool>,
     /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
     /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
     /// matrix, run Cholesky, and invert on every evaluation.
@@ -1843,9 +2002,22 @@ impl OmegaMatrix {
             eta_names: names,
             diagonal,
             free_mask,
+            block_declared: vec![false; n],
             inv,
             log_det,
         }
+    }
+
+    /// Record which etas were declared inside a `block_omega` / `block_kappa`
+    /// line (#1394). The parser is the only caller: it is the only place that
+    /// has seen the declaration. A length that disagrees with the matrix
+    /// dimension is ignored rather than panicking, since the field only steers
+    /// how a diagnostic is worded.
+    pub(crate) fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
+        if block_declared.len() == self.dim() {
+            self.block_declared = block_declared;
+        }
+        self
     }
 
     pub fn from_matrix(m: DMatrix<f64>, names: Vec<String>, diagonal: bool) -> Self {
@@ -1920,6 +2092,7 @@ impl OmegaMatrix {
             eta_names: names,
             diagonal,
             free_mask,
+            block_declared: vec![false; n],
             inv,
             log_det,
         }
@@ -1949,11 +2122,136 @@ pub struct SigmaVector {
 /// declared value. Which of the two applies is carried alongside the value in
 /// [`ModelParameters::residual_correlation_fixed`], not in this struct, so the
 /// serialized shape stays what `FitResult` consumers already parse.
+///
+/// "Holds it at the declared value" is exact, at any `|rho| < 1` the parser
+/// accepts, and that had to be repaired to be true: the packer applied the
+/// *estimation* rail — Fisher-z `|z| <= 3`, i.e. `|rho| <= 0.995_055` — to a
+/// `FIX`-ed correlation as well as to a free one, so every declaration above it
+/// collapsed onto that single value and the fit scored a covariance the model
+/// file never wrote, with nothing reported (#1307). The rail governs only the
+/// free case now. The free case keeps it, and it is not a defect there: a `rho`
+/// running to `-0.999_93` on a 12-observation fixture is a degenerate optimum,
+/// not an estimate — see `RHO_Z_BOUND`. A start past the rail is clamped onto it
+/// and reported as `W_INIT_NOT_REPRESENTABLE`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct ResidualCorrelation {
     pub sigma_i: usize,
     pub sigma_j: usize,
     pub rho: f64,
+}
+
+/// Spread of a user-declared parameter prior (#254).
+///
+/// Exactly one form is given per prior. `Rse` is the ergonomic one the feature
+/// exists for — a number read straight off a published parameter table — and
+/// `Sd` is the escape hatch for a θ that can be negative, where a *relative*
+/// standard error is meaningless.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum PriorSpread {
+    /// Relative standard error as a **fraction**. `rse = 25%` in the model file
+    /// arrives here as `0.25`; the parser is what normalizes the two spellings,
+    /// so nothing downstream has to know which one was written.
+    Rse(f64),
+    /// Absolute standard deviation, on the same scale the parameter was
+    /// declared on.
+    Sd(f64),
+}
+
+/// Which `[parameters]` family a prior is declared on (#254).
+///
+/// θ names and η names are separate namespaces, so a model may legally carry
+/// `theta CL(…)` and `omega CL ~ 0.09` at once. Resolving a prior by name alone
+/// cannot tell those apart, and both producers of a prior know which one was
+/// meant — the parser saw the declaration the `prior(...)` was attached to, and
+/// `[priors] from_fit` matched the source estimate on family as well as name. So
+/// the family travels with the prior rather than being re-derived from a string.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterKind {
+    Theta,
+    Omega,
+    Sigma,
+    Kappa,
+}
+
+impl ParameterKind {
+    /// The `[parameters]` keyword this family is declared with, for diagnostics.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ParameterKind::Theta => "theta",
+            ParameterKind::Omega => "omega",
+            ParameterKind::Sigma => "sigma",
+            ParameterKind::Kappa => "kappa",
+        }
+    }
+}
+
+/// A prior declared on one parameter, for penalized-ML / MAP estimation (#254).
+///
+/// Written inline next to the parameter it constrains:
+///
+/// ```text
+/// [parameters]
+///   theta TVCL(0.2, 0.001, 10.0)  prior(0.15, rse = 25%)
+///   omega ETA_CL ~ 0.09           prior(0.09, rse = 40%)
+/// ```
+///
+/// **`value` is on the scale the parameter was declared on** — a variance for a
+/// bare `omega X ~ v`, an SD under `(sd)` — and so is a [`PriorSpread::Sd`].
+/// That single rule is the whole user-facing convention: the RSE comes off the
+/// same row of the same table as the value, and no conversion is ever asked for.
+///
+/// What the prior *becomes* — a normal on θ, a lognormal on θ, a lognormal on a
+/// variance — is decided by how the parameter packs, not by this struct.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct ParameterPrior {
+    /// Name of the theta, omega/eta, sigma or kappa this prior applies to, as
+    /// declared in `[parameters]`.
+    pub name: String,
+    /// Prior central value, on the declared scale.
+    pub value: f64,
+    /// Prior spread.
+    pub spread: PriorSpread,
+    /// Which family [`Self::name`] refers to, when the producer knew.
+    ///
+    /// `None` means "resolve by name alone", which is unambiguous for every
+    /// model that does not reuse one name across two families and is what a
+    /// caller building a prior by hand can always fall back to. `Some` is what
+    /// the parser and `[priors] from_fit` supply, and it is the only thing that
+    /// can resolve `theta CL` against `omega CL` in the same model.
+    #[serde(default)]
+    pub kind: Option<ParameterKind>,
+}
+
+/// One priored parameter's line in the fit report (#254).
+///
+/// Named `shift_in_prior_sds` rather than `shift` because the informative
+/// number is the standardized one: "CL landed 1.8 prior SDs above the prior"
+/// says whether the data and the prior disagree, where a raw difference only
+/// says the parameter moved.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PriorSummary {
+    /// Parameter name as declared.
+    pub name: String,
+    /// Prior central value, on the scale the parameter was declared on.
+    pub prior_value: f64,
+    /// Final estimate, on that same declared scale.
+    pub estimate: f64,
+    /// `(x̂ − m) / s` in packed space — how far the estimate sits from the prior
+    /// mean in prior standard deviations. Signed.
+    pub shift_in_prior_sds: f64,
+    /// This parameter's contribution to [`FitResult::ofv_prior`] (the square of
+    /// `shift_in_prior_sds`).
+    pub penalty: f64,
+    /// Realised prior family: `"lognormal"` for a log-packed coordinate,
+    /// `"normal"` for an identity-packed one. Reported because it is decided by
+    /// the parameter's declared lower bound, not by the prior declaration — so
+    /// widening a θ's bounds to allow negative values moves its prior from
+    /// lognormal to normal, and this field is where that becomes visible.
+    pub family: String,
+    /// Lower end of the implied 95% prior interval, on the declared scale.
+    pub prior_lower_95: f64,
+    /// Upper end of the implied 95% prior interval, on the declared scale.
+    pub prior_upper_95: f64,
 }
 
 /// Full set of model parameters
@@ -3132,12 +3430,103 @@ impl std::fmt::Debug for ScalingSpec {
     }
 }
 
+/// The link function connecting an ETA's anchor theta to the individual
+/// parameter — i.e. the scale on which `η` enters additively.
+///
+/// The mu-scale is `g(θ)`: the individual parameter is `g⁻¹(g(θ) + η)`.
+/// Consumers that need the mu value itself use
+/// [`crate::estimation::parameterization::compute_mu_k`]; consumers that only
+/// care whether the parameter is lognormal use [`MuRef::log_transformed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuTransform {
+    /// `P = THETA * exp(ETA)` / `exp(log(THETA) + ETA)` — mu-scale `log(θ)`.
+    Log,
+    /// `P = THETA + ETA` — mu-scale `θ`.
+    Identity,
+    /// `P = inv_logit(THETA + ETA)` — THETA is *already* on the logit scale,
+    /// so the mu-scale is `θ` itself.
+    Logit,
+    /// `P = inv_logit(logit(THETA) + ETA)` — THETA is on the probability
+    /// scale `(0,1)` and the mu-scale is `logit(θ)`.
+    LogitProbability,
+}
+
 /// Associates an ETA with its mu-referencing anchor theta.
 #[derive(Debug, Clone)]
 pub struct MuRef {
     pub theta_name: String,
-    /// true for patterns THETA*exp(ETA) or exp(log(THETA)+ETA); false for THETA+ETA
-    pub log_transformed: bool,
+    /// Which link function relates `theta_name` to the individual parameter.
+    pub transform: MuTransform,
+}
+
+impl MuRef {
+    /// True when the individual parameter is lognormal in this ETA — patterns
+    /// `THETA*exp(ETA)` and `exp(log(THETA)+ETA)`. False for the additive and
+    /// both logit forms.
+    ///
+    /// This is the historical `log_transformed` flag; consumers that reason
+    /// about the *mu scale* (rather than "is this eta lognormal?") should match
+    /// on [`MuRef::transform`] instead.
+    pub fn log_transformed(&self) -> bool {
+        matches!(self.transform, MuTransform::Log)
+    }
+}
+
+/// A mu-reference whose typical value is a function of **several** thetas and
+/// subject covariates (#619) — the shape [`MuRef`] cannot hold because there is
+/// no single anchor theta:
+///
+/// ```text
+/// CL = (TVCL_NR + (CRCL - 90) * THETA_CRCL) * exp(ETA_CL)    # additive covariate
+/// CL = TVCL * (WT / 70) ^ THETA_WT * exp(ETA_CL)              # estimated exponent
+/// F  = inv_logit(LOGIT_F + THETA_SEX * SEX + ETA_F)           # logit-scale covariate
+/// ```
+///
+/// The eta still enters additively on the mu scale, `P_i = g⁻¹(g(A_i(θ)) + η_i)`
+/// with `A_i` the eta-free typical value evaluated at subject `i`'s covariates,
+/// so the EM M-step for the group's thetas is well-posed: hold
+/// `φ_i = g(A_i(θ)) + η_i` fixed and re-fit `θ` to the population of `φ_i`
+/// (NONMEM's `MU_k = LOG(THETA(1) + (CRCL-90)*THETA(2))`). SAEM and IMP/IMPMAP
+/// consume this; every other estimator ignores it, and [`CompiledModel::mu_refs`]
+/// is unchanged by its presence (an eta may appear in both when the typical
+/// value also matches a single-anchor pattern — the single-anchor entry keeps
+/// serving the inner-loop centring and reporting consumers exactly as before).
+#[derive(Debug, Clone)]
+pub struct CovariateMuRef {
+    /// The BSV eta this typical value carries.
+    pub eta_name: String,
+    /// Every theta the typical value reads, in declaration order. At least two —
+    /// a single-theta typical value is a plain [`MuRef`].
+    pub theta_names: Vec<String>,
+    /// Which link relates the typical value to the individual parameter:
+    /// [`MuTransform::Log`] for `A * exp(η)` / `exp(log(A) + η)`,
+    /// [`MuTransform::Logit`] for `inv_logit(A + η)`. Never `Identity` or
+    /// `LogitProbability` — those forms are not recorded.
+    pub transform: MuTransform,
+    /// Data covariates the typical value reads (names as written).
+    pub covariate_names: Vec<String>,
+    /// The subset of [`Self::theta_names`] the rest of the model also reads.
+    ///
+    /// Empty is the ordinary case and the precondition for the exact M-step
+    /// engine: freezing `φ_i` freezes the individual parameter, so the data term
+    /// is constant in the group's thetas *only* when those thetas reach the
+    /// likelihood through this typical value alone. A theta listed here is still
+    /// estimated by the group — it just forces the prior-plus-data engine, which
+    /// keeps the term it is live in.
+    pub shared_thetas: Vec<String>,
+    /// Whether a right-hand side other than this group's own typical value also
+    /// reads [`Self::eta_name`].
+    ///
+    /// The eta-side twin of [`Self::shared_thetas`], and the second reason the
+    /// exact engine can be inadmissible: the group step re-centres `η_ik` to
+    /// hold `φ_i` fixed, which only leaves the data alone when this typical
+    /// value is the eta's *only* consumer. Like a shared theta it does not drop
+    /// the group — it forces the prior-plus-data engine, which evaluates the
+    /// observation term with the shift applied.
+    pub(crate) eta_shared: bool,
+    /// The eta-free typical value `A(θ, covariates)`, with every local
+    /// `[individual_parameters]` definition it referenced already inlined.
+    pub(crate) typical: crate::parser::model_parser::Expression,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3582,23 +3971,43 @@ pub struct CompiledModel {
     pub eta_names: Vec<String>,
     /// IOV kappa names (length == n_kappa). Empty when no IOV.
     pub kappa_names: Vec<String>,
-    /// Names of the individual parameters declared at the top level of the
-    /// `[individual_parameters]` block, in declaration order. Parallel to
-    /// `pk_indices`; for analytical models the i-th name is the variable
-    /// whose value lands in `PkParams.values[pk_indices[i]]`. For ODE
-    /// models the i-th name is written sequentially into slot `i` by
-    /// `pk_param_fn`. Used by the FFI to label per-subject EBE individual
-    /// parameter values (e.g. `CL`, `V`, `Ka`).
+    /// Names of the individual parameters assigned in `[individual_parameters]`,
+    /// in first-assignment order: every top-level assignment, plus a name
+    /// assigned on every branch of an `if`/`else` when `[odes]`,
+    /// `[structural_model]`, `[scaling]` or `[derived]` reads it (#357). The
+    /// parser-synthesized `__ferx_ro_*` / `__ferx_pktime_*` parameters follow.
+    /// Used by the FFI to label per-subject EBE individual parameter values (e.g.
+    /// `CL`, `V`, `Ka`).
     ///
-    /// Bound: `pk_param_fn` writes at most `MAX_PK_PARAMS` slots (the size
-    /// of the fixed `PkParams.values` array). For analytical models the
-    /// parser already routes assignments through that fixed slot table, so
-    /// excess names are not possible. For ODE models with more than
-    /// `MAX_PK_PARAMS` top-level `[individual_parameters]` assignments,
-    /// names beyond index `MAX_PK_PARAMS - 1` will appear in this list but
-    /// `pk_param_fn` won't store their values — downstream consumers will
-    /// read either zero or NaN for those slots. In practice no PK model
-    /// approaches this limit.
+    /// **To read the i-th name's *value*, call
+    /// [`indiv_param_values`](Self::indiv_param_values) (or
+    /// [`indiv_param_value_map`](Self::indiv_param_value_map)), not
+    /// `PkParams.values[pk_indices[i]]`.** `pk_indices` is parallel to this list on
+    /// both engines, but it maps to the PK *slots* the engine consumes, and on an
+    /// analytical model a placeholder entry is indistinguishable from a genuine `CL`
+    /// entry — so the slot read silently returns `CL`'s value for every unbound name
+    /// (#1356).
+    ///
+    /// Where `pk_indices[i]` comes from differs by engine:
+    /// - **ODE and compartment-free models** route every name through
+    ///   `ode_param_slots`: a canonical PK name (`CL`, `V`, `KA`, `F`,
+    ///   `LAGTIME`, …, per `PkParams::name_to_index`) takes its fixed PK slot,
+    ///   and every other name takes the lowest free slot that is not one of the
+    ///   engine-reserved F/lagtime slots. A model declaring `V, KA, KE` in that
+    ///   order therefore stores them at slots `1, 4, 0`, not `0, 1, 2`.
+    /// - **Analytical models** give `pk_indices[i]` a real slot only when the
+    ///   name is bound on the `[structural_model]` line (its canonical PK slot)
+    ///   or referenced by a readout (#650, a spare slot). Every other name gets
+    ///   a placeholder `0`, which aliases the `CL` slot rather than holding that
+    ///   name's value; a name that differs from a bound name only in case (`v`
+    ///   next to `V`) instead gets that bound name's slot (#1356). Most such names
+    ///   (e.g. an intermediate `TVCL`) are never written to `PkParams`; a
+    ///   modeled-dose `D{n}`/`R{n}` is written, to a spare slot above
+    ///   `PK_IDX_LAGTIME`, but still cannot be read back through `pk_indices`.
+    ///
+    /// Bound: an ODE or compartment-free model whose names do not all fit the
+    /// `MAX_PK_PARAMS`-slot layout is rejected at parse time by
+    /// `ode_param_slots`, so on that layout every entry has a real slot.
     pub indiv_param_names: Vec<String>,
     /// Symbolic partial derivatives of every top-level `[individual_parameters]`
     /// assignment w.r.t. each θ and η axis, precomputed at parse time. Outer
@@ -3653,11 +4062,71 @@ pub struct CompiledModel {
     /// the source text plus an evaluator for the effective SD at a typical arm
     /// size (`γ/√W`), which is the number a reader actually needs.
     pub kappa_weights: Vec<Option<KappaWeight>>,
-    /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
+    /// Per-parameter priors declared with an inline `prior(value, rse = …)`
+    /// (#254). Empty for an ordinary maximum-likelihood fit, in which case every
+    /// objective is bit-identical to one computed before this field existed.
+    ///
+    /// This rides the **model**, not [`FitOptions`], because a prior changes the
+    /// estimates: a caller who parses a `.ferx` file and then hands `fit()` a
+    /// `FitOptions::default()` must not silently get an unpenalized fit back.
+    /// (The covariate-NN regularizer makes the opposite choice — `nn_l2` is a
+    /// `[fit_options]` key — because there the penalty is a *tuning* knob a
+    /// caller legitimately sweeps.)
+    ///
+    /// Resolved against the packed layout by the internal `PriorSet` once per
+    /// estimation stage.
+    pub priors: Vec<ParameterPrior>,
+    /// `[priors] from_fit = "…"` — the previous fit to import a prior from
+    /// (#254 phase 2), as the path was written.
+    ///
+    /// This is the model-updating path: a published or previously-run model
+    /// becomes the prior for a fit on new, sparse data, without the user
+    /// transcribing a parameter table. Every free parameter the source fit
+    /// reports with a usable standard error and whose name and family match a
+    /// parameter of *this* model becomes `prior(estimate, rse = SE/estimate)` on
+    /// this model's declared scale. An inline [`Self::priors`] entry on the same
+    /// parameter wins, so one imported prior can be overridden without dropping
+    /// the rest.
+    ///
+    /// A relative path is resolved against the **model file's** directory
+    /// (`parse_model_file` / `parse_full_model_file`), matching how `[data]
+    /// path` resolves; a model parsed from a string in memory has no directory
+    /// and resolves against the process's working directory.
+    ///
+    /// **Consumed by the parser.** Every parse entry point calls
+    /// `parser::model_parser::expand_prior_from_fit`, which reads the source fit,
+    /// appends the imported priors to [`Self::priors`], records what it declined
+    /// to import in [`Self::parse_warnings`], and leaves this field `None`. So a
+    /// model that came from a file or a string has already been expanded, and a
+    /// `Some` here means the expansion has not run.
+    ///
+    /// Once per *parse*, not once per fit — and a model needing data-derived
+    /// bindings (`api::covariate_stats`, `api::levels`) is parsed twice, so it
+    /// reads the file twice. Both reads precede any estimation, which is what
+    /// the guarantee below is about.
+    ///
+    /// The read deliberately does *not* live in the estimation path. It used to,
+    /// and that was wrong twice over: `build_prior_set` turns a failure into an
+    /// *empty* prior set, and `run_covariance` / `run_sir` never call the
+    /// validation that would have caught it — so a source fit that moved between
+    /// the fit and the post-fit step silently un-penalized the standard errors.
+    /// Reading per stage also left a window in which the file could change
+    /// mid-fit, so the prior the optimizer minimised and the prior the report
+    /// printed need not have been the same one.
+    ///
+    /// A caller that assembles a `CompiledModel` field by field and sets this
+    /// must call `expand_prior_from_fit` itself; an unexpanded model is refused
+    /// rather than fit unpenalized.
+    pub prior_from_fit: Option<String>,
+    /// Detected mu-referencing relationships: eta_name → (theta_name, transform).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
     /// Same as `mu_refs` but for IOV kappa parameters (kappa_name → MuRef).
     pub kappa_mu_refs: HashMap<String, MuRef>,
+    /// Multi-theta (covariate) mu-references, one per eta (#619). Populated by
+    /// the parser alongside `mu_refs`; consumed by the SAEM / IMP / IMPMAP
+    /// M-steps only. Empty when no typical value reads two or more thetas.
+    pub covariate_mu_refs: Vec<CovariateMuRef>,
     /// Computes covariate-adjusted typical values per subject for AD.
     /// Returns one value per `[individual_parameters]` assignment (in
     /// declaration order), evaluated with eta = 0. Covariates and theta are
@@ -3675,6 +4144,12 @@ pub struct CompiledModel {
     /// value to the correct PK slot. Note: the index here is the
     /// assignment/tv index, *not* the eta index — see `eta_map` for the
     /// latter (they diverge when some params are eta-free).
+    ///
+    /// Also parallel to `indiv_param_names`; see that field for how each
+    /// engine assigns the slot. On an analytical model a name that is neither
+    /// bound on the `[structural_model]` line nor referenced by a readout gets a
+    /// placeholder `0`, which aliases `PK_IDX_CL`, or the slot of a bound name
+    /// it matches case-insensitively (#1356).
     pub pk_indices: Vec<usize>,
     /// Per-tv eta index: `eta_map[i]` is the eta index referenced by the
     /// i-th `[individual_parameters]` assignment, or -1 if the assignment
@@ -4024,6 +4499,42 @@ pub enum GradientMethod {
     Fd,
 }
 
+impl GradientMethod {
+    /// The gradient method the outer loop will actually use for this
+    /// `(model, options)` pair — **the** answer to "is this fit on finite
+    /// differences?", for a caller that has both.
+    ///
+    /// The outer loop reads `model.gradient_method`, and the production entry
+    /// points (`fit_from_files`, `run_model_with_data`) stamp it from
+    /// `options.gradient_method` — forcing `Fd` for an SDE model, which has no
+    /// analytic-sensitivity path — before calling `fit()`. Both of those now stamp
+    /// *this* function, so there is one rule rather than three copies of it.
+    ///
+    /// It is deliberately the **union** of the three sources rather than a replay
+    /// of the stamp, because not every caller has run the stamp:
+    ///
+    /// - `validate_model_file` (`ferx check`) hands `check_model_options` the model
+    ///   straight out of the parser, whose `gradient_method` is still `Auto` while
+    ///   `[fit_options] gradient = fd` sits in the *options* — reading the model
+    ///   alone there says `Auto` for a fit that will run on FD (#1381 review).
+    /// - a Rust caller invoking `fit()` directly may have set
+    ///   `model.gradient_method` by hand and never touched `options` — reading the
+    ///   options alone would miss it, and the loop honours the model.
+    ///
+    /// Taking either source's `Fd`, plus `is_sde`, is right in all three cases and
+    /// idempotent on an already-stamped model.
+    pub(crate) fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
+        if model.gradient_method == GradientMethod::Fd
+            || options.gradient_method == GradientMethod::Fd
+            || model.is_sde()
+        {
+            GradientMethod::Fd
+        } else {
+            options.gradient_method
+        }
+    }
+}
+
 impl CompiledModel {
     /// Vector and data-bound θ level blocks declared by `[parameters]`.
     ///
@@ -4371,27 +4882,180 @@ impl CompiledModel {
         false
     }
 
+    /// Value of every `[individual_parameters]` name at `(theta, eta, covariates,
+    /// time)`, parallel to [`indiv_param_names`](Self::indiv_param_names) (#1356).
+    ///
+    /// **Use this, not `PkParams.values[pk_indices[i]]`, to read a name's value.**
+    /// `pk_indices` is a map to the PK *slots* the engine consumes, and on an
+    /// analytical model a name that is neither bound on the `[structural_model]`
+    /// line nor referenced by a `[scaling] y` readout has no slot of its own: its
+    /// entry is a placeholder `0`, so the slot read silently returns `CL`'s value.
+    /// An intermediate such as `TVCL = THCL * 3` is the common case, and a modeled
+    /// dose `D{n}`/`R{n}` — whose value *is* written, to a spare slot `pk_indices`
+    /// does not record — is another. This method reads the evaluator's own var
+    /// slot for each name, which every name has on either engine.
+    ///
+    /// `eta` is the extended vector the `pk_param_fn` consumes (BSV η followed by
+    /// IOV κ). `time` feeds the `TIME` built-in (#610), so pass the event or
+    /// observation time the values are wanted at; a model that does not read the
+    /// built-in ignores it.
+    ///
+    /// The parser-synthesized internal parameters (`__ferx_ro_*`, `__ferx_pktime_*`;
+    /// #486) are present here, positionally, because the result is parallel to
+    /// `indiv_param_names`. Use [`indiv_param_value_map`](Self::indiv_param_value_map)
+    /// for a user-facing name → value map, which drops them.
+    ///
+    /// `mixture_class` selects the `MIXNUM` subpopulation (1-based) an
+    /// `[individual_parameters]` expression branches on — pass `Some(mixest + 1)` for
+    /// a fitted subject, since [`SubjectResult::mixest`] is 0-based. **A mixture
+    /// model needs it**: `MIXNUM` reads a thread-local that defaults to class 1, so
+    /// `None` on a model such as `CL = if (MIXNUM == 1) TVCL1 else TVCL2` returns
+    /// class-1 values for every subject, including a class-2 one. `None` is correct —
+    /// and the only meaningful value — for a model with no `[mixture]` block.
+    ///
+    /// Falls back to the `pk_indices` slot read — with its placeholder caveat — for
+    /// a hand-built `CompiledModel` whose `indiv_param_partials` carries no compiled
+    /// program (test fixtures, `generate_data`). Every parsed model has one.
+    ///
+    /// # Panics
+    ///
+    /// If `mixture_class` is `Some(k)` with `k == 0` or `k` past the model's class
+    /// count (1 when the model declares no `[mixture]` block). An out-of-range class
+    /// matches no `MIXNUM` arm, so it would otherwise return whichever `else` branch
+    /// happens to be last — a silently wrong number of exactly the kind this method
+    /// exists to remove. Every in-tree caller derives the class from a fit, where it
+    /// cannot be out of range.
+    pub fn indiv_param_values(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+        mixture_class: Option<usize>,
+    ) -> Vec<f64> {
+        let n_classes = self.mixture.as_ref().map_or(1, |m| m.n_classes);
+        if let Some(k) = mixture_class {
+            assert!(
+                k >= 1 && k <= n_classes,
+                "indiv_param_values: mixture class {k} is out of range for a model with \
+                 {n_classes} class(es) (MIXNUM is 1-based; pass `Some(mixest + 1)`, or \
+                 `None` for a model with no [mixture] block)"
+            );
+        }
+        let _mix_guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+        let Some(prog) = self.indiv_param_partials.indiv_param_program.as_ref() else {
+            let pk = (self.pk_param_fn)(theta, eta, covariates, time);
+            return self
+                .pk_indices
+                .iter()
+                .map(|&i| pk.values.get(i).copied().unwrap_or(0.0))
+                .collect();
+        };
+        #[cfg(feature = "nn")]
+        let nn_outputs: Vec<Vec<f64>> = self
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                use crate::nn::CovariateMapper;
+                let n_w = nn.mapper.n_weights();
+                let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                nn.mapper.forward_raw(weights, covariates).expect(
+                    "NN forward_raw failed in indiv_param_values: this indicates a \
+                     weight-offset/length wiring bug (missing covariates are \
+                     substituted with 0.0, not errored on)",
+                )
+            })
+            .collect();
+        #[cfg(not(feature = "nn"))]
+        let nn_outputs: Vec<Vec<f64>> = Vec::new();
+        let mut vals = prog.eval_param_values(theta, eta, covariates, time, &nn_outputs);
+        // The program's var-slot prefix and `indiv_param_names` are built from the
+        // same list, so this is an identity in practice; resize rather than index
+        // blind so a hand-edited fixture cannot make a caller's `zip` silently drop
+        // the tail of the name list.
+        debug_assert_eq!(
+            vals.len(),
+            self.indiv_param_names.len(),
+            "indiv_param_values must be parallel to indiv_param_names"
+        );
+        vals.resize(self.indiv_param_names.len(), 0.0);
+        vals
+    }
+
+    /// User-facing name → value map of the `[individual_parameters]` block at
+    /// `(theta, eta, covariates, time)` — [`indiv_param_values`](Self::indiv_param_values)
+    /// keyed by name, with the parser-synthesized internal parameters
+    /// (`__ferx_ro_*` Form-C readout, `__ferx_pktime_*` direct-`TIME` mapping; #486)
+    /// dropped so they never surface as an sdtab / EBE column.
+    ///
+    /// This is what sdtab `[output]` columns, `[derived]` expressions and the
+    /// ferx-r `individual_estimates` table read (#1356).
+    ///
+    /// `mixture_class` carries the same contract — and the same panic — as
+    /// [`indiv_param_values`](Self::indiv_param_values): pass `Some(mixest + 1)` on a
+    /// mixture model, `None` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If `mixture_class` is out of range; see
+    /// [`indiv_param_values`](Self::indiv_param_values).
+    pub fn indiv_param_value_map(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+        mixture_class: Option<usize>,
+    ) -> HashMap<String, f64> {
+        let values = self.indiv_param_values(theta, eta, covariates, time, mixture_class);
+        self.indiv_param_names
+            .iter()
+            .zip(values)
+            .filter(|(name, _)| {
+                !crate::parser::model_parser::is_synthetic_readout_param(name.as_str())
+            })
+            .map(|(name, v)| (name.clone(), v))
+            .collect()
+    }
+
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
     /// `ALAG` alias). Used by the prediction dispatcher and inner optimizer
     /// to choose between cached-schedule / AD fast paths and the lagtime-
     /// aware slow paths.
     ///
     /// Checks both routes by which lagtime can be wired in:
-    ///   1. Analytical PK: `pk_indices` contains `PK_IDX_LAGTIME` when the
-    ///      `[structural_model]` line includes `lagtime=` / `alag=`.
-    ///   2. ODE: the LAGTIME/ALAG slot is populated by name in
-    ///      `build_pk_param_fn`'s ODE branch (sequential pk_indices do not
-    ///      reflect this), so we fall back to scanning `indiv_param_names`.
+    ///   1. `pk_indices` contains `PK_IDX_LAGTIME` whenever a parameter is
+    ///      routed to the lag slot: on the analytical engine by a `lagtime=` /
+    ///      `alag=` binding on the `[structural_model]` line, on the ODE (and
+    ///      compartment-free) layout by `ode_param_slots` sending a bare
+    ///      `LAGTIME`/`ALAG` name to its canonical slot. Two analytical
+    ///      exceptions write the lag slot without `pk_indices` recording it: a
+    ///      variable bound to two roles (e.g. `f=X, lagtime=X`) records only one
+    ///      of them, chosen by `HashMap` iteration order (#1359); and a
+    ///      `lagtime=` binding to a name assigned only inside an `if` without
+    ///      `else` is not in `indiv_param_names` at all.
+    ///   2. On the ODE engine, a compartment-indexed `ALAGn`/`LAGTIMEn` (#369)
+    ///      is not a canonical PK name, so `ode_param_slots` gives it an ordinary
+    ///      structural slot that `pk_indices` cannot identify; it is found by
+    ///      scanning `indiv_param_names`. (On the analytical engine an unbound
+    ///      `ALAGn` is rejected at parse time, and one bound via `lagtime=` /
+    ///      `alag=` is covered by route 1.) The scan also matches a bare `LAGTIME`/`ALAG`
+    ///      on every engine: redundant with route 1 on the ODE and
+    ///      compartment-free layout, and on the analytical engine a false
+    ///      positive for a `LAGTIME` declared without a `[structural_model]`
+    ///      binding — that value never reaches `PK_IDX_LAGTIME` and no lag is
+    ///      applied, yet the model is taken off the lag-free fast paths (the
+    ///      explicit sensitivity kernels and the cached event schedule).
     pub fn has_lagtime(&self) -> bool {
         if self.pk_indices.contains(&PK_IDX_LAGTIME) {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
             let u = n.to_uppercase();
-            // Bare `lagtime`/`alag` apply on any engine. A compartment-indexed
-            // `ALAGn`/`LAGTIMEn` (issue #369) only routes lag on the ODE engine
-            // — the analytical path has a single fixed dose route, where such a
-            // name lands in an unused spare slot — so gate it on `ode_spec`.
+            // A compartment-indexed `ALAGn`/`LAGTIMEn` (issue #369) only routes lag
+            // on the ODE engine, so gate it on `ode_spec`. The analytical engine has
+            // a single dose route: an unbound `ALAGn` is rejected at parse time, and
+            // a bound one already put `PK_IDX_LAGTIME` into `pk_indices` above.
             u == "LAGTIME"
                 || u == "ALAG"
                 || (self.ode_spec.is_some()
@@ -4477,11 +5141,15 @@ impl CompiledModel {
     }
 
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
-    /// either engine). Mirrors [`Self::has_lagtime`]: the analytical route puts
-    /// [`PK_IDX_F`] in `pk_indices` (from `f=` on the `[structural_model]`
-    /// line), while both engines may instead name it `F` (any case) in
-    /// `[individual_parameters]`; a compartment-indexed `Fn` routes on the ODE
-    /// engine only. Used with [`Subject::has_rate_defined_infusion`] to skip the
+    /// either engine). Mirrors [`Self::has_lagtime`]: [`PK_IDX_F`] is in
+    /// `pk_indices` when `f=` binds it on the analytical `[structural_model]`
+    /// line, or when an ODE / compartment-free model declares a bare `F`
+    /// (`ode_param_slots` routes the canonical name to that slot); the same two
+    /// analytical exceptions as for the lag slot apply to `f=`. The name scan
+    /// below adds a compartment-indexed `Fn`, which routes on the ODE engine
+    /// only. It also matches a bare `F` on every engine: redundant on the ODE
+    /// layout, and on the analytical engine a false positive for an `F` declared
+    /// without an `f=` binding, which is never applied. Used with [`Subject::has_rate_defined_infusion`] to skip the
     /// event-driven [`crate::pk::event_driven::EventSchedule`] cache when `F`
     /// could reshape an infusion window across the inner search (#419).
     pub fn has_bioavailability(&self) -> bool {
@@ -4489,8 +5157,7 @@ impl CompiledModel {
             return true;
         }
         self.indiv_param_names.iter().any(|n| {
-            let u = n.to_uppercase();
-            u == "F"
+            n.eq_ignore_ascii_case("F")
                 || (self.ode_spec.is_some()
                     && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::F, _))))
         })
@@ -4650,7 +5317,7 @@ impl CompiledModel {
     /// This uses the same packed FIX and structural-zero masks as estimation,
     /// including diagonal/separate BSV and IOV blocks and mixture overrides.
     pub fn free_packed_dim(&self) -> usize {
-        crate::estimation::parameterization::packed_held_mask(&self.default_params)
+        crate::estimation::parameterization::packed_fixed_mask(&self.default_params)
             .iter()
             .filter(|held| !**held)
             .count()
@@ -5315,7 +5982,8 @@ pub enum CovarianceStatus {
     Computed,
     /// Step was attempted but failed (e.g. singular Hessian).
     Failed,
-    /// FD Hessian was non-PD; SIR was run as a fallback and succeeded.
+    /// Covariance Hessian was non-PD (analytic R-matrix or FD stencil alike); SIR was
+    /// run as a fallback and succeeded.
     SirFallback,
 }
 
@@ -5336,19 +6004,70 @@ pub enum CovarianceFallback {
 /// NONMEM's `$COVARIANCE MATRIX=` options. All three share the same FD Hessian
 /// `R` (the observed information) and per-subject score cross-product
 /// `S = Σᵢ gᵢgᵢᵀ`; they differ only in how those are combined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialized (and printed) as the same token the `[fit_options]` key accepts —
+/// `r` / `s` / `rsr` — so the value a user writes, the value a fit reports and
+/// the value a `.fitrx` bundle stores are one spelling rather than three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CovarianceMethod {
     /// `R⁻¹` — inverse observed-information (Hessian) matrix. The model-based
     /// covariance; assumes the model is correctly specified (default, NONMEM
     /// `MATRIX=R`).
     #[default]
+    #[serde(rename = "r")]
     Hessian,
     /// `S⁻¹` — inverse cross-product (outer-product-of-gradients) matrix. The
     /// empirical-information covariance (NONMEM `MATRIX=S`).
+    #[serde(rename = "s")]
     CrossProduct,
     /// `R⁻¹ S R⁻¹` — the Huber–White "sandwich". Robust to model
     /// mis-specification; NONMEM's default (`MATRIX=RSR`).
+    #[serde(rename = "rsr")]
     Sandwich,
+}
+
+impl CovarianceMethod {
+    /// The `[fit_options] covariance_method` token for this estimator — `r`,
+    /// `s` or `rsr`.
+    ///
+    /// **The single spelling.** The serde rename above, the `.fitrx` wire value,
+    /// the fit YAML, the CLI diagnostics line and the warning `details` payload
+    /// all read this, and [`CovarianceMethod::from_label`] is its inverse, so a
+    /// reported estimator can be pasted straight back into a model file. The
+    /// parser additionally accepts the long aliases (`hessian` / `cross_product`
+    /// / `sandwich`); those are input-only and are never emitted.
+    pub fn label(self) -> &'static str {
+        match self {
+            CovarianceMethod::Hessian => "r",
+            CovarianceMethod::CrossProduct => "s",
+            CovarianceMethod::Sandwich => "rsr",
+        }
+    }
+
+    /// The matrix expression this estimator inverts — `R⁻¹`, `S⁻¹` or
+    /// `R⁻¹SR⁻¹`. Printed next to [`label`](CovarianceMethod::label) wherever a
+    /// standard error or condition number is reported, because the token alone
+    /// does not say what was inverted.
+    pub fn formula(self) -> &'static str {
+        match self {
+            CovarianceMethod::Hessian => "R⁻¹",
+            CovarianceMethod::CrossProduct => "S⁻¹",
+            CovarianceMethod::Sandwich => "R⁻¹SR⁻¹",
+        }
+    }
+
+    /// Inverse of [`label`](CovarianceMethod::label): the canonical token back to
+    /// the variant. `None` for anything else — the long parser aliases are
+    /// deliberately not accepted here, so a round-trip through `label` is the
+    /// only thing that round-trips.
+    pub fn from_label(s: &str) -> Option<CovarianceMethod> {
+        match s {
+            "r" => Some(CovarianceMethod::Hessian),
+            "s" => Some(CovarianceMethod::CrossProduct),
+            "rsr" => Some(CovarianceMethod::Sandwich),
+            _ => None,
+        }
+    }
 }
 
 /// Severity level for a structured warning entry.
@@ -5412,6 +6131,70 @@ pub enum WarningCode {
     /// THETA bound, this is an implementation constraint, so the affected fit
     /// result is not an interior optimum.
     ParameterAtRunawayGuard,
+    /// One or more **initial estimates** pack outside their own optimizer box
+    /// and were silently clamped onto it before the first objective evaluation
+    /// (#1251). A property of the *start*, decided before any fitting.
+    ///
+    /// Deliberately **not** [`WarningCode::BoundaryEstimate`], which is about
+    /// where a fit *ended*: `model_selection::estimate_near_boundary` reads that
+    /// category, and it drives `bootstrap`'s `skip_estimate_near_boundary` and
+    /// `Strictness::reject_on_boundary` — both on by default. Reusing it would
+    /// make a start-side notice drop bootstrap replicates and reject search
+    /// candidates, under a failure line reading "estimate pinned to a declared
+    /// bound: … *starts at* …".
+    InitOutsideBounds,
+    /// One or more declared values could not be **represented** in the packed
+    /// space at all, so the optimizer started from a different number than the
+    /// model file declares (#1307).
+    ///
+    /// Deliberately **not** [`WarningCode::InitOutsideBounds`], and the two are
+    /// not degrees of the same thing. That one is a start the box moved, and its
+    /// coordinate is genuinely outside its box. This one is a start the *packer*
+    /// moved, before any box existed — `pack_params` applies its guard first and
+    /// the box is then built from the already-moved value, so every coordinate
+    /// reported here is perfectly **in-box**. A consumer that read the two as one
+    /// code would conclude from "no `init_outside_bounds`" that the declared
+    /// values reached the optimizer, which is exactly the inference #1307 exists
+    /// to stop.
+    ///
+    /// Reachable two ways, both of them log-packing limits rather than
+    /// modelling advice: a θ / Ω-diagonal / Σ / `[mixture]`-override value at or
+    /// below the log-packing floor of `1e-10`, where `ln` has nothing to
+    /// return, and a **free** residual correlation past the Fisher-z estimation
+    /// rail. A `FIX`-ed correlation is not among them: its rail was a choice
+    /// about what may be *searched*, and #1307 removed it.
+    InitNotRepresentable,
+    /// The fit never left its initial estimates: **no** free θ, Ω or σ coordinate
+    /// moved, so the reported OFV is the OFV *of the initial values* and says
+    /// nothing about the model (#751's signature, surfaced as a warning by #997 §2).
+    ///
+    /// Distinct from [`WarningCode::Convergence`], which reports that the
+    /// optimizer's own stopping rule was not met: a stall at the start is most
+    /// often accompanied by `converged = true`, since a fit that never moved has
+    /// a perfectly flat objective trace to plateau on.
+    ///
+    /// Read from [`crate::stalled_at_init`], which prefers the optimizer's own
+    /// scaled-space escape verdict ([`FitResult::left_init`]) and falls back to a
+    /// natural-scale comparison against the initial estimates. It fires only when
+    /// *nothing* moved — a well-chosen start that the optimizer correctly leaves
+    /// in place on one parameter while moving another is not a stall.
+    StalledAtInit,
+    /// The empirical Bayes estimates at the final parameters depend on where the inner
+    /// loop starts: re-solving them cold at the reported estimates lands on a materially
+    /// worse objective than the EBEs the optimizer itself was minimising against — or on
+    /// no usable number at all (#833). Every EBE-derived diagnostic (IPRED, IWRES, CWRES,
+    /// shrinkage, the covariance step's inner solve) is therefore start-dependent.
+    ///
+    /// It reports a *measurement*, not a diagnosis: two things produce it — an individual
+    /// objective with more than one mode at these estimates, and an `inner_maxiter` a cold
+    /// start cannot converge within — and the two objectives alone do not distinguish
+    /// them. The message names both.
+    ///
+    /// Distinct from [`WarningCode::Convergence`]: the *outer* fit may be perfectly
+    /// converged; this is about the inner problem at the point it converged to. The
+    /// reported fit uses whichever EBE set scores the lowest objective, so the number is
+    /// the best of the candidates, not a coin flip.
+    EbeStartDependent,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
@@ -5494,6 +6277,10 @@ impl WarningCode {
             WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::BoundaryEstimate => "boundary_estimate",
             WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
+            WarningCode::InitOutsideBounds => "init_outside_bounds",
+            WarningCode::InitNotRepresentable => "init_not_representable",
+            WarningCode::StalledAtInit => "stalled_at_init",
+            WarningCode::EbeStartDependent => "ebe_start_dependent",
             WarningCode::InflatedRse => "inflated_rse",
             WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
@@ -5605,6 +6392,45 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.contains("w_init_not_representable") {
+        // #1307: a declared value the *packer* altered before any box existed —
+        // a `1e-10` log floor, or the Fisher-z rail on a free ρ. Matched on its
+        // own `W_` token and placed with the other token arms.
+        //
+        // Ahead of `w_init_outside_bounds` below, and not merely for tidiness:
+        // `contains` is a substring test over the whole message, and this one
+        // names that sibling token when it explains why the box check stayed
+        // silent on the same coordinate. Ordered the other way, the sibling arm
+        // would claim this message and report a coordinate that is, by
+        // construction, inside its box.
+        (WarningSeverity::Warning, WarningCode::InitNotRepresentable)
+    } else if lower.contains("w_init_outside_bounds") {
+        // #1251: an initial estimate that packs outside its own box and is
+        // clamped there before the first objective evaluation. Matched on its
+        // `W_` token and placed with the other token arms, ahead of every prose
+        // arm — the message names a coordinate and quotes bounds, and the
+        // nearest prose arm ("optimizer bound") is a *post-fit* boundary
+        // estimate whose category drives `skip_estimate_near_boundary` and
+        // `reject_on_boundary`. A near-miss phrasing there would silently drop
+        // bootstrap replicates.
+        (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
+    } else if lower.contains("w_stalled_at_init") {
+        // #997 §2: the fit never left its initial estimates. Matched on its `W_`
+        // token and placed with the other token arms, ahead of every prose one.
+        // The message quotes the *initial* values of the parameters that did not
+        // move, and the prose arms below claim on substrings like "did not
+        // converge" and "initial" — but the category here is deliberately not
+        // `Convergence`: a stalled fit usually reports `converged = true`, and a
+        // consumer branching on `convergence` would read the opposite of what
+        // happened.
+        (WarningSeverity::Warning, WarningCode::StalledAtInit)
+    } else if lower.contains("w_ebe_start_dependent") {
+        // #833: the inner loop has more than one mode at the final estimates. Matched
+        // on its `W_` token and placed with the other token arms: the message quotes
+        // OFV values and names the EBE-derived diagnostics, and the prose arms below
+        // claim on substrings like "shrinkage" (`eta_shrinkage`, whose category drives
+        // a different user action entirely) and "converge".
+        (WarningSeverity::Warning, WarningCode::EbeStartDependent)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -5616,6 +6442,16 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // methods and quotes counters, and "did not converge" style prose could plausibly be
         // added to it later without anyone remembering this chain exists.
         (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_nonfinite_objective") {
+        // #1303: the convergence verdict was demoted because the objective at
+        // the final estimates is `NaN`, infinite, or the clamped divergence
+        // sentinel. Matched on its `W_` token and placed with the other token
+        // arms, ahead of every prose arm — the message quotes the offending
+        // value and lists candidate causes ("infusion duration", "residual
+        // variance", …), any of which a later edit could grow into a phrase a
+        // prose arm below claims. Same `(Critical, Convergence)` verdict the
+        // prose arm gives, reached deterministically.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
@@ -5726,6 +6562,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_missing_dv") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_cmt_defaulted") {
+        // #1009: rows whose compartment the reader chose because the dataset did
+        // not say. Matched on its `W_` token and placed with the other reader
+        // arms, ahead of the prose arm below — the message quotes offending cell
+        // spellings, so a future edit could grow a phrase a prose arm claims.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
@@ -5753,6 +6595,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Info, WarningCode::MultiStart)
     } else if lower.contains("cancelled by user") {
         (WarningSeverity::Info, WarningCode::Cancelled)
+    } else if lower.contains("thread count overridden") {
+        // #1416: a front end's explicit `--threads` beat the model file's
+        // `[fit_options] threads`. A Warning, not Info, for the same reason the
+        // `--data` override is one — the two inputs disagreed and one was dropped.
+        (WarningSeverity::Warning, WarningCode::Threads)
     } else if lower.contains("threads configured") || lower.contains("threads than subjects") {
         (WarningSeverity::Info, WarningCode::Threads)
     } else if lower.contains("n\u{00b2} ofv")
@@ -5785,7 +6632,33 @@ pub struct FitResult {
     /// Full sequence of methods executed, in order. Always has at least one entry.
     pub method_chain: Vec<EstimationMethod>,
     pub converged: bool,
+    /// The objective that was minimised. Equal to `ofv_data + ofv_prior`, so for
+    /// a model with no `prior(...)` declarations (#254) it is the plain −2 log L
+    /// it has always been.
     pub ofv: f64,
+    /// The data half of [`Self::ofv`] — the −2 log L with no prior penalty.
+    ///
+    /// This is what [`Self::aic`] and [`Self::bic`] are computed from, and what
+    /// should be compared against an unpriored fit of the same model.
+    #[serde(default)]
+    pub ofv_data: f64,
+    /// The prior half of [`Self::ofv`]: `Σ ((x̂ − m)/s)²` over the priored
+    /// coordinates (#254). Exactly `0.0` when no prior is declared.
+    ///
+    /// Normalisation constants are omitted here just as they are on the data
+    /// side (ferx's −2 log L drops `N·log(2π)`), so this is not absolutely
+    /// comparable to a NONMEM `$PRIOR` objective — compare ΔOFV against a null
+    /// twin instead.
+    #[serde(default)]
+    pub ofv_prior: f64,
+    /// Per-parameter prior report (#254): where the prior sat, where the
+    /// estimate landed, and how far apart they are in prior SDs. Empty when no
+    /// prior is declared.
+    ///
+    /// When this is non-empty the standard errors in `se_*` are the curvature of
+    /// the **penalized** objective — MAP / penalized-ML SEs, not posterior SDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_summary: Vec<PriorSummary>,
     pub aic: f64,
     pub bic: f64,
     pub theta: Vec<f64>,
@@ -5800,9 +6673,11 @@ pub struct FitResult {
     /// Residual-error correlations in force for this fit.
     ///
     /// A plain `block_sigma` estimates these alongside theta/omega/sigma (#847);
-    /// a `block_sigma ... FIX` block holds them at the declared value — see
-    /// `residual_correlation_fixed`. Together with `sigma`, they make the fitted
-    /// residual covariance reconstructible as `rho * sigma[i] * sigma[j]`.
+    /// a `block_sigma ... FIX` block holds them at the declared value — exactly,
+    /// at any `|rho| < 1`, which before #1307 was true only below `0.995_055`
+    /// (see [`ResidualCorrelation`]) — see `residual_correlation_fixed`.
+    /// Together with `sigma`, they make the fitted residual covariance
+    /// reconstructible as `rho * sigma[i] * sigma[j]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub residual_correlations: Vec<ResidualCorrelation>,
     /// FIX flags parallel to `residual_correlations` (#847). Empty for a fit
@@ -5964,6 +6839,24 @@ pub struct FitResult {
     pub total_ebe_fallbacks: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
+    /// Which estimator produced `covariance_matrix`, the standard errors,
+    /// `cov_eigenvalues` and `cov_condition_number` — `R⁻¹`, `S⁻¹` or the
+    /// `R⁻¹SR⁻¹` sandwich (#1382).
+    ///
+    /// **Not a copy of [`FitOptions::covariance_method`].** Above
+    /// [`COV_HESSIAN_MAX_DIM`] free parameters a *defaulted* `r` is routed onto
+    /// the cross-product (#1064), so the estimator that ran is not always the
+    /// one that was asked for; this field is the one that ran, carried up from
+    /// the covariance step rather than re-derived.
+    ///
+    /// `Some` exactly when `covariance_matrix` is `Some`. A step that was not
+    /// requested, was skipped, failed, or fell back to SIR produces no matrix
+    /// and therefore no label — there is nothing for an estimator name to
+    /// describe. The numbers this labels are not comparable across estimators:
+    /// the same fit was measured at condition number 1.42e8 under the sandwich
+    /// and 3.68e5 under `s`, and both are correct for their estimator.
+    #[serde(default)]
+    pub covariance_method: Option<CovarianceMethod>,
     /// ETA shrinkage per random effect: `1 - SD(eta_hat_k) / sqrt(omega_kk)`.
     /// `NaN` when `omega_kk` is zero. Computed from the conditional **mode**
     /// (EBE); for the distribution-based counterpart see
@@ -6070,8 +6963,40 @@ pub struct FitResult {
     /// (unpenalized) `ofv` is not ≈ 0 at that point by design. `Some` only for
     /// NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at least one
     /// gradient-requesting iteration improved the OFV, and for trust-region and
-    /// GN; `None` for BOBYQA (derivative-free), built-in BFGS, and SAEM.
+    /// GN. For a *derivative-free* NLopt run (BOBYQA) it is the post-fit
+    /// finite-difference gradient described under [`Self::final_gradient_source`];
+    /// `None` for the built-in BFGS and SAEM.
+    ///
+    /// **It is always the gradient at the estimates reported beside it.** That is
+    /// the load-bearing half of the contract, and the one a multi-stage method can
+    /// break silently: `gn_hybrid` reports the FOCEI polish's estimates whenever the
+    /// polish improves on the Gauss-Newton phase, so it reports the polish's
+    /// gradient too — and `None` when the polish computed none, rather than the GN
+    /// phase's vector from a point that is no longer the answer.
     pub final_gradient: Option<Vec<f64>>,
+    /// Where [`Self::final_gradient`] came from — the one thing a consumer needs
+    /// in order to read it (#997 §1).
+    ///
+    /// - `"optimizer"` — the optimizer's own gradient, evaluated during the fit
+    ///   at the best-OFV point. Free: it had to be computed anyway.
+    /// - `"finite_difference"` — a central-difference gradient of the same
+    ///   (penalized) objective, computed **after** the fit at the reported
+    ///   estimates purely so a derivative-free run has something to check
+    ///   `converged` against. Costs `2·n_free` extra objective evaluations —
+    ///   one gradient's worth — and is gated by
+    ///   [`FitOptions::report_final_gradient`]. The EBEs are re-solved
+    ///   (warm-started) inside the stencil, so it is the gradient of the
+    ///   marginal objective, not a fixed-EBE approximation to it.
+    ///
+    /// `None` exactly when `final_gradient` is `None`.
+    ///
+    /// The distinction matters because the two differ in *what they prove*: an
+    /// optimizer gradient near zero is a stationarity claim the optimizer itself
+    /// acted on, whereas an FD gradient near zero is an independent check on a
+    /// run that had no gradient at all — which is the case (BOBYQA converging to
+    /// a worse optimum and reporting `converged = true`) #997 was filed about.
+    #[serde(default)]
+    pub final_gradient_source: Option<String>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
@@ -6525,7 +7450,11 @@ pub struct FitOptions {
     /// routes to the same quantity. Set `false` to force finite differences.
     pub analytic_cov_hessian: bool,
     pub fd_hessian_step: f64,
-    /// What to do when the FD Hessian is non-positive-definite.
+    /// What to do when the covariance Hessian is non-positive-definite.
+    ///
+    /// Not FD-specific despite the historical wording elsewhere: the non-PD branch runs on
+    /// whichever `R` was assembled, so it applies equally to the exact analytic R-matrix
+    /// (see [`analytic_cov_hessian`](Self::analytic_cov_hessian)).
     /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
     /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
     /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
@@ -6552,6 +7481,21 @@ pub struct FitOptions {
     /// Inner-loop (EBE) optimizer. `Auto` keeps the size-based default; any other
     /// value pins the inner solver with no dimension-based switching.
     pub inner_optimizer: InnerOptimizer,
+    /// Compute a finite-difference gradient at the reported estimates when the
+    /// outer optimizer supplied none of its own — i.e. for a derivative-free
+    /// NLopt run (BOBYQA). Default `true` (#997 §1).
+    ///
+    /// This is a *reporting* quantity: it is computed once, after the fit, and
+    /// never steers the optimizer. It exists because `converged = true` from a
+    /// derivative-free run is otherwise unfalsifiable — there is nothing in the
+    /// result to distinguish "the objective stopped moving" from "the optimizer
+    /// stopped moving". Cost is `2·n_free` objective evaluations, the same as a
+    /// single gradient step of the optimizers that report one for free.
+    ///
+    /// Set `false` to skip it when that cost is not worth paying (a large ODE
+    /// model whose every objective evaluation is seconds). The fit is otherwise
+    /// bit-identical either way — nothing downstream reads `final_gradient`.
+    pub report_final_gradient: bool,
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -6574,19 +7518,20 @@ pub struct FitOptions {
     /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
-    /// Exploration-phase cap on the stochastic-approximation step for the
-    /// **numerical θ/σ M-step** (issue #1011); `None` uses the
-    /// `MSTEP_SA_MAX_STEP` default of 0.03.
+    /// Optional exploration-phase cap on the stochastic-approximation step for
+    /// the **numerical θ/σ M-step** (issue #1011); `None` uses the model-keyed
+    /// default of `estimation::saem::default_mstep_damping`: `1.0` — **off** —
+    /// since #1415, except for a model with `iiv_on_ruv`, which keeps #1011's
+    /// `0.03` (the one shape on which the undamped channel was measured to
+    /// drift).
     ///
-    /// The M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)` rather than
-    /// assigned, because assigning it outright is `argmax` of a *single* MCMC η
-    /// draw rather than the SA average of `E[argmax]` — a Monte-Carlo bias that
-    /// does not decay with iteration count for a θ with no ETA. This is the
-    /// θ-side counterpart of the Ω cap; in the convergence phase the cap lifts
-    /// and the full decaying `γ = 1/(k−k1)` applies either way.
-    ///
-    /// Smaller damps harder. **`1.0` disables the damping**, reproducing the
-    /// pre-#1011 assignment exactly. Must be in `(0, 1]`.
+    /// Below `1.0` the M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)`
+    /// during exploration and averaged at `γ = 1/(k−k1)` in convergence,
+    /// instead of assigned. That cap divides the number of EM steps the
+    /// exploration phase amounts to, and was measured (#1415) to hold every
+    /// theta with no ETA near its initial estimate rather than estimate it;
+    /// it is kept as an opt-in for the FREM `iiv_on_ruv` shape of #1011, where
+    /// the undamped channel drifts. Smaller damps harder. Must be in `(0, 1]`.
     ///
     /// Ignored when the numerical M-step has no θ to estimate (every θ
     /// mu-referenced or `FIX`), and for mixture models — see
@@ -7218,6 +8163,7 @@ impl Default for FitOptions {
             // (#490) behind these defaults and how to pin an optimizer explicitly.
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
+            report_final_gradient: true,
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -7481,6 +8427,29 @@ impl Optimizer {
     /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
     /// is in scope.
     pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
+        self.resolve_auto_given_analytic(
+            model,
+            crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction),
+        )
+    }
+
+    /// [`Optimizer::resolve_auto`] with the analytic-outer-gradient predicate supplied
+    /// by the caller instead of read off `model`.
+    ///
+    /// The one production caller passes the live predicate (via `resolve_auto`). The
+    /// point of the split is the **counterfactual**: the `gradient = fd` ⇒
+    /// `optimizer = auto` coupling warning (#1381) has to ask what `auto` would have
+    /// picked with the gradient left at `auto`, and it must ask it off this function
+    /// rather than a re-spelled copy of the rule — a second copy is what lets the
+    /// warning claim a coupling that the resolver does not actually have (the
+    /// `BOBYQA_MAX_DIM` arm below being the arm that would drift first, since above
+    /// the threshold `auto` takes L-BFGS on an FD gradient and there is no coupling
+    /// to report).
+    pub(crate) fn resolve_auto_given_analytic(
+        self,
+        model: &CompiledModel,
+        analytic_outer_gradient: bool,
+    ) -> Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
@@ -7499,7 +8468,7 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
-        if crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction) {
+        if analytic_outer_gradient {
             Optimizer::NloptLbfgs
         } else {
             Optimizer::Bobyqa
@@ -7841,6 +8810,37 @@ impl FitOptions {
         }
     }
 
+    /// The methods running as pure likelihood evaluators for this fit: `imp` under
+    /// `imp_eval_only`, `laplace` under `agq_eval_only`. Chain-wide, not per-stage.
+    ///
+    /// Feeds [`crate::api::is_last_estimating_stage`], which is how both
+    /// [`Self::covariance_stage`] and `fit_inner` decide which stage owns the covariance
+    /// step. One implementation, so the diagnostic and the run cannot disagree about it.
+    pub(crate) fn eval_only_methods(&self) -> Vec<EstimationMethod> {
+        let mut v = Vec::new();
+        if self.imp_eval_only {
+            v.push(EstimationMethod::Imp);
+        }
+        if self.agq_eval_only {
+            v.push(EstimationMethod::Laplace);
+        }
+        v
+    }
+
+    /// The chain stage that would run the post-fit covariance step: the last stage that
+    /// estimates, ignoring a trailing run of evaluation-only stages (#615).
+    ///
+    /// `None` only for an empty chain, which `method_chain` never produces. Note this
+    /// answers *which stage owns the step*, not whether it runs — `covariance = false`
+    /// and a Bayes stage both suppress it, and the caller decides what that means.
+    pub(crate) fn covariance_stage(&self) -> Option<EstimationMethod> {
+        let chain = self.method_chain();
+        let eval_only = self.eval_only_methods();
+        (0..chain.len())
+            .find(|&i| crate::api::is_last_estimating_stage(&chain, i, &eval_only))
+            .map(|i| chain[i])
+    }
+
     /// The first stage of the method chain with no η–ε interaction — plain
     /// FOCE, or Gauss-Newton without `interaction = true` — or `None` when
     /// every stage has one (FOCEI, Laplace/AGQ, or a Monte-Carlo estimator).
@@ -8022,7 +9022,44 @@ impl FitOptions {
                 available.join(", ")
             ));
         }
+        warnings.extend(self.inert_covariance_key_notices());
         warnings
+    }
+
+    /// Notices for [`covariance_keys`] set on a chain whose covariance step never runs.
+    ///
+    /// Bayesian estimation reports posterior credible intervals and explicitly disables
+    /// the Hessian covariance and SIR steps (`fit_inner`), so all six covariance keys are
+    /// inert when the stage that would own the step ([`Self::covariance_stage`]) is Bayes.
+    ///
+    /// This is one rule over the group rather than an omission from each method's key
+    /// list. A key withheld from `method_specific_keys` produces the *wrong* diagnostic
+    /// for two of the three readers: the parser cannot distinguish "not a covariance-step
+    /// method" from "misspelled", so it prints "not used by method `Bayes`" — the same
+    /// text a typo gets — and lists every method-specific key as the suggested
+    /// alternative. It also scales wrongly: covering six keys × N methods by omission is
+    /// 6N chances to forget one, and forgetting one is #956.
+    fn inert_covariance_key_notices(&self) -> Vec<String> {
+        if !matches!(self.covariance_stage(), Some(EstimationMethod::Bayes)) {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut notices = Vec::new();
+        for key in &self.user_set_keys {
+            if !covariance_keys().contains(&key.as_str()) {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            notices.push(format!(
+                "fit option `{key}` configures the post-fit covariance step, but this fit \
+                 ends in Bayesian estimation, which reports posterior credible intervals \
+                 instead of Hessian standard errors and runs no covariance step, so it \
+                 has no effect."
+            ));
+        }
+        notices
     }
 
     /// [`Self::unsupported_keys_warnings`] plus the **model-conditional** notices.
@@ -8101,6 +9138,31 @@ pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
     ]
 }
 
+/// The covariance subset of [`framework_keys`]: knobs that only ever reach the post-fit
+/// covariance step ([`crate::estimation::covariance::run_covariance_step`]).
+///
+/// Kept as its own list for the same reason as [`ode_solver_keys`]: they are
+/// framework-level with respect to the *method* — every estimator that runs a covariance
+/// step honours all six — but the step itself is skipped when the chain's last estimating
+/// stage is Bayes, and [`FitOptions::unsupported_keys_warnings`] says so for exactly these
+/// keys. A unit test pins the subset relation so the two lists cannot drift.
+///
+/// `cov_inner_tol` belongs here rather than in nine `method_specific_keys` arms: it is the
+/// covariance step's own EBE tolerance, so its applicability is decided by whether that
+/// step runs, never by the estimator. Listing it per method is what shipped #956's bug —
+/// an omission from every arm made a key the parser had just applied report itself as
+/// ignored — and a per-method list re-arms it for the next covariance-capable method.
+pub(crate) fn covariance_keys() -> &'static [&'static str] {
+    &[
+        "covariance",
+        "covariance_method",
+        "covariance_fallback",
+        "analytic_cov_hessian",
+        "fd_hessian_step",
+        "cov_inner_tol",
+    ]
+}
+
 /// Framework-level fit-option keys: consumed by every method and typically
 /// exposed as dedicated top-level arguments in the language wrappers
 /// (`covariance`, `verbose`, `bloq_method`, `threads`, `sir`, ...). Kept
@@ -8108,11 +9170,13 @@ pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
 /// can list only method-specific suggestions without conflating the layers.
 pub fn framework_keys() -> &'static [&'static str] {
     &[
+        // Covariance step (`covariance_keys()`, kept in the same order).
         "covariance",
         "covariance_method",
         "covariance_fallback",
         "analytic_cov_hessian",
         "fd_hessian_step",
+        "cov_inner_tol",
         "verbose",
         "sir",
         "sir_samples",
@@ -8139,6 +9203,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "ebe_warm_start",
+        "report_final_gradient",
         "inits_from_nca",
         "frem_predictions",
         "frem_sigma",

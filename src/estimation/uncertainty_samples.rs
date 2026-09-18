@@ -15,7 +15,7 @@
 //! perturbed coherently (they share one packed vector).
 
 use crate::estimation::parameterization::{
-    compute_bounds, packed_fixed_mask, unpack_params, PackedBounds,
+    pack_with_bounds, unpack_params, PackedBounds, PackedStart,
 };
 use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector};
 use nalgebra::{DMatrix, DVector};
@@ -213,7 +213,13 @@ fn draw_asymptotic(
          fit with `covariance = true` and ensure the covariance step succeeds."
             .to_string()
     })?;
-    let x_hat = crate::estimation::parameterization::pack_params(template);
+    let PackedStart {
+        packed: x_hat,
+        bounds,
+        fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
+    } = pack_with_bounds(template);
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed {
         return Err(format!(
@@ -224,8 +230,6 @@ fn draw_asymptotic(
         ));
     }
     let chol = regularised_cholesky(cov)?;
-    let bounds = compute_bounds(template);
-    let fixed_mask = packed_fixed_mask(template);
 
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
@@ -284,10 +288,15 @@ fn draw_sir(
 
     // Bounds-rejection sampling. SIR already filtered for finite weights, but
     // we still validate to be defensive against extreme proposal samples that
-    // slipped through. Precompute bounds + fixed mask once per call.
-    let bounds = compute_bounds(template);
-    let fixed_mask = packed_fixed_mask(template);
-    let x_hat = crate::estimation::parameterization::pack_params(template);
+    // slipped through. Precompute the packed start, bounds and fixed mask in
+    // one walk, once per call.
+    let PackedStart {
+        packed: x_hat,
+        bounds,
+        fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
+    } = pack_with_bounds(template);
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
     let mut tries = 0usize;
@@ -363,6 +372,9 @@ mod tests {
     /// are filled with sensible defaults.
     fn fit_with_cov(template: &ModelParameters, cov: DMatrix<f64>) -> FitResult {
         FitResult {
+            ofv_data: 0.0,
+            ofv_prior: 0.0,
+            prior_summary: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             se_residual_correlations: None,
             covariate_relations: Vec::new(),
@@ -433,6 +445,7 @@ mod tests {
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             covariance_status: crate::types::CovarianceStatus::Computed,
+            covariance_method: Some(crate::types::CovarianceMethod::Hessian),
             shrinkage_eta: vec![],
             cond_dist: None,
             shrinkage_eps: f64::NAN,
@@ -461,6 +474,7 @@ mod tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            final_gradient_source: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

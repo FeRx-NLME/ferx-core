@@ -97,7 +97,7 @@ of the CSV).  An entirely excluded subject does not appear in any output.
 | `DV`   | numeric | |
 | `EVID` | numeric (0/1/2/3/4) | |
 | `AMT`  | numeric | |
-| `CMT`  | numeric | |
+| `CMT`  | numeric | compares the compartment ferx **resolved**, not the raw cell — see the note below |
 | `RATE` | numeric | |
 | `MDV`  | numeric | |
 | `CENS` | numeric | |
@@ -112,6 +112,33 @@ never matches a comparison on that column. For example, `ignore = DV < 0.001`
 does **not** exclude dose rows, whose `DV` is `.`; only observation rows with a
 real `DV` below the threshold are dropped. (You can still write
 `ignore = EVID == 0 && DV < 0.001` to be explicit.)
+
+**`CMT` is the exception to that rule**, because it is the one column with a
+default. A missing (`.`/blank/`NA`) or unreadable cell — and an absent `CMT`
+column altogether — resolves to compartment **1** before the filter ever sees the
+record. The guessed compartment can then go wrong in either direction:
+
+- a clause **stops** matching, and a row you meant to drop is kept —
+  `ignore = CMT == 2` on a cell that should have read `2`;
+- a clause **starts** matching, and a row you meant to keep is deleted —
+  `ignore = CMT == 1` on a cell that should have read something else.
+
+Measured on a one-compartment model with a single observation cell spelled `2`
+against `x`, nothing else changed: under `ignore = CMT == 2`, 3 records scored at
+an objective of −5.7650 against 4 records at −5.2516; under
+`ignore = CMT == 1 && TIME == 4`, the same two numbers the other way round.
+
+Since ferx 0.4.0 a `[data_selection]` clause that compares `CMT` therefore makes
+the dataset's defaulted compartments a reported finding —
+[`W_CMT_DEFAULTED`](../file-formats/check-report.qmd#dose-records) — the same
+warning a model whose dose compartment or per-CMT readout depends on `CMT`
+already gets. Rows the filter **removed** on the strength of a guessed
+compartment are counted and named separately in that message, since they are not
+in the fit at all: writing the compartment out would give you back data rather
+than move it. A clause on any other column stays silent, even when a `CMT` clause
+sits beside it in the same block — the count is keyed on the rule that actually
+excluded the record. Write the compartment explicitly in every row you intend to
+filter on.
 
 ---
 

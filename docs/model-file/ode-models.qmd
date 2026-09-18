@@ -463,11 +463,13 @@ Two things, both worth knowing now that `auto` is the default. When the
 fallback completes, neither makes the answer worse than the explicit result, but both can make a
 fit slower than pinning a method by hand.
 
-*It is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
+*The starting decision is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
 hour-based convention typical of PK models, and the one the default tolerances assume. The same
 model written in days reads 24× smaller and may never trigger; written in minutes it reads 60×
 larger and can escalate wholesale — an oral model with `ka = 0.6/min` puts `λ_max` at 36 with
-nothing stiff in it anywhere.
+nothing stiff in it anywhere. Once RK45 is running, its stage-based detector uses the
+dimensionless product of step size and an estimated Jacobian rate, so that second decision is
+unchanged by an hours-to-days conversion.
 
 *It measures speed, not separation.* Stiffness is really a *ratio* — a fast mode alongside a slow
 one — and this reads only the fast end. A system whose modes are all equally fast is not stiff
@@ -576,13 +578,16 @@ segment exhausts `ode_max_steps` and comes back with a **median relative error o
 central compartment, while `rodas4` integrates it to `7e-8` in 79 steps. And it does so
 *quietly*: the segment produces **zero** minimum-step clamps and a **lower** step-rejection rate
 than the accurate cases, so neither the min-step counter nor a rejection-rate detector can see
-it. Only re-reading the Jacobian can.
+it. A stage-based stability estimate or a fresh Jacobian can.
 
-So `auto` does exactly that. Every 25 accepted steps it re-runs the probe at the state the
-segment has reached and, if the verdict has changed, **swaps the stepper in place**: the segment
-keeps everything it has integrated so far and carries on with the other method, rather than
-restarting or re-solving. On the model above this takes `auto` from 143 % median error in 10 000
-steps to `7e-8` in 90 — matching the method a user would have had to know to name in advance.
+RK45 now uses the stages of every accepted step to estimate `h·ρ(J)`, the same dimensionless
+stability signal used by the original Dormand–Prince stiffness detector. Consecutive stiff
+verdicts switch to the stiff method without another RHS evaluation. Those verdict counters
+belong to the subject solve and survive event boundaries, even though the stepper workspace is
+rebuilt because a dose or forcing change invalidates its stages. Every 25 accepted steps `auto`
+also re-runs the Jacobian probe as a backstop. If either detector changes the verdict, it
+**swaps the stepper in place**: the segment keeps everything it has integrated so far and
+carries on with the other method, rather than restarting or re-solving.
 
 A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
 comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
@@ -597,8 +602,8 @@ event-time path (TTE draws, adaptive dosing) switches on the same rule, where it
 its output *is* the answer, so a badly integrated span moves the event time rather than one
 prediction.
 
-Being a threshold test, the re-probe is also a **discontinuity** in the objective as a function
-of θ: a segment whose `|Re λ|max` sits near the threshold when the probe fires can switch at θ
+Being threshold tests, both detectors add a **discontinuity** in the objective as a function
+of θ: a segment whose stage estimate or `|Re λ|max` sits near its threshold can switch at θ
 and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
 start-of-segment probe and the escalation guard have the same property — re-probing adds up to
 eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
@@ -608,11 +613,10 @@ standard errors on a model whose `ode_solver` warning reports mid-segment switch
 with `ode_auto_switch = false`, or with a named stiff method (pinned, and so free of both the
 probe and the guard), to see whether the switching is what moved them.
 
-A benign segment stays on its stepper: a segment shorter than 25 accepted steps is never
-re-probed at all, and a longer one pays roughly one probe per 25 steps — a Jacobian build and an
-eigensolve against 25 full steps — and keeps a trajectory bit-identical to the pinned explicit
-one, because the verdict never changes. To go back to one method per segment, chosen at its
-start:
+A benign segment stays on its stepper. Its per-step stage estimate is arithmetic over values
+RK45 already computed; it pays no extra RHS calls. The periodic backstop costs roughly one
+Jacobian probe per 25 accepted steps, counted across event intervals. To go back to one method
+per segment, chosen at its start:
 
 ```
 [fit_options]
@@ -650,8 +654,9 @@ warning (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step cl
 minimum
 step size, when a returned segment stopped before its requested end, when an `auto` escalation
 had to be discarded and re-solved explicitly, when that explicit fallback also failed, when an
-escalation was discarded because its derivatives overflowed, or when `ode_stiff_abort_after`
-cut a segment short — and, at `Info` severity, when `auto` escalated
+escalation was discarded because its derivatives overflowed, when `ode_stiff_abort_after`
+cut a segment short, or when a walk was abandoned *before integrating* because the subject's
+timeline could not be ordered — and, at `Info` severity, when `auto` escalated
 and everything worked, so an escalation is never invisible. Either way it says how many
 segments changed stepper part-way through, because that changes how the step counts above it
 read: the steps before a switch were taken by a different method than the ones after it. Clamps taken inside an escalation
@@ -661,6 +666,21 @@ most actionable line ferx prints about the solver: the probe was right that the 
 stiff and wrong about which stiff method could integrate it, which is the case for naming
 `ode_method = rodas5p` (or `rosenbrock23`) by hand. The counters ride along in the warning's
 `details` payload.
+
+The abandoned-walk case is the odd one out, and has its own counter
+(`abandoned_non_finite_timeline`) for that reason. A `NaN` or infinite dose time, lagtime,
+route lag or infusion duration makes the timeline unsortable, so ferx returns `NaN`
+predictions for that subject rather than silently dropping the offending dose and reporting
+the remaining, drug-free trajectory as valid. Nothing is integrated, so such a subject
+contributes nothing to any other counter in the payload — which, before this counter existed,
+read exactly like a subject there was nothing to integrate for. It is not an `ode_method`
+problem and no solver setting fixes it: check the dose records, and any exponential covariate
+model on `ALAG` / `F` / `D` / `R` that can overflow at typical covariate values.
+
+The counter is reported by `fit()`. `predict()`, `simulate()` and `predict_survival()` still
+return `NaN` for such a subject and say nothing about it — the solver-statistics scope those
+counters accumulate into is opened by the fit only. The `NaN` itself is the signal on those
+entry points, as it was before.
 
 #### When the derivatives overflow but the predictions do not
 
@@ -945,11 +965,10 @@ absorption lag can differ by route. Mirroring NONMEM's `F1`/`F2` and
   fall back to the bare value (or to `F = 1`, `lag = 0`).
 - The index must refer to a compartment the model actually has — `F3` on a
   two-state model is a parse error, not a silently-ignored parameter.
-- Each declared `Fn`/`ALAGn` occupies one of the seven spare slots in the
-  fixed 16-slot PK parameter layout (shared with other ODE structural
-  parameters). Declaring the full set for many compartments can exhaust them;
-  if so, `ode_param_slots` reports a clear "too many individual parameters"
-  error rather than failing silently.
+- Each declared `Fn`/`ALAGn` occupies one free slot in the fixed PK parameter
+  layout (`MAX_PK_PARAMS`, 128 slots), shared with the model's other individual
+  parameters. A model that runs out gets a clear "too many individual
+  parameters" parse error rather than failing silently.
 
 > ⚠️ **`F{n}` / `ALAG{n}` / `LAGTIME{n}` are reserved names** (just like the
 > bare `F` / `lagtime` above, and exactly as in NONMEM). On an ODE model,
@@ -1009,6 +1028,17 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
 - A transient `D{n} ≤ 0` during estimation is clamped to a tiny positive floor
   (so `AMT / D{n}` stays finite); the converged optimum is interior, so reported
   estimates are unaffected — the same guard the built-in absorption models use.
+- A **non-finite** `D{n}` (`NaN` / `Inf`) is *not* clamped — it is out of domain,
+  not on the wrong side of a wall. One that is already non-finite at typical
+  values is rejected at fit-init as `E_DOSE_ATTR_NONFINITE`, naming the subject
+  and the dose record; one produced by a mid-fit parameter excursion makes that
+  subject's predictions `NaN`, which the estimator reads as a diverged solve and
+  the optimizer as a wall to climb away from. Before
+  [#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284) both shapes were
+  quietly served as an **instantaneous bolus** — `NaN` took the floor (every `>`
+  is false for `NaN`) and `+Inf` gave `rate = AMT/Inf = 0`, which is not an
+  infusion at all — so the fit returned finite, silently wrong numbers, measured
+  2.03× high at one elimination half-time on a 1-cpt model.
 
 > ⚠️ Like `F{n}` / `ALAG{n}`, `D{n}` is a **reserved name** when a `RATE=-2` dose
 > targets compartment `n` (as in NONMEM). It then denotes that compartment's
@@ -1069,7 +1099,12 @@ matching `R{n}` (else a loud `E_MODELED_RATE_NO_PARAM` error, never a silent
 bolus); `R{n}` is a **reserved name** when a `RATE=-1` dose targets compartment
 `n`; it works on **both engines** over the same infusable compartments; a transient
 `R{n} ≤ 0` is clamped to a tiny positive floor (and warned via
-`W_MODELED_RATE_NONPOSITIVE` if non-positive at the initial estimate); and a
+`W_MODELED_RATE_NONPOSITIVE` if non-positive at the initial estimate); a
+**non-finite** `R{n}` is rejected at fit-init or repels the subject mid-fit,
+exactly as for `D{n}` above
+([#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284) — the damage ran the
+other way there, a `NaN` clamped to `RATE_FLOOR = 1e-8` spreading the dose over
+`AMT/1e-8` time units so that essentially nothing was delivered); and a
 modeled-rate dose routes its analytical gradient to finite differences. Internally,
 `RATE=-1 R{n}=r` resolves to exactly the explicit `RATE = r` infusion.
 

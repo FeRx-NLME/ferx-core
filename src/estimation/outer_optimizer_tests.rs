@@ -168,8 +168,14 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         ..FitOptions::default()
     };
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &opts)
-        .expect("the unmapped TVFLAT must be detected and frozen");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("the unmapped TVFLAT must be detected and frozen");
     let idx = |name: &str| {
         model
             .default_params
@@ -1000,6 +1006,8 @@ fn make_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "outer_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -1029,6 +1037,7 @@ fn make_model() -> CompiledModel {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -1199,8 +1208,14 @@ fn preflight_freezes_flat_theta() {
     let mut options = FitOptions::default();
     options.interaction = false;
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
-        .expect("flat TVV must be detected");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &options,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("flat TVV must be detected");
     assert!(!frozen.theta_fixed[0], "active TVCL stays free");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
     assert!(
@@ -1220,7 +1235,14 @@ fn preflight_no_freeze_when_all_thetas_active() {
     let mut options = FitOptions::default();
     options.interaction = false;
     assert!(
-        freeze_flat_thetas(&model, &pop, &model.default_params, &options).is_none(),
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &options,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+        )
+        .is_none(),
         "no theta is flat — nothing to freeze"
     );
 }
@@ -1246,8 +1268,14 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
     let mut options = FitOptions::default();
     options.interaction = false;
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
-        .expect("flat TVV must be detected");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &options,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("flat TVV must be detected");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen");
     assert!(
         frozen.theta[1].is_finite() && frozen.theta[1] <= upper + 1e-6,
@@ -1303,6 +1331,8 @@ fn test_outer_ad_gradient_block_omega() {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "block_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -1332,6 +1362,7 @@ fn test_outer_ad_gradient_block_omega() {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -1784,6 +1815,8 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         frem_config: None,
         residual_error_eta: None,
@@ -1820,6 +1853,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         kappa_init_as_sd: vec![false],
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -2132,6 +2166,287 @@ fn test_stall_retry_keeps_the_better_attempt() {
             ofv
         ),
         -250.87
+    );
+}
+
+/// [`resolve_mid_descent_restart`] decides whether a run that quit while still
+/// descending is restarted from the point it reached, and which of the two
+/// attempts is reported (#1277). Driven with `T = f64` (the penalized objective
+/// itself) so every branch runs without two NLopt fits.
+///
+/// The regression each assertion exists to catch, since a restart that fires too
+/// eagerly costs a whole extra optimization and one that fires too rarely leaves
+/// the #1277 fit 3886 OFV units short:
+/// - a converged / plateaued fit must not pay for a restart at all — the
+///   `restart` closure panics, so a gate that lets one through is a failure, not
+///   a silently slower suite;
+/// - a cancelled run must not be restarted, however stalled it looks: it stopped
+///   through the objective's 1e20 short-circuit, not at a minimum; and
+/// - the restart is adopted only on a *strictly* lower objective, so it can
+///   never make the reported fit worse, and a tie leaves the first attempt (with
+///   its warnings) standing.
+#[test]
+fn test_mid_descent_restart_only_fires_for_a_live_stall() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+
+    // Not a mid-descent stall (converged, or a `Failure` the plateau check
+    // accepted): no second optimization.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            false,
+            (-286.0042, false),
+            |_: &f64| panic!("restart must not run for a fit that did not stall mid-descent"),
+            ofv,
+        ),
+        -286.0042
+    );
+
+    // Stalled mid-descent, but the user cancelled: still no second optimization.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            true,
+            (3209.8087, true),
+            |_: &f64| panic!("restart must not run on a cancelled fit"),
+            ofv,
+        ),
+        3209.8087
+    );
+}
+
+#[test]
+fn test_mid_descent_restart_keeps_the_better_attempt() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+
+    // The #1277 case, measured on `tests/fixtures/two_cpt_dcm_regularized.ferx`
+    // at `nn_l2 = 0`: L-BFGS quit at eval 12 with the trace still falling, and a
+    // restart from that point ran to convergence 3886 OFV units lower. The
+    // restart is handed the stalled result — here the objective itself — so the
+    // assertion also pins that it starts from the reported point rather than
+    // from `x₀`. `verbose = true` covers the reporting line.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            true,
+            false,
+            (3209.8087, true),
+            |stalled: &f64| {
+                assert_eq!(
+                    *stalled, 3209.8087,
+                    "restart must start from the stalled point"
+                );
+                -676.7746
+            },
+            ofv,
+        ),
+        -676.7746
+    );
+
+    // A restart that lands worse keeps the first attempt.
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| 3209.8087, ofv),
+        -676.7746
+    );
+
+    // Ties do not displace the first attempt.
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| -676.7746, ofv),
+        -676.7746
+    );
+}
+
+/// A restart whose own objective is not a usable number must never displace a
+/// finite incumbent — the successor is screened, not just compared (#1277
+/// review).
+///
+/// `NaN` and `+inf` are rejected by the `<` comparison on their own, but
+/// **`−inf` is not**: `-inf < 3209.8` is `true`, so before the `ofv_is_valid`
+/// screen a restart that diverged to `−inf` was adopted, and the fit's usable
+/// estimates and diagnostics went with it. That is reachable the same way any
+/// non-finite objective is — `gate_converged_on_objective` exists precisely
+/// because the final cold solve can hand back a non-finite number after a trace
+/// that looked healthy — and demoting *that* run's `converged` does not stop it
+/// being ranked here.
+///
+/// The `−inf` row is the one that fails without the screen; `NaN` and `+inf` are
+/// held so that a later edit flipping the comparison cannot quietly re-open the
+/// other two.
+#[test]
+fn test_mid_descent_restart_rejects_a_non_finite_successor() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+    for bad in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+        assert_eq!(
+            resolve_mid_descent_restart(false, false, (3209.8087, true), |_: &f64| bad, ofv),
+            3209.8087,
+            "a restart scoring {bad:?} must not displace a finite incumbent"
+        );
+    }
+    // The sentinel `DIVERGENCE_OFV` band is screened too — `ofv_is_valid` is the
+    // rule, not `is_finite`, so a repelled subject's 1e20 cannot be adopted as an
+    // improvement either. (It would not be, being larger; asserted so the screen
+    // is the documented one.)
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (3209.8087, true), |_: &f64| 1e20, ofv),
+        3209.8087
+    );
+}
+
+/// The same screen on the #751 sibling. `resolve_stall_retry` shares the
+/// adoption rule and had the same `−inf` hole; latent, because it only runs on a
+/// fit that never left its start, but two resolvers with one rule and only one
+/// screen is how they drift (#1277 review).
+#[test]
+fn test_stall_retry_rejects_a_non_finite_retry() {
+    use crate::estimation::outer_optimizer::resolve_stall_retry;
+
+    let ofv = |x: &f64| *x;
+    for bad in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+        assert_eq!(
+            resolve_stall_retry(
+                Optimizer::NloptLbfgs,
+                false,
+                (-250.87, false),
+                || (bad, true),
+                ofv,
+            ),
+            -250.87,
+            "a retry scoring {bad:?} must not displace a finite first attempt"
+        );
+    }
+}
+
+/// [`worth_restarting_mid_descent`] is the guard that keeps the #1277 restart off
+/// a run demoted by [`gate_converged_on_objective`] instead of by a stall.
+///
+/// Without it, every fit whose objective goes non-finite reads as a mid-descent
+/// stall — `converged` is false and the NLopt `Failure` verdict was deferred —
+/// and pays for a second optimization from the very estimates that poisoned the
+/// objective. The `NaN`/`±inf` rows are the ones that fail if the objective
+/// argument is dropped.
+#[test]
+fn test_mid_descent_restart_skips_a_non_finite_objective() {
+    use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
+
+    assert!(worth_restarting_mid_descent(true, 3209.8087));
+    assert!(worth_restarting_mid_descent(true, -676.7746));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN));
+    assert!(!worth_restarting_mid_descent(true, f64::INFINITY));
+    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY));
+    // A finite objective is not on its own a reason to restart.
+    assert!(!worth_restarting_mid_descent(false, 3209.8087));
+}
+
+/// The published escape verdict is measured against the **original** initial
+/// estimates, not against wherever the attempt that produced it started (#1277
+/// review).
+///
+/// The #1277 restart begins at a stalled fit's estimates. Measuring
+/// `OuterResult::left_init` against *that* start reports a fit which recovered
+/// thousands of OFV units as having never moved, whenever the restart's own step
+/// is small — and `model_selection::stalled_at_init` prefers this flag over its
+/// own `theta_init` comparison (`src/model_selection.rs`), so the recovered fit
+/// would carry `W_STALLED_AT_INIT` and be thrown out by the default
+/// `Strictness::reject_init_stall`. The estimates would be right and the fit
+/// rejected.
+///
+/// The #1277 DCM fixture cannot catch this: its restart moves a long way
+/// (‖W‖² 287.9 → 15340.6), so both references agree. This drives the geometry the
+/// fixture lacks — `outer_maxiter = 1`, so the leg barely moves — and asserts the
+/// **straddle**: the same run must read `false` against its own start and `true`
+/// against the distant origin. Without the straddle assertion the test would pass
+/// against an implementation that answered `true` unconditionally.
+#[test]
+fn test_published_escape_verdict_uses_the_original_start() {
+    use crate::estimation::outer_optimizer::optimize_nlopt_once;
+
+    let model = make_model();
+    let population = make_population(4);
+    let options = FitOptions {
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        ..Default::default()
+    };
+
+    // The straddle is built the *inverse* way round from the production case, for
+    // a reason worth stating: the production geometry (own start near, reference
+    // far) cannot be constructed deterministically on this fixture. A small
+    // `outer_maxiter` does not hold BOBYQA still — its setup phase alone is
+    // `40 * (n + 1)` evaluations regardless of the budget — and neither does
+    // starting at the optimum, because with 4 free parameters on 4 identical
+    // subjects the optimum is flat and the optimizer wanders off it by more than
+    // `INIT_ESCAPE_STEP_S`. FIXing everything does not work either: fixed
+    // parameters get degenerate bounds, and the reference is clamped to them, so
+    // it collapses onto the start.
+    //
+    // So the leg runs from the default start and is handed *its own converged
+    // estimates* as the reference. Displacement from its own start is then large
+    // and displacement from the reference ~0 — the same two verdicts, opposite
+    // signs. An implementation that ignores `escape_from` reports `true` here,
+    // which is exactly the bug.
+    let start = model.default_params.clone();
+    let declines =
+        crate::estimation::outer_optimizer::OuterFdDeclineLog::new(population.subjects.len());
+    let reference = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        None,
+    )
+    .0
+    .params;
+
+    let (own, own_outcome) = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        None,
+    );
+    let (from_reference, reference_outcome) = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        Some(&reference),
+    );
+
+    // The straddle itself, asserted so it cannot silently become a tautology: the
+    // two references must disagree about this one run.
+    assert_eq!(
+        own.left_init,
+        Some(true),
+        "fixture precondition: the leg must escape its OWN start, or this test \
+         cannot tell the two references apart"
+    );
+    assert_eq!(
+        from_reference.left_init,
+        Some(false),
+        "the published verdict must be measured against `escape_from`, which this \
+         leg ends on top of — not against the start it happened to run from"
+    );
+
+    // The *internal* verdict — what the #751 stall retry and
+    // `failure_is_converged_plateau` read — stays relative to this attempt's own
+    // start in both cases. Those ask "did this leg descend, or twitch and die?",
+    // which is a question about the leg, not about the pair.
+    assert!(own_outcome.left_init);
+    assert!(
+        reference_outcome.left_init,
+        "escape_from must not move the internal displacement test"
     );
 }
 
@@ -2492,6 +2807,81 @@ fn global_presearch_branch_runs_or_warns() {
 //
 // Run with:  cargo test --lib --no-default-features --features ci \
 //              bench_cov_hessian -- --ignored --nocapture
+
+#[test]
+#[ignore = "benchmark: optimized serial-vs-Rayon population NLL"]
+fn bench_small_population_nll_dispatch() {
+    use rayon::prelude::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let model = make_model();
+    let params = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for n_subj in [1usize, 2, 4, 8, 16, 32] {
+            let population = make_population(n_subj);
+            let eta_hats: Vec<DVector<f64>> =
+                (0..n_subj).map(|_| DVector::zeros(1)).collect();
+            let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+                .map(|_| DMatrix::from_element(3, 1, 0.1))
+                .collect();
+            let eval = |i: usize| {
+                subject_nll(
+                    &model,
+                    &population.subjects[i],
+                    params,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    &[],
+                    true,
+                )
+            };
+            let serial_once = || -> f64 {
+                let values: Vec<f64> = (0..n_subj).map(&eval).collect();
+                values.iter().sum()
+            };
+            let parallel_once = || -> f64 {
+                let values: Vec<f64> = (0..n_subj).into_par_iter().map(&eval).collect();
+                values.iter().sum()
+            };
+            assert_eq!(serial_once().to_bits(), parallel_once().to_bits());
+            for _ in 0..20 {
+                black_box(serial_once());
+                black_box(parallel_once());
+            }
+            let mut serial = Vec::with_capacity(31);
+            let mut parallel = Vec::with_capacity(31);
+            for rep in 0..31 {
+                if rep % 2 == 0 {
+                    let start = Instant::now();
+                    black_box(serial_once());
+                    serial.push(start.elapsed());
+                    let start = Instant::now();
+                    black_box(parallel_once());
+                    parallel.push(start.elapsed());
+                } else {
+                    let start = Instant::now();
+                    black_box(parallel_once());
+                    parallel.push(start.elapsed());
+                    let start = Instant::now();
+                    black_box(serial_once());
+                    serial.push(start.elapsed());
+                }
+            }
+            serial.sort_unstable();
+            parallel.sort_unstable();
+            eprintln!(
+                "n={n_subj}: serial median={:?} range={:?}..{:?}; parallel median={:?} range={:?}..{:?}; serial/parallel={:.3}x",
+                serial[15], serial[0], serial[30], parallel[15], parallel[0], parallel[30],
+                serial[15].as_secs_f64() / parallel[15].as_secs_f64(),
+            );
+        }
+    });
+}
 
 /// Measures wall time for the gradient-FD Hessian (new path, issue #209) vs
 /// the legacy scalar-FD Hessian (reconstructed inline) on the same setup.
@@ -3051,6 +3441,128 @@ fn short_descending_tail_is_not_converged() {
     ));
 }
 
+// ── #833: which of the final inner loop's EBE candidates is reported ──────────
+
+#[test]
+fn the_lowest_objective_candidate_is_the_one_reported() {
+    // Candidates are passed [cold, warm re-solve, incumbent-as-held].
+    // FREM warfarin, measured: cold -167.95, the warm re-solve -174.91.
+    assert_eq!(reported_candidate(&[-167.95, -174.91, -174.90]), 1);
+    // The incumbent is a real candidate, not just a seed: `run_inner_loop_warm` is not
+    // monotone from its seed (the FREM NM arm, #1365), so the re-solve can score above
+    // the EBEs it started from — and then the held state has to win (review of #1386).
+    assert_eq!(reported_candidate(&[-100.0, -20.0, -174.91]), 2);
+    // And the cold solve wins when it is simply the best of the three.
+    assert_eq!(reported_candidate(&[-300.0, -174.91, -174.90]), 0);
+    // The held candidate is absent when it belongs to a different point than the one
+    // restored; two candidates then, same rule.
+    assert_eq!(reported_candidate(&[-167.95, -174.91]), 1);
+}
+
+#[test]
+fn a_tie_reports_the_cold_solve() {
+    // The unimodal case — most fits. Ties break by index and the caller passes the cold
+    // solve first, which is what keeps those fits bit-identical to the pre-#833
+    // behaviour.
+    assert_eq!(
+        reported_candidate(&[-286.004205, -286.004205, -286.004205]),
+        0
+    );
+}
+
+#[test]
+fn a_diverged_candidate_never_displaces_a_finite_one() {
+    // Every comparison against `NaN` is false, so a plain `<` chain gets this half right
+    // and the other half wrong. Both halves are asserted: a diverged warm solve must not
+    // win, *and* a diverged cold solve must not pin the fit to itself.
+    assert_eq!(reported_candidate(&[42.0, 50.0, f64::NAN]), 0);
+    assert_eq!(reported_candidate(&[42.0, 50.0, f64::INFINITY]), 0);
+    assert_eq!(reported_candidate(&[f64::NAN, 50.0, 42.0]), 2);
+    assert_eq!(reported_candidate(&[f64::NEG_INFINITY, 50.0, 42.0]), 2);
+    // All three unusable: index 0 comes back, so the caller reports the cold solve and
+    // `gate_converged_on_objective` (#1303) demotes the fit rather than this function
+    // inventing a verdict.
+    assert_eq!(reported_candidate(&[f64::NAN, f64::NAN, f64::NAN]), 0);
+}
+
+#[test]
+fn the_cold_verdict_separates_reproduction_from_a_material_gap() {
+    // Measured FREM gap: 6.96 on a reported -174.91 → the tolerance is
+    // 1e-3 * (1 + 174.91) = 0.176, so this is ~40x over.
+    match cold_solve_verdict(-167.95, -174.91) {
+        ColdSolveVerdict::Worse(gap) => assert!((gap - 6.96).abs() < 1e-9, "gap = {gap}"),
+        other => panic!("expected a material gap, got {other:?}"),
+    }
+    // A cold solve that ties (or beats) the reference reproduces it.
+    assert_eq!(
+        cold_solve_verdict(-174.91, -174.91),
+        ColdSolveVerdict::Reproduces
+    );
+    assert_eq!(
+        cold_solve_verdict(-200.0, -174.91),
+        ColdSolveVerdict::Reproduces
+    );
+    // The threshold itself: 1e-3 * (1 + 100) = 0.101, so 0.05 is inside and 0.5 is not.
+    assert_eq!(
+        cold_solve_verdict(-99.95, -100.0),
+        ColdSolveVerdict::Reproduces
+    );
+    assert!(matches!(
+        cold_solve_verdict(-99.5, -100.0),
+        ColdSolveVerdict::Worse(_)
+    ));
+    // `missed()` is what gates the extra candidates.
+    assert!(!cold_solve_verdict(-174.91, -174.91).missed());
+    assert!(cold_solve_verdict(-99.5, -100.0).missed());
+}
+
+#[test]
+fn a_non_finite_cold_solve_is_its_own_verdict() {
+    // The reason this is not a gap test: `NaN - x > tol` is false, so `Worse` would
+    // decline both the retry and the warning in the one case where the cold EBEs are
+    // certainly not the ones to report (review of #1386).
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            cold_solve_verdict(bad, -174.91),
+            ColdSolveVerdict::NonFinite,
+            "{bad} must not be classified by the gap test"
+        );
+        assert!(cold_solve_verdict(bad, -174.91).missed());
+    }
+}
+
+#[test]
+fn the_start_dependence_warning_reports_what_was_measured() {
+    // Silent when the cold solve reproduces the reported objective — this is what keeps
+    // the warning off ordinary fits.
+    assert!(ebe_start_dependence_warning(-174.91, -174.91).is_none());
+    assert!(ebe_start_dependence_warning(-200.0, -174.91).is_none());
+
+    let w = ebe_start_dependence_warning(-167.95, -174.91).expect("6.96 is material");
+    assert!(w.contains("6.9600"), "the gap belongs in the message: {w}");
+    assert!(w.contains("-167.9500") && w.contains("-174.9100"), "{w}");
+    // It must not diagnose multimodality on its own: the regression fixture for this
+    // code path has a gap that comes from the inner *budget*, not from a second mode
+    // (review of #1386). Both causes are named, and the wording stays conditional.
+    assert!(w.contains("or the inner loop cannot reach it"), "{w}");
+    assert!(
+        !w.contains("means the individual objective has more than one mode"),
+        "the message must not assert multimodality as the cause: {w}"
+    );
+
+    // The non-finite arm gets its own message, and it is not silent.
+    let nf = ebe_start_dependence_warning(f64::NAN, -174.91).expect("NaN must be reported");
+    assert!(nf.contains("non-finite objective"), "{nf}");
+
+    // Both arms carry the token that classifies them, so a consumer branching on
+    // `warnings_structured[].category` sees the same code for either.
+    for msg in [w, nf] {
+        let entry = crate::types::classify_warning(&msg);
+        assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
+}
+
 #[test]
 fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold
@@ -3308,4 +3820,917 @@ fn covariate_model_leaves_its_initial_estimates_1290() {
          is poisoning the objective again (#1290).",
         result.ofv,
     );
+}
+
+// ─── BestPoint: checkpoint the best point, not the current eval (#1317) ──────
+
+/// Absolute temp path unique to this process + tag (no working-dir pollution).
+fn best_point_tmp_path(tag: &str) -> String {
+    format!("/tmp/ferx_bestpoint_{}_{}.tmp", tag, std::process::id())
+}
+
+/// Arm a checkpoint sink with a zero-second interval, so every write is due.
+/// The sink is a thread-local and each `#[test]` owns its thread, so these
+/// tests do not interfere with each other.
+fn arm_checkpoint_sink(path: &str) {
+    crate::io::checkpoint::remove(path);
+    crate::io::checkpoint::init(
+        path.to_string(),
+        "test".to_string(),
+        None,
+        None,
+        vec!["focei".to_string()],
+        vec!["c0".to_string()],
+        0,
+    );
+}
+
+/// The #1317 regression in the shape the issue reports it: the optimizer
+/// evaluates 100, then 50, then an L-BFGS line-search probe at 1e6, and the
+/// checkpoint write lands on the probe. The `.tmp` must hold the 50 point — the
+/// pre-fix code wrote the probe, putting an OFV five orders of magnitude off
+/// into a file that a resume, a scorer or a progress monitor reads as "where the
+/// fit is".
+#[test]
+fn checkpoint_holds_the_best_point_not_the_line_search_probe() {
+    let path = best_point_tmp_path("probe");
+    arm_checkpoint_sink(&path);
+
+    let mut best = BestPoint::new();
+    for (iter, x, ofv) in [(1usize, 1.0, 100.0), (2, 2.0, 50.0), (3, 3.0, 1.0e6)] {
+        best.observe(iter, &[x], ofv, ofv);
+    }
+    assert!(crate::io::checkpoint::is_due(), "interval 0 → always due");
+    best.write_checkpoint(|x| x.to_vec());
+
+    let cp = crate::io::checkpoint::load(&path).expect("a due write produces a file");
+    assert_eq!(
+        cp.packed,
+        vec![2.0],
+        "checkpoint must hold the best point, not eval 3's probe"
+    );
+    assert_eq!(
+        cp.ofv, 50.0,
+        "and the OFV at that point, not the probe's 1e6"
+    );
+    assert_eq!(cp.iter, 2, "iter is the eval at which the best was seen");
+
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+}
+
+/// Ranking is on `ofv` — the objective the optimizer minimises, penalized under
+/// NN regularization — while the checkpoint reports `ofv_clean`. A point that
+/// fits the data better but carries a worse penalty must not displace the
+/// incumbent, or a heavier-λ optimum could lose to a start that merely overfits.
+#[test]
+fn best_point_ranks_on_the_penalized_objective_and_reports_the_clean_one() {
+    let mut best = BestPoint::new();
+    assert!(best.observe(1, &[1.0], 10.0, 100.0));
+    assert!(
+        !best.observe(2, &[2.0], 20.0, 1.0),
+        "a lower clean OFV must not win on a worse penalized objective"
+    );
+    let b = best.get().expect("an eval was observed");
+    assert_eq!(b.x, vec![1.0]);
+    assert_eq!(
+        b.ofv_clean, 100.0,
+        "the clean OFV travels with its own point"
+    );
+    assert_eq!(best.ofv(), 10.0, "ranking exposes the penalized objective");
+}
+
+/// NaN handling in both directions. `5.0 < NaN` and `NaN < 5.0` are both false,
+/// so a naive `<` leaves a NaN first eval as a permanent incumbent — which is
+/// also what the #59 restore would then land on.
+#[test]
+fn best_point_swaps_a_nan_incumbent_out_but_never_back_in() {
+    let mut best = BestPoint::new();
+    assert_eq!(best.ofv(), f64::INFINITY, "an empty tracker ranks as +inf");
+    assert!(best.get().is_none());
+    assert!(
+        best.observe(1, &[1.0], f64::NAN, f64::NAN),
+        "the first eval is always kept"
+    );
+    assert!(
+        best.observe(2, &[2.0], 5.0, 5.0),
+        "a finite eval must displace a NaN incumbent"
+    );
+    assert!(
+        !best.observe(3, &[3.0], f64::NAN, f64::NAN),
+        "a NaN eval must never displace a finite incumbent"
+    );
+    assert_eq!(best.get().expect("finite incumbent").x, vec![2.0]);
+}
+
+/// The NLopt driver tracks *scaled* `xs`, but a checkpoint stores the packed
+/// (log-theta / Cholesky-omega / log-sigma) vector that `unpack_params` reads on
+/// resume. `write_checkpoint` maps through the caller's unscale, so a driver
+/// working in scaled space cannot silently persist scaled coordinates.
+#[test]
+fn checkpoint_write_maps_the_tracked_point_into_packed_space() {
+    let path = best_point_tmp_path("scale");
+    arm_checkpoint_sink(&path);
+
+    let scale = [10.0, 0.5];
+    let mut best = BestPoint::new();
+    best.observe(7, &[0.3, 4.0], 1.0, 2.0);
+    best.write_checkpoint(|xs| xs.iter().zip(scale).map(|(v, s)| v * s).collect());
+
+    let cp = crate::io::checkpoint::load(&path).expect("a due write produces a file");
+    assert_eq!(cp.packed, vec![3.0, 2.0], "packed = xs · scale");
+    assert_eq!(cp.iter, 7);
+
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+}
+
+/// Nothing observed yet → nothing to record. Reachable when the write interval
+/// elapses before the first eval of a stage completes; writing a fabricated
+/// point there would be worse than leaving the previous stage's checkpoint in
+/// place.
+#[test]
+fn write_checkpoint_is_a_noop_before_the_first_eval() {
+    let path = best_point_tmp_path("empty");
+    arm_checkpoint_sink(&path);
+
+    BestPoint::new().write_checkpoint(|x| x.to_vec());
+    assert!(
+        crate::io::checkpoint::load(&path).is_none(),
+        "an empty tracker must not write"
+    );
+
+    crate::io::checkpoint::abandon();
+    crate::io::checkpoint::remove(&path);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  #997 §1 — a gradient at the solution for derivative-free fits
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `reporting_fd_gradient` on an unpenalized model must reproduce
+/// [`reconverged_fd_gradient`] **exactly**.
+///
+/// The two share `central_diff_packed`, so this is not a test of the stencil —
+/// it is a test of the *objective inside it*. `reconverged_fd_gradient` is the
+/// established definition (`2 · pop_nll`, EBEs re-solved warm-started at every
+/// perturbed point, `1e20` on a guard rejection); the new function has to be
+/// that plus the penalties, and on a model with no NN regularizer and no priors
+/// "plus the penalties" is plus exactly zero. Any drift in the re-typed
+/// objective — a dropped `2 ·`, a cold instead of warm inner solve, a different
+/// guard — shows up here as a difference rather than as a plausible-looking
+/// number nothing can check.
+///
+/// Bit-equality, not a tolerance: both sides evaluate the identical expression
+/// at the identical points, so anything but `==` would be hiding something.
+#[test]
+fn reporting_fd_gradient_equals_the_reconverged_one_when_nothing_is_penalized() {
+    let model = make_model();
+    let population = make_population(3);
+    let template = &model.default_params;
+    let options = FitOptions {
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let x = pack_params(template);
+    let bounds = compute_bounds(template);
+    let warm: Vec<DVector<f64>> = (0..population.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+    let priors = build_prior_set(&model, template);
+    assert!(
+        !priors.is_active(),
+        "fixture precondition: this model declares no priors"
+    );
+
+    let established =
+        reconverged_fd_gradient(&x, template, &model, &population, &warm, &bounds, &options);
+    let reporting = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+
+    // The comparison is worthless if both are zero — that is the shape a
+    // "return vec![0.0; n]" mutation takes, and it would pass `==` happily.
+    assert!(
+        established.iter().any(|g| g.abs() > 1e-6),
+        "fixture precondition: the reference gradient must be non-degenerate, got {established:?}"
+    );
+    assert_eq!(
+        reporting, established,
+        "the reporting gradient must differentiate the same objective the optimizer's own \
+         FD gradient does when there is no penalty to add"
+    );
+}
+
+/// The penalties go **inside** the stencil, not next to it.
+///
+/// `FitResult::final_gradient` is documented as the gradient of the objective
+/// the fit *minimised*, which under a prior (or an NN regularizer) is
+/// `∇(OFV + penalty)` — the gradient of the reported, unpenalized OFV is not ≈ 0
+/// at a regularized optimum by design. The optimizer's own path splices the
+/// analytic penalty gradient into the likelihood gradient afterwards; the
+/// reporting path has no caller to splice anything, so the penalty has to be
+/// differenced along with everything else.
+///
+/// Pinned against the analytic `∂penalty/∂x = 2(x−m)/s²` that
+/// `PriorSet::add_gradient` supplies to the optimizer, so the two paths agree on
+/// what the penalty contributes. Deleting `priors.penalty(xv)` from the eval
+/// leaves the difference at zero and fails here.
+#[test]
+fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
+    let mut model = make_model();
+    let population = make_population(3);
+    let options = FitOptions {
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let template = &model.default_params;
+    let x = pack_params(template);
+    let bounds = compute_bounds(template);
+    let warm: Vec<DVector<f64>> = (0..population.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+
+    let unpenalized = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &build_prior_set(&model, template),
+    );
+
+    // A prior deliberately *away* from the initial value (TVCL starts at 5.0),
+    // so `2(x−m)/s²` is far from zero and the assertion can distinguish
+    // "differenced the penalty" from "differenced nothing".
+    model.priors = vec![crate::types::ParameterPrior {
+        name: "TVCL".into(),
+        value: 2.0,
+        spread: crate::types::PriorSpread::Rse(0.2),
+        kind: Some(crate::types::ParameterKind::Theta),
+    }];
+    let template = &model.default_params;
+    let priors = build_prior_set(&model, template);
+    assert!(priors.is_active(), "the prior must have resolved");
+
+    let penalized = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+
+    // What the optimizer's own path adds for the same prior at the same point.
+    let mut analytic_penalty_grad = vec![0.0; x.len()];
+    priors.add_gradient(&x, &mut analytic_penalty_grad);
+    assert!(
+        analytic_penalty_grad[0].abs() > 1.0,
+        "fixture precondition: the prior must pull hard enough to be visible above FD noise, \
+         got {}",
+        analytic_penalty_grad[0]
+    );
+
+    for k in 0..x.len() {
+        let observed = penalized[k] - unpenalized[k];
+        let want = analytic_penalty_grad[k];
+        assert!(
+            observed.is_finite() && want.is_finite(),
+            "coordinate {k}: non-finite gradient (observed {observed}, want {want})"
+        );
+        // Measured, not argued: the worst realised |observed − want| over the four
+        // coordinates is 4.03e-9 (all of it on the priored coordinate 0; the other
+        // three are exactly 0, the penalty not touching them). That residue is the
+        // FD truncation error of the quadratic penalty at `h = 1e-4·(1+|x|)`. The
+        // bound is 1e-7 — 25× the realised error, and eight orders below the
+        // ≈ 33 the assertion is trying to see, so a dropped penalty cannot pass.
+        assert!(
+            (observed - want).abs() < 1e-7,
+            "coordinate {k}: the reporting gradient must pick up the prior penalty \
+             analytically-equivalently — differenced {observed}, analytic {want}"
+        );
+    }
+}
+
+/// End to end: a **derivative-free** fit must come back carrying a gradient, and
+/// it must be the gradient at the point the fit actually reported.
+///
+/// This is the defect #997 was filed on — `converged = TRUE` with
+/// `final_gradient = NULL` for exactly the optimizer where a premature stop is
+/// most likely. The point assertion is the substantive half: a gradient computed
+/// at the *initial* estimates, or at the last probe NLopt happened to evaluate
+/// rather than the restored best point, would be finite, plausible and wrong, and
+/// no "is_some" check could tell. `packed_estimate` is the exact vector the
+/// reported estimates and the covariance step were built from, so recomputing the
+/// gradient there and requiring equality pins the point.
+#[test]
+fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimates() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+
+    assert_eq!(
+        result.final_gradient_source.as_deref(),
+        Some("finite_difference"),
+        "a derivative-free run has no gradient of its own to report"
+    );
+    let reported = result
+        .final_gradient
+        .as_ref()
+        .expect("the source says finite_difference, so there must be a gradient");
+    assert!(
+        reported.iter().all(|g| g.is_finite()),
+        "a reporting gradient that is NaN/inf is worse than none: {reported:?}"
+    );
+
+    let packed = result
+        .packed_estimate
+        .as_ref()
+        .expect("the NLopt path records the exact packed estimate");
+    let bounds = compute_bounds(&model.default_params);
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+    let priors = build_prior_set(&model, &model.default_params);
+    // The warm start the production path used: the final inner-loop EBEs, which
+    // the result carries per subject.
+    let ebes: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
+    let recomputed = reporting_fd_gradient(
+        packed,
+        &model.default_params,
+        &model,
+        &population,
+        &ebes,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+    assert_eq!(
+        reported.len(),
+        packed.len(),
+        "the gradient is reported in packed space, one entry per coordinate"
+    );
+    // Measured: the realised difference is exactly 0.0 on every coordinate — the
+    // same deterministic stencil over the same objective at the same point, so
+    // there is nothing for it to be. The bound is a relative 1e-12 rather than
+    // `==` only to leave room for a platform whose parallel reduction order in
+    // `pop_nll_opts` differs; anything larger would stop discriminating the
+    // wrong-point failure this test exists for: measured on this fixture, the same
+    // gradient taken at the *initial* estimates instead differs by 1.2e3 to 2.5e5
+    // per coordinate, so the bound has fifteen orders of margin over the mistake.
+    for (k, (got, want)) in reported.iter().zip(&recomputed).enumerate() {
+        assert!(
+            (got - want).abs() <= 1e-12 * (1.0 + want.abs()),
+            "coordinate {k}: the reported gradient must be the one at the reported estimates \
+             — got {got}, recomputed at `packed_estimate` {want}"
+        );
+    }
+}
+
+/// A gradient-based run keeps reporting the gradient it actually used, labelled
+/// as such. The two labels are what let a consumer tell a stationarity claim the
+/// optimizer acted on from an after-the-fact check on a run that had none — so a
+/// change that relabelled everything `"finite_difference"` (or recomputed a
+/// perfectly good optimizer gradient for the sake of uniformity) must fail here.
+#[test]
+fn a_gradient_based_fit_reports_the_optimizers_own_gradient() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+    assert_eq!(
+        result.final_gradient_source.as_deref(),
+        Some("optimizer"),
+        "L-BFGS computes a gradient at every iteration; there is nothing to recompute"
+    );
+    assert!(result.final_gradient.is_some());
+}
+
+/// `report_final_gradient = false` opts out of the `2·n_free` evaluations and
+/// restores the pre-#997 shape: no gradient, and — this is the part worth
+/// pinning — no *label* either, so `final_gradient_source` cannot claim a
+/// provenance for a gradient that does not exist.
+#[test]
+fn report_final_gradient_false_leaves_a_derivative_free_fit_with_no_gradient() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+    assert!(
+        result.final_gradient.is_none(),
+        "the caller opted out of computing one"
+    );
+    assert!(
+        result.final_gradient_source.is_none(),
+        "no gradient means no provenance to report"
+    );
+}
+
+/// End to end (#997 §2): a fit that never left its initial estimates must *say
+/// so on the result*, not merely be diagnosable by a caller who knows to call
+/// `stalled_at_init` themselves. The predicate predates this; the wiring is what
+/// was missing, so the wiring is what this test exists for — delete the emit
+/// site in `api::fit` and it reddens.
+///
+/// A one-evaluation budget is the deterministic way to produce the condition:
+/// NLopt returns after evaluating the start, so the reported estimates are the
+/// initial ones exactly and the optimizer's own escape test records
+/// `left_init = Some(false)`.
+#[test]
+fn a_fit_that_never_left_its_initial_estimates_says_so_on_the_result() {
+    let (model, template) = pinned_at_init_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 30,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = crate::api::fit(&model, &population, &template, &options).expect("fit");
+
+    assert_eq!(
+        result.left_init,
+        Some(false),
+        "fixture precondition: a one-eval budget must not let the fit escape its start"
+    );
+    let entry = result
+        .warnings_structured
+        .iter()
+        .find(|e| e.category == crate::types::WarningCode::StalledAtInit)
+        .unwrap_or_else(|| {
+            panic!(
+                "a fit pinned to its initial estimates must carry the warning; got {:?}",
+                result
+                    .warnings_structured
+                    .iter()
+                    .map(|e| e.category)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        entry.details.is_some(),
+        "the structured entry must survive `rebuild_warnings_structured` with its payload \
+         intact — a re-classified copy would have none"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_STALLED_AT_INIT")),
+        "the flat warning list the CLI prints must carry it too: {:?}",
+        result.warnings
+    );
+}
+
+/// The negative arm of the same wiring, on the same model and data: a fit given
+/// a real budget moves, and must not be flagged. Without this the test above is
+/// satisfied by an implementation that warns unconditionally.
+#[test]
+fn a_fit_with_a_real_budget_is_not_flagged_as_stalled() {
+    let model = make_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 60,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+
+    assert_eq!(
+        result.left_init,
+        Some(true),
+        "fixture precondition: this budget must actually let the fit move, or the assertion \
+         below passes for the wrong reason"
+    );
+    assert!(
+        !result
+            .warnings_structured
+            .iter()
+            .any(|e| e.category == crate::types::WarningCode::StalledAtInit),
+        "a fit that moved must not be flagged: {:?}",
+        result.warnings
+    );
+}
+
+/// A model that genuinely cannot leave its initial estimates, built without
+/// reaching into the optimizer.
+///
+/// The obvious way to produce a stall — a tiny evaluation budget — does not
+/// work: BOBYQA's budget is `outer_maxiter · (n+1) + 40 · (n+1)` evaluations, so
+/// even `outer_maxiter = 1` buys it 205 on this model and it moves freely. So
+/// pin the objective instead of the budget: FIX Ω and Σ, and put a prior on each
+/// free θ centred exactly on its own initial value with a 0.01 % RSE. The
+/// penalized objective is then a quadratic well of curvature ~2/(1e-4·ln θ₀)²
+/// centred at the start, which no likelihood improvement this dataset can offer
+/// comes close to paying for — the fit converges normally, and converges where
+/// it began.
+fn pinned_at_init_model() -> (CompiledModel, ModelParameters) {
+    let mut model = make_model();
+    let mut template = model.default_params.clone();
+    template.omega_fixed = vec![true];
+    template.sigma_fixed = vec![true];
+    model.priors = template
+        .theta_names
+        .iter()
+        .zip(&template.theta)
+        .map(|(name, value)| crate::types::ParameterPrior {
+            name: name.clone(),
+            value: *value,
+            spread: crate::types::PriorSpread::Rse(1e-4),
+            kind: Some(crate::types::ParameterKind::Theta),
+        })
+        .collect();
+    model.default_params = template.clone();
+    (model, template)
+}
+
+/// A `[mixture]` model's objective is the K-fold log-sum-exp, not any one
+/// class's likelihood, and the reporting stencil has to difference *that*.
+///
+/// The check needs a second implementation, or it proves nothing: comparing the
+/// reported gradient against a recomputation by the same function agrees with a
+/// wrong answer by construction. `mixture::mixture_gradient_fd` is that second
+/// implementation — an independent central difference of `mixture_ofv` with its
+/// own absolute step (`1e-5`), no bounds clamping and no fixed mask — so a
+/// reporting stencil that fell through to the single-class path would disagree
+/// with it by the whole class-mixing term.
+#[test]
+fn reporting_fd_gradient_differences_the_mixture_objective() {
+    let src = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+    let population = make_population(4);
+    let template = &model.default_params;
+    assert!(
+        template.mixture.is_some(),
+        "fixture precondition: the template must carry a mixture, or this test runs the \
+         single-class branch and proves nothing"
+    );
+    let options = FitOptions {
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let x = pack_params(template);
+    let bounds = compute_bounds(template);
+    let warm: Vec<DVector<f64>> = (0..population.subjects.len())
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options);
+    let priors = build_prior_set(&model, template);
+
+    let ours = reporting_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &bounds,
+        &options,
+        &nn_reg,
+        &priors,
+    );
+    let independent = crate::estimation::mixture::mixture_gradient_fd(
+        &model,
+        &population,
+        &x,
+        template,
+        &options,
+    );
+
+    for (k, (got, want)) in ours.iter().zip(&independent).enumerate() {
+        assert!(
+            got.is_finite() && want.is_finite(),
+            "coordinate {k}: non-finite ({got} vs {want}) — a diverged solve must not be \
+             folded away as agreement"
+        );
+        // Measured on this fixture: worst realised relative gap 1.18e-7 over the six
+        // coordinates, set by the two stencils' different steps (`1e-4·(1+|x|)` here
+        // against a flat `1e-5` there). The bound is 1e-5, ~85x that.
+        //
+        // Measured for the failure it exists to catch, too: forcing the single-class
+        // branch leaves coordinates 0-2 within 1.2e-7 (the class-shared θ and Ω are
+        // barely affected) and moves **coordinate 3, the mixing logit `MIXL`, to
+        // 8.0e-1** — five orders above the bound. So it is the mixing coordinate
+        // that does the discriminating here, which is why the fixture declares a
+        // free `logit(1) = MIXL`; a mixture fixture with the mixing probability
+        // FIXed would pass this test with the branch deleted.
+        let rel = (got - want).abs() / (1.0 + want.abs());
+        assert!(
+            rel < 1e-5,
+            "coordinate {k}: the reporting stencil must difference the mixture objective — \
+             got {got}, independent mixture FD {want} (relative {rel:.3e})"
+        );
+    }
+    assert!(
+        independent.iter().any(|g| g.abs() > 1e-3),
+        "fixture precondition: the reference gradient must be non-degenerate, got {independent:?}"
+    );
+}
+
+/// #1154 — the outer FD-fallback diagnostic.
+///
+/// A per-subject decline of the analytic outer gradient is salvaged onto
+/// `subject_reconverged_fd_gradient`: correct, several times slower on that subject, and
+/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic (Dual2)`
+/// because it reads a **model**-level predicate.
+///
+/// These pin the *recording*, which is what makes the report honest. An earlier revision
+/// probed the provider at `η = 0` instead, and PR #1418's review showed that reports
+/// fallbacks that never happen: the provider's own declines are parameter-dependent
+/// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
+/// subject can decline at the probe point and be served at its EBE. Both halves of that
+/// are pinned below.
+mod outer_fd_fallback {
+    use super::*;
+    use std::path::Path;
+
+    /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
+    /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
+    /// so `subject_sensitivities` declines that subject while every bolus-dosed one stays
+    /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
+    /// a property of the records — which is what makes it a stable fixture.
+    const WARFARIN_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    fn mk_pop(subjects: Vec<Subject>) -> Population {
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// The analytic subject, and a twin whose bolus is replaced by a rate-defined
+    /// infusion the outer provider declines under `F ≠ 1`.
+    fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
+        let model =
+            crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let mut analytic = pop.subjects[0].clone();
+        analytic.id = "IN_SCOPE".into();
+        let mut declining = pop.subjects[0].clone();
+        declining.id = "OUT_OF_SCOPE".into();
+        declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
+        (model, analytic, declining)
+    }
+
+    /// Run one real outer-gradient evaluation over `pop` through the same mixed assembly
+    /// the optimizer uses, and return the log it filled.
+    fn record_one_gradient_eval(model: &CompiledModel, pop: &Population) -> OuterFdDeclineLog {
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let _ = population_gradient_sens_mixed(&x, params, model, pop, &ehs, &bounds, &opts, &log);
+        log
+    }
+
+    /// Fixture precondition, asserted rather than assumed: the two subjects must land on
+    /// *opposite* sides of the provider gate. Without this the warning test below is
+    /// satisfied by a population where both decline (or neither does).
+    #[test]
+    fn fixture_subjects_straddle_the_provider_gate() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let theta = &model.default_params.theta;
+        let zeros = vec![0.0; model.n_eta];
+        assert!(
+            crate::sens::provider::subject_sensitivities(&model, &analytic, theta, &zeros)
+                .is_some(),
+            "in-scope subject must be served by the provider"
+        );
+        assert!(
+            crate::sens::provider::subject_sensitivities(&model, &declining, theta, &zeros)
+                .is_none(),
+            "modeled-duration subject must be declined by the provider"
+        );
+    }
+
+    /// The warning counts the subjects the assembly actually salvaged, and names one.
+    /// Mutations that must redden it: dropping the `declines.record(i)` call, or reporting
+    /// the first subject rather than the first *declining* one.
+    #[test]
+    fn warns_with_count_and_example_subject() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
+        assert!(w.contains("1 of 2"), "got: {w}");
+        assert!(
+            w.contains("OUT_OF_SCOPE"),
+            "must name the declining subject, not the in-scope one; got: {w}"
+        );
+        assert!(!w.contains("IN_SCOPE"), "got: {w}");
+    }
+
+    /// An all-analytic population is silent.
+    #[test]
+    fn silent_when_every_subject_is_analytic() {
+        let (model, analytic, _) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic]);
+        let log = record_one_gradient_eval(&model, &pop);
+        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
+    }
+
+    /// The case the *inner* warning deliberately suppresses and this one must not: a
+    /// population where **every** subject declines while the model-level report still says
+    /// analytic. That is the mismatch `gradient_method_outer` gets wrong, so an all-FD
+    /// population is exactly when the warning is most needed.
+    #[test]
+    fn warns_when_every_subject_declines_on_an_in_scope_model() {
+        let (model, _, declining) = analytic_and_declining();
+        assert_eq!(
+            crate::build_info::gradient_method_outer(
+                &crate::build_info::BUILD_INFO,
+                EstimationMethod::FoceI,
+                Optimizer::NloptLbfgs,
+                &model,
+            ),
+            crate::build_info::GradientMethodKind::Analytic,
+            "fixture precondition: the model-level report must say analytic, or there is \
+             no mismatch to warn about"
+        );
+        let pop = mk_pop(vec![declining.clone(), declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        let w =
+            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
+        assert!(w.contains("2 of 2"), "got: {w}");
+    }
+
+    /// A log nobody wrote to is silent. This is the property that makes every route gate
+    /// unnecessary: BOBYQA (including the mixture `Auto` downgrade), GN, trust-region,
+    /// `reconverge_gradient_interval = 1` and `outer_maxiter = 0` all reach the end
+    /// without touching the analytic branch, so there is nothing to report.
+    #[test]
+    fn an_untouched_log_says_nothing() {
+        let (_, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        assert!(
+            outer_fd_fallback_warning(&pop, &log).is_none(),
+            "a fit that never evaluated an analytic outer gradient must not warn — even \
+             with a subject the provider would decline"
+        );
+    }
+
+    /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`
+    /// dispatches on — must follow `interaction`: FOCE is a different entry point
+    /// (`subject_packed_gradient_foce`, the Sheiner–Beal marginal) from FOCEI
+    /// (`subject_packed_gradient`, the Almquist Laplace marginal), and hard-coding either
+    /// would hand a `method = foce` fit the gradient of the other objective.
+    ///
+    /// Asserted on the returned *values*, not on `is_some()`: both marginals serve the
+    /// same subjects on this fixture, so an `is_some()` test passes under a hard-coded
+    /// flag and would be a tautology. The non-degeneracy assert below pins that the two
+    /// marginals really do disagree here, so this cannot quietly become one either.
+    #[test]
+    fn follows_the_interaction_flag() {
+        let (model, analytic, _) = analytic_and_declining();
+        let x = pack_params(&model.default_params);
+        let zeros = vec![0.0; model.n_eta];
+        let focei = crate::estimation::sens_outer_gradient::subject_packed_gradient(
+            &model,
+            &analytic,
+            &model.default_params,
+            &x,
+            &zeros,
+        )
+        .expect("FOCEI entry point serves the in-scope subject");
+        let foce = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
+            &model,
+            &analytic,
+            &model.default_params,
+            &x,
+            &zeros,
+        )
+        .expect("FOCE entry point serves the in-scope subject");
+        assert!(
+            focei
+                .iter()
+                .zip(&foce)
+                .any(|(a, b)| (a - b).abs() > 1e-8 * a.abs().max(b.abs()).max(1.0)),
+            "fixture precondition: the two marginals must disagree on this subject, or \
+             this test cannot see which entry point was taken. focei = {focei:?}, \
+             foce = {foce:?}"
+        );
+        assert_eq!(
+            subject_analytic_outer_gradient(
+                &model,
+                &analytic,
+                &model.default_params,
+                &x,
+                &zeros,
+                true
+            ),
+            Some(focei),
+            "interaction = true must take the FOCEI entry point"
+        );
+        assert_eq!(
+            subject_analytic_outer_gradient(
+                &model,
+                &analytic,
+                &model.default_params,
+                &x,
+                &zeros,
+                false
+            ),
+            Some(foce),
+            "interaction = false must take the FOCE entry point"
+        );
+    }
 }

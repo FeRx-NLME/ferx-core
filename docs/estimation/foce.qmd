@@ -45,6 +45,7 @@ The analytic route is the default (`gradient_method = auto`); one provider evalu
 What follows is the detail behind that one-line answer:
 
 - [Reading the resolved route](#reading-the-resolved-route) — what the startup banner tells you.
+- [The outer-loop route is reported as a warning](#outer-loop-fd-fallback) — why `gradient_method_outer` is model-level.
 - Analytic scope — [models and readouts](#analytic-scope-models-and-readouts),
   [likelihood and scaling](#analytic-scope-likelihood-and-scaling),
   [dose events](#analytic-scope-dose-events),
@@ -67,6 +68,23 @@ The startup banner reports the route **actually resolved** across the population
 When the population splits across routes, the banner shows per-route subject counts, e.g. `analytic (Dual2) ×118, FD ×3`.
 
 This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.qmd).
+
+### The outer-loop route is reported as a warning {#outer-loop-fd-fallback}
+
+The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
+
+The two can disagree. A subject the provider declines — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event, two modeled infusion windows that happen to coincide at the current estimates — is salvaged individually onto a reconverged finite-difference gradient, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. The results are correct; the fit is just slower on those subjects. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+
+```
+1 of 32 subjects fell outside the analytic sensitivity provider's scope during this fit
+(e.g. subject 7) and used finite-difference outer gradients; their results are correct
+but slower. The reported outer gradient method is the model-level route, not the
+per-subject one.
+```
+
+The count is **recorded as the fit runs**, from the gradient evaluations that actually happened — not predicted by probing the provider at some chosen parameter point. That distinction is load-bearing, because a decline is not purely a property of the subject's records: the separability check on modeled infusion windows reads the *resolved* durations and lag times, so a subject can decline at `η = 0` and be served at its EBE. A probe would announce a fallback that never occurred.
+
+Recording also means the warning is self-gating. A derivative-free BOBYQA fit (including a `[mixture]` model left on `optimizer = auto`, which resolves to BOBYQA), a Gauss-Newton or trust-region fit, a `reconverge_gradient_interval = 1` fit that forces the reconverged gradient on every evaluation, and an `outer_maxiter = 0` evaluation-only run never select the analytic branch, so they have nothing to record and say nothing. Conversely, any recorded decline is by construction a mismatch with the model-level label — including when *every* subject declines, which is the case that label gets most wrong.
 
 ### Analytic scope: models and readouts {#analytic-scope-models-and-readouts}
 
@@ -146,13 +164,24 @@ Other per-subject FD fallbacks include an `input_rate` forcing combined with an 
 
 ### Moving boundaries and one-sided derivatives {#moving-boundaries}
 
-A moving boundary — a lagged dose arrival, the rate-on of a lagged infusion, an infusion or zero-order window end — is **not a data record**, so it supplies no parameters of its own: it subdivides the interval that the next record terminates, and every piece of that interval runs on that record's snapshot (#1073). A boundary falling *strictly inside* a record interval therefore has the same covariate snapshot on both sides, and the covariate field jump that used to be injected there is simply absent. Any forcing that straddles the instant — another dose's infusion, a zero-order window, a built-in `R_in` — is still carried in both velocities, so the rate and mass jumps stay exact. A genuine two-sided field jump survives only when a **record lands exactly on the boundary**; there the derivative really is two-sided (the value stays continuous, but the field assignment flips) and the walk returns the one-sided derivative of the branch its own event ordering uses rather than declining (#1068). Two narrower approximations in the same cell — a second moving boundary colliding with the arrival (#1076), and a straddling built-in `R_in` whose kernel reads the changing covariate leaving an explicit `½(∂f⁻/∂t − ∂f⁺/∂t)` curvature term uncarried (#1075) — are tracked in the #1078 epic. #1076 is reachable only through that same co-timed geometry. #1075 is not: `ẍ = ∂f/∂t + J·f` and every saltation site carries only `J·f`, so *any* non-autonomous field leaves the explicit term uncarried — including an `[odes]` RHS that simply reads `TAD` under an η-carrying lagtime, with no straddling input rate and no colliding boundary. Measured on that geometry at 2.2e-1 on `∂²f/∂η_ALAG²` (#1070 improved it from 6.4e-1 but does not close it), an order of magnitude above the 6.4e-2 #1075 was originally filed on.
+A moving boundary — a lagged dose arrival, the rate-on of a lagged infusion, an infusion or zero-order window end — is **not a data record**, so it supplies no parameters of its own: it subdivides the interval that the next record terminates, and every piece of that interval runs on that record's snapshot (#1073). A boundary falling *strictly inside* a record interval therefore has the same covariate snapshot on both sides, and the covariate field jump that used to be injected there is simply absent. Any forcing that straddles the instant — another dose's infusion, a zero-order window, a built-in `R_in` — is still carried in both velocities, so the rate and mass jumps stay exact.
 
-**Sampling exactly on a moving dose boundary.** With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the estimated `D{cmt}`/`R{cmt}`, and an observation may sit exactly on it (sampling at end-of-infusion is a normal design). The prediction is **kinked** in `D` at that point: just above the coincidence the infusion is still running at the sample, so only the rate `amt/D` matters; just below it the dose has finished and a decay term appears. The two one-sided slopes therefore differ, and no two-sided derivative exists — a central finite difference returns their *average*, which corresponds to neither branch. ferx returns the **one-sided** derivative — specifically, the derivative of the branch its own event ordering already uses to define the *value* at that instant (an infusion at its end is still contributing; a dose at its arrival has landed). Both engines agree: the ODE path injects the standard jump/saltation term at the event, and since #486 the closed-form path reaches the identical value by stepping the read-out state back across the zero-length window between the sample and the boundary. The same applies to a sample landing on a **lagged dose arrival**.
+#### A record landing exactly on the boundary {#record-on-a-moving-boundary}
+
+A record landing exactly on the boundary is the one place the derivative really is two-sided: the value stays continuous, but the field assignment flips as the boundary sweeps through the record, so the two one-sided derivatives differ by a finite amount and a central finite difference returns their average, which is neither. The walk returns a one-sided derivative rather than declining, and — since #1068 — it returns the branch its own event ordering implements, because both sides of the boundary read **one** snapshot. Which branch that is follows from where the boundary sorts against a co-timed record: a dose arrival, a lagged infusion's rate-on, a built-in absorption onset and a per-route `lag=` onset all sort *before* the record, so they report the limit from below; an infusion or zero-order window end sorts *after* it, so it reports the limit from above. The rule is uniform across the four onset sites by construction rather than by coincidence — a `first_order(ka=KA, lag=LAG)` forcing and an otherwise identical unlagged one take different timeline events, and reporting opposite branches for them would be a difference of bookkeeping rather than of model. Before #1068 the arrival arms mixed two records at that one instant — the pre side from the co-timed record, the post side from the next one — which attributed a *stationary* field jump to a *moving* boundary and returned a value outside both one-sided limits (measured 0.89 % on `∂f/∂η_lag`, first order, on a multi-dose subject; invisible on a single-dose one, where the state at the arrival is zero and the spurious term is multiplied away). A second moving boundary colliding with the arrival (#1076) and an input-rate onset's field jump (#1069) are exact for the same reason the interior case is, and were re-measured at 4.6e-9 and 5.9e-9 respectively.
+
+#### The remaining approximation: a non-autonomous RHS {#non-autonomous-rhs-residual}
+
+The one approximation left in this cell is a straddling built-in `R_in` whose kernel reads the changing covariate, leaving an explicit `½(∂f⁻/∂t − ∂f⁺/∂t)` curvature term uncarried (#1075, tracked in the #1078 epic) — and it is *not* confined to any co-timed geometry: `ẍ = ∂f/∂t + J·f` and every saltation site carries only `J·f`, so *any* non-autonomous field leaves the explicit term uncarried — including an `[odes]` RHS that simply reads `TAD` under an η-carrying lagtime, with no straddling input rate and no colliding boundary. Measured on that geometry at 2.9e-1 on `∂²f/∂η_ALAG²` (#1070 improved it from 6.4e-1 but does not close it) — against two independent oracles, double-FD of the production predictor and a central difference of the analytic *first*-order gradient, which agree with each other to seven significant figures. The straddling-`R_in` geometry #1075 was originally filed on, at 6.4e-2, is exact today (7.4e-7); the non-autonomous RHS is what is left.
+
+Be precise about what that second-order residual reaches, because it is wider than "the Hessian": `∂f/∂η` and `∂f/∂θ` are exact, but the FOCE/FOCEI **objective's** θ-gradient is assembled from *second* derivatives of `f` — `d2f_deta2` feeds the inner Hessian and the `∂log|H̃|/∂η` curvature term in `sens_outer_gradient.rs`, so it enters the analytic outer gradient handed to L-BFGS/SLSQP, as well as the covariance step and standard errors. It does **not** enter the objective *value*, which is why the `nonmem_anchor/tad_lag_*` evaluations agree to 4e-4. On a `TAD`-reading RHS with an η on the lagtime, prefer `optimizer = bobyqa` (derivative-free) until #1075 lands if you want the pre-#1070 numerical behaviour; `gradient_method = auto` now resolves such models to L-BFGS, where it previously chose BOBYQA.
+
+#### Sampling exactly on a moving dose boundary {#sampling-on-a-moving-boundary}
+
+With a modeled `RATE=-1`/`-2` dose the infusion window end moves with the estimated `D{cmt}`/`R{cmt}`, and an observation may sit exactly on it (sampling at end-of-infusion is a normal design). The prediction is **kinked** in `D` at that point: just above the coincidence the infusion is still running at the sample, so only the rate `amt/D` matters; just below it the dose has finished and a decay term appears. The two one-sided slopes therefore differ, and no two-sided derivative exists — a central finite difference returns their *average*, which corresponds to neither branch. ferx returns the **one-sided** derivative — specifically, the derivative of the branch its own event ordering already uses to define the *value* at that instant (an infusion at its end is still contributing; a dose at its arrival has landed). Both engines agree: the ODE path injects the standard jump/saltation term at the event, and since #486 the closed-form path reaches the identical value by stepping the read-out state back across the zero-length window between the sample and the boundary. The same applies to a sample landing on a **lagged dose arrival**.
 
 The practical consequence is that at *exactly* such a coincidence an analytic gradient and a finite-difference gradient will not agree: a central difference averages across a branch switch the model does not actually make there (and across a *bolus* arrival it would return an enormous value, since it straddles a jump). That is a property of the model, not a defect, and it is transient in a fit — the lagtime and `D` are estimated, so they only sweep past a fixed sample time momentarily.
 
-Be precise about what that second-order residual reaches, because it is wider than "the Hessian": `∂f/∂η` and `∂f/∂θ` are exact, but the FOCE/FOCEI **objective's** θ-gradient is assembled from *second* derivatives of `f` — `d2f_deta2` feeds the inner Hessian and the `∂log|H̃|/∂η` curvature term in `sens_outer_gradient.rs`, so it enters the analytic outer gradient handed to L-BFGS/SLSQP, as well as the covariance step and standard errors. It does **not** enter the objective *value*, which is why the `nonmem_anchor/tad_lag_*` evaluations agree to 4e-4. On a `TAD`-reading RHS with an η on the lagtime, prefer `optimizer = bobyqa` (derivative-free) until #1075 lands if you want the pre-#1070 numerical behaviour; `gradient_method = auto` now resolves such models to L-BFGS, where it previously chose BOBYQA.
 
 ### Model-size and readout scope limits {#model-size-scope-limits}
 
@@ -281,6 +310,22 @@ When `covariance = true`, ferx-core computes the variance-covariance matrix of t
 - **Relative standard errors (%RSE)** for assessing estimation precision
 - **Omega SEs** via delta method from the Cholesky parameterization
 
+### Which stage runs it, and when it does not run at all {#which-stage-runs-the-covariance-step}
+
+In a method chain the covariance step runs **once**, on the last stage that estimates — a trailing evaluation-only stage (`imp_eval_only`, `agq_eval_only`) reads out a likelihood at fixed parameters and does not take ownership of it. Recomputing the step after every stage would pay for it several times over for one reported result ([#615](https://github.com/FeRx-NLME/ferx-core/issues/615)).
+
+Bayesian estimation is the one method that never runs it: `method = bayes` reports posterior credible intervals from the sampled chain, not Hessian standard errors, so ferx disables the covariance and SIR steps for it. That makes all six covariance keys — `covariance`, `covariance_method`, `covariance_fallback`, `analytic_cov_hessian`, `fd_hessian_step`, `cov_inner_tol` — inert when a fit *ends* in `bayes`, and setting one there is reported as such:
+
+```
+fit option `cov_inner_tol` configures the post-fit covariance step, but this fit
+ends in Bayesian estimation, which reports posterior credible intervals instead of
+Hessian standard errors and runs no covariance step, so it has no effect.
+```
+
+Where the Bayes stage falls in the chain is what decides this, not its presence: `methods = [bayes, focei]` ends on FOCEI, which runs the step and consumes every one of those keys, so no notice is issued. `methods = [focei, bayes]` does not.
+
+Every other estimator — FOCE, FOCEI, Laplace/AGQ, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP, VI — runs the covariance step and honours all six keys. They are framework-level for that reason, rather than listed per method ([#956](https://github.com/FeRx-NLME/ferx-core/issues/956)).
+
 ### How the Hessian is built
 
 The covariance is `2·H⁻¹`, where `H` is the Hessian of the objective. There are two routes to `H`, and both produce the same object — the observed information at the converged point.
@@ -357,7 +402,7 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
   covariance_method = rsr
 ```
 
-`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite FD Hessian (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
+`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite covariance Hessian, analytic R-matrix or FD stencil alike (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
 
 #### NONMEM cross-check (S / RSR, FOCEI)
 
@@ -410,7 +455,7 @@ let fit_with_cov = run_covariance(&fit, None, None, &opts)?;
 
 `run_covariance` reconstructs the fitted parameters from the `FitResult`, re-runs the final inner loop (cold-started, exactly as the inline covariance path in `fit()` does) to rebuild the covariance-step inputs, and calls the same FD-Hessian covariance step `fit()` runs inline — so the result matches fitting with `covariance = true`. For an **in-memory** fit from any packed-Cholesky-space optimizer (BOBYQA/SLSQP/MMA, BFGS, the trust region, or Gauss-Newton) the match is **bit-for-bit**: the fit carries the optimizer's exact Cholesky factor and `run_covariance` reuses it. A fit **reloaded from a `.fitrx` bundle**, or produced by SAEM / importance-sampling / Bayes (which rebuild `omega` from the reported matrix), instead reconstructs the factor by re-decomposing `fit.omega`, so it matches only up to finite-difference noise (~1e-5, platform dependent). The returned `FitResult` is a clone of `fit` with `covariance_matrix`, `se_theta` / `se_omega` / `se_sigma` / `se_kappa`, `covariance_status`, and the condition-number diagnostics refreshed. `run_covariance_step` on the passed options is ignored — calling the function is itself the request.
 
-A covariance step that runs but cannot produce a usable matrix (a non-positive-definite or structurally-unusable FD Hessian) is **not** an error: the returned fit reports `covariance_status = Failed` with a diagnostic in `warnings`, mirroring the inline `fit()` behaviour. `Err` is reserved for input problems — a missing or hash-mismatched model/dataset, a dimension mismatch, or an IOV model supplied without its population.
+A covariance step that runs but cannot produce a usable matrix (a non-positive-definite or structurally-unusable covariance Hessian) is **not** an error: the returned fit reports `covariance_status = Failed` with a diagnostic in `warnings`, mirroring the inline `fit()` behaviour. `Err` is reserved for input problems — a missing or hash-mismatched model/dataset, a dimension mismatch, or an IOV model supplied without its population.
 
 The second and third arguments (`Option<&CompiledModel>` / `Option<&Population>`) behave exactly as for `run_sir`: `Some(...)` is used as-is (caller owns verification), `None` re-reads from `fit.model_path` / `fit.data_path` with SHA-256 integrity checks that refuse stale source. See [Caller-supplied vs. re-read inputs](sir.qmd#caller-supplied-vs.-re-read-inputs).
 
@@ -428,7 +473,7 @@ SEs in the regularised directions are inflated (since `1/λ_clipped` is larger t
 
 ### SIR fallback for non-PD Hessians
 
-When a model is poorly identified or converges to a saddle point, the FD Hessian can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
+When a model is poorly identified or converges to a saddle point, the covariance Hessian — whether `R` came from the analytic route or the FD stencil — can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
 
 ```
 [fit_options]
@@ -453,11 +498,76 @@ The outer loop terminates when any of:
 
 The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-5`, tight enough that residual EBE noise does not perturb the marginal objective the outer optimizer minimises — see [`fit-options.md`](../model-file/fit-options.qmd#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
 
+### When the optimizer stops without converging {#stopping-without-converging}
+
+NLopt has a fourth way to stop: a bare `Failure`, which its line search returns when it
+cannot make progress against the curvature estimate it has built up. That says nothing
+about *where* the fit is. It comes back both at a finished optimum — the objective is
+already flat to ~8 significant figures, so no step improves it — and at a point the fit was
+still descending through.
+
+ferx tells the two apart on the objective trace rather than on the gradient norm, which at
+these optima still reads O(1): the run must have a **flat tail** (several evaluations since
+the last real improvement), must have **moved off its initial estimates**, and a **cold
+re-solve** of the inner loop at the restored best point must reproduce the objective the
+optimizer saw. All three hold ⇒ the fit converged and is reported as converged
+([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)).
+
+When they do not, the optimizer is **restarted once from the best point it reached**
+([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)). That is what clears the
+curvature memory the failed line search was built on, and it usually costs nothing in the
+sense that matters: the restart is adopted only if it ends at a **strictly lower**
+objective, so it can never make a reported fit worse. On the two-compartment deep-compartment
+model in `tests/fixtures/two_cpt_dcm_regularized.ferx`, L-BFGS quit at evaluation 12 with the
+trace still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units
+lower (3209.81 → −676.77).
+
+Three cases are deliberately left alone. A run that spent its `maxiter` budget stops with
+NLopt's `MaxEvalReached`, not a `Failure`, so a restart can never hand a fit a second
+evaluation budget behind your back — raise `maxiter` instead. A **cancelled** run is not
+restarted. And a second stall is reported as a stall: you get `converged: false` and the
+`Outer optimization did not converge` warning, which is the honest signal and bounds the
+worst case at two optimizations.
+
 ## Warm Starting
 
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.
 
 The warm start is taken from the **best point seen so far**, not from whatever the optimizer evaluated last ([#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290)). That distinction matters because the individual objective can be multimodal: a trial step the line search is about to reject may land somewhere the inner loop solves into a different, worse basin, and if those EBEs were carried forward, every later evaluation would inherit them. The starting point would then re-evaluate *worse* than it did a moment earlier — an objective that moves under the optimizer's feet, which no line search can descend. Anchoring the warm start to the incumbent keeps the objective at the incumbent reproducible; evaluations that do not improve on it leave the cache untouched.
+
+### The final inner loop {#final-inner-loop}
+
+When the outer optimizer stops, ferx restores the best point it saw
+([#59](https://github.com/FeRx-NLME/ferx-core/issues/59)) and runs one more inner loop there —
+the EBEs that reach the sdtab, the covariance step and the reported objective come from that
+solve, not from the trajectory.
+
+That solve runs **cold**, from η = 0. When its objective reproduces the best value the
+optimizer saw, it is what the fit reports and nothing else runs — which is the ordinary case,
+and it costs exactly what it always did.
+
+When it does **not** reproduce that value, two more candidates are scored on the same
+objective: the EBEs the optimizer was minimising against, exactly as it left them, and a
+re-solve seeded from those. The lowest of the three is reported. Before
+[#833](https://github.com/FeRx-NLME/ferx-core/issues/833) only the cold solve ran, so where it
+settled at a different η̂ than the trajectory had, the reported OFV came out *above* the
+best-seen value the point had just been restored for (+3.5 on a fluconazole 2-cpt binding
+model), and the covariance step ran at those different EBEs. The held EBEs are scored as a
+candidate in their own right, not merely used as a seed, because a re-solve is not guaranteed
+to improve on the point it starts from.
+
+The comparison is also a diagnostic. A cold re-solve that lands materially worse — or returns
+no usable number at all — raises the `ebe_start_dependent` warning (see
+[Warnings](../warnings.qmd#codes-convergence)), which quotes both objectives. The estimates are
+unaffected; what depends on the starting point is the EBEs at them, and so every diagnostic
+built on those (IPRED, IWRES, CWRES, shrinkage) plus the covariance step. Two things produce
+it, and the warning names both rather than guessing: an individual objective with more than one
+mode at these estimates, and an `inner_maxiter` a cold start cannot converge within. Raising
+`inner_maxiter`, or `inner_restarts` for a suspected second mode, tells them apart.
+
+The cold number is also what the convergence self-consistency check reads
+([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)); a fit whose "optimum" exists only
+under a warm start is still rejected.
 
 ## Configuration Example
 

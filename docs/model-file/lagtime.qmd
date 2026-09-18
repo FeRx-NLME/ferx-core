@@ -154,9 +154,20 @@ ill-conditioned.
 :::
 
 If both `lagtime=` and `alag=` are supplied on the same `[structural_model]`
-line (or if both keys appear in a programmatically constructed PK
-parameter map), `lagtime` wins. This is intentional but unlikely to be
-intended; prefer using only one of the two names per model.
+line (or both keys appear in a programmatically constructed PK parameter map)
+and they bind **different** values, the model is rejected at parse time
+([#1048](https://github.com/FeRx-NLME/ferx-core/issues/1048)):
+
+```
+[structural_model]: `alag=TLAGA` and `lagtime=TLAGB` are two spellings of the
+same parameter (the absorption lag time) bound to different values — only
+`lagtime=TLAGB` would be applied and `TLAGA` silently discarded. Use one spelling.
+```
+
+Both spellings bound to the **same** value (`lagtime=X, alag=X`) is redundant but
+harmless and still accepted. The same rule applies to the other two alias pairs,
+`v=`/`v1=` (central volume) and `q=`/`q2=` (inter-compartmental clearance).
+Prefer using only one of the two names per model.
 
 ## Notes and caveats
 

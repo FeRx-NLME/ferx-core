@@ -1246,12 +1246,12 @@ pub fn predict_iov(
 /// IOV predictions with caller-owned per-event parameter storage. Every event
 /// is still evaluated at its current theta, eta, kappa, covariates and time;
 /// only allocation capacity is reused, never numerical values.
-pub(crate) fn predict_iov_with_scratch(
+pub(crate) fn predict_iov_with_scratch<K: AsRef<[f64]>>(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta_bsv: &[f64],
-    kappas: &[Vec<f64>],
+    kappas: &[K],
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
     use std::collections::HashMap;
@@ -1294,7 +1294,7 @@ pub(crate) fn predict_iov_with_scratch(
         let mut c = Vec::with_capacity(eta_bsv.len() + n_kappa);
         c.extend_from_slice(eta_bsv);
         match occ_to_k.get(&occ_id) {
-            Some(&k) if k < kappas.len() => c.extend_from_slice(&kappas[k]),
+            Some(&k) if k < kappas.len() => c.extend_from_slice(kappas[k].as_ref()),
             _ => c.extend(std::iter::repeat(0.0).take(n_kappa)),
         }
         c
@@ -1532,6 +1532,33 @@ pub(crate) fn predict_iov_with_scratch(
     preds
 }
 
+/// The superposition engine's [`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite)
+/// (#1189, #1284): true when any dose's effective arrival `dose.time + lagtime` is
+/// non-finite, so the whole subject must come back non-finite.
+///
+/// Superposition builds no break-time timeline to run that predicate over — it sums
+/// closed forms over doses — so the guard is spelled here instead, and it is spelled
+/// **once**. A non-finite arrival matches neither the `t_eff <= t` arm nor the
+/// pre-arrival SS arm (every comparison against `NaN` is false), so an unguarded walk
+/// silently *drops* the dose and returns the remaining, drug-free trajectory as a valid
+/// prediction — the #1189 silent-drop failure mode.
+///
+/// Both inputs can reach here non-finite: a `NaN` `lagtime`, and a dose whose modeled
+/// `D{n}`/`R{n}` resolved out of domain ([`DoseEvent::non_finite`](crate::types::DoseEvent)).
+///
+/// **One predicate, two callers, because they had drifted apart in both directions.**
+/// [`predict_concentration`] and [`analytical_state_at_times`] are the value and state
+/// twins of the same superposition, and the #1399 review measured them disagreeing on
+/// the same subject: with the guard only on the value side, a `NaN` `D1` returned
+/// `ipred = NaN` next to `states = [[0.0]]` — a valid-looking compartment amount handed
+/// to `[derived]` / state-output consumers for a subject the prediction path had just
+/// repelled. A third superposition walk must take this predicate rather than re-derive
+/// it.
+#[inline]
+pub(crate) fn superposition_arrival_non_finite(doses: &[DoseEvent], lagtime: f64) -> bool {
+    doses.iter().any(|d| !(d.time + lagtime).is_finite())
+}
+
 /// Predict concentration at a given time for a subject, summing contributions
 /// from all prior doses (superposition principle).
 ///
@@ -1560,6 +1587,12 @@ pub fn predict_concentration(
     pk_params: &PkParams,
 ) -> f64 {
     let lagtime = pk_params.lagtime();
+    // A non-finite arrival makes the whole subject non-finite — see
+    // `superposition_arrival_non_finite`, which the state twin
+    // (`analytical_state_at_times`) reads too.
+    if superposition_arrival_non_finite(doses, lagtime) {
+        return f64::NAN;
+    }
     let mut conc = 0.0;
     for dose in doses {
         let t_eff = dose.time + lagtime;
@@ -1613,7 +1646,20 @@ pub fn predict_concentration(
             }
         }
     }
-    conc.max(0.0)
+    // Floor at zero — but `f64::max` **discards** `NaN` (`f64::NAN.max(0.0) == 0.0`),
+    // which turns a non-finite concentration into a confident `0.0` (#1284, #1399
+    // review finding 2). The arrival guard above cannot cover this: a `NaN` gets into
+    // `conc` from the *closed form's* own inputs too — a non-finite bioavailability
+    // `F`, measured returning `[0.0]` from `predict()` on a `one_cpt_iv(.., f=F)`
+    // model with `F` overflowed at typical values, while the state twin's `if *s < 0.0`
+    // floor (which does not discard `NaN`) reported `[[NaN]]` for the same subject.
+    // Preserve the `NaN` so every non-finite dose attribute has one outcome on this
+    // engine; `+inf` needs no special case, since `f64::INFINITY.max(0.0)` is `inf`.
+    if conc.is_nan() {
+        conc
+    } else {
+        conc.max(0.0)
+    }
 }
 
 /// External bioavailability multiplier for the analytical superposition closed
@@ -2172,6 +2218,14 @@ pub fn analytical_state_at_times(
     );
     let lagtime = pk_params.lagtime();
     let n_states = pk_model.topology().n_states;
+    // The value twin's guard, on the same predicate (#1284, #1399 review finding 1).
+    // Without it this walk skips the non-finite dose exactly as `predict_concentration`
+    // did — `t_eff <= t` and the SS arm are both false for `NaN` — and returns a
+    // drug-free **zero** state for a subject whose predictions are `NaN`, leaking a
+    // valid-looking compartment amount to `[derived]` and the state output columns.
+    if superposition_arrival_non_finite(&subject.doses, lagtime) {
+        return vec![vec![f64::NAN; n_states]; times.len()];
+    }
     times
         .iter()
         .map(|&t| {
@@ -2349,6 +2403,19 @@ pub fn compute_predictions_with_states(
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.
 pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
+    compute_predictions_recycle(pk_model, subject, pk_params, Vec::new())
+}
+
+/// Allocation-reusing counterpart of [`compute_predictions`] for repeated
+/// evaluations of the same subject. The ordinary static superposition path
+/// overwrites `out` in place; event-driven fallbacks retain their established
+/// owned-vector implementation.
+fn compute_predictions_recycle(
+    pk_model: PkModel,
+    subject: &Subject,
+    pk_params: &PkParams,
+    mut out: Vec<f64>,
+) -> Vec<f64> {
     // Defensive guard (#324/#394): modeled-RATE doses (RATE=-2 -> D{cmt}) must be
     // resolved to a concrete (`Fixed`) rate/duration *before* reaching this closed
     // form. The analytical dispatch paths do exactly that (`api::model_preds` and
@@ -2398,11 +2465,14 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
             &pk_pk_only,
         );
     }
-    subject
-        .obs_times
-        .iter()
-        .map(|&t| predict_concentration(pk_model, &subject.doses, t, pk_params))
-        .collect()
+    out.clear();
+    out.extend(
+        subject
+            .obs_times
+            .iter()
+            .map(|&t| predict_concentration(pk_model, &subject.doses, t, pk_params)),
+    );
+    out
 }
 
 /// True when any dose targets a compartment the **dose-superposition** dispatch
@@ -2647,6 +2717,29 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
+    compute_predictions_with_tv_recycle_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        scratch,
+        schedule,
+        Vec::new(),
+    )
+}
+
+/// Inner-loop counterpart of [`compute_predictions_with_tv_into_with_schedule`]
+/// that reuses the returned observation vector on allocation-sensitive repeated
+/// evaluations of one subject.
+pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    scratch: &mut EventPkParams,
+    schedule: Option<&event_driven::EventSchedule>,
+    mut recycled: Vec<f64>,
+) -> Vec<f64> {
     // #905: on an analytical model, a subject with no Gaussian observation feeds the
     // PK predictor nothing — every hazard left here is closed-form and no
     // binary/CTMM linear predictor reads a concentration (see
@@ -2662,7 +2755,9 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // subject is gated — correctly, it feeds the predictor nothing like any other
     // no-Gaussian-obs subject.
     if model.ode_spec.is_none() && !subject_feeds_analytical_pk(model, subject) {
-        return vec![f64::NAN; subject.obs_times.len()];
+        recycled.clear();
+        recycled.resize(subject.obs_times.len(), f64::NAN);
+        return recycled;
     }
     // A `one_cpt_transit` subject that the closed form can't serve (TIME switch / TV
     // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
@@ -2678,7 +2773,9 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         // prediction. These zeros are never read: `apply_analytic_readout` builds
         // an empty `state[]` for such a model (no `central = conc × V` step) and
         // overwrites every entry with the readout's value.
-        vec![0.0; subject.obs_times.len()]
+        recycled.clear();
+        recycled.resize(subject.obs_times.len(), 0.0);
+        recycled
     } else if let Some(ref ode) = model.ode_spec {
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
@@ -2775,7 +2872,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
         let resolved =
             crate::dosing::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
-        compute_predictions(model.pk_model, &resolved, &pk)
+        compute_predictions_recycle(model.pk_model, &resolved, &pk, recycled)
     };
 
     // Analytical initial-compartment amounts (issue #521): layer the closed-form
@@ -3413,6 +3510,8 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "cl_from_cr".into(),
             pk_model: PkModel::OneCptIv,
@@ -3457,6 +3556,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![],
@@ -3704,6 +3804,139 @@ mod tests {
         pk.values[crate::types::PK_IDX_LAGTIME] = 5.0;
         let c = predict_concentration(PkModel::OneCptOral, &doses, 1.0, &pk);
         assert_eq!(c, 0.0);
+    }
+
+    /// A non-finite dose arrival must come back `NaN`, never a drug-free `0.0`
+    /// (#1189's silent-drop shape, closed on this engine by #1284).
+    ///
+    /// `predict_concentration` sums closed forms over doses instead of walking a
+    /// break-time timeline, so it has no `timeline_has_non_finite` to run. Both
+    /// of its arms test `t_eff` against `t`, and every comparison against `NaN`
+    /// is false, so the dose was simply skipped and the *remaining* trajectory —
+    /// here, nothing at all — was returned as a valid prediction. Worse than the
+    /// dropped dose is what follows it: the trailing `conc.max(0.0)` is an
+    /// `f64::max`, which discards `NaN` (`0.0f64.max(NaN) == 0.0`, verified
+    /// below), so even a dose that *did* contribute `NaN` was floored to `0.0`.
+    /// Two independent ways for the same subject to read finite and wrong.
+    ///
+    /// Both inputs to `t_eff` are exercised, because they arrive from different
+    /// places: a `NaN` `lagtime` (an overflowing `$PK` expression) and a `NaN`
+    /// `dose.time` (`DoseEvent::non_finite`, a modeled `D{n}`/`R{n}` that
+    /// resolved out of domain). The finite control pins that the guard did not
+    /// simply start rejecting everything.
+    ///
+    /// Mutation (run): delete the `superposition_arrival_non_finite` early return in
+    /// `predict_concentration` → both non-finite arms return `0.0` and this fires,
+    /// naming which one; delete it in `analytical_state_at_times` → the state half
+    /// fires instead, at `0.0`.
+    #[test]
+    fn non_finite_arrival_gives_nan_not_a_drug_free_zero() {
+        // The floor that would have hidden it — measured here rather than recalled.
+        assert_eq!(f64::NAN.max(0.0), 0.0, "f64::max discards NaN");
+
+        let pk = make_pk_params(1.0, 10.0);
+        let finite = predict_concentration(PkModel::OneCptIv, &[bolus_dose(0.0, 100.0)], 4.0, &pk);
+        assert!(
+            finite.is_finite() && finite > 0.0,
+            "control: a finite dose still predicts ({finite})"
+        );
+
+        let mut nan_lag = pk;
+        nan_lag.values[crate::types::PK_IDX_LAGTIME] = f64::NAN;
+        let via_lag =
+            predict_concentration(PkModel::OneCptIv, &[bolus_dose(0.0, 100.0)], 4.0, &nan_lag);
+        assert!(via_lag.is_nan(), "NaN lagtime: got {via_lag}, want NaN");
+
+        let via_dose_time =
+            predict_concentration(PkModel::OneCptIv, &[bolus_dose(f64::NAN, 100.0)], 4.0, &pk);
+        assert!(
+            via_dose_time.is_nan(),
+            "NaN dose time: got {via_dose_time}, want NaN"
+        );
+
+        // The *other* finite dose in the same subject must not rescue it: the
+        // subject is non-finite, not "finite where it happens to have data".
+        let mixed = predict_concentration(
+            PkModel::OneCptIv,
+            &[bolus_dose(0.0, 100.0), bolus_dose(f64::NAN, 100.0)],
+            4.0,
+            &pk,
+        );
+        assert!(mixed.is_nan(), "one bad dose poisons the sum: got {mixed}");
+
+        // …and the **state** twin must say the same thing about the same subject.
+        // It ran its own copy of this loop and had its own zero floor, so with the
+        // guard on one side only it reported a drug-free `[[0.0]]` next to the
+        // `NaN` above — a valid-looking compartment amount for a repelled subject
+        // (#1399 review finding 1).
+        let subj = Subject {
+            id: "nan-arrival".into(),
+            doses: vec![bolus_dose(f64::NAN, 100.0)],
+            obs_times: vec![4.0, 8.0],
+            ..Default::default()
+        };
+        let states = analytical_state_at_times(PkModel::OneCptIv, &subj, &pk, &subj.obs_times);
+        assert_eq!(states.len(), 2, "one state vector per time");
+        for (k, s) in states.iter().enumerate() {
+            assert!(
+                s.iter().all(|v| v.is_nan()),
+                "state twin at time {k}: got {s:?}, want all NaN"
+            );
+        }
+        // Straddle: the same walk on a finite dose still returns real amounts.
+        let ok_subj = Subject {
+            id: "finite".into(),
+            doses: vec![bolus_dose(0.0, 100.0)],
+            obs_times: vec![4.0],
+            ..Default::default()
+        };
+        let ok_states =
+            analytical_state_at_times(PkModel::OneCptIv, &ok_subj, &pk, &ok_subj.obs_times);
+        assert!(
+            ok_states[0].iter().all(|v| v.is_finite()) && ok_states[0][0] > 0.0,
+            "control state: {:?}",
+            ok_states[0]
+        );
+    }
+
+    /// A `NaN` that enters the superposition **through the closed form's own inputs**
+    /// — not through the arrival — must survive the trailing zero floor (#1399 review
+    /// finding 2).
+    ///
+    /// `conc.max(0.0)` is an `f64::max`, so it discarded the `NaN` and reported a
+    /// confident `0.0`. A non-finite bioavailability `F` is the reachable route: the
+    /// arrival is perfectly finite, so `superposition_arrival_non_finite` does **not**
+    /// cover this — asserted below, because two gates that reject the same inputs are a
+    /// test hole rather than belt-and-braces. Measured end to end before the fix: an
+    /// analytical `one_cpt_iv(.., f=F)` with `F` overflowed at typical values returned
+    /// `predict() = [0.0]` while the state twin — whose `if *s < 0.0` floor does not
+    /// discard `NaN` — returned `[[NaN]]` for the same subject. The two twins disagreed
+    /// in *opposite* directions, one per finding.
+    ///
+    /// Mutation (run): restore the bare `conc.max(0.0)` → the `F` arm returns `0.0` and
+    /// this fires.
+    #[test]
+    fn a_nan_from_the_closed_form_survives_the_zero_floor() {
+        let doses = [bolus_dose(0.0, 100.0)];
+        let mut pk = make_pk_params(1.0, 10.0);
+        pk.values[crate::types::PK_IDX_F] = f64::NAN;
+
+        // The arrival is finite, so the other guard cannot be what catches this.
+        assert!(
+            !superposition_arrival_non_finite(&doses, pk.lagtime()),
+            "the arrival guard must NOT cover the F case — otherwise this test is \
+             passing on the strength of a different gate"
+        );
+
+        let got = predict_concentration(PkModel::OneCptIv, &doses, 4.0, &pk);
+        assert!(got.is_nan(), "NaN F: got {got}, want NaN");
+
+        // A negative concentration is still floored — the fix preserves `NaN`, it does
+        // not remove the floor.
+        let mut neg = make_pk_params(1.0, 10.0);
+        neg.values[crate::types::PK_IDX_F] = -1.0;
+        let floored = predict_concentration(PkModel::OneCptIv, &doses, 4.0, &neg);
+        assert_eq!(floored, 0.0, "a negative concentration still floors to 0");
     }
 
     #[test]

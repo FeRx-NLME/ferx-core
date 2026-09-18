@@ -1,5 +1,5 @@
 use super::*;
-use crate::estimation::parameterization::packed_held_mask;
+use crate::estimation::parameterization::packed_fixed_mask;
 use crate::parser::model_parser::parse_model_string;
 use crate::types::test_helpers::minimal_fit_result;
 use crate::types::{WarningEntry, WarningSeverity};
@@ -192,7 +192,7 @@ fn model_free_dim(model_text: &str) -> usize {
 fn tally(model_text: &str, n_obs: usize) -> BicInputs {
     let model = parse_model_string(model_text).expect("model parses");
     let template = &model.default_params;
-    let mask = packed_held_mask(template);
+    let mask = packed_fixed_mask(template);
     let out = bic_inputs_for(&model, template, &mask, n_obs);
     assert_eq!(
         out.n_free(),

@@ -129,6 +129,89 @@ fn block_summary(values: &[f64]) -> (f64, f64, f64) {
     (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
 }
 
+/// Render the per-parameter prior report (#254), or nothing when no prior is in
+/// force.
+///
+/// One writer for both the console (`print_results`) and the file summary, so
+/// the two cannot drift — the numbers a user quotes from a terminal and the ones
+/// in a saved report have to be the same numbers.
+///
+/// The column that earns its place is `shift`: `(x̂ − m)/s` in the space the
+/// prior lives in. A raw difference only says the estimate moved; the
+/// standardized one says whether the data and the prior actually disagree, which
+/// is the question a MAP fit is asked. `family` is printed because it is decided
+/// by the parameter's declared *bounds*, not by the prior declaration — see
+/// [`crate::estimation::priors`].
+fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
+    if result.prior_summary.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n--- Parameter Priors (penalized ML / MAP) ---");
+    let _ = writeln!(
+        out,
+        "  {:<16} {:>12} {:>12} {:>8} {:>10}  {}",
+        "PARAMETER", "PRIOR", "ESTIMATE", "SHIFT", "PENALTY", "PRIOR 95%"
+    );
+    for p in &result.prior_summary {
+        let _ = writeln!(
+            out,
+            "  {:<16} {:>12.5} {:>12.5} {:>8.2} {:>10.3}  [{:.4}, {:.4}] ({})",
+            p.name,
+            p.prior_value,
+            p.estimate,
+            p.shift_in_prior_sds,
+            p.penalty,
+            p.prior_lower_95,
+            p.prior_upper_95,
+            p.family,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  SHIFT is (estimate − prior) in prior SDs. Standard errors above are the \
+         curvature of\n  the penalized objective — MAP standard errors, not posterior SDs."
+    );
+}
+
+/// The covariance-step status with the estimator that produced it appended, e.g.
+/// `computed (R⁻¹SR⁻¹, covariance_method = rsr)` (#1382).
+///
+/// A condition number is not comparable across estimators — the same fit was
+/// measured at 1.42e8 under the sandwich and 3.68e5 under `s`, both correct —
+/// so the status line has to say which one it is before the figure below it can
+/// be compared to NONMEM (whose `$COVARIANCE` default is `RSR`, not `R`) or to
+/// another ferx run. Falls back to the bare status when there is no matrix and
+/// hence no estimator to name.
+fn covariance_status_label(result: &FitResult) -> String {
+    let status = match result.covariance_status {
+        CovarianceStatus::Computed => "computed",
+        CovarianceStatus::Failed => "FAILED",
+        CovarianceStatus::NotRequested => "not requested",
+        CovarianceStatus::SirFallback => "SIR fallback",
+    };
+    match result.covariance_method {
+        Some(m) => format!(
+            "{status} ({}, covariance_method = {})",
+            m.formula(),
+            m.label()
+        ),
+        None => status.to_string(),
+    }
+}
+
+/// The note printed directly above the first `SE` column, naming the estimator
+/// those standard errors were inverted out of (#1382). `None` when no covariance
+/// matrix was produced, in which case every `SE` cell renders as `---` anyway.
+fn standard_error_source_note(result: &FitResult) -> Option<String> {
+    result.covariance_method.map(|m| {
+        format!(
+            "Standard errors from {} (covariance_method = {})",
+            m.formula(),
+            m.label()
+        )
+    })
+}
+
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
@@ -148,8 +231,19 @@ pub fn print_results(result: &FitResult) {
 
     eprintln!("\n--- Objective Function ---");
     eprintln!("OFV:  {:.4}", result.ofv);
+    if !result.prior_summary.is_empty() {
+        eprintln!("  data:  {:.4}", result.ofv_data);
+        eprintln!("  prior: {:.4}", result.ofv_prior);
+    }
     eprintln!("AIC:  {:.4}", result.aic);
     eprintln!("BIC:  {:.4}", result.bic);
+    {
+        let mut buf = String::new();
+        write_prior_summary(&mut buf, result);
+        if !buf.is_empty() {
+            eprint!("{buf}");
+        }
+    }
 
     eprintln!(
         "\nSubjects: {}  Observations: {}  Parameters: {}",
@@ -177,6 +271,9 @@ pub fn print_results(result: &FitResult) {
 
     // Theta estimates
     eprintln!("\n--- THETA Estimates ---");
+    if let Some(note) = standard_error_source_note(result) {
+        eprintln!("{note}");
+    }
     eprintln!(
         "{:<16} {:>12} {:>12} {:>10}",
         "Parameter", "Estimate", "SE", "%RSE"
@@ -604,13 +701,7 @@ pub fn print_results(result: &FitResult) {
 
     // Run info
     eprintln!("\n--- Run Info ---");
-    let cov_str = match result.covariance_status {
-        crate::types::CovarianceStatus::Computed => "computed",
-        crate::types::CovarianceStatus::Failed => "FAILED",
-        crate::types::CovarianceStatus::NotRequested => "not requested",
-        crate::types::CovarianceStatus::SirFallback => "SIR fallback",
-    };
-    eprintln!("  Covariance: {}", cov_str);
+    eprintln!("  Covariance: {}", covariance_status_label(result));
     eprintln!("  Wall time:  {:.1}s", result.wall_time_secs);
     eprintln!("  ferx v{}", result.ferx_version);
 
@@ -691,8 +782,17 @@ pub fn format_summary(result: &FitResult) -> String {
     // --- Objective function ---
     let _ = writeln!(out, "\n--- Objective Function ---");
     let _ = writeln!(out, "  OFV:  {:.4}", result.ofv);
+    // Under parameter priors (#254) the OFV above is the penalized objective
+    // that was minimised, so the split is printed right under it — and AIC/BIC
+    // are labelled with the half they are computed from, since an information
+    // criterion from a penalized objective would not be one.
+    if !result.prior_summary.is_empty() {
+        let _ = writeln!(out, "    data:  {:.4}", result.ofv_data);
+        let _ = writeln!(out, "    prior: {:.4}", result.ofv_prior);
+    }
     let _ = writeln!(out, "  AIC:  {:.4}", result.aic);
     let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
+    write_prior_summary(&mut out, result);
 
     // Failed / SIR-fallback covariance make the SE columns meaningless, so we
     // suppress the derived CV% (mirrors `print_results`).
@@ -719,6 +819,9 @@ pub fn format_summary(result: &FitResult) -> String {
 
     // --- THETA ---
     let _ = writeln!(out, "\n--- THETA ---");
+    if let Some(note) = standard_error_source_note(result) {
+        let _ = writeln!(out, "  {note}");
+    }
     let _ = writeln!(
         out,
         "  {:<16} {:>12} {:>12} {:>8}",
@@ -872,15 +975,24 @@ pub fn format_summary(result: &FitResult) -> String {
 
     // --- Diagnostics ---
     let _ = writeln!(out, "\n--- Diagnostics ---");
-    let cov_str = match result.covariance_status {
-        CovarianceStatus::Computed => "computed",
-        CovarianceStatus::Failed => "FAILED",
-        CovarianceStatus::NotRequested => "not requested",
-        CovarianceStatus::SirFallback => "SIR fallback",
-    };
-    let _ = writeln!(out, "  Covariance: {}", cov_str);
+    let _ = writeln!(out, "  Covariance: {}", covariance_status_label(result));
     if let Some(cn) = result.cov_condition_number {
-        let _ = writeln!(out, "  Condition number: {:.1}", cn);
+        // The estimator is named on the line above; repeat the token here because
+        // a condition number is the figure most often copied out on its own, and
+        // it means different things under `r`, `s` and `rsr` (#1382).
+        match result.covariance_method {
+            Some(m) => {
+                let _ = writeln!(
+                    out,
+                    "  Condition number: {:.1}  (covariance_method = {})",
+                    cn,
+                    m.label()
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  Condition number: {:.1}", cn);
+            }
+        }
     }
     if !result.shrinkage_eta.is_empty() {
         let parts: Vec<String> = result
@@ -1863,6 +1975,14 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         writeln!(f, "  method_chain: [{}]", chain.join(", ")).map_err(|e| e.to_string())?;
     }
+    // Which estimator produced every SE, eigenvalue and condition number below
+    // (#1382). Emitted only when a covariance matrix exists — a fit with no
+    // covariance step has no estimator to name, and an unconditional `null` key
+    // would read as "the label is missing" rather than "there is nothing to
+    // label". Spelled as the `[fit_options]` token so it can be pasted back.
+    if let Some(m) = result.covariance_method {
+        writeln!(f, "  covariance_method: {}", m.label()).map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  uses_ode_solver: {}", result.uses_ode_solver).map_err(|e| e.to_string())?;
     writeln!(f, "  uses_sde: {}", result.uses_sde).map_err(|e| e.to_string())?;
     if let Some(n_hmc) = result.saem_n_subjects_hmc {
@@ -1878,8 +1998,39 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
+    // Emitted only under a prior (#254), so an unpriored fit's YAML is
+    // byte-identical to what it was before this feature.
+    if !result.prior_summary.is_empty() {
+        writeln!(f, "  ofv_data: {:.6}", result.ofv_data).map_err(|e| e.to_string())?;
+        writeln!(f, "  ofv_prior: {:.6}", result.ofv_prior).map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # aic/bic are computed from ofv_data: a penalized objective"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(f, "  # is not a log-likelihood.").map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  aic: {:.6}", result.aic).map_err(|e| e.to_string())?;
     writeln!(f, "  bic: {:.6}", result.bic).map_err(|e| e.to_string())?;
+
+    if !result.prior_summary.is_empty() {
+        writeln!(f, "\nparameter_priors:").map_err(|e| e.to_string())?;
+        for p in &result.prior_summary {
+            writeln!(f, "  - name: {}", p.name).map_err(|e| e.to_string())?;
+            writeln!(f, "    prior_value: {:.6}", p.prior_value).map_err(|e| e.to_string())?;
+            writeln!(f, "    estimate: {:.6}", p.estimate).map_err(|e| e.to_string())?;
+            writeln!(f, "    shift_in_prior_sds: {:.6}", p.shift_in_prior_sds)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    penalty: {:.6}", p.penalty).map_err(|e| e.to_string())?;
+            writeln!(f, "    family: {}", p.family).map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    prior_95: [{:.6}, {:.6}]",
+                p.prior_lower_95, p.prior_upper_95
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
 
     writeln!(f, "\ndata:").map_err(|e| e.to_string())?;
     writeln!(f, "  n_subjects: {}", result.n_subjects).map_err(|e| e.to_string())?;
@@ -2555,6 +2706,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
              (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored"
         )
         .map_err(|e| e.to_string())?;
+        // #1382: a bootstrap / SIR / uncertainty-propagation tool reading this block
+        // is consuming one of three different matrices; say which.
+        if let Some(m) = result.covariance_method {
+            writeln!(f, "  estimator: {} # {}", m.label(), m.formula())
+                .map_err(|e| e.to_string())?;
+        }
         writeln!(f, "  parameters: [{}]", names.join(", ")).map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
@@ -2672,6 +2829,9 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            ofv_data: 0.0,
+            ofv_prior: 0.0,
+            prior_summary: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             se_residual_correlations: None,
             covariate_relations: Vec::new(),
@@ -2742,6 +2902,7 @@ mod tests {
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
+            covariance_method: None,
             shrinkage_eta: Vec::new(),
             cond_dist: None,
             shrinkage_eps: f64::NAN,
@@ -2770,6 +2931,7 @@ mod tests {
             sigma_init: Vec::new(),
             obs_time_range: None,
             final_gradient: None,
+            final_gradient_source: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -2845,6 +3007,92 @@ mod tests {
         assert!(s.contains("EPS shrinkage: 8.0%"));
         assert!(s.contains("Warnings: 1"));
         assert!(s.contains("heads up"));
+        // #1382 non-degeneracy for the test below: this fixture has no estimator,
+        // so the bare forms are what an unlabelled result must still print.
+        assert!(s.contains("  Covariance: computed\n"));
+        assert!(s.contains("Condition number: 42.0\n"));
+    }
+
+    /// #1382: the printed summary names the estimator behind the SE column, the
+    /// covariance status and the condition number.
+    ///
+    /// Three places, not one, and each is separately load-bearing: the SE note is
+    /// the only thing on screen next to the `SE` column, the status line is where
+    /// a reader looks for "did the covariance step work", and the condition number
+    /// is the figure most often copied out on its own — 1.42e8 under `rsr` and
+    /// 3.68e5 under `s` are the same fit, and only one is comparable to a given
+    /// NONMEM run.
+    ///
+    /// The `format_summary_contains_key_sections` fixture above pins the
+    /// *unlabelled* rendering of the same two lines, so this cannot pass by the
+    /// suffix being unconditional.
+    #[test]
+    fn format_summary_names_the_covariance_estimator() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = vec![1.5];
+        r.theta_names = vec!["CL".into()];
+        r.theta_fixed = vec![false];
+        r.se_theta = Some(vec![0.15]);
+        r.covariance_status = CovarianceStatus::Computed;
+        r.cov_condition_number = Some(1.42e8);
+        r.covariance_method = Some(crate::types::CovarianceMethod::Sandwich);
+
+        let s = format_summary(&r);
+        assert!(
+            s.contains("Standard errors from R⁻¹SR⁻¹ (covariance_method = rsr)"),
+            "the SE column must say what was inverted:\n{s}"
+        );
+        assert!(
+            s.contains("Covariance: computed (R⁻¹SR⁻¹, covariance_method = rsr)"),
+            "the status line must name the estimator:\n{s}"
+        );
+        // The whole line, not the two halves (#1382 review): asserting
+        // `contains("(covariance_method = rsr)")` separately from
+        // `contains("Condition number: …")` passes on the *SE note's* suffix, so
+        // deleting the suffix from this line alone left the test green. Verified
+        // by deleting it: the split form passed, this form fails.
+        assert!(
+            s.contains("  Condition number: 142000000.0  (covariance_method = rsr)\n"),
+            "the condition number must carry the estimator on its own line — it is \
+             the figure most often copied out alone:\n{s}"
+        );
+    }
+
+    /// #1382: the fit YAML records the estimator, spelled as the `[fit_options]`
+    /// token so it can be pasted straight back into a model file — and omits the
+    /// key entirely when there is no matrix to label, rather than emitting a
+    /// `null` that reads as a missing label for a number that exists.
+    #[test]
+    fn write_estimates_yaml_records_the_covariance_estimator() {
+        let mut r = comprehensive_result();
+        r.covariance_method = Some(crate::types::CovarianceMethod::CrossProduct);
+        r.covariance_matrix = Some(DMatrix::identity(3, 3));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(
+            yaml.contains("  covariance_method: s\n"),
+            "the model block must record the estimator:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("  estimator: s # S⁻¹"),
+            "the covariance_matrix block feeds bootstrap / SIR / uncertainty \
+             propagation, which consume one of three different matrices:\n{yaml}"
+        );
+
+        // No matrix → no label anywhere, and no `null` key.
+        let mut bare = comprehensive_result();
+        bare.covariance_method = None;
+        bare.covariance_matrix = None;
+        let path2 = dir.path().join("bare.yaml");
+        write_estimates_yaml(&bare, path2.to_str().unwrap()).expect("yaml write");
+        let yaml2 = std::fs::read_to_string(&path2).expect("yaml read");
+        assert!(
+            !yaml2.contains("covariance_method:"),
+            "an unlabelled fit must omit the key, not emit null:\n{yaml2}"
+        );
     }
 
     #[test]
@@ -3379,6 +3627,9 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            ofv_data: 0.0,
+            ofv_prior: 0.0,
+            prior_summary: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             se_residual_correlations: None,
             covariate_relations: Vec::new(),
@@ -3449,6 +3700,7 @@ mod tests {
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
+            covariance_method: None,
             shrinkage_eta: Vec::new(),
             cond_dist: None,
             shrinkage_eps: f64::NAN,
@@ -3477,6 +3729,7 @@ mod tests {
             sigma_init: Vec::new(),
             obs_time_range: None,
             final_gradient: None,
+            final_gradient_source: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -4655,6 +4908,99 @@ mod tests {
         // No typical arm size (an empty or all-non-finite weight column):
         // the weight still prints, without the derived SD.
         r.kappa_weight_typical = vec![None];
+        print_results(&r);
+    }
+
+    /// The three renderers of the per-parameter prior report (#254) — the file
+    /// summary, the YAML, and the stderr printer — must all emit it, and all
+    /// three must stay silent on an unpriored fit.
+    ///
+    /// The report is the only place a MAP fit says how far the data pulled each
+    /// estimate from its prior, so a renderer that silently drops it leaves a
+    /// penalized fit indistinguishable from an unpenalized one in the output the
+    /// user actually reads. Every assertion below is paired with its negative on
+    /// the *same* `FitResult` with `prior_summary` cleared, so none of them can
+    /// pass on a renderer that prints the block unconditionally.
+    #[test]
+    fn the_prior_report_renders_in_the_summary_the_yaml_and_the_printer() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.ofv = 110.0;
+        r.ofv_data = 100.0;
+        r.ofv_prior = 10.0;
+        r.prior_summary = vec![
+            crate::types::PriorSummary {
+                name: "TVCL".to_string(),
+                prior_value: 0.15,
+                estimate: 0.132,
+                shift_in_prior_sds: -0.48,
+                penalty: 0.2304,
+                family: "lognormal".to_string(),
+                prior_lower_95: 0.0919,
+                prior_upper_95: 0.2449,
+            },
+            crate::types::PriorSummary {
+                name: "HILL".to_string(),
+                prior_value: 1.0,
+                estimate: 1.4,
+                shift_in_prior_sds: 0.8,
+                penalty: 0.64,
+                family: "normal".to_string(),
+                prior_lower_95: 0.02,
+                prior_upper_95: 1.98,
+            },
+        ];
+
+        // --- The file summary -------------------------------------------------
+        let summary = format_summary(&r);
+        assert!(summary.contains("Parameter Priors"), "{summary}");
+        // Both rows, and the OFV split labelled under the penalized total.
+        assert!(summary.contains("TVCL"), "{summary}");
+        assert!(summary.contains("HILL"), "{summary}");
+        assert!(summary.contains("lognormal"), "{summary}");
+        assert!(summary.contains("normal"), "{summary}");
+        assert!(summary.contains("data:  100.0000"), "{summary}");
+        assert!(summary.contains("prior: 10.0000"), "{summary}");
+        // The shift is the column the report exists for, so it must be the
+        // standardized one and not a raw difference (−0.48, not −0.018).
+        assert!(summary.contains("-0.48"), "{summary}");
+
+        // --- The YAML ---------------------------------------------------------
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("read yaml");
+        assert!(yaml.contains("\nparameter_priors:"), "{yaml}");
+        assert!(yaml.contains("  - name: TVCL"), "{yaml}");
+        assert!(yaml.contains("    shift_in_prior_sds: -0.480000"), "{yaml}");
+        assert!(yaml.contains("    penalty: 0.230400"), "{yaml}");
+        assert!(yaml.contains("    family: lognormal"), "{yaml}");
+        assert!(
+            yaml.contains("    prior_95: [0.091900, 0.244900]"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("  ofv_data: 100.000000"), "{yaml}");
+        assert!(yaml.contains("  ofv_prior: 10.000000"), "{yaml}");
+
+        // --- The stderr printer ----------------------------------------------
+        // No capture here; this is the smoke half — the formatting it shares
+        // with the summary is asserted above, through the one `write_prior_summary`.
+        print_results(&r);
+
+        // --- The negative, on the same result --------------------------------
+        // Without this every assertion above is satisfied by a renderer that
+        // emits the block unconditionally, which would put an empty prior table
+        // into every unpriored fit's output.
+        r.prior_summary.clear();
+        r.ofv_prior = 0.0;
+        r.ofv_data = r.ofv;
+        let plain = format_summary(&r);
+        assert!(!plain.contains("Parameter Priors"), "{plain}");
+        assert!(!plain.contains("prior:"), "{plain}");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let plain_yaml = std::fs::read_to_string(&path).expect("read yaml");
+        assert!(!plain_yaml.contains("parameter_priors:"), "{plain_yaml}");
+        assert!(!plain_yaml.contains("ofv_prior:"), "{plain_yaml}");
+        assert!(!plain_yaml.contains("ofv_data:"), "{plain_yaml}");
         print_results(&r);
     }
 

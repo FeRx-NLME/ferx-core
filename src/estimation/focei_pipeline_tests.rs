@@ -107,8 +107,15 @@ fn fused_inner_and_marginal_match_separate_passes() {
                                 interaction,
                             )
                         };
-                        let fused =
-                            run_inner_loop_and_nll(&model, &pop, params, &opts, warm, Some(&mu));
+                        let fused = run_inner_loop_and_nll(
+                            &model,
+                            &pop,
+                            params,
+                            &opts,
+                            warm,
+                            Some(&mu),
+                            None,
+                        );
                         assert_eq!(expected_nll.to_bits(), fused.4.to_bits());
                         for (a, b) in separate.0.iter().zip(&fused.0) {
                             assert_eq!(bits(a.as_slice()), bits(b.as_slice()));
@@ -158,7 +165,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             &separate.3,
             &opts,
         );
-        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None);
+        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None, None);
         assert_eq!(expected.to_bits(), fused.4.to_bits());
     }
 }
@@ -237,14 +244,30 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                         *acc += 2.0 * value;
                     }
                 }
+                // #1154: the same assembly records which subjects it salvaged onto the
+                // per-subject FD gradient. Asserted here, inside the existing
+                // `iov` × `mixed` sweep, because it is the only place both the IOV and
+                // the non-IOV `declines.record(i)` arms are exercised — a decline log
+                // tested on one engine only is an assertion against a constant on the
+                // other (mutating the IOV `record` alone left the whole suite green).
+                let declines = OuterFdDeclineLog::new(pop.subjects.len());
                 let actual = if iov {
                     population_gradient_sens_iov_mixed(
-                        &x, params, &model, &pop, &etas, &kappas, &bounds, &opts,
+                        &x, params, &model, &pop, &etas, &kappas, &bounds, &opts, &declines,
                     )
                 } else {
-                    population_gradient_sens_mixed(&x, params, &model, &pop, &etas, &bounds, &opts)
+                    population_gradient_sens_mixed(
+                        &x, params, &model, &pop, &etas, &bounds, &opts, &declines,
+                    )
                 };
                 assert_eq!(bits(&expected), bits(&actual));
+                let expected_declines: Vec<usize> = if mixed { vec![0] } else { vec![] };
+                assert_eq!(
+                    declines.declined_indices(),
+                    expected_declines,
+                    "iov = {iov}, mixed = {mixed}, interaction = {interaction}: the decline \
+                     log must name exactly the subjects the assembly sent to FD"
+                );
             }
         }
     }

@@ -117,12 +117,189 @@ The remediation there is the data scale rather than the model — rescale DV, or
 use a proportional or log-transformed error model — and the warning message says
 so when the hit is a Sigma.
 
+### The same box, on the way in
+
+`parameter_at_runaway_guard` is about where a fit *ended*. The box also applies
+before the first objective evaluation: `clamp_to_bounds()` moves the packed
+**start** inside it, and until #1251 that happened in silence. A
+`theta TVCL(0.05, 0.1, 10.0)` fits from `0.1` — a factor of two from what was
+written — and reports nothing.
+
+The start is now compared against the same box, by the same walk, with two
+verdicts split on *whose* bound it is:
+
+- **Outside a bound you declared** — a `theta` below its own lower or above its
+  own upper — is an error, `E_THETA_INIT_OUTSIDE_BOUNDS`, refused before any
+  fitting. NM-TRAN refuses the identical stream too (error 24).
+- **Outside one of the internal guards above** — the hidden `1e9` Theta cap, the
+  Omega rails, the Sigma rails — is a `W_INIT_OUTSIDE_BOUNDS` warning
+  carrying the `init_outside_bounds` category. It is a warning because these
+  recover: `omega ETA_CL ~ 1e8` on `examples/warfarin.ferx` packs to $+9.21$
+  against the $+6$ rail, starts from a variance of $1.6\times10^5$, and still
+  reaches the base optimum under all eight optimizer × method combinations. The
+  Omega **lower** rail is the exception and is an error
+  (`E_OMEGA_INIT_AT_RAIL`), because there the fit is genuinely trapped.
+
+There is deliberately no third verdict for the `1e-10` Theta **floor**, and the
+reason is the packing rather than an oversight: `pack_params()` floors the value
+at `1e-10` and the box floors the bound at `1e-10`, so a start below it compares
+*equal* and nothing has been moved relative to the box. A declared range that
+lies entirely below the floor is a different matter — see below.
+
+That flooring is also why the **declared** verdict is not decided on the packed
+scale. `theta TVCL(-5.0, 0.0, 10.0)` packs the start and its declared lower onto
+the same $\ln(10^{-10}) = -23.0259$, so a packed comparison would see a start
+sitting exactly on its bound and say nothing — while the fit actually begins
+from $10^{-10}$, which is neither the declared $-5$ nor the declared $0$. A
+declared lower bound of `0` is the idiomatic spelling for a positive parameter
+(`theta TVLAG(0.0, 0.0, 12.0)` ships in this repo), so the shape most likely to
+carry the mistake was the one shape the packed predicate could not see.
+`E_THETA_INIT_OUTSIDE_BOUNDS` therefore compares `theta[i]` against
+`theta_lower[i]` / `theta_upper[i]` directly, on the natural scale, and reports
+where the fit really starts. The internal guards keep the packed comparison,
+which is the only scale on which they exist. Over every `.ferx` file in this
+repository the two predicates give the same answer — zero out-of-box thetas —
+so the stronger one costs nothing.
+
+#### Why the Omega lower rail traps and the upper one does not
+
+The two Omega rails are not symmetric, and the asymmetry is measured rather than
+argued. On `examples/warfarin.ferx` + `data/warfarin.csv` (10 subjects, FOCE,
+`covariance = false`), with `E_OMEGA_INIT_AT_RAIL` bypassed so the optimizer
+could be reached at all:
+
+| start | packs to | outcome |
+|---|---|---|
+| `omega ETA_CL ~ 6.144212353328210e-6` | $-6.0$ exactly | **trapped** — the coordinate is bit-identical for the whole run, ending at the rail with TVV 10x high and $\sigma$ at 42% |
+| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3640$, $\omega^2_{CL}$ 0.028595) |
+| `omega ETA_CL ~ 162754.79141900392` | $+6.0$ exactly | recovers the base optimum, under `lbfgs` and under `bobyqa` |
+| `omega ETA_CL ~ 1e8` | $+9.21$, clamped onto $+6.0$ | recovers the base optimum |
+
+So what traps a fit is the exact equality `packed_start == lower` — not the
+value, and not a basin of the objective, since one part in $10^7$ of slack is
+enough to recover the optimum to every printed digit. Nor is it a general
+property of starting on a bound: `theta TVCL(0.001, 0.001, 10.0)` and
+`theta TVKA(0.01, 0.01, 50.0)` both begin exactly on their own active lower
+bound on this dataset and converge normally.
+
+No accepted model can reach the trapped state. Every free Omega / Omega-IOV /
+mixture-Omega diagonal at or below the rail is an `E_OMEGA_INIT_AT_RAIL` error
+before any optimizer runs, and the upper rail — which nothing rejects — does not
+trap.
+
+That is also why the Omega **regularisation floor** sits *below* the rail rather
+than inside it. A declared `omega NAME ~ 0.0` is not positive-definite, so it is
+regularised with an eigenvalue floor of `1e-8`, giving $L_{ii} = 10^{-4}$ and a
+packed start of $-9.21$ — 3.2 units below the $-6$ the same model's box carries.
+Reading that as a defect and lifting the floor into the interior is exactly what
+would stop `omega ~ 0.0` being rejected, since the gate fires on
+`packed <= lower`. The floor answers "what can be factored" and the rail answers
+"what may be searched"; they are kept apart on purpose, and the invariant that
+matters is that a regularised zero is always *caught* rather than quietly
+clamped into the interior.
+
+#### When the box is empty
+
+A packed box can come out **empty** — `lower > upper` — and then there is no
+side to be outside of. That is `E_INIT_BOUNDS_INVERTED`, an error, with three
+causes. The code is not Theta-specific even though only a `theta` can reach it
+through the parser: every other segment's bounds are compile-time constants, and
+a FIX pin is `lower == upper`, which is equal rather than inverted. The three
+causes are:
+
+- the declared bounds are swapped, `theta TVCL(1.0, 5.0, 2.0)`;
+- the declared range lies entirely **above** the `1e9` cap, which the box
+  substitutes for the declared upper: `theta TVCL(5e9, 2e9, 1e12)` packs to a
+  lower of $21.42$ against an upper of $20.72$;
+- the declared range lies entirely **below** the `1e-10` floor, which the box
+  substitutes for the declared lower: `theta TVCL(1e-12, 1e-13, 1e-11)` — an
+  ordinary declaration of a small parameter, with its own lower bound below its
+  own upper — packs to a lower of $-23.03$ against an upper of $-25.33$.
+
+This is the one start-side check with **no `maxiter = 0` exemption**. The others
+are exempt because a clamped start does not stick without a search; an empty box
+is not clamped at all — `clamp_to_bounds()` cannot clamp into an interval that
+does not exist — and an evaluation-only run clamps too, so exempting it would
+leave the aborting case unreported. The remedy is to rescale the parameter (fit
+it in different units, or factor out a constant) so its range lands inside
+$(10^{-10}, 10^{9})$. Only the affected coordinate is silenced by it: the rest
+of the file is still walked, so `ferx check` reports a swapped `TVCL` bound and
+an `omega ~ 1e8` in the same pass.
+
+Three things the comparison deliberately does not do:
+
+- A start sitting **exactly on** a bound is left alone. There `clamp_to_bounds`
+  is a no-op, so nothing is silently moved and the premise does not apply. (This
+  is a deliberate divergence from NM-TRAN, which also rejects equality, with
+  errors 627 and 628.)
+- A **FIX'd** coordinate is never reported, and needs no special case: its bounds
+  are pinned to its own packed value, so it cannot be strictly outside them.
+- An **evaluation-only** run (`maxiter = 0`) is exempt, exactly as for
+  `E_OMEGA_INIT_AT_RAIL` — with the single exception of the empty box above. It
+  clamps too; it just does not hold the clamped value through a search, and that
+  stickiness is what the check is about.
+
+#### What the box cannot see: values the packer moved
+
+The comparison above is against the **packed** start, which is not the same
+question as "did my declared values reach the optimizer". `pack_params()` clamps
+*before* any box exists, and the box is then built from the already-moved value,
+so a coordinate the packer moved compares perfectly **in-box**. Two guards do
+this:
+
+- the `1e-10` **log floor**, on every log-packed segment — Theta, the Omega and
+  Omega_IOV Cholesky diagonals, Sigma, the `[mixture]` overrides. `ln` has no
+  value at or below 0, so the floor is structural rather than a policy choice
+  and cannot be lifted by declaring the parameter `FIX`: `ln(0)` is $-\infty$,
+  which the optimizer's magnitude scaling would then divide a coordinate by.
+- the Fisher-z **rail** on a residual correlation, $\pm 3$, i.e.
+  $|\rho| \le 0.995055$. This one *is* a policy choice — it bounds what the
+  optimizer may search — so since #1307 it applies to a **free** correlation
+  only. A `FIX`ed one is held exactly.
+
+A coordinate either guard moved is reported as `W_INIT_NOT_REPRESENTABLE`
+(category `init_not_representable`), naming the declared value and the value the
+optimizer actually sees. It carries its own code rather than reusing
+`init_outside_bounds` because the two support opposite conclusions: a silent
+`W_INIT_OUTSIDE_BOUNDS` does **not** mean your declared values survived the
+pack, which is exactly the inference the separate code exists to stop. Like the
+empty box, it is **not** exempt at `maxiter = 0` — an evaluation-only run scores
+the substituted value too, so there is no run of any length in which the
+declared number is used.
+
+It stands down only on a coordinate another diagnostic **will actually be
+emitted** for, which makes the two complementary rather than two opinions on the
+same coordinate. "Will actually be emitted" is the whole of the rule: the box
+walks above are themselves exempt at `maxiter = 0`, so at that setting they
+claim nothing and this arm reports everything it found. What is left over in a
+searching run is precisely the set nothing else can see: a **`FIX`ed**
+coordinate, whose box is pinned to the moved value; a Theta whose declared lower
+bound is itself at or below the floor, where value and bound are floored
+identically; and a free correlation, which lands exactly *on* its rail rather
+than outside it.
+
+A coordinate can be moved **twice** — `sigma PROP_ERR ~ 0.0 (sd)` is floored to
+an SD of $10^{-10}$ by the packer and then clamped onto the $e^{-8} =
+3.354626\times 10^{-4}$ rail by the box. The message always names the value the
+fit will actually use, and its cause names both steps; the number is obtained by
+running the real unpacker over the clamped vector, so it cannot drift from the
+packing convention.
+
+Over every `.ferx` file in this repository exactly **one** declaration is
+claimed: `theta TVBETA(0.0, FIX)` in `nonmem_anchor/ss_chz_const_fit.ferx`, the
+ferx spelling of NONMEM's `$THETA 0.0 FIX`. It runs at $10^{-10}$, which is
+numerically indistinguishable from zero inside that model's
+$\exp(\texttt{TVBETA} \cdot c)$ and is why the anchor was green without anyone
+noticing. If you need an exact zero on a log-packed Theta, declare a negative
+lower bound — `theta TVBETA(0.0, -5.0, 5.0) FIX` — which selects identity
+packing and holds the zero exactly.
+
 ## Where the packed space surfaces
 
 It is not purely internal; it shows up in several user-visible places.
 
 - **Covariance matrix.** `FitResult.covariance_matrix` — and the
-  `covariance_matrix:` block in the fit YAML — is the inverse FD Hessian of
+  `covariance_matrix:` block in the fit YAML — is the inverse covariance Hessian of
   the OFV **with respect to the packed vector**, not with respect to
   $(\theta, \Omega, \Sigma)$. Its `parameters:` list names the packed
   coordinates: `log_chol_<eta>` for an Omega diagonal, `chol_<i>_<j>` for an

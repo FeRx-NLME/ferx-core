@@ -761,6 +761,52 @@ fn classify_warning_recognizes_internal_runaway_guard() {
     assert_eq!(off_diag.severity, WarningSeverity::Critical);
 }
 
+/// #1251: a **start** outside its own box is `InitOutsideBounds`, and must not
+/// reach `BoundaryEstimate`, which is about where a fit *ended*.
+///
+/// This is not a taxonomy preference. `model_selection::estimate_near_boundary`
+/// reads `BoundaryEstimate` off `warnings_structured`, and it drives two
+/// **default-on** filters: `bootstrap`'s `skip_estimate_near_boundary`
+/// (`BootstrapOptions::default`) and `Strictness::reject_on_boundary`. Measured
+/// before the split: a start-side message carrying the phrase "optimizer bound"
+/// classified as `BoundaryEstimate`, `estimate_near_boundary` returned `true`,
+/// and `check_strictness` failed the fit with *"estimate pinned to a declared
+/// bound: TVCL **starts at** 1.00e11 …"*. A bootstrap would have dropped every
+/// replicate of a model whose start was clamped.
+///
+/// So the discriminator is asserted, not just the category (#1255): the two
+/// messages are classified side by side, and the start-side one is required to
+/// keep out of the estimate-side arm.
+#[test]
+fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
+    let start_side = classify_warning(
+        "W_INIT_OUTSIDE_BOUNDS: TVCL starts at a value of 1.0e11, above ferx's internal \
+         upper cap of 1.0e9. The start is clamped onto that rail before the first \
+         objective evaluation.",
+    );
+    let estimate_side = classify_warning(
+        "Parameter estimate(s) pinned to an optimizer bound: TVKA (50.0000 at upper bound).",
+    );
+
+    assert_eq!(start_side.category, WarningCode::InitOutsideBounds);
+    assert_eq!(start_side.severity, WarningSeverity::Warning);
+    assert_eq!(estimate_side.category, WarningCode::BoundaryEstimate);
+    assert_ne!(
+        start_side.category, estimate_side.category,
+        "the two must not share an arm — `estimate_near_boundary` reads the \
+         estimate-side one and drops bootstrap replicates on it"
+    );
+
+    // And the separation is by an explicit `W_` token, not by prose: a message
+    // that merely avoids the phrase "optimizer bound" would fall through to
+    // `General` instead, losing the typing altogether.
+    assert_eq!(
+        classify_warning("TVCL starts outside its packed box.").category,
+        WarningCode::General,
+        "without the token there is no arm to land in — which is why the token exists"
+    );
+}
+
 /// #778: the `WarningCode` serde token is a public API an agent / the R
 /// wrapper pins against. This snapshot fails loudly if a variant's token
 /// drifts, and asserts `as_str()` and the serde representation agree.
@@ -785,6 +831,7 @@ fn warning_code_tokens_are_stable() {
         (EtaShrinkage, "eta_shrinkage"),
         (BoundaryEstimate, "boundary_estimate"),
         (ParameterAtRunawayGuard, "parameter_at_runaway_guard"),
+        (InitOutsideBounds, "init_outside_bounds"),
         (InflatedRse, "inflated_rse"),
         (HighCorrelation, "high_correlation"),
         (DataQuality, "data_quality"),
@@ -796,8 +843,80 @@ fn warning_code_tokens_are_stable() {
         (Cancelled, "cancelled"),
         (Threads, "threads"),
         (Simulation, "simulation"),
+        (FlipFlop, "flip_flop"),
+        (AbsorptionTwinDeclined, "absorption_twin_declined"),
+        (FlatParameter, "flat_parameter"),
+        (OdeSolver, "ode_solver"),
+        (StalledAtInit, "stalled_at_init"),
+        (EbeStartDependent, "ebe_start_dependent"),
         (General, "general"),
+        // #1307. Appended rather than filed next to `InitOutsideBounds`, which
+        // is where it belongs by subject: the match below returns each variant's
+        // *index in this list*, so inserting mid-list renumbers every arm after
+        // it and the diff stops being reviewable.
+        (InitNotRepresentable, "init_not_representable"),
     ];
+    // The list is hand-maintained, and had silently fallen four variants behind
+    // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
+    // `FlatParameter` and `OdeSolver` were each shipped without a row here, so
+    // their tokens were never pinned by the test whose job that is. The match
+    // below is the guard against that recurring: it has no wildcard arm, so a new
+    // `WarningCode` variant fails to compile here until someone touches this test.
+    // It deliberately does not call `as_str` — a body that delegated would pin
+    // nothing, since `as_str` is the thing under test.
+    fn _every_variant_is_listed_above(c: WarningCode) -> usize {
+        match c {
+            Convergence => 0,
+            CovarianceStep => 1,
+            CovarianceFailed => 2,
+            CovarianceRegularized => 3,
+            ConditionNumber => 4,
+            OptimizerHealth => 5,
+            ViBadBasin => 6,
+            DwAutocorrelation => 7,
+            EtaNormality => 8,
+            Experimental => 9,
+            BloqMethod => 10,
+            Sir => 11,
+            ImportanceSampling => 12,
+            EpsShrinkage => 13,
+            EtaShrinkage => 14,
+            BoundaryEstimate => 15,
+            ParameterAtRunawayGuard => 16,
+            InitOutsideBounds => 17,
+            InflatedRse => 18,
+            HighCorrelation => 19,
+            DataQuality => 20,
+            OmegaStructure => 21,
+            GradientFallback => 22,
+            MuReferencing => 23,
+            OptimizerConfig => 24,
+            MultiStart => 25,
+            Cancelled => 26,
+            Threads => 27,
+            Simulation => 28,
+            FlipFlop => 29,
+            AbsorptionTwinDeclined => 30,
+            FlatParameter => 31,
+            OdeSolver => 32,
+            StalledAtInit => 33,
+            EbeStartDependent => 34,
+            General => 35,
+            InitNotRepresentable => 36,
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        37,
+        "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
+    );
+    for (i, (code, _)) in expected.iter().enumerate() {
+        assert_eq!(
+            _every_variant_is_listed_above(*code),
+            i,
+            "`expected` and the exhaustiveness match disagree on {code:?}"
+        );
+    }
     for (code, token) in expected {
         assert_eq!(code.as_str(), *token, "as_str drift for {code:?}");
         // serde token == as_str token (rename_all = "snake_case").
@@ -990,6 +1109,13 @@ fn classify_warning_roundtrips_every_engine_message() {
             "boundary_estimate",
         ),
         (
+            "W_INIT_OUTSIDE_BOUNDS: ETA_CL starts at a variance of 1.0e8, above the \
+             optimizer's upper variance rail of 1.6e5. The start is clamped onto that \
+             rail before the first objective evaluation.",
+            Warning,
+            "init_outside_bounds",
+        ),
+        (
             "High relative standard error (RSE > 50%): TVCL (72%).",
             Warning,
             "inflated_rse",
@@ -1006,6 +1132,12 @@ fn classify_warning_roundtrips_every_engine_message() {
         ),
         (
             "W_MISSING_DV: 2 observation row(s) (EVID=0) had a missing DV",
+            Warning,
+            "data_quality",
+        ),
+        (
+            "W_CMT_DEFAULTED: the dataset has no CMT column, so 10 dose row(s) and 110 \
+             observation row(s) were assigned compartment 1.",
             Warning,
             "data_quality",
         ),
@@ -1709,13 +1841,15 @@ fn dose_event_resolve_rate_modeled_duration_matches_explicit_infusion() {
 
 #[test]
 fn dose_event_resolve_rate_clamps_nonpositive_duration() {
-    // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
+    // A transient *finite* D <= 0 mid-search clamps to DURATION_FLOOR so
     // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_PARAM).
+    // A NON-finite D is not a small positive one and takes the other branch —
+    // `dose_event_resolve_rate_repels_a_non_finite_duration` (#1284).
     let mut map = DoseAttrMap::default();
     map.insert(DoseAttr::Duration, 1, 9);
     let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
 
-    for bad in [0.0, -3.0, f64::NAN] {
+    for bad in [0.0, -3.0, -1e-9] {
         let mut params = [0.0; MAX_PK_PARAMS];
         params[9] = bad;
         let r = modeled.resolve_rate(&map, &params);
@@ -1754,13 +1888,15 @@ fn dose_event_resolve_rate_modeled_rate_matches_explicit_infusion() {
 
 #[test]
 fn dose_event_resolve_rate_clamps_nonpositive_rate() {
-    // A transient R <= 0 (or NaN) mid-search clamps to RATE_FLOOR so the
+    // A transient *finite* R <= 0 mid-search clamps to RATE_FLOOR so the
     // implied duration = amt / R stays finite (mirror of the duration clamp).
+    // A NON-finite R takes the other branch — see
+    // `dose_event_resolve_rate_repels_a_non_finite_duration` (#1284).
     let mut map = DoseAttrMap::default();
     map.insert(DoseAttr::Rate, 1, 9);
     let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
 
-    for bad in [0.0, -3.0, f64::NAN] {
+    for bad in [0.0, -3.0, -1e-9] {
         let mut params = [0.0; MAX_PK_PARAMS];
         params[9] = bad;
         let r = modeled.resolve_rate(&map, &params);
@@ -1769,6 +1905,73 @@ fn dose_event_resolve_rate_clamps_nonpositive_rate() {
             r.duration.is_finite() && r.duration > 0.0,
             "duration finite"
         );
+    }
+}
+
+#[test]
+fn dose_event_resolve_rate_repels_a_non_finite_duration_or_rate() {
+    // #1284. A non-finite modeled `D{n}`/`R{n}` must NOT take the domain-floor
+    // clamp: `x > floor` is false for `NaN`, so the floor arm served the dose as
+    // an instantaneous bolus (`duration = 1e-8`) and `+inf` served one too
+    // (`rate = amt/inf = 0`, which `is_infusion()` reads as "not an infusion").
+    // Both returned finite, silently wrong numbers — measured 2.03x high at one
+    // elimination half-time on a 1-cpt model.
+    //
+    // The property that makes the engines repel instead is that the resolved
+    // dose's **time** is non-finite: that is what every walk's timeline guard
+    // reads (`timeline_has_non_finite` / `EventSchedule::non_finite_event_time`,
+    // and `predict_concentration`'s `t_eff` guard). The `(rate, duration)` pair
+    // cannot carry it — `is_real_infusion` demands both finite and positive, so
+    // a non-finite pair falls to the bolus branch, which reads only `amt`.
+    //
+    // Mutation (run): drop either `if !d_raw.is_finite()` / `if !r_raw.is_finite()`
+    // early return in `resolve_rate` → that attribute's arm resolves to a finite
+    // time at the floor and the `is_finite()` assert below fires, naming D or R.
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Duration, 1, 9);
+    map.insert(DoseAttr::Rate, 1, 10);
+
+    for (attr, slot, mode) in [
+        ("D1", 9usize, RateMode::ModeledDuration),
+        ("R1", 10usize, RateMode::ModeledRate),
+    ] {
+        let modeled = DoseEvent::modeled(3.0, 100.0, 1, false, 0.0, mode);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut params = [0.0; MAX_PK_PARAMS];
+            params[slot] = bad;
+            let r = modeled.resolve_rate(&map, &params);
+            assert!(
+                !r.time.is_finite(),
+                "{attr} = {bad}: resolved time {} is finite, so no timeline guard sees it \
+                 and the dose is served as a bolus",
+                r.time
+            );
+            assert!(!r.rate.is_finite(), "{attr} = {bad}: rate {}", r.rate);
+            assert!(
+                !r.duration.is_finite(),
+                "{attr} = {bad}: duration {}",
+                r.duration
+            );
+            // Resolution still happened — a dose left `Modeled` would trip
+            // `is_real_infusion`'s unresolved tripwire in every engine.
+            assert_eq!(r.rate_mode, RateMode::Fixed, "{attr} = {bad}: resolved");
+            // The event is still recognisable: amt/cmt/ss/ii are untouched.
+            assert_eq!((r.amt, r.cmt, r.ss, r.ii), (100.0, 1, false, 0.0));
+        }
+
+        // The straddle, and it must straddle under the OLD behaviour too: a
+        // finite value just *below* the floor is the clamp's own job and keeps a
+        // finite time, while `NaN` — which the old `>` comparison sent down the
+        // same arm — does not. Assert the straddle itself so it cannot silently
+        // become a tautology.
+        let mut low = [0.0; MAX_PK_PARAMS];
+        low[slot] = 1e-12;
+        let clamped = modeled.resolve_rate(&map, &low);
+        assert!(
+            clamped.time.is_finite() && clamped.rate.is_finite() && clamped.duration.is_finite(),
+            "{attr}: a finite sub-floor value is clamped, not repelled"
+        );
+        assert_eq!(clamped.time, 3.0, "{attr}: the clamp leaves the time alone");
     }
 }
 
@@ -2509,14 +2712,18 @@ fn covariate_form_labels_are_the_block_spellings() {
         (CovariateForm::Power, "power"),
         (CovariateForm::Hockey, "hockey"),
         (CovariateForm::Categorical, "categorical"),
+        (CovariateForm::Categorical2, "categorical2"),
         (CovariateForm::Expr("(WT/70)^0.75".into()), "expr"),
     ];
     for (form, label) in &cases {
         assert_eq!(&form.label(), label);
     }
-    // Only `categorical` reads a categorical column; the check against the
-    // `[covariates]` declaration is keyed on this.
+    // The two categorical forms read a categorical column; the check against
+    // the `[covariates]` declaration is keyed on this, so a new categorical
+    // variant left out of `is_categorical` would be checked against the wrong
+    // column kind (#1312).
     assert!(CovariateForm::Categorical.is_categorical());
+    assert!(CovariateForm::Categorical2.is_categorical());
     assert!(!CovariateForm::Power.is_categorical());
     assert!(!CovariateForm::Expr("1".into()).is_categorical());
 }
@@ -2637,12 +2844,9 @@ mod theta_block_scale_guards {
             .unwrap()
             .model;
         let p = &model.default_params;
-        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
-        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
-        let exact = fixed
+        let exact = crate::estimation::parameterization::packed_fixed_mask(p)
             .iter()
-            .zip(&structural)
-            .filter(|(f, z)| !**f && !**z)
+            .filter(|held| !**held)
             .count();
         assert_eq!(model.free_packed_dim(), exact);
         assert_eq!(exact, 7);
@@ -3022,4 +3226,234 @@ fn non_interaction_stage_walks_the_whole_method_chain() {
         ..Default::default()
     };
     assert_eq!(chain.non_interaction_stage(), None);
+}
+
+// ---------------------------------------------------------------------------
+// #956: the covariance keys are one group, and the group is framework-level.
+//
+// `cov_inner_tol` shipped in *no* advertised key list while having a working
+// `apply_fit_option` arm, so `unsupported_keys_warnings` announced that a value the
+// parser had just applied would be ignored. The fix lists it with its five siblings in
+// `framework_keys()` rather than in nine `method_specific_keys` arms — a per-method list
+// re-arms the same trap for the next covariance-capable method — and the one case where
+// the group really is inert (a chain ending in Bayes) becomes a rule over the group,
+// mirroring the `ode_*` model-conditional notice above.
+// ---------------------------------------------------------------------------
+
+/// The [`covariance_keys`] analogue of [`ode_solver_keys_are_a_subset_of_framework_keys`].
+#[test]
+fn covariance_keys_are_a_subset_of_framework_keys() {
+    let fw = framework_keys();
+    for k in covariance_keys() {
+        assert!(
+            fw.contains(k),
+            "`{k}` is in covariance_keys() but not framework_keys() — it would \
+             spuriously warn as method-unsupported (#956)"
+        );
+    }
+}
+
+/// Every method advertises the *whole* covariance group, not most of it.
+///
+/// This is the guard the #956 bug needed and did not have. The reverse scraper in
+/// `model_parser_tests` unions the ten `method_specific_keys` arms, so a key present in
+/// any one arm satisfies it — deleting `cov_inner_tol` from eight of nine arms leaves it
+/// green. This asserts per method, so a covariance key that drifts back into per-method
+/// lists and is forgotten in one of them names that method.
+#[test]
+fn every_method_advertises_the_whole_covariance_key_group() {
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+        EstimationMethod::Vi,
+    ] {
+        for k in covariance_keys() {
+            let advertised = framework_keys().contains(k) || method_specific_keys(m).contains(k);
+            assert!(
+                advertised,
+                "method `{}` advertises neither `{k}` in framework_keys() nor in its \
+                 method_specific_keys() arm — a fit setting it would be told the value \
+                 it just applied will be ignored (#956)",
+                m.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn bayes_chain_warns_that_covariance_keys_have_no_effect() {
+    let opts = FitOptions {
+        method: EstimationMethod::Bayes,
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    let w = opts.unsupported_keys_warnings();
+
+    assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
+    // Pinned in full for the same reason as the `ode_reltol` notice above: the string
+    // reaches the CLI and the fit YAML verbatim, and a `\`-continuation that is not
+    // exactly right ships a run of spaces that `contains` cannot see.
+    assert_eq!(
+        w[0],
+        "fit option `cov_inner_tol` configures the post-fit covariance step, but this \
+         fit ends in Bayesian estimation, which reports posterior credible intervals \
+         instead of Hessian standard errors and runs no covariance step, so it has no \
+         effect."
+    );
+    // The method-level phrasing would be the wrong diagnosis, and is what the key's
+    // omission from `method_specific_keys` used to produce: "not used by method `Bayes`"
+    // is the text a *misspelled* key gets, and it lists every method-specific key as the
+    // suggested alternative.
+    assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
+}
+
+#[test]
+fn bayes_chain_warns_once_per_distinct_covariance_key() {
+    let mut keys: Vec<&str> = covariance_keys().to_vec();
+    keys.push("cov_inner_tol");
+    let opts = FitOptions {
+        method: EstimationMethod::Bayes,
+        ..opts_with_user_set_keys(&keys)
+    };
+
+    let w = opts.unsupported_keys_warnings();
+    assert_eq!(
+        w.len(),
+        covariance_keys().len(),
+        "one notice per distinct key, got: {w:?}"
+    );
+    for k in covariance_keys() {
+        assert!(
+            w.iter().any(|m| m.contains(k)),
+            "no notice named `{k}`: {w:?}"
+        );
+    }
+    for m in &w {
+        assert!(
+            !m.contains("  "),
+            "notice contains a run of spaces — check the `\\` line continuations: {m:?}"
+        );
+    }
+}
+
+/// The notice follows the covariance step, not the presence of a Bayes stage.
+///
+/// `[bayes, focei]` ends on FOCEI, which runs the step and consumes every covariance
+/// key; `[focei, bayes]` does not, because the step only ever runs on the chain's last
+/// estimating stage (#615) and Bayes disables its own. The pair straddles the predicate:
+/// a rule keyed on "the chain contains Bayes" passes the second and fails the first.
+#[test]
+fn covariance_key_notice_follows_the_last_estimating_stage() {
+    let ends_estimating = FitOptions {
+        methods: vec![EstimationMethod::Bayes, EstimationMethod::FoceI],
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    assert_eq!(
+        ends_estimating.covariance_stage(),
+        Some(EstimationMethod::FoceI)
+    );
+    assert!(
+        ends_estimating.unsupported_keys_warnings().is_empty(),
+        "a chain that ends in FOCEI runs the covariance step: {:?}",
+        ends_estimating.unsupported_keys_warnings()
+    );
+
+    let ends_bayes = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Bayes],
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    assert_eq!(ends_bayes.covariance_stage(), Some(EstimationMethod::Bayes));
+    assert_eq!(ends_bayes.unsupported_keys_warnings().len(), 1);
+}
+
+/// A trailing evaluation-only stage does not take ownership of the covariance step.
+///
+/// `[bayes, imp]` under `imp_eval_only` estimates in Bayes and only *evaluates* in IMP,
+/// so `is_last_estimating_stage` puts the step on the Bayes stage and the keys are inert
+/// — the same rule `fit_inner` runs, reached through the same helper rather than a
+/// second copy of it.
+#[test]
+fn eval_only_trailing_stage_leaves_the_covariance_step_on_bayes() {
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Bayes, EstimationMethod::Imp],
+        imp_eval_only: true,
+        ..opts_with_user_set_keys(&["fd_hessian_step"])
+    };
+    assert_eq!(opts.eval_only_methods(), vec![EstimationMethod::Imp]);
+    assert_eq!(opts.covariance_stage(), Some(EstimationMethod::Bayes));
+    assert_eq!(opts.unsupported_keys_warnings().len(), 1);
+
+    // Without the eval-only flag the IMP stage estimates, so it owns the step.
+    let estimating = FitOptions {
+        imp_eval_only: false,
+        ..opts.clone()
+    };
+    assert_eq!(estimating.covariance_stage(), Some(EstimationMethod::Imp));
+    assert!(estimating.unsupported_keys_warnings().is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #1382 — one spelling for the covariance estimator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **L3 — the serde token *is* `label()`.**
+///
+/// The point of the field is that a reported estimator can be pasted straight
+/// back into a `[fit_options]` block, so the JSON value, the `.fitrx` value, the
+/// YAML value and the model-file value have to be one string. Derived serde would
+/// have emitted `"CrossProduct"`; the explicit renames make it `"s"`. Asserting
+/// the *equality* rather than the literals separately is what stops a later
+/// rename of one from drifting past the other.
+#[test]
+fn the_serialized_covariance_method_is_the_fit_option_token() {
+    for m in [
+        CovarianceMethod::Hessian,
+        CovarianceMethod::CrossProduct,
+        CovarianceMethod::Sandwich,
+    ] {
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert_eq!(
+            json,
+            format!("\"{}\"", m.label()),
+            "the wire token and the fit-option token must be the same string for {m:?}"
+        );
+        let back: CovarianceMethod = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, m);
+        assert_eq!(CovarianceMethod::from_label(m.label()), Some(m));
+    }
+    // The three tokens are what the parser accepts, and they are distinct — a
+    // label collision would make two estimators indistinguishable in every
+    // output this issue is about.
+    assert_eq!(CovarianceMethod::Hessian.label(), "r");
+    assert_eq!(CovarianceMethod::CrossProduct.label(), "s");
+    assert_eq!(CovarianceMethod::Sandwich.label(), "rsr");
+    assert_eq!(CovarianceMethod::from_label("hessian"), None);
+    assert_eq!(CovarianceMethod::from_label(""), None);
+}
+
+/// **L4 — `formula()` says what was inverted, and says something different for
+/// each estimator.** The token alone does not tell a reader why 1.42e8 and
+/// 3.68e5 are both correct for the same fit; `R⁻¹` vs `R⁻¹SR⁻¹` does.
+#[test]
+fn each_covariance_estimator_prints_a_distinct_matrix_expression() {
+    let all = [
+        CovarianceMethod::Hessian,
+        CovarianceMethod::CrossProduct,
+        CovarianceMethod::Sandwich,
+    ];
+    let formulas: Vec<&str> = all.iter().map(|m| m.formula()).collect();
+    let unique: std::collections::HashSet<&&str> = formulas.iter().collect();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "two estimators share a printed expression: {formulas:?}"
+    );
+    assert_eq!(CovarianceMethod::Hessian.formula(), "R⁻¹");
+    assert_eq!(CovarianceMethod::Sandwich.formula(), "R⁻¹SR⁻¹");
 }

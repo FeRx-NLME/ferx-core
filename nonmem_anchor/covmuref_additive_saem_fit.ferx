@@ -1,0 +1,41 @@
+# Additive renal covariate on CL, SAEM — ferx side of the #619 NONMEM anchor.
+#
+# `CL = (TVCL + (CRCL - 90) * TH_CRCL) * exp(ETA_CL)` reads two thetas, so it
+# is not log-linear in one theta and has no single mu-reference anchor. Before
+# #619 both thetas sat on the eta-frozen numerical M-step and the renal slope
+# drifted to its bound; now the parser records a *covariate mu-reference*
+# (TVCL, TH_CRCL) on ETA_CL and SAEM re-fits both thetas to the population of
+# individual log-CL values each iteration (`covariate_mu_ref.rs`). The
+# matching NONMEM control is covmuref_additive_saem.ctl, whose
+# `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))` is the same relationship spelled
+# as a (nonlinear) MU.
+#
+# Data: data/covmuref_additive.csv, simulated from this model by
+# nonmem_anchor/simulate_covmuref_data.py.
+#
+# Truths: TVCL=5, TH_CRCL=0.05, TVV=50, omega^2 = 0.09 (CL), 0.04 (V),
+#         sigma (SD) = 0.10. Starts deliberately away from truth.
+
+[parameters]
+  theta TVCL(4.0,     0.0, 100.0)
+  theta TH_CRCL(0.02, 0.0,   5.0)
+  theta TVV(40.0,     1.0, 500.0)
+
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = saem
+  seed = 619

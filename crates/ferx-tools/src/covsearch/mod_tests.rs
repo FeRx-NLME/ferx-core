@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ferx_core::edit::ModelText;
-use ferx_core::{CovariateForm, StrictnessVerdict};
+use ferx_core::{CovariateForm, CovariateOp, StrictnessVerdict};
 
 use super::*;
 use crate::search::test_support::converged_fit;
@@ -59,6 +59,7 @@ fn effect(parameter: &str, covariate: &str, form: CovariateForm) -> Effect {
         parameter: parameter.into(),
         covariate: covariate.into(),
         form,
+        op: CovariateOp::Multiply,
     }
 }
 
@@ -1142,4 +1143,85 @@ fn default_dir_sits_next_to_the_config() {
         default_dir(Path::new("runs/warfarin.ferxsearch")),
         Path::new("runs/warfarin-covsearch")
     );
+}
+
+#[test]
+fn an_additive_effect_is_a_candidate_and_adds_exactly_one_free_theta() {
+    // #1313 end to end on the tools side: the space passes the coverage check,
+    // becomes a candidate of its own, and the model it writes carries one more
+    // estimated θ than the base — which is where the step's LRT `df` comes
+    // from (`n_parameters` of the two fits).
+    let cfg = config("COVARIATE?(KA, WT, lin, +)", "").unwrap();
+    let base = cfg.load_base().unwrap();
+    let space = Space::from_config(&cfg, &base).unwrap();
+    assert_eq!(
+        space
+            .candidates
+            .iter()
+            .map(Effect::label)
+            .collect::<Vec<_>>(),
+        vec!["KA-WT-linear-add"]
+    );
+    assert_eq!(space.candidates[0].op, CovariateOp::Add);
+
+    let mut model = space.base_model.clone();
+    model
+        .apply(ModelEdit::AddCovariateRelation(
+            space.candidates[0].relation(),
+        ))
+        .expect("the additive relation must apply");
+    assert_eq!(
+        model.block_lines("covariate_model").last().unwrap(),
+        "KA ~ WT linear(center = median) +"
+    );
+
+    // The candidate and the base differ by exactly one estimated θ. Both are
+    // bound to the same data, since `linear`'s PsN bounds are data-derived.
+    let population = ferx_core::read_nonmem_csv(
+        cfg.data.as_ref().expect("the config names a dataset"),
+        None,
+        None,
+    )
+    .expect("the example data reads");
+    let bound = |text: &str| -> ferx_core::CompiledModel {
+        let mut parsed = ferx_core::parser::model_parser::parse_full_model(text)
+            .unwrap_or_else(|e| panic!("must parse: {e}"));
+        ferx_core::api::bind_covariate_stats(&mut parsed, text, &population)
+            .unwrap_or_else(|e| panic!("covariate statistics must bind: {e}"));
+        parsed.model
+    };
+    let base_n = bound(&space.base_model.render()).theta_names.len();
+    let candidate = bound(&model.render());
+    assert_eq!(
+        candidate.theta_names.len(),
+        base_n + 1,
+        "an additive linear relation declares one θ, so the step's df is 1"
+    );
+
+    // …and the θ is live: the desugared expression is a sum whose added term
+    // reads the covariate, not a factor.
+    let ka = candidate
+        .covariate_model
+        .as_ref()
+        .expect("the block is recorded")
+        .desugared_individual_parameters
+        .iter()
+        .find(|l| l.trim_start().starts_with("KA "))
+        .expect("KA is assigned")
+        .clone();
+    // Both operators on one pair are two competing candidates, distinctly
+    // named — the `[covariate_model]` line the pair gets is the thing they
+    // compete for, so they must not collide on their id.
+    let both = config("COVARIATE?(KA, WT, lin); COVARIATE?(KA, WT, lin, +)", "").unwrap();
+    let both_base = both.load_base().unwrap();
+    let both_space = Space::from_config(&both, &both_base).unwrap();
+    let mut labels: Vec<String> = both_space.candidates.iter().map(Effect::label).collect();
+    labels.sort();
+    assert_eq!(labels, vec!["KA-WT-linear", "KA-WT-linear-add"]);
+
+    assert!(
+        ka.contains(") + (if (present(WT))"),
+        "the effect must be added to KA, not multiplied into it: {ka}"
+    );
+    assert!(ka.trim().ends_with("else 0.0)"), "{ka}");
 }

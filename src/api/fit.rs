@@ -87,6 +87,23 @@ pub fn fit_from_files(
     // legacy auto-detect when both are absent).
     let opts = options.unwrap_or_default();
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
+    // The file's `[fit_options]` are ignored here by design, but its
+    // `[data_selection]` is **not** — `build_selection_filter_merged` just applied it
+    // to the read above. So the options handed to `fit()` have to carry the merged
+    // clauses too, or `CmtConsumer::DataSelectionFilter` is asked about an empty list
+    // and withholds `W_CMT_DEFAULTED` on a fit that really was filtered on a
+    // compartment the reader invented (#1409 review). Only the selection strings are
+    // merged; every other key still comes from the caller.
+    let opts = {
+        let (ignore_exprs, accept_exprs, ignore_subjects) =
+            crate::api::run::merge_selection_exprs(&parsed.fit_options, &opts);
+        FitOptions {
+            ignore_exprs,
+            accept_exprs,
+            ignore_subjects,
+            ..opts
+        }
+    };
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
     let data_path = data_path.as_str();
     let (mut population, covariate_table) = read_population_for(
@@ -113,13 +130,10 @@ pub fn fit_from_files(
     }
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
-    // SDE models have no analytic-sensitivity path — force FD.
-    model.gradient_method =
-        if model.is_sde() && opts.gradient_method != crate::types::GradientMethod::Fd {
-            crate::types::GradientMethod::Fd
-        } else {
-            opts.gradient_method
-        };
+    // SDE models have no analytic-sensitivity path — force FD. One rule, shared
+    // with `run.rs`'s stamp and with the #1381 coupling check, which has to agree
+    // with what the loop will actually do on a model the parser has not stamped.
+    model.gradient_method = crate::types::GradientMethod::effective(&model, &opts);
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     result.covariate_table = covariate_table;
     if let Some(w) = data_path_warning {
@@ -870,8 +884,54 @@ pub fn fit(
     }
 }
 
+/// The etas a SAEM run started with these options would actually build a
+/// covariate mu-reference group for (#619) — `run_saem`'s two outer gates
+/// (`mu_referencing`, non-mixture) *and* `resolve_covariate_mu_groups` itself,
+/// which additionally drops a group for weak IIV, a conflicting single-anchor
+/// pair, or an all-`FIX`ed theta list.
+///
+/// Kept as one function because the caller is the pre-run warning assembly in
+/// [`fit_inner`], which must not disagree with what the estimator will do —
+/// mirroring only the two outer gates suppressed the #621 warning for every
+/// group the resolver drops, which is exactly where it is true (#918 review).
+pub(crate) fn saem_active_covariate_group_etas<'m>(
+    model: &'m CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<&'m str> {
+    if !options.mu_referencing || model.mixture.is_some() {
+        return Vec::new();
+    }
+    let split = crate::estimation::saem::classify_mu_ref_pairs(model, &init_params.theta_lower);
+    let conflicts = crate::estimation::saem::mu_ref_pairs_for_cov_groups(&split);
+    let (groups, _notes) = crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
+        model,
+        population,
+        &conflicts,
+        &init_params.theta_fixed,
+        &init_params.omega.matrix,
+    );
+    groups
+        .iter()
+        .filter_map(|g| model.eta_names.get(g.eta_idx).map(String::as_str))
+        .collect()
+}
+
+/// `active_group_etas` names the etas the run about to start will actually
+/// build a covariate mu-reference group for (#619) — the resolved list, not the
+/// parsed one. Group membership is *not* a property of the model: `run_saem`
+/// builds none under `mu_referencing = false` and none for a mixture (the class
+/// draw would have to enter the group's prior term, which has not been
+/// derived), and `resolve_covariate_mu_groups` drops individual groups for weak
+/// IIV, a conflicting single-anchor pair, or an all-`FIX`ed theta list. Reading
+/// the group off `model.covariate_mu_refs` would silence this warning in
+/// exactly the cases where nothing mu-references the parameter — and
+/// `mu_referencing = false` is the case the warning exists for (#621, #918
+/// review). Pass `&[]` where no group runs.
 pub(crate) fn saem_non_mu_referenced_individual_params_warning(
     model: &CompiledModel,
+    active_group_etas: &[&str],
 ) -> Option<String> {
     let mut names = Vec::new();
     for (param_name, &eta_idx) in model.indiv_param_names.iter().zip(model.eta_map.iter()) {
@@ -891,7 +951,11 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
         let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
             continue;
         };
-        if !model.mu_refs.contains_key(eta_name) {
+        // A multi-theta typical value (#619) is mu-referenced too: SAEM moves
+        // its thetas through the covariate mu-reference group — but only when
+        // the run builds one for *this* eta.
+        let has_group = active_group_etas.contains(&eta_name.as_str());
+        if !model.mu_refs.contains_key(eta_name) && !has_group {
             names.push(param_name.as_str());
         }
     }
@@ -961,7 +1025,16 @@ fn fit_inner(
     // matters most (#621). This is assembled before the startup banner so verbose
     // runs show it before SAEM begins.
     if chain.iter().any(|&m| m == EstimationMethod::Saem) {
-        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
+        // Resolve the groups the way `run_saem` will — the two gates it applies
+        // first, then `resolve_covariate_mu_groups` itself, which drops a group
+        // for weak IIV, a conflicting single-anchor pair or an all-FIXed theta
+        // list. Mirroring only the two outer gates suppressed this warning for
+        // the dropped groups, which is precisely where it is true (#918 review).
+        let active_group_eta_names =
+            saem_active_covariate_group_etas(model, population, init_params, options);
+        if let Some(w) =
+            saem_non_mu_referenced_individual_params_warning(model, &active_group_eta_names)
+        {
             pre_run_warnings.push(if n_stages > 1 {
                 format!("[SAEM] {w}")
             } else {
@@ -1127,11 +1200,31 @@ fn fit_inner(
     // clamped. Placed here — before every population-dependent check — because
     // the predicate needs no data and fails identically for every method.
     first_error(&check_variance_init_rails(init_params, options))?;
+    // #254: refuse a prior that cannot be applied, before any optimizer runs.
+    // See `check_parameter_priors` for why an unapplied prior is an error and
+    // not a warning.
+    first_error(&crate::api::validation::check_parameter_priors(
+        model,
+        init_params,
+        options,
+    ))?;
+
+    // An initial estimate that packs strictly outside its own box and is
+    // silently clamped there (#1251). Computed **once**, into a local: it
+    // returns a mix of errors (a θ outside the user's own declared range) and
+    // warnings (the internal Ω / Σ / hidden-θ-cap rails), and `first_error`
+    // consumes only the errors. The non-errors are pushed into
+    // `accumulated_warnings` at the `option_diags` block below — which is not
+    // declared until ~50 lines from here, so this cannot simply be inlined.
+    // Getting that wrong reports every one of these from `ferx check` and drops
+    // them silently from `fit()`, the #1033 failure mode.
+    let start_box_diags = check_packed_start_in_box(init_params, options);
+    first_error(&start_box_diags)?;
 
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
-    let held_mask = crate::estimation::parameterization::packed_held_mask(init_params);
+    let held_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
     let n_params_pre = held_mask.iter().filter(|&&b| !b).count();
 
     // Probe NLopt algorithm availability only when global_search will actually
@@ -1179,8 +1272,11 @@ fn fit_inner(
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
     accumulated_warnings.extend(pre_run_warnings);
-    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
-    // by read_nonmem_csv into population.warnings.
+    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING, W_MISSING_DV,
+    // W_CMT_DEFAULTED, …) accumulated by read_nonmem_csv into
+    // population.warnings. The list is illustrative, not exhaustive — every code
+    // the reader emits is in the `src/diagnostics.rs` registry table, which is the
+    // one place that has to stay complete.
     //
     // Through the shared filter, so `ferx check` suppresses exactly what `fit()`
     // does — see `reader_warning_suppressed`.
@@ -1188,7 +1284,7 @@ fn fit_inner(
         population
             .warnings
             .iter()
-            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, options, w))
             .cloned(),
     );
 
@@ -1216,6 +1312,14 @@ fn fit_inner(
         }
     }
 
+    // The outer-gradient FD-fallback notice (#1154) is *not* emitted here. It reports
+    // which subjects actually took the per-subject reconverged-FD outer gradient, which
+    // is only knowable once the gradient has run — `outer_optimizer::optimize_population`
+    // owns the runtime log and pushes the warning onto its own `OuterResult::warnings`.
+    // A probe at this point would have to guess a parameter point, and the provider's
+    // declines are parameter-dependent (`moving_bounds_separable` reads the resolved
+    // infusion windows and lag times), so a guess reports fallbacks that never happen.
+
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
@@ -1236,6 +1340,12 @@ fn fit_inner(
     // computed for `first_error`; re-calling `check_model_options` here would emit
     // every one of these twice.
     for d in option_diags.iter().filter(|d| !d.is_error()) {
+        accumulated_warnings.push(d.message.clone());
+    }
+    // The warning half of the packed-start-in-box check (#1251) — the internal
+    // Ω / Σ / hidden-θ-cap rails. Its error half was consumed by `first_error`
+    // above, on the same `Vec`, for exactly the reason the comment above gives.
+    for d in start_box_diags.iter().filter(|d| !d.is_error()) {
         accumulated_warnings.push(d.message.clone());
     }
     // Experimental-feature notices (data-independent; see check_experimental_features).
@@ -1301,6 +1411,31 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // Which stage last **wrote** `result.ofv` — i.e. who owns the number this fit
+    // will publish as `FitResult::ofv` (#1303).
+    //
+    // It cannot be derived from the chain, and both obvious guesses are wrong on
+    // a real configuration:
+    //
+    //   * `chain.last()` — an `imp_eval_only` stage deliberately does **not**
+    //     touch `result`; its importance-sampled −2 log L goes to
+    //     `FitResult::importance_sampling`, and the preceding estimator's
+    //     objective stays in `ofv`. So `methods = vi, imp` + `imp_eval_only`
+    //     publishes *VI's* objective, under IMP's name.
+    //   * `final_method` (the last **estimating** stage) — an AGQ readout stage is
+    //     evaluation-only *and* replaces `prev.ofv` with its quadrature marginal,
+    //     so `methods = focei, laplace` + `agq_eval_only` publishes the
+    //     eval-only stage's objective, not the estimator's.
+    //
+    // The two evaluation-only families differ in exactly this, so the only
+    // honest answer is to record it where the write happens. Consumed by the
+    // non-finite-objective gate, whose one exemption (`publishes_no_objective`:
+    // VI's deliberate `NaN` under `vi_final_ofv = none`) is a statement about
+    // *whose* objective this is — naming the wrong stage either demotes a
+    // perfectly good VI fit or exempts a real objective from the gate.
+    //
+    // `None` only until the first stage writes one.
+    let mut objective_stage: Option<EstimationMethod> = None;
     // A VI stage's result must survive later stages of a chain: `methods = vi, imp`
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
@@ -1312,16 +1447,7 @@ fn fit_inner(
     let mut vi_stage_idx: Option<usize> = None;
     // The methods running as pure likelihood evaluators for this fit. Chain-wide, not
     // per-stage, so it is built once here and read both inside the loop and after it.
-    let eval_only_methods: Vec<EstimationMethod> = {
-        let mut v = Vec::new();
-        if options.imp_eval_only {
-            v.push(EstimationMethod::Imp);
-        }
-        if options.agq_eval_only {
-            v.push(EstimationMethod::Laplace);
-        }
-        v
-    };
+    let eval_only_methods: Vec<EstimationMethod> = options.eval_only_methods();
     // Per-stage convergence wall time, parallel to `chain`/`method_chain`
     // (#713). Excludes the covariance step, which is timed separately below
     // and only ever runs on the last estimating stage.
@@ -1534,6 +1660,9 @@ fn fit_inner(
                 stage_opts.hessian_anchor(),
             );
             let ofv = 2.0 * nll;
+            // This stage writes `result.ofv` on both branches, so it owns the
+            // published objective even though it estimates nothing (#1303).
+            objective_stage = Some(method);
             match result.as_mut() {
                 // Chained: keep the estimator's parameters and replace only the OFV, so the
                 // reported objective is the quadrature marginal at the point it reached.
@@ -1541,23 +1670,38 @@ fn fit_inner(
                 // Standalone: there is nothing to preserve, so this becomes the canonical
                 // result at the (unchanged) initial parameters.
                 None => {
+                    // #1303: no optimizer ran, so "converged" here only ever
+                    // meant "the quadrature evaluated". It must still not claim
+                    // success at an objective that is `NaN` or a sentinel —
+                    // `agq_population_nll` can return either on a subject whose
+                    // timeline or variance is degenerate.
+                    let mut converged = true;
+                    let gate_warning =
+                        crate::estimation::outer_optimizer::gate_converged_on_objective(
+                            &mut converged,
+                            ofv,
+                        );
                     result = Some(crate::estimation::outer_optimizer::OuterResult {
                         params: stage_params.clone(),
                         ofv,
-                        converged: true,
+                        converged,
                         n_iterations: 0,
                         eta_hats,
                         h_matrices,
                         kappas,
                         covariance_matrix: None,
+                        // No covariance step on an evaluation-only stage, so no
+                        // estimator to name (#1382).
+                        covariance_method: None,
                         covariance_wall_time_secs: 0.0,
-                        warnings: Vec::new(),
+                        warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
                         saem_n_subjects_hmc: None,
                         ebe_convergence_warnings: 0,
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
                         final_gradient: None,
+                        final_gradient_source: None,
                         sir_fallback_proposal: None,
                         impmap_trace: None,
                         bayes: None,
@@ -1611,23 +1755,42 @@ fn fit_inner(
                     &kappas,
                     stage_opts.interaction,
                 );
+                // #1303 — as in the AGQ arm above: an evaluation-only stage still
+                // publishes a `(converged, ofv)` pair, and must not claim the
+                // first at a `NaN` or sentinel value of the second.
+                //
+                // Only *this* branch owns the objective. The chained branch below
+                // (a preceding estimator exists) writes `is_result` and leaves
+                // `result.ofv` alone, so `objective_stage` must stay pointing at
+                // that estimator — which is the #1303 review's P1.
+                objective_stage = Some(method);
+                let ofv = 2.0 * nll;
+                let mut converged = true;
+                let gate_warning = crate::estimation::outer_optimizer::gate_converged_on_objective(
+                    &mut converged,
+                    ofv,
+                );
                 result = Some(crate::estimation::outer_optimizer::OuterResult {
                     params: stage_params.clone(),
-                    ofv: 2.0 * nll,
-                    converged: true,
+                    ofv,
+                    converged,
                     n_iterations: 0,
                     eta_hats,
                     h_matrices,
                     kappas,
                     covariance_matrix: None,
+                    // No covariance step on an evaluation-only stage, so no
+                    // estimator to name (#1382).
+                    covariance_method: None,
                     covariance_wall_time_secs: 0.0,
-                    warnings: Vec::new(),
+                    warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
                     saem_n_subjects_hmc: None,
                     ebe_convergence_warnings: 0,
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
                     final_gradient: None,
+                    final_gradient_source: None,
                     sir_fallback_proposal: None,
                     impmap_trace: None,
                     bayes: None,
@@ -1781,6 +1944,9 @@ fn fit_inner(
                 w.clone()
             });
         }
+        // An estimating stage replaces the whole `OuterResult`, objective included,
+        // so it becomes the owner of the published `ofv` (#1303).
+        objective_stage = Some(method);
         result = Some(stage_result);
 
         // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
@@ -1905,14 +2071,18 @@ fn fit_inner(
         .as_ref()
         .map(|mp| mp.mixest.clone());
     //
-    // ODE models run this pass inside a solver-statistics scope (#1080 Part B): it is the one
+    // ODE models run this pass under solver-statistics collection (#1080 Part B): it is the one
     // production sweep that integrates every subject at the final estimates through the
     // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
     // decisions can be observed without threading a stats sink through every predictor. Costs
     // one thread-local read per segment on the ODE path and nothing at all elsewhere.
-    let solver_stats_scope =
-        integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter);
-    let mut subjects = compute_subject_results(
+    //
+    // The scope used to be opened *here*, around the call. It is now opened per subject inside
+    // it and the counters come back as a return value, because the pass is parallel over
+    // subjects (#1329) and `SolverStatsScope` is thread-local — a scope held on this thread
+    // would have reported zero of everything. The `bool` is what the `.then()` used to decide.
+    let ode_model = integrates_odes(model);
+    let (mut subjects, mut ode_solver_stats) = compute_subject_results(
         model,
         population,
         &result.params,
@@ -1921,32 +2091,29 @@ fn fit_inner(
         &result.kappas,
         options.interaction,
         mixest_classes.as_deref(),
+        ode_model,
     );
-    let mut ode_solver_stats = solver_stats_scope
-        .map(|scope| scope.collected())
-        .unwrap_or_default();
     // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
     // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
     // sensitivity solve per subject is what makes that clause reportable: the solve the fit's
     // gradient ran throughout, run once more at the estimates the fit reports. No-ops for
     // every model not on the analytic ODE sensitivity path, and for every FD fit.
     //
-    // It gets its **own** scope, and exactly one field crosses back. Sharing the prediction
+    // It gets its **own** scopes, and exactly one field crosses back. Sharing the prediction
     // pass's scope would double every step, clamp and escalation count across two different
     // solves — and worse, a `min_dt` clamp that happened only in the gradient solve would
     // fire the warning's clamp clause, which tells the user their *predictions* were
     // freeze-padded. Only `auto_stiff_rejected_jets` describes something the prediction pass
     // structurally cannot observe, so only it is carried over.
-    if integrates_odes(model) {
-        let sens_scope = crate::ode::solver::SolverStatsScope::enter();
-        sweep_sensitivity_solver_stats(
+    if ode_model {
+        ode_solver_stats.auto_stiff_rejected_jets = sweep_sensitivity_solver_stats(
             model,
             population,
             &result.params,
             &result.eta_hats,
             mixest_classes.as_deref(),
-        );
-        ode_solver_stats.auto_stiff_rejected_jets = sens_scope.collected().auto_stiff_rejected_jets;
+        )
+        .auto_stiff_rejected_jets;
     }
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
@@ -1995,8 +2162,28 @@ fn fit_inner(
     let n_obs = population.n_obs();
     let n_params = n_params_pre;
 
-    let ofv = result.ofv;
-    let aic = ofv + 2.0 * n_params as f64;
+    // Parameter priors (#254). `result.ofv` is the clean −2LL that every
+    // optimizer reports (the penalty is excluded from it by construction), so
+    // the prior half is recomputed here at the final estimate and the two are
+    // published separately.
+    //
+    // `ofv` becomes the **penalized total** — the objective that was actually
+    // minimised, and the quantity NONMEM's `$PRIOR` also reports — so a
+    // converged minimum, a ΔOFV between two priored models, and the printed
+    // "Final OFV" all mean the same thing. `ofv_prior` is exactly zero for an
+    // unpriored fit, which is every fit that existed before this feature, so
+    // nothing moves there.
+    //
+    // **AIC and BIC keep using `ofv_data`.** A penalized objective is not a log
+    // likelihood, and an information criterion computed from one is not an
+    // information criterion — it would silently reward a tighter prior.
+    let prior_set = crate::estimation::outer_optimizer::build_prior_set(model, &result.params);
+    let packed_final = crate::estimation::parameterization::pack_params(&result.params);
+    let ofv_prior = prior_set.penalty(&packed_final);
+    let prior_summary = prior_set.summarize(&packed_final);
+    let ofv_data = result.ofv;
+    let ofv = ofv_data + ofv_prior;
+    let aic = ofv_data + 2.0 * n_params as f64;
     // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
     // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
     #[cfg(feature = "survival")]
@@ -2009,7 +2196,7 @@ fn fit_inner(
     #[cfg(not(feature = "survival"))]
     let n_for_bic: usize = n_obs;
     let bic = if n_for_bic > 0 {
-        ofv + n_params as f64 * (n_for_bic as f64).ln()
+        ofv_data + n_params as f64 * (n_for_bic as f64).ln()
     } else {
         f64::NAN
     };
@@ -2295,6 +2482,38 @@ fn fit_inner(
     // `result.params` holds the *final* stage's estimates, so a chained
     // `methods = vi, focei` is gated on its last stage, like `run_covariance_step`.
     let mut converged = result.converged;
+    // The objective gate (#1303), applied to the OFV this `FitResult` publishes
+    // — `ofv_data + ofv_prior`, which includes a penalty evaluated after the last
+    // optimizer returned and so is a different number from the one any estimator
+    // gated. Placed ahead of the parameter-level warnings because it is the
+    // stronger statement: at a `NaN` or sentinel objective the estimates are not
+    // a minimum of anything, so the boundary / RSE / shrinkage diagnostics below
+    // are describing a point rather than a solution.
+    //
+    // The stage passed is the tracked **owner** of `result.ofv` (see
+    // `objective_stage` where it is declared), not a position in the chain.
+    // Neither `chain.last()` nor `final_method` is right for both evaluation-only
+    // families, and getting it wrong demotes a converged VI fit that was finished
+    // the recommended way (`methods = vi, imp` + `imp_eval_only`).
+    let objective_stage = objective_stage.unwrap_or(final_method);
+    if let Some((msg, entry)) =
+        nonfinite_objective_warning(&mut converged, ofv, objective_stage, options)
+    {
+        // The estimator that produced this objective has already pushed the same
+        // sentence as a plain string — `[STAGE] `-prefixed when the chain has more
+        // than one stage. Drop that copy and keep this one: they say the same
+        // thing, but only this one carries the typed `details` payload
+        // (`ofv`, `reason`, `divergence_cutoff`, `method`) that `docs/warnings.qmd`
+        // documents and a programmatic consumer reads.
+        //
+        // Matched on suffix rather than equality so the chain prefix does not
+        // defeat it, and the message interpolates the offending value, so a
+        // *different* stage's non-finite objective in the same chain is a
+        // different string and survives.
+        warnings.retain(|w| !w.ends_with(msg.as_str()));
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     if let Some((msg, entry)) = runaway_guard_warning(&mut converged, &result.params) {
         warnings.push(msg);
         native_warnings.push(entry);
@@ -2309,7 +2528,11 @@ fn fit_inner(
     // escalations, and escalations the guard discarded — none of which any production path
     // reported before. Emitted typed at source, at `Info` severity when the only thing to
     // report is that `auto` escalated and it worked.
-    if let Some((msg, entry)) = ode_solver_diagnostics_warning(&ode_solver_stats, options) {
+    if let Some((msg, entry)) = ode_solver_diagnostics_warning(
+        &ode_solver_stats,
+        options,
+        SolverStatsPhase::PostfitPredictions,
+    ) {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -2351,7 +2574,7 @@ fn fit_inner(
             model
                 .mu_refs
                 .get(name)
-                .map(|r| r.log_transformed)
+                .map(|r| r.log_transformed())
                 .unwrap_or(false)
         })
         .collect();
@@ -2372,7 +2595,7 @@ fn fit_inner(
                 model
                     .kappa_mu_refs
                     .get(name)
-                    .map(|r| r.log_transformed)
+                    .map(|r| r.log_transformed())
                     .unwrap_or(false)
             })
             .collect();
@@ -2445,6 +2668,9 @@ fn fit_inner(
         covariance_wall_time_secs,
         converged,
         ofv,
+        ofv_data,
+        ofv_prior,
+        prior_summary,
         aic,
         bic,
         theta: result.params.theta.clone(),
@@ -2543,6 +2769,12 @@ fn fit_inner(
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
         covariance_status,
+        // #1382: the estimator that actually produced `covariance_matrix`, carried
+        // up from the covariance step rather than read back off
+        // `options.covariance_method` — the two part company whenever #1064's
+        // large-problem router swaps a defaulted `r` for the cross-product, and
+        // `stage_opts` is a per-stage clone besides.
+        covariance_method: result.covariance_method,
         shrinkage_eta,
         cond_dist: result.cond_dist.clone(),
         shrinkage_eps,
@@ -2576,6 +2808,7 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
+        final_gradient_source: result.final_gradient_source.clone(),
         optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
@@ -2655,6 +2888,16 @@ fn fit_inner(
     // packed parameter names, which are derived from the assembled `FitResult`;
     // `rebuild_warnings_structured` preserves this native entry by message.
     if let Some((msg, entry)) = high_correlation_warning(&fit_result) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
+    }
+
+    // A fit that never left its initial estimates (#997 §2). Appended
+    // post-construction for the same reason as `high_correlation_warning`: the
+    // predicate it surfaces (`crate::stalled_at_init`) reads the assembled
+    // `FitResult` — `left_init`, `theta_init`/`theta`, and the fixed masks —
+    // none of which exist as one object before this point.
+    if let Some((msg, entry)) = crate::api::stalled_at_init_warning(&fit_result) {
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }

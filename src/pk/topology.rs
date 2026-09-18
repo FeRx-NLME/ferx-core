@@ -99,6 +99,27 @@ impl PkTopology {
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         self.infusable
     }
+
+    /// How many compartments a dose row's `CMT` can actually route to on this
+    /// model — the count of live entries in [`Self::channels`], which is the same
+    /// table [`Self::dose_channel`] dispatches on.
+    ///
+    /// Counted rather than read off `n_states` because the two genuinely differ:
+    /// the transit and inverse-Gaussian models carry `n_states` 2 or 3 but
+    /// `channels: &[]`, since their closed form absorbs every dose through the
+    /// depot and `single_dose_concentration` never reads `dose.cmt` at all. For
+    /// those a `CMT` the reader had to invent changes nothing, and answering with
+    /// `n_states` would claim otherwise (#1009).
+    ///
+    /// The count and the *highest addressable index* coincide only while no table
+    /// has an interior `None` (`[Some, None, Some]` would count 2 and address 3).
+    /// That is pinned rather than assumed — `topology_fields_are_internally_consistent`
+    /// asserts every table's live channels form a prefix — so the cheaper spelling
+    /// stays the right one (#1409).
+    #[inline]
+    pub(crate) fn addressable_dose_compartments(&self) -> usize {
+        self.channels.iter().flatten().count()
+    }
 }
 
 use Channel::{Central, Depot, Periph1, Periph2};
@@ -247,6 +268,20 @@ mod tests {
                 .enumerate()
                 .filter_map(|(i, c)| c.map(|_| i + 1))
                 .collect();
+            // The live channels must form a PREFIX of the table — no interior
+            // `None`. `addressable_dose_compartments` counts live entries, and
+            // `api::validation` reads that count as "how far a dose's CMT can
+            // address"; the two answers coincide only under this invariant, and
+            // `[Some, None, Some]` would separate them (2 against 3, #1409). A
+            // topology that genuinely needs a hole must change that method too.
+            assert_eq!(
+                channel_set,
+                (1..=channel_set.len()).collect::<Vec<_>>(),
+                "{m:?}: channels {:?} have an interior None — the live entries must be \
+                 a prefix, or `addressable_dose_compartments` stops meaning \
+                 'the highest CMT a dose can address'",
+                t.channels
+            );
             // Every routable compartment must be a parse-accepted infusion target.
             for &cmt in &channel_set {
                 assert!(

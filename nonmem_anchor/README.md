@@ -29,6 +29,12 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Record ordering at a two-year timescale** | a dose and a sample on the same record time at `TIME = 17520` — [#1226](https://github.com/FeRx-NLME/ferx-core/issues/1226) review (`ADVAN1 TRANS2`, `MAXEVAL=0`, `$THETA` `FIX`, `$OMEGA 0 FIX`, `$TABLE FORMAT=s1PE23.16`). The four anchors above all sit at `t ≈ 8.2`, where `ulp` is 1.78e-15 and the `EVENT_MATCH_TOL` recording band is 563 ulp wide. At `t ≥ 16384` — 17520 h is two years — `ulp` (3.638e-12) exceeds the tolerance, so a band written as the sum `t < t_break + TOL` rounds back and matches **nothing**, not even bit equality. This run pins the answer in that regime: `PRED = 1.4404316545059672E+02`, post-dose, exactly as at `t ≈ 8.2`. It does double duty as the ordering anchor for a **dose landing on the same time as an observation**, which is what `provider_reads_a_dose_landing_on_the_last_observation` checks the analytic-sensitivity walk against — that walk skipped its final break entirely and never applied such a dose (3.79 against production's 1003.79) | `lag_arrival_read_largetime.ctl` | *(in `src/ode/predictions_tests.rs::lag_arrival_read_1226`)* |
 | **`SS=1` dose × a model-time-reading `[odes]` RHS** | a steady-state dose on a right-hand side that reads the `TAD` built-in — [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) (`ADVAN13 TOL=9`, `MAXEVAL=0 METHOD=0 POSTHOC`, every `$THETA` `FIX`, `$OMEGA 0 FIX`, `$TABLE FORMAT=,1PE20.13`). The steady-state run-in handed the compiled RHS a parameter array two slots short, so `TAD` read `NaN` for the whole run-in and `0.0*TAD` was `NaN` too — merely *mentioning* the built-in broke an ordinary `SS=1` model. **NONMEM has no `TAD` built-in in `$DES`**, so the cycle clock is written by hand as `TADX = MOD(T + 120.0, 12.0)`; that is exactly `TAD` here because the pulses sit at multiples of 12 and 120 is one too. It raises NONMEM's `WARNING 68` (`MOD` outside a simulation block), which concerns gradients and is inert at `MAXEVAL=0`. Three statements make the anchor trustworthy and none of them is ferx-against-ferx: the `TAD` train **converges** (`train_tad_n21` vs `train_tad`, 3.5e-7 over a doubling) while its absolute-clock twin does **not** (`train_tabs_n21` vs `train_tabs`, 0.294) — which is why only `TAD` is anchored and `TAFD`/`T`/`TIME` are a separate question; NONMEM's own SS routine reproduces NONMEM's own 41-dose train to **1.28e-9**; and a **closed form outside both engines** (`A* = D·Φ(II)/(1−Φ(II))`, `Φ(s) = exp(−k(s + c·s²/2))`) reproduces NONMEM to 7.7e-9 and ferx to **3.0e-10** — so NONMEM's uniform 8e-9 offset is its own `TOL=9`/print floor, not ferx drift, and the closed form is the *tighter* reference. ferx **`NaN` at every observation** before the fix, `8.8902009677` against NONMEM's `8.8902010334` after (7.4e-9), asserted separately on the objective engine (`ode_predictions_event_driven`) and the states engine (`ode_dense_solve_states`) — two engines here, not two callers, because the model-time reroute (#1124) sends them to different walkers than the autonomous twin. `ss_tabs*` is committed as the **parity guard** for the absolute-clock half: ferx and NONMEM agree to 1.5e-9 on a value that is *not* a steady state, and a change to the run-in must not move it silently | `ss_tad.ctl`, `train_tad.ctl`, `train_tad_n21.ctl`, `ss_tabs.ctl`, `train_tabs.ctl`, `train_tabs_n21.ctl` (6) | `ss_tad_fit.ferx`, `ss_tabs_fit.ferx` |
 | **Covariate thetas × the EBE warm start** | a two-compartment oral model carrying three covariate thetas, fitted to convergence — [#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290) (`ADVAN4 TRANS4`, `$EST METHOD=1 INTERACTION MAXEVAL=9999`, `$COV MATRIX=R`). Unlike the rest of this table this is an **estimation** anchor, not a prediction one: the question is where the optimizer lands, so nothing is fixed and both engines start from the same initial estimates. ferx stalled on evaluation 1 at the initial point's **-1026.350403** with every theta unchanged; after the fix it reaches **-1195.304253** on its default optimizer and **-1199.429664** on the built-in BFGS, against NONMEM's MINIMIZATION SUCCESSFUL **-1199.4297842339142** — 1.2e-4 OFV, and thetas agreeing to ~4 significant figures (`4.94250/4.94183`, `48.5638/48.5627`, `0.729/0.7296`, `0.5549/0.5549`, `0.5810/0.5774`). The residual **4.13** between ferx's default (NLopt L-BFGS) and the optimum is *not* the stall and is tracked separately: that path stops on `FtolReached` against a warm-started objective reading -1178.09 at a point whose cold-start value is -1195.30. The dataset is `data/two_cpt_oral_cov.csv` with observation `CMT` recoded 1 → 2, since ferx's `two_cpt_oral` reads `CMT=1` observations from the central compartment while `ADVAN4` numbers the depot 1 | `covmodel_stall.ctl` | `examples/two_cpt_oral_covmodel.ferx` |
+| **Additive (`+`) covariate effects** | a `[covariate_model]` relation *added* to a parameter instead of multiplied into it — [#1313](https://github.com/FeRx-NLME/ferx-core/issues/1313) (`ADVAN4 TRANS4`, `$EST METHOD=1 INTERACTION MAXEVAL=0 POSTHOC`, `$TABLE FORMAT=s1PE23.16`, on `covmodel_stall.csv`). Two arms: **lin** is the additive combination alone (`CL = THETA(1)*EXP(ETA(1)) + THETA(6)*(WT-70)`), **mixed** carries a multiplicative *and* an additive relation on the same `CL`, which is the placement rule the block gains with the operator — `TVCL*f*EXP(ETA) + t` is neither `TVCL*f*(EXP(ETA) + t)` nor `(TVCL*EXP(ETA) + t)*f`, so NONMEM's own spelling settles it. Non-degeneracy is in the data: `WT` 45.0 .. 93.7 about a centre of 70 and `CRCL` 46.5 .. 150.0 about 100, so **both** terms take both signs and move `CL` by up to 25 % of `TVCL`; zeroing the slope makes the same comparison miss by 39 % / 43 %. `PRED` matches to **3.08e-15** / **2.65e-15** relative (print precision). **The objective is compared as a difference against each arm's `*_null.ctl` twin** (the same stream with the additive slope `0 FIX`), because ferx and NONMEM disagree by **16.02** on this dataset *with no covariate model at all* — measured, not assumed: `additive_cov_lin_null.ctl` **is** that model, and ferx holds its own value to 1e-9 across `inner_tol` 1e-10 .. 1e-14 and `inner_restarts` 0 .. 8, so it is not an inner-EBE tolerance. The offset is stable in the slope (16.0246 at 0, 16.0247 at 0.04), so the difference cancels it: ΔOFV agrees to **1.13e-4** on −4.0855 (lin) and **3.15e-4** on +1.0076 (mixed). The baseline offset itself is pre-existing and belongs to the FOCEI-vs-NONMEM work (#864), not to #1313 | `additive_cov_lin.ctl`, `additive_cov_lin_null.ctl`, `additive_cov_mixed.ctl`, `additive_cov_mixed_null.ctl` (4) | *(in `tests/additive_covariate_nonmem_anchor.rs`)* |
+| **Logit-normal mu-referencing** | `FR1 = 1/(1+exp(-(LOGIT_FR1 + ETA_FR1)))` under SAEM — [#918](https://github.com/FeRx-NLME/ferx-core/issues/918) (NONMEM's explicit `MU_3 = THETA(3)`, `METHOD=SAEM`) | `logit_fraction_saem.ctl` | `logit_fraction_saem_fit.ferx` |
+| **Covariate mu-referencing, additive** | `CL = (TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)` under SAEM — [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) (NONMEM's *nonlinear* `MU_1 = LOG(THETA(1) + (CRCL-90)*THETA(2))`, `METHOD=SAEM`; data `data/covmuref_additive.csv` from `simulate_covmuref_data.py`, CRCL constant per subject) | `covmuref_additive_saem.ctl` | `covmuref_additive_saem_fit.ferx` |
+| **Covariate mu-referencing, power** | `CL = TVCL * (WT/70)^TH_WT * exp(ETA_CL)` under SAEM — [#619](https://github.com/FeRx-NLME/ferx-core/issues/619) (NONMEM's linear `MU_1 = LOG(THETA(1)) + THETA(2)*LOG(WT/70)`; data `data/covmuref_power.csv`) | `covmuref_power_saem.ctl` | `covmuref_power_saem_fit.ferx` |
+| **`[parameters]` rejects what it cannot parse** | a scale tag - or any other trailing text - on a `block_omega` / `block_sigma` / `block_kappa` declaration, and a line matching no declaration form at all - [#1377](https://github.com/FeRx-NLME/ferx-core/issues/1377). **Not a fit anchor, and the only row here that is not: the object under test is a parse outcome, so there is no number to compare.** What the two streams record is that the comparator also treats these shapes as errors rather than ignoring them, which is the whole question #1377 asks - ferx used to drop both in silence and report the file VALID. Each stream is a valid warfarin `ADVAN2` `MAXEVAL=0` evaluation differing from an accepted one by exactly one token, in the same vary-one-input-at-a-time discipline as the rest of this table, so neither needs a separate baseline file: arm A appends `FOO` to the `$OMEGA BLOCK` record, arm B puts `BANANA` on a line of its own. NM-TRAN rejects both with `AN ERROR WAS FOUND IN THE CONTROL STATEMENTS.`, the offending record echoed under a caret, ` THE CHARACTERS IN ERROR ARE: FOO` / `: BANANA`, and the reason code `   20  UNKNOWN OPTION.` (nmfe exit 107); each control - the same stream with that one token deleted - is accepted with `OBJECTIVE FUNCTION VALUE: 213.51174651518426`. **Read the asymmetry before quoting this pair: it is two cases for ferx and one for NM-TRAN.** A NONMEM record runs to the next `$`, so arm B's own-line `BANANA` is parsed as one more option on the `$OMEGA` record and fails with the same error 20 as arm A's trailing `FOO`; NM-TRAN has no notion of "a line matching no declaration form" because it has no notion of a line there at all. What the pair supports is the narrower claim that **an unknown token anywhere in the `$OMEGA` region is an error** - not that the comparator separates the two halves the way ferx's line-oriented `[parameters]` does. **Provenance: measured first-hand at `9a7d79c` - `nmfe76` (`/opt/NONMEM/nm760/run/nmfe76`), `NONMEM VERSION 7.6.0 (nm760)`, docker image `nonmemdocker:V0.1` (`sha256:2ee46060f1e0`), run from `nonmem_anchor/` against `../data/warfarin.csv`.** Measured in the same session and deliberately **not** anchored here: NM-TRAN *accepts* `$OMEGA BLOCK(2) SD 0.3 0.02 0.2`, squaring the diagonal only (0.3 -> 0.09, 0.2 -> 0.04) and leaving the off-diagonal 0.02 a covariance - its `run.ext` is byte-identical to the plain `0.09 0.02 0.04` control's, and the SD/correlation row reports `OMEGA(2,1) = 3.33333E-01 = 0.02/(0.3*0.2)`, which a correlation reading would have shown as 0.02. A widening tracked as [#1387](https://github.com/FeRx-NLME/ferx-core/issues/1387), not part of this change. **A third stream, from the PR's round-3 review:** a `$THETA` bound that is present but not a number. ferx used to replace `theta TVCL(50, 0.001-10.0)`'s joined lower bound with its default and report VALID; it now reports `Bad theta lower bound`. NM-TRAN refuses the same shape: `$THETA (0.001-10.0, 0.134) FIX` is rejected (exit 107) with ` THE CHARACTERS IN ERROR ARE: 0.001-` and `   18  INCORRECTLY FORMED VALUE, OPTION, OR RESERVED WORD.`, and its one-edit control `(0.001, 0.134, 10.0) FIX` is accepted at `OBJECTIVE FUNCTION VALUE: 213.51174651518426`. A bare `-` is rejected with error 22 (`UNKNOWN SYMBOL`), and `1e` as either bound with error 18. Measured first-hand on the committed file, same image and driver. **One deliberate divergence, not NONMEM-backed:** in NM-TRAN `;` starts a comment (these streams carry `; CL V KA` and run), while `.ferx` comments are `#` and `//` only, so ferx rejects a `;` line in `[parameters]` with a message naming `#`. That follows ferx's own grammar; making `;` a comment is tracked in [#1393](https://github.com/FeRx-NLME/ferx-core/issues/1393) | `parameters_reject_trailing_token.ctl`, `parameters_reject_stray_line.ctl`, `parameters_reject_theta_bound.ctl` (3) | *(in `tests/check_command.rs` and `src/parser/model_parser_tests.rs`)* |
+| **`[fit_options]` and `[error_model]` reject what they cannot parse** | a `[fit_options]` line that is not a `key = value` pair, and an `[error_model]` line matching no statement form - [#1390](https://github.com/FeRx-NLME/ferx-core/issues/1390). **Not a fit anchor, for the same reason as the `[parameters]` row above: the object under test is a parse outcome, so there is no number to compare.** Both streams are the same valid warfarin `ADVAN2` `MAXEVAL=0` evaluation, differing from the accepted control by exactly one edit. **Arm B is the one that supports the ferx rule**: `BANANA` on its own line in `$ERROR`, *beside a complete `Y = IPRED * (1 + EPS(1))`*, is rejected with `AN ERROR WAS FOUND IN THE CONTROL STATEMENTS.`, the offending line echoed under a caret, and `  202  FORTRAN SYNTAX IS INCORRECT OR INAPPROPRIATE IN THIS CONTEXT.` (nmfe exit 107). The *beside a complete statement* part is the whole point - a block with only the stray line already failed in ferx, late and unhelpfully, with "No error model found"; the defect was only visible when a valid statement was there to be fitted instead. **Arm A is a measured NEGATIVE result and must not be quoted as backing the `[fit_options]` rule**: `$ESTIMATION MAXEVAL 0` - the `=` left out - is *accepted*, exit 0, and *honoured*, the `.lst` reporting `ESTIMATION STEP OMITTED:                 YES`. A NONMEM record is a token stream running to the next `$` in which whitespace and `=` are both separators, while ferx's `[fit_options]` is a line-oriented `key = value` block, so NM-TRAN simply cannot express the object; that half is anchored on ferx's own terms instead (an exact message plus a `parse_full_model` control that `method = saem` still selects SAEM). **Read the asymmetry on arm B too**: `$ERROR` is Fortran, so NM-TRAN rejects `BANANA` as a syntax error rather than as "a line matching no error-model form" - it has no notion of a declaration form there. The claim supported is the narrower one, that a stray line in the residual-error region is an error and not something to drop. The control - arm B with the `BANANA` line deleted, which is also arm A with the `=` restored - is accepted at `OBJECTIVE FUNCTION VALUE: 215.06724369784769`. As with `[parameters]`, ferx's rejection of a `;` line is a deliberate divergence and not NONMEM-backed ([#1393](https://github.com/FeRx-NLME/ferx-core/issues/1393)). **Provenance: measured first-hand on the committed files - `nmfe75` (`/opt/NONMEM/nm751/run/nmfe75`), NONMEM 7.5.1, licensed `pmx` container image `a8b78e6253e5`, 2026-09-15, run against `../data/warfarin.csv`.** | `error_model_reject_stray_line.ctl`, `fit_options_reject_missing_equals.ctl` (2) | *(in `tests/check_command.rs` and `src/parser/model_parser_tests.rs`)* |
 
 The **`TIME`-readout** control runs on its own tiny `scaling_time_readout.csv`
 (one subject, 100 mg IV bolus, seven samples over 24 h) — see
@@ -81,6 +87,43 @@ respective model (see below).
 > dataset, simulated from the biphasic model itself (`simulate_biphasic_ig_data.py`),
 > so NONMEM also **recovers** the truths. Re-run with
 > `nmfe75 freijer_biphasic_ig.ctl freijer_biphasic_ig.lst`.
+
+> **Logit mu-referencing run status — DONE (#918).** The licensed NONMEM run
+> landed (`results/logit_fraction_saem.{ext,lst}`, NONMEM 7.5.1,
+> `METHOD=SAEM INTERACTION NBURN=2000 NITER=1000 ISAMPLE=10 SEED=918` followed by
+> `METHOD=IMP EONLY=1`). Unlike the OFV-at-optimum anchors above, this one
+> compares **estimates**: the model is fitted from the same starting values by
+> both engines on the same matched dataset (`simulate_logit_fraction_data.py`),
+> and the slow-gated `tests/saem_logit_mu_ref.rs` pins the fraction. Re-run with
+> `nmfe75 logit_fraction_saem.ctl logit_fraction_saem.lst`; the ferx side is
+> `cargo run --release -p ferx-cli -- nonmem_anchor/logit_fraction_saem_fit.ferx --data data/logit_fraction_oral.csv`.
+>
+> | Parameter | truth | NONMEM SAEM | ferx SAEM |
+> |---|---:|---:|---:|
+> | `CL` (L/h) | 5.0 | 5.291 | 5.308 |
+> | `V` (L) | 50.0 | 55.72 | 54.57 |
+> | `FR1` (fast fraction) | 0.600 | 0.604 | 0.594 |
+> | `LOGIT_FR1` | 0.4055 | 0.4219 | 0.3793 |
+> | `KA1` (1/h) | 2.0 | 2.056 | 2.057 |
+> | `KA2` (1/h) | 0.2 | 0.2225 | 0.2356 |
+> | ω²(CL), ω²(V) | 0.09, 0.09 | 0.0902, 0.1157 | 0.0881, 0.1198 |
+> | ω²(logit FR1) | 0.25 | 0.1828 | 0.1861 |
+> | σ proportional (SD) | 0.08 | 0.0809 | 0.0823 |
+>
+> Note the design: 60 subjects × 16 samples, dose split between a fast and a slow
+> first-order pathway, so the fraction is identified by the **shape** of the curve
+> rather than by exposure magnitude (a bioavailability `F` would be confounded
+> with `CL`/`V` in oral-only data). Both engines start at `FR1 = 0.4`.
+>
+> **`.lst` truncation.** This NONMEM 7.5.1 build aborts while printing the final
+> report section of the SAEM+IMP chain — after both estimation stages finish and
+> after every output file is written. The committed `.lst` therefore ends at
+> `#TERM` and carries no "FINAL PARAMETER ESTIMATE" block; read the estimates from
+> `results/logit_fraction_saem.ext` instead (the last `-1000000000` row of each
+> `TABLE NO.` block — table 1 is SAEM, table 2 the IMP objective, `#OBJV`
+> equivalent −3698.448). The abort is not the fit failing: the two runs performed
+> while preparing this anchor (with and without `$COVARIANCE`) produced
+> bit-identical `.ext` trajectories. The table above is what `.ext` reports.
 
 ## The dataset
 
@@ -630,6 +673,57 @@ mv dose_cmt_*.lst dose_cmt_*.tab results/
 > relative deviation, so the committed anchors are re-derivable rather than
 > taken on trust.
 
+## `DEFDOSE` vs a dataset that does not say (#1009)
+
+`defdose_no_cmt.ctl` / `defdose_cmt2.ctl` / `defdose_cmt2float.ctl` — three
+evaluation-only runs (`$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0`) on the same
+model and the same 10 warfarin subjects, differing only in how the dataset spells
+`CMT`. `ADVAN13 TOL=9`, `$MODEL COMP=(CENTRAL, DEFOBS) COMP=(DEPOT, DEFDOSE)` —
+the dosed compartment is the **second** one, which is the shape in which a
+missing `CMT` column is not recoverable. `$SIGMA 0.0004` = ferx
+`sigma PROP_ERR ~ 0.02 (sd)`. ferx twin: `defdose_depot_second_fit.ferx`
+(`states = [central, depot]`, `maxiter = 0`, `ode_reltol 1e-9 / ode_abstol 1e-11`).
+
+| run / dataset | `CMT` on dose rows | NONMEM doses | NONMEM OBJV | ferx doses |
+|---|---|---|---|---|
+| `defdose_cmt2` | `2` | DEPOT | **−182.66670816329514** | depot |
+| `defdose_cmt2float` | `2.0` | DEPOT | **−182.66670816329514** | depot — compartment 1 before #1009 |
+| `defdose_no_cmt` | *(no column)* | DEPOT (`DEFDOSE`) | **−182.66670816329514** | compartment 1 = central (OFV 154050.610450) |
+
+The point of the third row is that NM-TRAN resolves an undecorated dose against
+the model's declared `DEFDOSE`, and ferx has no such declaration — so the
+compartment really is ambiguous rather than merely unstated. #1009 fixes the
+*second* row (a float-formatted cell is now read as its integer) and makes the
+third audible (`W_CMT_DEFAULTED`) rather than silently resolved.
+
+Consumed by `tests/defdose_no_cmt_nonmem_anchor.rs`, ungated (`MAXEVAL = 0` on 10
+subjects is sub-second, so it runs on every PR). Realised |Δ OFV| against NONMEM
+on the two agreeing datasets: **4.084e-8**, relative 2.2e-10; the test's bound is
+`5e-7`.
+
+### Run it
+
+From this directory, then move the output into `results/`:
+
+```bash
+for f in defdose_no_cmt defdose_cmt2 defdose_cmt2float; do nmfe76 "$f.ctl" "$f.lst"; done
+mv defdose_*.lst defdose_*.tab defdose_*.ext defdose_*.phi results/
+```
+
+> **Run status — DONE (#1009), re-derived.** Each `.ctl` names **its own** dataset
+> (`$DATA defdose_<case>.csv`) and its own `$TABLE FILE=`, so the loop above is the
+> whole recipe and each run's `.lst` records which dataset produced it. That
+> matters here more than usual: the three runs return the *same* OBJV by design, so
+> without per-run filenames the committed evidence could not distinguish "the float
+> dataset was run" from "the integer dataset was run twice" — and the float arm is
+> the one the fix is about. An earlier revision of this anchor had exactly that
+> hole (all three `$DATA data.csv`, no `data.csv` committed); it was caught in
+> review and all three runs were re-executed from the committed files on NONMEM
+> 7.6.0, each returning `-182.66670816329514`.
+>
+> The committed `.csv` files are the exact bytes NONMEM read (CRLF line endings
+> included), so the ferx side is fed the same dataset and not a re-export of it.
+
 ## Slow-accumulation steady-state anchors (#908)
 
 `ss_slow_advan1.ctl` / `ss_slow_advan2.ctl` — two evaluation-only runs pinning `SS=1` for a
@@ -860,3 +954,75 @@ where the train says `0.962` and `1.200` — every record after `t = 48` short b
 Mutation-verified: with `restore_chz` writing `0.0` the arm fails at **99.8% relative
 disagreement** on `H`.
 The shape was right; only the origin was wrong.
+
+---
+
+## Parameter priors vs `$PRIOR NWPRI` (#254)
+
+`prior_theta_null.{ctl,ferx}` · `prior_theta_nwpri.{ctl,ferx}` ·
+`prior_theta_nwpri_centered.ctl` · test `the_prior_penalty_matches_nonmem_nwpri`
+(`tests/parameter_priors.rs`)
+
+Anchors the penalty ferx adds for an inline `prior(...)` against NONMEM's
+`$PRIOR NWPRI`, on the warfarin dataset.
+
+### The construction
+
+The two engines do not agree on a priored objective by construction — they
+disagree about parameterisation, about which normalisation constants the
+objective carries, and about the optimizer path. Three choices remove all three:
+
+- **Same coordinate.** Both sides write the model on the log scale
+  (`CL = EXP(THETA(1) + ETA(1))`), and the ferx θ is declared with a *negative*
+  lower bound so ferx packs it as the identity. Both engines then put a normal
+  prior on the same number with the same mean and SD, and nothing rests on ferx's
+  packing conventions.
+- **Same point.** `MAXEVAL=0` / `maxiter = 0`. The quantity under test is the
+  objective, not a minimizer's path to it.
+- **A null control, run first.** Same model, no prior, both engines. If that
+  disagreed, an agreeing prior term would only mean two compensating errors.
+
+A third NONMEM run puts the prior mean *exactly on* `THETA(1)`. It reproduces the
+null objective, which establishes that NWPRI — like ferx — omits the prior's
+normalisation constant. That is what lets the absolute values be compared rather
+than only their difference.
+
+### Measured
+
+| | NONMEM 7.5.1 | ferx |
+|---|---|---|
+| null (no prior) | 177.82632978040530 | 177.826330 |
+| prior centred on θ | 177.826 (== null) | — |
+| prior offset from θ | 177.94393305151641 | 177.943933 |
+| **prior contribution** | **0.11760327111** | **0.117603** |
+
+Worst realised disagreement **5.2e-8** (priored objective) and 2.2e-7 (null) —
+both at the limit of the six decimals ferx's fit YAML prints, not a real gap. The
+closed form is `((-2.0 + 1.89712) / 0.30)² = 0.117603266`, which both engines
+reproduce, so the arm pins ferx against NONMEM *and* against arithmetic. The test
+bound is 1e-6: two orders above the realised error, and far below the 1e-3 that
+would let a dropped constant or a factor-of-two scale error through.
+
+### Two NWPRI traps worth recording
+
+- `NTHETA` / `NETA` must match the **estimation problem's** counts, not the
+  number of parameters you actually want to prior. `NTHETA=1` on a three-θ model
+  fails with `NOT ENOUGH INITIAL THETAS DEFINED FOR COMPUTATIONS: CHECK PRIORS`.
+  The two θ not under test are given prior means equal to their own values (zero
+  quadratic contribution) and a flat variance, so they cancel between the paired
+  runs.
+- `$THETAPV` must use the `BLOCK(n) FIX` form. Per-element `FIX` is rejected with
+  `INPUTS SPECIFIED TO ROUTINE NWPRI ARE INAPPROPRIATE`, a message that names
+  neither the offending record nor the reason.
+
+### What this arm does *not* cover
+
+The Ω prior. ferx puts a lognormal prior on the **variance** (a normal on
+`½·ln(variance)`, its packed coordinate); NWPRI's Ω prior is an inverse-Wishart.
+They are genuinely different priors, so there is no NONMEM run to difference
+against — the Ω scale is pinned instead by the Tier-1 closed forms in
+`src/estimation/priors_tests.rs`, including the variance-vs-`(sd)` differential
+pair whose penalties must differ by exactly 4×. Anchoring Ω would need the
+`$OMEGA 1 FIX` + `EXP(THETA(k))·ETA(1)` reparameterisation, which rests on FOCE's
+marginal being invariant under a linear rescaling of η; that is a separate null
+control and is not yet run.

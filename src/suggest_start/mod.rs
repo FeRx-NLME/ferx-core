@@ -258,7 +258,7 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     }
 
     // For EBE sweeps, only include lognormal-parameterised thetas
-    // (mu_ref.log_transformed = true, i.e. THETA * exp(ETA) form).
+    // (mu_ref.log_transformed() = true, i.e. THETA * exp(ETA) form).
     // Logit thetas are excluded from the EBE sweep: the eta can compensate
     // for a wrong TV on the logit scale, creating spurious rRMSE minima.
     // Covariate thetas (no mu_ref at all) are also excluded.
@@ -270,13 +270,13 @@ fn nca_with_ebe(model: &CompiledModel, population: &Population) -> SuggestedStar
     let lognormal_theta_names: std::collections::HashSet<&str> = model
         .mu_refs
         .values()
-        .filter(|mr| mr.log_transformed)
+        .filter(|mr| mr.log_transformed())
         .map(|mr| mr.theta_name.as_str())
         .collect();
     let logit_theta_names: std::collections::HashSet<&str> = model
         .mu_refs
         .values()
-        .filter(|mr| !mr.log_transformed)
+        .filter(|mr| !mr.log_transformed())
         .map(|mr| mr.theta_name.as_str())
         .collect();
 
@@ -367,10 +367,16 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         return (empty_pop_nca(), warnings);
     }
 
-    // ODE models: pk_indices are sequential (slot i = position i), not semantic.
-    // NCA can't reliably map estimates to the user's parameter names (which could
-    // be KE, EMAX, or anything else — not necessarily CL/V).  Fall back to model
-    // defaults and let the nca_sweep method sweep them via rRMSE.
+    // ODE models: `pk_indices` does route a canonical name (CL, V, KA, …) to its PK
+    // slot (`ode_param_slots`), but that is a naming convention, not a structural
+    // guarantee — the `[odes]` RHS decides what a parameter means, so an ODE `CL`
+    // need not be the clearance NCA estimates. Every other name (KE, EMAX, …) takes
+    // the lowest free slot, often a canonical index the model left unused (declare
+    // `V, KA, KE` and KE lands in slot 0 = `PK_IDX_CL`), so a slot lookup such as
+    // `find_theta_for_slot` would take it for that PK parameter; and `pk_model` is
+    // only a placeholder. NCA can't reliably map its estimates onto the user's
+    // parameters, so fall back to model defaults and let the nca_sweep method
+    // sweep them via rRMSE.
     if model.ode_spec.is_some() {
         warnings.push(
             "inits_from_nca: ODE model detected; NCA estimation skipped (parameter names are user-defined). Use the nca_sweep method for rRMSE-based sweep.".into(),

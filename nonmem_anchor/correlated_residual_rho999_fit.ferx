@@ -1,0 +1,31 @@
+# #1307. The ferx twin of `correlated_residual_rho999.ctl` — see that file for
+# why the block is balanced and why every parameter is FIX.
+#
+# The block_sigma lower triangle is variance-scale, like NONMEM's
+# `$SIGMA BLOCK(2)`: Var(PROP), Cov(PROP, ADD), Var(ADD). Cov = -0.008991 =
+# -0.999 * 0.03 * 0.3, i.e. rho = -0.999 — past ferx's Fisher-z estimation rail
+# of -tanh(3) = -0.995055, which `pack_rho` used to apply to a FIXed correlation
+# as well as to a free one. The sibling anchor
+# `correlated_residual_combined.ctl` declares rho = 0.5 and cannot see that.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+
+  omega ETA_CL ~ 0.04 FIX
+
+  block_sigma (PROP_ERR, ADD_ERR) = [0.0009, -0.008991, 0.09] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+
+[fit_options]
+  method = foce
+  maxiter = 0

@@ -192,6 +192,8 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "warfarin".into(),
         pk_model: PkModel::OneCptOral,
@@ -233,6 +235,7 @@ fn build_warfarin_model() -> CompiledModel {
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
@@ -332,6 +335,8 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
@@ -372,6 +377,7 @@ fn generate_two_cpt_iv() {
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
@@ -467,6 +473,8 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
@@ -507,6 +515,7 @@ fn generate_two_cpt_oral_cov() {
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
@@ -678,6 +687,8 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "mm_oral".into(),
         pk_model: PkModel::OneCptOral,
@@ -715,6 +726,7 @@ fn generate_mm_oral() {
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),

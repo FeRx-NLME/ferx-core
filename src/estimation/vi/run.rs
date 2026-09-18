@@ -4,7 +4,8 @@
 //!
 //! 1. Evaluate `−ELBO` and its gradients ([`population_neg_elbo`]).
 //! 2. Adam-step the packed population vector `x` and every subject's `φᵢ`, then
-//!    project `x` back into the declared parameter box ([`compute_bounds`]).
+//!    project `x` back into the declared parameter box
+//!    ([`compute_bounds`](crate::estimation::parameterization::compute_bounds)).
 //! 3. Replace `Ω` with its closed-form maximizer (unless `vi_omega_update = adam`).
 //! 4. Once inside the averaging window, fold `x` and `{φᵢ}` into a Polyak mean.
 //!
@@ -34,7 +35,7 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::nn_reg::NnRegularizer;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params,
+    clamp_to_bounds, compute_mu_k, pack_params, pack_with_bounds, unpack_params, PackedStart,
 };
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
@@ -202,9 +203,10 @@ fn fold_nn_penalty(reg: &NnRegularizer, x: &[f64], grad_x: &mut [f64], scratch: 
 /// zero-tolerance statement of it: an `x` that cannot move must never *contribute* evidence
 /// of convergence, whatever `φ` happens to be doing on a given window.
 fn param_criterion_applies(template: &ModelParameters) -> bool {
-    let fixed = crate::estimation::parameterization::packed_fixed_mask(template);
-    let structural = crate::estimation::parameterization::omega_structural_zero_mask(template);
-    fixed.iter().zip(structural.iter()).any(|(&f, &z)| !f && !z)
+    // `packed_fixed_mask` holds FIX coordinates and structural-zero Ω entries (#1018).
+    crate::estimation::parameterization::packed_fixed_mask(template)
+        .iter()
+        .any(|&held| !held)
 }
 
 /// Scale factor turning the median absolute deviation into a consistent estimator of
@@ -580,7 +582,15 @@ pub fn run_vi(
     // nothing about the box NLopt is handed for FOCE/FOCEI, and unlike SAEM's
     // M-step VI has no optimizer to hand it to — so `θ (1.0, 0.1, 10.0)` is
     // enforced by projecting `x` after each step, or it is not enforced at all.
-    let bounds = compute_bounds(init_params);
+    //
+    // Packed here too (#1252): the box cannot be built without the packed start
+    // anyway, so `packed_init` is carried down to where `x` is initialised
+    // rather than re-walked there.
+    let PackedStart {
+        packed: packed_init,
+        bounds,
+        ..
+    } = pack_with_bounds(init_params);
 
     // Occasions per subject, from the data. Fixed for the run, so compute once: this is
     // what sets each subject's stacked dimension and the pooled `Ω_iov` denominator.
@@ -598,7 +608,7 @@ pub fn run_vi(
     // randomization, so the fit is reproducible by default. The initial estimates
     // are projected too, so `x` is inside the box from the first evaluation
     // onwards rather than only after the first step.
-    let mut x = pack_params(init_params);
+    let mut x = packed_init;
     clamp_to_bounds(&mut x, &bounds);
     // Each subject's `q` starts at *its own* prior: the block-diagonal
     // `Σ_b = Ω ⊕ Ω_iov^{⊗K_i}`, which is `Ω` itself without IOV. Starting at the prior
@@ -1144,6 +1154,7 @@ pub fn run_vi(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = cov_out;
     warnings.extend(cov_warnings);
 
@@ -1185,6 +1196,24 @@ pub fn run_vi(
         superseded_by: None,
     };
 
+    // #1303. Gated like every other estimator, *except* under the default
+    // `vi_final_ofv = none`, where the `NaN` above is VI declaring that it
+    // published no objective rather than failing to reach one — see
+    // `publishes_no_objective`, which owns that exemption. Under
+    // `vi_final_ofv = laplace` the objective is a real `2·pop_nll` and a `NaN`
+    // there means the same thing it means everywhere else.
+    let objective_gate = if crate::estimation::outer_optimizer::publishes_no_objective(
+        crate::types::EstimationMethod::Vi,
+        options,
+    ) {
+        None
+    } else {
+        crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, ofv)
+    };
+    if let Some(w) = objective_gate {
+        warnings.push(w);
+    }
+
     Ok(OuterResult {
         params: final_params,
         ofv,
@@ -1194,6 +1223,7 @@ pub fn run_vi(
         h_matrices,
         kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
@@ -1202,6 +1232,7 @@ pub fn run_vi(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        final_gradient_source: None,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,

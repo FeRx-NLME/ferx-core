@@ -80,22 +80,68 @@
 //! transform, a mixture branch — that is a hard error naming the explicit
 //! handle, not a guess.
 //!
+//! # The additive operator (#1313)
+//!
+//! A trailing `+` makes the relation a term added to the parameter instead of
+//! a factor on it — MFL's `COVARIATE(CL, WT, lin, +)`:
+//!
+//! ```text
+//! [covariate_model]
+//!   CL ~ WT linear(center = 70) +      # CL = TVCL * exp(ETA_CL) + θ*(WT - 70)
+//!   CL ~ WT power(center = 70)         # the default, `*`, may also be written
+//! ```
+//!
+//! The operator is the **last token of the line body**, before any `=>` θ
+//! clause, mirroring MFL, where it is the last argument. It is not written
+//! between the covariate and the form: `CL ~ WT + linear(...)` would invite
+//! `CL ~ WT + AGE`, the term-expression reading this block's syntax exists to
+//! avoid (see above).
+//!
+//! **The additive template is null at zero, and Pharmpy's is not.** Pharmpy
+//! reuses the multiplicative template under `+`, so its additive linear effect
+//! adds `1 + θ·(WT − median)`: a covariate at its centre adds `1` to the
+//! parameter. ferx drops that leading `1` — see [`CovariateOp`] for the full
+//! table and for what it costs in Pharmpy round-tripping.
+//!
+//! Placement is the mirror of the multiplicative rule rather than a second
+//! version of it: the multiplicative factors of a parameter go into its
+//! top-level product exactly as before, and the additive terms are appended
+//! after it, so `CL = TVCL * <factors> * exp(ETA_CL) + <terms>`. Both kinds on
+//! one parameter therefore land in one rewrite, and a multiplicative relation
+//! can never be multiplied into one addend of a sum this block itself created —
+//! the product is rebuilt from the original right-hand side, before any term is
+//! appended. An additive relation carries no top-level-product requirement at
+//! all (there is nothing to multiply into); when the right-hand side is not a
+//! plain product the appended sum parenthesises it, since `if (c) a else b + t`
+//! would otherwise bind the term inside the `else` arm.
+//!
+//! An additive term does make the typical value a sum, which the #619
+//! mu-reference detector does not match — so mu-referencing switches off for
+//! that parameter and SAEM falls back to the numerical M-step. That is the safe
+//! direction (the effect stays in the expression; #619 was the effect being
+//! *dropped*), and `model_parser` says so in a parse warning rather than
+//! leaving it to be discovered in a fit.
+//!
 //! # Missing covariate values
 //!
 //! A missing covariate is `NaN` in the covariate table, and division here
 //! underflows to `0.0` rather than `inf`, so an unguarded `(WT/70)^θ` on a
 //! missing row would yield a silent `0` instead of a loud `NaN`. Every
-//! generated factor is therefore wrapped in
-//! `if (present(COV)) <factor> else 1.0`, using the `present(...)` predicate
-//! the DSL grew for exactly this. The equivalent spelling `COV == COV` works
-//! too — `NaN` compares false against itself — but this text is what a user
-//! reads back out of `ferx check` and diffs against a NONMEM control stream,
-//! so it says what it means.
+//! generated effect is therefore wrapped in
+//! `if (present(COV)) <effect> else <neutral>`, using the `present(...)`
+//! predicate the DSL grew for exactly this. The equivalent spelling
+//! `COV == COV` works too — `NaN` compares false against itself — but this text
+//! is what a user reads back out of `ferx check` and diffs against a NONMEM
+//! control stream, so it says what it means.
+//!
+//! The neutral element is **per operator** — `1.0` for a factor, `0.0` for an
+//! added term ([`CovariateOp::neutral`]). Sharing one would give a subject with
+//! a missing covariate a silent `+1` on the parameter.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::types::{
-    CovariateDecl, CovariateForm, CovariateKind, CovariateLevels, CovariateModelSpec,
+    CovariateDecl, CovariateForm, CovariateKind, CovariateLevels, CovariateModelSpec, CovariateOp,
     CovariateRelation, CovariateStat, CovariateSummary, CovariateTheta,
 };
 
@@ -152,23 +198,43 @@ pub(crate) fn apply_covariate_model(
     }
     parameters.extend(generated_thetas.iter().cloned());
 
-    // Group the factors by parameter so one rewrite pass handles every relation
-    // on a given parameter, in declaration order.
-    let mut factors: Vec<(String, Vec<String>)> = Vec::new();
+    // Group the effects by parameter so one rewrite pass handles every relation
+    // on a given parameter, in declaration order, keeping the multiplicative
+    // and additive ones apart: the product is rebuilt from the original
+    // right-hand side and the terms are appended after it, so a factor can
+    // never end up inside one addend of a sum this block created.
+    let mut effects: Vec<ParameterEffects> = Vec::new();
     for rel in &relations {
-        let Some(factor) = relation_factor(rel) else {
+        let Some(text) = relation_effect(rel) else {
             continue;
         };
-        match factors.iter_mut().find(|(p, _)| *p == rel.parameter) {
-            Some((_, fs)) => fs.push(factor),
-            None => factors.push((rel.parameter.clone(), vec![factor])),
+        let entry = match effects.iter_mut().find(|e| e.parameter == rel.parameter) {
+            Some(e) => e,
+            None => {
+                effects.push(ParameterEffects {
+                    parameter: rel.parameter.clone(),
+                    factors: Vec::new(),
+                    terms: Vec::new(),
+                });
+                effects.last_mut().expect("just pushed")
+            }
+        };
+        match rel.op {
+            CovariateOp::Multiply => entry.factors.push(text),
+            CovariateOp::Add => entry.terms.push(text),
         }
     }
     // Classify factors against the η/κ names *plus* every intermediate that
     // reads one, so a factor is not mistaken for η-free (see below).
     let random_bearing = random_bearing_names(individual_parameters, ctx.eta_kappa_names);
-    for (param, fs) in &factors {
-        insert_factors(individual_parameters, param, fs, &random_bearing)?;
+    for e in &effects {
+        insert_effects(
+            individual_parameters,
+            &e.parameter,
+            &e.factors,
+            &e.terms,
+            &random_bearing,
+        )?;
     }
 
     Ok(CovariateModelSpec {
@@ -179,6 +245,15 @@ pub(crate) fn apply_covariate_model(
         generated_thetas,
         relations,
     })
+}
+
+/// The generated text of every relation on one `[individual_parameters]`
+/// name, split by operator — the multiplicative factors in declaration order
+/// and the additive terms in declaration order.
+struct ParameterEffects {
+    parameter: String,
+    factors: Vec<String>,
+    terms: Vec<String>,
 }
 
 // ── Relation parsing ───────────────────────────────────────────────────────
@@ -226,7 +301,7 @@ fn parse_relations(
     Ok(out)
 }
 
-/// `PARAM ~ COV form(kwargs) [=> THETA(init, lower, upper)[, ...]]`
+/// `PARAM ~ COV form(kwargs) [*|+] [=> THETA(init, lower, upper)[, ...]]`
 fn parse_relation_line(
     line: &str,
     ctx: &CovariateModelContext<'_>,
@@ -236,6 +311,7 @@ fn parse_relation_line(
         Some((b, t)) => (b.trim(), Some(t.trim())),
         None => (line, None),
     };
+    let (body, op) = split_trailing_op(body, line)?;
     let Some((param, rest)) = body.split_once('~') else {
         return Err(format!(
             "[covariate_model]: expected `PARAM ~ COV form(...)`, got `{line}`"
@@ -261,8 +337,8 @@ fn parse_relation_line(
     };
     if form_src.is_empty() {
         return Err(format!(
-            "[covariate_model]: `{param} ~ {covariate}` states no form — expected one of \
-             none, linear, linear_relative, exponential, power, hockey, categorical, expr"
+            "[covariate_model]: `{param} ~ {covariate}` states no form — expected one of {}",
+            form_list()
         ));
     }
     let decl = ctx
@@ -305,6 +381,7 @@ fn parse_relation_line(
         parameter: param.to_string(),
         covariate: covariate.to_string(),
         form,
+        op,
         center,
         resolved_center,
         fix,
@@ -318,6 +395,35 @@ fn parse_relation_line(
     };
     rel.thetas = build_thetas(&rel, decl, summary, explicit.as_deref())?;
     Ok(rel)
+}
+
+/// Split the trailing `*` / `+` operator token off the line body (#1313).
+///
+/// The operator is the **last** token of the body, after the form and before
+/// any `=>` clause (which the caller has already removed) — the position MFL
+/// puts it in, `COVARIATE(CL, WT, lin, +)`. Nothing else a relation line can
+/// end with is a bare `+` or `*`: every form ends in an identifier or a `)`,
+/// and `expr("WT*2")` keeps its operators inside the quotes.
+///
+/// `*` is the default and may be written explicitly, so a generated file can
+/// state the combination on every line rather than only on the additive ones.
+fn split_trailing_op<'a>(body: &'a str, line: &str) -> Result<(&'a str, CovariateOp), String> {
+    let body = body.trim();
+    let (rest, op) = match body.chars().next_back() {
+        Some('+') => (&body[..body.len() - 1], CovariateOp::Add),
+        Some('*') => (&body[..body.len() - 1], CovariateOp::Multiply),
+        _ => return Ok((body, CovariateOp::Multiply)),
+    };
+    let rest = rest.trim();
+    if rest.is_empty() || rest.ends_with('~') {
+        return Err(format!(
+            "[covariate_model]: `{line}` states the `{}` operator but no form — expected \
+             `PARAM ~ COV form(...) {}`",
+            op.label(),
+            op.label()
+        ));
+    }
+    Ok((rest, op))
 }
 
 /// Reject a centring constant the relation's own algebra cannot use.
@@ -381,6 +487,7 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
         "power" => CovariateForm::Power,
         "hockey" => CovariateForm::Hockey,
         "categorical" => CovariateForm::Categorical,
+        "categorical2" => CovariateForm::Categorical2,
         "expr" => {
             let text = body
                 .trim()
@@ -398,9 +505,9 @@ fn parse_form(src: &str) -> Result<(CovariateForm, HashMap<String, CovariateStat
         }
         other => {
             return Err(format!(
-                "[covariate_model]: unknown form `{other}`{} — expected one of none, linear, \
-                 linear_relative, exponential, power, hockey, categorical, expr",
-                did_you_mean(other)
+                "[covariate_model]: unknown form `{other}`{} — expected one of {}",
+                did_you_mean(other),
+                form_list()
             ))
         }
     };
@@ -476,7 +583,7 @@ fn center_argument(
             return Ok(None);
         }
         CovariateForm::Hockey => ("breakpoint", CovariateStat::Median),
-        CovariateForm::Categorical => ("ref", CovariateStat::Mode),
+        CovariateForm::Categorical | CovariateForm::Categorical2 => ("ref", CovariateStat::Mode),
         _ => ("center", CovariateStat::Median),
     };
     for key in ["center", "breakpoint", "ref"] {
@@ -500,8 +607,8 @@ fn check_kind(form: &CovariateForm, decl: &CovariateDecl) -> Result<(), String> 
     }
     match (form.is_categorical(), decl.kind) {
         (true, CovariateKind::Continuous) => Err(format!(
-            "[covariate_model]: `categorical(...)` on `{}`, which [covariates] declares \
-             continuous",
+            "[covariate_model]: `{}(...)` on `{}`, which [covariates] declares continuous",
+            form.label(),
             decl.name
         )),
         (false, CovariateKind::Categorical) => Err(format!(
@@ -602,12 +709,13 @@ fn build_thetas(
         // can never help.
         let levels = levels_of(decl, summary).unwrap_or_default();
         return Err(format!(
-            "[covariate_model]: `{} ~ {} categorical(...)` has nothing to estimate — `{}` has \
+            "[covariate_model]: `{} ~ {} {}(...)` has nothing to estimate — `{}` has \
              {} level{} ({}), and a categorical relation spends one θ per *non-reference* level. \
              Declare the levels the data actually carries (`{} categorical(levels = [...])` in \
              [covariates]), or drop the relation.",
             rel.parameter,
             rel.covariate,
+            rel.form.label(),
             decl.name,
             levels.len(),
             if levels.len() == 1 { "" } else { "s" },
@@ -656,17 +764,27 @@ fn build_thetas(
         return Ok(Vec::new());
     };
     let mut out = match rel.form {
-        CovariateForm::Categorical => {
+        CovariateForm::Categorical | CovariateForm::Categorical2 => {
             let base = format!("THETA_{}_{}", rel.parameter, rel.covariate);
+            // The two shapes differ by `θ_cat2 = 1 + θ_cat`, so `categorical2`
+            // takes the *image* of `categorical`'s defaults under exactly that
+            // map: bounds (−1, 5) → (0, 6) — which is what Pharmpy's `cat2`
+            // uses verbatim — and init −0.001 → 0.999, so the two forms start
+            // at the identical model. (Pharmpy's own `cat2` init is 1.01; ferx
+            // already differs on the `cat` init's sign, following PsN.)
+            let (init, lower, upper) = match rel.form {
+                CovariateForm::Categorical2 => (0.999, 0.0, 6.0),
+                // PsN's categorical θ is null at 0 and bounded symmetrically
+                // about it, so the parameterization has no preferred sign.
+                _ => (-0.001, -1.0, 5.0),
+            };
             non_reference_levels(rel, decl, summary)?
                 .into_iter()
                 .map(|level| CovariateTheta {
-                    // PsN's categorical θ is null at 0 and bounded symmetrically
-                    // about it, so the parameterization has no preferred sign.
                     name: format!("{base}_{}", level_suffix(level)),
-                    init: -0.001,
-                    lower: -1.0,
-                    upper: 5.0,
+                    init,
+                    lower,
+                    upper,
                     fixed: false,
                     level: Some(level),
                 })
@@ -791,17 +909,21 @@ fn expected_theta_count(
     Ok(match rel.form {
         CovariateForm::None | CovariateForm::Expr(_) => 0,
         CovariateForm::Hockey => 2,
-        CovariateForm::Categorical => match levels_of(decl, summary) {
-            Some(levels) => levels.len().saturating_sub(1),
-            None => {
-                return Err(format!(
-                    "[covariate_model]: `categorical(...)` on `{}` needs its levels, but \
-                     [covariates] declares none. Write `{} categorical(levels = [0, 1])` for a \
-                     θ vector fixed by the file, or `levels = auto` to read them off the data.",
-                    decl.name, decl.name
-                ))
+        CovariateForm::Categorical | CovariateForm::Categorical2 => {
+            match levels_of(decl, summary) {
+                Some(levels) => levels.len().saturating_sub(1),
+                None => {
+                    return Err(format!(
+                        "[covariate_model]: `{}(...)` on `{}` needs its levels, but [covariates] \
+                         declares none. Write `{} categorical(levels = [0, 1])` for a θ vector \
+                         fixed by the file, or `levels = auto` to read them off the data.",
+                        rel.form.label(),
+                        decl.name,
+                        decl.name
+                    ))
+                }
             }
-        },
+        }
         _ => 1,
     })
 }
@@ -870,56 +992,110 @@ fn theta_declaration(theta: &CovariateTheta) -> String {
 
 // ── Factor generation ──────────────────────────────────────────────────────
 
-/// The multiplicative factor a relation contributes, already guarded against a
-/// missing covariate value. `None` for `none` and for a relation still waiting
-/// on data.
-fn relation_factor(rel: &CovariateRelation) -> Option<String> {
+/// The effect text a relation contributes — a multiplicative factor under `*`,
+/// an added term under `+` — already guarded against a missing covariate
+/// value. `None` for `none` and for a relation still waiting on data.
+///
+/// The two operators share the *shape* of each form and differ in its null:
+/// the multiplicative template is `1 + …` (or `exp(…)` / `(…)^θ`), whose
+/// neutral value is `1`, and the additive one is the same expression minus that
+/// `1`, so a covariate at its centre contributes `0` and so does a θ at the
+/// *form's* null — `0` everywhere except `categorical2`, whose θ is the factor
+/// itself and whose null is `1` (#1312), hence its `θ_k - 1`. This is
+/// where ferx parts company with Pharmpy, which reuses the multiplicative
+/// template verbatim under `+` — see [`CovariateOp`].
+fn relation_effect(rel: &CovariateRelation) -> Option<String> {
     let cov = &rel.covariate;
+    let add = rel.op == CovariateOp::Add;
     let inner = match &rel.form {
         CovariateForm::None => return None,
+        // `expr(...)` is verbatim by definition: the operator says how the
+        // modeller's own expression combines, and does not rewrite it.
         CovariateForm::Expr(text) => format!("({text})"),
         _ if rel.needs_data() => return None,
         CovariateForm::Linear => {
             let c = fmt(rel.resolved_center?);
-            format!("(1 + {} * ({cov} - {c}))", rel.thetas[0].name)
+            let theta = &rel.thetas[0].name;
+            if add {
+                format!("({theta} * ({cov} - {c}))")
+            } else {
+                format!("(1 + {theta} * ({cov} - {c}))")
+            }
         }
         CovariateForm::LinearRelative => {
             let c = fmt(rel.resolved_center?);
-            format!("(1 + {} * ({cov} / {c} - 1))", rel.thetas[0].name)
+            let theta = &rel.thetas[0].name;
+            if add {
+                format!("({theta} * ({cov} / {c} - 1))")
+            } else {
+                format!("(1 + {theta} * ({cov} / {c} - 1))")
+            }
         }
         CovariateForm::Exponential => {
             let c = fmt(rel.resolved_center?);
-            format!("exp({} * ({cov} - {c}))", rel.thetas[0].name)
+            let theta = &rel.thetas[0].name;
+            if add {
+                format!("(exp({theta} * ({cov} - {c})) - 1)")
+            } else {
+                format!("exp({theta} * ({cov} - {c}))")
+            }
         }
         CovariateForm::Power => {
             let c = fmt(rel.resolved_center?);
-            format!("({cov} / {c})^{}", rel.thetas[0].name)
+            let theta = &rel.thetas[0].name;
+            if add {
+                format!("(({cov} / {c})^{theta} - 1)")
+            } else {
+                format!("({cov} / {c})^{theta}")
+            }
         }
         CovariateForm::Hockey => {
             let b = fmt(rel.resolved_center?);
-            format!(
-                "(if ({cov} <= {b}) 1 + {} * ({cov} - {b}) else 1 + {} * ({cov} - {b}))",
-                rel.thetas[0].name, rel.thetas[1].name
-            )
+            let (lo, hi) = (&rel.thetas[0].name, &rel.thetas[1].name);
+            if add {
+                format!("(if ({cov} <= {b}) {lo} * ({cov} - {b}) else {hi} * ({cov} - {b}))")
+            } else {
+                format!(
+                    "(if ({cov} <= {b}) 1 + {lo} * ({cov} - {b}) else 1 + {hi} * ({cov} - {b}))"
+                )
+            }
         }
-        CovariateForm::Categorical => {
+        CovariateForm::Categorical | CovariateForm::Categorical2 => {
+            // `categorical` reads its θ as an offset from the reference
+            // (`1 + θ_k`), `categorical2` as the factor itself (`θ_k`). Only
+            // the non-reference branch differs.
+            let offset = matches!(rel.form, CovariateForm::Categorical);
             let mut expr = String::from("(");
             for theta in &rel.thetas {
-                expr.push_str(&format!(
-                    "if ({cov} == {}) 1 + {} else ",
-                    fmt(theta.level?),
-                    theta.name
-                ));
+                // Null-subtraction under `+` is the same one every other
+                // additive template applies, and it is per *form*, not shared:
+                // `categorical`'s multiplicative branch is `1 + θ_k`, so its
+                // additive one is `θ_k`; `categorical2`'s is `θ_k` against a
+                // reference of `1`, so its additive one is `θ_k - 1`. That
+                // keeps `θ_cat2 = 1 + θ_cat` an exact reparameterization under
+                // `+` too — and keeps `cat +` and `cat2 +` from being the same
+                // text, which would make them duplicate search candidates.
+                let body = match (add, offset) {
+                    (false, true) => format!("1 + {}", theta.name),
+                    (false, false) | (true, true) => theta.name.clone(),
+                    (true, false) => format!("{} - 1", theta.name),
+                };
+                expr.push_str(&format!("if ({cov} == {}) {body} else ", fmt(theta.level?)));
             }
-            // The reference level, and anything not listed, contributes 1.
-            expr.push_str("1)");
+            // The reference level, and anything not listed, is the null.
+            expr.push_str(if add { "0)" } else { "1)" });
             expr
         }
     };
     // A missing covariate takes the neutral branch — without this the relation
     // would silently contribute `0` (division by a missing value underflows to
-    // zero here, it does not blow up).
-    Some(format!("(if (present({cov})) {inner} else 1.0)"))
+    // zero here, it does not blow up). The neutral element is the operator's,
+    // not a shared `1.0`: a missing covariate on an additive relation must
+    // contribute nothing, and `+ 1.0` is not nothing.
+    Some(format!(
+        "(if (present({cov})) {inner} else {:.1})",
+        rel.op.neutral()
+    ))
 }
 
 /// `eta_kappa`, plus every top-level `[individual_parameters]` variable whose
@@ -965,12 +1141,20 @@ fn random_bearing_names(lines: &[String], eta_kappa: &HashSet<String>) -> HashSe
     set
 }
 
-/// Multiply `factors` into `param`'s right-hand side, immediately before the
-/// first η/κ-bearing top-level factor.
-fn insert_factors(
+/// Rewrite `param`'s right-hand side with the relations on it: `factors`
+/// multiplied in immediately before the first η/κ-bearing top-level factor,
+/// then `terms` appended as a sum.
+///
+/// The order is the point. The product is rebuilt from the **original**
+/// right-hand side, so the top-level-product requirement is asked of the model
+/// the user wrote, not of the sum this function is about to create — and a
+/// multiplicative relation can never be multiplied into one addend of an
+/// additive relation declared before it, whatever order the block lines are in.
+fn insert_effects(
     lines: &mut [String],
     param: &str,
     factors: &[String],
+    terms: &[String],
     eta_kappa: &HashSet<String>,
 ) -> Result<(), String> {
     let idx = assignment_line(lines, param).ok_or_else(|| {
@@ -982,6 +1166,44 @@ fn insert_factors(
         .expect("assignment_line matched an `=`");
     let rhs = rhs.trim();
 
+    let mut rebuilt_rhs = if factors.is_empty() {
+        rhs.to_string()
+    } else {
+        multiply_in(param, rhs, factors, eta_kappa)?
+    };
+    if !terms.is_empty() {
+        // `if (c) a else b + t` puts the term inside the `else` arm, and
+        // `a + b * f` is not `(a + b) * f`: anything that is not already a
+        // plain top-level product has to be parenthesised before a term is
+        // appended to it. A product needs no parentheses, and not adding them
+        // keeps the generated line diffable against the hand-written one.
+        if !is_plain_product(&rebuilt_rhs) {
+            rebuilt_rhs = format!("({rebuilt_rhs})");
+        }
+        rebuilt_rhs.push_str(" + ");
+        rebuilt_rhs.push_str(&terms.join(" + "));
+    }
+    lines[idx] = format!("{lhs}= {rebuilt_rhs}");
+    Ok(())
+}
+
+/// Whether `rhs` is a top-level product of plain multiplicative terms — the
+/// shape a factor can be inserted into, and the shape a term can be appended
+/// to without parentheses.
+fn is_plain_product(rhs: &str) -> bool {
+    split_top_level(rhs, '*')
+        .iter()
+        .all(|p| is_simple_factor(p))
+}
+
+/// `factors` multiplied into `rhs` immediately before its first η/κ-bearing
+/// top-level factor (or at the end when it has none).
+fn multiply_in(
+    param: &str,
+    rhs: &str,
+    factors: &[String],
+    eta_kappa: &HashSet<String>,
+) -> Result<String, String> {
     let parts = split_top_level(rhs, '*');
     // *Every* factor has to be a plain multiplicative term, not just the whole
     // RHS when it happens to carry no top-level `*`. Checking only the latter
@@ -1006,8 +1228,7 @@ fn insert_factors(
     for (offset, factor) in factors.iter().enumerate() {
         rebuilt.insert(first_random + offset, factor.clone());
     }
-    lines[idx] = format!("{}= {}", lhs, rebuilt.join(" * "));
-    Ok(())
+    Ok(rebuilt.join(" * "))
 }
 
 fn non_product_error(param: &str, rhs: &str) -> String {
@@ -1016,6 +1237,9 @@ fn non_product_error(param: &str, rhs: &str) -> String {
          right-hand side is not a top-level product, so multiplying into it would change what \
          the expression means (and, for a sum or a transform, would move the effect out of the \
          non-η group the SAEM mu-reference detector reads, #619).\n\
+         An additive relation (a trailing `+`) has no such requirement — it is appended to the \
+         right-hand side rather than multiplied into it — so this applies to a multiplicative \
+         relation only.\n\
          Wire the factor by hand instead:\n\
          \x20 [individual_parameters]\n\
          \x20   {param} = ... * COV_{param} * ...   # COV_{param} = the factor, placed where you \
@@ -1208,18 +1432,8 @@ fn join_names(names: &[String]) -> String {
 
 /// A one-edit-away suggestion for a misspelled form name.
 fn did_you_mean(word: &str) -> String {
-    const FORMS: &[&str] = &[
-        "none",
-        "linear",
-        "linear_relative",
-        "exponential",
-        "power",
-        "hockey",
-        "categorical",
-        "expr",
-    ];
     let lower = word.to_lowercase();
-    match FORMS
+    match FORM_SPELLINGS
         .iter()
         .filter(|f| levenshtein(&lower, f) <= 2)
         .min_by_key(|f| levenshtein(&lower, f))
@@ -1227,6 +1441,32 @@ fn did_you_mean(word: &str) -> String {
         Some(best) => format!(" (did you mean `{best}`?)"),
         None => String::new(),
     }
+}
+
+/// Every form the block accepts, in the order the diagnostics list them.
+///
+/// The two "expected one of …" messages and [`did_you_mean`] all read this one
+/// array. They used to carry their own copies, and #1312 added `categorical2`
+/// to two of the three — the missing-form diagnostic kept listing eight forms
+/// and quietly hid the new one from anyone who left the form off. A single list
+/// removes that failure mode rather than fixing one instance of it;
+/// `every_form_the_parser_accepts_is_offered_by_both_diagnostics` pins that it
+/// stays complete.
+const FORM_SPELLINGS: &[&str] = &[
+    "none",
+    "linear",
+    "linear_relative",
+    "exponential",
+    "power",
+    "hockey",
+    "categorical",
+    "categorical2",
+    "expr",
+];
+
+/// `FORM_SPELLINGS` as the diagnostics render it.
+fn form_list() -> String {
+    FORM_SPELLINGS.join(", ")
 }
 
 /// Levenshtein distance, for the did-you-mean above only.

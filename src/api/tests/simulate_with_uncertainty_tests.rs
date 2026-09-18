@@ -30,6 +30,8 @@ fn tiny_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "uncertainty_smoke".into(),
         pk_model: PkModel::OneCptIv,
@@ -59,6 +61,7 @@ fn tiny_model() -> CompiledModel {
         kappa_init_as_sd: Vec::new(),
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -394,6 +397,9 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
     let n_packed = crate::estimation::parameterization::packed_len(template);
     let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
     FitResult {
+        ofv_data: 0.0,
+        ofv_prior: 0.0,
+        prior_summary: Vec::new(),
         residual_correlation_fixed: Vec::new(),
         se_residual_correlations: None,
         covariate_relations: Vec::new(),
@@ -464,6 +470,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         covariance_status: CovarianceStatus::Computed,
+        covariance_method: Some(crate::types::CovarianceMethod::Hessian),
         shrinkage_eta: vec![],
         cond_dist: None,
         shrinkage_eps: f64::NAN,
@@ -492,6 +499,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sigma_init: template.sigma.values.clone(),
         obs_time_range: None,
         final_gradient: None,
+        final_gradient_source: None,
         optimizer: "bobyqa".to_string(),
         n_starts: 1,
         multi_start_seed: None,
@@ -1355,6 +1363,101 @@ fn omega_off_diagonal_lower_rail_is_a_runaway_not_a_collapse() {
         crate::types::classify_warning(&msg).severity,
         WarningSeverity::Critical
     );
+}
+
+/// #1328 (PR #1406 review): the fit-end guard walk does **not** read the
+/// `ModelParameters` a caller handed `fit()`. On every estimating path it reads
+/// what `unpack_params` rebuilt from the optimizer's packed best point, so for a
+/// block Ω the property that matters is a composition — `pack_with_bounds` →
+/// `clamp_to_bounds` → `unpack_params` → the guard walk must still see the rail.
+/// The two tests either side of this one each cover one end of it and neither
+/// crosses the middle: they build an `OmegaMatrix` and re-pack it in the same
+/// breath.
+///
+/// Measured, not assumed: replacing the off-diagonal arm of `unpack_params`'
+/// reconstruction with `0.0` leaves the whole of
+/// `tests/runaway_guard_demotes_convergence.rs` green, because the
+/// evaluation-only IMP stage that file uses to reach the fit-end check hands the
+/// inner loop its `stage_params` directly and never round-trips them. This test
+/// is the one that reddens on that mutation.
+///
+/// Both rails, because the verdict is not the side here (#1205).
+#[test]
+fn a_block_omega_off_diagonal_at_the_rail_survives_pack_clamp_unpack() {
+    use crate::estimation::parameterization::{
+        clamp_to_bounds, coordinate_kinds, pack_with_bounds, unpack_params, PackedCoordKind,
+        PackedStart,
+    };
+    use crate::types::OmegaMatrix;
+    use nalgebra::DMatrix;
+
+    for rail in [10.0_f64, -10.0_f64] {
+        let mut params = tiny_model().default_params;
+        params.sigma.values.fill(1.0);
+        params.sigma_fixed = vec![false; params.sigma.values.len()];
+
+        let mut chol = DMatrix::<f64>::identity(2, 2);
+        chol[(1, 0)] = rail;
+        params.omega = OmegaMatrix::from_chol_factor(
+            chol,
+            vec!["ETA_CL".into(), "ETA_V".into()],
+            false,
+            DMatrix::from_element(2, 2, true),
+        );
+        params.omega_fixed = vec![false; 2];
+
+        // Premise: the coordinate under test is the Ω off-diagonal, it packs to
+        // the literal rail, and the rail is a bound of its own box — otherwise
+        // the clamp below would be doing the work instead of the round trip.
+        let kinds = coordinate_kinds(&params);
+        let k = kinds
+            .iter()
+            .position(|k| *k == PackedCoordKind::OmegaOffDiagonal)
+            .expect("the fixture must contain an Ω off-diagonal coordinate");
+        let PackedStart {
+            mut packed, bounds, ..
+        } = pack_with_bounds(&params);
+        assert_eq!(packed[k], rail, "rail {rail}: the packed start is the rail");
+        assert_eq!(
+            if rail > 0.0 {
+                bounds.upper[k]
+            } else {
+                bounds.lower[k]
+            },
+            rail,
+            "rail {rail}: and the rail is that coordinate's own bound"
+        );
+
+        // The production sequence: the optimizer works on a clamped packed
+        // vector and `optimize_population` publishes `unpack_params` of it.
+        clamp_to_bounds(&mut packed, &bounds);
+        let round_tripped = unpack_params(&packed, &params);
+
+        // The mechanism, named: the reconstruction puts the rail back on the
+        // Cholesky element. `unpack_params` writing `0.0` there fails here.
+        assert_eq!(
+            round_tripped.omega.chol[(1, 0)],
+            rail,
+            "rail {rail}: the off-diagonal must survive pack → clamp → unpack"
+        );
+
+        // And the consequence the user sees.
+        let mut converged = true;
+        let (_msg, entry) = super::runaway_guard_warning(&mut converged, &round_tripped)
+            .unwrap_or_else(|| panic!("rail {rail}: the round-tripped point is still at the rail"));
+        assert!(
+            !converged,
+            "rail {rail}: a rail that survives the round trip must still demote"
+        );
+        let hit = &entry.details.as_ref().unwrap()["parameters"][0];
+        assert_eq!(hit["parameter"], "ETA_V~ETA_CL", "rail {rail}");
+        assert_eq!(hit["verdict"], "runaway", "rail {rail}");
+        assert_eq!(
+            hit["packed_estimate"].as_f64().unwrap(),
+            rail,
+            "rail {rail}"
+        );
+    }
 }
 
 #[test]

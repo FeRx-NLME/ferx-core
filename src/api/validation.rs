@@ -695,13 +695,282 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
 /// shape the model cannot have. Shared by `fit()` and `ferx check` so the two
 /// cannot disagree about which warnings a user sees.
 ///
-/// Currently one case: `W_NO_DOSES` on a compartment-free model (#811). The reader
-/// reads a dose-free dataset as a probable missing `AMT` column; for a model with
-/// no compartments that is its normal shape — every model-based meta-analysis
-/// dataset is dose-free — so the advice ("check that the dataset has an AMT
-/// column") is wrong rather than merely noisy.
-pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) -> bool {
+/// Two cases:
+///
+/// - `W_NO_DOSES` on a compartment-free model (#811). The reader reads a
+///   dose-free dataset as a probable missing `AMT` column; for a model with no
+///   compartments that is its normal shape — every model-based meta-analysis
+///   dataset is dose-free — so the advice ("check that the dataset has an AMT
+///   column") is wrong rather than merely noisy.
+/// - `W_CMT_DEFAULTED` on a model for which `CMT` addresses nothing (#1009). The
+///   reader reports how many rows it had to pick a compartment for; picking is
+///   only a *guess* when there was something to choose between. See
+///   [`cmt_defaulting_is_ambiguous`] for what counts.
+///
+/// `options` is read only by the `W_CMT_DEFAULTED` arm, and only for
+/// [`CmtConsumer::DataSelectionFilter`]: a `[data_selection]` clause comparing `CMT` is a
+/// consumer of the resolved compartment that lives on [`FitOptions`] rather than on
+/// the model (#1409). Callers pass the same options the read will use — the merged
+/// model-file + call options in `fit()`, `parsed.fit_options` in `ferx check`.
+pub(crate) fn reader_warning_suppressed(
+    model: &CompiledModel,
+    options: &FitOptions,
+    warning: &str,
+) -> bool {
+    if warning.starts_with("W_CMT_DEFAULTED") {
+        return !cmt_defaulting_is_ambiguous(model, options);
+    }
     model.is_algebraic() && warning.starts_with("W_NO_DOSES")
+}
+
+/// Whether this model reads a row's `CMT` for anything, so that a `CMT` the reader
+/// had to invent could change a number (#1009).
+///
+/// **Derived from an enumeration, not from a list of model classes.** Three
+/// consecutive review rounds on PR #1404 broke this predicate the same way — it was
+/// written as a list of the classes someone had thought of, and each round a
+/// reviewer found the one that was missing (the observation-side dispatchers, then
+/// `OdeSpec::readout` and the analytical dose channel, then `[data_selection]`).
+/// #1409 replaced the list with [`CmtConsumer`]: every channel that reads a row's
+/// `CMT` is a variant, each variant answers its own question off the engine's own
+/// routing table, and this is their OR. A new consumer is a compile error in
+/// [`CmtConsumer::is_live`] and a red test in `cmt_data_selection_scope.rs` until someone
+/// says which side of the question it falls on.
+///
+/// The state count behind [`CmtConsumer::DoseCompartment`] deliberately includes the
+/// injected joint-PK-TTE `__chz_*` accumulators along with the PK states. They are
+/// not dose targets, but they exist only when an `[event_model]` does, and an event
+/// model routes its rows *by CMT* — so a dataset with no `CMT` column keys every row
+/// to compartment 1 and starves the endpoint. Counting them cannot produce a false
+/// positive for that reason, and excluding them would produce a false negative.
+fn cmt_defaulting_is_ambiguous(model: &CompiledModel, options: &FitOptions) -> bool {
+    CmtConsumer::iter().any(|c| c.is_live(model, options))
+}
+
+/// Every channel that reads a row's `CMT`, so the compartment the reader had to
+/// invent could change a number (#1409).
+///
+/// This enum *is* the scope of `W_CMT_DEFAULTED`. Adding a channel means adding a
+/// variant, which is a compile error in [`Self::is_live`] and [`Self::next`] and a
+/// red `tests/cmt_data_selection_scope.rs` / `tests/cmt_endpoint_scope.rs` until it
+/// carries a fixture that measures the difference the channel makes. That is the step all three #1404 review rounds
+/// skipped, each time by widening a condition in place.
+///
+/// Each arm asks the **consumer's own** routing table rather than restating it, so a
+/// model class added to one of those tables cannot fall outside this predicate:
+/// `OdeSpec::n_states` / `PkTopology::channels` for the dose channel,
+/// `api::run::obs_routing_for` for the endpoint channel (the one place a routing set
+/// is derived from a model), and `SelectionFilter` for the filter channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmtConsumer {
+    /// Which compartment a **dose** row lands in — `[odes]` states, or an
+    /// analytical topology's `channels` (an oral model's `CMT=2` is a real
+    /// depot-bypassing central bolus, a 2-cpt model's `CMT=2` the peripheral).
+    DoseCompartment,
+    /// Which **scale** an observation uses — `[scaling] obs_scale[CMT=N]`.
+    ///
+    /// Parses on an analytical model, where the dose channel may be inert, and
+    /// `pk::validate_per_cmt_scaling` only checks that the *observed* CMTs have
+    /// entries — so a `CMT`-less dataset keys every row to 1, `{1} ⊆ {1, 2}`, and
+    /// validation passes. Measured on `pk one_cpt_iv` with `obs_scale[CMT=1] = 1000`
+    /// / `obs_scale[CMT=2] = 1`: the same data spelled `CMT=2` gives OFV **0.0357**,
+    /// with the column dropped **6097015712.1246**.
+    PerCmtScaling,
+    /// Which **error model** an observation uses — `CMT=N: DV ~ ...`.
+    PerCmtErrorModel,
+    /// Which **readout** an observation reads — `y[CMT=N]`, on either engine.
+    ///
+    /// Measured on a one-state `[odes]` model `d/dt(central) = -CL/V*central` with
+    /// `y[CMT=1] = central/V` and `y[CMT=2] = central/V*1000`: OFV **10028.0940**
+    /// with the column, **0.0357** without, and `ferx check` silent both ways before
+    /// #1404.
+    PerCmtReadout,
+    /// Which **endpoint** a row routes to — `[event_model] cmt`, or a binary /
+    /// categorical / CTMM endpoint's CMT.
+    EndpointRouting,
+    /// Which rows are **kept at all** — a `[data_selection]` clause comparing `CMT`.
+    DataSelectionFilter,
+}
+
+impl CmtConsumer {
+    /// The channel after this one, or `None` at the end of the chain.
+    ///
+    /// **This is the enumeration.** There is deliberately no second `ALL` array to
+    /// keep in step: a hand-written list is exactly the thing that goes stale, and it
+    /// did — the first version of this file carried `ALL: [CmtConsumer; 6]` next to an
+    /// exhaustive `index()`, and a 7th variant that satisfied every `match` while
+    /// being left out of the array passed all 22 tests in
+    /// `reader_warning_suppression_tests` while `cmt_defaulting_is_ambiguous` silently
+    /// never asked it (measured on the #1423 review's probe). The doc there claimed
+    /// that case was a red test. It was not.
+    ///
+    /// Written as a chain because the `match` is then **exhaustive over variants**, so
+    /// a new consumer cannot compile without someone deciding where in the order it
+    /// goes — and the arm they must edit to make it reachable (the previous tail's
+    /// `None`) is in the same `match`, three lines away, rather than in another item
+    /// that still compiles untouched.
+    ///
+    /// **What this does and does not guarantee**, stated exactly because the thing it
+    /// replaced overclaimed. Adding a variant is a compile error in three places
+    /// (`next`, [`Self::is_live`], and `only_live` in the unit tests), and that is the
+    /// forcing function. It is *not* a red test: an author who answers all three and
+    /// writes `NewVariant => None` without repointing the previous tail leaves it
+    /// unreachable from [`Self::iter`], and the suite stays green — verified by probe,
+    /// not assumed. Stable Rust cannot enumerate a type's variants without a derive
+    /// macro, so no test here can close that gap; the chain narrows it to a single
+    /// `match` where both arms are visible at once, instead of an array in another
+    /// item that compiles untouched.
+    fn next(self) -> Option<Self> {
+        match self {
+            CmtConsumer::DoseCompartment => Some(CmtConsumer::PerCmtScaling),
+            CmtConsumer::PerCmtScaling => Some(CmtConsumer::PerCmtErrorModel),
+            CmtConsumer::PerCmtErrorModel => Some(CmtConsumer::PerCmtReadout),
+            CmtConsumer::PerCmtReadout => Some(CmtConsumer::EndpointRouting),
+            CmtConsumer::EndpointRouting => Some(CmtConsumer::DataSelectionFilter),
+            CmtConsumer::DataSelectionFilter => None,
+        }
+    }
+
+    /// Every channel, in order, starting from the head of the chain.
+    pub(crate) fn iter() -> impl Iterator<Item = CmtConsumer> {
+        std::iter::successors(Some(CmtConsumer::DoseCompartment), |c| c.next())
+    }
+
+    /// Whether this channel actually reads `CMT` on this model + options.
+    ///
+    /// The arms are deliberately **disjoint in what they accept**, not
+    /// belt-and-braces: `PerCmtErrorModel` requires a non-empty map and
+    /// `EndpointRouting` covers the empty one, so each arm is the only reason some
+    /// model reports and deleting either reddens a test. Before #1409 the empty map
+    /// was the *only* thing that reported an endpoint model — an accident, and one a
+    /// `!m.is_empty()` gate in #1404 round 3 removed, silencing a measured endpoint
+    /// mis-routing (competing risks with endpoints at `cmt = 1` / `cmt = 2`, one
+    /// cell spelled `x`: the event moves from `cause_b` to `cause_a`, OFV 27.8497
+    /// against 28.3610, no diagnostic). It now rests on the routing sets themselves.
+    ///
+    /// `ErrorSpec::Selected` is correctly absent: it resolves its branch from the
+    /// covariate selector (`ErrorSpec::obs_keys` builds a synthetic index), never
+    /// from `obs_cmts`.
+    pub(crate) fn is_live(self, model: &CompiledModel, options: &FitOptions) -> bool {
+        let per_cmt = |r: &crate::ode::OdeReadout| matches!(r, crate::ode::OdeReadout::PerCmt(_));
+        match self {
+            CmtConsumer::DoseCompartment => addressable_dose_compartments(model) > 1,
+            CmtConsumer::PerCmtScaling => matches!(model.scaling, ScalingSpec::PerCmt(_)),
+            // Non-empty only. An empty map dispatches no error model at all; it is
+            // what the parser hands every endpoint-only model, and that model is
+            // reported by `EndpointRouting` below on its own merits.
+            CmtConsumer::PerCmtErrorModel => {
+                matches!(&model.error_spec, ErrorSpec::PerCmt(m) if !m.is_empty())
+            }
+            // Both readout structs. `OdeReadout::PerCmt` is dispatched on
+            // `subject.obs_cmts` from `OdeSpec::readout` for an `[odes]` model
+            // (`ode::predictions::read_observable`, and `sens::ode_provider` for the
+            // `Dual2` twin) and from `AnalyticReadout::readout` for an analytical
+            // one. #1404 round 2 inspected only the second.
+            CmtConsumer::PerCmtReadout => {
+                model.ode_spec.as_ref().is_some_and(|s| per_cmt(&s.readout))
+                    || model
+                        .analytic_readout
+                        .as_ref()
+                        .is_some_and(|ar| per_cmt(&ar.readout))
+            }
+            CmtConsumer::EndpointRouting => crate::api::run::model_routes_rows_by_cmt(model),
+            CmtConsumer::DataSelectionFilter => data_selection_reads_cmt(options),
+        }
+    }
+}
+
+/// Whether a `[data_selection]` clause compares the `CMT` column (#1409).
+///
+/// `resolve_row_cmt`'s own doc says it is shared by "the dose row, the observation
+/// row **and the `[data]` selection filter's `RowContext`**" — the filter is fed the
+/// *defaulted* value, so a clause naming `CMT` decides which rows are scored on a
+/// compartment the reader invented. Measured on `pk one_cpt_iv` with
+/// `[data_selection] ignore = CMT == 2`, one observation cell spelled `2` against
+/// `x` and nothing else changed: 3 records scored at −5.7650 against 4 at −5.2516,
+/// with `ferx check` reporting `ok — 0 warning(s)` both ways. The row the filter was
+/// told to drop is silently kept and scored. (Those are the realised numbers of
+/// `tests/cmt_data_selection_scope.rs`, printed by it on every run. #1409's own
+/// reprex reports −4.6162 / −6.9517 — the same defect on its own dataset, not this
+/// fixture; quoting those here described a measurement nothing in the tree makes.)
+///
+/// Asked of the compiled clauses rather than of the raw strings, so the answer
+/// tracks what the filter actually parses (`CMT`/`cmt` case-folding, `&&`-joined
+/// sub-expressions, the bare-identifier `IGNORE=C` shorthand) instead of a second
+/// spelling of it here. A clause that does not parse answers **true**: the read is
+/// about to fail on it anyway, so an extra warning can mask nothing, while `false`
+/// would silently narrow the predicate on an expression nobody has inspected.
+fn data_selection_reads_cmt(options: &FitOptions) -> bool {
+    match crate::io::datareader::SelectionFilter::from_opts(
+        &options.ignore_exprs,
+        &options.accept_exprs,
+        // `ignore_subjects` compares `Subject::id` and never reads a row's CMT.
+        &[],
+    ) {
+        Ok(filter) => filter.references_column("cmt"),
+        Err(_) => true,
+    }
+}
+
+/// How many compartments a *dose* row's `CMT` can route to on whichever engine
+/// serves this model.
+///
+/// Read off each engine's own routing table rather than restated, so a model class
+/// added to one of those tables cannot quietly fall outside this predicate:
+/// `OdeSpec::n_states` for an `[odes]` model, and
+/// `PkTopology::addressable_dose_compartments` — the live entries of the very table
+/// `dose_needs_event_walk` dispatches on — for an analytical `pk` model.
+///
+/// The analytical arm is **not** a formality. `ONE_CPT_ORAL` is
+/// `channels: [Some(Depot), Some(Central)]`, so `CMT=2` on an oral model is the
+/// documented depot-bypass central bolus (#350), and `TWO_CPT_IV` routes `CMT=2`
+/// to the peripheral; `pk::dose_needs_event_walk` sends exactly those subjects to
+/// the event-driven walk, which is NONMEM-anchored for `ADVAN2` central and
+/// `ADVAN3`/`ADVAN4` peripheral boluses. A dataset that meant one of those and lost
+/// its `CMT` column silently gets a compartment-1 bolus instead — the same defect
+/// #1009 reports for `[odes]`, on the other engine.
+///
+/// `0` for a model no closed form serves (see [`analytical_closed_form_dispatched`])
+/// and for the transit / inverse-Gaussian closed forms (every dose absorbs through
+/// the depot; `dose.cmt` is never read), so neither warns.
+fn addressable_dose_compartments(model: &CompiledModel) -> usize {
+    if let Some(spec) = model.ode_spec.as_ref() {
+        return spec.n_states;
+    }
+    if !analytical_closed_form_dispatched(model) {
+        return 0;
+    }
+    model.pk_model.topology().addressable_dose_compartments()
+}
+
+/// Whether an analytical closed form is what actually serves this model's
+/// predictions — the condition for [`CompiledModel::pk_model`] to mean anything.
+///
+/// Spelled as the *positive* question rather than as `!is_algebraic()` (#1409).
+/// `is_algebraic()` is the marker for a compartment-free `$PRED`-equivalent model
+/// (#811), and a model can fail it while still never reaching a closed form: an
+/// endpoint-only model (TTE, binary, categorical) has no `[structural_model]` block
+/// at all, and `model_parser.rs` gives it `PkModel::OneCptIv` as a **placeholder**
+/// that `types.rs` warns must never be dispatched on (#1356). Reading that
+/// placeholder's topology is benign only by the coincidence that the analytical
+/// branch of that parser arm picks a one-channel model while the `[odes]` branch
+/// picks a two-channel one — exactly the kind of accident #1409 exists to remove.
+///
+/// The three conditions mirror the production dispatch in `pk::predict_subject`, in
+/// its own order: `is_algebraic()` first (nothing to integrate or superpose), then
+/// `ode_spec` (the ODE engine), then the closed form. The third condition is the one
+/// that arm cannot see — it never runs on an endpoint-only model because that model
+/// scores no Gaussian observation, which is exactly what an empty `ErrorSpec`
+/// dispatch table says.
+fn analytical_closed_form_dispatched(model: &CompiledModel) -> bool {
+    if model.is_algebraic() || model.ode_spec.is_some() {
+        return false;
+    }
+    match &model.error_spec {
+        ErrorSpec::Single(_) => true,
+        ErrorSpec::PerCmt(m) => !m.is_empty(),
+        ErrorSpec::Selected { endpoints, .. } => !endpoints.is_empty(),
+    }
 }
 
 /// The *fatal* model-vs-population checks every `simulate()` entry point owes its
@@ -2235,13 +2504,17 @@ fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec
             Diagnostic::error(
                 "E_COV_LEVEL_UNKNOWN",
                 format!(
-                    "[covariate_model]: `{} ~ {} categorical(...)` declares levels {declared:?} \
+                    "[covariate_model]: `{} ~ {} {}(...)` declares levels {declared:?} \
                      (reference {reference}), but `{}` also takes {unknown:?} in the data. An \
                      undeclared value takes the same factor as the reference level, so the fit \
                      would silently model it as reference. List every level \
                      (`{} categorical(levels = [...])`), use `levels = auto` to read them off \
                      the data, or filter the rows out.",
-                    rel.parameter, rel.covariate, rel.covariate, rel.covariate
+                    rel.parameter,
+                    rel.covariate,
+                    rel.form.label(),
+                    rel.covariate,
+                    rel.covariate
                 ),
             )
             .with_block("covariate_model"),
@@ -3472,6 +3745,96 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // `gradient = fd` with `optimizer` left at `auto` moves **two** factors, not one
+    // (#1381). `auto` resolves to `nlopt_lbfgs` when the exact analytic outer gradient
+    // is available and `bobyqa` when only finite differences are, so forcing the
+    // gradient also swaps the optimizer — and the swap is the larger effect: on the
+    // reporter's model the one-line change moved the OFV by 4.98, of which only 0.38
+    // was the gradient once the optimizer was pinned to BOBYQA in both arms.
+    //
+    // That default is right (it rests on #490's benchmarking across ~10 FOCEI
+    // datasets); what was missing is anything saying so at the point the coupling
+    // bites, so a user running a one-variable experiment gets two variables moved
+    // silently. `FitResult.optimizer` already records `"auto (bobyqa)"` (#490) and
+    // `final_gradient_source` records the effect (#1380) — both are fields the user
+    // has to think to read *afterwards*.
+    //
+    // Fires only when the coupling actually changed the pick. Both sides of the
+    // comparison go through `resolve_outer_optimizer` — the same function the outer
+    // loop resolves with — differing *only* in the analytic-gradient predicate fed
+    // to it: the live one, and the scope-only one that says what `auto` would have
+    // picked under `gradient = auto`. Asking that question of `resolve_auto`
+    // directly was wrong twice over on review: it misses the mixture arm (where
+    // `auto` is BOBYQA whatever the gradient), and it knows nothing about the
+    // `outer_maxiter == 0` short-circuit that constructs no optimizer at all.
+    //
+    // Quiet, therefore, on: a model out of the analytic scope anyway (ODE/PD, LTBS,
+    // TTE) where `fd` changed nothing; a model above `BOBYQA_MAX_DIM`, where `auto`
+    // takes L-BFGS on an FD gradient either way; a mixture model; and an
+    // evaluation-only (`maxiter = 0`) fit.
+    //
+    // The gradient is read through `GradientMethod::effective`, not off
+    // `model.gradient_method`, because `validate_model_file` (`ferx check`) hands us
+    // the model straight from the parser with `gradient = fd` still sitting in the
+    // *options* — the advertised case, which read the stale `Auto` and said nothing.
+    let effective_gradient = crate::types::GradientMethod::effective(model, options);
+    if options.optimizer == Optimizer::Auto
+        // The user's own `gradient = fd`, not an engine-forced one. An SDE model is
+        // forced to `Fd` whatever was asked for; there is no user-side coupling to
+        // report there, and this gate — read off `options`, where the counterfactual
+        // below is read off the effective method — is what excludes it.
+        && options.gradient_method == crate::types::GradientMethod::Fd
+    {
+        // The FOCE/FOCEI-family stages that actually reach the outer optimizer.
+        // `laplace` is excluded because `fit()` overrides `auto` to `nlopt_lbfgs` for
+        // it before the outer loop sees it (#317), so its optimizer does not move;
+        // `saem`, `imp`/`impmap`, `bayes` and `vi` never run the outer optimizer at
+        // all. `gn_hybrid` is included: its FOCEI polish routes through
+        // `optimize_population_warm` → `optimize_population` with `auto` still live.
+        let runs_outer = crate::estimation::outer_optimizer::runs_outer_optimizer(options)
+            && chain.iter().any(|&m| {
+                matches!(
+                    m,
+                    EstimationMethod::Foce
+                        | EstimationMethod::FoceI
+                        | EstimationMethod::FoceGnHybrid
+                )
+            });
+        let has_mixture = model.default_params.mixture.is_some();
+        let in_scope = crate::sens::provider::analytic_outer_gradient_in_scope(model);
+        let resolve = |analytic: bool| {
+            crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                Optimizer::Auto,
+                model,
+                has_mixture,
+                analytic,
+            )
+            .0
+        };
+        let forced = resolve(in_scope && effective_gradient != crate::types::GradientMethod::Fd);
+        let unforced = resolve(in_scope);
+        if runs_outer && forced != unforced {
+            diags.push(
+                Diagnostic::warning(
+                    "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT",
+                    &format!(
+                        "gradient = fd also changed the outer optimizer: with optimizer = auto \
+                         left in place it resolved to {} rather than the {} this model would \
+                         have used under gradient = auto, because auto picks the derivative-free \
+                         optimizer when there is no exact analytic gradient to feed a \
+                         gradient-based one. Two factors moved, not one — if you are comparing \
+                         an fd arm against an auto arm, pin optimizer = {} in both so the \
+                         difference you measure is the gradient.",
+                        forced.label(),
+                        unforced.label(),
+                        forced.label(),
+                    ),
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
             if !matches!(
@@ -3777,22 +4140,26 @@ fn outer_search_runs(options: &FitOptions) -> bool {
     })
 }
 
-/// The largest **variance** whose packed coordinate still lands on the `-6`
-/// lower rail: `ln(√v) ≤ -6 ⇔ v ≤ e⁻¹²`. Quoted in the tiny-non-zero message so
-/// the user is told where the cliff is, not just that they are past it.
-const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6;
-
 /// Which declaration a flagged variance coordinate came from — the keyword the
 /// user has to go and edit.
 enum VarianceDecl {
-    /// A `Ω` diagonal. `block: false` is `omega NAME ~ v`; `block: true` is a
-    /// `block_omega` diagonal, whose `L_ii` also carries the off-diagonals, so
-    /// no single declared variance describes it.
-    Omega { block: bool },
-    /// An `Ω_IOV` diagonal. `block: true` is a `block_kappa` (IOV Option B)
+    /// A `Ω` diagonal. `correlated: true` is a `block_omega` diagonal that
+    /// really has off-diagonals, so `L_ii` carries them and no single declared
+    /// variance describes it; `block_declared` is how the line is *spelled*.
+    /// The two differ only for a one-eta `block_omega (NAME) = [v]` — a block
+    /// declaration with no correlations — which is why they are separate fields
+    /// rather than one bool (#1394).
+    Omega {
+        correlated: bool,
+        block_declared: bool,
+    },
+    /// An `Ω_IOV` diagonal. `correlated: true` is a `block_kappa` (IOV Option B)
     /// diagonal — correlated exactly like a `block_omega`, and reported the same
-    /// way.
-    Kappa { block: bool },
+    /// way. Same split as [`VarianceDecl::Omega`].
+    Kappa {
+        correlated: bool,
+        block_declared: bool,
+    },
     /// A `[mixture]` per-class Ω override (#977): its 1-based class, and the
     /// **declared** base eta name. Not the packed coordinate's display name —
     /// `coordinate_names` reports `ETA_CL_MIX2` for this slot, which appears
@@ -3825,9 +4192,9 @@ impl VarianceDecl {
         }
     }
 
-    /// How the enclosing block is spelled in the model file, for the arm that
-    /// reports a near-singular block. `None` for anything that is not a block
-    /// diagonal.
+    /// The `block_omega` / `block_kappa` keyword, for a declaration spelled as a
+    /// block. `None` for a diagonal `omega` / `kappa` line and for a mixture
+    /// override.
     ///
     /// Ω_IOV's block spelling is `block_kappa`, not `block_omega`: both take
     /// the same message arm — the cause and the remedy are identical — but
@@ -3836,27 +4203,73 @@ impl VarianceDecl {
     /// assert the keyword each way round.
     fn block_keyword(&self) -> Option<&'static str> {
         match self {
-            VarianceDecl::Omega { block: true } => Some("block_omega"),
-            VarianceDecl::Kappa { block: true } => Some("block_kappa"),
+            VarianceDecl::Omega {
+                block_declared: true,
+                ..
+            } => Some("block_omega"),
+            VarianceDecl::Kappa {
+                block_declared: true,
+                ..
+            } => Some("block_kappa"),
+            _ => None,
+        }
+    }
+
+    /// The keyword for the arm that reports a **near-singular block** — i.e.
+    /// only when the eta actually has off-diagonals for the story to be about.
+    ///
+    /// Not the same predicate as [`Self::block_keyword`], and the difference is
+    /// the whole of the one-eta case: `block_omega (ETA_CL) = [0.0]` is spelled
+    /// as a block but is not correlated with anything, so "it is the
+    /// correlations that do this" would be a false explanation and "lower the
+    /// covariances involving ETA_CL" an unfollowable repair. It gets the
+    /// declared-zero arm, in its own block spelling (#1394).
+    /// Deliberately **not** routed through [`Self::block_keyword`]: an
+    /// `OmegaMatrix` rebuilt from a bare matrix (`from_matrix`, and so the
+    /// ferx-r entry points) records no provenance, but its off-diagonals are
+    /// inferred and real. Keying this arm on provenance would drop the
+    /// near-singular-block message for exactly those callers and quote a
+    /// diagonal `omega NAME ~ 0.0` at a correlated eta. Correlation is a
+    /// property of the matrix and is always knowable; the spelling is not.
+    fn correlated_block_keyword(&self) -> Option<&'static str> {
+        match self {
+            VarianceDecl::Omega {
+                correlated: true, ..
+            } => Some("block_omega"),
+            VarianceDecl::Kappa {
+                correlated: true, ..
+            } => Some("block_kappa"),
             _ => None,
         }
     }
 }
 
 impl VarianceDecl {
-    /// The declaration as written in the model file, e.g. `omega ETA_CL`,
-    /// `kappa KAPPA_CL`, `omega(2) ETA_CL`. `coord_name` is the packed
-    /// coordinate's display name, used for every declaration whose slot and
-    /// declaration share a name.
-    fn declaration(&self, coord_name: &str) -> String {
+    /// The **zero declaration** as it would be written in the model file, value
+    /// included: `omega ETA_CL ~ 0.0`, `kappa KAPPA_CL ~ 0.0`,
+    /// `omega(2) ETA_CL ~ 0.0`, or `block_omega (ETA_CL) = [0.0]`.
+    ///
+    /// The value is part of the string because the two spellings do not share a
+    /// shape: a diagonal line takes `~ v` and a block takes `= [lower triangle]`,
+    /// so a keyword-only prefix cannot be completed by the caller. Both put
+    /// `FIX` last, which is what lets [`fix_suggestion`] append it to either.
+    ///
+    /// `coord_name` is the packed coordinate's display name, used for every
+    /// declaration whose slot and declaration share a name.
+    fn zero_declaration(&self, coord_name: &str) -> String {
         match self {
-            VarianceDecl::MixtureOmega { class, eta } => format!("omega({class}) {eta}"),
-            _ => format!("{} {coord_name}", self.keyword()),
+            VarianceDecl::MixtureOmega { class, eta } => format!("omega({class}) {eta} ~ 0.0"),
+            // Only a one-eta block reaches here spelled as a block: a correlated
+            // one is taken by the near-singular arm, which quotes no declaration.
+            _ => match self.block_keyword() {
+                Some(kw) => format!("{kw} ({coord_name}) = [0.0]"),
+                None => format!("{} {coord_name} ~ 0.0", self.keyword()),
+            },
         }
     }
 
     /// What to call the random effect in prose. Same reasoning as
-    /// [`Self::declaration`]: a mixture override's packed coordinate is
+    /// [`Self::zero_declaration`]: a mixture override's packed coordinate is
     /// displayed as `ETA_CL_MIX2`, but the eta the user declared and reasons
     /// about is `ETA_CL`.
     fn subject_name(&self, coord_name: &str) -> String {
@@ -3867,12 +4280,11 @@ impl VarianceDecl {
     }
 }
 
-/// The remedy line, spelled the way the declaration actually parses.
+/// The remedy line, spelled the way the declaration actually parses — including
+/// a one-eta `block_omega (NAME) = [0.0] FIX`, which is an edit to the line the
+/// user wrote rather than a rewrite into a different declaration form (#1394).
 fn fix_suggestion(decl: &VarianceDecl, coord_name: &str, trailer: &str) -> String {
-    format!(
-        "write `{} ~ 0.0 FIX`{trailer}",
-        decl.declaration(coord_name)
-    )
+    format!("write `{} FIX`{trailer}", decl.zero_declaration(coord_name))
 }
 
 /// Does this coordinate sit **exactly** on the regularisation floor — the one
@@ -3898,24 +4310,34 @@ fn rail_variance_is_the_floor(template: &ModelParameters, i: usize) -> bool {
 ///
 /// `coordinate_kinds` decides *whether* a
 /// coordinate qualifies; the segment boundaries below only decide *which
-/// keyword* to print, and they are re-derived the way `packed_len` derives them
-/// because the packed vector carries no provenance. All three live arms
-/// (`omega`, `kappa`, `[mixture] omega(2)`) are pinned by a sibling test
-/// asserting that keyword in the message, so a layout change that moves a
-/// segment reddens rather than silently mislabelling a declaration.
+/// keyword* to print, and they come from
+/// [`packed_segments`](crate::estimation::parameterization) — the one
+/// derivation of the packed layout (#1252) — because the packed vector carries
+/// no provenance. All three live arms (`omega`, `kappa`, `[mixture] omega(2)`)
+/// are pinned by a sibling test asserting that keyword in the message, so a
+/// layout change that moves a segment reddens rather than silently
+/// mislabelling a declaration.
 fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<VarianceDecl>> {
     use crate::estimation::parameterization::{
-        coordinate_kinds, omega_packed_len, PackedCoordKind,
+        coordinate_kinds, omega_block_declared_mask, omega_correlated_diagonal_mask,
+        packed_segments, PackedCoordKind,
     };
 
-    let n_theta = template.theta.len();
-    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
-    let n_sigma = template.sigma.values.len();
-    let n_iov = template
-        .omega_iov
-        .as_ref()
-        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
-    let iov_end = n_theta + n_omega + n_sigma + n_iov;
+    let segs = packed_segments(template);
+    let iov_end = segs.mixture_omega_start();
+    // Both facts are per **eta**, not per matrix (#1394). A `block_omega`
+    // anywhere in the model makes `omega.diagonal` false for every coordinate,
+    // so keying the message on the matrix flag gave a diagonally-declared eta
+    // the block wording — advice to "lower the covariances involving" an eta
+    // that has none, and, worse, in place of the `~ 0.0 FIX` repair this check
+    // exists to hand out (#1229).
+    //
+    // They are two masks rather than one because they answer two questions that
+    // agree on every block of two or more etas and come apart on a one-eta
+    // `block_omega (NAME)`: whether the *correlations* explain `L_ii` (they
+    // cannot, with no off-diagonals) and how the line is *spelled* (as a block).
+    let correlated = omega_correlated_diagonal_mask(template);
+    let block_declared = omega_block_declared_mask(template);
 
     coordinate_kinds(template)
         .iter()
@@ -3924,13 +4346,19 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
             if *kind != PackedCoordKind::OmegaDiagonal {
                 return None;
             }
-            if i < n_theta + n_omega {
+            // One lookup each covers Ω and Ω_IOV alike: both masks are
+            // packed-length and mark both segments.
+            let correlated = correlated.get(i).copied().unwrap_or(false);
+            let block_declared = block_declared.get(i).copied().unwrap_or(false);
+            if i < segs.sigma_start() {
                 Some(VarianceDecl::Omega {
-                    block: !template.omega.diagonal,
+                    correlated,
+                    block_declared,
                 })
             } else if i < iov_end {
                 Some(VarianceDecl::Kappa {
-                    block: template.omega_iov.as_ref().is_some_and(|m| !m.diagonal),
+                    correlated,
+                    block_declared,
                 })
             } else {
                 // A `[mixture]` Ω override (#977): one packed scalar each, in
@@ -4009,9 +4437,7 @@ pub(crate) fn check_variance_init_rails(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<Diagnostic> {
-    use crate::estimation::parameterization::{
-        compute_bounds, coordinate_names, pack_params, packed_fixed_mask,
-    };
+    use crate::estimation::parameterization::{coordinate_names, pack_with_bounds, PackedStart};
 
     // A clamped start is only trapped when something searches — an eval-only
     // run clamps too, it just does not hold. See `outer_search_runs`.
@@ -4019,9 +4445,13 @@ pub(crate) fn check_variance_init_rails(
         return Vec::new();
     }
 
-    let packed = pack_params(init_params);
-    let bounds = compute_bounds(init_params);
-    let fixed = packed_fixed_mask(init_params);
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
+    } = pack_with_bounds(init_params);
     let decls = variance_decl_by_coordinate(init_params);
     // Built only if something actually fires: `coordinate_names` allocates a
     // `String` per coordinate, and this runs on the successful path of every
@@ -4052,7 +4482,7 @@ pub(crate) fn check_variance_init_rails(
         }
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
         let name = names.get(i).cloned().unwrap_or_else(|| format!("#{i}"));
-        let declaration = decl.declaration(&name);
+        let declaration = decl.zero_declaration(&name);
         let name = decl.subject_name(&name);
 
         // The variance **on this coordinate**: `L_ii²`, reconstructed from the
@@ -4068,7 +4498,7 @@ pub(crate) fn check_variance_init_rails(
         // Every message describes the coordinate the optimizer clamps, never a
         // declaration the check cannot see. Three shapes, in decreasing
         // confidence about what the user actually wrote.
-        let (message, suggestion) = if let Some(block_kw) = decl.block_keyword() {
+        let (message, suggestion) = if let Some(block_kw) = decl.correlated_block_keyword() {
             // A `block_omega` diagonal. The declared variances may all be
             // perfectly ordinary — it is the *correlation* that drives `L_ii`
             // to zero — so naming a per-eta variance here would point away from
@@ -4103,7 +4533,7 @@ pub(crate) fn check_variance_init_rails(
             // citing NM-TRAN's *zero*-variance refusal, are both sound.
             (
                 format!(
-                    "`{declaration} ~ 0.0` declares no variability but is not `FIX`-ed, so \
+                    "`{declaration}` declares no variability but is not `FIX`-ed, so \
                      the optimizer is asked to estimate a variance from a start it cannot \
                      leave: the zero is regularised to {OMEGA_REGULARIZATION_FLOOR:e}, whose \
                      packed coordinate ln(L) = {p:.2} lies below its own lower bound of \
@@ -4120,11 +4550,22 @@ pub(crate) fn check_variance_init_rails(
             // Everything else: a tiny-but-positive diagonal start, or a
             // regularised indefinite matrix. The declared value is not
             // recoverable, so only the coordinate is described.
+            // The cliff comes from `lo` — **this coordinate's** lower bound, out
+            // of the box `pack_with_bounds` built two dozen lines up — not from
+            // the rail constant and not from a decimal. It was
+            // `6.144_212_353_328_21e-6`, `exp(2·-6)` typed out in a different
+            // file from the `-6`, which is a message quoting a rail it has no
+            // link to (#1242). Reading `lo` is what makes the quoted figure and
+            // the bound the same number by construction rather than by
+            // agreement; `rail_variance_at` is only the conversion, and is
+            // pinned at non-default rails so it cannot be re-spelled as a
+            // constant either (PR #1408 review).
+            let cliff = crate::estimation::parameterization::rail_variance_at(lo);
             (
                 format!(
                     "{name} starts at a variance of {rail_variance:.3e} on the optimizer's \
                      scale (ln(L) = {p:.2}), at or below its lower bound of {lo:.1} — every \
-                     variance ≤ {RAIL_VARIANCE:.2e} lands on that rail — so the start is \
+                     variance ≤ {cliff:.2e} lands on that rail — so the start is \
                      clamped there and the coordinate cannot be estimated from it. Start \
                      {name} at ≥ 1e-5, or `FIX` it if it should carry no variability. NONMEM \
                      accepts such a start but collapses it to ≈ 1e-9, which is the same \
@@ -4145,6 +4586,782 @@ pub(crate) fn check_variance_init_rails(
 #[cfg(test)]
 #[path = "tests/variance_init_rail_tests.rs"]
 mod variance_init_rail_tests;
+
+#[cfg(test)]
+#[path = "tests/parameter_prior_check_tests.rs"]
+mod parameter_prior_check_tests;
+
+/// Reject a `prior(...)` declaration that cannot be applied (#254).
+///
+/// **This is the gate**, and it has two call sites that must stay in step:
+/// `api::fit::fit_inner` runs it before any optimizer does, so a prior that
+/// survives to `build_prior_set` has already been checked against the very
+/// `ModelParameters` layout the optimizer will pack; and
+/// [`validate_model_file`] runs it so `ferx check` refuses exactly the models
+/// `fit()` refuses. It needs no dataset — the prior is resolved against the
+/// packed parameter layout alone — so it belongs with the other
+/// data-independent checks there.
+///
+/// Three classes of failure, all errors rather than warnings — an unapplied or
+/// half-applied prior is invisible in the output, because the fit still
+/// converges and still reports estimates with nothing saying the prior was
+/// dropped.
+pub(crate) fn check_parameter_priors(
+    model: &CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    if model.priors.is_empty() && model.prior_from_fit.is_none() {
+        return Vec::new();
+    }
+
+    // 1. The prior does not resolve — unknown name, a FIXed parameter, a block
+    //    element, a duplicate, or (#254 phase 2) a `[priors] from_fit` that is
+    //    missing, unreadable, or lands no prior at all. `PriorSet::build`
+    //    produces the message; this function only decides the severity and the
+    //    code.
+    let n_priors = match crate::estimation::priors::PriorSet::build(model, init_params) {
+        Ok(set) => set.len(),
+        Err(msg) => {
+            return vec![Diagnostic::error("E_PRIOR_UNRESOLVED", msg)
+                .with_block("parameters")
+                .with_suggestion(
+                    "A prior must name a `theta`, `omega`, `sigma` or `kappa` declared in \
+                     `[parameters]` that is estimated (not `FIX`) and does not belong to a \
+                     `block_omega` / `block_sigma` / `block_kappa`.",
+                )]
+        }
+    };
+
+    // 2. The last stage that *estimates* cannot apply priors.
+    //
+    //    Not `chain.last()`: a trailing evaluation-only stage (`imp` under
+    //    `imp_eval_only`, `laplace` under `agq_eval_only`) consumes the preceding
+    //    stage's parameters and runs no optimizer, so it can neither apply a
+    //    prior nor undo one an earlier stage applied. Testing the literal last
+    //    stage is wrong in both directions — `[saem, laplace]` + `agq_eval_only`
+    //    would be accepted (Laplace is supported, but here it only evaluates
+    //    SAEM's estimates, so nothing ever applied the prior) and `[focei, imp]`
+    //    + `imp_eval_only` would be rejected (IMP is unsupported, but FOCEI
+    //    already applied it).
+    //
+    //    `covariance_stage` is the same predicate that decides which stage owns
+    //    the covariance step, for the same reason: one derivation, so the two
+    //    cannot disagree about which stage the reported estimates came from.
+    let Some(last) = options.covariance_stage() else {
+        return Vec::new();
+    };
+    if !applies_parameter_priors(last) {
+        return vec![Diagnostic::error(
+            "E_PRIOR_METHOD_UNSUPPORTED",
+            format!(
+                "A prior is in force on {} parameter(s), but the last estimating stage \
+                 (`{}`) does not apply parameter priors — the fit would silently return the \
+                 unpenalized maximum-likelihood estimates.",
+                n_priors,
+                last.label(),
+            ),
+        )
+        .with_block("parameters")
+        .with_suggestion(
+            "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
+             Use one of those as the last estimating stage — chaining is fine, e.g. \
+             `methods = [saem, focei]` — or remove the prior declarations.",
+        )];
+    }
+
+    // 3. The requested covariance estimator cannot carry the prior.
+    //
+    //    Both rejected forms fail for the same reason: `S` is a sum over
+    //    *subjects*, and a prior has no subject decomposition — it contributes
+    //    one score for the whole population, not one per subject — so nothing
+    //    assembled from `S` can represent it. `R` is the only half that carries
+    //    the prior's curvature.
+    //
+    //    `s` is the obvious case (`S⁻¹` is simply the unpenalized information).
+    //    `rsr` is the subtler one and was missed at first: `R⁻¹ S R⁻¹` puts two
+    //    prior-shrunk `R⁻¹` factors around a prior-free `S`, so the result is
+    //    neither the penalized estimator nor the unpenalized one — it under-states
+    //    the SE on every priored coordinate by roughly the square of the shrinkage.
+    //    A wrong-by-construction robust SE is worse than no robust SE, so this is
+    //    an error and not a warning, and the `s` diagnostic below must not go on
+    //    recommending `rsr` as the safe alternative.
+    if options.run_covariance_step {
+        let method = options.covariance_method;
+        let detail = match method {
+            crate::types::CovarianceMethod::CrossProduct => Some((
+                "s",
+                "`S⁻¹` is the score cross-product alone, so the reported standard errors \
+                 would be the unpenalized ones.",
+            )),
+            crate::types::CovarianceMethod::Sandwich => Some((
+                "rsr",
+                "the `R⁻¹ S R⁻¹` sandwich wraps a prior-free `S` in two prior-shrunk `R⁻¹` \
+                 factors, so the reported standard errors are neither the penalized nor the \
+                 unpenalized ones — they are systematically too small on every priored \
+                 coordinate.",
+            )),
+            crate::types::CovarianceMethod::Hessian => None,
+        };
+        if let Some((name, why)) = detail {
+            return vec![Diagnostic::error(
+                "E_PRIOR_COV_METHOD_UNSUPPORTED",
+                format!(
+                    "`covariance_method = {name}` cannot represent a parameter prior: `S` is a \
+                     sum of per-subject scores, and a prior contributes one score for the whole \
+                     population rather than one per subject — {why}"
+                ),
+            )
+            .with_block("fit_options")
+            .with_suggestion(
+                "Use `covariance_method = r` (the default, whose Hessian carries the prior's \
+                 curvature), or set `covariance = false`.",
+            )];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Whether an estimation method's optimizer applies parameter priors (#254).
+///
+/// The FOCE family does: every outer optimizer under `foce` / `focei` /
+/// `laplace` (NLopt, built-in BFGS, trust-region) plus both Gauss–Newton
+/// variants minimise a packed objective the penalty is simply added to.
+///
+/// SAEM, IMP/IMPMAP, Bayes and VI do not, each for its own reason: SAEM's M-step
+/// is closed form and would need a conjugate MAP update rather than an added
+/// term; IMP/IMPMAP need their Monte-Carlo M-step penalized (planned, and the
+/// only one of these that is a straightforward extension); and `bayes` already
+/// carries its own Ω prior, so a second one on the same parameter is a
+/// modelling error rather than a missing feature.
+pub(crate) fn applies_parameter_priors(method: crate::types::EstimationMethod) -> bool {
+    use crate::types::EstimationMethod as M;
+    matches!(
+        method,
+        M::Foce | M::FoceI | M::Laplace | M::FoceGn | M::FoceGnHybrid
+    )
+}
+
+/// The `W_` token carried inside the message text of every start-outside-the-box
+/// *warning*, so [`crate::types::classify_warning`] can recover
+/// `WarningCode::InitOutsideBounds` from the flat string `fit()` stores.
+///
+/// A token rather than a prose match, following `W_ABSORPTION_TWIN_DECLINED`:
+/// the nearest prose arm is `"optimizer bound"` → `BoundaryEstimate`, whose
+/// category drives `bootstrap`'s `skip_estimate_near_boundary` and
+/// `Strictness::reject_on_boundary`, both on by default. A message that drifted
+/// into that arm would silently drop bootstrap replicates.
+const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
+
+/// The `W_` token carried inside the message text of every *not representable*
+/// warning (#1307), so [`crate::types::classify_warning`] can recover
+/// [`crate::types::WarningCode::InitNotRepresentable`] from the flat string
+/// `fit()` stores.
+///
+/// A separate token from [`START_OUT_OF_BOX_TOKEN`] because the two answer
+/// different questions and a consumer must be able to tell them apart: that one
+/// fires on a start the box moved, this one on a value the packer moved before
+/// any box existed — and every coordinate this one names is, by construction,
+/// *inside* its box. `classify_warning` tests this token first, because the
+/// message below names the other one when it explains that silence.
+const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
+
+/// Report an initial estimate that packs **strictly outside** its own box, and
+/// is therefore silently moved by `clamp_to_bounds` before the first objective
+/// evaluation (#1251).
+///
+/// Data-independent, exactly like [`check_variance_init_rails`]: the predicate
+/// is a property of the initial parameters alone, so `ferx check model.ferx`
+/// reports it without a `--data` file.
+///
+/// # Severity, and where each verdict comes from
+///
+/// | coordinate | whose bound | verdict |
+/// |---|---|---|
+/// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
+/// | any coordinate the **packer itself** altered (#1307) | ferx's | warning, and not exempt at `maxiter = 0` |
+/// | θ strictly outside its **declared** lower / upper | the user's | **error** |
+/// | θ above the hidden `1e9` cap | ferx's | warning |
+/// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
+/// | Ω / Ω_IOV / mixture-Ω **diagonal**, above `+6` | ferx's | warning |
+/// | Ω off-diagonal, outside `±10` | ferx's | warning |
+/// | Σ, outside `[−8, 5]` | ferx's | warning |
+///
+/// The hidden `1e-10` **floor** has no *box* row, and that is a property of the
+/// packing rather than an omission: `packed = max(θ, 1e-10).ln()` is floored
+/// identically to the bound, so a start below the floor compares *equal*, and a
+/// declared range lying entirely below it empties the box instead — the first
+/// row, not the fourth (#1309 review). It is the second row that reports it
+/// instead, and from the other side: not "where does this start sit in its box"
+/// but "did the declared number survive the pack at all" (#1307). The two are
+/// independent, so a coordinate may be reported by both.
+///
+/// That second row is why `W_INIT_OUTSIDE_BOUNDS` staying silent does **not**
+/// mean the declared values reached the optimizer. It carries its own token,
+/// `W_INIT_NOT_REPRESENTABLE`, precisely so a consumer can tell the two apart.
+///
+/// That same flooring is why the **declared** θ row is judged on the natural
+/// scale and not the packed one. `theta TVCL(-5.0, 0.0, 10.0)` packs to
+/// `packed == lower == ln(1e-10)`, so a packed comparison sees a start sitting
+/// exactly on its bound and says nothing — while the fit begins from `1e-10`,
+/// which is neither the declared `-5` nor the declared `0`. A declared lower of
+/// `0` is the idiomatic spelling for a positive parameter, so that was the
+/// shape most likely to carry the defect. [`theta_outside_declared_range`]
+/// answers the declared question; the packed walk keeps ferx's internal rails,
+/// and the two partition the θ segment (#1309 review).
+///
+/// The empty box is first because it is the one arm that stops a **crash**
+/// rather than a silent clamp: `clamp_to_bounds` calls `f64::clamp`, which
+/// panics on `min > max`, and every optimizer entry clamps the start before its
+/// first objective evaluation — `evaluate_at_initial_params` included, which is
+/// why this row alone ignores the `maxiter = 0` exemption.
+///
+/// The θ error follows NM-TRAN, which refuses the identical stream outright
+/// (error 24, before any estimation), and the clamp really does move the start:
+/// `theta TVCL(0.05, 0.1, 10.0)` fits from `0.1`, a factor of two.
+///
+/// The Ω **upper** rail is a warning and not an error, measured rather than
+/// assumed. On `examples/warfarin.ferx`, `omega ETA_CL ~ 1e8` (packed `+9.21`
+/// against the `+6` rail, clamped to a variance of `1.6e5`) recovers the base
+/// optimum under **all eight** optimizer × method arms: `foce` and `focei`
+/// each × `bobyqa`, `slsqp`, `lbfgs`, `bfgs`, with θ and ω agreeing to 5–6
+/// significant figures and |ΔOFV| ≤ 0.14 — and in the two arms that differ at
+/// all, the clamped start ends up *better*. That is the opposite of the lower
+/// rail, where every default path is trapped, which is why #1229 is an error
+/// and this is not. NONMEM's own `$OMEGA 1e8` run fails (`ROUNDING ERRORS`,
+/// OFV 117.63 worse) but starts literally at `1e8`; ferx clamps to `1.6e5`
+/// first, so the two are different experiments and the ferx arm decides.
+///
+/// # Scope, against `check_variance_init_rails`
+///
+/// The two partition the out-of-box set. #1229 claims `packed <= lower` on the
+/// coordinates `variance_decl_by_coordinate` marks — a superset of "strictly
+/// below" that also takes equality — so this check claims every strictly-outside
+/// coordinate **except** those. Disjoint, and together exhaustive.
+pub(crate) fn check_packed_start_in_box(
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    use crate::estimation::parameterization::{
+        coordinate_kinds, coordinate_names, coordinates_outside_bounds,
+        coordinates_with_inverted_bounds, pack_with_bounds, theta_outside_declared_range,
+        theta_representable_range, BoxSide, PackGuard, PackedCoordKind, LOG_PACK_FLOOR,
+        RHO_Z_BOUND, SIGMA_PACK_LOWER, SIGMA_PACK_UPPER, THETA_PACK_CEIL,
+    };
+
+    let start = pack_with_bounds(init_params);
+    let kinds = coordinate_kinds(init_params);
+    // The #1229 scope gate, reused as the partition: `Some` exactly on the
+    // Ω / Ω_IOV / mixture-Ω diagonals it claims.
+    let decls = variance_decl_by_coordinate(init_params);
+    // Allocated only if something fires — `coordinate_names` builds a `String`
+    // per coordinate and this runs on the successful path of every fit.
+    let mut names: Option<Vec<String>> = None;
+
+    let mut diags = Vec::new();
+
+    // ── an EMPTY box, before the eval-only exemption ────────────────────────
+    //
+    // Deliberately **not** exempt at `maxiter = 0`, unlike everything below.
+    // The exemption exists because a clamped start does not *stick* without a
+    // search; an empty box is not clamped at all — `clamp_to_bounds` calls
+    // `f64::clamp`, which panics on `min > max` — and
+    // `evaluate_at_initial_params` clamps too. So an eval-only run on an empty
+    // box aborts the process, and gating this on `outer_search_runs` would
+    // leave exactly that case uncovered.
+    //
+    // The indices claimed here are excluded from both walks below rather than
+    // returning outright: `ferx check` reports a whole model in one pass, and a
+    // file with a swapped `TVCL` bound *and* an `omega ~ 1e8` should say both
+    // (#1309 review). `fit()` stops at the first error either way.
+    let mut inverted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for hit in coordinates_with_inverted_bounds(&start, &kinds) {
+        inverted.insert(hit.index);
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(hit.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", hit.index));
+        // Only THETA can reach this through the parser — every other segment's
+        // bounds are constants and a FIX pin is `lower == upper` — so the
+        // `cause` clause is THETA-shaped and a non-THETA coordinate simply
+        // reports its packed bounds. See `coordinates_with_inverted_bounds`.
+        let cause = if hit.kind == PackedCoordKind::Theta {
+            let (lo, hi) = (
+                init_params.theta_lower[hit.index],
+                init_params.theta_upper[hit.index],
+            );
+            if !(lo <= hi) {
+                format!(
+                    "its declared range is empty — the lower bound {lo:e} is above the upper \
+                     bound {hi:e}. Swap them, or widen the range"
+                )
+            } else if lo > THETA_PACK_CEIL {
+                format!(
+                    "its declared range ({lo:e}, {hi:e}) lies entirely above ferx's internal \
+                     upper cap of {THETA_PACK_CEIL:e}, which the packer substitutes for the \
+                     declared upper, so the box has no representable value left. Rescale \
+                     {name} — different units, or a factored-out constant — so its range fits \
+                     below {THETA_PACK_CEIL:e}"
+                )
+            } else {
+                format!(
+                    "its declared range ({lo:e}, {hi:e}) lies entirely below ferx's internal \
+                     lower floor of {LOG_PACK_FLOOR:e}, which the packer substitutes for the \
+                     declared lower, so the box has no representable value left. Rescale \
+                     {name} — different units, or a factored-out constant — so its range \
+                     reaches above {LOG_PACK_FLOOR:e}"
+                )
+            }
+        } else {
+            "its packed bounds are not orderable".to_string()
+        };
+        diags.push(
+            Diagnostic::error(
+                "E_INIT_BOUNDS_INVERTED",
+                format!(
+                    "`{name}` has an empty optimizer box — {cause}. In the optimizer's packed \
+                     space the lower bound is {:.6} and the upper is {:.6}, so no start can be \
+                     placed inside it and the fit cannot begin.",
+                    hit.lower, hit.upper,
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(format!(
+                "give {name} a non-empty range that ferx can represent \
+                 ({LOG_PACK_FLOOR:e}, {THETA_PACK_CEIL:e})"
+            )),
+        );
+    }
+
+    // ── a declared value the PACK ALTERED, before any box existed ───────────
+    //
+    // Also not exempt at `maxiter = 0`, and for the stronger of the two reasons
+    // the empty-box arm above is not. A clamped start does not *stick* without a
+    // search — that is what the exemption below is for — but a packing guard is
+    // not a start that got moved, it is a value the packed space **cannot
+    // represent at all**. `evaluate_at_initial_params` unpacks the same vector,
+    // so an eval-only run reports the OFV of the substituted value; there is no
+    // run of any length in which the declared number is used (#1307).
+    //
+    // It stands down on a coordinate another diagnostic **will actually be
+    // emitted** for, so the two are complementary rather than two opinions —
+    // and "will actually be emitted" is the whole of the predicate, not a
+    // paraphrase of it. `claimed` used to be built unconditionally from the two
+    // walks below, but those walks sit *after* the `maxiter = 0` early return:
+    // at `maxiter = 0` their indices suppressed this arm while producing nothing
+    // themselves, so `theta TVCL(-5.0, 0.0, 10.0)` reported **nothing at all**
+    // on an eval-only run that scores `1e-10` — the exact guarantee this arm
+    // exists to make (#1307 review round 1). The `outer_search_runs` gate is
+    // what keeps the suppression tied to an actual emission.
+    //
+    // `coordinates_outside_bounds`' below-a-variance-rail hits are claimed here
+    // although *this* function skips them: `check_variance_init_rails` emits
+    // them, both call sites run it alongside this check (`api::fit` and
+    // `validate_model_file`), and it carries the identical `outer_search_runs`
+    // exemption — so the gate holds for that arm too.
+    //
+    // What is left over is precisely the set nothing else can see: a **held**
+    // coordinate, whose box `pack_with_bounds` pins to the already-moved value;
+    // a θ whose declared lower is itself at or below the floor, where the packer
+    // floors the value and the bound identically; and a free ρ, which lands
+    // exactly *on* its rail rather than outside it. Those three are the #1309
+    // doc's own list of what the box predicate is structurally blind to.
+    let mut claimed: std::collections::BTreeSet<usize> = inverted.iter().copied().collect();
+    if outer_search_runs(options) {
+        claimed.extend(coordinates_outside_bounds(&start, &kinds).map(|h| h.index));
+        claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
+    }
+
+    // What the fit will **actually** use, which is not `mv.represented` whenever
+    // the box moves the coordinate a second time: `sigma X ~ 0.0 (sd)` is
+    // floored to an SD of `1e-10` by the packer and then clamped onto the
+    // `exp(-8) = 3.355e-4` rail, and a message naming the intermediate would
+    // name a number no objective evaluation ever sees.
+    //
+    // Taken by running the **real** unpacker over the clamped vector rather than
+    // by back-transforming each kind here, so there is no second copy of the
+    // packing convention to drift — `coordinate_values` puts it on the same
+    // reporting scale `PackMove::declared` uses. Built lazily: `start.moves` is
+    // empty on essentially every fit, and this allocates three vectors.
+    //
+    // Clamping per coordinate rather than through `clamp_to_bounds`, and
+    // skipping `inverted`, because that helper calls `f64::clamp`, which
+    // **panics** on `min > max` — and `inverted` holds exactly the coordinates
+    // `coordinates_with_inverted_bounds` found to be unorderable, so every index
+    // it does not hold satisfies `lower <= upper`.
+    let mut effective: Option<Vec<f64>> = None;
+    for mv in start.moves.iter().filter(|m| !claimed.contains(&m.index)) {
+        let effective = effective.get_or_insert_with(|| {
+            let mut clamped = start.packed.clone();
+            for (i, x) in clamped.iter_mut().enumerate() {
+                if !inverted.contains(&i) {
+                    *x = x.clamp(start.bounds.lower[i], start.bounds.upper[i]);
+                }
+            }
+            crate::estimation::parameterization::coordinate_values(
+                &crate::estimation::parameterization::unpack_params(&clamped, init_params),
+            )
+        });
+        // Falls back to the packer's own output if the parallel vector is short
+        // — the same hand-built-`ModelParameters` guard the walks above carry.
+        let seen = effective.get(mv.index).copied().unwrap_or(mv.represented);
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(mv.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", mv.index));
+        let held = start.fixed.get(mv.index).copied().unwrap_or(false);
+        // What the user has to change, which depends on the guard and not on
+        // the coordinate: the floor is a property of `ln`, the ρ rail is a
+        // property of the estimator.
+        let (cause, remedy) = match mv.guard {
+            PackGuard::ValueFloor => (
+                format!(
+                    "ferx packs it on the log scale, and `ln` has no value at or below 0, so \
+                     the packer substitutes a floor of {LOG_PACK_FLOOR:e}"
+                ),
+                format!(
+                    "declare {name} at or above {LOG_PACK_FLOOR:e}, or — if it is meant to be \
+                     absent — remove it from the model rather than declaring it at zero"
+                ),
+            ),
+            PackGuard::RhoRail => (
+                format!(
+                    "an estimated residual correlation is bounded at |ρ| ≤ {:.6} (Fisher-z \
+                     |z| ≤ {RHO_Z_BOUND}) so the likelihood cannot chase `log|R| → −∞` through \
+                     a singular R",
+                    crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
+                ),
+                format!(
+                    "start {name} at a correlation inside (−{rail:.6}, {rail:.6}), or write the \
+                     block `FIX` if the declared correlation is an assertion rather than a \
+                     starting point — a `FIX`-ed correlation is held exactly, with no rail",
+                    rail = crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
+                ),
+            ),
+            // A free ρ that was inadmissible takes **both** guards: backed off
+            // the unit boundary, then railed. `pack_params_with_moves` records
+            // one move for the pair (the first guard to bind) and reports the
+            // final value, so the cause has to name the second step too or it
+            // will not explain the number it quotes. `held` is what tells the
+            // two apart — a FIX-ed ρ never meets the rail (#1307).
+            PackGuard::RhoUnit if !held => (
+                format!(
+                    "a correlation at or beyond ±1 has no Fisher-z coordinate (`atanh(±1)` is \
+                     infinite), so the packer backs it off the unit boundary, and the \
+                     estimation rail then bounds an estimated correlation at |ρ| ≤ {:.6}",
+                    crate::estimation::parameterization::unpack_rho(RHO_Z_BOUND),
+                ),
+                format!("declare {name} strictly inside (−1, 1)"),
+            ),
+            PackGuard::RhoUnit => (
+                "a correlation at or beyond ±1 has no Fisher-z coordinate (`atanh(±1)` is \
+                 infinite), so the packer backs it off the unit boundary"
+                    .to_string(),
+                format!("declare {name} strictly inside (−1, 1)"),
+            ),
+        };
+        // Why the *other* start-side check says nothing about this coordinate —
+        // the inference #1307 exists to stop. Only worth spelling out for a
+        // held coordinate, where the box is pinned to the moved value and the
+        // silence is total.
+        let box_note = if held {
+            format!(
+                " `{name}` is `FIX`ed, so its optimizer box is pinned to the value the packer \
+                 produced: it reads as perfectly in-box and {START_OUT_OF_BOX_TOKEN} cannot see \
+                 it."
+            )
+        } else {
+            String::new()
+        };
+        // A ferx literal (`1e-10`, `1e-20`) round-trips exactly under `{:e}`;
+        // anything *computed* does not — `{:e}` on `tanh(3)` hands the user
+        // `9.950547536867305e-1`, seventeen digits of a rail whose definition is
+        // `tanh(3)`, and the box rails are `exp(-8)`-shaped too. Same split
+        // #1309's review applied to the box messages, for the same reason.
+        let computed = seen != mv.represented || mv.guard != PackGuard::ValueFloor;
+        let represented = if computed {
+            format!("{seen:.6e}")
+        } else {
+            format!("{seen:e}")
+        };
+        // The box moved it a *second* time, so the cause has to name both steps
+        // or the guard it blames will not explain the number it quotes.
+        let chain = if seen != mv.represented {
+            format!(
+                ", which the optimizer's own box then clamps to {:.6e}",
+                seen
+            )
+        } else {
+            String::new()
+        };
+        // A held coordinate never moves again, so the substituted value is what
+        // the whole fit uses; a free one only *starts* there and the optimizer
+        // leaves it. Worth the two spellings: they are the difference between a
+        // broken `FIX` contract and a start the user may not care about.
+        let consequence = if held {
+            format!("{name} is held at {represented} for the whole fit, and never at the declared value")
+        } else {
+            format!("the search begins from {represented} rather than from the declared value")
+        };
+        diags.push(
+            Diagnostic::warning(
+                NOT_REPRESENTABLE_TOKEN,
+                format!(
+                    "{NOT_REPRESENTABLE_TOKEN}: {name} is declared as {:e} but the optimizer \
+                     sees {represented} — {cause}{chain}. Every objective evaluation, and every \
+                     estimate that depends on {name}, uses the value the optimizer sees, so \
+                     {consequence}.{box_note} {remedy}.",
+                    mv.declared,
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(remedy),
+        );
+    }
+
+    // Same exemption as the rail check: an eval-only run clamps too, it just
+    // does not hold. `tests/check_command.rs` pins that `fit()` succeeds at
+    // `outer_maxiter = 0` on a start that would otherwise be refused. The
+    // empty-box errors already collected are **not** exempt and ride out with
+    // it — an eval-only run clamps into the empty box too, and aborts.
+    if !outer_search_runs(options) {
+        return diags;
+    }
+
+    // ── θ against its own DECLARED range ────────────────────────────────────
+    //
+    // Judged on the natural scale, not the packed one, and that is the whole
+    // reason this is a separate walk: `pack_params` floors the value at
+    // `LOG_PACK_FLOOR` and `unpinned_bounds` floors the bound at the same
+    // constant, so `theta TVCL(-5.0, 0.0, 10.0)` packs to `packed == lower`
+    // and the packed comparison reports nothing at all. See
+    // `theta_outside_declared_range` (#1309 review).
+    //
+    // The `(index, side)` pairs claimed here are the ones the rail walk below
+    // skips, so the two partition the θ segment: a declared violation is an
+    // error here, and what is left over on θ is an internal cap, hence a
+    // warning there.
+    let mut declared_hits: std::collections::BTreeSet<(usize, BoxSide)> =
+        std::collections::BTreeSet::new();
+    for hit in theta_outside_declared_range(init_params) {
+        if inverted.contains(&hit.index) {
+            continue;
+        }
+        declared_hits.insert((hit.index, hit.side));
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(hit.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", hit.index));
+        // The interval a start actually has to land inside: the declaration
+        // intersected with ferx's packing caps. Two things read it.
+        //
+        // Where the fit *begins*, which is not always the bound the user
+        // declared — for a declared lower at or below `LOG_PACK_FLOOR` the
+        // box starts at the floor, so `theta TVCL(-5.0, 0.0, 10.0)` begins from
+        // `1e-10` and not from `0`.
+        //
+        // And the remedy, which has to name a range ferx can represent: with
+        // `theta TVCL(0.05, 0.1, 1e12)` the declared upper is above the hidden
+        // `1e9` cap, so advertising it sends the user to a value that then
+        // trips `W_INIT_OUTSIDE_BOUNDS`.
+        //
+        // Both are taken on the **natural** scale rather than by unpacking
+        // `start.bounds`, because `exp(ln(x))` is not the identity: that route
+        // prints `9.999999999999996e-11` for the floor and
+        // `1.0000000000000002e-1` for a declared `0.1`. `unpinned_bounds` packs
+        // this same interval, so there is nothing to drift from (#1309 review).
+        let (lo_advice, hi_advice) = theta_representable_range(init_params, hit.index);
+        let effective = init_params.theta[hit.index].clamp(lo_advice, hi_advice);
+        diags.push(
+            Diagnostic::error(
+                "E_THETA_INIT_OUTSIDE_BOUNDS",
+                format!(
+                    "`theta {name}` starts at {value:e}, {side} its own declared \
+                     {bound_word} bound of {bound:e}. The optimizer clamps the start into its \
+                     box before the first objective evaluation, so the fit begins from \
+                     {effective:e} — silently, on every run, and every estimate that depends on \
+                     {name} moves with it. Start {name} inside its declared range, or widen the \
+                     range. NONMEM refuses the same declaration outright, at NM-TRAN time and \
+                     before any estimation (error 24).",
+                    value = hit.value,
+                    bound = hit.bound,
+                    side = hit.side.direction(),
+                    bound_word = hit.side.bound_name(),
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(format!(
+                "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
+                 the declared range"
+            )),
+        );
+    }
+
+    // No `inverted` consult here: `coordinates_outside_bounds` already declines
+    // a coordinate whose bounds are not finite and orderable, so a second test
+    // would reject exactly what the first one rejects — the redundant gate
+    // CLAUDE.md names as a test hole. The declared-range walk above needs its
+    // consult because it never looks at the packed box at all.
+    for hit in coordinates_outside_bounds(&start, &kinds) {
+        // Below a variance rail is #1229's error, reported there with its own
+        // three-way message about what the declaration probably was. Reporting
+        // it here too would double-report it.
+        if hit.side == BoxSide::Below && decls.get(hit.index).is_some_and(Option::is_some) {
+            continue;
+        }
+        // A θ already reported against its own declaration. What is left on the
+        // θ segment is therefore always one of ferx's internal caps — see the
+        // `PackedCoordKind::Theta` arm below, which relies on exactly that.
+        if declared_hits.contains(&(hit.index, hit.side)) {
+            continue;
+        }
+        let names = names.get_or_insert_with(|| coordinate_names(init_params));
+        let name = names
+            .get(hit.index)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", hit.index));
+        let side = hit.side.direction();
+
+        // Everything reaching here is one of ferx's internal rails. The reporting scale
+        // is read back off the *packed* coordinate, never from
+        // `coordinate_values`: for a `block_omega` the natural-scale entry is
+        // the matrix variance while the coordinate clamped is `L_ii`, and
+        // quoting the former produces a message that contradicts itself.
+        //
+        // Every number below that is *computed* (an `exp()` of a packed value)
+        // is printed at `{:.3e}`, not `{:e}`. `{:e}` on `(2.0 * 6.0).exp()`
+        // prints `1.6275479141900392e5`, seventeen digits of a rail whose
+        // definition is `exp(12)`; `{:.3e}` prints `1.628e5` (#1309 review).
+        // Declared literals keep `{:e}`, which round-trips them exactly.
+        let (start_desc, rail_desc, remedy) = match hit.kind {
+            // Reachable on the **upper** side only, and that is a property of
+            // the packing plus the partition rather than of this arm.
+            // `Below`: `packed = max(θ, 1e-10).ln()` against
+            // `lower = max(θ_lower, 1e-10).ln()` fires only when
+            // `θ_lower > 1e-10` and `θ < θ_lower`, which is a *declared*
+            // violation and so was claimed by `theta_outside_declared_range`
+            // above; on the identity branch `packed` and `lower` are the
+            // declared numbers themselves, likewise claimed. `Above`: the same
+            // argument leaves only `θ_upper > THETA_PACK_CEIL`, where the cap
+            // ferx substitutes is what the start exceeds. A declared range
+            // falling *entirely* outside the caps does not arrive here at all:
+            // it inverts the box, and `E_INIT_BOUNDS_INVERTED` above claims it.
+            // So the cap named here is unconditionally `THETA_PACK_CEIL`
+            // (#1309 review).
+            PackedCoordKind::Theta => (
+                format!("a value of {:e}", init_params.theta[hit.index]),
+                format!(
+                    "ferx's internal upper cap of {THETA_PACK_CEIL:e} (the declared bound is \
+                     {:e}, which the packer cannot represent)",
+                    init_params.theta_upper[hit.index],
+                ),
+                format!(
+                    "start {name} inside ({:e}, {:e})",
+                    LOG_PACK_FLOOR, THETA_PACK_CEIL
+                ),
+            ),
+            PackedCoordKind::OmegaDiagonal => {
+                // `exp(2·ln(L_ii)) = L_ii²`, which **is** the variance on a
+                // diagonal Ω and is **not** on a block one: there `L_ii` is
+                // what is left of the eta's variance after the off-diagonals,
+                // so quoting `L_ii²` as "a variance" names a number that
+                // appears nowhere in the model file. Measured on
+                // `block_omega (ETA_CL, ETA_V) = [0.09, 100.0, 4e5]`, whose
+                // declared ETA_V variance is 4e5: this arm printed 2.889e5.
+                // `decls` is `Some` on every Ω diagonal and already carries the
+                // block/diagonal split #1229 established, so the wording comes
+                // from the same source as the rail check's (#1309 review).
+                let block_kw = decls
+                    .get(hit.index)
+                    .and_then(Option::as_ref)
+                    .and_then(VarianceDecl::block_keyword);
+                let l_squared = (2.0 * hit.packed).exp();
+                let rail = (2.0 * hit.bound).exp();
+                (
+                    match block_kw {
+                        Some(kw) => format!(
+                            "a `{kw}` Cholesky diagonal of L = {:.3e} (L² = {l_squared:.3e}, \
+                             which is what is left of {name}'s variance once the \
+                             off-diagonals are accounted for, not the variance declared for it)",
+                            hit.packed.exp(),
+                        ),
+                        None => format!("a variance of {l_squared:.3e}"),
+                    },
+                    format!(
+                        "the optimizer's {bound_word} variance rail of {rail:.3e}",
+                        bound_word = hit.side.bound_name(),
+                    ),
+                    match block_kw {
+                        Some(_) => format!(
+                            "reduce {name}'s declared variance, or the covariances involving \
+                             it, until its Cholesky diagonal is below {:.3e}",
+                            hit.bound.exp()
+                        ),
+                        None => format!(
+                            "start {name} below {rail:.3e}, or `FIX` it if it is meant to be \
+                             that large"
+                        ),
+                    },
+                )
+            }
+            PackedCoordKind::OmegaOffDiagonal => (
+                format!("a Cholesky element of {:.3e}", hit.packed),
+                format!(
+                    "the optimizer's {} rail of {:e}",
+                    hit.side.bound_name(),
+                    hit.bound
+                ),
+                format!("reduce the covariances involving {name}"),
+            ),
+            // Σ is stored, packed and railed on the **SD** scale
+            // (`SigmaVector::values`; `model_parser` square-roots a plain
+            // `sigma X ~ v` declaration and keeps a `(sd)` one), so every
+            // number here is an SD and none of them need appear in the model
+            // file: `sigma PROP_ERR ~ 1e6` reports `1.000e3`. Naming the scale
+            // is the whole remedy — `ModelParameters` does not record which
+            // spelling was written, so the message cannot convert back
+            // (#1309 review). Same defect the `block_omega` L-vs-L² arm above
+            // fixes, on the one arm that had kept a scale-free noun.
+            PackedCoordKind::Sigma => (
+                format!("an SD of {:.3e}", hit.packed.exp()),
+                format!(
+                    "the optimizer's {bound_word} SD rail of {:.3e}",
+                    hit.bound.exp(),
+                    bound_word = hit.side.bound_name(),
+                ),
+                format!(
+                    "start {name} at an SD inside ({:.3e}, {:.3e}) — a plain \
+                     `sigma {name} ~ v` declares the **variance** `v`, whose square root is \
+                     what is railed here",
+                    SIGMA_PACK_LOWER.exp(),
+                    SIGMA_PACK_UPPER.exp()
+                ),
+            ),
+        };
+        diags.push(
+            Diagnostic::warning(
+                START_OUT_OF_BOX_TOKEN,
+                format!(
+                    "{START_OUT_OF_BOX_TOKEN}: {name} starts at {start_desc}, {side} \
+                     {rail_desc}. The start is clamped onto that rail before the first \
+                     objective evaluation, so the fit begins from the rail and not from what \
+                     was declared. {remedy}."
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(remedy),
+        );
+    }
+    diags
+}
+
+#[cfg(test)]
+#[path = "tests/packed_start_box_tests.rs"]
+mod packed_start_box_tests;
 
 /// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
 /// resets under an SDE model, and a negative typical-value lag time. These are
@@ -4319,12 +5536,14 @@ pub fn check_model_data_warnings(
     // own comment above (a modeled SS infusion may overlap on some occasions only), so
     // blanket suppression would drop a true finding.
     //
-    // `[diffusion]` is **not** excluded, and the reason is measured rather than assumed.
-    // `solve_ekf` seeds a finite TAFD anchor and never equilibrates (#1260), which reads like
-    // an exemption — but `ode_predictions_ekf_with_diffusion` computes the Kalman `R` from a
-    // standard `ode_predictions` pass, and that one does run the run-in, so the `NaN` reaches
-    // the likelihood anyway: the same model plus `[diffusion] central ~ 0.01` measures
-    // `OFV: NaN`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
+    // `[diffusion]` is **not** excluded, twice over. Since #1260 `solve_ekf` runs its own
+    // run-in (`ode::ekf::equilibrate_ss_ekf`) on the same cycle-local clock with the same
+    // `ss_run_in_params` anchors, so a `TAFD`-reading RHS reads `NaN` there first-hand and a
+    // `T` / `TIME`-reading one sees the cycle-local value on both engines. And even before
+    // that, `ode_predictions_ekf_with_diffusion` computed the Kalman `R` from a standard
+    // `ode_predictions` pass, which does run the run-in, so the `NaN` reached the likelihood
+    // anyway — measured then as `OFV: NaN` on the same model plus `[diffusion] central ~
+    // 0.01`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
     if let Some(prog) = model
         .ode_spec
         .as_ref()
@@ -4597,36 +5816,6 @@ pub fn check_model_data_warnings(
              Use an ODE or analytical model if the lag matters."
                 .to_string(),
         ));
-    }
-
-    // Steady-state doses are not equilibrated on the EKF/SDE path. `solve_ekf` applies an
-    // `SS=1` record as a single bolus and never runs the equilibration, so the state is
-    // the one-dose state while `tad_anchor_for`'s `ss` branch hands the RHS a `TAD`
-    // folded into `[0, II)` — an anchor describing a periodic pulse train that this
-    // engine did not build. Measured on #1263: 55% low against an explicit train on an
-    // autonomous model (90.48 vs 200.27), and a further 24.1% `ipred` divergence at
-    // t=150 for an `SS=1` infusion whose end break lands past a virtual pulse. Both are
-    // silent — hence a warning rather than a quiet wrong answer (#1260).
-    if model.is_sde() {
-        let n_ss_sde = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_periodic_ss_dose())
-            .count();
-        if n_ss_sde > 0 {
-            diags.push(Diagnostic::warning(
-                "W_SDE_STEADY_STATE",
-                format!(
-                    "{} subject(s) have SS=1 dose records with a [diffusion] (SDE) \
-                     model. Steady-state doses are not yet equilibrated on the EKF/SDE \
-                     path — the record is applied as a single dose, so predictions and \
-                     the objective reflect a one-dose history rather than a steady \
-                     state. Use an ODE or analytical model, or expand the steady state \
-                     into an explicit dose train.",
-                    n_ss_sde
-                ),
-            ));
-        }
     }
 
     // Negative typical-value lag time at the initial point (eta = 0).
@@ -5123,7 +6312,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the block
 /// name attached), the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`), the
 /// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
-/// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), and
+/// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), the
+/// scale tag on a `block_*` declaration (→ `E_BLOCK_VARIANCE_ONLY`, #1377), and
 /// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
 /// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
@@ -5177,6 +6367,56 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
     if err.contains("consumed positionally") {
         return Diagnostic::error("E_SIGMA_ORDER_MISMATCH", err.to_string());
     }
+    // #1377: a scale tag on a `block_omega` / `block_sigma` / `block_kappa`
+    // declaration. Its own code rather than the `E_PARSE` catch-all for the same
+    // reason as #993 and #1001: the remedy is mechanical — square each diagonal
+    // entry and write the off-diagonals as covariances — so `ferxtranslate` or
+    // ferx-r can offer it instead of reprinting prose. Until #1377 the tag was
+    // dropped in silence and the file reported VALID, which is why the code is
+    // worth having at all.
+    //
+    // The sentinel is the message's own prefix, ``[parameters]: `block_``, which
+    // `reject_block_scale_tag` is the only writer of. Every other unrecognised
+    // `[parameters]` line stays `E_PARSE` deliberately, since there is no
+    // mechanical repair to offer for arbitrary trailing text.
+    //
+    // A prefix, not a substring of the whole message. That message quotes the
+    // user's line, so `omega ETA_KA ~ 0.30 is variance-only` — an unrecognized
+    // line whose text happened to contain the phrase — was raised to this code
+    // with a "delete the tag" suggestion for a tag it did not have (#1388 review
+    // round 3 #9). One gate: a second condition on the same message (an
+    // `is variance-only` filter, an `Offending line:` split) rejected no input
+    // the prefix accepts, so no test could see it go (round 4 #3).
+    //
+    // No `.with_block()`: the message already opens with `[parameters]`, and the
+    // renderer prefixes whatever block it is given — setting both prints it
+    // twice. Same reasoning as `E_SIGMA_ORDER_MISMATCH` above.
+    if let Some(head) = err.strip_prefix("[parameters]: `block_") {
+        // The repair travels as a field, not only inside the prose (#1388
+        // review): a mechanical remedy is the whole reason this shape has a code
+        // of its own, and a consumer that offers a fix should not have to scrape
+        // the sentence apart to find it.
+        //
+        // Which repair applies depends on the tag the author wrote. `(sd)` means
+        // the numbers are wrong and have to change; `(variance)` / `(var)` means
+        // the numbers were right all along and only the tag has to go. Telling a
+        // `(variance)` author to "square each SD" is worse than saying nothing --
+        // they wrote variances already, and squaring them would break a correct
+        // model. The tag is read back out of the one phrase the emitting arm
+        // always carries it in, at its first occurrence: the emitter writes it
+        // before the quoted line.
+        let tag_is_sd = head
+            .split_once("the scale tag `(")
+            .is_some_and(|(_, rest)| rest.starts_with("sd)`"));
+        let suggestion = if tag_is_sd {
+            "square each SD into a variance and write the off-diagonals as covariances"
+        } else {
+            "delete the tag: the lower triangle is already variances and covariances, \
+             so the numbers do not change"
+        };
+        return Diagnostic::error("E_BLOCK_VARIANCE_ONLY", err.to_string())
+            .with_suggestion(suggestion);
+    }
     // #1040: the block-header shapes the parser used to drop silently.
     // `check_block_names` writes each offending header as ``[name] (line N)``,
     // so the block / line the check report wants come straight out of the
@@ -5217,6 +6457,10 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 #[cfg(test)]
 #[path = "tests/block_name_diagnostic_tests.rs"]
 mod block_name_diagnostic_tests;
+
+#[cfg(test)]
+#[path = "tests/model_name_report_tests.rs"]
+mod model_name_report_tests;
 
 /// Give a block-header diagnostic its message plus whatever location the
 /// message text carries.
@@ -5291,21 +6535,27 @@ fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
     use crate::parser::model_parser::parse_full_model_file;
 
-    let model_name = Path::new(model_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model")
-        .to_string();
-
     // 1. Parse. A parse failure is terminal — without an AST there is nothing
-    //    further to validate, so return a report carrying just that diagnostic.
+    //    further to validate, so return a report carrying just that diagnostic,
+    //    under the file stem (the declared name is not recoverable without a parse).
     let mut parsed = match parse_full_model_file(Path::new(model_path)) {
         Ok(p) => p,
         Err(e) => {
+            let stem = Path::new(model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string();
             let data = data_path.map(|s| s.to_string());
-            return CheckReport::new(model_name, data, vec![parse_error_to_diagnostic(&e)]);
+            return CheckReport::new(stem, data, vec![parse_error_to_diagnostic(&e)]);
         }
     };
+    // The report's `model` is the name the fit will carry — the declared
+    // `model NAME`, else the file stem — resolved by the same function the
+    // fit entry points use, so `ferx check` and `ferx run` cannot disagree on
+    // it (#1395: the check report used the stem unconditionally).
+    super::run::set_model_name(&mut parsed.model, model_path);
+    let model_name = parsed.model.name.clone();
 
     // Resolve which dataset (if any) to check against: an explicit
     // `data_path` wins over the model's `[data]` block; absence of both just
@@ -5344,6 +6594,28 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    *actual* `init_params`; here the parsed inits are all there is, which
     //    is exactly what the model file declares.
     diags.extend(check_variance_init_rails(
+        &parsed.model.default_params,
+        &parsed.fit_options,
+    ));
+
+    // 2b-ter. Initial estimates strictly outside their own packed box (#1251).
+    //    Same inputs, same data-independence: `ferx check model.ferx` reports a
+    //    θ outside its declared range without a dataset, exactly as `fit()`
+    //    refuses it.
+    diags.extend(check_packed_start_in_box(
+        &parsed.model.default_params,
+        &parsed.fit_options,
+    ));
+
+    // 2b-quater. A `prior(...)` that cannot be applied (#254). Same inputs and
+    //    the same data-independence as the two above: a prior resolves against
+    //    the packed parameter layout, never against the dataset, so `ferx check
+    //    model.ferx` must refuse an unresolvable prior — or a method / covariance
+    //    combination that would drop it — exactly as `fit()` does. Without this
+    //    a model whose prior names a FIXed or unknown parameter reports clean and
+    //    then fails at fit time.
+    diags.extend(check_parameter_priors(
+        &parsed.model,
         &parsed.model.default_params,
         &parsed.fit_options,
     ));
@@ -5439,12 +6711,14 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 for w in population
                     .warnings
                     .iter()
-                    .filter(|w| !reader_warning_suppressed(&parsed.model, w))
+                    .filter(|w| !reader_warning_suppressed(&parsed.model, &parsed.fit_options, w))
                 {
                     let code = if w.starts_with("W_ADDL_MISSING_II") {
                         "W_ADDL_MISSING_II"
                     } else if w.starts_with("W_IOV_OCC_MISSING") {
                         "W_IOV_OCC_MISSING"
+                    } else if w.starts_with("W_CMT_DEFAULTED") {
+                        "W_CMT_DEFAULTED"
                     } else {
                         "W_DATA"
                     };

@@ -1,0 +1,48 @@
+# Warfarin 1-cpt oral, fitted with priors from a "published" model (#254).
+#
+# The model-updating pattern: a literature popPK model supplies the central
+# values and their RSEs, a small local dataset supplies the data, and the fit
+# returns a regularized (MAP) estimate that borrows strength from both.
+#
+# Every prior is (central value, relative uncertainty). The value and the RSE are
+# on the scale the parameter was declared on — a variance for a bare
+# `omega X ~ v`, an SD under `(sd)` — so both come off the same row of the source
+# paper's parameter table with no conversion.
+#
+#   cargo run --release -p ferx-cli -- examples/warfarin_prior.ferx \
+#       --data data/warfarin.csv
+#
+# The report splits the OFV into its data and prior halves and prints, per
+# priored parameter, how far the estimate landed from the prior in prior SDs.
+# A shift beyond about ±2 means the data is arguing with the prior.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)  prior(0.134, rse = 15%)
+  theta TVV(10.0, 0.1, 500.0)   prior(8.1,   rse = 10%)
+  theta TVKA(1.5, 0.01, 50.0)   prior(1.0,   rse = 40%)
+
+  # Ω priors are what keep a sparse fit off the variance boundary. Declared (and
+  # so priored) on the variance scale.
+  omega ETA_CL ~ 0.09  prior(0.07, rse = 50%)
+  omega ETA_V  ~ 0.04  prior(0.02, rse = 50%)
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  # Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid).
+  # A final stage that cannot apply them is refused rather than run unpenalized.
+  method     = focei
+  maxiter    = 300
+  covariance = true

@@ -59,6 +59,15 @@
 //! per-θ FD loop — the CLAUDE.md "route to FD via a support predicate, and
 //! unit-test the routing" rule. Non-NN θ are never touched by this module, so a
 //! model with no `[covariate_nn]` block is bit-for-bit unaffected.
+//!
+//! The FOCE/FOCEI family does not go through here at all. Its event-driven
+//! sensitivity walk has each event's `z^{(e)}` in hand, so it applies the same
+//! factorization *exactly* and per event — the program is evaluated with every
+//! network output seeded on a dual axis of its own (`ModelNnAxisGuard`), giving
+//! `∂p/∂z` and `∂²p/∂η∂z` directly, and the weight columns follow by the
+//! backprop Jacobian at that event's covariates (`sens::provider::
+//! nn_param_derivatives_at_cov`, #1300). That is the time-varying-input case this
+//! module declines, closed on the walk rather than here.
 
 use crate::types::{CompiledModel, Subject};
 use nalgebra::DMatrix;

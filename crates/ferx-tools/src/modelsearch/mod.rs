@@ -106,8 +106,8 @@ use serde::Deserialize;
 use crate::search::fitter::{RunnerFitter, StepFitter};
 use crate::search::seed::seed_from;
 use crate::search::{
-    BaseModel, Candidate, CandidateError, CandidateResult, Criterion, ModelContext, PkTemplate,
-    RankType, RunReport, SearchConfig,
+    BaseModel, Candidate, CandidateError, CandidateResult, Criterion, ModelContext, Penalties,
+    PkTemplate, RankType, RunReport, SearchConfig,
 };
 
 pub mod structure;
@@ -160,6 +160,8 @@ pub struct ModelsearchOptions {
     /// to be selected. `None` — Pharmpy's default — selects the best model
     /// on the criterion alone.
     pub cutoff: Option<f64>,
+    /// `[rank.penalties]`, read behind a `penalized` rank type (#1185).
+    pub penalties: Penalties,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
@@ -190,6 +192,7 @@ impl ModelsearchOptions {
             iiv_strategy: section.iiv_strategy,
             rank: config.rank.kind_or_default(),
             cutoff: config.rank.cutoff,
+            penalties: config.rank.penalties(),
         };
         options.validate()?;
         Ok(options)
@@ -212,9 +215,8 @@ impl ModelsearchOptions {
                 ));
             }
         }
-        // A file asking for an unimplemented criterion fails here, before
-        // any data is read.
-        self.rank.criterion()?;
+        // A bad penalty schedule fails here, before any data is read.
+        self.penalties.validate()?;
         Ok(())
     }
 
@@ -227,9 +229,7 @@ impl ModelsearchOptions {
 
     /// The runner criterion this ranks on.
     pub fn criterion(&self) -> Criterion {
-        self.rank
-            .criterion()
-            .expect("validated: the rank type has a criterion")
+        self.rank.criterion_with(self.penalties)
     }
 }
 
@@ -378,6 +378,7 @@ pub fn run_modelsearch(
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base)?;
     let result = search(&fitter, space, &options, run.progress)?;

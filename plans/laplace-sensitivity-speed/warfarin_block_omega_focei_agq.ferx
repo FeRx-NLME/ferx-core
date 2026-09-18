@@ -1,0 +1,39 @@
+# Benchmark fixture: a full 3×3 block-Ω warfarin, Gauss-Newton-anchored FOCEI AGQ
+# (`method = focei`, `n_agq = 3`).
+#
+# Same structural/error model and data as examples/warfarin.ferx, but every η pair is
+# correlated (`block_omega` over all three). `agq::use_analytic_grid_response` defaults
+# to the analytic `dH̃/dx` route (`focei_htilde_dx`) for the Gauss-Newton anchor here: one
+# extra ordinary `subject_sensitivities` call per subject per gradient, independent of
+# `n_free`, vs. the FD route's `2·n_free = 20` perturbed-anchor rebuilds
+# (`n_free = n_theta(3) + n_omega(6) + n_sigma(1) = 10`).
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  block_omega (ETA_CL, ETA_V, ETA_KA) = [
+    0.09,
+    0.02, 0.04,
+    0.01, 0.01, 0.30
+  ]
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  n_agq      = 3
+  maxiter    = 300
+  covariance = false

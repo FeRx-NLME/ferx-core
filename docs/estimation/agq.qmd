@@ -354,8 +354,74 @@ alternative costs `2 × n_free` *full population objective* evaluations, each
 re-solving every subject's inner loop. On warfarin that is the difference between
 6.5 s and 0.4 s.
 
-A fully analytic `dH/dθ` would need third derivatives (`∂³nll/∂η²∂θ`); the provider
-stops at `∂²f/∂η∂θ`, so that one order is finite-differenced.
+The grid sweep itself is contracted once, not once per parameter: the node
+gradients, weights and positions do not depend on which parameter is being
+differentiated, so the two weighted moments `Σⱼ wⱼgⱼ` and `Σⱼ wⱼgⱼzⱼᵀ` are formed
+once and each parameter then costs `O(d²)` — `O(Q·d² + n_free·d²)` rather than
+`O(n_free·Q·d²)` for `Q = n_agq^d` nodes and `d` random effects. At `n_agq = 1`
+every node sits at `z = 0`, so the node-displacement half is identically zero and
+the matrix products behind it are skipped rather than computed and multiplied by
+zero. Neither changes the number of node evaluations, which is what dominates on
+an ODE model.
+
+A fully analytic `dH/dθ` needs third derivatives (`∂³nll/∂η²∂θ`); the provider's
+ordinary second-order call stops at `∂²f/∂η∂θ`, so by default that one order is
+finite-differenced, as described above.
+
+### Analytic instead of finite-difference `dH/dθ`
+
+Both anchors also have an analytic route for that last order, replacing the
+`2 × n_free` perturbed-anchor rebuilds with a fixed number of extra provider calls:
+
+- **`focei`, `n_agq > 1` (Gauss-Newton `H̃`)** — `H̃ = Ω⁻¹ + Σⱼ pⱼaⱼaⱼᵀ` is bilinear
+  in *first*-order sensitivities, so `dH̃/dθ` needs only the mixed second-order
+  blocks (`∂²f/∂η∂θ`, `∂²f/∂η²`) the provider already returns for FOCEI's own
+  `theta_block`/`sigma_block` terms — no third order at all. One extra ordinary
+  sensitivity call replaces the whole FD sweep, at zero call-count-vs-per-call-cost
+  ambiguity. This has always been the default for this anchor.
+- **`laplace`, `n_agq = 1` (exact `H`)** — needs the full third-order jet, so each
+  analytic evaluation costs materially more than a plain anchor rebuild, against
+  materially fewer calls. Whether that nets out is representation-dependent, and on
+  the measured **diagonal** Ω fixture the call counts are similar:
+  `n_free = n_theta + d + n_sigma = 3 + 3 + 1 = 7` gives 14 FD rebuilds versus
+  `1 + 2(n_theta + d) = 13` provider evaluations. These are different work units;
+  similar counts imply neither equal runtime nor parity for diagonal Ω in general.
+  Successive benchmark sessions on this fixture measured opposite timing signs. The **block-Ω**
+  case is where the call-count gap is real — 20 FD
+  rebuilds against 13 provider evaluations — and it measured −24% provider time on
+  5 of 5 reps at an identical outer-iteration count and matching OFV to four decimals. That made it
+  the default too.
+
+  The sweep then dropped to **`1 + 2·n_eta` evaluations** (13 → 7 on a 3-θ/3-η
+  model): it reads `∂³f/∂η³` and `∂³f/∂η²∂θ`, and the θ axes existed only to build
+  blocks the covariance step consumes. `∂³f/∂η²∂θ` comes instead from `∂/∂η` of
+  `∂²f/∂η∂θ` — the same mixed partial, a cheaper difference direction. That moved
+  even the diagonal fixture decisively off parity: **−36%** provider time against
+  the finite-difference route, where it had been −5%.
+
+So **both anchors now use the analytic route by default.** The direct grid-response
+parity test compares both anchors at `n_agq = 1` and `3` with a `1e-5` scaled-error
+tolerance; separate Hessian-derivative tests cover block Ω, combined error, and ODE
+models (the ODE test uses `5e-3`). These tests provide the derivative correctness
+evidence. Benchmark OFVs agree at the console's four-decimal precision; that
+agreement does not establish exact equality or gradient equivalence.
+
+On an ODE `laplace` fit the route does change the
+optimizer's path — the benchmark fixture converges in 37 outer iterations instead of
+56 — so converged estimates can move within the convergence tolerance.
+
+`FERX_AGQ_GRID_RESPONSE` is retained as a benchmarking escape hatch rather than
+removed: `fd` forces the finite-difference sweep, `analytic` is now also the
+default, and any other value (including an unset-but-misspelled one, e.g.
+`analytical`) is rejected outright rather than silently falling back — a benchmark's
+"candidate" arm that quietly becomes identical to its baseline would otherwise
+report "no difference" instead of an error. It is deliberately an environment
+variable and not a `[fit_options]` key: there is nothing here for a *user* to
+choose.
+
+The finite-difference sweep is also still the live fallback, not dead code: the
+analytic route declines — out of its narrower scope (M3 censoring, say), or on an
+ill-conditioned anchor — and the FD sweep then runs exactly as before.
 
 ### Every model gets this gradient — including TTE and categorical
 

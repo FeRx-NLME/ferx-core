@@ -24,7 +24,9 @@
 //! `PkNum`/`Dual2` instantiation (mixed-effects DCM via FOCEI, Phase A M2)
 //! differentiates cleanly without branch-on-`max` ambiguity.
 
-use nalgebra::{DMatrix, DVector};
+use nalgebra::DMatrix;
+#[cfg(test)]
+use nalgebra::DVector;
 use std::collections::HashMap;
 
 use crate::types::{CompiledModel, FitOptions, PkParams, Population};
@@ -378,11 +380,10 @@ impl MlpMapper {
     pub fn forward(&self, x: &[f64], weights: &[f64]) -> Result<Vec<f64>, NnError> {
         self.check_shapes(x, weights)?;
         let (_pre, post) = self.forward_cache(x, weights);
-        let last = post
+        Ok(post
             .into_iter()
             .last()
-            .expect("at least one layer activation");
-        Ok(last.iter().copied().collect())
+            .expect("at least one layer activation"))
     }
 
     /// Full Jacobian dy/dθ, shape `(n_outputs × n_weights)`, as a dense
@@ -459,12 +460,7 @@ impl MlpMapper {
     ) -> Result<(Vec<f64>, DMatrix<f64>), NnError> {
         self.check_shapes(x, weights)?;
         let (pre, post) = self.forward_cache(x, weights);
-        let output: Vec<f64> = post
-            .last()
-            .expect("at least one layer activation")
-            .iter()
-            .copied()
-            .collect();
+        let output: Vec<f64> = post.last().expect("at least one layer activation").clone();
 
         let n_out = self.n_outputs();
         let mut jac = DMatrix::<f64>::zeros(n_out, self.n_params);
@@ -473,8 +469,18 @@ impl MlpMapper {
         //   - seed the adjoint da_L = e_k
         //   - propagate backward through the activation derivative at each
         //     layer, accumulating grad_W_l and grad_b_l into `jac` row k.
+        //
+        // Plain slice loops rather than `nalgebra` products (#1300 follow-up): the
+        // hot DCM paths call this once per event per gradient, and the former
+        // `weight_matrix` + `transpose()` built two fresh matrices per layer per
+        // output. The transposed product accumulates over `i` in increasing order,
+        // which is the order `gemv` over the transposed matrix's columns took, so the
+        // adjoint is bit-identical (pinned by `jacobian_matches_nalgebra_reference`).
+        let mut adjoint: Vec<f64> = vec![0.0; n_out];
+        let mut dz_l: Vec<f64> = Vec::new();
         for k in 0..n_out {
-            let mut adjoint = DVector::<f64>::zeros(n_out);
+            adjoint.clear();
+            adjoint.resize(n_out, 0.0);
             adjoint[k] = 1.0;
 
             // Walk layers L, L-1, ..., 1.
@@ -490,23 +496,21 @@ impl MlpMapper {
                 // output layer is seeded directly at z_L, so its activation
                 // derivative is skipped — every deeper layer is unaffected.
                 let z_l = &pre[l - 1]; // pre-activation of layer l (indexed from 1)
-                let dz_l = if preactivation && is_output_layer {
-                    adjoint.clone()
+                dz_l.clear();
+                if preactivation && is_output_layer {
+                    dz_l.extend_from_slice(&adjoint);
                 } else {
-                    let d: DVector<f64> = DVector::from_iterator(
-                        self.layers[l],
-                        z_l.iter().map(|&z| activation.derivative(z)),
+                    dz_l.extend(
+                        adjoint
+                            .iter()
+                            .zip(z_l.iter())
+                            .map(|(&a, &z)| a * activation.derivative(z)),
                     );
-                    adjoint.component_mul(&d)
-                };
+                }
 
                 // grad_W_l[i,j] = dz_l[i] * a_{l-1}[j].
                 // We unflatten into the row-major W block within `jac` row k.
-                let a_prev = if l == 1 {
-                    DVector::<f64>::from_column_slice(x)
-                } else {
-                    post[l - 2].clone()
-                };
+                let a_prev: &[f64] = if l == 1 { x } else { &post[l - 2] };
 
                 let w_start = self.offsets[l - 1];
                 let n_l = self.layers[l];
@@ -521,10 +525,19 @@ impl MlpMapper {
                     jac[(k, w_start + n_l * n_lm1 + i)] = dz_i;
                 }
 
-                // Propagate to layer l-1: da_{l-1} = W_l^T · dz_l.
+                // Propagate to layer l-1: da_{l-1} = W_lᵀ · dz_l, read straight off
+                // the row-major weight block: `adj[j] = Σ_i W[i][j]·dz[i]`.
                 if l > 1 {
-                    let w_l = self.weight_matrix(weights, l);
-                    adjoint = w_l.transpose() * dz_l;
+                    let w = &weights[w_start..w_start + n_l * n_lm1];
+                    adjoint.clear();
+                    adjoint.resize(n_lm1, 0.0);
+                    for i in 0..n_l {
+                        let dz_i = dz_l[i];
+                        let row = &w[i * n_lm1..(i + 1) * n_lm1];
+                        for (adj_j, &w_ij) in adjoint.iter_mut().zip(row) {
+                            *adj_j += w_ij * dz_i;
+                        }
+                    }
                 }
             }
         }
@@ -719,6 +732,7 @@ impl MlpMapper {
     /// (≤300 weights for DCM, ≤62 for low-dim NODE) the per-call alloc is
     /// negligible; a zero-copy variant via column-major storage is tracked
     /// against Phase A M3 in `plans/dcm-and-low-dim-node.md`.
+    #[cfg(test)]
     fn weight_matrix(&self, weights: &[f64], l: usize) -> DMatrix<f64> {
         let n_l = self.layers[l];
         let n_lm1 = self.layers[l - 1];
@@ -736,7 +750,60 @@ impl MlpMapper {
     /// Forward pass returning pre-activations and post-activations per layer.
     /// `pre[l-1]` is the pre-activation z_l (length `layers[l]`);
     /// `post[l-1]` is the post-activation a_l (length `layers[l]`).
-    fn forward_cache(&self, x: &[f64], weights: &[f64]) -> (Vec<DVector<f64>>, Vec<DVector<f64>>) {
+    ///
+    /// Plain slice loops over the row-major weight block, two `Vec` allocations per
+    /// layer and nothing else (#1300 follow-up). The former version built a `DMatrix`
+    /// view of every layer's weights, a bias `DVector`, the product, the sum and a
+    /// clone of the activation on **every** call — and `pk_param_fn` calls this once per
+    /// event per objective evaluation on a DCM, once more per event per gradient for
+    /// the sensitivity walk. `z_i` accumulates `W[i][j]·a[j]` over `j` in increasing
+    /// order and adds the bias last, exactly the order `nalgebra`'s column-wise `gemv`
+    /// plus the trailing `+ b` produced, so every value is bit-identical (pinned by
+    /// `forward_cache_matches_nalgebra_reference`).
+    fn forward_cache(&self, x: &[f64], weights: &[f64]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let l_max = self.layers.len() - 1;
+        let mut pre: Vec<Vec<f64>> = Vec::with_capacity(l_max);
+        let mut post: Vec<Vec<f64>> = Vec::with_capacity(l_max);
+
+        for l in 1..=l_max {
+            let a_prev: &[f64] = if l == 1 { x } else { &post[l - 2] };
+            let n_l = self.layers[l];
+            let n_lm1 = self.layers[l - 1];
+            let w_start = self.offsets[l - 1];
+            let w = &weights[w_start..w_start + n_l * n_lm1];
+            let b = self.bias_slice(weights, l);
+            let activation = if l == l_max {
+                self.output_activation
+            } else {
+                self.hidden_activation
+            };
+            let mut z = Vec::with_capacity(n_l);
+            let mut a = Vec::with_capacity(n_l);
+            for i in 0..n_l {
+                let row = &w[i * n_lm1..(i + 1) * n_lm1];
+                let mut acc = row[0] * a_prev[0];
+                for (&w_ij, &a_j) in row.iter().zip(a_prev).skip(1) {
+                    acc += w_ij * a_j;
+                }
+                let z_i = acc + b[i];
+                z.push(z_i);
+                a.push(activation.apply(z_i));
+            }
+            pre.push(z);
+            post.push(a);
+        }
+
+        (pre, post)
+    }
+
+    /// The pre-#1300-follow-up `forward_cache`, built on `nalgebra` products: the
+    /// reference the slice-loop version is pinned bit-identical to. Test-only.
+    #[cfg(test)]
+    fn forward_cache_nalgebra(
+        &self,
+        x: &[f64],
+        weights: &[f64],
+    ) -> (Vec<DVector<f64>>, Vec<DVector<f64>>) {
         let l_max = self.layers.len() - 1;
         let mut pre = Vec::with_capacity(l_max);
         let mut post = Vec::with_capacity(l_max);
@@ -759,6 +826,59 @@ impl MlpMapper {
         }
 
         (pre, post)
+    }
+
+    /// The pre-#1300-follow-up backprop (`nalgebra` transpose product for the adjoint),
+    /// the reference `jacobian_matches_nalgebra_reference` pins the slice-loop version
+    /// against. Test-only.
+    #[cfg(test)]
+    fn jacobian_nalgebra(&self, x: &[f64], weights: &[f64], preactivation: bool) -> DMatrix<f64> {
+        let (pre, post) = self.forward_cache_nalgebra(x, weights);
+        let n_out = self.n_outputs();
+        let mut jac = DMatrix::<f64>::zeros(n_out, self.n_params);
+        for k in 0..n_out {
+            let mut adjoint = DVector::<f64>::zeros(n_out);
+            adjoint[k] = 1.0;
+            for l in (1..self.layers.len()).rev() {
+                let is_output_layer = l == self.layers.len() - 1;
+                let activation = if is_output_layer {
+                    self.output_activation
+                } else {
+                    self.hidden_activation
+                };
+                let z_l = &pre[l - 1];
+                let dz_l = if preactivation && is_output_layer {
+                    adjoint.clone()
+                } else {
+                    let d: DVector<f64> = DVector::from_iterator(
+                        self.layers[l],
+                        z_l.iter().map(|&z| activation.derivative(z)),
+                    );
+                    adjoint.component_mul(&d)
+                };
+                let a_prev = if l == 1 {
+                    DVector::<f64>::from_column_slice(x)
+                } else {
+                    post[l - 2].clone()
+                };
+                let w_start = self.offsets[l - 1];
+                let n_l = self.layers[l];
+                let n_lm1 = self.layers[l - 1];
+                for i in 0..n_l {
+                    let dz_i = dz_l[i];
+                    let row_offset = w_start + i * n_lm1;
+                    for j in 0..n_lm1 {
+                        jac[(k, row_offset + j)] = dz_i * a_prev[j];
+                    }
+                    jac[(k, w_start + n_l * n_lm1 + i)] = dz_i;
+                }
+                if l > 1 {
+                    let w_l = self.weight_matrix(weights, l);
+                    adjoint = w_l.transpose() * dz_l;
+                }
+            }
+        }
+        jac
     }
 
     fn check_shapes(&self, x: &[f64], weights: &[f64]) -> Result<(), NnError> {
@@ -1029,6 +1149,25 @@ impl NamedMlpMapper {
     ) -> Result<DMatrix<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
         self.mlp.jacobian_preactivation(&x, weights)
+    }
+
+    /// Post-activation Jacobian `∂a_L/∂weights` (`n_outputs × n_weights`) at this
+    /// covariate snapshot, with the same zero-fill input construction as
+    /// [`forward_raw`](Self::forward_raw) — the output-side twin of
+    /// [`jacobian_preactivation_raw`](Self::jacobian_preactivation_raw).
+    ///
+    /// The `[individual_parameters]` program reads the *activated* output (`a_L`, what
+    /// `Op::PushNnOutput` pushes), so a chain rule that seeds the program on those
+    /// outputs (`ModelNnAxisGuard`) needs `∂a_L/∂w`, activation derivative included.
+    /// The pre-activation variant exists for the bias finite-difference identity, which
+    /// is a different chain and would need dividing back through `f'(z)`.
+    pub(crate) fn jacobian_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Result<DMatrix<f64>, NnError> {
+        let x = self.build_input_vec_zero_fill(covariates);
+        self.mlp.jacobian(&x, weights)
     }
 
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
@@ -1497,6 +1636,88 @@ impl NnRegularizer {
 
 #[cfg(test)]
 mod tests {
+    /// Deterministic pseudo-random weights/inputs (LCG) — no rand dependency, and
+    /// the same stream on every platform so a bit-identity failure reproduces.
+    fn lcg(seed: &mut u64) -> f64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+
+    /// The slice-loop `forward_cache` is a value-preserving rewrite of the `nalgebra`
+    /// version: every pre- and post-activation, for every layer, must be **bit**-equal
+    /// across a spread of shapes and activations — the accumulation order is the
+    /// argument, and this is the check that the argument holds on this platform.
+    #[test]
+    fn forward_cache_matches_nalgebra_reference() {
+        let shapes: [&[usize]; 5] = [&[1, 1], &[2, 3, 2], &[2, 8, 3], &[4, 8, 8, 5], &[3, 5, 1]];
+        let acts = [
+            (super::Activation::Tanh, super::Activation::Softplus),
+            (super::Activation::Relu, super::Activation::Identity),
+            (super::Activation::Sigmoid, super::Activation::Sigmoid),
+        ];
+        let mut seed = 0x1300u64;
+        let mut checked = 0usize;
+        for shape in shapes {
+            for &(hidden, output) in &acts {
+                let mlp = super::MlpMapper::new(shape.to_vec(), hidden, output).unwrap();
+                for _ in 0..8 {
+                    let w: Vec<f64> = (0..mlp.n_weights()).map(|_| 1.7 * lcg(&mut seed)).collect();
+                    let x: Vec<f64> = (0..mlp.n_inputs()).map(|_| 3.0 * lcg(&mut seed)).collect();
+                    let (pre, post) = mlp.forward_cache(&x, &w);
+                    let (pre_r, post_r) = mlp.forward_cache_nalgebra(&x, &w);
+                    for l in 0..pre.len() {
+                        assert_eq!(
+                            pre[l].as_slice(),
+                            pre_r[l].as_slice(),
+                            "pre-activation, layer {l}, shape {shape:?}"
+                        );
+                        assert_eq!(
+                            post[l].as_slice(),
+                            post_r[l].as_slice(),
+                            "post-activation, layer {l}, shape {shape:?}"
+                        );
+                        checked += pre[l].len();
+                    }
+                    assert_eq!(
+                        mlp.forward(&x, &w).unwrap().as_slice(),
+                        post_r.last().unwrap().as_slice()
+                    );
+                }
+            }
+        }
+        assert!(checked > 500, "fixture too small ({checked} values)");
+    }
+
+    /// Same for the backprop Jacobian, both seeds (post- and pre-activation).
+    #[test]
+    fn jacobian_matches_nalgebra_reference() {
+        let shapes: [&[usize]; 4] = [&[2, 3, 2], &[2, 8, 3], &[4, 8, 8, 5], &[3, 5, 1]];
+        let mut seed = 0x1301u64;
+        for shape in shapes {
+            let mlp = super::MlpMapper::new(
+                shape.to_vec(),
+                super::Activation::Tanh,
+                super::Activation::Softplus,
+            )
+            .unwrap();
+            for _ in 0..6 {
+                let w: Vec<f64> = (0..mlp.n_weights()).map(|_| 1.7 * lcg(&mut seed)).collect();
+                let x: Vec<f64> = (0..mlp.n_inputs()).map(|_| 3.0 * lcg(&mut seed)).collect();
+                for pre in [false, true] {
+                    let got = mlp.jacobian_impl(&x, &w, pre).unwrap();
+                    let want = mlp.jacobian_nalgebra(&x, &w, pre);
+                    assert_eq!(
+                        got.as_slice(),
+                        want.as_slice(),
+                        "shape {shape:?}, preactivation {pre}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     use approx::assert_relative_eq;
 
@@ -2892,12 +3113,15 @@ mod regularizer_fit_tests {
     ///
     /// The robust, deterministic signal is the **fitted weight-block norm**: L2
     /// adds `2λw` to the weight gradient, so a heavier λ pulls the optimum's
-    /// weights closer to 0 (monotonically).
+    /// weights to the optimizer's floor. What is asserted is that floor and not
+    /// an ordering *between* the two λ > 0 fits — see the comment on
+    /// `REGULARIZED_NORM_FLOOR` below, which is the assertion #1277 reported
+    /// failing.
     ///
     /// The modulator variance is the *effect* being claimed, and it is only a
     /// meaningful check when the λ = 0 fit actually produces spread to remove. On
     /// this null-covariate dataset the unregularized fit invents a large spurious
-    /// CL modulator variance (~480 across subjects) — precisely the overfitting
+    /// CL modulator variance — precisely the overfitting
     /// `nn_l2` exists to suppress — and L2 collapses it to ~0. Asserting both ends
     /// keeps the oracle non-degenerate in the sense CLAUDE.md requires: an
     /// assertion that the regularized modulator is flat is worthless if the
@@ -2924,12 +3148,27 @@ mod regularizer_fit_tests {
     fn l2_shrinks_weights_and_modulator_variation() {
         let (model, options, population) = load();
 
+        // Every λ must run to convergence for its fitted weight norm to mean
+        // anything: #1277 was three fits whose weight norms were compared without
+        // anyone asking whether the optimizer had finished, and two of them had
+        // not — L-BFGS quit at eval 12 with the trace still falling ~2600 OFV per
+        // eval, so the "fitted" norms below were wherever the stall happened to
+        // land. Assert it here rather than reading it off the norms, which is a
+        // symptom and a weak one: the λ=0 stall reported ‖W‖² = 287.9 against a
+        // converged 15340.6, a difference no ordering check can distinguish from
+        // a second local optimum.
         let fit_at = |lambda: f64| -> Vec<f64> {
             let mut o = options.clone();
             o.nn_l2_lambda = lambda;
-            crate::fit(&model, &population, &model.default_params, &o)
-                .unwrap_or_else(|e| panic!("fit at λ={lambda} failed: {e}"))
-                .theta
+            let r = crate::fit(&model, &population, &model.default_params, &o)
+                .unwrap_or_else(|e| panic!("fit at λ={lambda} failed: {e}"));
+            assert!(
+                r.converged,
+                "fit at λ={lambda} must converge for its weight norm to be a fitted \
+                 quantity at all (OFV {:.4}); warnings: {:?}",
+                r.ofv, r.warnings
+            );
+            r.theta
         };
 
         let t0 = fit_at(0.0);
@@ -2946,43 +3185,75 @@ mod regularizer_fit_tests {
             cl_modulator_variance(&model, &population, &t_mid),
             cl_modulator_variance(&model, &population, &t_big),
         );
+        // Printed in scientific notation because the quantities that matter here
+        // are the *regularized* ones, and at ~1e-9 a fixed-point `{:.5}` renders
+        // every one of them as `0.00000` — which is how #1277's failure message
+        // came to read `2225.50764 → 0.00000 → 0.03844`, hiding that the two
+        // numbers being ordered were both at the optimizer's floor.
         eprintln!(
-            "weight ‖W‖²: λ=0 {n0:.5}, λ=5 {n_mid:.5}, λ=100 {n_big:.5}\n\
-             CL modulator var: λ=0 {v0:.6}, λ=5 {v_mid:.6}, λ=100 {v_big:.6}"
+            "weight ‖W‖²: λ=0 {n0:e}, λ=5 {n_mid:e}, λ=100 {n_big:e}\n\
+             CL modulator var: λ=0 {v0:e}, λ=5 {v_mid:e}, λ=100 {v_big:e}"
         );
 
-        // Decisive signal: the fitted weight norm shrinks strongly and
-        // monotonically with λ (observed here ~2159 → ~0.004 → ~0.003). This is
-        // the guaranteed mechanism by which L2 flattens the covariate→modulator
-        // map.
+        // The baseline must have weights worth shrinking. Measured: 1.534e4.
         assert!(
-            n_mid <= n0 + 1e-9 && n_big <= n_mid + 1e-9,
-            "weight norm must be non-increasing in λ (‖W‖²: {n0:.5} → {n_mid:.5} → {n_big:.5})"
-        );
-        assert!(
-            n_big < n0 * 0.5,
-            "heavy L2 (λ=100) must more than halve the fitted weight norm \
-             ({n_big:.5} vs λ=0 {n0:.5})"
+            n0 > 1.0,
+            "the λ=0 fit must leave a weight block for L2 to shrink \
+             (‖W‖² {n0:e}); a baseline already at zero makes every check below \
+             vacuous"
         );
 
-        // The unregularized fit must actually overfit — otherwise the flatness
-        // check below passes against a baseline that was already flat and proves
-        // nothing.
+        // Decisive signal: heavy L2 drives the fitted weight norm to the
+        // optimizer's floor — twelve orders of magnitude below the λ=0 baseline.
+        //
+        // **Not** asserted as an ordering `n_big <= n_mid`, which is what #1277
+        // reported failing (`0.00000 → 0.03844`). Both regularized norms sit at
+        // that floor, so which of the two is smaller is set by the path BOBYQA
+        // and L-BFGS happen to take, not by λ, and the comparison flips between
+        // platforms while saying nothing about the regularizer. The floor itself
+        // is the stronger claim and the stable one: it implies both orderings
+        // against `n0` and survives either sign of the noise.
+        //
+        // Measured (macOS/arm64, all three fits converged): λ=0 1.534e4,
+        // λ=5 4.03e-8, λ=100 5.92e-11 — worst realised 4.03e-8, so the bound
+        // below carries ~2500x headroom. It still discriminates: #1277's own
+        // λ=100 stall landed at 1.16e-3, an order of magnitude *above* it.
+        //
+        // The ubuntu/x86_64 *values* are not recorded here because a green
+        // `cargo test` captures this test's own trace; what is confirmed on that
+        // platform is the bound, on the `Slow regression tests (nn)` leg of run
+        // 35268862787. Print the trace with `--nocapture` before retuning it.
+        const REGULARIZED_NORM_FLOOR: f64 = 1e-4;
         assert!(
-            v0 > 1.0,
-            "the λ=0 fit must invent real spurious CL spread for this test to have \
-             a baseline to remove (var {v0:.6}); a near-zero unregularized variance \
-             means the fixture is degenerate, not that L2 worked"
+            n_mid < REGULARIZED_NORM_FLOOR && n_big < REGULARIZED_NORM_FLOOR,
+            "L2 must drive the fitted weight norm to ~0 at both λ > 0 \
+             (‖W‖²: {n0:e} → {n_mid:e} → {n_big:e}, floor {REGULARIZED_NORM_FLOOR:e})"
         );
 
-        // The effect: L2 collapses that spurious spread toward a constant map.
+        // The effect: L2 collapses the spurious spread toward a constant map.
         // Both regularized fits must be flat; their ordering *relative to each
-        // other* is not asserted, because at ~1e-9 the difference between them is
-        // float noise rather than an effect of λ.
+        // other* is not asserted, for the same reason as the norms above — at
+        // ~1e-23 the difference between them is float noise rather than λ.
+        const FLAT_VAR_MAX: f64 = 1e-3;
         assert!(
-            v_mid < 1e-3 && v_big < 1e-3,
+            v_mid < FLAT_VAR_MAX && v_big < FLAT_VAR_MAX,
             "L2 must collapse the spurious CL modulator spread \
-             ({v0:.6} → {v_mid:.6} → {v_big:.6})"
+             ({v0:e} → {v_mid:e} → {v_big:e})"
+        );
+
+        // ...and the unregularized fit must actually overfit, or the flatness
+        // check above passes against a baseline that was already flat and proves
+        // nothing. Stated relative to `FLAT_VAR_MAX` rather than as a bare `> 1.0`:
+        // the λ=0 optimum on this null-covariate dataset is one of several the
+        // optimizer can reach, so its absolute spread moves between platforms
+        // (1.245 measured here against the ~480 the fixture was written on) while
+        // the gap to the regularized fits does not — those sit at 1e-23, twenty
+        // orders below either. 100x leaves ~12x headroom on the realised 1.245.
+        assert!(
+            v0 > 100.0 * FLAT_VAR_MAX,
+            "the λ=0 fit must invent real spurious CL spread for this test to have \
+             a baseline to remove (var {v0:e}); a near-zero unregularized variance \
+             means the fixture is degenerate, not that L2 worked"
         );
     }
     /// Each λ must act alone. `nn_l2` on its own is the likeliest real

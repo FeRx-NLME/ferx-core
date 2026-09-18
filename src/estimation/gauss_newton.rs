@@ -64,11 +64,15 @@ pub fn run_foce_gn(
     let mut trust_radius: f64 = 1.0; // TR initial radius (in scaled space)
     let delta_max: f64 = 10.0; // TR maximum radius
 
-    let bounds = compute_bounds(init_params);
-    let mut x = pack_params(init_params);
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        fixed: fixed_mask,
+        // #1307's pack-move list is not this caller's object.
+        moves: _,
+    } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x, &bounds);
     let n_packed = x.len();
-    let fixed_mask = packed_fixed_mask(init_params);
 
     // Scaling: computed once from initial x; x itself stays in real packed space
     // throughout the GN loop. Scaling only affects the linear system solve so
@@ -86,6 +90,11 @@ pub fn run_foce_gn(
     // curvature in the BHHH system; `ofv_clean` — the −2LL at the same point —
     // is what the trace, checkpoint, verbose lines and the reported OFV carry.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    // Parameter priors (#254), on the same contract. Their curvature is an exact
+    // constant `2/s²` diagonal, so unlike the NN smoothness term there is no
+    // Gauss–Newton approximation involved — the BHHH system sees the true
+    // Hessian of this part of the objective.
+    let priors = crate::estimation::outer_optimizer::build_prior_set(model, init_params);
 
     // BHHH Information-matrix approximation degrades as the censoring fraction
     // grows — each censored row contributes less Fisher information than its
@@ -137,13 +146,15 @@ pub fn run_foce_gn(
             &kappas,
             options.interaction,
         );
-    let mut ofv = ofv_clean + nn_reg.penalty_value(&params.theta);
+    let mut ofv = ofv_clean + nn_reg.penalty_value(&params.theta) + priors.penalty(&x);
 
     if verbose {
         eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv_clean);
     }
 
     let mut converged = false;
+    // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
+    let mut best = crate::estimation::outer_optimizer::BestPoint::new();
 
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -175,6 +186,13 @@ pub fn run_foce_gn(
             let theta_x = unpack_params(&x, init_params).theta;
             nn_reg.add_packed_gradient(&theta_x, grad.as_mut_slice());
             nn_reg.add_packed_hessian(&theta_x, &mut |i, j, v| h_bhhh[(i, j)] += v);
+        }
+        // Parameter priors (#254): same two contributions, already in packed
+        // space. Guarded on `is_active` for the same reason — an unpriored fit
+        // must take a byte-identical path.
+        if priors.is_active() {
+            priors.add_gradient(&x, grad.as_mut_slice());
+            priors.add_hessian(&mut |i, j, v| h_bhhh[(i, j)] += v);
         }
 
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
@@ -290,7 +308,8 @@ pub fn run_foce_gn(
                 &kap_try,
                 options.interaction,
             );
-        let ofv_try = ofv_try_clean + nn_reg.penalty_value(&params_try.theta);
+        let ofv_try =
+            ofv_try_clean + nn_reg.penalty_value(&params_try.theta) + priors.penalty(&x_try);
 
         // TR ratio: actual OFV decrease vs quadratic model decrease.
         // rho < 0 or non-finite OFV → reject.
@@ -384,10 +403,16 @@ pub fn run_foce_gn(
             );
         }
 
-        // Checkpoint (#755): persist the accepted point periodically. `x` is
+        // Checkpoint (#755): persist the best accepted point periodically. `x` is
         // already the packed vector, so this is alloc-free until a write is due.
+        // A trust-region step is only accepted at `rho >= 0.25`, i.e. on a real
+        // reduction in `ofv`, so the incumbent is normally this iteration's
+        // point; tracking it explicitly still matters when the penalized `ofv`
+        // ranked here and the clean OFV written diverge under NN regularization,
+        // and keeps every driver on one rule (#1317).
+        best.observe(iter, &x, ofv, ofv_clean);
         if crate::io::checkpoint::is_due() {
-            crate::io::checkpoint::maybe_write(iter, ofv_clean, &x);
+            best.write_checkpoint(|best_x| best_x.to_vec());
         }
 
         if verbose {
@@ -443,7 +468,15 @@ pub fn run_foce_gn(
     // penalized under covariate-NN regularization (see `FitResult::final_gradient`).
     let mut grad_final = grad_final.as_slice().to_vec();
     nn_reg.add_packed_gradient(&gn_params.theta, &mut grad_final);
-    let mut final_gradient: Option<Vec<f64>> = Some(grad_final);
+    priors.add_gradient(&x, &mut grad_final);
+    // The reported gradient and *where it came from*, carried as one value rather
+    // than two variables kept in step by hand. They are only meaningful together:
+    // a vector from one phase under the other phase's label is worse than no
+    // gradient at all, and the two-variable spelling let exactly that happen —
+    // see the polish merge below. `zip`/`unzip` at the two ends then encode the
+    // invariant `final_gradient.is_some() == final_gradient_source.is_some()`
+    // structurally, instead of restating it at each `OuterResult` literal.
+    let mut final_gradient: Option<(Vec<f64>, String)> = Some((grad_final, "optimizer".into()));
 
     // Penalized: this is what the FOCEI polish below is ranked against.
     let gn_ofv = ofv;
@@ -476,13 +509,26 @@ pub fn run_foce_gn(
             wall_time_secs: covariance_wall_time_secs,
             warnings: cov_warnings,
             sir_fallback_proposal,
+            method: covariance_method,
         } = out;
         warnings.extend(cov_warnings);
+
+        // #1303: `converged` here is the LM loop's own stop rule (a small
+        // parameter/objective step), which a run whose objective went `NaN`
+        // partway can still satisfy. Gate it on the objective this result
+        // publishes.
+        if let Some(w) = crate::estimation::outer_optimizer::gate_converged_on_objective(
+            &mut converged,
+            gn_ofv_clean,
+        ) {
+            warnings.push(w);
+        }
 
         if verbose {
             eprintln!("FOCE-GN completed. Final OFV = {:.4}", gn_ofv_clean);
         }
 
+        let (final_gradient, final_gradient_source) = final_gradient.unzip();
         return OuterResult {
             params: gn_params,
             ofv: gn_ofv_clean,
@@ -492,6 +538,7 @@ pub fn run_foce_gn(
             h_matrices,
             kappas,
             covariance_matrix,
+            covariance_method,
             covariance_wall_time_secs,
             warnings,
             saem_mu_ref_m_step_evals_saved: None,
@@ -500,6 +547,7 @@ pub fn run_foce_gn(
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             final_gradient,
+            final_gradient_source,
             sir_fallback_proposal,
             impmap_trace: None,
             bayes: None,
@@ -546,7 +594,11 @@ pub fn run_foce_gn(
     // is added back before the compare — comparing clean against clean would
     // throw the regularized polish away whenever the penalty bit (a penalized
     // optimum's clean OFV is ≥ the unregularized GN optimum's by construction).
-    let polish_penalized = polish_result.ofv + nn_reg.penalty_value(&polish_result.params.theta);
+    let polish_penalized = polish_result.ofv
+        + nn_reg.penalty_value(&polish_result.params.theta)
+        + priors.penalty(&crate::estimation::parameterization::pack_params(
+            &polish_result.params,
+        ));
     if polish_penalized < gn_ofv {
         if verbose {
             eprintln!(
@@ -560,7 +612,27 @@ pub fn run_foce_gn(
         final_h_mats = polish_result.h_matrices;
         final_kappas = polish_result.kappas;
         converged = polish_result.converged || converged;
-        final_gradient = polish_result.final_gradient.or(final_gradient);
+        // The polish's estimates are the ones being reported, so the polish's
+        // gradient is the only one that may be reported with them — *including*
+        // when the polish has none, which is why this is an unconditional
+        // transfer and not an `.or(…)`.
+        //
+        // The `.or(…)` it replaces (and the `is_some()` guard that replaced that)
+        // kept the GN phase's gradient whenever the polish supplied none —
+        // reachable under `optimizer = bobyqa` with `report_final_gradient =
+        // false`, or with the built-in BFGS — and reported a vector evaluated at
+        // the *pre-polish* GN point against post-polish estimates, labelled
+        // `"optimizer"`. Finite, plausible, and wrong at a point nobody asked
+        // about: precisely what `FitResult::final_gradient`'s "at the reported
+        // estimates" contract exists to exclude. `None` is the honest answer when
+        // the accepted phase computed nothing.
+        //
+        // `zip` also enforces the pairing: a polish that somehow carried a
+        // gradient without a source (or the reverse) yields `None` rather than a
+        // half-populated pair.
+        final_gradient = polish_result
+            .final_gradient
+            .zip(polish_result.final_gradient_source);
     } else {
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
@@ -596,13 +668,24 @@ pub fn run_foce_gn(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = out;
     warnings.extend(cov_warnings);
+
+    // #1303 — the hybrid's verdict is `polish_result.converged || converged`, an
+    // OR that can keep a `true` from whichever half did *not* supply `final_ofv`.
+    // Gate on the objective actually published.
+    if let Some(w) =
+        crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, final_ofv)
+    {
+        warnings.push(w);
+    }
 
     if verbose {
         eprintln!("FOCE-GN completed. Final OFV = {:.4}", final_ofv);
     }
 
+    let (final_gradient, final_gradient_source) = final_gradient.unzip();
     OuterResult {
         params: final_params,
         ofv: final_ofv,
@@ -612,6 +695,7 @@ pub fn run_foce_gn(
         h_matrices: final_h_mats,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
@@ -620,6 +704,7 @@ pub fn run_foce_gn(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient,
+        final_gradient_source,
         sir_fallback_proposal,
         impmap_trace: None,
         bayes: None,
@@ -945,16 +1030,14 @@ fn subject_nll_pop_grad_analytical(
     let omega_start = n_theta;
     // Single source: same column-major lower-tri order as `pack_params`.
     let omega_entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, template.omega.diagonal);
-    let free_mask = &template.omega.free_mask;
 
     for (ko, &(row, col)) in omega_entries.iter().enumerate() {
         let k = omega_start + ko;
+        // Held: FIX, or a structural zero (cross-block off-diagonal of a mixed
+        // block + diagonal Ω). `packed_fixed_mask` carries both since #1018, so
+        // this is the only gate — a second `free_mask` test here would reject
+        // exactly the same entries and hide a mutation of either.
         if fixed_mask[k] {
-            continue;
-        }
-        // Structural zero (cross-block off-diagonal in a multi-block_omega
-        // declaration): same reasoning as the Laplace path.
-        if !free_mask[(row, col)] {
             continue;
         }
         if row == col {
@@ -1411,19 +1494,14 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     // Single source: same column-major lower-tri order as `pack_params`.
     let omega_entries: Vec<(usize, usize)> = lower_tri_entries(n_eta, template.omega.diagonal);
     let l_omega = &omega.chol;
-    let free_mask = &template.omega.free_mask;
 
     for (ko, &(row, col)) in omega_entries.iter().enumerate() {
         let k = omega_start + ko;
+        // Held: FIX, or a structural zero (the model declares L[row, col] ≡ 0,
+        // so skipping it keeps the outer optimiser from pulling the slot away
+        // from zero on the strength of an in-block-only chain rule).
+        // `packed_fixed_mask` carries both since #1018 — one gate, not two.
         if fixed_mask[k] {
-            continue;
-        }
-        // Structural zero (cross-block off-diagonal in a multi-block_omega
-        // declaration): the model declares L[row, col] ≡ 0, so its gradient
-        // is zero by construction. Skipping here prevents the outer
-        // optimiser from pulling these slots away from zero on the strength
-        // of an in-block-only chain rule.
-        if !free_mask[(row, col)] {
             continue;
         }
         // v = L[:,col]
@@ -2066,6 +2144,8 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "gn_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -2095,6 +2175,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
@@ -2270,7 +2351,7 @@ mod tests {
                 "ETA_CL".to_string(),
                 crate::types::MuRef {
                     theta_name: "TVCL".to_string(),
-                    log_transformed: true,
+                    transform: MuTransform::Log,
                 },
             );
             m
@@ -3129,6 +3210,8 @@ mod tests {
             mixture: None,
         };
         let model = CompiledModel {
+            priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "gn_block_omega_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -3158,6 +3241,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
@@ -3423,6 +3507,8 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            priors: Vec::new(),
+            prior_from_fit: None,
             covariate_model: None,
             name: "iov_gn_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -3453,6 +3539,7 @@ mod tests {
             kappa_init_as_sd: vec![false],
             kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
+            covariate_mu_refs: Vec::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
             pk_indices: vec![0, 1],
@@ -3624,7 +3711,7 @@ mod tests {
                 "ETA_CL".to_string(),
                 crate::types::MuRef {
                     theta_name: "TVCL".to_string(),
-                    log_transformed: true,
+                    transform: MuTransform::Log,
                 },
             );
             m
@@ -4022,6 +4109,151 @@ mod tests {
             !res.warnings.iter().any(is_targeted),
             "mixed-effects gn must not carry the #1006 warning: {:?}",
             res.warnings
+        );
+    }
+
+    /// `gn_hybrid` options with the FOCEI polish reached through `run_foce_gn`.
+    fn hybrid_opts(report_final_gradient: bool) -> FitOptions {
+        FitOptions {
+            method: crate::types::EstimationMethod::FoceGnHybrid,
+            optimizer: crate::types::Optimizer::Bobyqa,
+            outer_maxiter: 30,
+            run_covariance_step: false,
+            report_final_gradient,
+            ..Default::default()
+        }
+    }
+
+    /// When the FOCEI polish wins, the reported gradient must be the **polish's**
+    /// — including when the polish has none.
+    ///
+    /// The merge used to keep the GN phase's gradient whenever the polish supplied
+    /// one of `None`, which `optimizer = bobyqa` + `report_final_gradient = false`
+    /// reaches directly. The reported estimates are then the polish's while the
+    /// reported gradient was evaluated at the *pre-polish* GN point, and labelled
+    /// `"optimizer"` on top: finite, plausible, and about a point nobody asked
+    /// about. `FitResult::final_gradient` is documented as the gradient **at the
+    /// reported estimates**, so `None` is the only honest answer here (reviewer
+    /// catch on #1380).
+    #[test]
+    fn an_accepted_polish_with_no_gradient_reports_none_not_the_gn_phase_vector() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = hybrid_opts(false);
+
+        // Precondition, established independently of the fields under test: the
+        // polish has to actually win on this fixture, or the assertions below are
+        // about a branch that never ran. Pure GN on the identical model/data/budget
+        // is the control.
+        let pure = run_foce_gn(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..opts.clone()
+            },
+        );
+        let hybrid = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            hybrid.ofv < pure.ofv,
+            "fixture precondition: the FOCEI polish must be accepted, or this test \
+             exercises the `else` arm — pure GN {:.6}, hybrid {:.6}",
+            pure.ofv,
+            hybrid.ofv
+        );
+        // And the control confirms the GN phase *does* produce a gradient, so
+        // "None" below is the transfer working and not a phase that had nothing.
+        assert!(
+            pure.final_gradient.is_some(),
+            "fixture precondition: the GN phase must have a gradient to leak"
+        );
+
+        assert!(
+            hybrid.final_gradient.is_none(),
+            "the accepted polish computed no gradient, so there is none to report; \
+             got the GN phase's {:?}",
+            hybrid.final_gradient
+        );
+        assert!(
+            hybrid.final_gradient_source.is_none(),
+            "and no provenance to claim for it, got {:?}",
+            hybrid.final_gradient_source
+        );
+    }
+
+    /// The other half of the same transfer: when the polish *does* carry a
+    /// gradient it must arrive with the polish's own label. The FOCEI polish is an
+    /// ordinary NLopt run, so under a derivative-free `optimizer` that label is
+    /// `"finite_difference"` (#997 §1) — **not** the `"optimizer"` the GN phase
+    /// would have claimed. Without this arm, "transfer both fields unconditionally"
+    /// is satisfied by an implementation that hard-codes the GN label.
+    #[test]
+    fn an_accepted_polish_reports_its_own_gradient_under_its_own_label() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = hybrid_opts(true);
+
+        let pure = run_foce_gn(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..opts.clone()
+            },
+        );
+        let hybrid = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            hybrid.ofv < pure.ofv,
+            "fixture precondition: the FOCEI polish must be accepted — pure GN \
+             {:.6}, hybrid {:.6}",
+            pure.ofv,
+            hybrid.ofv
+        );
+        assert_eq!(
+            hybrid.final_gradient_source.as_deref(),
+            Some("finite_difference"),
+            "a derivative-free polish reports the post-fit FD gradient, not the GN \
+             phase's optimizer gradient"
+        );
+        assert!(hybrid.final_gradient.is_some());
+    }
+
+    /// The GN phase reports its own gradient under its own `"optimizer"` label —
+    /// the value the polish merge above overwrites, and the one a *rejected*
+    /// polish leaves standing.
+    ///
+    /// There is no separate rejected-polish test because after the fix that arm
+    /// contains no gradient code at all: it neither reads nor writes the pair, so
+    /// its behaviour is whatever the initializer left, which is exactly what this
+    /// test pins. (It is also not reachable on this fixture — the polish improves
+    /// 57706.3 → 28.6 from every start tried, and the polish budget is hard-coded
+    /// to 100 evaluations inside `run_foce_gn`, so it cannot be starved into
+    /// losing.) A future edit that adds gradient handling to the `else` arm needs
+    /// its own fixture; this one would not see it.
+    #[test]
+    fn the_gn_phase_reports_its_own_gradient_under_the_optimizer_label() {
+        let model = make_model();
+        let pop = make_population();
+        let res = run_foce_gn(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::FoceGn,
+                ..hybrid_opts(false)
+            },
+        );
+        assert!(
+            res.final_gradient.is_some(),
+            "GN computes a gradient every iteration; there is nothing to recompute"
+        );
+        assert_eq!(
+            res.final_gradient_source.as_deref(),
+            Some("optimizer"),
+            "and `report_final_gradient = false` must not suppress a gradient the \
+             optimizer produced anyway"
         );
     }
 }

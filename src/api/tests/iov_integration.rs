@@ -29,6 +29,8 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "iov_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -60,6 +62,7 @@ fn make_iov_model() -> CompiledModel {
         kappa_init_as_sd: vec![false],
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],

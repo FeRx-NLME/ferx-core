@@ -150,6 +150,8 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         name: "iov_grad_test".into(),
         pk_model: PkModel::OneCptIv,
@@ -198,6 +200,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         kappa_init_as_sd: vec![false],
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],

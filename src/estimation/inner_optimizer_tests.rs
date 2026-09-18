@@ -1,5 +1,43 @@
+#![allow(unexpected_cfgs)]
+
 use super::*;
 use std::collections::HashMap;
+#[cfg(profiling_allocations)]
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+#[cfg(profiling_allocations)]
+struct CountingAllocator;
+
+#[cfg(profiling_allocations)]
+static ALLOCATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(profiling_allocations)]
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(profiling_allocations)]
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+#[cfg(profiling_allocations)]
+static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// An endpoint-only mixed-effects CTMM (#759): no `[structural_model]`, so no Gaussian
 /// data term and no PK provider — the inner objective is `½(η'Ω⁻¹η + log|Ω|) + D_ctmm(η)`.
@@ -107,6 +145,7 @@ mod ctmm_inner {
         let theta = &params.theta;
 
         for &eta0 in &[-0.4_f64, 0.0, 0.55] {
+            let err_keys = model.error_spec.obs_keys(&subject);
             let g = super::super::analytic_eta_nll_gradient_with_schedule(
                 &model,
                 &subject,
@@ -117,6 +156,10 @@ mod ctmm_inner {
                 &params.residual_correlations,
                 None,
                 None,
+                err_keys.as_ref(),
+                &mut Vec::new(),
+                &mut nalgebra::DVector::zeros(model.n_eta),
+                &mut nalgebra::DVector::zeros(model.n_eta),
             )
             .expect("endpoint-only CTMM is in analytic scope");
 
@@ -853,6 +896,334 @@ fn inner_solver_scaling_bench() {
     }
 }
 
+/// Pre-scratch-reuse dense BFGS, retained only as a bitwise regression oracle.
+fn legacy_dense_bfgs(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    let mut h_inv = DMatrix::identity(n, n);
+    let mut g = grad(x);
+    let mut f_cur = obj(x);
+    let mut first_step = true;
+
+    for _ in 0..max_iter {
+        let gnorm = grad_norm_metric(&g, None);
+        if first_step && gnorm > 1.0 {
+            h_inv *= 1.0 / gnorm;
+            first_step = false;
+        }
+        if gnorm < tol {
+            return true;
+        }
+
+        let g_vec = DVector::from_column_slice(&g);
+        let d_vec = -&h_inv * &g_vec;
+        let d: Vec<f64> = d_vec.iter().copied().collect();
+        if d.iter().zip(&g).map(|(di, gi)| di * gi).sum::<f64>() >= 0.0 {
+            h_inv = DMatrix::identity(n, n);
+            let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
+            let (alpha, f_new) = legacy_line_search(obj, x, &d, &g, n, f_cur);
+            if alpha == 0.0 {
+                return false;
+            }
+            for i in 0..n {
+                x[i] += alpha * d[i];
+            }
+            f_cur = f_new;
+            g = grad(x);
+            continue;
+        }
+
+        let (alpha, f_new) = legacy_line_search(obj, x, &d, &g, n, f_cur);
+        if alpha == 0.0 {
+            return false;
+        }
+        let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
+        for i in 0..n {
+            x[i] += s[i];
+        }
+        f_cur = f_new;
+
+        let g_new = grad(x);
+        let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
+        let s_vec = DVector::from_column_slice(&s);
+        let y_vec = DVector::from_column_slice(&y);
+        let sy = s_vec.dot(&y_vec);
+        if sy > 1e-12 {
+            let rho = 1.0 / sy;
+            let eye = DMatrix::identity(n, n);
+            let s_yt = rho * &s_vec * y_vec.transpose();
+            let y_st = rho * &y_vec * s_vec.transpose();
+            let s_st = rho * &s_vec * s_vec.transpose();
+            h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+        }
+        g = g_new;
+    }
+    false
+}
+
+fn legacy_line_search(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    d: &[f64],
+    g: &[f64],
+    n: usize,
+    f0: f64,
+) -> (f64, f64) {
+    let c1 = 1e-4;
+    let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
+    if !(dg < 0.0) || !dg.is_finite() {
+        return (0.0, f0);
+    }
+    let mut alpha = 1.0;
+    let mut x_new = vec![0.0; n];
+    for _ in 0..MAX_LINE_SEARCH_TRIALS {
+        for i in 0..n {
+            x_new[i] = x[i] + alpha * d[i];
+        }
+        let f_new = obj(&x_new);
+        if f_new.is_finite() && f_new <= f0 + c1 * alpha * dg {
+            return (alpha, f_new);
+        }
+        let denom = 2.0 * (f_new - f0 - dg * alpha);
+        let alpha_quad = if f_new.is_finite() && denom > 0.0 {
+            -dg * alpha * alpha / denom
+        } else {
+            0.5 * alpha
+        };
+        alpha = alpha_quad.clamp(0.1 * alpha, 0.5 * alpha);
+        if alpha < 1e-16 {
+            break;
+        }
+    }
+    (0.0, f0)
+}
+
+fn legacy_nelder_mead(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> bool {
+    let mut simplex = Vec::with_capacity(n + 1);
+    simplex.push(x.to_vec());
+    for i in 0..n {
+        let mut point = x.to_vec();
+        let delta = if point[i].abs() > 1e-8 {
+            0.05 * point[i].abs()
+        } else {
+            0.00025
+        };
+        point[i] += delta;
+        simplex.push(point);
+    }
+    let mut fvals: Vec<f64> = simplex.iter().map(|p| obj(p)).collect();
+
+    for _ in 0..max_iter {
+        let mut indices: Vec<usize> = (0..=n).collect();
+        indices.sort_by(|&a, &b| {
+            fvals[a]
+                .partial_cmp(&fvals[b])
+                .unwrap_or(std::cmp::Ordering::Greater)
+        });
+        let best = indices[0];
+        let worst = indices[n];
+        let second_worst = indices[n - 1];
+        if fvals[worst] - fvals[best] < tol {
+            x.copy_from_slice(&simplex[best]);
+            return true;
+        }
+
+        let mut centroid = vec![0.0; n];
+        for &idx in &indices[..n] {
+            for j in 0..n {
+                centroid[j] += simplex[idx][j];
+            }
+        }
+        for value in &mut centroid {
+            *value /= n as f64;
+        }
+
+        let reflected: Vec<f64> = (0..n)
+            .map(|j| centroid[j] + (centroid[j] - simplex[worst][j]))
+            .collect();
+        let fr = obj(&reflected);
+        if fr < fvals[second_worst] && fr >= fvals[best] {
+            simplex[worst] = reflected;
+            fvals[worst] = fr;
+            continue;
+        }
+        if fr < fvals[best] {
+            let expanded: Vec<f64> = (0..n)
+                .map(|j| centroid[j] + 2.0 * (reflected[j] - centroid[j]))
+                .collect();
+            let fe = obj(&expanded);
+            if fe < fr {
+                simplex[worst] = expanded;
+                fvals[worst] = fe;
+            } else {
+                simplex[worst] = reflected;
+                fvals[worst] = fr;
+            }
+            continue;
+        }
+
+        let contracted: Vec<f64> = (0..n)
+            .map(|j| centroid[j] + 0.5 * (simplex[worst][j] - centroid[j]))
+            .collect();
+        let fc = obj(&contracted);
+        if fc < fvals[worst] {
+            simplex[worst] = contracted;
+            fvals[worst] = fc;
+            continue;
+        }
+
+        let best_point = simplex[best].clone();
+        for i in 0..=n {
+            if i != best {
+                for j in 0..n {
+                    simplex[i][j] = best_point[j] + 0.5 * (simplex[i][j] - best_point[j]);
+                }
+                fvals[i] = obj(&simplex[i]);
+            }
+        }
+    }
+    let best = fvals
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater))
+        .map(|(i, _)| i)
+        .unwrap();
+    x.copy_from_slice(&simplex[best]);
+    false
+}
+
+fn run_dense_scratch_fixture(n: usize, legacy: bool) -> (bool, Vec<u64>, u64, usize, usize) {
+    let obj_evals = std::cell::Cell::new(0usize);
+    let grad_evals = std::cell::Cell::new(0usize);
+    let obj = |x: &[f64]| {
+        obj_evals.set(obj_evals.get() + 1);
+        x.iter()
+            .enumerate()
+            .map(|(i, &xi)| {
+                let target = (i + 1) as f64 / n as f64;
+                let residual = xi - target;
+                0.5 * (i + 1) as f64 * residual * residual + 0.01 * residual.powi(4)
+            })
+            .sum::<f64>()
+    };
+    let grad = |x: &[f64]| {
+        grad_evals.set(grad_evals.get() + 1);
+        x.iter()
+            .enumerate()
+            .map(|(i, &xi)| {
+                let target = (i + 1) as f64 / n as f64;
+                let residual = xi - target;
+                (i + 1) as f64 * residual + 0.04 * residual.powi(3)
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut x = vec![1.5; n];
+    let converged = if legacy {
+        legacy_dense_bfgs(&obj, &grad, &mut x, n, 200, 1e-10)
+    } else {
+        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, false)
+    };
+    let final_objective = obj(&x).to_bits();
+    (
+        converged,
+        x.iter().map(|v| v.to_bits()).collect(),
+        final_objective,
+        obj_evals.get(),
+        grad_evals.get(),
+    )
+}
+
+#[test]
+fn dense_bfgs_scratch_reuse_is_bitwise_identical_to_legacy() {
+    for n in [2, 4, 8] {
+        assert_eq!(
+            run_dense_scratch_fixture(n, false),
+            run_dense_scratch_fixture(n, true),
+            "dense BFGS changed its path at eta dimension {n}"
+        );
+    }
+}
+
+#[test]
+fn nelder_mead_scratch_reuse_is_bitwise_identical_to_legacy() {
+    for n in [2, 4, 8] {
+        let run = |legacy: bool| {
+            let evals = std::cell::Cell::new(0usize);
+            let obj = |x: &[f64]| {
+                evals.set(evals.get() + 1);
+                x.iter()
+                    .enumerate()
+                    .map(|(i, &xi)| {
+                        let residual = xi - (i + 1) as f64 / n as f64;
+                        (i + 1) as f64 * residual * residual + 0.01 * residual.powi(4)
+                    })
+                    .sum::<f64>()
+            };
+            let mut x = vec![1.5; n];
+            let converged = if legacy {
+                legacy_nelder_mead(&obj, &mut x, n, 2_000, 1e-12)
+            } else {
+                nelder_mead_minimize(&obj, &mut x, n, 2_000, 1e-12)
+            };
+            let final_objective = obj(&x).to_bits();
+            (
+                converged,
+                x.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                final_objective,
+                evals.get(),
+            )
+        };
+        assert_eq!(
+            run(false),
+            run(true),
+            "Nelder-Mead changed its path at eta dimension {n}"
+        );
+    }
+}
+
+#[test]
+#[cfg(profiling_allocations)]
+#[ignore = "allocation microbenchmark: run alone with --ignored --nocapture"]
+fn dense_bfgs_scratch_allocation_bench() {
+    for n in [2, 4, 8] {
+        ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        std::hint::black_box(run_dense_scratch_fixture(n, false));
+        let current = (
+            ALLOCATION_CALLS.load(Ordering::Relaxed),
+            ALLOCATED_BYTES.load(Ordering::Relaxed),
+        );
+
+        ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        std::hint::black_box(run_dense_scratch_fixture(n, true));
+        let legacy = (
+            ALLOCATION_CALLS.load(Ordering::Relaxed),
+            ALLOCATED_BYTES.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "n={n}: scratch={} allocs/{} bytes; legacy={} allocs/{} bytes",
+            current.0, current.1, legacy.0, legacy.1
+        );
+        assert!(
+            current.0 < legacy.0,
+            "scratch reuse must reduce allocations"
+        );
+        assert!(current.1 < legacy.1, "scratch reuse must reduce bytes");
+    }
+}
+
 /// The interpolating backtracking line search returns a step that satisfies
 /// the Armijo sufficient-decrease test and strictly lowers the objective,
 /// using only a handful of trial evaluations (the property the FOCEI inner
@@ -871,7 +1242,8 @@ fn line_search_finds_armijo_step_quickly() {
         evals.set(evals.get() + 1);
         obj(xx)
     };
-    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial);
     let evals = evals.get();
     assert!(alpha > 0.0, "a descent step must be found");
     let c1 = 1e-4;
@@ -897,7 +1269,8 @@ fn line_search_rejects_non_descent_direction() {
     let g = [2.0 * (x[0] - 3.0)]; // = −6
     let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
     let f0 = obj(&x);
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -918,12 +1291,13 @@ fn line_search_survives_non_finite_objective() {
     let f0 = 10.0;
     // Every trial step returns NaN — must not panic, must report no step.
     let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
-    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
     assert_eq!(f_new, f0, "baseline objective is returned unchanged");
     // +inf trials behave identically (never accepted, never a panic).
     let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
-    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, 1, f0);
+    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -938,7 +1312,8 @@ fn line_search_rejects_non_finite_direction() {
     let g = [-6.0];
     let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
     let f0 = obj(&x);
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, 1, f0);
+    let mut trial = [0.0];
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1124,8 +1499,18 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
     assert_eq!(n_start_rejected, 1);
 }
 
-#[test]
-fn test_frem_jacobian_overrides_fd_with_exact_values() {
+/// A minimal FREM model + subject: 3 etas (CL, V, COV_WT), and a subject with two PK
+/// observations plus one covariate pseudo-observation (`FREMTYPE = 100`, value 90,
+/// mapping to `theta[2]` = `TV_WT` and `eta[2]` = `ETA_WT_FREM`).
+///
+/// `default_params.theta[2]` is 90, i.e. the same value as the pseudo-observation, so a
+/// caller testing anything that reads `cov_obs − TV` must move one of the two first —
+/// at the default they are equal and a wrong answer is indistinguishable from a right one.
+///
+/// Shared by the Jacobian-override test and the cold-seed tests so the FREM shape is
+/// declared once: a `CompiledModel` literal is ~50 fields wide and a second copy would
+/// have to be edited on every field addition.
+fn frem_model_and_subject() -> (CompiledModel, Subject) {
     use crate::types::{
         DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
     };
@@ -1156,6 +1541,8 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         mixture: None,
     };
     let model = CompiledModel {
+        priors: Vec::new(),
+        prior_from_fit: None,
         covariate_model: None,
         has_conditional_eta_params: false,
         name: "frem_jac_test".into(),
@@ -1186,6 +1573,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         kappa_init_as_sd: vec![],
         kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
         pk_indices: vec![0, 1],
@@ -1252,6 +1640,13 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         obs_records: vec![],
     };
 
+    (model, subject)
+}
+
+#[test]
+fn test_frem_jacobian_overrides_fd_with_exact_values() {
+    let (model, subject) = frem_model_and_subject();
+
     let theta = [10.0, 100.0, 90.0];
     let eta = [0.1, -0.05, 2.5];
 
@@ -1268,6 +1663,86 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         jac[(0, 0)].abs() > 1e-10,
         "PK row: ∂Y/∂η_CL should be nonzero"
     );
+}
+
+// ── FREM-aware cold seed (#406 / #1349) ────────────────────────────
+
+/// The cold seed places each FREM covariate eta at its data-implied mode `cov_obs − TV`
+/// and leaves every other eta at zero.
+#[test]
+fn cold_seed_places_frem_covariate_etas_at_their_data_implied_mode() {
+    let (model, subject) = frem_model_and_subject();
+    let mut params = model.default_params.clone();
+    // The fixture ships `TV_WT` equal to the pseudo-observation, where the seed is 0 and
+    // indistinguishable from the plain zero vector this test exists to reject. Move it.
+    params.theta[2] = 72.0;
+
+    let seed = cold_eta_seed(&model, &subject, &params, 3);
+
+    // Non-degeneracy first: the quantity under test must not be zero, or the assertion
+    // below passes against the very behaviour it is meant to catch.
+    assert_eq!(subject.observations[2], 90.0);
+    assert!(
+        seed[2].abs() > 1.0,
+        "the seeded value must be far from 0, or this test passes under the \
+         pre-#1349 plain zero vector"
+    );
+    assert!(
+        (seed[2] - 18.0).abs() < 1e-12,
+        "covariate eta seeded at cov_obs − TV = 90 − 72 = 18, got {}",
+        seed[2]
+    );
+    // PK etas carry no pseudo-observation and stay at 0.
+    assert_eq!(seed[0], 0.0);
+    assert_eq!(seed[1], 0.0);
+}
+
+/// #1349 — the *fallback* has to use the same seed, not a plain zero vector.
+///
+/// This is the call site the fix is about: when the inner BFGS does not certify
+/// convergence, the FREM arm re-centres with a Nelder–Mead restart, and that restart used
+/// to start at η = 0. NM's initial simplex step at zero is 0.00025 per coordinate, so it
+/// cannot travel the 18 units this subject's covariate eta needs — it returned a point
+/// with the covariate eta still at ~0 and the PK etas carrying the block-Ω⁻¹ force that
+/// produces.
+///
+/// `max_iter = 1` is what forces the fallback: one BFGS iteration cannot reach a gradient
+/// norm below `tol`, so `bfgs_converged` is false and the restart runs. The assertion is
+/// on the covariate eta, which is the coordinate the two seeds disagree about.
+#[test]
+fn the_frem_nelder_mead_fallback_restarts_from_the_data_implied_seed() {
+    let (model, subject) = frem_model_and_subject();
+    let mut params = model.default_params.clone();
+    params.theta[2] = 72.0; // pseudo-obs is 90 → the covariate eta's mode is 18
+
+    let result = find_ebe(&model, &subject, &params, 1, 1e-12, None, None, 0);
+
+    // Precondition: the fallback must actually have run, or this test is an assertion
+    // about the ordinary BFGS path and the seed it exercises is the cold-start one.
+    assert!(
+        result.used_fallback,
+        "max_iter = 1 must leave the inner BFGS uncertified so the NM restart runs"
+    );
+    assert!(
+        (result.eta[2] - 18.0).abs() < 1.0,
+        "covariate eta should stay at its data-implied mode 18, got {} — a restart from \
+         a plain zero vector cannot travel there (#1349)",
+        result.eta[2]
+    );
+}
+
+/// A model with no `[frem]` config gets the plain zero vector, so every non-FREM caller
+/// (the cold start *and* the Nelder–Mead fallback seed) is bit-identical to the
+/// pre-#1349 `vec![0.0; n_eta]`.
+#[test]
+fn cold_seed_is_all_zeros_without_frem() {
+    let (mut model, subject) = frem_model_and_subject();
+    model.frem_config = None;
+    let params = model.default_params.clone();
+
+    let seed = cold_eta_seed(&model, &subject, &params, 3);
+
+    assert_eq!(seed, vec![0.0, 0.0, 0.0]);
 }
 
 #[test]
@@ -1537,4 +2012,121 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
             eta_fd[k]
         );
     }
+}
+
+/// A subject with an `EVID 3/4` reset makes `cacheable_schedule` return `Some`; a plain
+/// subject with neither a reset nor a time-varying covariate makes it return `None` (see
+/// `cacheable_schedule`'s guard). `run_inner_loop_warm_cached` must produce results
+/// bit-identical to the uncached `run_inner_loop_warm` in both cases — including when
+/// `build_schedule_cache`'s per-subject `Some`/`None` entries are mixed in the same
+/// population, which is the scenario that would expose an index misalignment between the
+/// cache and `population.subjects`.
+#[test]
+fn cached_schedule_inner_loop_matches_uncached() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("parse one_cpt_iv model");
+    let params = &model.default_params;
+
+    let obs_times = vec![1.0, 4.0, 8.0, 24.0];
+    let n = obs_times.len();
+    let no_reset_subject = Subject {
+        id: "no-reset".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: obs_times.clone(),
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 5.0, 3.0, 1.0],
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    let reset_subject = Subject {
+        id: "reset".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 4.0, 8.0, 13.0, 16.0, 20.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![8.0, 5.0, 3.0, 8.0, 5.0, 3.0],
+        obs_cmts: vec![1; 6],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: vec![12.0],
+        reset_covariates: Vec::new(),
+        cens: vec![0; 6],
+        occasions: vec![1; 6],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    };
+    assert!(!no_reset_subject.has_resets());
+    assert!(reset_subject.has_resets());
+
+    let population = Population {
+        subjects: vec![
+            no_reset_subject.clone(),
+            reset_subject.clone(),
+            no_reset_subject,
+            reset_subject,
+        ],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let schedules = build_schedule_cache(&model, &population);
+    assert!(schedules[0].is_none());
+    assert!(schedules[1].is_some());
+    assert!(schedules[2].is_none());
+    assert!(schedules[3].is_some());
+
+    let uncached = run_inner_loop_warm(&model, &population, params, 50, 1e-8, None, None, 0, 0);
+    let cached = run_inner_loop_warm_cached(
+        &model,
+        &population,
+        params,
+        50,
+        1e-8,
+        None,
+        None,
+        0,
+        0,
+        &schedules,
+    );
+
+    for i in 0..population.subjects.len() {
+        assert_eq!(
+            uncached.0[i].as_slice(),
+            cached.0[i].as_slice(),
+            "subject {i}: η̂ diverged between the cached and uncached inner loop"
+        );
+        assert_eq!(
+            uncached.1[i].as_slice(),
+            cached.1[i].as_slice(),
+            "subject {i}: Jacobian diverged between the cached and uncached inner loop"
+        );
+    }
+    assert_eq!(uncached.2.n_unconverged, cached.2.n_unconverged);
+    assert_eq!(uncached.2.n_fallback, cached.2.n_fallback);
+    assert_eq!(uncached.2.n_start_rejected, cached.2.n_start_rejected);
 }

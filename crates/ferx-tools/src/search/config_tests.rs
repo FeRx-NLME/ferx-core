@@ -124,7 +124,7 @@ fn defaults_when_sections_are_omitted() {
 }
 
 #[test]
-fn every_rank_type_maps_to_a_criterion_except_penalized() {
+fn every_rank_type_maps_to_a_criterion() {
     for (name, want) in [
         ("ofv", Criterion::Ofv),
         ("aic", Criterion::Aic),
@@ -139,10 +139,38 @@ fn every_rank_type_maps_to_a_criterion_except_penalized() {
         ));
         assert_eq!(cfg.run_options().criterion, want, "{name}");
     }
-    let e = load_err(
+    // `penalized` maps too, at pyDarwin's default schedule (#1185)…
+    let cfg = load(
         "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"penalized\"\n",
     );
-    assert!(e.contains("penalized\" is not implemented yet"), "{e}");
+    assert_eq!(
+        cfg.run_options().criterion,
+        Criterion::Penalized(Penalties::default())
+    );
+    // …with `[rank.penalties]` overlaying only what it names…
+    let cfg = load(
+        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"penalized\"\n\
+         [rank.penalties]\ntheta = 5\ncrash = 1e6\n",
+    );
+    let want = Penalties {
+        theta: 5.0,
+        crash: 1e6,
+        ..Penalties::default()
+    };
+    assert_eq!(cfg.run_options().criterion, Criterion::Penalized(want));
+    assert_eq!(cfg.rank.penalties(), want);
+    // …a misspelt key refused…
+    let e = load_err(
+        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"penalized\"\n\
+         [rank.penalties]\nthetas = 5\n",
+    );
+    assert!(e.contains("unknown field `thetas`"), "{e}");
+    // …and a bad charge refused at load, whatever the rank type.
+    let e = load_err(
+        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"bic\"\n\
+         [rank.penalties]\nomega = -1\n",
+    );
+    assert!(e.contains("[rank.penalties] omega = -1"), "{e}");
     let e =
         load_err("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[rank]\ntype = \"lrt\"\n");
     assert!(e.contains("unknown variant `lrt`"), "{e}");
@@ -322,4 +350,18 @@ fn the_shipped_example_file_loads_and_resolves() {
         .mfl
         .render()
         .starts_with("PERIPHERALS(0..1);LAGTIME([OFF,ON]);COVARIATE?(CL,WT,[pow,lin])"));
+}
+
+#[test]
+fn run_reuse_from_is_read_relative_to_the_file() {
+    let cfg = load(
+        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[run]\n\
+         reuse_from = [\"../warfarin-modelsearch\", \"cov\"]\n",
+    );
+    assert_eq!(
+        cfg.reuse_dirs(),
+        vec![cfg.dir.join("../warfarin-modelsearch"), cfg.dir.join("cov")]
+    );
+    let cfg = load("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n");
+    assert!(cfg.reuse_dirs().is_empty());
 }

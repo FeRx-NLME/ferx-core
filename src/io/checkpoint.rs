@@ -1,8 +1,10 @@
 //! Periodic checkpoint / restart for interrupted fits (#755).
 //!
-//! A running fit writes a small JSON `.tmp` file holding the current population
-//! estimates and where it is in the method chain, no more often than a
-//! configurable interval. If the process is killed, the next run on the same
+//! A running fit writes a small JSON `.tmp` file holding the population
+//! estimates it should be resumed from and where it is in the method chain, no
+//! more often than a configurable interval. Which estimates those are is
+//! method-dependent — the best point reached for the deterministic optimizers,
+//! the latest state for SAEM; see [`Checkpoint::ofv`]. If the process is killed, the next run on the same
 //! model + data resumes from that point instead of starting over; on successful
 //! completion the file is removed. Because the write is throttled, a run that
 //! finishes before the first interval elapses never leaves a `.tmp` behind
@@ -61,9 +63,24 @@ pub struct Checkpoint {
     /// Optimizer coordinate names in packed order; length- and name-checked on
     /// resume so a structurally different model can never be resumed by mistake.
     pub coord_names: Vec<String>,
-    /// Iteration / eval counter within the running stage at save time.
+    /// Iteration / eval index, within the running stage, of the point in
+    /// `packed` — see [`Checkpoint::ofv`] for which point that is.
     pub iter: usize,
-    /// Best OFV seen so far (informational; shown in the resume banner).
+    /// Objective at the point in `packed` (informational; shown in the resume
+    /// banner). **Which point that is depends on the stage's method**, so a
+    /// consumer that ranks or compares checkpoints has to read `method_chain`
+    /// and `stage_idx` first:
+    ///
+    /// - the deterministic outer optimizers (FOCE / FOCEI / Laplace, whether on
+    ///   the NLopt driver or the built-in BFGS loop, and Gauss-Newton) save the
+    ///   **best incumbent reached so far**, because their objective is evaluated
+    ///   at every point the optimizer probes and a line-search trial point is not
+    ///   where the fit is (#1317). Here `ofv` is the unpenalized −2LL at that
+    ///   point and `iter` is the eval at which it was seen;
+    /// - **SAEM** saves its **latest** stochastic-approximation state, since that
+    ///   is what a correct continuation of the chain resumes from. Here `ofv` is
+    ///   that iteration's conditional NLL — neither a best-so-far nor a marginal
+    ///   −2LL — and `iter` is the iteration index.
     #[serde(with = "crate::io::serde_nan::scalar")]
     pub ofv: f64,
     /// Unix seconds at save (informational).
@@ -189,8 +206,9 @@ pub fn set_stage(stage_idx: usize) {
 }
 
 /// Write a checkpoint iff at least `interval_secs` have elapsed since the last
-/// write (or since `init`). `packed` is the current packed optimizer vector;
-/// `iter` / `ofv` are informational. No-op when no sink is active. Best-effort:
+/// write (or since `init`). `packed` is the packed optimizer vector to persist —
+/// callers pass the best incumbent (the deterministic optimizers) or the latest
+/// state (SAEM), see [`Checkpoint::ofv`]; `iter` / `ofv` are informational. No-op when no sink is active. Best-effort:
 /// I/O errors are swallowed so a fit never fails because a checkpoint couldn't
 /// be written (the clock only advances on a successful write, so a transient
 /// failure is retried next iteration).
