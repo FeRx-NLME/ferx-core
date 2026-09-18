@@ -2121,12 +2121,26 @@ fn optimize_nlopt(
                 options,
                 false,
                 declines,
-                Some(init_params),
+                Some(RestartLeg {
+                    escape_from: init_params,
+                    spent_evals: stalled.n_iterations,
+                }),
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
-            // so the two legs add up.
+            // so the two legs add up — and the second leg ran on what the first
+            // left of the budget (`RestartLeg::spent_evals`), so the sum is
+            // bounded by `outer_maxiter` like any other fit's.
             restarted.n_iterations += stalled.n_iterations;
+            // Pushed on the restart's own result, so it reaches `FitResult` only
+            // if the restart is adopted — a rejected restart is dropped whole.
+            // `classify_warning` files it under `optimizer_health` on the phrase
+            // "resumed from the best point seen".
+            restarted.warnings.push(mid_descent_restart_warning(
+                options.optimizer,
+                stalled.ofv,
+                stalled.n_iterations,
+            ));
             restarted
         },
         penalized,
@@ -2143,16 +2157,34 @@ fn optimize_nlopt(
 /// never acted on. Measured on the #1277 fixture — the two-cpt DCM in
 /// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0` — L-BFGS quit at
 /// eval 12 with the trace still falling ~2600 OFV per eval; restarting from that
-/// point ran to convergence 3886 OFV units lower (3209.81 → −676.77). The
-/// mechanism is not NN-specific: the restart is what clears the `(s, y)` pairs
-/// whose curvature estimate the failed line search was built on.
+/// point ran to convergence 3886 OFV units lower (3209.81 → −676.77; 7902 →
+/// −540 by eval 44 on Linux, where the abort sits at a different OFV). The
+/// mechanism is not NN-specific, and it is not one mechanism. Luksan's `plis`
+/// line search is capped at ten step reductions and ten extrapolations, and a
+/// cap hit on an iteration where the algorithm has just restarted — which the
+/// first iteration always is — returns a bare `Failure` that discards every
+/// point it accepted (#1411, `plis.c` instrumented). The eval-12 abort is the
+/// *extrapolation* cap inside the first line search: the identity-Hessian
+/// overshoot cap ([`should_cap_gradient`]) shrank the opening gradient 1.7e5×,
+/// so every trial point showed a huge real decrease next to a tiny predicted
+/// slope and the search extrapolated eleven times — before any `(s, y)` pair
+/// exists. A fresh run from the best point works there because it re-arms that
+/// cap around a gradient that is now O(1). The other shape is the *reduction*
+/// cap later in the same fixture, where a subject's EBE mode switch degenerates
+/// the curvature pair and the next direction is ~1e17 long; there the fresh
+/// `(s, y)` memory is what helps.
 ///
 /// Three things keep it from making any fit worse:
 ///
 /// - it runs **only** on `mid_descent_stall`, so a converged fit, a plateaued
 ///   `Failure`, and a run that spent its `maxiter` budget (a `MaxEvalReached`
-///   *success* state, not a `Failure`) are all untouched — the restart can never
-///   quietly hand a fit a second evaluation budget;
+///   *success* state, not a `Failure`) are all untouched — and the restart runs
+///   on what the stalled leg left of the budget ([`RestartLeg::spent_evals`]),
+///   so it never hands a fit a second one (#1428; the first version did, and
+///   said here that it could not). The two legs together are bounded by
+///   `outer_maxiter` the way any single run is — `maxeval` is a soft bound for
+///   L-BFGS, checked between line searches, so a few evals of overshoot are
+///   possible on either leg;
 /// - the restart is adopted only on a **strictly lower** penalized objective.
 ///   Unlike the `left_init` retry above there is no second condition to check:
 ///   this attempt starts *at* the reported point, so anywhere it ends is
@@ -2165,6 +2197,16 @@ fn optimize_nlopt(
 /// the honest signal and caps what this adds at one extra optimization. (The
 /// ceiling for the whole of [`optimize_nlopt`] is three, since the `left_init`
 /// retry can fire first and hand its own result here.)
+///
+/// Deliberately **not** gated on the optimizer, unlike the `left_init` retry.
+/// The line-search caps above are L-BFGS's, but the predicate here is not "did
+/// Luksan abort" — it is "did NLopt return a bare `Failure` while the trace was
+/// still descending, at a point a cold re-solve does not call a plateau", which
+/// SLSQP (its own line search, `positive directional derivative`) and the
+/// derivative-free methods can also produce; and the adoption rule (strictly
+/// lower, or the stalled result stands) makes a pointless restart cost one
+/// optimization and change nothing. An adopted restart is named in
+/// `FitResult.warnings` ([`mid_descent_restart_warning`], `optimizer_health`).
 ///
 /// Pulled out as a pure fn — `restart` is handed the stalled result and returns
 /// its successor — so every branch is unit-testable without driving two NLopt
@@ -2248,23 +2290,63 @@ fn resolve_stall_retry<T>(
     retry
 }
 
+/// What makes the #1277 restart leg different from a fresh attempt — the two
+/// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
+pub(crate) struct RestartLeg<'a> {
+    /// The point the *published* escape verdict is measured against: the user's
+    /// initial estimates, not the stalled leg's estimates this leg starts at.
+    pub(crate) escape_from: &'a ModelParameters,
+    /// Objective evaluations the stalled leg already spent. The restart runs on
+    /// what is left of the fit's `outer_maxiter` budget, not on a fresh one — a
+    /// restart is a continuation of the same fit, and a user's `maxiter` is a
+    /// bound on the fit (#1428).
+    pub(crate) spent_evals: usize,
+}
+
+/// The evaluation budget one NLopt run is given: `outer_maxiter × (n + 1)` for the
+/// gradient methods, plus BOBYQA's `40 × (n + 1)` triangulation headroom for the
+/// derivative-free one. Spelled once so the restart leg's remaining budget is
+/// computed from the same number the first leg was given.
+fn outer_eval_budget(algo: nlopt::Algorithm, n: usize, outer_maxiter: usize) -> u32 {
+    let per_iter = n as u32 + 1;
+    let base = (outer_maxiter as u32).saturating_mul(per_iter);
+    if matches!(algo, nlopt::Algorithm::Bobyqa) {
+        // BOBYQA is derivative-free: each eval is one objective call, not
+        // n+1 (gradient methods FD the gradient inside one outer iter).
+        // Give it enough headroom to triangulate a quadratic in n-D and
+        // still make real trust-region progress: 40 evals/param baseline
+        // plus the outer_maxiter budget. The setup phase alone costs
+        // 2n+1 evals before any movement.
+        base.saturating_add(40 * per_iter)
+    } else {
+        base
+    }
+}
+
 /// One NLopt outer-optimizer run. Returns the result and the
 /// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
 /// attempt on. `hold_cap_at_init` is the retry mode — see
 /// [`should_cap_gradient`].
 ///
-/// `escape_from` separates **where this attempt starts** from **what its
-/// published escape verdict is measured against**, which are the same thing for
-/// every attempt but the #1277 restart. `None` means "this attempt's own start",
-/// the ordinary case. `Some(origin)` reports [`OuterResult::left_init`] relative
-/// to `origin` instead — the restart begins at a stalled fit's estimates, but the
-/// flag that reaches `model_selection::stalled_at_init` has to answer "are the
-/// reported estimates still on top of the values the *user* supplied". The two
-/// internal consumers of displacement keep this attempt's own start either way:
-/// the L-BFGS overshoot cap ("has the fit moved yet?") and
-/// [`failure_is_converged_plateau`] ("did it descend, or twitch and die?") are
-/// both questions about this leg, not about the pair.
+/// `restart` is `Some` for the #1277 restart leg only, and carries the two
+/// things that leg inherits from the stalled one ([`RestartLeg`]):
+///
+/// - `escape_from` separates **where this attempt starts** from **what its
+///   published escape verdict is measured against**, which are the same thing
+///   for every attempt but the restart. `None` means "this attempt's own
+///   start", the ordinary case. The restart reports [`OuterResult::left_init`]
+///   relative to `escape_from` instead — it begins at a stalled fit's estimates,
+///   but the flag that reaches `model_selection::stalled_at_init` has to answer
+///   "are the reported estimates still on top of the values the *user*
+///   supplied". The two internal consumers of displacement keep this attempt's
+///   own start either way: the L-BFGS overshoot cap ("has the fit moved yet?")
+///   and [`failure_is_converged_plateau`] ("did it descend, or twitch and die?")
+///   are both questions about this leg, not about the pair.
+/// - `spent_evals` is subtracted from the run's evaluation budget
+///   ([`outer_eval_budget`]), so the two legs together never exceed the
+///   `outer_maxiter` the user set. The caller does not restart on an empty
+///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
 fn optimize_nlopt_once(
     model: &CompiledModel,
     population: &Population,
@@ -2272,8 +2354,10 @@ fn optimize_nlopt_once(
     options: &FitOptions,
     hold_cap_at_init: bool,
     declines: &OuterFdDeclineLog,
-    escape_from: Option<&ModelParameters>,
+    restart: Option<RestartLeg<'_>>,
 ) -> (OuterResult, AttemptOutcome) {
+    let escape_from = restart.as_ref().map(|r| r.escape_from);
+    let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -2931,16 +3015,13 @@ fn optimize_nlopt_once(
     let mut opt = nlopt::Nlopt::new(algo, n, objective, nlopt::Target::Minimize, state);
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
+    // The budget this leg may spend: the fit's, less what a stalled leg it
+    // continues already used. `.max(1)`, never `0`: NLopt reads `maxeval = 0` as
+    // unlimited, and `optimize_nlopt` does not restart on an empty budget anyway.
+    let full_budget = outer_eval_budget(algo, n, options.outer_maxiter);
+    let max_eval = full_budget.saturating_sub(spent_evals as u32).max(1);
     if matches!(algo, nlopt::Algorithm::Bobyqa) {
-        // BOBYQA is derivative-free: each eval is one objective call, not
-        // n+1 (gradient methods FD the gradient inside one outer iter).
-        // Give it enough headroom to triangulate a quadratic in n-D and
-        // still make real trust-region progress: 40 evals/param baseline
-        // plus the outer_maxiter budget. The setup phase alone costs
-        // 2n+1 evals before any movement.
-        let bobyqa_maxeval =
-            (options.outer_maxiter as u32).saturating_mul(n as u32 + 1) + 40 * (n as u32 + 1);
-        opt.set_maxeval(bobyqa_maxeval).unwrap();
+        opt.set_maxeval(max_eval).unwrap();
         // BOBYQA's xtol_rel controls rho_end / rho_start — i.e. how much
         // it must shrink the trust radius to declare success. 1e-12 is
         // unreachable in any realistic budget and forces MaxevalReached
@@ -2971,8 +3052,7 @@ fn optimize_nlopt_once(
             .collect();
         opt.set_initial_step(&init_step).unwrap();
     } else {
-        opt.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
-            .unwrap();
+        opt.set_maxeval(max_eval).unwrap();
         if options.agq_nodes().is_some() {
             // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
             // term and the posterior Hessian are both central differences, so the gradient
@@ -3319,6 +3399,13 @@ fn optimize_nlopt_once(
     // `converged` for an entirely different reason — see
     // [`worth_restarting_mid_descent`], which is handed this and the objective.
     let stalled_mid_descent = stationarity_check_pending && !converged;
+    // Whether any of the fit's budget is left for a restart to run on (#1428).
+    // `n_evals_outer` counts objective calls, the same thing NLopt's `maxeval`
+    // counts — but `maxeval` is a *soft* bound for L-BFGS: `luksan/plis.c` checks
+    // it only between line searches, so a line search that fails after crossing
+    // it comes back as a bare `Failure`, not `MaxEvalReached`, and the count can
+    // sit a few evals past the budget here.
+    let budget_left = spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize;
 
     // A cold re-solve that does not reproduce the reported objective — whether it lands
     // materially above it or returns no usable number at all — says the EBEs at these
@@ -3376,6 +3463,18 @@ fn optimize_nlopt_once(
     }
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
+    }
+    // A stall with no budget left is not restarted (see
+    // `worth_restarting_mid_descent`), and the reason the user can act on is the
+    // budget, not the stall — a line search that fails after crossing `maxeval`
+    // is a bare `Failure`, so the `max_eval_reached` branch above never saw it.
+    // Same advice as that branch, not pushed twice.
+    if stalled_mid_descent && !budget_left && !max_eval_reached {
+        warnings.push(format!(
+            "Outer optimization stopped mid-descent with its evaluation budget (maxiter = {}) \
+             spent, so it was not restarted; increase maxiter for a tighter fit.",
+            options.outer_maxiter,
+        ));
     }
 
     // The gradient to report, and where it came from (#997 §1). A gradient-based
@@ -3453,7 +3552,11 @@ fn optimize_nlopt_once(
         result,
         AttemptOutcome {
             left_init,
-            mid_descent_stall: worth_restarting_mid_descent(stalled_mid_descent, final_ofv),
+            mid_descent_stall: worth_restarting_mid_descent(
+                stalled_mid_descent,
+                final_ofv,
+                budget_left,
+            ),
         },
     )
 }
@@ -3471,8 +3574,40 @@ fn optimize_nlopt_once(
 /// as one expression the two facts are separated only by statement order, and
 /// moving the read three lines down would silently turn every non-finite fit
 /// into a restart.
-fn worth_restarting_mid_descent(stalled_mid_descent: bool, final_ofv: f64) -> bool {
-    stalled_mid_descent && ofv_is_valid(final_ofv)
+///
+/// `budget_left` is whether this run left any of the fit's evaluation budget
+/// unspent (#1428). The restart continues the fit on that remainder, so a run
+/// that died on its last permitted evaluation has nothing to continue with —
+/// and `set_maxeval(0)` would hand NLopt an *unlimited* budget, not an empty
+/// one. Such a run is reported as it stands, with an "increase maxiter" warning
+/// of its own: the ordinary budget warning is keyed on `MaxEvalReached`, which a
+/// line search that fails after crossing `maxeval` never returns.
+fn worth_restarting_mid_descent(
+    stalled_mid_descent: bool,
+    final_ofv: f64,
+    budget_left: bool,
+) -> bool {
+    stalled_mid_descent && ofv_is_valid(final_ofv) && budget_left
+}
+
+/// The `FitResult` warning a fit carries when it was restarted mid-descent and
+/// the restart was adopted (#1428). The phrase "resumed from the best point
+/// seen" is what `classify_warning` files under `optimizer_health`, and what the
+/// PR-time regression test (`nn::regularizer_fit_tests::first_line_search_abort_is_resumed_not_reported`)
+/// looks for; keep it if the wording changes.
+fn mid_descent_restart_warning(
+    optimizer: Optimizer,
+    stalled_ofv: f64,
+    stalled_evals: usize,
+) -> String {
+    format!(
+        "Outer optimizer ({}) stopped mid-descent (bare Failure at OFV = {:.6} after {} \
+         evaluations) and was resumed from the best point seen on the remaining maxiter \
+         budget; the reported estimates are from the resumed run.",
+        optimizer.label(),
+        stalled_ofv,
+        stalled_evals,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

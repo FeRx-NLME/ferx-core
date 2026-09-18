@@ -6492,7 +6492,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // EBE, a silently degenerate subject. Precedes the generic "degenerate"
         // branch so a flip-flop message never misroutes to optimizer-health.
         (WarningSeverity::Warning, WarningCode::FlipFlop)
-    } else if lower.contains("trust radius") || lower.contains("degenerate") {
+    } else if lower.contains("trust radius")
+        || lower.contains("degenerate")
+        || lower.contains("resumed from the best point seen")
+    {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
         (WarningSeverity::Warning, WarningCode::DwAutocorrelation)
