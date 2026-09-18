@@ -248,9 +248,12 @@ and the compartment state is inaccessible by name — use `compartments[i]` inst
 - Named access is not available for integrals in **analytical models**. Use
   `compartments[i]` in `integral(...)` for analytical models.
 - **SDE models** (`[diffusion]` block): `compartments[i]` returns the
-  **deterministic ODE state** at each observation time, not the EKF-filtered state.
-  For most post-fit derived quantities this is sufficient, but values will differ
-  from the EKF posterior mean when process noise is large.
+  **deterministic ODE state** at each observation time. Today that is the only
+  state there is — the EKF propagates the state covariance and never corrects
+  the mean with the observed data, so there is no filtered trajectory for it to
+  differ from (see
+  [What the filter does not do](diffusion.qmd#what-the-filter-does-not-do)).
+  The distinction becomes real when the mean update lands.
 - **IOV subjects**: `compartments[i]` evaluates to `NaN` — compartment states are
   not yet available on the IOV prediction path
   (`W_DERIVED_CMT_IOV_UNSUPPORTED` warning is emitted). Scalar references —

@@ -5949,7 +5949,13 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
              of toy examples, with estimator support limited to FOCE/FOCEI. \
              Standard errors and convergence behaviour are not yet proven across \
              diverse datasets — validate results carefully before relying on \
-             them. See the Feature Maturity page in the documentation.",
+             them. The filter is covariance-only: the state mean is propagated \
+             by the ODE and is never corrected by the observed data, so what is \
+             fitted is the deterministic ODE prediction with an inflated \
+             observation variance. There is no filtered state trajectory, and \
+             sdtab IWRES is scaled by the residual error alone, so it reads \
+             over-dispersed on these fits (issue #1285). See the Feature \
+             Maturity page in the documentation.",
         ));
     }
     #[cfg(feature = "nn")]

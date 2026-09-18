@@ -340,7 +340,9 @@ $$
 
 Subjects with fewer than 2 finite IWRES values are excluded from both statistics. Both fields are `NaN` when no subject qualifies.
 
-When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F (plus SDE process noise for ODE models). When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
+When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F. When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
+
+The warning used to add "SDE process noise may also help" on ODE models. It no longer does: the Kalman filter behind `[diffusion]` propagates the state covariance but never corrects the state mean with the observed data, so it inflates the observation variance instead of supplying the dynamics the statistic is reporting — see [what the filter does not do](model-file/diffusion.qmd#what-the-filter-does-not-do).
 
 ### Covariance Status
 

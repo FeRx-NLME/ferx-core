@@ -8,12 +8,11 @@ This example extends a one-compartment ODE model with a `[diffusion]` block that
 
 ## When to use
 
-Add `[diffusion]` process noise when:
-- IWRES shows autocorrelation that cannot be absorbed by the residual error alone (Durbin-Watson < 1.5)
-- Structural misspecification is suspected (e.g. unmodelled absorption variability, time-varying elimination)
-- You want a data-driven stochastic extension rather than adding a transit compartment or a new mechanistic model
+Add `[diffusion]` process noise when you want a number for how much unexplained variance accumulates along the trajectory: a `DIFF_<STATE>` large relative to sigma is evidence that the ODE structure is missing a mechanism, and that is worth estimating when the competing structural models are not identifiable from the design.
 
-The SDE approach inflates the residual variance at each observation by the integrated process covariance (`V_total = P[state] + σ²(PRED)`), estimated via an Extended Kalman Filter (EKF). `DIFF_CENTRAL` captures the diffusion coefficient on the central compartment state; it is estimated on the variance scale.
+Do **not** add it to absorb IWRES autocorrelation. ferx implements the covariance half of the Extended Kalman Filter (EKF): the state covariance is propagated and shrunk at each observation, but the state mean is never corrected by the observed values. The fit is therefore the deterministic ODE prediction with an inflated observation variance (`V_total = P[state] + σ²(PRED)`) — nothing is filtered, and the inflation depends on the parameters and the sampling times rather than on what the subject did. See [What the filter does not do](../model-file/diffusion.qmd#what-the-filter-does-not-do) for the three consequences that follow.
+
+`DIFF_CENTRAL` is the diffusion variance on the central compartment state; it is estimated on the variance scale.
 
 ## Dataset
 
@@ -95,7 +94,9 @@ diffusion:
     se: 0.001102
 ```
 
-A small `DIFF_CENTRAL` (near zero) indicates the process noise is negligible and the standard ODE model is adequate. A large value relative to the mean compartment level suggests real stochastic variability; check whether the DW statistic improves (moves toward 2.0) compared to the deterministic ODE.
+A small `DIFF_CENTRAL` (near zero) indicates the process noise is negligible and the standard ODE model is adequate. A large value relative to the mean compartment level says the deterministic structure does not account for the data — it does not say the stochastic extension has accounted for it.
+
+Compare the *structural* estimates against the ODE fit rather than the residual diagnostics: with the state mean uncorrected, the inflation re-weights the fit, and on a misspecified model it can pull a structural parameter well away from the value the ODE fit recovered ([measured example](../model-file/diffusion.qmd#when-to-use-sde-models)). The Durbin-Watson statistic and the residual plots from an SDE fit will not settle the comparison: `IWRES` is scaled by the residual error alone, so it reads over-dispersed on these fits.
 
 ## Tips
 

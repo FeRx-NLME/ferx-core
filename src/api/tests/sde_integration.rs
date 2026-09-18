@@ -288,6 +288,24 @@ fn sde_emits_experimental_warning() {
         "experimental"
     );
 
+    // #1285 (#1350 row 10a): "experimental" alone does not tell a user *what*
+    // is fitted. The message must keep saying that the state mean is never
+    // corrected by the data — that, not the maturity label, is why a
+    // `[diffusion]` fit cannot be read as a filtered state and why its sdtab
+    // IWRES reads over-dispersed. Mutation: delete that sentence from
+    // `check_experimental_features`.
+    //
+    // The category assertion above is load-bearing for the wording: the
+    // `classify_warning` chain tests "autocorrelation" / "durbin" *before*
+    // "experimental feature", so a future edit that explains the limitation in
+    // those words would silently re-file this warning under
+    // `dw_autocorrelation`.
+    assert!(
+        exp.message.contains("never corrected by the observed data"),
+        "W_EXPERIMENTAL_SDE must say the EKF leaves the state mean uncorrected: {}",
+        exp.message
+    );
+
     // Sanity: a non-SDE model must NOT emit the experimental warning.
     let base = parse_full_model(BASE_MODEL_SRC).expect("base model should parse");
     assert!(

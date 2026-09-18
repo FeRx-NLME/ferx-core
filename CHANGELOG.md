@@ -117,6 +117,19 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **ferx no longer recommends `[diffusion]` as a remedy for residual autocorrelation.** The IWRES
+  Durbin-Watson warning has dropped its "For ODE models, SDE process noise may also help" suffix,
+  and the docs no longer describe the SDE path as a filtered state. The Kalman filter behind
+  `[diffusion]` propagates the state covariance but never corrects the state mean with the
+  observed data, so what is fitted is the deterministic ODE prediction with an inflated
+  observation variance: it re-weights the fit rather than following a subject's drift, there is no
+  filtered `IPRED` or posterior state trajectory, and sdtab `IWRES` — scaled by the residual error
+  alone — reads over-dispersed. Measured on a two-compartment population fitted as one
+  compartment, adding `central ~ 0.01` improved the objective by 669 for one parameter while
+  leaving the statistic below its threshold (0.40 to 0.77) and moving CL from 0.99 to 2.49 against
+  a truth of 1.0. `W_EXPERIMENTAL_SDE` now states the limitation on every SDE fit. Nothing
+  numerical changes; the mean update itself is still open
+  ([#1285](https://github.com/FeRx-NLME/ferx-core/issues/1285)).
 - **`mstep_damping` now defaults to `1.0` (off), except for models with `iiv_on_ruv`.** The 0.03
   exploration cap that #1011 introduced divides the number of EM steps the exploration phase
   amounts to, and was measured to *hold* every no-ETA theta near its initial estimate rather than
