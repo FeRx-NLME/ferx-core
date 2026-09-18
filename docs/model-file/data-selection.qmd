@@ -97,7 +97,7 @@ of the CSV).  An entirely excluded subject does not appear in any output.
 | `DV`   | numeric | |
 | `EVID` | numeric (0/1/2/3/4) | |
 | `AMT`  | numeric | |
-| `CMT`  | numeric | |
+| `CMT`  | numeric | compares the compartment ferx **resolved**, not the raw cell — see the note below |
 | `RATE` | numeric | |
 | `MDV`  | numeric | |
 | `CENS` | numeric | |
@@ -112,6 +112,22 @@ never matches a comparison on that column. For example, `ignore = DV < 0.001`
 does **not** exclude dose rows, whose `DV` is `.`; only observation rows with a
 real `DV` below the threshold are dropped. (You can still write
 `ignore = EVID == 0 && DV < 0.001` to be explicit.)
+
+**`CMT` is the exception to that rule**, because it is the one column with a
+default. A missing (`.`/blank/`NA`) or unreadable cell — and an absent `CMT`
+column altogether — resolves to compartment **1** before the filter ever sees the
+record, so `ignore = CMT == 2` silently keeps a row it was meant to drop, and
+`accept = CMT == 1` silently keeps one it was meant to exclude. Measured on a
+one-compartment model with `ignore = CMT == 2` and a single observation cell
+spelled `2` against `x`: 3 records scored and an objective of −4.6162 against 4
+records and −6.9517.
+
+Since ferx 0.4.0 a `[data_selection]` clause that compares `CMT` therefore makes
+the dataset's defaulted compartments a reported finding —
+[`W_CMT_DEFAULTED`](../file-formats/check-report.qmd#dose-records) — the same
+warning a model whose dose compartment or per-CMT readout depends on `CMT`
+already gets. Write the compartment explicitly in every row you intend to filter
+on.
 
 ---
 

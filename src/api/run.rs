@@ -1045,6 +1045,16 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .with_design_states(design_states)
 }
 
+/// Whether this model routes any observation row to its endpoint **by CMT** (#1409).
+///
+/// Derived from [`obs_routing_for`] — the only place a routing set is built from a
+/// model — rather than restated, so an endpoint family added there is in scope for
+/// `W_CMT_DEFAULTED` without a second edit. The missing-DV policy does not enter the
+/// question, so the fitting policy is passed and the answer is the same either way.
+pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
+    obs_routing_for(model, MissingDvPolicy::Skip).routes_by_cmt()
+}
+
 /// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`
 /// but no `ParsedModel`: the `.fitrx` reload (`io::fitrx::load_fit`) and the
 /// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path`. The same

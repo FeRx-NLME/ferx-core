@@ -706,9 +706,19 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
 ///   reader reports how many rows it had to pick a compartment for; picking is
 ///   only a *guess* when there was something to choose between. See
 ///   [`cmt_defaulting_is_ambiguous`] for what counts.
-pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) -> bool {
+///
+/// `options` is read only by the `W_CMT_DEFAULTED` arm, and only for
+/// [`CmtConsumer::DataSelection`]: a `[data_selection]` clause comparing `CMT` is a
+/// consumer of the resolved compartment that lives on [`FitOptions`] rather than on
+/// the model (#1409). Callers pass the same options the read will use — the merged
+/// model-file + call options in `fit()`, `parsed.fit_options` in `ferx check`.
+pub(crate) fn reader_warning_suppressed(
+    model: &CompiledModel,
+    options: &FitOptions,
+    warning: &str,
+) -> bool {
     if warning.starts_with("W_CMT_DEFAULTED") {
-        return !cmt_defaulting_is_ambiguous(model);
+        return !cmt_defaulting_is_ambiguous(model, options);
     }
     model.is_algebraic() && warning.starts_with("W_NO_DOSES")
 }
@@ -716,23 +726,172 @@ pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) ->
 /// Whether this model reads a row's `CMT` for anything, so that a `CMT` the reader
 /// had to invent could change a number (#1009).
 ///
-/// `CMT` addresses exactly two channels — where a **dose** lands, and which readout,
-/// scale or error model an **observation** uses — so this asks one question of each
-/// and ORs them. Both rounds of review on PR #1404 found the same failure mode: a
-/// predicate written as a *list* of the model classes someone had thought of, which
-/// then missed the class on the other engine. So each half is now read off the
-/// engine's own routing table rather than restated from it — see
-/// [`addressable_dose_compartments`] and [`observation_is_cmt_dispatched`], where the
-/// measurements and the deliberate exclusions live.
+/// **Derived from an enumeration, not from a list of model classes.** Three
+/// consecutive review rounds on PR #1404 broke this predicate the same way — it was
+/// written as a list of the classes someone had thought of, and each round a
+/// reviewer found the one that was missing (the observation-side dispatchers, then
+/// `OdeSpec::readout` and the analytical dose channel, then `[data_selection]`).
+/// #1409 replaced the list with [`CmtConsumer`]: every channel that reads a row's
+/// `CMT` is a variant, each variant answers its own question off the engine's own
+/// routing table, and this is their OR. A new consumer is a compile error in
+/// [`CmtConsumer::is_live`] and a red test in `cmt_consumer_scope.rs` until someone
+/// says which side of the question it falls on.
 ///
-/// The state count deliberately includes the injected joint-PK-TTE `__chz_*`
-/// accumulators along with the PK states. They are not dose targets, but they exist
-/// only when an `[event_model]` does, and an event model routes its rows *by CMT* —
-/// so a dataset with no `CMT` column keys every row to compartment 1 and starves
-/// the endpoint. Counting them cannot produce a false positive for that reason, and
-/// excluding them would produce a false negative.
-fn cmt_defaulting_is_ambiguous(model: &CompiledModel) -> bool {
-    addressable_dose_compartments(model) > 1 || observation_is_cmt_dispatched(model)
+/// The state count behind [`CmtConsumer::DoseCompartment`] deliberately includes the
+/// injected joint-PK-TTE `__chz_*` accumulators along with the PK states. They are
+/// not dose targets, but they exist only when an `[event_model]` does, and an event
+/// model routes its rows *by CMT* — so a dataset with no `CMT` column keys every row
+/// to compartment 1 and starves the endpoint. Counting them cannot produce a false
+/// positive for that reason, and excluding them would produce a false negative.
+fn cmt_defaulting_is_ambiguous(model: &CompiledModel, options: &FitOptions) -> bool {
+    CmtConsumer::ALL.iter().any(|c| c.is_live(model, options))
+}
+
+/// Every channel that reads a row's `CMT`, so the compartment the reader had to
+/// invent could change a number (#1409).
+///
+/// This enum *is* the scope of `W_CMT_DEFAULTED`. Adding a channel means adding a
+/// variant, which is a compile error in [`Self::is_live`] and [`Self::index`] and a
+/// red `tests/cmt_consumer_scope.rs` until it carries a fixture that measures the
+/// difference the channel makes. That is the step all three #1404 review rounds
+/// skipped, each time by widening a condition in place.
+///
+/// Each arm asks the **consumer's own** routing table rather than restating it, so a
+/// model class added to one of those tables cannot fall outside this predicate:
+/// `OdeSpec::n_states` / `PkTopology::channels` for the dose channel,
+/// `api::run::obs_routing_for` for the endpoint channel (the one place a routing set
+/// is derived from a model), and `SelectionFilter` for the filter channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmtConsumer {
+    /// Which compartment a **dose** row lands in — `[odes]` states, or an
+    /// analytical topology's `channels` (an oral model's `CMT=2` is a real
+    /// depot-bypassing central bolus, a 2-cpt model's `CMT=2` the peripheral).
+    DoseCompartment,
+    /// Which **scale** an observation uses — `[scaling] obs_scale[CMT=N]`.
+    ///
+    /// Parses on an analytical model, where the dose channel may be inert, and
+    /// `pk::validate_per_cmt_scaling` only checks that the *observed* CMTs have
+    /// entries — so a `CMT`-less dataset keys every row to 1, `{1} ⊆ {1, 2}`, and
+    /// validation passes. Measured on `pk one_cpt_iv` with `obs_scale[CMT=1] = 1000`
+    /// / `obs_scale[CMT=2] = 1`: the same data spelled `CMT=2` gives OFV **0.0357**,
+    /// with the column dropped **6097015712.1246**.
+    PerCmtScaling,
+    /// Which **error model** an observation uses — `CMT=N: DV ~ ...`.
+    PerCmtErrorModel,
+    /// Which **readout** an observation reads — `y[CMT=N]`, on either engine.
+    ///
+    /// Measured on a one-state `[odes]` model `d/dt(central) = -CL/V*central` with
+    /// `y[CMT=1] = central/V` and `y[CMT=2] = central/V*1000`: OFV **10028.0940**
+    /// with the column, **0.0357** without, and `ferx check` silent both ways before
+    /// #1404.
+    PerCmtReadout,
+    /// Which **endpoint** a row routes to — `[event_model] cmt`, or a binary /
+    /// categorical / CTMM endpoint's CMT.
+    EndpointRouting,
+    /// Which rows are **kept at all** — a `[data_selection]` clause comparing `CMT`.
+    DataSelectionFilter,
+}
+
+impl CmtConsumer {
+    /// Every variant, in declaration order. Pinned dense and complete against
+    /// [`Self::index`] by `cmt_consumer_all_lists_every_variant`, so a variant added
+    /// to the enum but not to this array is a red test rather than a silent hole.
+    pub(crate) const ALL: [CmtConsumer; 6] = [
+        CmtConsumer::DoseCompartment,
+        CmtConsumer::PerCmtScaling,
+        CmtConsumer::PerCmtErrorModel,
+        CmtConsumer::PerCmtReadout,
+        CmtConsumer::EndpointRouting,
+        CmtConsumer::DataSelectionFilter,
+    ];
+
+    /// This variant's position in [`Self::ALL`]. Exhaustive on purpose: it is half
+    /// of the completeness guard (the other half is the test that walks `ALL` and
+    /// checks every index is its own slot). Test-only — nothing in production needs
+    /// an ordinal, and the guard is the whole reason it exists.
+    #[cfg(test)]
+    pub(crate) fn index(self) -> usize {
+        match self {
+            CmtConsumer::DoseCompartment => 0,
+            CmtConsumer::PerCmtScaling => 1,
+            CmtConsumer::PerCmtErrorModel => 2,
+            CmtConsumer::PerCmtReadout => 3,
+            CmtConsumer::EndpointRouting => 4,
+            CmtConsumer::DataSelectionFilter => 5,
+        }
+    }
+
+    /// Whether this channel actually reads `CMT` on this model + options.
+    ///
+    /// The arms are deliberately **disjoint in what they accept**, not
+    /// belt-and-braces: `PerCmtErrorModel` requires a non-empty map and
+    /// `EndpointRouting` covers the empty one, so each arm is the only reason some
+    /// model reports and deleting either reddens a test. Before #1409 the empty map
+    /// was the *only* thing that reported an endpoint model — an accident, and one a
+    /// `!m.is_empty()` gate in #1404 round 3 removed, silencing a measured endpoint
+    /// mis-routing (competing risks with endpoints at `cmt = 1` / `cmt = 2`, one
+    /// cell spelled `x`: the event moves from `cause_b` to `cause_a`, OFV 27.8497
+    /// against 28.3610, no diagnostic). It now rests on the routing sets themselves.
+    ///
+    /// `ErrorSpec::Selected` is correctly absent: it resolves its branch from the
+    /// covariate selector (`ErrorSpec::obs_keys` builds a synthetic index), never
+    /// from `obs_cmts`.
+    pub(crate) fn is_live(self, model: &CompiledModel, options: &FitOptions) -> bool {
+        let per_cmt = |r: &crate::ode::OdeReadout| matches!(r, crate::ode::OdeReadout::PerCmt(_));
+        match self {
+            CmtConsumer::DoseCompartment => addressable_dose_compartments(model) > 1,
+            CmtConsumer::PerCmtScaling => matches!(model.scaling, ScalingSpec::PerCmt(_)),
+            // Non-empty only. An empty map dispatches no error model at all; it is
+            // what the parser hands every endpoint-only model, and that model is
+            // reported by `EndpointRouting` below on its own merits.
+            CmtConsumer::PerCmtErrorModel => {
+                matches!(&model.error_spec, ErrorSpec::PerCmt(m) if !m.is_empty())
+            }
+            // Both readout structs. `OdeReadout::PerCmt` is dispatched on
+            // `subject.obs_cmts` from `OdeSpec::readout` for an `[odes]` model
+            // (`ode::predictions::read_observable`, and `sens::ode_provider` for the
+            // `Dual2` twin) and from `AnalyticReadout::readout` for an analytical
+            // one. #1404 round 2 inspected only the second.
+            CmtConsumer::PerCmtReadout => {
+                model.ode_spec.as_ref().is_some_and(|s| per_cmt(&s.readout))
+                    || model
+                        .analytic_readout
+                        .as_ref()
+                        .is_some_and(|ar| per_cmt(&ar.readout))
+            }
+            CmtConsumer::EndpointRouting => crate::api::run::model_routes_rows_by_cmt(model),
+            CmtConsumer::DataSelectionFilter => data_selection_reads_cmt(options),
+        }
+    }
+}
+
+/// Whether a `[data_selection]` clause compares the `CMT` column (#1409).
+///
+/// `resolve_row_cmt`'s own doc says it is shared by "the dose row, the observation
+/// row **and the `[data]` selection filter's `RowContext`**" — the filter is fed the
+/// *defaulted* value, so a clause naming `CMT` decides which rows are scored on a
+/// compartment the reader invented. Measured on `pk one_cpt_iv` with
+/// `[data_selection] ignore = CMT == 2`, one observation cell spelled `2` against
+/// `x` and nothing else changed: 3 observations kept and OFV −4.6162 against 4 kept
+/// and OFV −6.9517, with `ferx check` reporting `ok — 0 warning(s)` both ways. The
+/// row the filter was told to drop is silently kept and scored.
+///
+/// Asked of the compiled clauses rather than of the raw strings, so the answer
+/// tracks what the filter actually parses (`CMT`/`cmt` case-folding, `&&`-joined
+/// sub-expressions, the bare-identifier `IGNORE=C` shorthand) instead of a second
+/// spelling of it here. A clause that does not parse answers **true**: the read is
+/// about to fail on it anyway, so an extra warning can mask nothing, while `false`
+/// would silently narrow the predicate on an expression nobody has inspected.
+fn data_selection_reads_cmt(options: &FitOptions) -> bool {
+    match crate::io::datareader::SelectionFilter::from_opts(
+        &options.ignore_exprs,
+        &options.accept_exprs,
+        // `ignore_subjects` compares `Subject::id` and never reads a row's CMT.
+        &[],
+    ) {
+        Ok(filter) => filter.references_column("cmt"),
+        Err(_) => true,
+    }
 }
 
 /// How many compartments a *dose* row's `CMT` can route to on whichever engine
@@ -753,73 +912,47 @@ fn cmt_defaulting_is_ambiguous(model: &CompiledModel) -> bool {
 /// its `CMT` column silently gets a compartment-1 bolus instead — the same defect
 /// #1009 reports for `[odes]`, on the other engine.
 ///
-/// `0` for an algebraic model (no compartments at all) and for the transit /
-/// inverse-Gaussian closed forms (every dose absorbs through the depot; `dose.cmt`
-/// is never read), so neither warns.
+/// `0` for a model no closed form serves (see [`analytical_closed_form_dispatched`])
+/// and for the transit / inverse-Gaussian closed forms (every dose absorbs through
+/// the depot; `dose.cmt` is never read), so neither warns.
 fn addressable_dose_compartments(model: &CompiledModel) -> usize {
     if let Some(spec) = model.ode_spec.as_ref() {
         return spec.n_states;
     }
-    if model.is_algebraic() {
+    if !analytical_closed_form_dispatched(model) {
         return 0;
     }
     model.pk_model.topology().addressable_dose_compartments()
 }
 
-/// Whether an *observation* row's `CMT` selects its scale, readout or error model.
+/// Whether an analytical closed form is what actually serves this model's
+/// predictions — the condition for [`CompiledModel::pk_model`] to mean anything.
 ///
-/// Engine-independent, and the reason the dose test alone is not enough: a per-CMT
-/// `[scaling]` block parses on an analytical model, and `pk::validate_per_cmt_scaling`
-/// only checks that the *observed* CMTs have entries — so a `CMT`-less dataset keys
-/// every row to 1, `{1} ⊆ {1, 2}`, and validation passes. Measured on a
-/// `pk one_cpt_iv` with `obs_scale[CMT=1] = 1000` / `obs_scale[CMT=2] = 1`: the same
-/// data spelled with `CMT=2` gives OFV **0.0357**, with the column dropped
-/// **6097015712.1246**, and before #1404 widened this predicate neither arm warned.
+/// Spelled as the *positive* question rather than as `!is_algebraic()` (#1409).
+/// `is_algebraic()` is the marker for a compartment-free `$PRED`-equivalent model
+/// (#811), and a model can fail it while still never reaching a closed form: an
+/// endpoint-only model (TTE, binary, categorical) has no `[structural_model]` block
+/// at all, and `model_parser.rs` gives it `PkModel::OneCptIv` as a **placeholder**
+/// that `types.rs` warns must never be dispatched on (#1356). Reading that
+/// placeholder's topology is benign only by the coincidence that the analytical
+/// branch of that parser arm picks a one-channel model while the `[odes]` branch
+/// picks a two-channel one — exactly the kind of accident #1409 exists to remove.
 ///
-/// Both readouts are tested because `OdeReadout::PerCmt` is dispatched on
-/// `subject.obs_cmts` from **two** structs — `OdeSpec::readout` for an `[odes]` model
-/// (`ode::predictions::read_observable`, and `sens::ode_provider` for the `Dual2`
-/// twin) and `AnalyticReadout::readout` for an analytical one. The first round of
-/// this predicate covered only the second, which left exactly the one-state `[odes]`
-/// model with `y[CMT=N]` readouts unreported: measured on `d/dt(central)` with
-/// `y[CMT=1] = central/V` and `y[CMT=2] = central/V*1000`, OFV **10028.0940** with the
-/// column and **0.0357** without, no warning either way.
-///
-/// `ErrorSpec::PerCmt` matches **any** map, empty included. An empty one is what the
-/// parser hands every model with no `[error_model]` block — TTE-only, binary,
-/// categorical (`model_parser.rs`: "An empty PerCmt arises for TTE-only models") —
-/// so this reports every declared endpoint model, and on an absent `CMT` column that
-/// duplicates `E_ENDPOINT_NO_RECORDS`.
-///
-/// That duplication is deliberate, and a `!m.is_empty()` gate to remove it was tried
-/// and **reverted**: it reasoned about the absent-column cause only, while
-/// `W_CMT_DEFAULTED` also fires for a *missing* or *unparseable* cell. In those cases
-/// every endpoint keeps rows, so `E_ENDPOINT_NO_RECORDS`'s `routed.get(&cmt) == 0`
-/// condition cannot fire, and the defaulted row is silently re-routed between
-/// endpoints instead. Measured on the competing-risks example with its endpoints at
-/// `cmt = 1` / `cmt = 2` and one event row's cell spelled `x` rather than `2`: the
-/// event moves from `cause_b` to `cause_a`, OFV 27.8497 against 28.3610, and with the
-/// gate in place `ferx check` reported `0 warning(s)` on both. Duplicating a
-/// diagnostic is cheaper than silencing one.
-///
-/// `ErrorSpec::Selected` is correctly absent: it resolves its branch from the
-/// covariate selector (`ErrorSpec::obs_keys` builds a synthetic index), never from
-/// `obs_cmts`.
-fn observation_is_cmt_dispatched(model: &CompiledModel) -> bool {
-    if matches!(model.scaling, ScalingSpec::PerCmt(_)) {
-        return true;
+/// The three conditions mirror the production dispatch in `pk::predict_subject`, in
+/// its own order: `is_algebraic()` first (nothing to integrate or superpose), then
+/// `ode_spec` (the ODE engine), then the closed form. The third condition is the one
+/// that arm cannot see — it never runs on an endpoint-only model because that model
+/// scores no Gaussian observation, which is exactly what an empty `ErrorSpec`
+/// dispatch table says.
+fn analytical_closed_form_dispatched(model: &CompiledModel) -> bool {
+    if model.is_algebraic() || model.ode_spec.is_some() {
+        return false;
     }
-    if matches!(model.error_spec, ErrorSpec::PerCmt(_)) {
-        return true;
+    match &model.error_spec {
+        ErrorSpec::Single(_) => true,
+        ErrorSpec::PerCmt(m) => !m.is_empty(),
+        ErrorSpec::Selected { endpoints, .. } => !endpoints.is_empty(),
     }
-    let per_cmt = |r: &crate::ode::OdeReadout| matches!(r, crate::ode::OdeReadout::PerCmt(_));
-    if model.ode_spec.as_ref().is_some_and(|s| per_cmt(&s.readout)) {
-        return true;
-    }
-    model
-        .analytic_readout
-        .as_ref()
-        .is_some_and(|ar| per_cmt(&ar.readout))
 }
 
 /// The *fatal* model-vs-population checks every `simulate()` entry point owes its
@@ -6502,7 +6635,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 for w in population
                     .warnings
                     .iter()
-                    .filter(|w| !reader_warning_suppressed(&parsed.model, w))
+                    .filter(|w| !reader_warning_suppressed(&parsed.model, &parsed.fit_options, w))
                 {
                     let code = if w.starts_with("W_ADDL_MISSING_II") {
                         "W_ADDL_MISSING_II"

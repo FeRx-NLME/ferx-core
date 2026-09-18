@@ -60,6 +60,22 @@ impl SelectionFilter {
         cols
     }
 
+    /// True when any ignore/accept clause reads `col` (case-insensitive; standard
+    /// NONMEM columns included).
+    ///
+    /// `api::validation` asks this for `cmt`: the filter's `RowContext` is fed the
+    /// compartment the reader *resolved*, so on a dataset with no usable `CMT` cell
+    /// a clause naming `CMT` selects rows on an invented value and `W_CMT_DEFAULTED`
+    /// has to fire (#1409). `ignore_subject_ids` is not consulted — it compares
+    /// `Subject::id` and reads no row column at all.
+    pub(crate) fn references_column(&self, col: &str) -> bool {
+        self.ignore
+            .iter()
+            .chain(self.accept.iter())
+            .flat_map(|c| c.columns())
+            .any(|c| c.eq_ignore_ascii_case(col))
+    }
+
     /// True when any ignore/accept clause compares a covariate column as a raw
     /// string, so the reader must build the per-row `str_covariates` map. Lets a
     /// purely numeric filter (the common case) skip that per-row allocation.
@@ -437,6 +453,20 @@ impl ObsRouting {
     pub(crate) fn with_missing_dv(mut self, policy: MissingDvPolicy) -> Self {
         self.missing_dv = policy;
         self
+    }
+
+    /// Whether **any** observation row's endpoint is chosen by its `CMT` — i.e.
+    /// whether this routing is something other than "every row is Gaussian".
+    ///
+    /// The empty-sets default means the reader takes the Gaussian parallel-Vec path
+    /// for every row and never consults the routing tables, so a compartment it had
+    /// to invent cannot move a row between endpoints. Any non-empty set and it can:
+    /// this is what `api::validation::CmtConsumer::EndpointRouting` asks, so the
+    /// `W_CMT_DEFAULTED` scope rests on the routing sets themselves rather than on
+    /// the side-effect of an endpoint-only model carrying an empty `ErrorSpec` map
+    /// (#1409).
+    pub(crate) fn routes_by_cmt(&self) -> bool {
+        !self.tte.is_empty() || !self.discrete.is_empty() || !self.count.is_empty()
     }
 
     /// The integer-coded non-Gaussian endpoint kind (discrete-state or count) a

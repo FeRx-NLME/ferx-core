@@ -1265,7 +1265,7 @@ fn fit_inner(
         population
             .warnings
             .iter()
-            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, options, w))
             .cloned(),
     );
 
