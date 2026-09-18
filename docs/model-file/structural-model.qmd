@@ -210,6 +210,12 @@ following are rejected by name rather than silently ignored:
 `[error_model]`, `[fit_options]`, `[covariates]`, `[derived]` and `[output]` all
 work unchanged.
 
+Because nothing is dosed, the dose-attribute names a `pk(...)` or `[odes]` model
+reserves — `F`, `LAGTIME`, and the compartment-indexed `F1`, `ALAG1`, `D2`, `R1`
+— carry no meaning here and are ordinary parameter names (a fraction, a factor
+level, a slope). They are neither bound to a dose route nor rejected for lacking
+one (#1358).
+
 ### Worked example
 
 An Emax time-course with between-subject variability on the baseline — the shape

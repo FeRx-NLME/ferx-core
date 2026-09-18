@@ -3108,9 +3108,19 @@ pub fn parse_full_model_with(
     // `build_pk_param_fn` so its closure writes the value alongside the canonical
     // PK assignments. Empty (and the map stays `Default`) for ODE models and for
     // the common analytical model with no `RATE=-1`/`-2` dosing.
+    //
+    // Keyed on `uses_ode_param_layout`, **not** `is_ode` (#1358): a compartment-free
+    // model (#811) has `is_ode == false` but no doses at all, so a dose-attribute
+    // name means nothing there — `F1` / `ALAG1` / `D2` are ordinary parameter names
+    // (a factor level, a fraction). Gating on `is_ode` ran this loop against its
+    // placeholder `pk_model` and empty `pk_param_map`, so `F{n}`/`ALAG{n}` hit the
+    // dose-route reject below (about a `pk(...)` model the user never wrote), a
+    // `D{n}`/`R{n}` off the placeholder's one infusable compartment hit the
+    // infusable reject, and `D1`/`R1` were recorded as an analytical modeled dose
+    // at a spare slot `ode_param_slots` never gave them.
     let mut analytical_dose_attr_map = crate::types::DoseAttrMap::default();
     let mut analytical_modeled_slots: Vec<(String, usize)> = Vec::new();
-    if !is_ode {
+    if !uses_ode_param_layout {
         let mut next_slot = crate::types::PK_IDX_LAGTIME + 1;
         for name in &indiv_var_names {
             // Only the modeled-`RATE` attributes (`D{cmt}` duration, `R{cmt}`
