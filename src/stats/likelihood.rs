@@ -887,7 +887,42 @@ pub(crate) fn obs_nll_subject_into(
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    obs_nll_subject_into_with_schedule(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        residual_correlations,
+        eta,
+        pk_scratch,
+        None,
+    )
+}
+
+/// [`obs_nll_subject_into`] with the subject's cached event-driven schedule.
+///
+/// Same relationship as [`individual_nll_into`] to
+/// [`individual_nll_into_with_schedule`], and for the same reason: on the
+/// event-driven path the uncached call rebuilds `EventSchedule::for_subject`
+/// — a merged event sort plus a per-interval bounds `Vec` — inside every
+/// evaluation, and the SAEM M-step evaluates this once per subject per NLopt
+/// step, tens of times per iteration. `None` is exactly the previous behaviour,
+/// and is what a subject whose schedule cannot be reused
+/// (`inner_optimizer::cacheable_schedule`) still gets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_into_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    eta: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
+    let preds = pk::compute_predictions_with_tv_into_with_schedule(
+        model, subject, theta, eta, pk_scratch, schedule,
+    );
     obs_nll_subject_from_preds(
         model,
         subject,

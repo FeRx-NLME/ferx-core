@@ -16,8 +16,7 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_into, individual_nll_iov, individual_nll_iov_with_scratch,
-    individual_nll_prepared, iov_occasion_groups, obs_nll_subject_into, IndividualNllPrep,
-    IndividualNllScratch,
+    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1048,6 +1047,11 @@ fn theta_sigma_mstep_light(
     // value is estimated from its own class members and a held `sigma(k)`
     // override does not bias the free base σ.
     mix_mstep: Option<MixMstep<'_>>,
+    // Per-subject cached `EventSchedule`s (`&[]` = no cache). The M-step's
+    // derivative-free solve evaluates `obs_nll_sum` `maxiter * (n + 1)` times,
+    // each one a full prediction per subject, so on the event-driven path this
+    // is the same per-call schedule rebuild the E-step kernels stopped paying.
+    schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -1200,9 +1204,11 @@ fn theta_sigma_mstep_light(
                 (Some(mx), Some(kappas)) => {
                     obs_nll_sum_iov_mix(model, population, &th, &sg, etas, kappas, mx)
                 }
-                (Some(mx), None) => obs_nll_sum_mix(model, population, &th, &sg, etas, mx),
+                (Some(mx), None) => {
+                    obs_nll_sum_mix(model, population, &th, &sg, etas, mx, schedules)
+                }
                 (None, Some(kappas)) => obs_nll_sum_iov(model, population, &th, &sg, etas, kappas),
-                (None, None) => obs_nll_sum(model, population, &th, &sg, etas),
+                (None, None) => obs_nll_sum(model, population, &th, &sg, etas, schedules),
             };
             if val.is_finite() {
                 val
@@ -1319,6 +1325,10 @@ pub(crate) fn obs_nll_sum(
     theta: &[f64],
     sigma_values: &[f64],
     etas: &[Vec<f64>],
+    // Per-subject cached `EventSchedule`s, parallel to `population.subjects`.
+    // `&[]` means "no cache" and reproduces the per-call rebuild exactly; that is
+    // what the tests and any caller without one pass.
+    schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
     use rayon::prelude::*;
     // Collect in subject order and sum serially so the objective does not
@@ -1329,7 +1339,7 @@ pub(crate) fn obs_nll_sum(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            obs_nll_subject_into(
+            crate::stats::likelihood::obs_nll_subject_into_with_schedule(
                 model,
                 subject,
                 theta,
@@ -1337,6 +1347,7 @@ pub(crate) fn obs_nll_sum(
                 &model.residual_correlations,
                 &etas[i],
                 scratch,
+                schedules.get(i).and_then(|s| s.as_ref()),
             )
         })
         .collect();
@@ -1386,6 +1397,7 @@ fn obs_nll_sum_mix(
     sigma_values: &[f64],
     etas: &[Vec<f64>],
     mix: MixMstep<'_>,
+    schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
     use rayon::prelude::*;
     let per_subj: Vec<f64> = population
@@ -1397,7 +1409,7 @@ fn obs_nll_sum_mix(
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
             let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
-            obs_nll_subject_into(
+            crate::stats::likelihood::obs_nll_subject_into_with_schedule(
                 model,
                 subject,
                 theta,
@@ -1405,6 +1417,7 @@ fn obs_nll_sum_mix(
                 &model.residual_correlations,
                 &etas[i],
                 scratch,
+                schedules.get(i).and_then(|s| s.as_ref()),
             )
         })
         .collect();
@@ -3827,9 +3840,9 @@ pub fn run_saem(
                                         Some(kaps) => obs_nll_sum_iov(
                                             model, population, th, &sigma_now, &shifted, kaps,
                                         ),
-                                        None => {
-                                            obs_nll_sum(model, population, th, &sigma_now, &shifted)
-                                        }
+                                        None => obs_nll_sum(
+                                            model, population, th, &sigma_now, &shifted, &schedules,
+                                        ),
                                     }
                                 };
                                 group.solve_numerical(population, &input, mstep_maxiter, &data)
@@ -3897,6 +3910,7 @@ pub fn run_saem(
                         // Closed-form branch is never taken for a mixture (disabled
                         // above), so no class guard is needed here.
                         None,
+                        &schedules,
                     );
                     damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                     damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
@@ -3995,6 +4009,7 @@ pub fn run_saem(
                         classes: mix.classes.as_slice(),
                         class_sigma_over: &mix_sigma_over,
                     }),
+                    &schedules,
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                 damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
@@ -4024,6 +4039,7 @@ pub fn run_saem(
                             classes: m.classes.as_slice(),
                             class_sigma_over: &mix_sigma_over,
                         }),
+                        &schedules,
                     );
                     damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                     damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
@@ -5645,6 +5661,7 @@ mod tests {
                 classes: &[0, 0],
                 class_sigma_over: &no_over,
             },
+            &[],
         );
         let as_class2 = obs_nll_sum_mix(
             &model,
@@ -5656,6 +5673,7 @@ mod tests {
                 classes: &[1, 1],
                 class_sigma_over: &no_over,
             },
+            &[],
         );
         assert!(as_class1.is_finite() && as_class2.is_finite());
         assert!(
@@ -5678,6 +5696,7 @@ mod tests {
                 classes: &[1, 1],
                 class_sigma_over: &over,
             },
+            &[],
         );
         assert!(
             (with_override - as_class2).abs() > 1e-6,
@@ -5839,12 +5858,13 @@ DV ~ proportional(EPS)
                 false,
                 &packs_log,
                 None,
+                &[],
             )
         };
         let objective = |lt: &[f64], ls: &[f64]| {
             let th: Vec<f64> = lt.iter().map(|x| x.exp()).collect();
             let sg: Vec<f64> = ls.iter().map(|x| x.exp()).collect();
-            obs_nll_sum(&model, &pop, &th, &sg, &etas)
+            obs_nll_sum(&model, &pop, &th, &sg, &etas, &[])
         };
 
         let (theta_ref, sigma_ref) = solve(900);
@@ -5921,6 +5941,7 @@ DV ~ proportional(EPS)
                 classes: &classes,
                 class_sigma_over: &class_sigma_over,
             }),
+            &[],
         );
         assert!(
             (theta_mix[0] - theta_ref[0]).abs() > 0.03,
@@ -5990,7 +6011,7 @@ DV ~ proportional(EPS)
         let objective = |lt: &[f64], ls: &[f64]| {
             let th: Vec<f64> = lt.iter().map(|x| x.exp()).collect();
             let sg: Vec<f64> = ls.iter().map(|x| x.exp()).collect();
-            obs_nll_sum(&model, &pop, &th, &sg, &etas)
+            obs_nll_sum(&model, &pop, &th, &sg, &etas, &[])
         };
         let f_start = objective(&start_theta, &start_sigma);
         let (theta_b, sigma_b) = theta_sigma_mstep_light(
@@ -6010,6 +6031,7 @@ DV ~ proportional(EPS)
             false,
             &packs_log,
             None,
+            &[],
         );
         let f_b = objective(&theta_b, &sigma_b);
         assert!(f_b.is_finite() && f_start.is_finite());
