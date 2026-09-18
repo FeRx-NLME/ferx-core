@@ -37,6 +37,75 @@ use rand_distr::StandardNormal;
 /// Exposed pub(crate) so the unit test can pin the choice across refactors.
 pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bobyqa;
 
+/// Initial BOBYQA trust radius of the numerical θ/σ M-step, in packed
+/// (log / identity) units — a 10 % move (#1415).
+///
+/// The M-step is a *warm-started local* solve: it starts at the current
+/// estimate and is expected to return the nearby maximiser of the η-frozen
+/// conditional likelihood. Left to NLopt's default, the first design is a
+/// quarter of the bound range — 2.5 log units for a theta declared on
+/// `(0.01, 200)`, 3.25 for σ on its `[-8, 5]` box — so BOBYQA's first `2n+1`
+/// interpolation points sit at ×12–×26 of the current value, its quadratic
+/// model is built on garbage, and the few trust-region steps the budget allows
+/// go nowhere. Measured on the thiotepa model of #1415 (11 free coordinates):
+/// the returned point improved the conditional objective by 0.05–6 units per
+/// M-step where a converged solve from the same point improved it by 13–224,
+/// and several coordinates came back with a displacement of exactly zero.
+/// With a 0.1 radius and [`MSTEP_FTOL_REL`], the same budget reproduces a
+/// 4000-evaluation solve to 4 decimals on the melphalan model (3 free
+/// coordinates) and captures 50–90 % of the achievable gain on thiotepa; a
+/// 3× budget on top of that bought nothing (IS −2 log L 5835.0 against
+/// 5827.3, at 2.3× the wall time), so the budget is left alone.
+const MSTEP_INITIAL_STEP: f64 = 0.1;
+
+/// Initial BOBYQA step for one packed coordinate: [`MSTEP_INITIAL_STEP`],
+/// bounded by a quarter of the coordinate's own interval.
+///
+/// BOBYQA requires `upper - lower >= 2 * step` on every free coordinate and
+/// otherwise rejects the *whole* problem with `NLOPT_INVALID_ARGS` before the
+/// first evaluation (#1420 review). A quarter of the width is NLopt's own
+/// default and leaves the factor-of-two margin; a pinned coordinate
+/// (`upper == lower`) is eliminated by NLopt before BOBYQA runs and keeps the
+/// nominal step, which only has to be positive. An unbounded coordinate
+/// (`+∞` width) keeps the nominal step too.
+fn mstep_initial_step(lower: f64, upper: f64) -> f64 {
+    let width = upper - lower;
+    if width > 0.0 && width.is_finite() {
+        MSTEP_INITIAL_STEP.min(width / 4.0)
+    } else {
+        MSTEP_INITIAL_STEP
+    }
+}
+
+/// Relative objective tolerance of the numerical θ/σ M-step (#1415).
+///
+/// Was `1e-4`: on a conditional objective of a few thousand units that stops
+/// the solve as soon as an iteration gains less than ~0.1, which with the
+/// default first design above was almost every iteration — 300 of 304 M-steps
+/// on melphalan ended `FtolReached` after moving a fraction of the distance a
+/// converged solve moves. `1e-7` is 1e-3 units on a 1e4 objective, below
+/// anything the SA blend can resolve, and the `maxeval` budget still bounds
+/// the work.
+const MSTEP_FTOL_REL: f64 = 1e-7;
+
+/// Relative objective tolerance of the numerical θ/σ M-step **under a mixture
+/// model** — the pre-#1415 value, kept deliberately, together with NLopt's
+/// default first design (no `set_initial_step`).
+///
+/// A `MIXNUM`-switched typical value is estimated by this solve from a hard
+/// class draw (#996), and the NONMEM-anchored seed sweep in
+/// `tests/mixture_nonmem.rs` was calibrated on the partial step that
+/// configuration returns. Measured on that anchor (10-seed mean, NONMEM FOCEI
+/// MLE `TVCL2` 2.842, `p(1)` 0.5, IMP marginal 300.87): the #1415
+/// configuration lands `TVCL2` at 3.23; the local first design alone at 3.09;
+/// the 1e-7 tolerance alone moves `p(1)` to 0.44 and the IMP marginal to
+/// 306.9. An exact per-class M-step on a hard class draw is a different
+/// estimator (classification EM, not EM), so the mixture channel keeps the
+/// configuration its anchor measured until it gets its own schedule and its
+/// own anchor — the same reason `damps_numerical_mstep` vetoes the damping for
+/// mixtures.
+const MSTEP_MIXTURE_FTOL_REL: f64 = 1e-4;
+
 // ---------------------------------------------------------------------------
 // SAEM state
 // ---------------------------------------------------------------------------
@@ -91,44 +160,90 @@ const SAEM_RUV_OMEGA_LN_GROWTH: f64 = 3.0;
 /// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
 const OMEGA_SA_MAX_STEP: f64 = 0.1;
 
-/// Maximum per-iteration stochastic-approximation step for the **numerical θ/σ
-/// M-step** during the exploration phase — the θ-side counterpart of
-/// [`OMEGA_SA_MAX_STEP`] (issue #1011).
+/// Default exploration-phase cap on the stochastic-approximation step for the
+/// **numerical θ/σ M-step** — the `mstep_damping` fit option — and, since
+/// #1415, **off** (`1.0`): the numerical maximiser is assigned outright in both
+/// phases, exactly as it was before #1011.
 ///
-/// A log-mu-referenced θ is updated by the closed-form `log θ += γ·mean(η)`,
-/// which is an exact Robbins-Monro average and therefore already damped. A θ
-/// with **no ETA** has no such channel: it is moved only by NLopt re-maximising
-/// the η-frozen conditional observation likelihood against a *single* MCMC draw.
-/// Assigning that maximiser outright is `argmax` of one draw, not the SA average
-/// of `E[argmax]`, so the estimate carries a Monte-Carlo bias that does not decay
-/// with iteration count — precisely the "single un-equilibrated MCMC draw"
-/// hazard [`OMEGA_SA_MAX_STEP`] exists to prevent for Ω, which the θ channel was
-/// left exposed to.
+/// #1011 introduced a 0.03 cap after a FREM `iiv_on_ruv` reprex whose
+/// absorption-split fraction `TVFRD1` (no ETA) drifted from 0.383 to 0.039
+/// under the undamped update, and read the cap's 0.290 as "landing on the
+/// marginal optimum". #1415 measured what that cap actually does, with the
+/// M-step solver itself repaired ([`MSTEP_INITIAL_STEP`], [`MSTEP_FTOL_REL`]):
 ///
-/// Measured on the FREM `iiv_on_ruv` reprex of #1011, whose absorption fraction
-/// `TVFRD1` carries no ETA (marginal −2logL optimum ≈ 0.29, NONMEM IMP 0.394):
+/// * **It is a hold, not an estimate.** On the same reprex the capped fit ends
+///   where it starts: 0.383 → 0.361, and from a deliberately wrong 0.2 start,
+///   0.2 → 0.191. Its "good" answer was the model's initial estimate, which
+///   that auto-generated FREM model had taken from a FOCEI fit.
+/// * **It freezes every other no-ETA theta the same way**, which is the
+///   #1415 report. The cap divides the number of EM steps the exploration
+///   phase amounts to (50 M-steps × cap), and a covariate slope confounded
+///   with an ETA needs all of them. `covmuref_power` with `TH_WT` routed onto
+///   the numerical channel (NONMEM SAEM 0.921, start 0.3): cap 0.03 → 0.323,
+///   0.1 → 0.340, 0.3 → 0.403, off → 0.961. Thiotepa (`ferx-testdata`,
+///   eight no-ETA thetas, importance-sampled −2 log L, optimum 5824): cap
+///   0.03 → 5928, 0.1 → 5897, 0.3 → 5860, off → 5827. Melphalan and
+///   clofarabine order the same way.
+/// * **The convergence-phase Robbins-Monro blend hurts too.** `γ = 1/(k−k1)`
+///   is the right average for a statistic that is stationary around the
+///   optimum, but the sequence of η-frozen maximisers is an EM trajectory,
+///   not noise around a fixed point; averaging it weights the early, still
+///   crawling iterates most (`TH_WT` 0.637 with the blend, 0.961 without).
 ///
-/// | exploration cap | TVFRD1 |
-/// |---|---|
-/// | undamped (1.0, pre-#1011) | 0.039 |
-/// | 0.1 | 0.170 |
-/// | **0.03** | **0.290** |
-/// | 0.01 | 0.355 |
-/// | 0.003 | 0.357 |
+/// The FREM drift is real and is *not* fixed by this: undamped, that reprex
+/// settles near `TVFRD1` 0.18 from either start on the default schedule and
+/// keeps drifting on a 3× longer one (0.032), and 200 MH steps per iteration
+/// do not change it — so it is not plain E-step under-mixing. The
+/// importance-sampled objective cannot rank the two points on that 12-eta
+/// model (ESS/K = 0.001); the FOCEI objective can, and the drifted fit is 47
+/// units worse than the held one (7492.7 against 7445.3). It is tracked as
+/// #1421; `mstep_damping = 0.03`
+/// remains available as the documented hold for that shape of model, and its
+/// gate and no-effect warnings are unchanged.
 ///
-/// 0.03 lands on the marginal optimum. Averaging the M-step *objective* over the
-/// last K draws instead reaches only 0.081 at K = 50, and 0.130 at K = 150 for
-/// 15× the wall time, because consecutive SAEM draws are heavily autocorrelated.
-/// Damping the iterate accumulates over every iteration rather than a K-window,
-/// so it is both the more accurate and the cheaper cure.
+/// `cap >= 1.0` is the "off" sentinel of [`mstep_sa_step`] — assignment in
+/// both phases — which is now the default for every model except one shape,
+/// see [`default_mstep_damping`].
+const MSTEP_SA_MAX_STEP: f64 = 1.0;
+
+/// The #1011 exploration cap, kept as the default for a model with
+/// `iiv_on_ruv` — the one shape on which the undamped numerical channel was
+/// measured to drift, and exactly the shape #1011 fixed.
 ///
-/// In the convergence phase the cap is lifted and the full decaying
-/// `γ = 1/(k−k1)` applies, exactly as for Ω.
-const MSTEP_SA_MAX_STEP: f64 = 0.03;
+/// The drift is the `iiv_on_ruv` coupling, not FREM and not the no-ETA channel
+/// as such: the #1011 reprex with its `iiv_on_ruv` line and `ETA_RUV` omega
+/// removed, otherwise identical (475 subjects, FREM block of 11), lands undamped
+/// at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 /
+/// 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342 / 2.228 / 147.5. With
+/// `iiv_on_ruv` back in, undamped drifts to 0.18 from either start (47 FOCEI
+/// units worse than the capped 0.36), 200 MH steps per iteration do not change
+/// it, and #1011 had already ruled out sampler mixing and σ. Under `iiv_on_ruv`
+/// the E-step is modified — `η_RUV` is re-centred into σ every iteration (#904)
+/// — and a σ that shares the numerical M-step with the no-ETA thetas is what
+/// that channel's σ-side of the blend acts on; that is where the pathology
+/// lives, and it needs its own fix (#1421). Until then this cap holds those
+/// thetas near their start, which on that reprex is the better answer.
+const MSTEP_SA_MAX_STEP_IIV_ON_RUV: f64 = 0.03;
+
+/// Default `mstep_damping` for a fit that did not set one (#1415).
+///
+/// Off ([`MSTEP_SA_MAX_STEP`]) unless the model has `iiv_on_ruv`, which keeps
+/// the #1011 cap ([`MSTEP_SA_MAX_STEP_IIV_ON_RUV`]). A value the user sets wins
+/// either way, and the gate and no-effect warnings in the caller are unchanged.
+fn default_mstep_damping(has_iiv_on_ruv: bool) -> f64 {
+    if has_iiv_on_ruv {
+        MSTEP_SA_MAX_STEP_IIV_ON_RUV
+    } else {
+        MSTEP_SA_MAX_STEP
+    }
+}
 
 /// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
 ///
-/// Only when NLopt is left estimating a θ that **anchors no mu-reference** — the
+/// Since #1415 the damping is opt-in (`mstep_damping` below 1.0; the default
+/// [`MSTEP_SA_MAX_STEP`] is off), so this gate only decides whether a cap the
+/// user *set* applies, and whether to warn that it does not. When it does:
+/// only when NLopt is left estimating a θ that **anchors no mu-reference** — the
 /// #1011 shape, and exactly the condition the no-ETA advisory warns on.
 /// `theta_is_mu_ref_anchor` is that predicate, and it is mu-reference *detection*
 /// rather than a scan of ETA usage: an η attached in a form the parser cannot pair
@@ -190,8 +305,9 @@ fn damps_numerical_mstep(
 ///
 /// * No θ for the damping to act on (see [`damps_numerical_mstep`]) → `1.0`,
 ///   the undamped pre-#1011 assignment, so those fits are byte-identical.
-/// * Exploration → capped at [`MSTEP_SA_MAX_STEP`], the θ-side counterpart of
-///   the [`OMEGA_SA_MAX_STEP`] cap on Ω.
+/// * Exploration → capped at the `mstep_damping` value, the θ-side counterpart
+///   of the [`OMEGA_SA_MAX_STEP`] cap on Ω. The default [`MSTEP_SA_MAX_STEP`]
+///   is `1.0`, i.e. no cap (#1415).
 /// * Convergence → the full decaying `γ = 1/(k−k1)`, same schedule as Ω.
 ///
 /// **`cap >= 1.0` is a sentinel, not a cap value.** It disables the damping in
@@ -239,8 +355,8 @@ fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64,
 /// documented "off" switch) — `+∞` included, since a caller writing
 /// `f64::INFINITY` means "no damping", and routing it to the *maximum* damping
 /// would be the exact opposite. `<= 0.0` (`-∞` included) and `NaN` fall back to
-/// the calibrated default rather than to a hair above zero, since a near-zero
-/// cap is itself a frozen fit. `None` means the value was already in range.
+/// the default rather than to a hair above zero, since a near-zero cap is
+/// itself a frozen fit (#1415). `None` means the value was already in range.
 fn sanitize_mstep_damping(cap: f64) -> Option<f64> {
     if cap.is_nan() || cap <= 0.0 {
         Some(MSTEP_SA_MAX_STEP)
@@ -1021,11 +1137,53 @@ fn theta_sigma_mstep_light(
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
     opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
-    opt.set_ftol_rel(1e-4).unwrap();
-
-    match opt.optimize(&mut xs) {
-        Ok(_) | Err(_) => {}
+    if mix_mstep.is_some() {
+        // The mixture arm keeps the pre-#1415 configuration — NLopt's default
+        // first design and the 1e-4 tolerance — on purpose. Its class typical
+        // values are estimated from a *hard* class draw (#996), and the
+        // NONMEM-anchored `tests/mixture_nonmem.rs` seed sweep was calibrated
+        // on what this solve returned under that configuration, which is a
+        // partial step. A converged solve moves the anchor off the NONMEM MLE
+        // (seed-mean TVCL2 2.84 → 3.23 with both settings; 3.09 with the local
+        // first design alone; p(1) 0.54 → 0.44 and IMP marginal 300.9 → 306.9
+        // with the tolerance alone), so an exact per-class M-step on a hard
+        // draw is not the same estimator, and needs its own schedule and its
+        // own anchor before it changes. See `MSTEP_MIXTURE_FTOL_REL`.
+        opt.set_ftol_rel(MSTEP_MIXTURE_FTOL_REL).unwrap();
+    } else {
+        opt.set_ftol_rel(MSTEP_FTOL_REL).unwrap();
+        // A warm-started local solve needs a *local* first design (#1415).
+        // Every coordinate gets the same trust radius in packed units, undone
+        // through the optional magnitude scaling so the radius is the same
+        // fraction of the parameter either way.
+        //
+        // Bounded by the coordinate's own interval: BOBYQA refuses the whole
+        // problem (`NLOPT_INVALID_ARGS`, before a single evaluation) if any
+        // free coordinate has `upper - lower < 2 * step`, and the error is
+        // discarded below, so a theta declared on a narrow interval — CL on
+        // (1.9, 2.1) is 0.10008 log units wide — would silently turn every
+        // M-step into a no-op for θ *and* σ (#1420 review). A quarter of the
+        // width is NLopt's own default and leaves the required factor-of-two
+        // margin. A pinned coordinate (`upper == lower`) is eliminated by NLopt
+        // before BOBYQA sees it; it keeps the nominal step, which must stay
+        // positive.
+        let initial_step: Vec<f64> = (0..n)
+            .map(|i| mstep_initial_step(lower[i], upper[i]) / scale[i])
+            .collect();
+        opt.set_initial_step(&initial_step).unwrap();
     }
+
+    let outcome = opt.optimize(&mut xs);
+    // A configuration NLopt rejects outright is a bug in this function, not a
+    // property of the fit; `xs` is then untouched and the M-step is a silent
+    // no-op. Loud in debug (every unit and slow test), swallowed in release
+    // like every other NLopt outcome here.
+    debug_assert!(
+        !matches!(outcome, Err((nlopt::FailState::InvalidArgs, _))),
+        "SAEM numerical M-step: NLopt rejected the problem (InvalidArgs) — \
+         check the initial step against the bounds"
+    );
+    let _ = outcome;
 
     // Unscale back to log-space.
     let x_final: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
@@ -2636,14 +2794,15 @@ pub fn run_saem(
     if !thetas_without_eta.is_empty() {
         warnings.push(format!(
             "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
-             mu-referenced and are moved only by the η-frozen numerical M-step. That channel \
-             re-maximises against a single MCMC η draw, so it carries a Monte-Carlo bias that \
-             SA damping (#1011) reduces but does not remove, and it can still settle away from \
-             the marginal optimum. For a typical value, put it in a mu-referenceable form \
+             mu-referenced and are moved only by the η-frozen numerical M-step, which \
+             re-maximises the conditional likelihood against each iteration's MCMC η draw. \
+             That is a valid (stochastic) EM update, but a noisier and slower one than the \
+             closed-form mu-reference shift, and it can settle away from the marginal optimum \
+             on a poorly mixing chain. For a typical value, put it in a mu-referenceable form \
              (`P = TVP * exp(ETA_P)` with a small, optionally FIX, omega — ferx applies \
-             mu-referencing automatically). For a parameter that has no ETA to give — a \
-             covariate coefficient, an allometric exponent, a structural constant — hold it \
-             FIX, or cross-check the fit against FOCEI/IMPMAP.",
+             mu-referencing automatically). For a covariate coefficient, an allometric \
+             exponent or a structural constant, cross-check the fit against FOCEI/IMPMAP, or \
+             hold it FIX.",
             thetas_without_eta.join(", ")
         ));
     }
@@ -2701,7 +2860,7 @@ pub fn run_saem(
     // #1011: exploration-phase cap on the numerical M-step's SA step. `None`
     // takes the calibrated default; `1.0` disables the damping entirely.
     let mstep_damping_cap = match options.saem_mstep_damping {
-        None => MSTEP_SA_MAX_STEP,
+        None => default_mstep_damping(model.residual_error_eta.is_some()),
         Some(v) => match sanitize_mstep_damping(v) {
             None => v,
             Some(fixed) => {
@@ -4223,6 +4382,7 @@ pub fn run_saem(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = out;
     warnings.extend(cov_warnings);
 
@@ -4293,6 +4453,7 @@ pub fn run_saem(
         h_matrices,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved,
@@ -4551,11 +4712,12 @@ mod tests {
     }
 
     /// The SA schedule: off entirely when NLopt has no θ to estimate (so those
-    /// fits keep their pre-#1011 numbers), capped in exploration, full decaying
-    /// γ in convergence.
+    /// fits keep their pre-#1011 numbers); when the user sets a cap, capped in
+    /// exploration and full decaying γ in convergence; and off by default
+    /// (#1415), which is the sentinel value in both phases.
     #[test]
     fn mstep_sa_step_caps_exploration_and_frees_convergence() {
-        let d = MSTEP_SA_MAX_STEP;
+        let d = 0.03; // the pre-#1415 default, now an opt-in value
 
         // No numerically-estimated θ → undamped, in both phases.
         assert_eq!(mstep_sa_step(false, true, 1.0, d), 1.0);
@@ -4572,18 +4734,45 @@ mod tests {
         // `mstep_damping` overrides the cap.
         assert_eq!(mstep_sa_step(true, true, 1.0, 0.005), 0.005);
 
-        // Its documented "off" value of 1.0 must restore the undamped pre-#1011
-        // assignment in BOTH phases — convergence included, where the schedule
-        // would otherwise still damp at γ = 1/(k−k1). Regression: `cap = 1.0`
-        // first only lifted the exploration cap, which left the reprex at
-        // TVFRD1 0.047 instead of its true undamped 0.039.
+        // The "off" value of 1.0 is assignment in BOTH phases — convergence
+        // included, where the schedule would otherwise still damp at
+        // γ = 1/(k−k1). Regression: `cap = 1.0` first only lifted the
+        // exploration cap, which left the #1011 reprex at TVFRD1 0.047 instead
+        // of its true undamped 0.039.
         assert_eq!(mstep_sa_step(true, true, 1.0, 1.0), 1.0);
         assert_eq!(mstep_sa_step(true, false, 0.002, 1.0), 1.0);
         assert_eq!(mstep_sa_step(true, false, 0.5, 1.0), 1.0);
 
-        // The θ cap must be at least as tight as Ω's: the θ channel has no
-        // closed-form averaged alternative, so it is the more exposed of the two.
-        assert!(MSTEP_SA_MAX_STEP <= OMEGA_SA_MAX_STEP);
+        // #1415: the default IS that "off" value. A capped default divides the
+        // number of EM steps the exploration phase amounts to and froze every
+        // no-ETA theta near its start (`covmuref_power` TH_WT 0.323 at 0.03
+        // against NONMEM's 0.921; 0.961 off) — see `MSTEP_SA_MAX_STEP`.
+        assert_eq!(MSTEP_SA_MAX_STEP, 1.0);
+        assert_eq!(mstep_sa_step(true, true, 1.0, MSTEP_SA_MAX_STEP), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.004, MSTEP_SA_MAX_STEP), 1.0);
+    }
+
+    /// The default cap is keyed to the one shape it was measured to help
+    /// (#1415): `iiv_on_ruv` keeps #1011's 0.03 (its reprex drifts undamped —
+    /// TVFRD1 0.18 against the held 0.36, 47 FOCEI units worse — and the same
+    /// model without `iiv_on_ruv` lands on NONMEM IMP undamped), everything
+    /// else is off. Mutation check: returning 0.03 for both freezes the Tier-3
+    /// `saem_recovers_the_allometric_exponent_on_the_numerical_mstep`; returning
+    /// 1.0 for both is the #1011 regression by default.
+    #[test]
+    fn default_mstep_damping_caps_only_iiv_on_ruv() {
+        assert_eq!(default_mstep_damping(true), MSTEP_SA_MAX_STEP_IIV_ON_RUV);
+        assert_eq!(default_mstep_damping(true), 0.03);
+        assert_eq!(default_mstep_damping(false), MSTEP_SA_MAX_STEP);
+        assert_eq!(default_mstep_damping(false), 1.0);
+        // The iiv_on_ruv default is a real cap, so the schedule engages: capped
+        // exploration, decaying γ in convergence.
+        let d = default_mstep_damping(true);
+        assert_eq!(mstep_sa_step(true, true, 1.0, d), d);
+        assert_eq!(mstep_sa_step(true, false, 0.5, d), 0.5);
+        // And a fit that sets `mstep_damping` overrides both defaults (the
+        // caller's `match options.saem_mstep_damping`), so the constants are
+        // only ever the `None` arm.
     }
 
     /// The damping gate (#1011). A mixture is vetoed outright; otherwise the
@@ -5400,6 +5589,308 @@ mod tests {
             "MSTEP_NLOPT_ALGORITHM changed — see comment above this test \
              for the Emax-Hill identifiability rationale before adjusting."
         );
+    }
+
+    /// #1415 fixture: a 1-cpt IV model whose two thetas carry no ETA, three
+    /// subjects, data generated at `CL = 2, V = 20` for a 100 mg bolus with a
+    /// fixed ±10 % pattern (so σ has a non-degenerate maximiser).
+    fn noeta_mstep_fixture() -> (CompiledModel, crate::types::Population) {
+        use std::io::Write as _;
+
+        const MODEL: &str = r#"
+[parameters]
+theta TVCL(1.0, 0.01, 200.0)
+theta TVV(10.0, 0.1, 500.0)
+sigma EPS ~ 0.05
+
+[individual_parameters]
+CL = TVCL
+V = TVV
+
+[structural_model]
+pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+DV ~ proportional(EPS)
+"#;
+        let model = crate::parser::model_parser::parse_model_string(MODEL).unwrap();
+
+        let (cl, v, dose) = (2.0_f64, 20.0_f64, 100.0_f64);
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
+        for id in 1..=3 {
+            csv.push_str(&format!("{id},0,0,{dose},1,1\n"));
+            for (j, t) in [1.0_f64, 2.0, 4.0, 8.0, 12.0].iter().enumerate() {
+                let c = dose / v * (-cl / v * t).exp();
+                let bump = if (id + j) % 2 == 0 { 1.1 } else { 0.9 };
+                csv.push_str(&format!("{id},{t},{:.6},0,0,1\n", c * bump));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+        (model, pop)
+    }
+
+    /// #1415: the budgeted, warm-started numerical M-step must return the
+    /// *nearby maximiser* of the η-frozen conditional likelihood, not a point
+    /// somewhere along the way to it — or, as the old configuration did on this
+    /// very fixture, a point further away.
+    ///
+    /// Fixture: a 1-cpt IV model whose two thetas carry no ETA (the #1415
+    /// shape), three subjects, data generated at `CL = 2, V = 20` with a fixed
+    /// ±10 % pattern (so σ has a non-degenerate maximiser), and the solve
+    /// started 0.05 log units away on every free coordinate — the distance one
+    /// SAEM iteration's blend typically leaves it from the next draw's
+    /// maximiser. The reference is the same solver with a 300× budget from the
+    /// same start.
+    ///
+    /// Measured on this fixture (packed-space |Δ| against the reference, then
+    /// the objective gap), production budgets `mstep_maxiter = 3` (exploration)
+    /// and `5` (convergence):
+    ///
+    /// | config | budget | CL | V | σ | gap |
+    /// |---|---|---|---|---|---|
+    /// | before #1415 (NLopt default first design, `ftol_rel = 1e-4`) | 3 | 0.060 | 0.046 | 0.044 | 1.19 |
+    /// | before #1415 | 5 | 0.024 | 0.034 | 0.051 | 0.40 |
+    /// | **now** | 3 | 0.005 | 0.004 | 0.048 | 0.045 |
+    /// | **now** | 5 | 3e-4 | 2e-4 | 9e-4 | 1e-4 |
+    ///
+    /// The old solve started 0.05 off and came back 0.06 off on CL: its first
+    /// `2n+1` design points sat at ×12–×26 of the start, and the trust-region
+    /// steps the budget then allowed did not recover. Mutation check: drop
+    /// `set_initial_step` and the CL bound fails at both budgets (realised
+    /// 0.060 / 0.024). What this fixture pins is the first design; the
+    /// `1e-4 → 1e-7` tolerance change is *not* observable here — on an
+    /// objective of −11 a relative 1e-4 is already 1e-3 absolute — and is
+    /// pinned by the production measurement in [`MSTEP_FTOL_REL`]'s doc
+    /// instead (a 100-subject variant of this fixture does trip on it, but
+    /// the tolerance then truncates the reference solve too, so the
+    /// comparison stops meaning anything).
+    #[test]
+    fn budgeted_mstep_returns_the_converged_conditional_maximiser() {
+        let (model, pop) = noeta_mstep_fixture();
+        let (cl, v) = (2.0_f64, 20.0_f64);
+        let etas: Vec<Vec<f64>> = vec![vec![]; pop.subjects.len()];
+
+        // Start 0.05 log units from the generating values, on every coordinate.
+        let d = 0.05_f64;
+        let start_theta = vec![(cl.ln() - d), (v.ln() + d)];
+        let start_sigma = vec![(0.1_f64).ln() + d];
+        let theta_lower = vec![(0.01_f64).ln(), (0.1_f64).ln()];
+        let theta_upper = vec![(200.0_f64).ln(), (500.0_f64).ln()];
+        let sigma_lower = vec![-8.0];
+        let sigma_upper = vec![5.0];
+        let packs_log = vec![true, true];
+
+        let solve = |maxiter: u32| {
+            theta_sigma_mstep_light(
+                &model,
+                &pop,
+                &etas,
+                None,
+                &start_theta,
+                &start_sigma,
+                &theta_lower,
+                &theta_upper,
+                &sigma_lower,
+                &sigma_upper,
+                2,
+                1,
+                maxiter,
+                false,
+                &packs_log,
+                None,
+            )
+        };
+        let objective = |lt: &[f64], ls: &[f64]| {
+            let th: Vec<f64> = lt.iter().map(|x| x.exp()).collect();
+            let sg: Vec<f64> = ls.iter().map(|x| x.exp()).collect();
+            obs_nll_sum(&model, &pop, &th, &sg, &etas)
+        };
+
+        let (theta_ref, sigma_ref) = solve(900);
+        let f_start = objective(&start_theta, &start_sigma);
+        let f_ref = objective(&theta_ref, &sigma_ref);
+        assert!(f_ref.is_finite() && f_start.is_finite());
+        // The reference really is a maximiser: within 2 % of the generating
+        // values (the ±10 % pattern is not exactly symmetric under a
+        // proportional error, so the MLE is ~1 % off: realised CL 2.0195,
+        // V 20.06), and the fixture is not degenerate.
+        assert!(
+            (theta_ref[0] - cl.ln()).abs() < 0.02 && (theta_ref[1] - v.ln()).abs() < 0.02,
+            "reference solve must land near the generating CL / V: {:?}",
+            theta_ref.iter().map(|x| x.exp()).collect::<Vec<_>>()
+        );
+        assert!(
+            f_ref < f_start - 1.0,
+            "fixture must be non-degenerate: reference {f_ref} vs start {f_start}"
+        );
+
+        // (budget, |Δθ| bound, |Δσ| bound, objective-gap bound): each bound is
+        // ~2× the realised value in the table above, and every one sits below
+        // what the old configuration realised.
+        for (maxiter, tol_theta, tol_sigma, tol_gap) in
+            [(3_u32, 0.01, 0.1, 0.1), (5_u32, 2e-3, 5e-3, 1e-2)]
+        {
+            let (theta_b, sigma_b) = solve(maxiter);
+            let f_b = objective(&theta_b, &sigma_b);
+            assert!(f_b.is_finite());
+            for (i, (b, r)) in theta_b.iter().zip(theta_ref.iter()).enumerate() {
+                assert!(
+                    (b - r).abs() < tol_theta,
+                    "maxiter {maxiter}, theta[{i}]: budgeted {b:.5} vs converged {r:.5} — the \
+                     warm-started M-step stopped short (#1415)"
+                );
+            }
+            assert!(
+                (sigma_b[0] - sigma_ref[0]).abs() < tol_sigma,
+                "maxiter {maxiter}, sigma: budgeted {:.5} vs converged {:.5}",
+                sigma_b[0],
+                sigma_ref[0]
+            );
+            assert!(
+                f_b - f_ref < tol_gap,
+                "maxiter {maxiter}: budgeted objective {f_b} must match the converged {f_ref}"
+            );
+        }
+
+        // The mixture arm deliberately keeps the pre-#1415 configuration (see
+        // `MSTEP_MIXTURE_FTOL_REL`): the same start under a (single-class)
+        // `MixMstep` must reproduce the old partial step, not the converged
+        // maximiser. Realised: CL 0.060 off at `mstep_maxiter = 3`, against
+        // 0.005 on the non-mixture arm above. This pins the asymmetry so that
+        // re-unifying the two arms is a deliberate change with its own anchor.
+        let classes = vec![0usize; pop.subjects.len()];
+        let class_sigma_over: Vec<Vec<(usize, f64)>> = vec![Vec::new()];
+        let (theta_mix, _) = theta_sigma_mstep_light(
+            &model,
+            &pop,
+            &etas,
+            None,
+            &start_theta,
+            &start_sigma,
+            &theta_lower,
+            &theta_upper,
+            &sigma_lower,
+            &sigma_upper,
+            2,
+            1,
+            3,
+            false,
+            &packs_log,
+            Some(MixMstep {
+                classes: &classes,
+                class_sigma_over: &class_sigma_over,
+            }),
+        );
+        assert!(
+            (theta_mix[0] - theta_ref[0]).abs() > 0.03,
+            "mixture arm: CL {:.5} vs converged {:.5} — the mixture M-step is expected to keep \
+             the pre-#1415 (partial-step) configuration; if this was changed on purpose, \
+             re-anchor tests/mixture_nonmem.rs and update MSTEP_MIXTURE_FTOL_REL",
+            theta_mix[0],
+            theta_ref[0]
+        );
+    }
+
+    /// The per-coordinate initial step is bounded by the coordinate's own
+    /// interval (#1420 review): BOBYQA requires `upper − lower ≥ 2·step`.
+    #[test]
+    fn mstep_initial_step_is_bounded_by_the_interval() {
+        // Wide interval: the nominal step.
+        assert_eq!(
+            mstep_initial_step((0.01_f64).ln(), (200.0_f64).ln()),
+            MSTEP_INITIAL_STEP
+        );
+        assert_eq!(mstep_initial_step(-8.0, 5.0), MSTEP_INITIAL_STEP);
+        // Narrow interval: a quarter of the width, leaving the factor-of-two
+        // margin BOBYQA needs. CL on (1.9, 2.1) is 0.10008 log units wide.
+        let (lo, hi) = ((1.9_f64).ln(), (2.1_f64).ln());
+        let step = mstep_initial_step(lo, hi);
+        assert!(step < MSTEP_INITIAL_STEP);
+        assert!((step - (hi - lo) / 4.0).abs() < 1e-15);
+        assert!(hi - lo >= 2.0 * step);
+        // Exactly at the threshold and just above: still bounded by the width.
+        assert!(mstep_initial_step(0.0, 0.4) <= 0.1 && mstep_initial_step(0.0, 0.4) > 0.0);
+        assert!((mstep_initial_step(0.0, 0.2) - 0.05).abs() < 1e-15);
+        // Pinned and unbounded coordinates keep a positive nominal step.
+        assert_eq!(mstep_initial_step(0.7, 0.7), MSTEP_INITIAL_STEP);
+        assert_eq!(
+            mstep_initial_step(f64::NEG_INFINITY, f64::INFINITY),
+            MSTEP_INITIAL_STEP
+        );
+        assert_eq!(mstep_initial_step(0.0, f64::INFINITY), MSTEP_INITIAL_STEP);
+    }
+
+    /// #1420 review (P1): a free theta declared on an interval narrower than
+    /// twice the nominal step made BOBYQA reject the whole problem before its
+    /// first evaluation, and because the outcome is discarded the joint θ/σ
+    /// M-step silently returned its start on every iteration — freezing θ *and*
+    /// σ. Same fixture as above with CL bounded to (1.9, 2.1), 0.10008 log
+    /// units wide, started at 1.95. Mutation check: use the unbounded
+    /// `MSTEP_INITIAL_STEP` for every coordinate and this fails on the
+    /// `f_b < f_start` assertion with the start returned unchanged (in a debug
+    /// build the `debug_assert!` on `InvalidArgs` fires first).
+    #[test]
+    fn mstep_moves_a_theta_declared_on_a_narrow_interval() {
+        let (model, pop) = noeta_mstep_fixture();
+        let etas: Vec<Vec<f64>> = vec![vec![]; pop.subjects.len()];
+
+        let start_theta = vec![(1.95_f64).ln(), (20.0_f64).ln() + 0.05];
+        let start_sigma = vec![(0.1_f64).ln() + 0.05];
+        let theta_lower = vec![(1.9_f64).ln(), (0.1_f64).ln()];
+        let theta_upper = vec![(2.1_f64).ln(), (500.0_f64).ln()];
+        let sigma_lower = vec![-8.0];
+        let sigma_upper = vec![5.0];
+        let packs_log = vec![true, true];
+        assert!(
+            theta_upper[0] - theta_lower[0] < 2.0 * MSTEP_INITIAL_STEP,
+            "fixture must be narrower than twice the nominal step to exercise the bound"
+        );
+
+        let objective = |lt: &[f64], ls: &[f64]| {
+            let th: Vec<f64> = lt.iter().map(|x| x.exp()).collect();
+            let sg: Vec<f64> = ls.iter().map(|x| x.exp()).collect();
+            obs_nll_sum(&model, &pop, &th, &sg, &etas)
+        };
+        let f_start = objective(&start_theta, &start_sigma);
+        let (theta_b, sigma_b) = theta_sigma_mstep_light(
+            &model,
+            &pop,
+            &etas,
+            None,
+            &start_theta,
+            &start_sigma,
+            &theta_lower,
+            &theta_upper,
+            &sigma_lower,
+            &sigma_upper,
+            2,
+            1,
+            5,
+            false,
+            &packs_log,
+            None,
+        );
+        let f_b = objective(&theta_b, &sigma_b);
+        assert!(f_b.is_finite() && f_start.is_finite());
+        assert!(
+            f_b < f_start - 0.5,
+            "the M-step must improve the conditional objective from a narrow-interval start: \
+             {f_b} vs {f_start} (an unchanged start means NLopt rejected the problem)"
+        );
+        // Every free coordinate moved — the failure mode was all three frozen.
+        assert!(
+            (theta_b[0] - start_theta[0]).abs() > 1e-4,
+            "CL did not move"
+        );
+        assert!((theta_b[1] - start_theta[1]).abs() > 1e-3, "V did not move");
+        assert!(
+            (sigma_b[0] - start_sigma[0]).abs() > 1e-3,
+            "sigma did not move"
+        );
+        // And CL stayed inside its declared interval.
+        assert!(theta_b[0] >= theta_lower[0] - 1e-12 && theta_b[0] <= theta_upper[0] + 1e-12);
     }
 
     #[test]

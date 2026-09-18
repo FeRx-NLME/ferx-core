@@ -1293,6 +1293,14 @@ fn fit_inner(
         }
     }
 
+    // The outer-gradient FD-fallback notice (#1154) is *not* emitted here. It reports
+    // which subjects actually took the per-subject reconverged-FD outer gradient, which
+    // is only knowable once the gradient has run — `outer_optimizer::optimize_population`
+    // owns the runtime log and pushes the warning onto its own `OuterResult::warnings`.
+    // A probe at this point would have to guess a parameter point, and the provider's
+    // declines are parameter-dependent (`moving_bounds_separable` reads the resolved
+    // infusion windows and lag times), so a guess reports fallbacks that never happen.
+
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
@@ -1663,6 +1671,9 @@ fn fit_inner(
                         h_matrices,
                         kappas,
                         covariance_matrix: None,
+                        // No covariance step on an evaluation-only stage, so no
+                        // estimator to name (#1382).
+                        covariance_method: None,
                         covariance_wall_time_secs: 0.0,
                         warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
@@ -1749,6 +1760,9 @@ fn fit_inner(
                     h_matrices,
                     kappas,
                     covariance_matrix: None,
+                    // No covariance step on an evaluation-only stage, so no
+                    // estimator to name (#1382).
+                    covariance_method: None,
                     covariance_wall_time_secs: 0.0,
                     warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
@@ -2736,6 +2750,12 @@ fn fit_inner(
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
         covariance_status,
+        // #1382: the estimator that actually produced `covariance_matrix`, carried
+        // up from the covariance step rather than read back off
+        // `options.covariance_method` — the two part company whenever #1064's
+        // large-problem router swaps a defaulted `r` for the cross-product, and
+        // `stage_opts` is a per-stage clone besides.
+        covariance_method: result.covariance_method,
         shrinkage_eta,
         cond_dist: result.cond_dist.clone(),
         shrinkage_eps,

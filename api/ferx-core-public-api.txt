@@ -42,6 +42,9 @@ pub ferx_core::api::PreparedRun::init_params: ferx_core::ModelParameters
 pub ferx_core::api::PreparedRun::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::api::PreparedRun::parsed: ferx_core::ParsedModel
 pub ferx_core::api::PreparedRun::population: ferx_core::Population
+pub struct ferx_core::api::RunOverrides
+pub ferx_core::api::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::api::RunOverrides::threads: core::option::Option<usize>
 pub struct ferx_core::api::SimulateOptions
 pub ferx_core::api::SimulateOptions::horizon: core::option::Option<f64>
 pub ferx_core::api::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
@@ -96,8 +99,10 @@ pub fn ferx_core::api::read_population_for_simulation(model: &ferx_core::Compile
 pub fn ferx_core::api::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::api::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::api::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::api::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::api::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::api::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::api::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::api::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> alloc::vec::Vec<ferx_core::SimulationResult>
 pub fn ferx_core::api::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, alloc::string::String> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::api::simulate_adaptive_from_spec(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, alloc::string::String>
@@ -426,6 +431,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::bayes: core::option::Op
 pub ferx_core::estimation::outer_optimizer::OuterResult::cond_dist: core::option::Option<ferx_core::CondDist>
 pub ferx_core::estimation::outer_optimizer::OuterResult::converged: bool
 pub ferx_core::estimation::outer_optimizer::OuterResult::covariance_matrix: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
+pub ferx_core::estimation::outer_optimizer::OuterResult::covariance_method: core::option::Option<ferx_core::CovarianceMethod>
 pub ferx_core::estimation::outer_optimizer::OuterResult::covariance_wall_time_secs: f64
 pub ferx_core::estimation::outer_optimizer::OuterResult::ebe_convergence_warnings: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::eta_hats: alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
@@ -2149,6 +2155,10 @@ pub enum ferx_core::types::CovarianceMethod
 pub ferx_core::types::CovarianceMethod::CrossProduct
 pub ferx_core::types::CovarianceMethod::Hessian
 pub ferx_core::types::CovarianceMethod::Sandwich
+impl ferx_core::CovarianceMethod
+pub fn ferx_core::CovarianceMethod::formula(self) -> &'static str
+pub fn ferx_core::CovarianceMethod::from_label(s: &str) -> core::option::Option<ferx_core::CovarianceMethod>
+pub fn ferx_core::CovarianceMethod::label(self) -> &'static str
 pub enum ferx_core::types::CovarianceStatus
 pub ferx_core::types::CovarianceStatus::Computed
 pub ferx_core::types::CovarianceStatus::Failed
@@ -2957,6 +2967,7 @@ pub ferx_core::types::FitResult::converged: bool
 pub ferx_core::types::FitResult::cov_condition_number: core::option::Option<f64>
 pub ferx_core::types::FitResult::cov_eigenvalues: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::covariance_matrix: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
+pub ferx_core::types::FitResult::covariance_method: core::option::Option<ferx_core::CovarianceMethod>
 pub ferx_core::types::FitResult::covariance_n_evals_estimated: core::option::Option<usize>
 pub ferx_core::types::FitResult::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::types::FitResult::covariance_wall_time_secs: f64
@@ -3425,6 +3436,10 @@ pub enum ferx_core::CovarianceMethod
 pub ferx_core::CovarianceMethod::CrossProduct
 pub ferx_core::CovarianceMethod::Hessian
 pub ferx_core::CovarianceMethod::Sandwich
+impl ferx_core::CovarianceMethod
+pub fn ferx_core::CovarianceMethod::formula(self) -> &'static str
+pub fn ferx_core::CovarianceMethod::from_label(s: &str) -> core::option::Option<ferx_core::CovarianceMethod>
+pub fn ferx_core::CovarianceMethod::label(self) -> &'static str
 pub enum ferx_core::CovarianceStatus
 pub ferx_core::CovarianceStatus::Computed
 pub ferx_core::CovarianceStatus::Failed
@@ -4391,6 +4406,7 @@ pub ferx_core::FitResult::converged: bool
 pub ferx_core::FitResult::cov_condition_number: core::option::Option<f64>
 pub ferx_core::FitResult::cov_eigenvalues: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::covariance_matrix: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
+pub ferx_core::FitResult::covariance_method: core::option::Option<ferx_core::CovarianceMethod>
 pub ferx_core::FitResult::covariance_n_evals_estimated: core::option::Option<usize>
 pub ferx_core::FitResult::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::FitResult::covariance_wall_time_secs: f64
@@ -4736,6 +4752,9 @@ pub struct ferx_core::ResidualCorrelation
 pub ferx_core::ResidualCorrelation::rho: f64
 pub ferx_core::ResidualCorrelation::sigma_i: usize
 pub ferx_core::ResidualCorrelation::sigma_j: usize
+pub struct ferx_core::RunOverrides
+pub ferx_core::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::RunOverrides::threads: core::option::Option<usize>
 #[non_exhaustive] pub struct ferx_core::RuvMagnitude
 pub ferx_core::RuvMagnitude::per_sigma: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
 pub ferx_core::RuvMagnitude::per_sigma_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
@@ -4948,8 +4967,10 @@ pub fn ferx_core::resolve_data_path(model_data_path: core::option::Option<&str>,
 pub fn ferx_core::run_covariance(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::run_sir(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> alloc::vec::Vec<ferx_core::SimulationResult>
 pub fn ferx_core::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, alloc::string::String> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>

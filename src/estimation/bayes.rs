@@ -1611,6 +1611,9 @@ pub fn run_bayes(
         h_matrices,
         kappas,
         covariance_matrix: None,
+        // A Bayesian fit reports posterior credible intervals, never a Hessian
+        // covariance, so there is no estimator to name (#1382).
+        covariance_method: None,
         covariance_wall_time_secs: 0.0,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,

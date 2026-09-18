@@ -244,6 +244,55 @@ pub fn prepare_run_with_inits(
     })
 }
 
+/// Settings a front end (the `ferx` CLI, an R caller) named **explicitly**, which
+/// therefore win over the model file's `[fit_options]` (#1416).
+///
+/// The distinction each field encodes is *"did the caller name this key"*, not
+/// *"is its value different from the default"*: `threads: Some(0)` is a caller
+/// who asked for the engine's own worker count and means it, and it overrides a
+/// model file's `threads = 8` exactly as `Some(1)` would. `None` is the key going
+/// unmentioned, and leaves the model file in charge. This is the same rule
+/// `ferx_fit(settings = ...)` follows on the R side, and the opposite of the
+/// `FitOptions::default()` field-comparison rule — a front end is a caller, not a
+/// set of defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunOverrides {
+    /// Overrides `[fit_options] inits_from_nca` (the CLI's `--inits-from-nca`).
+    pub inits_from_nca: Option<crate::suggest_start::NcaInit>,
+    /// Overrides `[fit_options] threads` (the CLI's `--threads`). `Some(0)` means
+    /// the engine default was asked for by name; see [`FitOptions::threads`].
+    pub threads: Option<usize>,
+}
+
+/// Apply a front end's explicit `threads` choice onto the model file's
+/// `[fit_options]`, returning the conflict warning when the two disagree (#1416).
+///
+/// A model-file `threads` of `0` or absent is not a conflict — the file pinned
+/// nothing — so only a positive, differing model-file count is reported. The
+/// override itself is unconditional whenever the caller named the key.
+pub(crate) fn apply_threads_override(
+    options: &mut FitOptions,
+    requested: Option<usize>,
+) -> Option<String> {
+    let requested = requested?;
+    let from_file = options.threads;
+    options.threads = Some(requested);
+    match from_file {
+        Some(from_file) if from_file > 0 && from_file != requested => {
+            let asked = if requested == 0 {
+                "the default worker count".to_string()
+            } else {
+                format!("{requested}")
+            };
+            Some(format!(
+                "thread count overridden: using {asked} instead of the model's \
+                 `[fit_options] threads = {from_file}`"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Like [`run_model_with_data`], but lets the caller (e.g. the CLI's
 /// `--inits-from-nca` flag) override the model file's `inits_from_nca` fit
 /// option. When `inits_override` is `None` the model-file value is used as-is;
@@ -253,6 +302,26 @@ pub fn run_model_with_data_inits(
     data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
 ) -> Result<(FitResult, Population), String> {
+    run_model_with_overrides(
+        model_path,
+        data_path,
+        &RunOverrides {
+            inits_from_nca: inits_override,
+            threads: None,
+        },
+    )
+}
+
+/// [`run_model_with_data`] with every front-end override a caller can name; see
+/// [`RunOverrides`]. This is the entrypoint the `ferx` CLI uses, so a flag it
+/// surfaces (`--threads`, `--inits-from-nca`) beats the model file rather than
+/// being silently vetoed by it (#1416).
+pub fn run_model_with_overrides(
+    model_path: &str,
+    data_path: Option<&str>,
+    overrides: &RunOverrides,
+) -> Result<(FitResult, Population), String> {
+    let inits_override = overrides.inits_from_nca;
     let PreparedRun {
         mut parsed,
         mut population,
@@ -275,6 +344,11 @@ pub fn run_model_with_data_inits(
         data_path
     );
 
+    // An explicitly named `--threads` beats `[fit_options] threads`, and says so
+    // when the two disagree (#1416) — the same precedence `--data` already has
+    // over the `[data]` block, applied before `fit()` sizes its pool.
+    let threads_warning = apply_threads_override(&mut parsed.fit_options, overrides.threads);
+
     // Checkpoint / restart (#755): write `{model_stem}.tmp` next to the CLI
     // outputs and resume from it on a re-run of the same model + data. Disabled
     // by `[fit_options] checkpoint = false`. The CLI's `--clean` flag removes an
@@ -296,8 +370,12 @@ pub fn run_model_with_data_inits(
         &parsed.fit_options,
     )?;
     result.covariate_table = covariate_table;
-    if let Some(w) = data_path_warning {
+    let mut appended = false;
+    for w in [data_path_warning, threads_warning].into_iter().flatten() {
         result.warnings.push(w);
+        appended = true;
+    }
+    if appended {
         rebuild_warnings_structured(&mut result);
     }
     result.model_path = Some(model_path.to_string());
@@ -408,6 +486,17 @@ pub(crate) fn simulation_design_covariates(
 }
 
 pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), String> {
+    run_model_simulate_with_overrides(model_path, &RunOverrides::default())
+}
+
+/// [`run_model_simulate`] with the front-end overrides of [`RunOverrides`], so
+/// `ferx model.ferx --simulate --threads 1` is not vetoed by the model file's
+/// `[fit_options] threads` either (#1416). `inits_from_nca` is inert here — a
+/// simulated design has no observed data to run NCA on.
+pub fn run_model_simulate_with_overrides(
+    model_path: &str,
+    overrides: &RunOverrides,
+) -> Result<(FitResult, Population), String> {
     use crate::parser::model_parser::parse_full_model_file;
     use std::collections::HashMap;
 
@@ -830,12 +919,17 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     );
 
     let init_params = build_init_params(&parsed);
+    // Same `--threads` precedence as the data path (#1416).
+    let threads_warning = apply_threads_override(&mut parsed.fit_options, overrides.threads);
     let mut result = fit(
         &parsed.model,
         &population,
         &init_params,
         &parsed.fit_options,
     )?;
+    if let Some(w) = threads_warning {
+        result.warnings.push(w);
+    }
     // No data file to hash — data is simulated in-process. Hash the model
     // post-fit (same pattern as `run_model_with_data`); failures are
     // non-fatal and just disable the integrity check in `run_sir`.
@@ -876,8 +970,11 @@ pub fn run_from_file(path: &str) -> Result<FitResult, String> {
     run_model_simulate(path).map(|(r, _)| r)
 }
 
-fn set_model_name(model: &mut CompiledModel, path: &str) {
-    if model.name == "Unnamed" {
+/// Give a model that declares no `model NAME` line the file stem as its name.
+/// Shared with `validate_model_file`, so a fit and a check report the same name
+/// for the same file (#1395: the check report used the stem unconditionally).
+pub(crate) fn set_model_name(model: &mut CompiledModel, path: &str) {
+    if model.name == crate::parser::model_parser::UNNAMED_MODEL {
         if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
             model.name = stem.to_string();
         }
