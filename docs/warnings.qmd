@@ -29,6 +29,77 @@ surface: tokens never change or get repurposed once released, so a consumer can
 branch on them safely (new warning classes get new tokens). `details` is omitted
 when empty.
 
+## Which entry points report warnings {#entry-points}
+
+`fit()` is not the only door. Every model/data finding and every ODE-solver
+diagnostic is reported by each entry point that has a channel to carry it, and
+the list is the same one on all of them — there is no per-entry-point filter.
+
+| Entry point | Channel | Carries |
+|---|---|---|
+| `fit()` | `FitResult::warnings` / `warnings_structured` | everything below, **plus** the fit-only codes: convergence, covariance, shrinkage, the estimator/optimizer option warnings and the packed-start rails |
+| `ferx check` | the check report | everything below except the solver diagnostics (nothing has been integrated yet), plus the option warnings |
+| `predict_diag()` | `PredictionOutput::warnings` | the non-fit bundle (below) |
+| `simulate_with_options_diag()` | `SimulationOutput::warnings` | the same, plus per-subject simulation diagnostics |
+| `simulate_adaptive()` | `AdaptiveSimulationResult::warnings` | the same |
+| `predict()`, `simulate()`, `simulate_with_seed()`, `simulate_with_options()` | — | nothing; each is a thin wrapper over the form above it |
+| `simulate_with_uncertainty()` | — | nothing; its return is a flat row vector |
+| `predict_survival()`, `predict_categorical()` | — | nothing yet |
+
+Before ferx 0.4.0 the middle three rows were silent. That mattered because the
+failures they were silent about are the ones that look fine: an `SS=1` dose on
+an `[odes]` right-hand side reading `TAFD` came back through `predict()` as a
+column of `NaN` with no explanation, and a segment that exhausted
+`ode_max_steps` came back as a column of *identical* finite numbers — plottable,
+and wrong.
+
+### The non-fit bundle {#non-fit-bundle}
+
+The rule is that **a finding about the model or the data is carried; a finding
+about the fit's configuration or the optimizer's start is not** — on these entry
+points there is no fit and no optimizer, so such a finding would be about
+something that is not happening.
+
+Carried, in this order:
+
+1. **Parse warnings** — e.g. `W_ABSORPTION_TWIN_DECLINED`, which changes what a
+   prediction does.
+2. **Data-reader warnings** — `W_ADDL_MISSING_II`, `W_IOV_OCC_MISSING`, through
+   the same suppression filter `fit()` and `ferx check` use, so all three
+   suppress exactly the same ones.
+3. **Model/data warnings** — `W_STEADY_STATE_*`, `W_SDE_*`,
+   `W_NEGATIVE_LAGTIME`, `W_MODELED_*`, `W_ADDITIVE_INIT_SCALE`, …
+4. **Experimental-feature notices** — a feature is experimental whichever door
+   you use it through.
+5. **The ODE-solver diagnostics** of the pass that just ran.
+
+Not carried, and the reason is structural rather than editorial:
+
+- The **estimator/optimizer option warnings** (`W_GN_NO_RANDOM_EFFECTS`,
+  `W_VI_OMEGA_UNANCHORED`, …). Their subject is a `[fit_options]` combination
+  that is not running, and these entry points take no fit options at all, so
+  reporting them would mean inventing defaults the caller never chose.
+- The **packed-start rail warnings**. Their subject is the vector the outer
+  optimizer starts from; nothing is packed on a prediction or a simulation.
+- `fit()`'s **operational notes** — the finite-difference-fallback count, the
+  thread-count hint, the covariance-step cost estimate.
+
+Within what it carries the list is unfiltered on purpose. Two members are
+phrased for a fit (`W_ADDITIVE_INIT_SCALE` talks about optimizer basins; the
+modeled-duration checks call their values "initial estimates"), and they are
+still true of the numbers being served — a σ~add~ that cannot absorb the data is
+as visible in a simulated `DV` column as in a fit. Dropping a code because it
+reads oddly outside a fit is what produced the "which entry point sees which
+finding" confusion in the first place.
+
+One consequence worth knowing: `W_ODE_SOLVER_DIAGNOSTICS` from a non-`fit()`
+entry point describes **that call**, at the parameters you passed, and says so —
+`"at the supplied parameters"` and `"Counters are from this predict() pass"`
+rather than the post-fit sweep's `"at the final estimates"`. A discarded stiff
+escalation likewise says that *this pass* paid for both solves, not that a fit
+did. The `ode_method` named is the one stamped on the model by its own
+`[fit_options]`, not a default.
+
 ## Severity {#severity}
 
 | Severity | Meaning | Typical agent response |

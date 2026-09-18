@@ -168,8 +168,14 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         ..FitOptions::default()
     };
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &opts)
-        .expect("the unmapped TVFLAT must be detected and frozen");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("the unmapped TVFLAT must be detected and frozen");
     let idx = |name: &str| {
         model
             .default_params
@@ -1202,8 +1208,14 @@ fn preflight_freezes_flat_theta() {
     let mut options = FitOptions::default();
     options.interaction = false;
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
-        .expect("flat TVV must be detected");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &options,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("flat TVV must be detected");
     assert!(!frozen.theta_fixed[0], "active TVCL stays free");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen (FIX)");
     assert!(
@@ -1223,7 +1235,14 @@ fn preflight_no_freeze_when_all_thetas_active() {
     let mut options = FitOptions::default();
     options.interaction = false;
     assert!(
-        freeze_flat_thetas(&model, &pop, &model.default_params, &options).is_none(),
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &options,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+        )
+        .is_none(),
         "no theta is flat — nothing to freeze"
     );
 }
@@ -1249,8 +1268,14 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
     let mut options = FitOptions::default();
     options.interaction = false;
 
-    let (frozen, warnings) = freeze_flat_thetas(&model, &pop, &model.default_params, &options)
-        .expect("flat TVV must be detected");
+    let (frozen, warnings) = freeze_flat_thetas(
+        &model,
+        &pop,
+        &model.default_params,
+        &options,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+    .expect("flat TVV must be detected");
     assert!(frozen.theta_fixed[1], "flat TVV is frozen");
     assert!(
         frozen.theta[1].is_finite() && frozen.theta[1] <= upper + 1e-6,
@@ -2366,18 +2391,36 @@ fn test_published_escape_verdict_uses_the_original_start() {
     // signs. An implementation that ignores `escape_from` reports `true` here,
     // which is exactly the bug.
     let start = model.default_params.clone();
-    let reference = optimize_nlopt_once(&model, &population, &start, &options, false, None)
-        .0
-        .params;
+    let declines =
+        crate::estimation::outer_optimizer::OuterFdDeclineLog::new(population.subjects.len());
+    let reference = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        None,
+    )
+    .0
+    .params;
 
-    let (own, own_outcome) =
-        optimize_nlopt_once(&model, &population, &start, &options, false, None);
+    let (own, own_outcome) = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        None,
+    );
     let (from_reference, reference_outcome) = optimize_nlopt_once(
         &model,
         &population,
         &start,
         &options,
         false,
+        &declines,
         Some(&reference),
     );
 
@@ -4442,4 +4485,252 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
         independent.iter().any(|g| g.abs() > 1e-3),
         "fixture precondition: the reference gradient must be non-degenerate, got {independent:?}"
     );
+}
+
+/// #1154 — the outer FD-fallback diagnostic.
+///
+/// A per-subject decline of the analytic outer gradient is salvaged onto
+/// `subject_reconverged_fd_gradient`: correct, several times slower on that subject, and
+/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic (Dual2)`
+/// because it reads a **model**-level predicate.
+///
+/// These pin the *recording*, which is what makes the report honest. An earlier revision
+/// probed the provider at `η = 0` instead, and PR #1418's review showed that reports
+/// fallbacks that never happen: the provider's own declines are parameter-dependent
+/// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
+/// subject can decline at the probe point and be served at its EBE. Both halves of that
+/// are pinned below.
+mod outer_fd_fallback {
+    use super::*;
+    use std::path::Path;
+
+    /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
+    /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
+    /// so `subject_sensitivities` declines that subject while every bolus-dosed one stays
+    /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
+    /// a property of the records — which is what makes it a stable fixture.
+    const WARFARIN_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    fn mk_pop(subjects: Vec<Subject>) -> Population {
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// The analytic subject, and a twin whose bolus is replaced by a rate-defined
+    /// infusion the outer provider declines under `F ≠ 1`.
+    fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
+        let model =
+            crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let mut analytic = pop.subjects[0].clone();
+        analytic.id = "IN_SCOPE".into();
+        let mut declining = pop.subjects[0].clone();
+        declining.id = "OUT_OF_SCOPE".into();
+        declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
+        (model, analytic, declining)
+    }
+
+    /// Run one real outer-gradient evaluation over `pop` through the same mixed assembly
+    /// the optimizer uses, and return the log it filled.
+    fn record_one_gradient_eval(model: &CompiledModel, pop: &Population) -> OuterFdDeclineLog {
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let ehs: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let _ = population_gradient_sens_mixed(&x, params, model, pop, &ehs, &bounds, &opts, &log);
+        log
+    }
+
+    /// Fixture precondition, asserted rather than assumed: the two subjects must land on
+    /// *opposite* sides of the provider gate. Without this the warning test below is
+    /// satisfied by a population where both decline (or neither does).
+    #[test]
+    fn fixture_subjects_straddle_the_provider_gate() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let theta = &model.default_params.theta;
+        let zeros = vec![0.0; model.n_eta];
+        assert!(
+            crate::sens::provider::subject_sensitivities(&model, &analytic, theta, &zeros)
+                .is_some(),
+            "in-scope subject must be served by the provider"
+        );
+        assert!(
+            crate::sens::provider::subject_sensitivities(&model, &declining, theta, &zeros)
+                .is_none(),
+            "modeled-duration subject must be declined by the provider"
+        );
+    }
+
+    /// The warning counts the subjects the assembly actually salvaged, and names one.
+    /// Mutations that must redden it: dropping the `declines.record(i)` call, or reporting
+    /// the first subject rather than the first *declining* one.
+    #[test]
+    fn warns_with_count_and_example_subject() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
+        assert!(w.contains("1 of 2"), "got: {w}");
+        assert!(
+            w.contains("OUT_OF_SCOPE"),
+            "must name the declining subject, not the in-scope one; got: {w}"
+        );
+        assert!(!w.contains("IN_SCOPE"), "got: {w}");
+    }
+
+    /// An all-analytic population is silent.
+    #[test]
+    fn silent_when_every_subject_is_analytic() {
+        let (model, analytic, _) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic]);
+        let log = record_one_gradient_eval(&model, &pop);
+        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
+    }
+
+    /// The case the *inner* warning deliberately suppresses and this one must not: a
+    /// population where **every** subject declines while the model-level report still says
+    /// analytic. That is the mismatch `gradient_method_outer` gets wrong, so an all-FD
+    /// population is exactly when the warning is most needed.
+    #[test]
+    fn warns_when_every_subject_declines_on_an_in_scope_model() {
+        let (model, _, declining) = analytic_and_declining();
+        assert_eq!(
+            crate::build_info::gradient_method_outer(
+                &crate::build_info::BUILD_INFO,
+                EstimationMethod::FoceI,
+                Optimizer::NloptLbfgs,
+                &model,
+            ),
+            crate::build_info::GradientMethodKind::Analytic,
+            "fixture precondition: the model-level report must say analytic, or there is \
+             no mismatch to warn about"
+        );
+        let pop = mk_pop(vec![declining.clone(), declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        let w =
+            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
+        assert!(w.contains("2 of 2"), "got: {w}");
+    }
+
+    /// A log nobody wrote to is silent. This is the property that makes every route gate
+    /// unnecessary: BOBYQA (including the mixture `Auto` downgrade), GN, trust-region,
+    /// `reconverge_gradient_interval = 1` and `outer_maxiter = 0` all reach the end
+    /// without touching the analytic branch, so there is nothing to report.
+    #[test]
+    fn an_untouched_log_says_nothing() {
+        let (_, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        assert!(
+            outer_fd_fallback_warning(&pop, &log).is_none(),
+            "a fit that never evaluated an analytic outer gradient must not warn — even \
+             with a subject the provider would decline"
+        );
+    }
+
+    /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`
+    /// dispatches on — must follow `interaction`: FOCE is a different entry point
+    /// (`subject_packed_gradient_foce`, the Sheiner–Beal marginal) from FOCEI
+    /// (`subject_packed_gradient`, the Almquist Laplace marginal), and hard-coding either
+    /// would hand a `method = foce` fit the gradient of the other objective.
+    ///
+    /// Asserted on the returned *values*, not on `is_some()`: both marginals serve the
+    /// same subjects on this fixture, so an `is_some()` test passes under a hard-coded
+    /// flag and would be a tautology. The non-degeneracy assert below pins that the two
+    /// marginals really do disagree here, so this cannot quietly become one either.
+    #[test]
+    fn follows_the_interaction_flag() {
+        let (model, analytic, _) = analytic_and_declining();
+        let x = pack_params(&model.default_params);
+        let zeros = vec![0.0; model.n_eta];
+        let focei = crate::estimation::sens_outer_gradient::subject_packed_gradient(
+            &model,
+            &analytic,
+            &model.default_params,
+            &x,
+            &zeros,
+        )
+        .expect("FOCEI entry point serves the in-scope subject");
+        let foce = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
+            &model,
+            &analytic,
+            &model.default_params,
+            &x,
+            &zeros,
+        )
+        .expect("FOCE entry point serves the in-scope subject");
+        assert!(
+            focei
+                .iter()
+                .zip(&foce)
+                .any(|(a, b)| (a - b).abs() > 1e-8 * a.abs().max(b.abs()).max(1.0)),
+            "fixture precondition: the two marginals must disagree on this subject, or \
+             this test cannot see which entry point was taken. focei = {focei:?}, \
+             foce = {foce:?}"
+        );
+        assert_eq!(
+            subject_analytic_outer_gradient(
+                &model,
+                &analytic,
+                &model.default_params,
+                &x,
+                &zeros,
+                true
+            ),
+            Some(focei),
+            "interaction = true must take the FOCEI entry point"
+        );
+        assert_eq!(
+            subject_analytic_outer_gradient(
+                &model,
+                &analytic,
+                &model.default_params,
+                &x,
+                &zeros,
+                false
+            ),
+            Some(foce),
+            "interaction = false must take the FOCE entry point"
+        );
+    }
 }
