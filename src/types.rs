@@ -7381,8 +7381,11 @@ pub struct FitOptions {
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
     /// Optional exploration-phase cap on the stochastic-approximation step for
-    /// the **numerical θ/σ M-step** (issue #1011); `None` uses the
-    /// `MSTEP_SA_MAX_STEP` default, which is `1.0` — **off** — since #1415.
+    /// the **numerical θ/σ M-step** (issue #1011); `None` uses the model-keyed
+    /// default of `estimation::saem::default_mstep_damping`: `1.0` — **off** —
+    /// since #1415, except for a model with `iiv_on_ruv`, which keeps #1011's
+    /// `0.03` (the one shape on which the undamped channel was measured to
+    /// drift).
     ///
     /// Below `1.0` the M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)`
     /// during exploration and averaged at `γ = 1/(k−k1)` in convergence,

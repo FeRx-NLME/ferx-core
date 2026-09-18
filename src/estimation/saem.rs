@@ -183,8 +183,41 @@ const OMEGA_SA_MAX_STEP: f64 = 0.1;
 /// gate and no-effect warnings are unchanged.
 ///
 /// `cap >= 1.0` is the "off" sentinel of [`mstep_sa_step`] — assignment in
-/// both phases — which is now the default.
+/// both phases — which is now the default for every model except one shape,
+/// see [`default_mstep_damping`].
 const MSTEP_SA_MAX_STEP: f64 = 1.0;
+
+/// The #1011 exploration cap, kept as the default for a model with
+/// `iiv_on_ruv` — the one shape on which the undamped numerical channel was
+/// measured to drift, and exactly the shape #1011 fixed.
+///
+/// The drift is the `iiv_on_ruv` coupling, not FREM and not the no-ETA channel
+/// as such: the #1011 reprex with its `iiv_on_ruv` line and `ETA_RUV` omega
+/// removed, otherwise identical (475 subjects, FREM block of 11), lands undamped
+/// at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 /
+/// 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342 / 2.228 / 147.5. With
+/// `iiv_on_ruv` back in, undamped drifts to 0.18 from either start (47 FOCEI
+/// units worse than the capped 0.36), 200 MH steps per iteration do not change
+/// it, and #1011 had already ruled out sampler mixing and σ. Under `iiv_on_ruv`
+/// the E-step is modified — `η_RUV` is re-centred into σ every iteration (#904)
+/// — and a σ that shares the numerical M-step with the no-ETA thetas is what
+/// that channel's σ-side of the blend acts on; that is where the pathology
+/// lives, and it needs its own fix. Until then this cap holds those thetas
+/// near their start, which on that reprex is the better answer.
+const MSTEP_SA_MAX_STEP_IIV_ON_RUV: f64 = 0.03;
+
+/// Default `mstep_damping` for a fit that did not set one (#1415).
+///
+/// Off ([`MSTEP_SA_MAX_STEP`]) unless the model has `iiv_on_ruv`, which keeps
+/// the #1011 cap ([`MSTEP_SA_MAX_STEP_IIV_ON_RUV`]). A value the user sets wins
+/// either way, and the gate and no-effect warnings in the caller are unchanged.
+fn default_mstep_damping(has_iiv_on_ruv: bool) -> f64 {
+    if has_iiv_on_ruv {
+        MSTEP_SA_MAX_STEP_IIV_ON_RUV
+    } else {
+        MSTEP_SA_MAX_STEP
+    }
+}
 
 /// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
 ///
@@ -2787,7 +2820,7 @@ pub fn run_saem(
     // #1011: exploration-phase cap on the numerical M-step's SA step. `None`
     // takes the calibrated default; `1.0` disables the damping entirely.
     let mstep_damping_cap = match options.saem_mstep_damping {
-        None => MSTEP_SA_MAX_STEP,
+        None => default_mstep_damping(model.residual_error_eta.is_some()),
         Some(v) => match sanitize_mstep_damping(v) {
             None => v,
             Some(fixed) => {
@@ -4675,6 +4708,29 @@ mod tests {
         assert_eq!(MSTEP_SA_MAX_STEP, 1.0);
         assert_eq!(mstep_sa_step(true, true, 1.0, MSTEP_SA_MAX_STEP), 1.0);
         assert_eq!(mstep_sa_step(true, false, 0.004, MSTEP_SA_MAX_STEP), 1.0);
+    }
+
+    /// The default cap is keyed to the one shape it was measured to help
+    /// (#1415): `iiv_on_ruv` keeps #1011's 0.03 (its reprex drifts undamped —
+    /// TVFRD1 0.18 against the held 0.36, 47 FOCEI units worse — and the same
+    /// model without `iiv_on_ruv` lands on NONMEM IMP undamped), everything
+    /// else is off. Mutation check: returning 0.03 for both freezes the Tier-3
+    /// `saem_recovers_the_allometric_exponent_on_the_numerical_mstep`; returning
+    /// 1.0 for both is the #1011 regression by default.
+    #[test]
+    fn default_mstep_damping_caps_only_iiv_on_ruv() {
+        assert_eq!(default_mstep_damping(true), MSTEP_SA_MAX_STEP_IIV_ON_RUV);
+        assert_eq!(default_mstep_damping(true), 0.03);
+        assert_eq!(default_mstep_damping(false), MSTEP_SA_MAX_STEP);
+        assert_eq!(default_mstep_damping(false), 1.0);
+        // The iiv_on_ruv default is a real cap, so the schedule engages: capped
+        // exploration, decaying γ in convergence.
+        let d = default_mstep_damping(true);
+        assert_eq!(mstep_sa_step(true, true, 1.0, d), d);
+        assert_eq!(mstep_sa_step(true, false, 0.5, d), 0.5);
+        // And a fit that sets `mstep_damping` overrides both defaults (the
+        // caller's `match options.saem_mstep_damping`), so the constants are
+        // only ever the `None` arm.
     }
 
     /// The damping gate (#1011). A mixture is vetoed outright; otherwise the

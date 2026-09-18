@@ -238,7 +238,8 @@ had then blended even that at 3 % per exploration M-step. The result was a
 theta that travelled a small fraction of the way to the optimum and stopped,
 on every model with such a theta — allometric and maturation exponents,
 covariate slopes, inter-compartmental clearances. Both are fixed: the solve
-starts local and converges, and the exploration cap is off by default.
+starts local and converges, and the exploration cap is off by default (it is
+kept only for `iiv_on_ruv` models — see the next section).
 
 Measured on the three `ferx-testdata` models of #1415, importance-sampled
 −2 log L at the final estimates (lower is better; the IS readout, not the
@@ -274,7 +275,8 @@ do not depend on this channel.
 `mstep_damping` blends the numerical M-step result in as
 `θ ← θ + γ_θ·(θ* − θ)` during exploration, with `γ_θ` capped at the value
 you set, and averages it at `γ = 1/(k−k1)` in convergence. **It is off by
-default** (`1.0`, plain assignment in both phases):
+default** (`1.0`, plain assignment in both phases) for every model except one
+with `iiv_on_ruv`, which keeps the 0.03 cap — the reason is measured below:
 
 ```
 [fit_options]
@@ -312,9 +314,18 @@ drifting on a 3× longer one (0.03), and 200 MH steps per iteration do not
 change it — so it is not plain E-step under-mixing. The importance-sampled
 objective cannot rank the two points on a 12-eta model (ESS/K = 0.001), but the
 FOCEI objective can: the drifted fit is 47 units worse than the held one
-(7492.7 against 7445.3), so on this model the hold is the better answer. For that shape of model `mstep_damping = 0.03` remains the
-documented way to hold the no-ETA thetas at values estimated elsewhere; `FIX`
-is the honest spelling of the same thing.
+(7492.7 against 7445.3), so on this model the hold is the better answer.
+
+The drift is the **`iiv_on_ruv` coupling**, not FREM and not the no-ETA
+channel as such: the same model with its `iiv_on_ruv` line and `ETA_RUV`
+omega removed lands undamped at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 —
+on NONMEM IMP's 0.394 / 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342
+/ 2.228 / 147.5. Under `iiv_on_ruv` the E-step is modified (`η_RUV` is
+re-centred into σ every iteration) and σ shares the numerical M-step with the
+no-ETA thetas; that is where the pathology lives, and it needs its own fix. So
+**the default is keyed to that shape**: a model with `iiv_on_ruv` keeps the
+0.03 cap, every other model runs undamped, and a value you set wins either
+way. `FIX` is the honest spelling of the same hold when the value is known.
 
 The option only acts on the channel it is about: a fit is damped when NLopt is
 left estimating a theta that is **not mu-referenced**, which is exactly the

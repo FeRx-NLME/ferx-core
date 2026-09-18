@@ -105,12 +105,14 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
-- **`mstep_damping` now defaults to `1.0` (off).** The 0.03 exploration cap that #1011 introduced
-  divides the number of EM steps the exploration phase amounts to, and was measured to *hold* every
-  no-ETA theta near its initial estimate rather than estimate it — its FREM reprex ends at 0.361
-  from a 0.383 start and at 0.191 from a 0.2 start. The option stays as an opt-in hold for that FREM
-  `iiv_on_ruv` shape, where the undamped channel drifts (0.18 from either start, 47 FOCEI-objective
-  units worse than the held start); that drift is tracked separately. (#1415)
+- **`mstep_damping` now defaults to `1.0` (off), except for models with `iiv_on_ruv`.** The 0.03
+  exploration cap that #1011 introduced divides the number of EM steps the exploration phase
+  amounts to, and was measured to *hold* every no-ETA theta near its initial estimate rather than
+  estimate it — its FREM reprex ends at 0.361 from a 0.383 start and at 0.191 from a 0.2 start.
+  The drift that cap was answering is specific to the `iiv_on_ruv` coupling (the same model
+  without it lands on NONMEM IMP undamped), so an `iiv_on_ruv` model keeps the 0.03 default —
+  undamped it drifts to 0.18 from either start, 47 FOCEI-objective units worse than the held
+  start — and that drift is tracked separately. A value you set wins either way. (#1415)
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
 - **`method = laplace` no longer recomputes the sensitivity jet its grid anchor was just built
