@@ -1904,8 +1904,12 @@ pub fn subject_sensitivities_iov(
     // stacked-`(θ, η_bsv, κ)` layout over the event-driven RK45 walk (the TV-cov
     // walk fed per-occasion params). Returns the identical `SubjectSens` shape, so
     // the block-Ω assembly (`prepare_stacked`) consumes it unchanged. Out-of-scope
-    // ODE subjects return `None` → the population drops to FD, mirroring the
-    // analytical IOV gate (#439 ODE IOV).
+    // ODE subjects return `None` → **that subject** drops to the reconverged-FD
+    // gradient, mirroring the analytical IOV gate (#439 ODE IOV). The decline used
+    // to take the whole population with it; `population_gradient_sens_iov_mixed`
+    // salvages it per subject (#466 review round 2), and
+    // `outer_optimizer::outer_fd_fallback_warning` counts the declines so the
+    // salvage is visible rather than merely slow (#1154).
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             return crate::sens::ode_provider::ode_subject_sensitivities_iov(
