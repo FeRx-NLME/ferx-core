@@ -33,9 +33,12 @@ section of the SDLC for the versioning policy).
   the one requested (above 100 free parameters a defaulted `r` is routed onto the cross-product),
   and it is reported next to the `SE` column, on the `Covariance:` and `Condition number:` lines,
   in the fit YAML/JSON, in the `.fitrx` bundle and in the `condition_number` /
-  `covariance_failed` / `covariance_regularized` warning `details` payloads — everywhere as the
-  same `r` / `s` / `rsr` token `[fit_options]` accepts. `None` when no covariance matrix was
-  produced (#1382).
+  `covariance_regularized` warning `details` payloads — everywhere as the same `r` / `s` / `rsr`
+  token `[fit_options]` accepts. `None`, and the key omitted, when no covariance matrix was
+  produced — including `covariance_failed`, which by definition has none. `run_covariance`
+  relabels the result it returns instead of inheriting the incoming fit's estimator, and now
+  replaces that fit's covariance-step warnings rather than carrying them alongside a covariance
+  block it has recomputed (#1382).
 
 - **A fit now says when subjects fall out of the analytic outer-gradient scope.** A subject whose
   data shape the sensitivity provider declines at runtime — a rate-defined infusion under `F ≠ 1`,

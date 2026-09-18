@@ -398,8 +398,10 @@ Where it appears:
   the `covariance_matrix:` block for tools that consume the raw matrix;
 - `{model}-fit.json` and the `.fitrx` bundle — as the same `r` / `s` / `rsr`
   token, so a recorded value can be pasted straight back into `[fit_options]`;
-- the `condition_number`, `covariance_failed` and `covariance_regularized`
-  warning `details` payloads — see [Details payloads](warnings.qmd#details).
+- the `condition_number` and `covariance_regularized` warning `details` payloads
+  — see [Details payloads](warnings.qmd#details). Not `covariance_failed`: that
+  code means the step produced no matrix, so by the rule above there is no
+  estimator to name and the key is omitted.
 
 A `.fitrx` bundle written before this field existed loads with
 `covariance_method: None`: the file does not record it, and a default would be a

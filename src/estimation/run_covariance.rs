@@ -341,8 +341,48 @@ fn run_covariance_scoped(
     out.covariance_method = covariance_method;
     out.covariance_status = covariance_status;
     out.covariance_wall_time_secs = covariance_wall_time_secs;
+    // The incoming fit's covariance-step warnings describe a covariance step this
+    // call has just replaced, so they are dropped before the new ones are added
+    // (#1382 review). Measured on the 12-subject fixture: re-running an `r` fit
+    // under `s` otherwise returns `covariance_method = s` beside a retained
+    // "eigenvalue floor applied to FD Hessian" entry whose payload still reads
+    // `{"covariance_method": "r", "condition_number": 4.09e9}` — a message about a
+    // step that no longer exists (that floor warning cannot even fire under the
+    // cross-product), carrying the stale condition number next to a `cov_condition_number`
+    // field this function recomputed. Re-enriching it instead of dropping it would
+    // be worse: it would stamp the `r` step's message with the `s` step's numbers.
+    //
+    // Scoped to the four covariance-step codes — exactly what `new_warnings`
+    // replaces. The SE-derived post-fit diagnostics (`inflated_rse`,
+    // `high_correlation`) are also stale after a re-run, but `run_covariance` does
+    // not re-derive them at all; refreshing those is `fit_inner`'s postfit pass and
+    // a separate change.
+    out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    // Rebuild so the machine-readable payloads agree with the fields above: the
+    // entries are keyed by message, so the surviving native ones are preserved and
+    // the new covariance warnings get `details` sourced from the *refreshed*
+    // `cov_condition_number` / `cov_eigenvalues` / `covariance_method`. Without
+    // this the new warnings reach `warnings` with no structured entry at all.
+    crate::api::rebuild_warnings_structured(&mut out);
     Ok(out)
+}
+
+/// Does this warning describe the covariance step itself — the step
+/// [`run_covariance`] recomputes and whose warnings it therefore replaces?
+///
+/// Classified rather than matched on prose, so the set tracks
+/// [`crate::types::classify_warning`] instead of drifting from it. `Sir` is
+/// deliberately absent: `run_covariance` discards the SIR fallback proposal and
+/// never runs the sampler, so a SIR warning is not this function's to replace.
+fn is_covariance_step_warning(msg: &str) -> bool {
+    matches!(
+        crate::types::classify_warning(msg).category,
+        WarningCode::CovarianceStep
+            | WarningCode::CovarianceFailed
+            | WarningCode::CovarianceRegularized
+            | WarningCode::ConditionNumber
+    )
 }
 
 #[cfg(test)]

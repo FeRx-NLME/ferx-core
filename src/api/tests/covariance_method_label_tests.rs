@@ -18,184 +18,21 @@
 //! `estimation::covariance::published_covariance_method` is the single owner, and
 //! its two unit tests (`the_published_label_names_the_routed_estimator_not_the_requested_one`,
 //! `a_step_that_produced_no_matrix_publishes_no_estimator`) pin the rule itself.
-//! What follows pins that the rule reaches the fit object, the YAML and the
-//! warning payload.
-use super::*;
-use crate::parser::model_parser::parse_model_string;
-use crate::types::{CovarianceMethod, CovarianceStatus};
-use std::collections::HashMap;
-
-/// One-compartment IV closed form — no ODE solve, so a covariance step that has
-/// to build a real FD Hessian still lands inside the Tier-1 budget.
-fn one_cpt_model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
-}
-
-fn subject(id: &str, scale: f64) -> Subject {
-    let obs_times: Vec<f64> = vec![0.5, 2.0, 8.0, 24.0];
-    let observations = obs_times
-        .iter()
-        .map(|t| scale * 10.0 * (-0.1 * t).exp())
-        .collect();
-    Subject {
-        id: id.into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        obs_times,
-        obs_raw_times: Vec::new(),
-        observations,
-        obs_cmts: vec![1, 1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-    }
-}
-
-/// Twelve subjects, not two: the cross-product `S = Σᵢ gᵢgᵢᵀ` has rank at most
-/// the subject count, so a fixture with fewer subjects than free parameters makes
-/// `covariance_method = s` fail as *rank-deficient* and publish no matrix at all.
-/// The test below would then be asserting `None == None` for a reason that has
-/// nothing to do with the label.
-fn population() -> Population {
-    Population {
-        subjects: (0..12)
-            .map(|i| subject(&format!("{i}"), 1.0 + 0.05 * i as f64))
-            .collect(),
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    }
-}
-
-fn opts(method: CovarianceMethod, explicit: bool) -> FitOptions {
-    FitOptions {
-        method: EstimationMethod::FoceI,
-        outer_maxiter: 1,
-        run_covariance_step: true,
-        covariance_method: method,
-        covariance_method_set: explicit,
-        threads: Some(1),
-        ..Default::default()
-    }
-}
-
-/// **G1 — the reported gap, end to end: the fit object names its estimator.**
-///
-/// Two arms, and the pair is the test: a single arm is satisfied by a field
-/// hard-coded to `Hessian`. `s` is the arm that cannot be faked, and it is also
-/// the one the reporter used to get 3.68e5 where the sandwich gave 1.42e8.
-///
-/// The premise — that the covariance step actually produced a matrix — is
-/// asserted first, because `covariance_method` is `None` whenever it did not, and
-/// a fixture that silently stopped producing one would make the real assertion
-/// vacuous.
-///
-/// Mutation (run): publish `options.covariance_method` from `run_covariance_step`'s
-/// *gated* wrapper instead of the inner step, or hard-code `Some(Hessian)` → the
-/// `s` arm fires.
-#[test]
-fn a_fit_reports_the_estimator_its_standard_errors_came_from() {
-    let model = one_cpt_model();
-    let pop = population();
-
-    for requested in [
-        CovarianceMethod::Hessian,
-        CovarianceMethod::CrossProduct,
-        CovarianceMethod::Sandwich,
-    ] {
-        let fit = fit(
-            &model,
-            &pop,
-            &model.default_params,
-            &opts(requested, /* explicit */ true),
-        )
-        .expect("fit");
-
-        assert!(
-            fit.covariance_matrix.is_some(),
-            "premise: the covariance step must produce a matrix under \
-             covariance_method = {}, else the label below is `None` for a reason \
-             unrelated to #1382. warnings: {:?}",
-            requested.label(),
-            fit.warnings
-        );
-        assert_eq!(
-            fit.covariance_method,
-            Some(requested),
-            "#1382: the fit reports no estimator, or the wrong one, for the SEs / \
-             eigenvalues / condition number it published under covariance_method = {}",
-            requested.label()
-        );
-    }
-}
-
-/// **G2 — the pairing, in both directions.** A matrix without a label is the
-/// reported bug; a label without a matrix is the mirror image, and it is worse —
-/// it invites a reader to compare a condition number that was never computed.
-///
-/// `run_covariance_step = false` is the cheap half. The `Failed` /
-/// `SirFallback` halves are covered structurally by
-/// `published_covariance_method`'s `None` arm rather than by standing up a
-/// singular Hessian here.
-#[test]
-fn a_fit_with_no_covariance_matrix_names_no_estimator() {
-    let model = one_cpt_model();
-    let pop = population();
-    let mut o = opts(CovarianceMethod::Sandwich, true);
-    o.run_covariance_step = false;
-
-    let fit = fit(&model, &pop, &model.default_params, &o).expect("fit");
-
-    assert!(fit.covariance_matrix.is_none(), "premise");
-    assert_eq!(
-        fit.covariance_status,
-        CovarianceStatus::NotRequested,
-        "premise"
-    );
-    assert_eq!(
-        fit.covariance_method, None,
-        "an estimator name must never outlive the matrix it describes — here there \
-         are no SEs, no eigenvalues and no condition number for `rsr` to label"
-    );
-    assert!(
-        fit.cov_condition_number.is_none() && fit.cov_eigenvalues.is_none(),
-        "premise: the quantities the label exists for are absent too"
-    );
-}
+//!
+//! **Tier boundary** (#1382 review). Nothing here calls `fit()`: this file holds
+//! the structural scan over the publishing sites and the warning-payload check,
+//! both of which run against source text or a typed struct. The end-to-end cases
+//! that do call `fit()` / `run_covariance` live in `tests/covariance_method_label.rs`,
+//! which is Tier 2 by CLAUDE.md's rule — public API, returning after a single
+//! outer iteration.
+use crate::types::CovarianceMethod;
 
 /// **G5 — the pairing, structurally: no covariance matrix is written anywhere
 /// without its estimator.**
 ///
-/// The behavioural tests above cover the paths a fixture can reach. This covers
-/// the ones it cannot: `OuterResult` is **public API with public fields**, and
+/// The behavioural tests in `tests/covariance_method_label.rs` cover the paths a
+/// fixture can reach. This covers the ones it cannot: `OuterResult` is **public
+/// API with public fields**, and
 /// `ferx-tools` calls `optimize_population` / `run_foce_gn` / `run_imp` /
 /// `run_impmap` / `run_bayes` directly without going near `fit()`, so a new
 /// estimator exit that sets `covariance_matrix` and forgets `covariance_method`
@@ -221,8 +58,9 @@ fn a_fit_with_no_covariance_matrix_names_no_estimator() {
 /// struct, and the invariant there is already owned by
 /// `published_covariance_method` and asserted directly by its two unit tests.
 ///
-/// What is written is pinned by G1 / G3; this pins only that *something* is
-/// written at every site — the half a fixture cannot reach.
+/// What is written is pinned by G1 / G3 in `tests/covariance_method_label.rs`;
+/// this pins only that *something* is written at every site — the half a fixture
+/// cannot reach.
 ///
 /// Mutation (run): delete `covariance_method` from any one estimator exit → that
 /// site is unlabelled and this fires naming the file. Delete a whole exit's
@@ -419,59 +257,6 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
          without going through `fit()`, which is why this is enforced at every publishing \
          site rather than once in `fit_inner`. A new site must set `covariance_method` \
          from the covariance step (never from `FitOptions`) and be listed here."
-    );
-}
-
-/// **G3 — `run_covariance` relabels, and does not inherit.**
-///
-/// The standalone entry point is a second publishing site: it clones the incoming
-/// fit and overwrites the covariance block, and `ferx-tools` / the R wrapper reach
-/// it without going through `fit()`. Two failures it pins, and neither is visible
-/// from G1:
-///
-/// 1. **A stale label outliving its matrix.** The incoming fit is labelled `r`;
-///    the re-run is under `s`. A clone that forgets to overwrite reports `r` for
-///    SEs that came out of `S⁻¹` — the reported bug, with an extra step.
-/// 2. **No label at all**, if the site simply does not set the field.
-///
-/// Mutation: delete the `out.covariance_method = …` assignment in
-/// `run_covariance` → the fit's own `r` survives and the first assertion fires.
-#[test]
-fn rerunning_the_covariance_step_relabels_the_result() {
-    let model = one_cpt_model();
-    let pop = population();
-
-    let fitted = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &opts(CovarianceMethod::Hessian, true),
-    )
-    .expect("fit");
-    assert_eq!(
-        fitted.covariance_method,
-        Some(CovarianceMethod::Hessian),
-        "premise: the incoming fit must already carry a *different* label, or the \
-         overwrite below is indistinguishable from doing nothing"
-    );
-
-    let rerun = crate::estimation::run_covariance::run_covariance(
-        &fitted,
-        Some(&model),
-        Some(&pop),
-        &opts(CovarianceMethod::CrossProduct, true),
-    )
-    .expect("run_covariance");
-
-    assert!(
-        rerun.covariance_matrix.is_some(),
-        "premise: {:?}",
-        rerun.warnings
-    );
-    assert_eq!(
-        rerun.covariance_method,
-        Some(CovarianceMethod::CrossProduct),
-        "run_covariance published an S⁻¹ matrix under the incoming fit's R⁻¹ label"
     );
 }
 

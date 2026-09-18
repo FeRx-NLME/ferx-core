@@ -3034,9 +3034,15 @@ mod tests {
             s.contains("Covariance: computed (R⁻¹SR⁻¹, covariance_method = rsr)"),
             "the status line must name the estimator:\n{s}"
         );
+        // The whole line, not the two halves (#1382 review): asserting
+        // `contains("(covariance_method = rsr)")` separately from
+        // `contains("Condition number: …")` passes on the *SE note's* suffix, so
+        // deleting the suffix from this line alone left the test green. Verified
+        // by deleting it: the split form passed, this form fails.
         assert!(
-            s.contains("(covariance_method = rsr)") && s.contains("Condition number: 142000000.0"),
-            "the condition number must carry the estimator it belongs to:\n{s}"
+            s.contains("  Condition number: 142000000.0  (covariance_method = rsr)\n"),
+            "the condition number must carry the estimator on its own line — it is \
+             the figure most often copied out alone:\n{s}"
         );
     }
 
