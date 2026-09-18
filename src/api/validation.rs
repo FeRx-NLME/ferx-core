@@ -718,6 +718,17 @@ pub(crate) fn reader_warning_suppressed(
     warning: &str,
 ) -> bool {
     if warning.starts_with("W_CMT_DEFAULTED") {
+        // A summary that reports rows a `CMT`-reading `[data_selection]` rule DELETED
+        // is never suppressed, whatever `options` say. The reader only counts such a
+        // row when the rule that removed it actually read `CMT`, so the finding
+        // carries its own proof that the channel is live — and that is the only way
+        // the entry points with no `&FitOptions` (`predict`, `simulate`, the adaptive
+        // driver, and any caller that filtered its population before handing it over)
+        // can report it at all (#1409 review). Keyed on the reader's own constant, so
+        // the two cannot drift.
+        if warning.contains(crate::io::datareader::CMT_FILTER_DELETED_MARKER) {
+            return false;
+        }
         return !cmt_defaulting_is_ambiguous(model, options);
     }
     model.is_algebraic() && warning.starts_with("W_NO_DOSES")
@@ -734,8 +745,10 @@ pub(crate) fn reader_warning_suppressed(
 /// #1409 replaced the list with [`CmtConsumer`]: every channel that reads a row's
 /// `CMT` is a variant, each variant answers its own question off the engine's own
 /// routing table, and this is their OR. A new consumer is a compile error in
-/// [`CmtConsumer::is_live`] and a red test in `cmt_data_selection_scope.rs` until someone
-/// says which side of the question it falls on.
+/// [`CmtConsumer::is_live`] and a red
+/// `every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one` until someone says
+/// which side of the question it falls on — the list itself cannot be forgotten,
+/// because the enum and [`CmtConsumer::ALL`] expand from one `cmt_consumers!` list.
 ///
 /// The state count behind [`CmtConsumer::DoseCompartment`] deliberately includes the
 /// injected joint-PK-TTE `__chz_*` accumulators along with the PK states. They are
@@ -747,22 +760,50 @@ fn cmt_defaulting_is_ambiguous(model: &CompiledModel, options: &FitOptions) -> b
     CmtConsumer::iter().any(|c| c.is_live(model, options))
 }
 
-/// Every channel that reads a row's `CMT`, so the compartment the reader had to
-/// invent could change a number (#1409).
+/// Declares [`CmtConsumer`] and its complete list from **one** token sequence.
 ///
-/// This enum *is* the scope of `W_CMT_DEFAULTED`. Adding a channel means adding a
-/// variant, which is a compile error in [`Self::is_live`] and [`Self::next`] and a
-/// red `tests/cmt_data_selection_scope.rs` / `tests/cmt_endpoint_scope.rs` until it
-/// carries a fixture that measures the difference the channel makes. That is the step all three #1404 review rounds
-/// skipped, each time by widening a condition in place.
+/// The list is the reason this is a macro rather than a plain `enum` plus a `const`.
+/// A hand-written array beside the enum is exactly what goes stale, and it did: the
+/// #1423 review added a 7th variant with arms in every `match` but no entry in the
+/// array, and all 22 unit tests stayed green while `cmt_defaulting_is_ambiguous`
+/// never asked it. A `next()`-chain spelling had the same hole one step further in —
+/// a variant whose arm was `None` was simply unreachable from the iterator, verified
+/// by the same probe.
 ///
-/// Each arm asks the **consumer's own** routing table rather than restating it, so a
-/// model class added to one of those tables cannot fall outside this predicate:
-/// `OdeSpec::n_states` / `PkTopology::channels` for the dose channel,
-/// `api::run::obs_routing_for` for the endpoint channel (the one place a routing set
-/// is derived from a model), and `SelectionFilter` for the filter channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CmtConsumer {
+/// Here a variant cannot exist without being in [`CmtConsumer::ALL`], because both
+/// are expanded from the same `$name` list. That is the whole trick; stable Rust
+/// cannot otherwise enumerate a type's variants.
+macro_rules! cmt_consumers {
+    ($( $(#[$meta:meta])* $name:ident ),+ $(,)?) => {
+        /// Every channel that reads a row's `CMT`, so the compartment the reader had
+        /// to invent could change a number (#1409).
+        ///
+        /// This enum *is* the scope of `W_CMT_DEFAULTED`. Adding a channel means
+        /// adding a variant to the `cmt_consumers!` list, which puts it in
+        /// [`Self::ALL`] by construction and is a compile error in [`Self::is_live`]
+        /// until someone says when it is live — the step all three #1404 review
+        /// rounds skipped, each time by widening a condition in place.
+        ///
+        /// Each arm asks the **consumer's own** routing table rather than restating
+        /// it, so a model class added to one of those tables cannot fall outside this
+        /// predicate: `OdeSpec::n_states` / `PkTopology::channels` for the dose
+        /// channel, `api::run::obs_routing_for` for the endpoint channel (the one
+        /// place a routing set is derived from a model), and `SelectionFilter` for
+        /// the filter channel.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum CmtConsumer {
+            $( $(#[$meta])* $name, )+
+        }
+
+        impl CmtConsumer {
+            /// Every variant, in declaration order — expanded from the same list as
+            /// the enum itself, so it cannot omit one.
+            pub(crate) const ALL: &'static [CmtConsumer] = &[ $( CmtConsumer::$name ),+ ];
+        }
+    };
+}
+
+cmt_consumers! {
     /// Which compartment a **dose** row lands in — `[odes]` states, or an
     /// analytical topology's `channels` (an oral model's `CMT=2` is a real
     /// depot-bypassing central bolus, a 2-cpt model's `CMT=2` the peripheral).
@@ -793,47 +834,9 @@ pub(crate) enum CmtConsumer {
 }
 
 impl CmtConsumer {
-    /// The channel after this one, or `None` at the end of the chain.
-    ///
-    /// **This is the enumeration.** There is deliberately no second `ALL` array to
-    /// keep in step: a hand-written list is exactly the thing that goes stale, and it
-    /// did — the first version of this file carried `ALL: [CmtConsumer; 6]` next to an
-    /// exhaustive `index()`, and a 7th variant that satisfied every `match` while
-    /// being left out of the array passed all 22 tests in
-    /// `reader_warning_suppression_tests` while `cmt_defaulting_is_ambiguous` silently
-    /// never asked it (measured on the #1423 review's probe). The doc there claimed
-    /// that case was a red test. It was not.
-    ///
-    /// Written as a chain because the `match` is then **exhaustive over variants**, so
-    /// a new consumer cannot compile without someone deciding where in the order it
-    /// goes — and the arm they must edit to make it reachable (the previous tail's
-    /// `None`) is in the same `match`, three lines away, rather than in another item
-    /// that still compiles untouched.
-    ///
-    /// **What this does and does not guarantee**, stated exactly because the thing it
-    /// replaced overclaimed. Adding a variant is a compile error in three places
-    /// (`next`, [`Self::is_live`], and `only_live` in the unit tests), and that is the
-    /// forcing function. It is *not* a red test: an author who answers all three and
-    /// writes `NewVariant => None` without repointing the previous tail leaves it
-    /// unreachable from [`Self::iter`], and the suite stays green — verified by probe,
-    /// not assumed. Stable Rust cannot enumerate a type's variants without a derive
-    /// macro, so no test here can close that gap; the chain narrows it to a single
-    /// `match` where both arms are visible at once, instead of an array in another
-    /// item that compiles untouched.
-    fn next(self) -> Option<Self> {
-        match self {
-            CmtConsumer::DoseCompartment => Some(CmtConsumer::PerCmtScaling),
-            CmtConsumer::PerCmtScaling => Some(CmtConsumer::PerCmtErrorModel),
-            CmtConsumer::PerCmtErrorModel => Some(CmtConsumer::PerCmtReadout),
-            CmtConsumer::PerCmtReadout => Some(CmtConsumer::EndpointRouting),
-            CmtConsumer::EndpointRouting => Some(CmtConsumer::DataSelectionFilter),
-            CmtConsumer::DataSelectionFilter => None,
-        }
-    }
-
-    /// Every channel, in order, starting from the head of the chain.
+    /// Every channel, in declaration order.
     pub(crate) fn iter() -> impl Iterator<Item = CmtConsumer> {
-        std::iter::successors(Some(CmtConsumer::DoseCompartment), |c| c.next())
+        CmtConsumer::ALL.iter().copied()
     }
 
     /// Whether this channel actually reads `CMT` on this model + options.
@@ -966,6 +969,19 @@ fn analytical_closed_form_dispatched(model: &CompiledModel) -> bool {
     if model.is_algebraic() || model.ode_spec.is_some() {
         return false;
     }
+    model_scores_gaussian_observations(model)
+}
+
+/// Whether this model scores any **Gaussian** observation — i.e. whether its
+/// `ErrorSpec` dispatches at least one error model.
+///
+/// An empty dispatch table is the parser's marker for a model with no
+/// `[error_model]` block, which is an endpoint-only model (TTE, binary, categorical,
+/// CTMM). Shared with `api::run::model_routes_rows_by_cmt`, which needs the same
+/// question to tell "the only endpoint is at the default compartment, so the guess is
+/// provably right" from "the guess picks between an endpoint and the Gaussian grid"
+/// (#1409).
+pub(crate) fn model_scores_gaussian_observations(model: &CompiledModel) -> bool {
     match &model.error_spec {
         ErrorSpec::Single(_) => true,
         ErrorSpec::PerCmt(m) => !m.is_empty(),
