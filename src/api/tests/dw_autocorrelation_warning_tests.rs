@@ -128,6 +128,37 @@ fn one_cpt_model() -> CompiledModel {
     parse_model_string(src).expect("parse")
 }
 
+/// The same model with a `[diffusion]` block, so the pair differs in exactly
+/// one thing: whether `model.is_sde()` holds.
+///
+/// Without this arm the test cannot see a recommendation gated on `is_sde()` —
+/// which is the population that must least of all be told to add process noise.
+/// `gradient_method = fd` because the EKF path has no analytic-sensitivity
+/// provider.
+fn one_cpt_sde_model() -> CompiledModel {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0) FIX
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[diffusion]
+  central ~ 0.01
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  gradient_method = fd
+"#;
+    parse_model_string(src).expect("parse")
+}
+
 /// Observations from a two-compartment truth, `100·(0.6·e^{-0.5t} + 0.4·e^{-0.05t})`.
 /// Against the model's single `e^{-0.1t}` the residuals are a smooth U — strongly
 /// positively autocorrelated, which is the `DW < 1.5` branch.
@@ -186,14 +217,36 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
 /// of the gate. Both facts are asserted rather than assumed: a fixture that
 /// drifted into the quiet band would otherwise leave this test passing on an
 /// empty search.
-#[test]
-fn fit_pushes_exactly_the_helpers_message() {
-    let model = one_cpt_model();
-    assert!(
-        model.ode_spec.is_some(),
-        "the removed suffix was gated on `ode_spec`; an analytic fixture cannot observe it"
-    );
+/// Every warning either fixture is *entitled* to emit, as (opening, closing)
+/// pairs. Both ends are pinned on purpose: with prefixes alone, appending the
+/// recommendation to an already-accounted warning — the shrinkage notice, say —
+/// stays accounted and the test passes (measured; that is how this list came to
+/// be anchored at both ends).
+///
+/// The thread notice opens with a machine-dependent count, so its "prefix" is
+/// `classify_warning`'s own key, matched anywhere in the string.
+const ACCOUNTED: &[(&str, &str)] = &[
+    (
+        "No estimation method was specified",
+        "to silence this warning.",
+    ),
+    (
+        "Outer optimization hit the evaluation budget",
+        "increase maxiter for a tighter fit.",
+    ),
+    ("Outer optimization did not converge", "did not converge"),
+    ("High ETA shrinkage", "or collecting more informative data."),
+    ("threads configured", "(no speed benefit beyond n_subjects)"),
+    (
+        "Stochastic differential equations ([diffusion]",
+        "See the Feature Maturity and SDE pages in the documentation.",
+    ),
+];
 
+/// Fit `model` and assert that the only thing `fit_inner` says about
+/// autocorrelation is the helper's message, and that it says nothing else at all
+/// beyond the warnings above.
+fn assert_fit_pushes_only_the_helpers_message(model: &CompiledModel, label: &str) {
     let pop = Population {
         subjects: vec![
             biexponential_subject("1", 1.0),
@@ -213,51 +266,44 @@ fn fit_pushes_exactly_the_helpers_message() {
         ..Default::default()
     };
 
-    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+    let result = fit(model, &pop, &model.default_params, &opts).expect("fit should succeed");
 
     assert!(
         result.dw_statistic.is_finite() && result.dw_statistic < 1.5,
-        "fixture must land on the branch the SDE sentence was appended to; DW = {}",
+        "[{label}] fixture must land on the branch the SDE sentence was appended to; DW = {}",
         result.dw_statistic
     );
 
     let expected = dw_autocorrelation_warning(result.dw_statistic)
         .expect("a DW below 1.5 must produce a message");
 
-    // Every warning this fixture is *entitled* to emit, by its opening words.
-    // Anything else — including a recommendation pushed as its own entry rather
-    // than appended to the message — is unaccounted for and fails below.
-    //
-    // Categories would be the tidier gate and do not work: `classify_warning`
-    // sends an unrecognised sentence to the `General` fallback, and this
-    // fixture already emits two legitimate `General` warnings (the default-method
-    // notice and the evaluation-budget notice), so a stray sentence would hide
-    // among them. Measured, not assumed: the six entries here classify as
-    // General ×2, Convergence, Threads, EtaShrinkage, DwAutocorrelation.
-    //
-    // The thread notice opens with a machine-dependent count, so it is matched
-    // on `classify_warning`'s own key rather than a prefix.
     let accounted = |w: &str| {
         w == expected
-            || w.starts_with("No estimation method was specified")
-            || w.starts_with("Outer optimization hit the evaluation budget")
-            || w.starts_with("Outer optimization did not converge")
-            || w.starts_with("High ETA shrinkage")
-            || w.contains("threads configured")
+            || ACCOUNTED
+                .iter()
+                .any(|(open, close)| w.contains(open) && w.ends_with(close))
     };
 
-    // The gate can fire: the sentence this PR removed is not accounted for by
-    // any arm above, so pushing it as a separate warning fails the assertion
-    // rather than slipping past a filter keyed on the helper's own vocabulary.
+    // The gate can fire, in both of the shapes that have slipped past a weaker
+    // version of this test: the recommendation as its own entry, and the
+    // recommendation appended to a warning that *is* accounted for.
+    let removed = "For ODE models, SDE process noise may also help.";
     assert!(
-        !accounted("For ODE models, SDE process noise may also help."),
-        "the allow-list must not absorb the removed recommendation"
+        !accounted(removed),
+        "[{label}] the allow-list must not absorb the removed recommendation"
     );
+    for w in &result.warnings {
+        let tampered = format!("{w} {removed}");
+        assert!(
+            !accounted(&tampered),
+            "[{label}] appending to an accounted warning must not stay accounted: {w}"
+        );
+    }
 
     let unaccounted: Vec<&String> = result.warnings.iter().filter(|w| !accounted(w)).collect();
     assert!(
         unaccounted.is_empty(),
-        "fit() emitted warnings this fixture does not account for: {unaccounted:#?}"
+        "[{label}] fit() emitted warnings this fixture does not account for: {unaccounted:#?}"
     );
 
     let dw_entries: Vec<&String> = result
@@ -271,10 +317,30 @@ fn fit_pushes_exactly_the_helpers_message() {
     assert_eq!(
         dw_entries.len(),
         1,
-        "expected exactly one dw_autocorrelation warning, got {dw_entries:#?}"
+        "[{label}] expected exactly one dw_autocorrelation warning, got {dw_entries:#?}"
     );
     assert_eq!(
         *dw_entries[0], expected,
-        "fit_inner must push the helper's message unmodified"
+        "[{label}] fit_inner must push the helper's message unmodified"
     );
+}
+
+#[test]
+fn fit_pushes_exactly_the_helpers_message() {
+    // Two arms differing in exactly one thing: whether the model is an SDE.
+    // A recommendation re-introduced behind `model.is_sde()` is invisible to a
+    // plain-ODE fixture (measured), and `[diffusion]` users are the population
+    // that must least of all be told to add process noise.
+    let ode = one_cpt_model();
+    assert!(
+        ode.ode_spec.is_some(),
+        "the removed suffix was gated on `ode_spec`; an analytic fixture cannot observe it"
+    );
+    assert!(!ode.is_sde(), "the ODE arm must not be an SDE model");
+    assert_fit_pushes_only_the_helpers_message(&ode, "ODE");
+
+    let sde = one_cpt_sde_model();
+    assert!(sde.ode_spec.is_some());
+    assert!(sde.is_sde(), "the SDE arm must carry a [diffusion] block");
+    assert_fit_pushes_only_the_helpers_message(&sde, "SDE");
 }
