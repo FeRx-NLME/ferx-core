@@ -600,6 +600,10 @@ pub(crate) fn individual_nll_prepared(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     prep: &IndividualNllPrep,
+    // The subject's cached event-driven schedule, or `None` where reuse is
+    // unsound (see `estimation::inner_optimizer::cacheable_schedule`) and the
+    // predictor must rebuild it per call, as it always did.
+    schedule: Option<&pk::event_driven::EventSchedule>,
     scratch: &mut IndividualNllScratch,
 ) -> f64 {
     scratch.ensure_eta(eta.len());
@@ -618,7 +622,7 @@ pub(crate) fn individual_nll_prepared(
         sigma_values,
         &model.residual_correlations,
         pk,
-        None,
+        schedule,
         &prep.err_keys,
         prep.ruv_mult.as_deref(),
         preds,

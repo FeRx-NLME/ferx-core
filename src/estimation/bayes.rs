@@ -838,12 +838,7 @@ pub fn run_bayes(
                         } else {
                             let kappas_opt =
                                 omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
-                            mh_scratch.begin_subject(
-                                model,
-                                &population.subjects[i],
-                                &theta,
-                                n_eta,
-                            );
+                            mh_scratch.begin_subject(model, &population.subjects[i], &theta, n_eta);
                             mh_steps(
                                 &mut etas[i],
                                 nll[i],
@@ -857,6 +852,7 @@ pub fn run_bayes(
                                 &mut rng,
                                 n_eta_mh,
                                 &mut mh_scratch,
+                                schedules[i].as_ref(),
                                 kappas_opt,
                             )
                         };

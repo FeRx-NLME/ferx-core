@@ -24,7 +24,7 @@
 //! biased and are the preferred basis for those diagnostics.
 
 use crate::estimation::saem::{
-    mh_kappa_steps, mh_steps, mh_steps_componentwise, SAEM_OMEGA_DIAG_FLOOR,
+    mh_kappa_steps, mh_steps, mh_steps_componentwise, MhScratch, SAEM_OMEGA_DIAG_FLOOR,
 };
 use crate::stats::likelihood::{individual_nll, individual_nll_iov};
 use crate::types::*;
@@ -111,11 +111,15 @@ pub fn run_conditional_distribution(
         .subjects
         .par_iter()
         .enumerate()
-        .map_init(crate::estimation::saem::MhScratch::default, |mh_scratch, (i, subject)| {
+        .map_init(MhScratch::default, |mh_scratch, (i, subject)| {
             let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(i as u64));
             // Same per-subject hoist as the SAEM E-step: the η-independent NLL
             // inputs and the proposal buffers are rebuilt here, not per proposal.
             mh_scratch.begin_subject(model, subject, theta, n_eta);
+            // Same once-per-subject schedule cache as the SAEM E-step. Here the
+            // conditional-distribution sweep visits each subject once, so this
+            // builds it once rather than once per proposal.
+            let schedule = crate::estimation::inner_optimizer::cacheable_schedule(model, subject);
 
             // Warm-start the chain at the EBE mode.
             let mut eta: Vec<f64> = warm_etas[i].iter().copied().collect();
@@ -191,6 +195,7 @@ pub fn run_conditional_distribution(
                     &mut rng,
                     n_mh_steps,
                     mh_scratch,
+                    schedule.as_ref(),
                     omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
                 );
                 nll = nll_b;
@@ -214,6 +219,7 @@ pub fn run_conditional_distribution(
                         &mut rng,
                         n_cw_sweeps,
                         mh_scratch,
+                        schedule.as_ref(),
                         omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
                     );
                     nll = nll_c;

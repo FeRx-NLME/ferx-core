@@ -706,6 +706,10 @@ pub(crate) fn mh_steps(
     // Caller-owned buffers, already pointed at this subject by
     // [`MhScratch::begin_subject`].
     scratch: &mut MhScratch,
+    // This subject's cached `EventSchedule`, or `None` where reuse is unsound
+    // (`inner_optimizer::cacheable_schedule`) and the predictor rebuilds it per
+    // call as before.
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
     // When Some, eta proposals are evaluated with IOV-aware NLL (kappas held fixed).
     // This is required for Gibbs correctness in IOV models: the acceptance ratio
     // must target p(η | κ, θ, data), which includes the per-occasion kappa terms.
@@ -767,6 +771,7 @@ pub(crate) fn mh_steps(
                 omega,
                 sigma_values,
                 prep,
+                schedule,
                 nll_scratch,
             )
         };
@@ -829,6 +834,7 @@ pub(crate) fn mh_steps_componentwise(
     // [`MhScratch::begin_subject`]. The sweep proposes in place on `eta`, so it
     // uses only the NLL half of the scratch.
     scratch: &mut MhScratch,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
     kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (Vec<usize>, usize, f64) {
     let n_eta = eta.len();
@@ -867,6 +873,7 @@ pub(crate) fn mh_steps_componentwise(
                     omega,
                     sigma_values,
                     prep,
+                    schedule,
                     nll_scratch,
                 )
             };
@@ -3027,6 +3034,30 @@ pub fn run_saem(
     // user configured (#918 review).
     let mut cov_group_skipped = vec![0usize; cov_mu_groups.len()];
 
+    // Per-subject `EventSchedule` cache, built once for the whole fit.
+    //
+    // A subject on the event-driven analytical path (time-varying covariates,
+    // EVID-3/4 resets, or a `TIME`-reading `[individual_parameters]` program)
+    // otherwise rebuilds its schedule inside *every* NLL evaluation: the
+    // `schedule: None` arm of `compute_predictions_with_tv_recycle_with_schedule`
+    // reaches `event_driven_predictions`, which calls `EventSchedule::for_subject`
+    // — a merged event list over `2·n_doses + n_obs + n_pk_only + n_reset`, a
+    // sort, and then a `Vec` of propagation bounds per interval, each an
+    // O(n_doses) scan plus a sort and a dedup. That is ~39 rebuilds per subject
+    // per iteration, 400 iterations deep, of something that does not depend on
+    // η at all — and `event_driven_predictions_with_schedule`'s own docstring
+    // already said where it belongs ("Hot loops should build the schedule once
+    // per subject ... the merged event sort and per-interval infusion-bound
+    // construction otherwise dominate per-call CPU on the TV-cov path"). FOCE's
+    // inner loop and the Bayes chain both cache it; SAEM did not.
+    //
+    // [`build_schedule_cache`] is the shared builder those two use, so the
+    // staleness rules (no η-dependent lagtime, no `F`-reshaped rate-defined
+    // infusion) are stated in exactly one place — see `cacheable_schedule`. It
+    // returns `None` per subject wherever reuse is unsound, which is then the
+    // established rebuild-per-call behaviour.
+    let schedules = crate::estimation::inner_optimizer::build_schedule_cache(model, population);
+
     // Main loop
     for k in 1..=n_iter {
         // Per-iteration combined (block + componentwise) accept / proposal
@@ -3313,6 +3344,7 @@ pub fn run_saem(
                                 &mut rng,
                                 n_mh_steps,
                                 mh_scratch,
+                                schedules[i].as_ref(),
                                 kappas_mh_opt,
                             );
                             nll_cur = nll_new;
@@ -3334,6 +3366,7 @@ pub fn run_saem(
                             &mut rng,
                             n_cw_sweeps,
                             mh_scratch,
+                            schedules[i].as_ref(),
                             kappas_mh_opt,
                         );
 
@@ -7015,6 +7048,7 @@ DV ~ additive(EPS)
             100,
             &mut pk_scratch,
             None,
+            None,
         );
 
         // Random walk with step=0: every proposal == current eta, accepted as
@@ -7899,6 +7933,7 @@ DV ~ additive(EPS)
                 50,
                 &mut scratch,
                 None,
+                None,
             );
             (eta, acc, nll)
         };
@@ -7950,6 +7985,7 @@ DV ~ additive(EPS)
             &mut rng,
             100,
             &mut scratch,
+            None,
             None,
         );
         // Coordinate 1 is frozen at its start; coordinate 0 has moved.
