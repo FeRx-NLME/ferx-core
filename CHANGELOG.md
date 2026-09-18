@@ -105,6 +105,12 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **`mstep_damping` now defaults to `1.0` (off).** The 0.03 exploration cap that #1011 introduced
+  divides the number of EM steps the exploration phase amounts to, and was measured to *hold* every
+  no-ETA theta near its initial estimate rather than estimate it — its FREM reprex ends at 0.361
+  from a 0.383 start and at 0.191 from a 0.2 start. The option stays as an opt-in hold for that FREM
+  `iiv_on_ruv` shape, where the undamped channel drifts (0.18 from either start, 47 FOCEI-objective
+  units worse than the held start); that drift is tracked separately. (#1415)
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
 - **`method = laplace` no longer recomputes the sensitivity jet its grid anchor was just built
@@ -159,6 +165,25 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **SAEM now estimates thetas that carry no ETA instead of leaving them near their initial
+  values.** A theta with no random effect is moved only by the numerical (η-frozen) M-step, and
+  that solve started NLopt from a first design a quarter of the bound range wide and stopped on a
+  `1e-4` relative tolerance, so it returned a few percent of a step; the #1011 damping then blended
+  that at 3 % per exploration M-step. On the thiotepa model of #1415 eight of eight such thetas
+  ended within 13 % of the way to the FOCEI estimate and four within 2 % of their start. The solve
+  now starts local (a 0.1 log-unit trust radius) and converges (`1e-7`), and the exploration cap is
+  off by default: importance-sampled −2 log L 6047.8 → 5827.3 on thiotepa (5823.6 at the FOCEI
+  optimum), 2705.8 → 2684.0 on melphalan (NONMEM SAEM 2682.4), 17778.5 → 17764.3 on clofarabine;
+  the in-repo `covmuref_power` allometric exponent routed onto this channel now lands at 0.961
+  against NONMEM SAEM's 0.921 (0.332 before, from a 0.3 start). Mixture models keep the previous
+  M-step configuration: their class typical values come from a hard class draw, and a converged
+  per-class solve moves the NONMEM-anchored mixture fit off the MLE. (#1415)
+- **A method chain no longer drops the η–ε interaction from the reported objective.** The parser
+  cleared `interaction` for every `method = [...]` chain not ending in `focei`, so `[saem, imp]`
+  published SAEM's final FOCE objective *without* interaction — 175 units above the FOCEI objective
+  at the same estimates on the thiotepa model — while `method = saem` alone published it with. A
+  chain now sets the flag only from a final `focei` (on) or `foce` (off), as the single-method form
+  does. (#1415)
 - **The adaptive-dosing frozen-schedule replay verifier now segments its timeline through the same break builder as the reactive driver it checks.** The verifier's own time-varying / IOV replay engine built its dose breaks by hand — a dose's time plus a real infusion's bioavailability-scaled end — so it pushed neither a per-route absorption onset nor a `zero_order()` window's edges. A zero-order window's constant rate is applied only to a segment the window fully contains, so an unbracketed edge dropped the rate for every segment straddling it and the replay under-delivered the absorbed mass: measured **100 % of the window short** (`0.0` against an exact `25.0`) on a two-dose `zero_order(dur = 2, lag = 1.5)` subject. The verifier is the designated internal oracle for adaptive dosing — the feature family that has no NONMEM comparator — so a divergence it reported there would have been its own artifact, and it was symmetrically blind to a real one. **Latent, not user-reachable:** an absorption-compartment dose under a time-varying covariate or IOV is a typed error today, on the base regimen (`#930`/`#931` scope) and at controller injection alike, so no run could reach the broken path; the fix lands ahead of any widening of that scope rather than after it. Every currently-reachable adaptive run is bit-identical ([#1188](https://github.com/FeRx-NLME/ferx-core/issues/1188)).
 - **A non-finite modeled infusion duration `D{n}` / rate `R{n}` is no longer served as an instantaneous bolus.** `NaN` and `±Inf` were handed to the domain floor that exists for a transient `D ≤ 0`, and neither survived: `NaN` took the floor (every `>` comparison is false for `NaN`), and `+Inf` gave `rate = AMT/Inf = 0`, which the engine does not read as an infusion at all. Either way the dose was delivered instantaneously and the fit returned finite, silently wrong numbers — measured **2.03× high** at one elimination half-time on a 1-cpt model, with no diagnostic from `fit()`, `ferx check` or `predict()`. A non-finite value now repels the subject instead: its predictions come back `NaN`, which the estimator reads as a diverged solve and the optimizer as a wall, matching what every other non-finite dose attribute (`ALAG`, `F`) already did. A value that is non-finite at typical values is still rejected up front as `E_DOSE_ATTR_NONFINITE`; this covers the mid-fit θ/η excursion that no fit-init check can see. Fits whose `D{n}`/`R{n}` stays finite are bit-identical, and a transient *finite* `D ≤ 0` / `R ≤ 0` is still clamped exactly as before ([#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284)).
 - **A non-finite dose arrival on the analytical superposition engine no longer predicts a drug-free `0.0`.** Both superposition walks — `predict_concentration` and the compartment-state twin behind `[derived]` and the state output columns — compare each dose's arrival against the time being evaluated, and every comparison against `NaN` is false, so the dose was skipped and the remaining (empty) trajectory returned as a valid prediction. Both now return `NaN`, which is what the ODE engines have done since [#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189), and they share one predicate so a subject can no longer be repelled on the prediction path while still reporting a finite compartment amount. Reachable from a `NaN` `lagtime` as well as from a modeled `D{n}`/`R{n}` ([#1284](https://github.com/FeRx-NLME/ferx-core/issues/1284)).
