@@ -5,7 +5,9 @@
 # inliner cannot resolve (assigned conditionally or later), so unlike
 # `covmuref_power_saem_fit.ferx` this model has *no* covariate mu-reference
 # group: TVCL keeps its single-anchor mu-reference and TH_WT carries no ETA and
-# rides the eta-frozen numerical M-step. That is the shape #1415 reports on
+# rides the eta-frozen numerical M-step. (#1422 tracks inlining an if/else-
+# assigned local; when that lands, this fixture needs a shape that still
+# defeats detection — the test asserts `covariate_mu_refs.is_empty()`.) That is the shape #1415 reports on
 # real models (a CrCL exponent written through an `if`/`else` CRCL, an
 # allometric or maturation exponent, an inter-compartmental clearance) — and
 # the NONMEM SAEM anchor is the same MLE as the grouped model's:
