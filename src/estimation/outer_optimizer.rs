@@ -2165,7 +2165,10 @@ fn optimize_nlopt(
 ///   *success* state, not a `Failure`) are all untouched — and the restart runs
 ///   on what the stalled leg left of the budget ([`RestartLeg::spent_evals`]),
 ///   so it never hands a fit a second one (#1428; the first version did, and
-///   said here that it could not);
+///   said here that it could not). The two legs together are bounded by
+///   `outer_maxiter` the way any single run is — `maxeval` is a soft bound for
+///   L-BFGS, checked between line searches, so a few evals of overshoot are
+///   possible on either leg;
 /// - the restart is adopted only on a **strictly lower** penalized objective.
 ///   Unlike the `left_init` retry above there is no second condition to check:
 ///   this attempt starts *at* the reported point, so anywhere it ends is
@@ -3380,6 +3383,13 @@ fn optimize_nlopt_once(
     // `converged` for an entirely different reason — see
     // [`worth_restarting_mid_descent`], which is handed this and the objective.
     let stalled_mid_descent = stationarity_check_pending && !converged;
+    // Whether any of the fit's budget is left for a restart to run on (#1428).
+    // `n_evals_outer` counts objective calls, the same thing NLopt's `maxeval`
+    // counts — but `maxeval` is a *soft* bound for L-BFGS: `luksan/plis.c` checks
+    // it only between line searches, so a line search that fails after crossing
+    // it comes back as a bare `Failure`, not `MaxEvalReached`, and the count can
+    // sit a few evals past the budget here.
+    let budget_left = spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize;
 
     // A cold re-solve that does not reproduce the reported objective — whether it lands
     // materially above it or returns no usable number at all — says the EBEs at these
@@ -3431,6 +3441,18 @@ fn optimize_nlopt_once(
     }
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
+    }
+    // A stall with no budget left is not restarted (see
+    // `worth_restarting_mid_descent`), and the reason the user can act on is the
+    // budget, not the stall — a line search that fails after crossing `maxeval`
+    // is a bare `Failure`, so the `max_eval_reached` branch above never saw it.
+    // Same advice as that branch, not pushed twice.
+    if stalled_mid_descent && !budget_left && !max_eval_reached {
+        warnings.push(format!(
+            "Outer optimization stopped mid-descent with its evaluation budget (maxiter = {}) \
+             spent, so it was not restarted; increase maxiter for a tighter fit.",
+            options.outer_maxiter,
+        ));
     }
 
     // The gradient to report, and where it came from (#997 §1). A gradient-based
@@ -3510,7 +3532,7 @@ fn optimize_nlopt_once(
             mid_descent_stall: worth_restarting_mid_descent(
                 stalled_mid_descent,
                 final_ofv,
-                spent_evals + n_evals_outer.load(Ordering::Relaxed) < full_budget as usize,
+                budget_left,
             ),
         },
     )
@@ -3534,8 +3556,9 @@ fn optimize_nlopt_once(
 /// unspent (#1428). The restart continues the fit on that remainder, so a run
 /// that died on its last permitted evaluation has nothing to continue with —
 /// and `set_maxeval(0)` would hand NLopt an *unlimited* budget, not an empty
-/// one. Such a run is reported as it stands, with the "increase maxiter" advice
-/// the budget warning already gives.
+/// one. Such a run is reported as it stands, with an "increase maxiter" warning
+/// of its own: the ordinary budget warning is keyed on `MaxEvalReached`, which a
+/// line search that fails after crossing `maxeval` never returns.
 fn worth_restarting_mid_descent(
     stalled_mid_descent: bool,
     final_ofv: f64,

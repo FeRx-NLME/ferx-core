@@ -543,10 +543,12 @@ also produce, and the strictly-lower rule makes a pointless restart cost one opt
 and change nothing.
 
 Three cases are deliberately left alone. A run that spent its `maxiter` budget stops with
-NLopt's `MaxEvalReached`, not a `Failure`, and a run that stalls on its last permitted
-evaluation is not restarted either: the restart runs on the *remaining* budget, so the two
-legs together never exceed the `maxiter` you set — raise it instead
-([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)). A **cancelled** run is not
+NLopt's `MaxEvalReached`, not a `Failure`, and a run that stalls with its budget already
+spent is not restarted either: the restart runs on the *remaining* budget, so the two legs
+together are bounded by the `maxiter` you set the way a single run is (NLopt checks the
+bound between line searches, so a few evaluations of overshoot are possible either way),
+and a stall that cannot be restarted for lack of budget says so with its own "increase
+maxiter" warning ([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)). A **cancelled** run is not
 restarted. And a second stall is reported as a stall: you get `converged: false` and the
 `Outer optimization did not converge` warning, which is the honest signal and bounds the
 worst case at two optimizations.

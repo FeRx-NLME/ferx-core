@@ -3377,14 +3377,22 @@ mod regularizer_fit_tests {
              from (reported {:.3}, abort 7901.99 / 3209.81, measured restarted −540.59)",
             fit.ofv
         );
-        // Both legs together stay inside `maxiter`: 12 spent by the stalled leg
-        // plus at most 32 by the restart. #1414 as merged spent 56 here.
+        // Both legs together are bounded by `maxiter` the way a single run is:
+        // 12 spent by the stalled leg plus a restart on the remaining 32
+        // (measured: exactly 44). NLopt's `maxeval` is a *soft* bound for L-BFGS
+        // — `luksan/plis.c` checks it between line searches, so a leg can
+        // overshoot by up to one line search (≤ ~20 evals) — and the macOS
+        // trajectory is unmeasured, so the bound is set against the pre-fix
+        // number rather than at the budget: #1414 as merged spent 12 + a fresh
+        // 44 = 56 here, and a fresh-budget restart cannot come in under it.
         let n = crate::estimation::parameterization::pack_params(&model.default_params).len();
         let budget = o.outer_maxiter * (n + 1);
+        let fresh_budget_total = 12 + budget;
         assert!(
-            fit.n_iterations <= budget,
+            fit.n_iterations < fresh_budget_total,
             "the restart must run on the remaining budget, not a fresh one: {} evaluations \
-             against a maxiter budget of {budget}",
+             against a maxiter budget of {budget} (a fresh-budget restart spends \
+             {fresh_budget_total})",
             fit.n_iterations
         );
     }
