@@ -650,6 +650,9 @@ pub fn run_bayes(
             let mut rng =
                 StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
             let mut scratch = EventPkParams::default();
+            // The block MH kernel owns its own buffers (`MhScratch`), which
+            // carry the η-independent NLL inputs alongside the `EventPkParams`.
+            let mut mh_scratch = crate::estimation::saem::MhScratch::default();
             let mut eta_sum: Vec<DVector<f64>> =
                 (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
             let mut eta_record_count = 0u64;
@@ -835,6 +838,12 @@ pub fn run_bayes(
                         } else {
                             let kappas_opt =
                                 omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
+                            mh_scratch.begin_subject(
+                                model,
+                                &population.subjects[i],
+                                &theta,
+                                n_eta,
+                            );
                             mh_steps(
                                 &mut etas[i],
                                 nll[i],
@@ -847,7 +856,7 @@ pub fn run_bayes(
                                 None,
                                 &mut rng,
                                 n_eta_mh,
-                                &mut scratch,
+                                &mut mh_scratch,
                                 kappas_opt,
                             )
                         };

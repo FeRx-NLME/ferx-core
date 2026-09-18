@@ -26,7 +26,6 @@
 use crate::estimation::saem::{
     mh_kappa_steps, mh_steps, mh_steps_componentwise, SAEM_OMEGA_DIAG_FLOOR,
 };
-use crate::pk::EventPkParams;
 use crate::stats::likelihood::{individual_nll, individual_nll_iov};
 use crate::types::*;
 use nalgebra::DVector;
@@ -112,8 +111,11 @@ pub fn run_conditional_distribution(
         .subjects
         .par_iter()
         .enumerate()
-        .map_init(EventPkParams::default, |pk_scratch, (i, subject)| {
+        .map_init(crate::estimation::saem::MhScratch::default, |mh_scratch, (i, subject)| {
             let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(i as u64));
+            // Same per-subject hoist as the SAEM E-step: the η-independent NLL
+            // inputs and the proposal buffers are rebuilt here, not per proposal.
+            mh_scratch.begin_subject(model, subject, theta, n_eta);
 
             // Warm-start the chain at the EBE mode.
             let mut eta: Vec<f64> = warm_etas[i].iter().copied().collect();
@@ -188,7 +190,7 @@ pub fn run_conditional_distribution(
                     None,
                     &mut rng,
                     n_mh_steps,
-                    pk_scratch,
+                    mh_scratch,
                     omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
                 );
                 nll = nll_b;
@@ -211,7 +213,7 @@ pub fn run_conditional_distribution(
                         &cw_sd,
                         &mut rng,
                         n_cw_sweeps,
-                        pk_scratch,
+                        mh_scratch,
                         omega_iov_opt.map(|iov| (kappas.as_slice(), iov)),
                     );
                     nll = nll_c;

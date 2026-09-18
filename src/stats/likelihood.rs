@@ -514,6 +514,119 @@ pub fn individual_nll_into_with_schedule(
     )
 }
 
+/// Caller-owned buffers for repeated [`individual_nll`] evaluations of one
+/// subject — the SAEM MH loop's counterpart to [`pk::EventPkParams`].
+///
+/// What it hoists is what [`individual_nll_into_with_schedule`] allocates on
+/// **every** call: the prediction vector (that wrapper hands
+/// `compute_predictions_with_tv_recycle_with_schedule` a fresh `Vec::new()`, so
+/// on the SAEM path nothing was ever actually recycled), and the two
+/// `DVector`s of the η-prior quadratic form. Three heap allocations per MH
+/// proposal, ~39 proposals per subject per SAEM iteration.
+///
+/// Purely buffers: every field is fully overwritten before it is read, so a
+/// reused scratch scores bit-identically to a fresh one. `pk` is public because
+/// the callers that still need a bare [`pk::EventPkParams`] (the mixture class
+/// draw, the IOV NLL) borrow it directly rather than keeping a second buffer.
+#[derive(Default)]
+pub(crate) struct IndividualNllScratch {
+    pub pk: pk::EventPkParams,
+    preds: Vec<f64>,
+    eta_work: DVector<f64>,
+    prior_work: DVector<f64>,
+}
+
+impl IndividualNllScratch {
+    /// Size the η-prior work vectors. A no-op once they match, so this is free
+    /// on every call after the first (`n_eta` is fixed for a whole fit).
+    fn ensure_eta(&mut self, n_eta: usize) {
+        if self.eta_work.len() != n_eta {
+            self.eta_work = DVector::zeros(n_eta);
+            self.prior_work = DVector::zeros(n_eta);
+        }
+    }
+}
+
+/// The η-independent inputs of one subject's individual NLL: the per-observation
+/// residual dispatch keys and the `#484` residual-magnitude multipliers.
+///
+/// Neither depends on η — `obs_keys` reads the CMT column or a covariate
+/// selector, `ruv_obs_mult` reads (θ, covariates, TIME) — so an MH sweep, which
+/// holds θ and σ fixed and varies only η, can build them once per subject
+/// instead of once per proposal. For an `ErrorSpec::Single`/`PerCmt` model
+/// `obs_keys` borrows and `ruv_obs_mult` returns `None` immediately, so this
+/// costs one `Vec<usize>` copy per subject per iteration; for a `Selected`
+/// error model (a `[error_model]` with an `if`) it takes a per-observation
+/// closure evaluation off the proposal loop entirely.
+pub(crate) struct IndividualNllPrep {
+    err_keys: Vec<usize>,
+    ruv_mult: Option<Vec<Vec<f64>>>,
+}
+
+impl IndividualNllPrep {
+    /// Point an existing (possibly empty) prep at a subject, reusing the key
+    /// buffer's allocation. There is deliberately no `new`: every caller holds a
+    /// long-lived scratch and refreshes it per subject.
+    pub(crate) fn refresh(&mut self, model: &CompiledModel, subject: &Subject, theta: &[f64]) {
+        self.err_keys.clear();
+        self.err_keys
+            .extend_from_slice(model.error_spec.obs_keys(subject).as_ref());
+        self.ruv_mult = model.ruv_obs_mult(subject, theta);
+    }
+}
+
+impl Default for IndividualNllPrep {
+    fn default() -> Self {
+        Self {
+            err_keys: Vec::new(),
+            ruv_mult: None,
+        }
+    }
+}
+
+/// Scratch-reusing, bit-identical form of [`individual_nll_into`].
+///
+/// Same arithmetic in the same order — it differs from the wrapper only in
+/// where the buffers come from (`prep`/`scratch` rather than four fresh
+/// allocations) — so a fit that switches to it reproduces the previous trace
+/// exactly. `residual_correlations` is `model.residual_correlations` for the
+/// same reason [`individual_nll_into`] uses it: every caller of this form holds
+/// ρ at its declaration.
+pub(crate) fn individual_nll_prepared(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    prep: &IndividualNllPrep,
+    scratch: &mut IndividualNllScratch,
+) -> f64 {
+    scratch.ensure_eta(eta.len());
+    let IndividualNllScratch {
+        pk,
+        preds,
+        eta_work,
+        prior_work,
+    } = scratch;
+    individual_nll_into_prepared_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        &model.residual_correlations,
+        pk,
+        None,
+        &prep.err_keys,
+        prep.ruv_mult.as_deref(),
+        preds,
+        eta_work,
+        prior_work,
+    )
+}
+
 /// Inner-loop form of [`individual_nll_into_with_schedule`] with subject-static
 /// residual dispatch and magnitude inputs prepared by the caller, plus a
 /// caller-owned prediction vector reused across objective evaluations.

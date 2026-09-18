@@ -15,8 +15,9 @@ use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov, iov_occasion_groups,
-    obs_nll_subject_into,
+    individual_nll, individual_nll_into, individual_nll_iov, individual_nll_iov_with_scratch,
+    individual_nll_prepared, iov_occasion_groups, obs_nll_subject_into, IndividualNllPrep,
+    IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -604,6 +605,71 @@ fn update_scalar_residual_sse(statistic: &mut Option<f64>, sample_sse: f64, gamm
 // Metropolis-Hastings step for one subject
 // ---------------------------------------------------------------------------
 
+/// Every buffer one subject's MH sweep needs, owned by the rayon worker rather
+/// than rebuilt per proposal.
+///
+/// The E-step evaluates the subject NLL ~39 times per subject per iteration
+/// (`n_mh_steps` block proposals + `n_cw_sweeps · n_eta` componentwise ones),
+/// and before this struct each of those allocated seven `Vec`/`DVector`s that
+/// were dropped microseconds later: four here (`z`, the `DVector` copy of it,
+/// the `chol(Ω)·z` product and `eta_prop`) and three inside
+/// [`individual_nll_into_with_schedule`](crate::stats::likelihood). On a bench
+/// like cefepime — 458 subjects, a **single** observation for the median
+/// subject — that allocator traffic is a real share of the sweep, not a
+/// rounding error, because there is so little arithmetic per evaluation to
+/// hide it behind.
+///
+/// `prep` is the η-independent half of the NLL's inputs, refreshed once per
+/// subject by [`MhScratch::begin_subject`]. Everything else is pure capacity:
+/// each field is fully overwritten before it is read, so a reused scratch and a
+/// fresh one score bit-identically.
+pub(crate) struct MhScratch {
+    nll: IndividualNllScratch,
+    prep: IndividualNllPrep,
+    z: DVector<f64>,
+    perturbation: DVector<f64>,
+    eta_prop: Vec<f64>,
+}
+
+impl Default for MhScratch {
+    fn default() -> Self {
+        Self {
+            nll: IndividualNllScratch::default(),
+            prep: IndividualNllPrep::default(),
+            z: DVector::zeros(0),
+            perturbation: DVector::zeros(0),
+            eta_prop: Vec::new(),
+        }
+    }
+}
+
+impl MhScratch {
+    /// Point the scratch at a new subject: rebuild the η-independent NLL inputs
+    /// and size the proposal buffers. Called once per subject per SAEM
+    /// iteration, never inside the proposal loop.
+    pub(crate) fn begin_subject(
+        &mut self,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        n_eta: usize,
+    ) {
+        self.prep.refresh(model, subject, theta);
+        if self.z.len() != n_eta {
+            self.z = DVector::zeros(n_eta);
+            self.perturbation = DVector::zeros(n_eta);
+        }
+        self.eta_prop.clear();
+        self.eta_prop.resize(n_eta, 0.0);
+    }
+
+    /// The per-event PK snapshot buffer, for the callers that still take a bare
+    /// [`EventPkParams`] (the mixture class draw, the IOV NLL).
+    pub(crate) fn pk(&mut self) -> &mut EventPkParams {
+        &mut self.nll.pk
+    }
+}
+
 /// Run `n_steps` symmetric random-walk MH iterations for one subject in-place.
 /// Returns (n_accepted, updated_nll).
 ///
@@ -637,7 +703,9 @@ pub(crate) fn mh_steps(
     eta_block_scale: Option<&[f64]>,
     rng: &mut impl Rng,
     n_steps: usize,
-    pk_scratch: &mut EventPkParams,
+    // Caller-owned buffers, already pointed at this subject by
+    // [`MhScratch::begin_subject`].
+    scratch: &mut MhScratch,
     // When Some, eta proposals are evaluated with IOV-aware NLL (kappas held fixed).
     // This is required for Gibbs correctness in IOV models: the acceptance ratio
     // must target p(η | κ, θ, data), which includes the per-occasion kappa terms.
@@ -647,44 +715,59 @@ pub(crate) fn mh_steps(
     let l = &omega.chol;
     let mut nll = nll_current;
     let mut n_accepted = 0;
+    // Split borrow: `perturbation.gemm(.., z, ..)` needs two fields of the
+    // scratch at once, and `individual_nll_prepared` needs two more.
+    let MhScratch {
+        nll: nll_scratch,
+        prep,
+        z,
+        perturbation,
+        eta_prop,
+    } = scratch;
 
     for _ in 0..n_steps {
-        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
-        let z_vec = DVector::from_column_slice(&z);
-        let perturbation = l * z_vec;
+        for slot in z.iter_mut() {
+            *slot = rng.sample(StandardNormal);
+        }
+        // `l * z` with the result written into a buffer we already own.
+        // `Mul` would allocate an output and reach the same `gemm_uninit`
+        // kernel; this reaches it through `Matrix::gemm` with `beta = 0`, which
+        // never reads `perturbation`'s previous contents.
+        perturbation.gemm(1.0, l, &*z, 0.0);
 
-        let eta_prop: Vec<f64> = (0..n_eta)
-            .map(|j| {
-                let bs = eta_block_scale.map_or(1.0, |s| s[j]);
-                eta[j] + step_scale * bs * perturbation[j]
-            })
-            .collect();
+        for j in 0..n_eta {
+            let bs = eta_block_scale.map_or(1.0, |s| s[j]);
+            eta_prop[j] = eta[j] + step_scale * bs * perturbation[j];
+        }
 
-        // For non-IOV models: reuse pk_scratch to avoid per-call allocation
-        // (dominant allocator pressure on the SAEM hot loop for TV-cov subjects).
-        // For IOV models: individual_nll_iov allocates its own scratch; correctness
-        // of the Gibbs conditional p(η | κ, θ, data) requires the per-occasion
-        // [eta_prop, kappa_k] predictions, which individual_nll_into does not compute.
+        // Both arms reuse the caller's buffers. For IOV models correctness of
+        // the Gibbs conditional p(η | κ, θ, data) requires the per-occasion
+        // [eta_prop, kappa_k] predictions, which `individual_nll_prepared` does
+        // not compute — hence the separate entry point, which since #1423-era
+        // profiling takes the scratch rather than allocating an `EventPkParams`
+        // per proposal.
         let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
-            individual_nll_iov(
+            individual_nll_iov_with_scratch(
                 model,
                 subject,
                 theta,
-                &eta_prop,
+                eta_prop,
                 kappas,
                 omega,
                 Some(omega_iov),
                 sigma_values,
+                &mut nll_scratch.pk,
             )
         } else {
-            individual_nll_into(
+            individual_nll_prepared(
                 model,
                 subject,
                 theta,
-                &eta_prop,
+                eta_prop,
                 omega,
                 sigma_values,
-                pk_scratch,
+                prep,
+                nll_scratch,
             )
         };
 
@@ -693,7 +776,7 @@ pub(crate) fn mh_steps(
         // the full acceptance criterion.
         let log_u: f64 = rng.random::<f64>().ln();
         if log_u < nll - nll_prop {
-            eta.copy_from_slice(&eta_prop);
+            eta.copy_from_slice(eta_prop);
             nll = nll_prop;
             n_accepted += 1;
         }
@@ -742,12 +825,20 @@ pub(crate) fn mh_steps_componentwise(
     cw_sd: &[f64],
     rng: &mut impl Rng,
     n_sweeps: usize,
-    pk_scratch: &mut EventPkParams,
+    // Caller-owned buffers, already pointed at this subject by
+    // [`MhScratch::begin_subject`]. The sweep proposes in place on `eta`, so it
+    // uses only the NLL half of the scratch.
+    scratch: &mut MhScratch,
     kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (Vec<usize>, usize, f64) {
     let n_eta = eta.len();
     let mut nll = nll_current;
     let mut per_eta_accepted = vec![0usize; n_eta];
+    let MhScratch {
+        nll: nll_scratch,
+        prep,
+        ..
+    } = scratch;
 
     for _ in 0..n_sweeps {
         for j in 0..n_eta {
@@ -756,7 +847,7 @@ pub(crate) fn mh_steps_componentwise(
             eta[j] = old_j + step_scales[j] * cw_sd[j] * z;
 
             let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
-                individual_nll_iov(
+                individual_nll_iov_with_scratch(
                     model,
                     subject,
                     theta,
@@ -765,9 +856,19 @@ pub(crate) fn mh_steps_componentwise(
                     omega,
                     Some(omega_iov),
                     sigma_values,
+                    &mut nll_scratch.pk,
                 )
             } else {
-                individual_nll_into(model, subject, theta, eta, omega, sigma_values, pk_scratch)
+                individual_nll_prepared(
+                    model,
+                    subject,
+                    theta,
+                    eta,
+                    omega,
+                    sigma_values,
+                    prep,
+                    nll_scratch,
+                )
             };
 
             // Symmetric scalar proposal cancels, same as the block kernel.
@@ -3106,9 +3207,14 @@ pub fn run_saem(
                 // iter (5937 × N_iter on the cefepime SAEM bench);
                 // with it, n_workers × N_iter ≈ 10 × N_iter.
                 .map_init(
-                    EventPkParams::default,
-                    |pk_scratch, (i, ((((eta, &nll), &scale), cw_sc_i), kappas_i))| {
+                    MhScratch::default,
+                    |mh_scratch, (i, ((((eta, &nll), &scale), cw_sc_i), kappas_i))| {
                         let subject = &population.subjects[i];
+                        // Point the worker's buffers at this subject and rebuild
+                        // the η-independent half of the NLL's inputs (residual
+                        // dispatch keys, `#484` magnitude multipliers) — once per
+                        // subject, not once per proposal.
+                        mh_scratch.begin_subject(model, subject, theta_ref, n_eta);
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
                                 .wrapping_add(k as u64 * 100_000)
@@ -3134,7 +3240,7 @@ pub fn run_saem(
                                 kappas_i,
                                 mix,
                                 omega_iov_for_eta_mh,
-                                pk_scratch,
+                                mh_scratch.pk(),
                                 &mut rng,
                             )
                         } else {
@@ -3206,7 +3312,7 @@ pub fn run_saem(
                                 blk_eta_scale_ref,
                                 &mut rng,
                                 n_mh_steps,
-                                pk_scratch,
+                                mh_scratch,
                                 kappas_mh_opt,
                             );
                             nll_cur = nll_new;
@@ -3227,7 +3333,7 @@ pub fn run_saem(
                             cw_sd_ref,
                             &mut rng,
                             n_cw_sweeps,
-                            pk_scratch,
+                            mh_scratch,
                             kappas_mh_opt,
                         );
 
@@ -6893,7 +6999,8 @@ DV ~ additive(EPS)
         let nll_start = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut pk_scratch = EventPkParams::with_capacity_for(&subj);
+        let mut pk_scratch = MhScratch::default();
+        pk_scratch.begin_subject(&model, &subj, &theta, eta.len());
         mh_steps(
             &mut eta,
             nll_start,
@@ -7776,7 +7883,8 @@ DV ~ additive(EPS)
             let mut eta = vec![0.2_f64, -0.1];
             let nll0 = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
             let mut rng = StdRng::seed_from_u64(7);
-            let mut scratch = EventPkParams::with_capacity_for(&subj);
+            let mut scratch = MhScratch::default();
+            scratch.begin_subject(&model, &subj, &theta, eta.len());
             let (acc, nll) = mh_steps(
                 &mut eta,
                 nll0,
@@ -7827,7 +7935,8 @@ DV ~ additive(EPS)
         let mut eta = eta0.clone();
         let nll0 = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma.values);
         let mut rng = StdRng::seed_from_u64(11);
-        let mut scratch = EventPkParams::with_capacity_for(&subj);
+        let mut scratch = MhScratch::default();
+        scratch.begin_subject(&model, &subj, &theta, eta.len());
         mh_steps(
             &mut eta,
             nll0,
