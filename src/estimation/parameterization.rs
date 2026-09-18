@@ -905,47 +905,28 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
-/// Packed-length mask marking each Ω / Ω_IOV Cholesky **diagonal** coordinate
-/// whose eta is declared inside a `block_omega` / `block_kappa` — one with at
-/// least one structurally free off-diagonal (#1394).
+/// Packed-length mask over the Ω / Ω_IOV Cholesky **diagonals**, answering
+/// `per_eta` for the eta each one belongs to. Everything else is `false`:
+/// off-diagonal coordinates, θ, Σ, the mixture Ω overrides (which the parser
+/// only permits over a diagonal base Ω) and the `block_sigma` ρ slots.
 ///
-/// [`omega_structural_zero_mask`]'s question asked per *eta* instead of per
-/// entry, and the point is that it is a **per-coordinate** property where
-/// `OmegaMatrix::diagonal` is a property of the whole matrix. A model mixing one
-/// `block_omega (ETA_CL, ETA_V)` with a diagonal `omega ETA_KA` packs Ω as a full
-/// Cholesky, so `!diagonal` holds for every coordinate while only two of the
-/// three etas are in a block — and a diagnostic keyed on the matrix flag then
-/// tells the user to lower the covariances of an eta that has none.
-///
-/// Everything else is `false`: off-diagonal coordinates, θ, Σ, the mixture Ω
-/// overrides (which the parser only permits over a diagonal base Ω) and the
-/// `block_sigma` ρ slots.
-///
-/// A one-eta `block_omega (ETA_CL)` has no off-diagonal and so reads as
-/// diagonal. That is the right answer rather than a gap: with no off-diagonals
-/// `L_ii²` *is* the declared variance, which is exactly the property the
-/// diagonal side of every such distinction rests on.
-pub(crate) fn omega_block_member_mask(template: &ModelParameters) -> Vec<bool> {
+/// The walk is the same column-major lower triangle as [`pack_params`] and
+/// [`omega_structural_zero_mask`], so the position arithmetic is derived once.
+/// `lower_tri_iter` yields only `(i,i)` when the matrix is diagonal, which is
+/// the right offsets — a diagonal Ω packs `n` coordinates, not `n(n+1)/2` —
+/// so there is no second `if om.diagonal` guard for the first to hide behind.
+fn omega_diagonal_mask(
+    template: &ModelParameters,
+    per_eta: impl Fn(&OmegaMatrix, usize) -> bool,
+) -> Vec<bool> {
     let segs = packed_segments(template);
     let mut mask = vec![false; segs.total()];
 
-    // Same column-major lower-triangle walk as `pack_params` /
-    // `omega_structural_zero_mask`, so the position arithmetic is shared rather
-    // than re-derived.
-    //
-    // `lower_tri_iter` yields only `(i,i)` when the matrix is diagonal, which is
-    // both the right offsets (a diagonal Ω packs `n` coordinates, not
-    // `n(n+1)/2`) and the right answer: a diagonal Ω has no off-diagonal
-    // coordinate for any eta to share, and both `OmegaMatrix` constructors leave
-    // its `free_mask` off-diagonals false. That is why there is no second
-    // `if om.diagonal` guard here — two conditions rejecting the same inputs
-    // cover for each other, and neither can then be shown to fail.
     let mark = |mask: &mut [bool], om: &OmegaMatrix, start: usize| {
-        let n = om.dim();
         let mut p = start;
-        for (i, j) in lower_tri_iter(n, om.diagonal) {
+        for (i, j) in lower_tri_iter(om.dim(), om.diagonal) {
             if i == j {
-                mask[p] = (0..n).any(|k| k != i && om.free_mask[(i, k)]);
+                mask[p] = per_eta(om, i);
             }
             p += 1;
         }
@@ -958,6 +939,46 @@ pub(crate) fn omega_block_member_mask(template: &ModelParameters) -> Vec<bool> {
     }
 
     mask
+}
+
+/// Packed-length mask marking each Ω / Ω_IOV Cholesky **diagonal** whose eta is
+/// **correlated with another** — one with at least one structurally free
+/// off-diagonal (#1394).
+///
+/// [`omega_structural_zero_mask`]'s question asked per *eta* instead of per
+/// entry, and the point is that it is a **per-coordinate** property where
+/// `OmegaMatrix::diagonal` is a property of the whole matrix. A model mixing one
+/// `block_omega (ETA_CL, ETA_V)` with a diagonal `omega ETA_KA` packs Ω as a full
+/// Cholesky, so `!diagonal` holds for every coordinate while only two of the
+/// three etas have any covariance — and a diagnostic keyed on the matrix flag
+/// tells the third to lower covariances it does not have.
+///
+/// This answers "**is it the correlations** that drive `L_ii` to zero?", which
+/// is what selects the near-singular-block explanation. It is deliberately
+/// *not* the same question as how the eta was declared: a one-eta
+/// `block_omega (ETA_CL)` is a block declaration with no correlations at all,
+/// where `L_ii²` is exactly the declared variance and the correlation story
+/// would be false. For the spelling, see [`omega_block_declared_mask`].
+pub(crate) fn omega_correlated_diagonal_mask(template: &ModelParameters) -> Vec<bool> {
+    omega_diagonal_mask(template, |om, i| {
+        (0..om.dim()).any(|k| k != i && om.free_mask[(i, k)])
+    })
+}
+
+/// Packed-length mask marking each Ω / Ω_IOV Cholesky **diagonal** whose eta was
+/// **declared inside** a `block_omega` / `block_kappa` line, one-eta blocks
+/// included (#1394).
+///
+/// Pure provenance, read from [`OmegaMatrix::block_declared`], and the only
+/// thing that can name a declaration the way the user spelled it. It says
+/// nothing about whether the eta has covariances — see
+/// [`omega_correlated_diagonal_mask`] for that. The two agree on every block of
+/// two or more etas and come apart only on a singleton, which is exactly the
+/// case where quoting one to answer the other goes wrong.
+pub(crate) fn omega_block_declared_mask(template: &ModelParameters) -> Vec<bool> {
+    omega_diagonal_mask(template, |om, i| {
+        om.block_declared.get(i).copied().unwrap_or(false)
+    })
 }
 
 /// What kind of quantity a packed coordinate holds, in [`pack_params`] order.
@@ -3269,9 +3290,9 @@ mod tests {
     /// `false` for the whole matrix, so a per-*matrix* answer calls all three
     /// etas block members; only ETA_CL and ETA_V are.
     #[test]
-    fn test_omega_block_member_mask_block_plus_diagonal() {
+    fn test_omega_correlated_diagonal_mask_block_plus_diagonal() {
         let template = block_plus_diag_template();
-        let mask = omega_block_member_mask(&template);
+        let mask = omega_correlated_diagonal_mask(&template);
         // 2 theta + 6 Ω + 1 sigma = 9.
         assert_eq!(mask.len(), packed_len(&template));
         // Ω packed offsets from 2: (0,0)=2 (1,0)=3 (2,0)=4 (1,1)=5 (2,1)=6 (2,2)=7.
@@ -3295,9 +3316,9 @@ mod tests {
     /// mask cannot be satisfied by an implementation that just returns `true`
     /// on every diagonal coordinate.
     #[test]
-    fn test_omega_block_member_mask_diagonal_is_all_false() {
+    fn test_omega_correlated_diagonal_mask_diagonal_is_all_false() {
         let template = make_template();
-        let mask = omega_block_member_mask(&template);
+        let mask = omega_correlated_diagonal_mask(&template);
         assert_eq!(mask.len(), packed_len(&template));
         assert!(mask.iter().all(|&m| !m));
     }
@@ -3306,9 +3327,9 @@ mod tests {
     /// **off-diagonal** coordinate between them is not — it is a covariance, not
     /// a variance, and nothing keyed on this mask has a message for it.
     #[test]
-    fn test_omega_block_member_mask_full_block() {
+    fn test_omega_correlated_diagonal_mask_full_block() {
         let template = make_block_template();
-        let mask = omega_block_member_mask(&template);
+        let mask = omega_correlated_diagonal_mask(&template);
         // 2 theta + 3 Ω + 1 sigma = 6.
         assert_eq!(mask.len(), packed_len(&template));
         // Ω packed offsets from 2: (0,0)=2 (1,0)=3 (1,1)=4.
@@ -3323,13 +3344,57 @@ mod tests {
         }
     }
 
+    /// #1394 / PR #1424 review: the two masks answer different questions and a
+    /// **one-eta block** is where they come apart. ETA_CL is declared in a
+    /// `block_omega` but has no free off-diagonal, so it is block-*declared*
+    /// and not *correlated*. Collapsing them back into one bool fails here
+    /// whichever way round it is collapsed.
+    #[test]
+    fn test_one_eta_block_is_declared_but_not_correlated() {
+        // 2×2 Ω: a one-eta block on ETA_CL plus a standalone diagonal ETA_V.
+        // No off-diagonal is free, so the matrix is structurally diagonal —
+        // but it is *packed* as a block, exactly as the parser builds it.
+        let mut m = DMatrix::zeros(2, 2);
+        m[(0, 0)] = 0.09;
+        m[(1, 1)] = 0.04;
+        let mut fm = DMatrix::from_element(2, 2, false);
+        fm[(0, 0)] = true;
+        fm[(1, 1)] = true;
+        let omega =
+            OmegaMatrix::from_matrix_with_mask(m, vec!["ETA_CL".into(), "ETA_V".into()], false, fm)
+                .with_block_declared(vec![true, false]);
+
+        let template = ModelParameters {
+            omega,
+            omega_fixed: vec![false, false],
+            ..make_block_template()
+        };
+
+        // Ω packed offsets from 2: (0,0)=2 (1,0)=3 (1,1)=4.
+        let correlated = omega_correlated_diagonal_mask(&template);
+        let declared = omega_block_declared_mask(&template);
+
+        assert!(
+            !correlated[2],
+            "a one-eta block has no covariance, so the correlation story is false"
+        );
+        assert!(declared[2], "...but it was declared as a block");
+        // The standalone diagonal eta is neither.
+        assert!(
+            !correlated[4] && !declared[4],
+            "ETA_V is a plain omega line"
+        );
+        // The off-diagonal coordinate is not a variance under either question.
+        assert!(!correlated[3] && !declared[3]);
+    }
+
     /// Ω_IOV takes the same walk at its own offset: a `block_kappa` mixed with a
     /// standalone `kappa` splits the same way, and the BSV segment ahead of it
     /// must not be swept in.
     #[test]
-    fn test_omega_block_member_mask_block_iov() {
+    fn test_omega_correlated_diagonal_mask_block_iov() {
         let template = block_plus_diag_iov_template();
-        let mask = omega_block_member_mask(&template);
+        let mask = omega_correlated_diagonal_mask(&template);
         // 1 theta + 1 BSV Ω + 1 sigma + 6 Ω_IOV = 9.
         assert_eq!(mask.len(), packed_len(&template));
         // iov (0,0)=3 and (1,1)=6 are in the block; (2,2)=8 is the standalone

@@ -3874,14 +3874,23 @@ fn outer_search_runs(options: &FitOptions) -> bool {
 /// Which declaration a flagged variance coordinate came from — the keyword the
 /// user has to go and edit.
 enum VarianceDecl {
-    /// A `Ω` diagonal. `block: false` is `omega NAME ~ v`; `block: true` is a
-    /// `block_omega` diagonal, whose `L_ii` also carries the off-diagonals, so
-    /// no single declared variance describes it.
-    Omega { block: bool },
-    /// An `Ω_IOV` diagonal. `block: true` is a `block_kappa` (IOV Option B)
+    /// A `Ω` diagonal. `correlated: true` is a `block_omega` diagonal that
+    /// really has off-diagonals, so `L_ii` carries them and no single declared
+    /// variance describes it; `block_declared` is how the line is *spelled*.
+    /// The two differ only for a one-eta `block_omega (NAME) = [v]` — a block
+    /// declaration with no correlations — which is why they are separate fields
+    /// rather than one bool (#1394).
+    Omega {
+        correlated: bool,
+        block_declared: bool,
+    },
+    /// An `Ω_IOV` diagonal. `correlated: true` is a `block_kappa` (IOV Option B)
     /// diagonal — correlated exactly like a `block_omega`, and reported the same
-    /// way.
-    Kappa { block: bool },
+    /// way. Same split as [`VarianceDecl::Omega`].
+    Kappa {
+        correlated: bool,
+        block_declared: bool,
+    },
     /// A `[mixture]` per-class Ω override (#977): its 1-based class, and the
     /// **declared** base eta name. Not the packed coordinate's display name —
     /// `coordinate_names` reports `ETA_CL_MIX2` for this slot, which appears
@@ -3914,9 +3923,9 @@ impl VarianceDecl {
         }
     }
 
-    /// How the enclosing block is spelled in the model file, for the arm that
-    /// reports a near-singular block. `None` for anything that is not a block
-    /// diagonal.
+    /// The `block_omega` / `block_kappa` keyword, for a declaration spelled as a
+    /// block. `None` for a diagonal `omega` / `kappa` line and for a mixture
+    /// override.
     ///
     /// Ω_IOV's block spelling is `block_kappa`, not `block_omega`: both take
     /// the same message arm — the cause and the remedy are identical — but
@@ -3925,27 +3934,73 @@ impl VarianceDecl {
     /// assert the keyword each way round.
     fn block_keyword(&self) -> Option<&'static str> {
         match self {
-            VarianceDecl::Omega { block: true } => Some("block_omega"),
-            VarianceDecl::Kappa { block: true } => Some("block_kappa"),
+            VarianceDecl::Omega {
+                block_declared: true,
+                ..
+            } => Some("block_omega"),
+            VarianceDecl::Kappa {
+                block_declared: true,
+                ..
+            } => Some("block_kappa"),
+            _ => None,
+        }
+    }
+
+    /// The keyword for the arm that reports a **near-singular block** — i.e.
+    /// only when the eta actually has off-diagonals for the story to be about.
+    ///
+    /// Not the same predicate as [`Self::block_keyword`], and the difference is
+    /// the whole of the one-eta case: `block_omega (ETA_CL) = [0.0]` is spelled
+    /// as a block but is not correlated with anything, so "it is the
+    /// correlations that do this" would be a false explanation and "lower the
+    /// covariances involving ETA_CL" an unfollowable repair. It gets the
+    /// declared-zero arm, in its own block spelling (#1394).
+    /// Deliberately **not** routed through [`Self::block_keyword`]: an
+    /// `OmegaMatrix` rebuilt from a bare matrix (`from_matrix`, and so the
+    /// ferx-r entry points) records no provenance, but its off-diagonals are
+    /// inferred and real. Keying this arm on provenance would drop the
+    /// near-singular-block message for exactly those callers and quote a
+    /// diagonal `omega NAME ~ 0.0` at a correlated eta. Correlation is a
+    /// property of the matrix and is always knowable; the spelling is not.
+    fn correlated_block_keyword(&self) -> Option<&'static str> {
+        match self {
+            VarianceDecl::Omega {
+                correlated: true, ..
+            } => Some("block_omega"),
+            VarianceDecl::Kappa {
+                correlated: true, ..
+            } => Some("block_kappa"),
             _ => None,
         }
     }
 }
 
 impl VarianceDecl {
-    /// The declaration as written in the model file, e.g. `omega ETA_CL`,
-    /// `kappa KAPPA_CL`, `omega(2) ETA_CL`. `coord_name` is the packed
-    /// coordinate's display name, used for every declaration whose slot and
-    /// declaration share a name.
-    fn declaration(&self, coord_name: &str) -> String {
+    /// The **zero declaration** as it would be written in the model file, value
+    /// included: `omega ETA_CL ~ 0.0`, `kappa KAPPA_CL ~ 0.0`,
+    /// `omega(2) ETA_CL ~ 0.0`, or `block_omega (ETA_CL) = [0.0]`.
+    ///
+    /// The value is part of the string because the two spellings do not share a
+    /// shape: a diagonal line takes `~ v` and a block takes `= [lower triangle]`,
+    /// so a keyword-only prefix cannot be completed by the caller. Both put
+    /// `FIX` last, which is what lets [`fix_suggestion`] append it to either.
+    ///
+    /// `coord_name` is the packed coordinate's display name, used for every
+    /// declaration whose slot and declaration share a name.
+    fn zero_declaration(&self, coord_name: &str) -> String {
         match self {
-            VarianceDecl::MixtureOmega { class, eta } => format!("omega({class}) {eta}"),
-            _ => format!("{} {coord_name}", self.keyword()),
+            VarianceDecl::MixtureOmega { class, eta } => format!("omega({class}) {eta} ~ 0.0"),
+            // Only a one-eta block reaches here spelled as a block: a correlated
+            // one is taken by the near-singular arm, which quotes no declaration.
+            _ => match self.block_keyword() {
+                Some(kw) => format!("{kw} ({coord_name}) = [0.0]"),
+                None => format!("{} {coord_name} ~ 0.0", self.keyword()),
+            },
         }
     }
 
     /// What to call the random effect in prose. Same reasoning as
-    /// [`Self::declaration`]: a mixture override's packed coordinate is
+    /// [`Self::zero_declaration`]: a mixture override's packed coordinate is
     /// displayed as `ETA_CL_MIX2`, but the eta the user declared and reasons
     /// about is `ETA_CL`.
     fn subject_name(&self, coord_name: &str) -> String {
@@ -3956,12 +4011,11 @@ impl VarianceDecl {
     }
 }
 
-/// The remedy line, spelled the way the declaration actually parses.
+/// The remedy line, spelled the way the declaration actually parses — including
+/// a one-eta `block_omega (NAME) = [0.0] FIX`, which is an edit to the line the
+/// user wrote rather than a rewrite into a different declaration form (#1394).
 fn fix_suggestion(decl: &VarianceDecl, coord_name: &str, trailer: &str) -> String {
-    format!(
-        "write `{} ~ 0.0 FIX`{trailer}",
-        decl.declaration(coord_name)
-    )
+    format!("write `{} FIX`{trailer}", decl.zero_declaration(coord_name))
 }
 
 /// Does this coordinate sit **exactly** on the regularisation floor — the one
@@ -3996,18 +4050,25 @@ fn rail_variance_is_the_floor(template: &ModelParameters, i: usize) -> bool {
 /// mislabelling a declaration.
 fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<VarianceDecl>> {
     use crate::estimation::parameterization::{
-        coordinate_kinds, omega_block_member_mask, packed_segments, PackedCoordKind,
+        coordinate_kinds, omega_block_declared_mask, omega_correlated_diagonal_mask,
+        packed_segments, PackedCoordKind,
     };
 
     let segs = packed_segments(template);
     let iov_end = segs.mixture_omega_start();
-    // Whether **this eta** is in a block, not whether the matrix is one (#1394).
-    // A `block_omega` anywhere in the model makes `omega.diagonal` false for
-    // every coordinate, so keying the message on the matrix flag gave a
-    // diagonally-declared eta the block wording — advice to "lower the
-    // covariances involving" an eta that has none, and, worse, in place of the
-    // `~ 0.0 FIX` repair this check exists to hand out (#1229).
-    let in_block = omega_block_member_mask(template);
+    // Both facts are per **eta**, not per matrix (#1394). A `block_omega`
+    // anywhere in the model makes `omega.diagonal` false for every coordinate,
+    // so keying the message on the matrix flag gave a diagonally-declared eta
+    // the block wording — advice to "lower the covariances involving" an eta
+    // that has none, and, worse, in place of the `~ 0.0 FIX` repair this check
+    // exists to hand out (#1229).
+    //
+    // They are two masks rather than one because they answer two questions that
+    // agree on every block of two or more etas and come apart on a one-eta
+    // `block_omega (NAME)`: whether the *correlations* explain `L_ii` (they
+    // cannot, with no off-diagonals) and how the line is *spelled* (as a block).
+    let correlated = omega_correlated_diagonal_mask(template);
+    let block_declared = omega_block_declared_mask(template);
 
     coordinate_kinds(template)
         .iter()
@@ -4016,13 +4077,20 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
             if *kind != PackedCoordKind::OmegaDiagonal {
                 return None;
             }
-            // One lookup covers Ω and Ω_IOV alike: the mask is packed-length and
-            // marks both segments.
-            let block = in_block.get(i).copied().unwrap_or(false);
+            // One lookup each covers Ω and Ω_IOV alike: both masks are
+            // packed-length and mark both segments.
+            let correlated = correlated.get(i).copied().unwrap_or(false);
+            let block_declared = block_declared.get(i).copied().unwrap_or(false);
             if i < segs.sigma_start() {
-                Some(VarianceDecl::Omega { block })
+                Some(VarianceDecl::Omega {
+                    correlated,
+                    block_declared,
+                })
             } else if i < iov_end {
-                Some(VarianceDecl::Kappa { block })
+                Some(VarianceDecl::Kappa {
+                    correlated,
+                    block_declared,
+                })
             } else {
                 // A `[mixture]` Ω override (#977): one packed scalar each, in
                 // `omega_override_addr` order, immediately after the Ω_IOV
@@ -4145,7 +4213,7 @@ pub(crate) fn check_variance_init_rails(
         }
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
         let name = names.get(i).cloned().unwrap_or_else(|| format!("#{i}"));
-        let declaration = decl.declaration(&name);
+        let declaration = decl.zero_declaration(&name);
         let name = decl.subject_name(&name);
 
         // The variance **on this coordinate**: `L_ii²`, reconstructed from the
@@ -4161,7 +4229,7 @@ pub(crate) fn check_variance_init_rails(
         // Every message describes the coordinate the optimizer clamps, never a
         // declaration the check cannot see. Three shapes, in decreasing
         // confidence about what the user actually wrote.
-        let (message, suggestion) = if let Some(block_kw) = decl.block_keyword() {
+        let (message, suggestion) = if let Some(block_kw) = decl.correlated_block_keyword() {
             // A `block_omega` diagonal. The declared variances may all be
             // perfectly ordinary — it is the *correlation* that drives `L_ii`
             // to zero — so naming a per-eta variance here would point away from
@@ -4196,7 +4264,7 @@ pub(crate) fn check_variance_init_rails(
             // citing NM-TRAN's *zero*-variance refusal, are both sound.
             (
                 format!(
-                    "`{declaration} ~ 0.0` declares no variability but is not `FIX`-ed, so \
+                    "`{declaration}` declares no variability but is not `FIX`-ed, so \
                      the optimizer is asked to estimate a variance from a start it cannot \
                      leave: the zero is regularised to {OMEGA_REGULARIZATION_FLOOR:e}, whose \
                      packed coordinate ln(L) = {p:.2} lies below its own lower bound of \

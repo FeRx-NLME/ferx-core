@@ -1929,6 +1929,23 @@ pub struct OmegaMatrix {
     /// Used by the SAEM M-step to zero sampling correlations that bleed into
     /// structurally-absent entries via `(1/N) Σ ηη^T`.
     pub free_mask: DMatrix<bool>,
+    /// Per-eta: was this eta **declared inside** a `block_omega` /
+    /// `block_kappa` line, rather than on its own `omega` / `kappa` line?
+    ///
+    /// Declaration provenance, which `free_mask` cannot supply: a **one-eta**
+    /// `block_omega (ETA_CL) = [0.09]` is accepted, and has no off-diagonal, so
+    /// it is indistinguishable from a standalone `omega ETA_CL` by covariance
+    /// structure alone (#1394). Only a diagnostic that quotes the user's own
+    /// spelling back at them needs this; every numerical path reads `free_mask`
+    /// and `diagonal`, which are unchanged.
+    ///
+    /// Empty, or all-`false`, means "no block declaration is recorded" — which
+    /// is the honest answer for every `OmegaMatrix` rebuilt from a bare matrix
+    /// (`from_matrix`, and so the ferx-r entry points): there the caller passed
+    /// numbers, not a declaration, so there is no spelling to preserve.
+    /// `pub(crate)` on purpose: it is a diagnostic-wording aid, not public API,
+    /// and nothing outside the crate builds an `OmegaMatrix` by struct literal.
+    pub(crate) block_declared: Vec<bool>,
     /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
     /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
     /// matrix, run Cholesky, and invert on every evaluation.
@@ -1985,9 +2002,22 @@ impl OmegaMatrix {
             eta_names: names,
             diagonal,
             free_mask,
+            block_declared: vec![false; n],
             inv,
             log_det,
         }
+    }
+
+    /// Record which etas were declared inside a `block_omega` / `block_kappa`
+    /// line (#1394). The parser is the only caller: it is the only place that
+    /// has seen the declaration. A length that disagrees with the matrix
+    /// dimension is ignored rather than panicking, since the field only steers
+    /// how a diagnostic is worded.
+    pub(crate) fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
+        if block_declared.len() == self.dim() {
+            self.block_declared = block_declared;
+        }
+        self
     }
 
     pub fn from_matrix(m: DMatrix<f64>, names: Vec<String>, diagonal: bool) -> Self {
@@ -2062,6 +2092,7 @@ impl OmegaMatrix {
             eta_names: names,
             diagonal,
             free_mask,
+            block_declared: vec![false; n],
             inv,
             log_det,
         }

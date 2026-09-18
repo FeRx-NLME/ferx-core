@@ -724,6 +724,142 @@ fn a_diagonal_kappa_is_unaffected_by_an_unrelated_block_kappa() {
     );
 }
 
+// ── one-eta blocks (#1394, codex review of PR #1424) ────────────────────────
+
+/// A **one-eta** `block_omega (ETA_CL) = [0.0]` parses (verified: `ferx check`
+/// reaches this diagnostic rather than a parse error), and it is the single
+/// shape where "does this eta have covariances?" and "how was the line
+/// spelled?" disagree. It has no off-diagonal, so the correlation story is
+/// false and the near-singular arm must not fire; but it is written as a block,
+/// so the repair must be an edit to *that* line.
+///
+/// Both halves matter and each fails differently:
+/// * keying the spelling on the correlation mask quotes `omega ETA_CL ~ 0.0`,
+///   a line the user never wrote — the defect class the #1246 review named;
+/// * keying the message arm on provenance restores the pre-#1394 message,
+///   "reduce the declared covariances involving ETA_CL", on an eta with none —
+///   measured on this exact file before the fix.
+#[test]
+fn a_one_eta_block_omega_keeps_its_own_spelling_without_the_correlation_story() {
+    let model = three_eta_model(&three_eta_params(
+        "block_omega (ETA_CL) = [0.0]\n   omega ETA_V ~ 0.04",
+    ));
+    let p = &model.default_params;
+
+    // The premise that makes this the disagreement case, asserted so the test
+    // cannot quietly become a duplicate of the plain-diagonal one: the matrix is
+    // not diagonal (a block exists), ETA_CL is declared in it, and yet it has no
+    // free off-diagonal.
+    assert!(
+        !p.omega.diagonal,
+        "a block declaration makes Ω non-diagonal"
+    );
+    assert!(
+        p.omega.block_declared[0],
+        "ETA_CL must be recorded as block-declared"
+    );
+    let n = p.omega.dim();
+    assert!(
+        !(0..n).any(|k| k != 0 && p.omega.free_mask[(0, k)]),
+        "premise: a one-eta block has no free off-diagonal"
+    );
+
+    // ETA_KA ~ 0.0 is also on the rail here; ETA_CL is the one under test.
+    let diags = rails_with_default_options(p);
+    let d = diags
+        .iter()
+        .find(|d| d.message.contains("ETA_CL"))
+        .unwrap_or_else(|| panic!("the one-eta block must be reported: {diags:#?}"));
+
+    // Spelled as the user wrote it, value form included — `= [0.0]`, not `~ 0.0`.
+    assert!(
+        d.message
+            .contains("`block_omega (ETA_CL) = [0.0]` declares no variability"),
+        "{}",
+        d.message
+    );
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("write `block_omega (ETA_CL) = [0.0] FIX`, or start it at 0.09"),
+        "the repair must edit the block line, not rewrite it as a diagonal omega"
+    );
+    // ...but without the correlation explanation, which is false here.
+    assert!(
+        !d.message.contains("correlation") && !d.message.contains("covariances"),
+        "a one-eta block has no covariances to reduce: {}",
+        d.message
+    );
+    // And the declared-zero reasoning, which *is* sound: with no off-diagonals
+    // L_ii² is exactly the declared variance.
+    assert!(d.message.contains("CANNOT BE ZERO"), "{}", d.message);
+}
+
+/// The Ω_IOV twin. `block_kappa` routes through the same `build_omega_matrix`,
+/// so provenance arrives the same way — but the spelling must say `block_kappa`,
+/// and a hardcoded `block_omega` is exactly the defect the sibling
+/// `near_singular_block_kappa_*` test was added to catch on the other arm.
+#[test]
+fn a_one_eta_block_kappa_keeps_its_own_spelling() {
+    let model_src = "[parameters]\n\
+         \x20 theta TVCL(0.2, 0.001, 10.0)\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 block_kappa (KAPPA_CL) = [0.0]\n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n\
+         \n\
+         [individual_parameters]\n\
+         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n\
+         V  = TVV\n\
+         \n\
+         [structural_model]\n\
+         pk one_cpt_iv(cl=CL, v=V)\n\
+         \n\
+         [error_model]\n\
+         DV ~ proportional(PROP_ERR)\n";
+    let model = crate::parser::model_parser::parse_model_string(model_src)
+        .unwrap_or_else(|e| panic!("one-eta block_kappa must parse: {e}"));
+    let p = &model.default_params;
+    let iov = p.omega_iov.as_ref().expect("model declares IOV");
+    assert!(
+        iov.block_declared[0],
+        "KAPPA_CL must be recorded as block-declared"
+    );
+
+    let diags = rails_with_default_options(p);
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    let d = &diags[0];
+    assert!(
+        d.message
+            .contains("`block_kappa (KAPPA_CL) = [0.0]` declares no variability"),
+        "{}",
+        d.message
+    );
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("write `block_kappa (KAPPA_CL) = [0.0] FIX`, or start it at 0.09")
+    );
+    // The keyword each way round: never the Ω spelling on an Ω_IOV declaration.
+    assert!(!d.message.contains("block_omega"), "{}", d.message);
+    assert!(!d.message.contains("correlation"), "{}", d.message);
+}
+
+/// The repair the diagnostic hands out has to **parse**, and for the one-eta
+/// block it is a form no other test writes (`= [...] FIX`). A suggestion that
+/// does not round-trip is worse than none, and nothing else here would catch a
+/// malformed one — every other arm suggests `~ 0.0 FIX`, which the rest of the
+/// suite exercises constantly.
+#[test]
+fn the_one_eta_block_repair_parses_and_clears_the_diagnostic() {
+    let model = three_eta_model(&three_eta_params(
+        "block_omega (ETA_CL) = [0.0] FIX\n   omega ETA_V ~ 0.04",
+    ));
+    let diags = rails_with_default_options(&model.default_params);
+    assert!(
+        !diags.iter().any(|d| d.message.contains("ETA_CL")),
+        "the suggested `FIX` must clear ETA_CL's diagnostic: {diags:#?}"
+    );
+}
+
 // ── Ω_IOV ───────────────────────────────────────────────────────────────────
 
 /// Regression: the Ω_IOV segment skipped. `kappa` goes through the same
