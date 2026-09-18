@@ -514,3 +514,70 @@ fn ferx_check_reads_unfiltered_so_it_answers_a_different_question() {
         "but fit()'s sentence is about a deletion: {fit_msg}"
     );
 }
+
+#[test]
+fn fit_from_files_reports_the_filter_its_own_read_applied() {
+    // The #1423 review's second finding, and the sharper half of the defect: this
+    // entry point — the one ferx-r calls — reads its population through
+    // `build_selection_filter_merged`, so the model file's `[data_selection]` DOES
+    // filter the fit, but it used to hand `fit()` only the *caller's* options, whose
+    // clause lists are empty. `CmtConsumer::DataSelectionFilter` was therefore asked
+    // about a filter that was not the one that ran, and withheld the warning on a fit
+    // the guessed compartment had genuinely changed.
+    //
+    // Measured on the same fixture as the rest of this file: 4 records scored against
+    // 3, and before the fix no `W_CMT_DEFAULTED` in `FitResult.warnings` either way.
+    // `run_model_with_data` (the CLI path) passes `parsed.fit_options` and was always
+    // correct, which is why every other test here missed it.
+    let src = model_src(IGNORE_CMT);
+    let m = temp(&src, ".ferx");
+    let d = temp(&csv("x"), ".csv");
+    // No `[data_selection]` in the caller's options at all — the whole point is that
+    // the clause reaches the predicate from the *model file*.
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    };
+    assert!(
+        opts.ignore_exprs.is_empty() && opts.accept_exprs.is_empty(),
+        "the caller must supply no clauses, or this passes for the wrong reason"
+    );
+    let result = ferx_core::fit_from_files(
+        m.path().to_str().unwrap(),
+        Some(d.path().to_str().unwrap()),
+        None,
+        Some(opts),
+    )
+    .expect("a 0-iteration evaluation returns");
+
+    // The filter really did run on this read — otherwise there is nothing to warn
+    // about and the assertion below would be vacuous.
+    let n: usize = result.n_obs;
+    let unfiltered = temp(&model_src(NO_SELECTION), ".ferx");
+    let baseline = ferx_core::fit_from_files(
+        unfiltered.path().to_str().unwrap(),
+        Some(d.path().to_str().unwrap()),
+        None,
+        Some(FitOptions {
+            outer_maxiter: 0,
+            ..FitOptions::default()
+        }),
+    )
+    .expect("baseline returns");
+    assert_eq!(
+        (n, baseline.n_obs),
+        (4, 4),
+        "with the cell unreadable the clause matches nothing, so both score every row \
+         — the difference this warning is about is against the *readable* spelling"
+    );
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "fit_from_files must report the compartment it guessed, since its own read \
+         filtered on it: {:?}",
+        result.warnings
+    );
+}

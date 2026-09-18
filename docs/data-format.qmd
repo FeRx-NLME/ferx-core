@@ -181,6 +181,7 @@ A model with a **declared endpoint** (survival, binary, categorical, CTMM) is re
 Since [#1409](https://github.com/FeRx-NLME/ferx-core/issues/1409) this reads the model's **declared endpoints** rather than the shape of its error-model table, so an endpoint model that *also* declares an `[error_model]` is covered — it gets `ErrorSpec::Single`, and keying on the empty per-CMT error map used to miss it entirely. Measured on `examples/tte_exponential.ferx`, where a bad `CMT` cell moves an event row into the Gaussian grid for an OFV of 254.5871 against 166.4395: silent before, reported now. One limit remains, in the safe direction — a model whose only endpoint sits at `cmt = 1` is still reported, although compartment 1 is provably the one right answer there, so the finding is a false positive rather than a missed one.
 
 A `[data_selection]` clause that compares `CMT` is the third thing the column addresses, and is likewise covered. The filter is handed the compartment the reader *resolved*, so a guess can make a clause stop matching (a row you meant to drop is kept) or start matching (a row you meant to keep is deleted). Rows deleted that way are counted and named separately in the message, because they never reach the dose / observation counts; see [Data selection](model-file/data-selection.qmd#supported-columns).
+
 ## Event Types (EVID)
 
 | EVID | Meaning |

@@ -1027,6 +1027,26 @@ pub(crate) fn build_selection_filter_merged(
     model_opts: &FitOptions,
     call_opts: &FitOptions,
 ) -> Result<Option<SelectionFilter>, String> {
+    let (ignore, accept, subjects) = merge_selection_exprs(model_opts, call_opts);
+    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
+        return Ok(None);
+    }
+    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
+}
+
+/// The merged `[data_selection]` expression strings — the model file's plus the
+/// caller's, de-duplicated — that [`build_selection_filter_merged`] compiles.
+///
+/// Split out so the *strings* can be had without the compiled filter (#1409 review).
+/// `fit_from_files` reads its population through the merged filter but hands `fit()`
+/// the caller's options alone, so `CmtConsumer::DataSelectionFilter` was asked about
+/// an empty clause list while the fit had in fact been filtered on a defaulted `CMT`.
+/// One implementation of the merge answers both questions, so the filter that runs
+/// and the filter the warning reasons about cannot come apart.
+pub(crate) fn merge_selection_exprs(
+    model_opts: &FitOptions,
+    call_opts: &FitOptions,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     // Merge by accumulating unique strings from both sources.
     let mut ignore = model_opts.ignore_exprs.clone();
     let mut accept = model_opts.accept_exprs.clone();
@@ -1058,10 +1078,7 @@ pub(crate) fn build_selection_filter_merged(
             subjects.push(t);
         }
     }
-    if ignore.is_empty() && accept.is_empty() && subjects.is_empty() {
-        return Ok(None);
-    }
-    SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
+    (ignore, accept, subjects)
 }
 
 /// The non-Gaussian row routing a dataset needs for `model`: every CMT the model

@@ -14,8 +14,8 @@
 //! compartment the reader chose.
 //!
 //! Since #1409 the predicate is an `any()` over [`CmtConsumer`], so the channels are
-//! also tested *as an enumeration*: `cmt_consumer_all_lists_every_variant` pins the
-//! list against the exhaustive `match` in `CmtConsumer::index`, and
+//! also tested *as an enumeration*: `cmt_consumer_iter_visits_every_variant_once` pins
+//! the `next()` chain that *is* the list, and
 //! `every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one` requires each
 //! variant to carry a model on which **it alone** reads `CMT` — so a new consumer is
 //! a compile error until someone builds the shape that makes it live, and no arm can
@@ -445,9 +445,10 @@ fn cmt_defaulted_is_reported_when_a_data_selection_clause_compares_cmt() {
     // The live defect #1409 was filed for. `resolve_row_cmt` feeds the *defaulted*
     // compartment to the filter's `RowContext`, so `ignore = CMT == 2` selects rows
     // on a value the reader invented. Measured on `pk one_cpt_iv` with one
-    // observation cell spelled `2` against `x` and nothing else changed: 3
-    // observations kept and OFV −4.6162 against 4 kept and −6.9517, with
-    // `ferx check` reporting `ok — 0 warning(s)` on both.
+    // observation cell spelled `2` against `x` and nothing else changed: 3 records
+    // scored at −5.7650 against 4 at −5.2516 (the realised numbers of
+    // `tests/cmt_data_selection_scope.rs`; #1409's reprex quotes −4.6162 / −6.9517 on
+    // its own dataset), with `ferx check` reporting `ok — 0 warning(s)` on both.
     //
     // Built on `OneCptIv` with no per-CMT anything, so every model-side arm is inert
     // and this can only pass through `CmtConsumer::DataSelectionFilter`.
@@ -540,20 +541,38 @@ fn an_unparseable_data_selection_clause_is_answered_conservatively() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cmt_consumer_all_lists_every_variant() {
-    // Half of the completeness guard; `CmtConsumer::index`'s exhaustive `match` is
-    // the other half. A variant added to the enum forces an `index` arm (compile
-    // error otherwise) and then reddens here until it is in `ALL` at that slot —
-    // which is what makes `cmt_defaulting_is_ambiguous`'s `ALL.iter().any(..)` a
-    // complete question rather than a list someone last updated in #1404.
-    for (i, c) in CmtConsumer::ALL.iter().enumerate() {
+fn cmt_consumer_iter_visits_every_variant_once() {
+    // The enumeration is the `next()` chain, so this pins that the chain is a
+    // permutation rather than a path that skips or revisits: every variant the chain
+    // yields is distinct, and the head is reachable from nowhere else.
+    //
+    // What this replaced, and why: the first version kept a hand-written
+    // `CmtConsumer::ALL` array beside an exhaustive `index()`, and asserted only that
+    // each array slot indexed itself. The #1423 review found the hole by probe — a
+    // 7th variant with arms in `index`, `is_live` and `only_live` but missing from the
+    // array left all 22 tests in this file green while `cmt_defaulting_is_ambiguous`
+    // never asked it. With the array gone there is no second list to forget.
+    let seen: Vec<CmtConsumer> = CmtConsumer::iter().collect();
+    let mut deduped = seen.clone();
+    deduped.dedup();
+    assert_eq!(
+        seen, deduped,
+        "the next() chain must not revisit a variant: {seen:?}"
+    );
+    for c in &seen {
         assert_eq!(
-            c.index(),
-            i,
-            "{c:?} is at slot {i} of CmtConsumer::ALL but indexes itself as {}",
-            c.index()
+            seen.iter().filter(|x| *x == c).count(),
+            1,
+            "{c:?} appears more than once in the chain: {seen:?}"
         );
     }
+    // A chain that collapsed to its head would satisfy everything above, so pin that
+    // it actually walks: every channel this file builds a fixture for is in it.
+    assert!(
+        seen.len() >= 6,
+        "the chain lost variants — it yields only {:?}",
+        seen
+    );
 }
 
 /// A model + options on which **exactly one** consumer reads `CMT`.
@@ -614,10 +633,9 @@ fn every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one() {
     // than being covered by a neighbour. (CLAUDE.md, "two redundant gates cover for
     // each other": an arm that never decides anything alone is untested however
     // green the suite is.)
-    for c in CmtConsumer::ALL {
+    for c in CmtConsumer::iter() {
         let (model, options) = only_live(c);
-        let live: Vec<CmtConsumer> = CmtConsumer::ALL
-            .into_iter()
+        let live: Vec<CmtConsumer> = CmtConsumer::iter()
             .filter(|x| x.is_live(&model, &options))
             .collect();
         assert_eq!(
@@ -639,8 +657,7 @@ fn a_model_that_reads_cmt_for_nothing_is_suppressed_on_every_channel() {
     // The control for the loop above: with no channel live the warning is withheld.
     // Without it, every assertion there passes for a predicate hard-wired to `true`.
     let (model, options) = (analytical(PkModel::OneCptIv), no_filter());
-    let live: Vec<CmtConsumer> = CmtConsumer::ALL
-        .into_iter()
+    let live: Vec<CmtConsumer> = CmtConsumer::iter()
         .filter(|x| x.is_live(&model, &options))
         .collect();
     assert_eq!(

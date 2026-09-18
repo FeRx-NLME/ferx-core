@@ -734,7 +734,7 @@ pub(crate) fn reader_warning_suppressed(
 /// #1409 replaced the list with [`CmtConsumer`]: every channel that reads a row's
 /// `CMT` is a variant, each variant answers its own question off the engine's own
 /// routing table, and this is their OR. A new consumer is a compile error in
-/// [`CmtConsumer::is_live`] and a red test in `cmt_consumer_scope.rs` until someone
+/// [`CmtConsumer::is_live`] and a red test in `cmt_data_selection_scope.rs` until someone
 /// says which side of the question it falls on.
 ///
 /// The state count behind [`CmtConsumer::DoseCompartment`] deliberately includes the
@@ -744,16 +744,16 @@ pub(crate) fn reader_warning_suppressed(
 /// to compartment 1 and starves the endpoint. Counting them cannot produce a false
 /// positive for that reason, and excluding them would produce a false negative.
 fn cmt_defaulting_is_ambiguous(model: &CompiledModel, options: &FitOptions) -> bool {
-    CmtConsumer::ALL.iter().any(|c| c.is_live(model, options))
+    CmtConsumer::iter().any(|c| c.is_live(model, options))
 }
 
 /// Every channel that reads a row's `CMT`, so the compartment the reader had to
 /// invent could change a number (#1409).
 ///
 /// This enum *is* the scope of `W_CMT_DEFAULTED`. Adding a channel means adding a
-/// variant, which is a compile error in [`Self::is_live`] and [`Self::index`] and a
-/// red `tests/cmt_consumer_scope.rs` until it carries a fixture that measures the
-/// difference the channel makes. That is the step all three #1404 review rounds
+/// variant, which is a compile error in [`Self::is_live`] and [`Self::next`] and a
+/// red `tests/cmt_data_selection_scope.rs` / `tests/cmt_endpoint_scope.rs` until it
+/// carries a fixture that measures the difference the channel makes. That is the step all three #1404 review rounds
 /// skipped, each time by widening a condition in place.
 ///
 /// Each arm asks the **consumer's own** routing table rather than restating it, so a
@@ -793,32 +793,47 @@ pub(crate) enum CmtConsumer {
 }
 
 impl CmtConsumer {
-    /// Every variant, in declaration order. Pinned dense and complete against
-    /// [`Self::index`] by `cmt_consumer_all_lists_every_variant`, so a variant added
-    /// to the enum but not to this array is a red test rather than a silent hole.
-    pub(crate) const ALL: [CmtConsumer; 6] = [
-        CmtConsumer::DoseCompartment,
-        CmtConsumer::PerCmtScaling,
-        CmtConsumer::PerCmtErrorModel,
-        CmtConsumer::PerCmtReadout,
-        CmtConsumer::EndpointRouting,
-        CmtConsumer::DataSelectionFilter,
-    ];
-
-    /// This variant's position in [`Self::ALL`]. Exhaustive on purpose: it is half
-    /// of the completeness guard (the other half is the test that walks `ALL` and
-    /// checks every index is its own slot). Test-only — nothing in production needs
-    /// an ordinal, and the guard is the whole reason it exists.
-    #[cfg(test)]
-    pub(crate) fn index(self) -> usize {
+    /// The channel after this one, or `None` at the end of the chain.
+    ///
+    /// **This is the enumeration.** There is deliberately no second `ALL` array to
+    /// keep in step: a hand-written list is exactly the thing that goes stale, and it
+    /// did — the first version of this file carried `ALL: [CmtConsumer; 6]` next to an
+    /// exhaustive `index()`, and a 7th variant that satisfied every `match` while
+    /// being left out of the array passed all 22 tests in
+    /// `reader_warning_suppression_tests` while `cmt_defaulting_is_ambiguous` silently
+    /// never asked it (measured on the #1423 review's probe). The doc there claimed
+    /// that case was a red test. It was not.
+    ///
+    /// Written as a chain because the `match` is then **exhaustive over variants**, so
+    /// a new consumer cannot compile without someone deciding where in the order it
+    /// goes — and the arm they must edit to make it reachable (the previous tail's
+    /// `None`) is in the same `match`, three lines away, rather than in another item
+    /// that still compiles untouched.
+    ///
+    /// **What this does and does not guarantee**, stated exactly because the thing it
+    /// replaced overclaimed. Adding a variant is a compile error in three places
+    /// (`next`, [`Self::is_live`], and `only_live` in the unit tests), and that is the
+    /// forcing function. It is *not* a red test: an author who answers all three and
+    /// writes `NewVariant => None` without repointing the previous tail leaves it
+    /// unreachable from [`Self::iter`], and the suite stays green — verified by probe,
+    /// not assumed. Stable Rust cannot enumerate a type's variants without a derive
+    /// macro, so no test here can close that gap; the chain narrows it to a single
+    /// `match` where both arms are visible at once, instead of an array in another
+    /// item that compiles untouched.
+    fn next(self) -> Option<Self> {
         match self {
-            CmtConsumer::DoseCompartment => 0,
-            CmtConsumer::PerCmtScaling => 1,
-            CmtConsumer::PerCmtErrorModel => 2,
-            CmtConsumer::PerCmtReadout => 3,
-            CmtConsumer::EndpointRouting => 4,
-            CmtConsumer::DataSelectionFilter => 5,
+            CmtConsumer::DoseCompartment => Some(CmtConsumer::PerCmtScaling),
+            CmtConsumer::PerCmtScaling => Some(CmtConsumer::PerCmtErrorModel),
+            CmtConsumer::PerCmtErrorModel => Some(CmtConsumer::PerCmtReadout),
+            CmtConsumer::PerCmtReadout => Some(CmtConsumer::EndpointRouting),
+            CmtConsumer::EndpointRouting => Some(CmtConsumer::DataSelectionFilter),
+            CmtConsumer::DataSelectionFilter => None,
         }
+    }
+
+    /// Every channel, in order, starting from the head of the chain.
+    pub(crate) fn iter() -> impl Iterator<Item = CmtConsumer> {
+        std::iter::successors(Some(CmtConsumer::DoseCompartment), |c| c.next())
     }
 
     /// Whether this channel actually reads `CMT` on this model + options.
@@ -872,9 +887,12 @@ impl CmtConsumer {
 /// *defaulted* value, so a clause naming `CMT` decides which rows are scored on a
 /// compartment the reader invented. Measured on `pk one_cpt_iv` with
 /// `[data_selection] ignore = CMT == 2`, one observation cell spelled `2` against
-/// `x` and nothing else changed: 3 observations kept and OFV −4.6162 against 4 kept
-/// and OFV −6.9517, with `ferx check` reporting `ok — 0 warning(s)` both ways. The
-/// row the filter was told to drop is silently kept and scored.
+/// `x` and nothing else changed: 3 records scored at −5.7650 against 4 at −5.2516,
+/// with `ferx check` reporting `ok — 0 warning(s)` both ways. The row the filter was
+/// told to drop is silently kept and scored. (Those are the realised numbers of
+/// `tests/cmt_data_selection_scope.rs`, printed by it on every run. #1409's own
+/// reprex reports −4.6162 / −6.9517 — the same defect on its own dataset, not this
+/// fixture; quoting those here described a measurement nothing in the tree makes.)
 ///
 /// Asked of the compiled clauses rather than of the raw strings, so the answer
 /// tracks what the filter actually parses (`CMT`/`cmt` case-folding, `&&`-joined

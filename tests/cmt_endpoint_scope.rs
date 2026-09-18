@@ -24,6 +24,15 @@
 //! *shipped* model file takes that path.
 //!
 //! Tier 2: `validate_model_file` only — no `fit()`.
+//!
+//! Gated on `survival`: the fixture is an `[event_model]` file, which without that
+//! feature is rejected at parse with `E_BLOCK_FEATURE_DISABLED` — so ungated this
+//! reads as "the warning did not fire" and reddens the base `Tests + coverage (core)`
+//! job, which runs the integration tests under `ferx-core/ci` alone. The gate obliges
+//! a matching `--test cmt_endpoint_scope` in the endpoint job of `ci.yml`, which
+//! `tests/ci_workflow_endpoint_coverage.rs` pins as a set equality.
+
+#![cfg(feature = "survival")]
 
 use ferx_core::validate_model_file;
 use std::io::Write;
