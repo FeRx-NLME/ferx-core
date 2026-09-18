@@ -22616,11 +22616,21 @@ fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartm
 /// so `F1`/`ALAG1` hit the analytical dose-route reject and `D2` the
 /// infusable-compartment reject — both about a `pk(...)` model the user never wrote.
 /// Each value must be readable through `pk_indices` like any other parameter, and
-/// the dose-attribute map must stay empty (the loop also *recorded* `D1`/`R1` as an
-/// analytical modeled dose, at a slot `ode_param_slots` never gave it).
+/// the dose-attribute map must stay empty — `D1`/`R1` *parsed* under the old gate,
+/// so for those two arms `dose_attr_map.is_empty()` is the one assertion that
+/// sees the defect: the loop recorded them as an analytical modeled dose at spare
+/// slot 9 while `ode_param_slots` had put the value at slot 1. (`parse_warnings`
+/// is a guard against any other diagnostic; the dead-parameter census skips
+/// compartment-free models, so it cannot fire here either way.)
 #[test]
 fn algebraic_structural_model_accepts_dose_attribute_shaped_parameter_names() {
-    for (name, value) in [("F1", 0.25), ("ALAG1", 0.5), ("D2", 2.0), ("R1", 3.0)] {
+    for (name, value) in [
+        ("F1", 0.25),
+        ("ALAG1", 0.5),
+        ("D1", 1.5),
+        ("D2", 2.0),
+        ("R1", 3.0),
+    ] {
         let src = format!(
             "[parameters]\n\
             \x20 theta TVE0(10.0, 0.1, 100.0)\n\

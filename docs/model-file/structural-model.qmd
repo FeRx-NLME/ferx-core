@@ -210,11 +210,14 @@ following are rejected by name rather than silently ignored:
 `[error_model]`, `[fit_options]`, `[covariates]`, `[derived]` and `[output]` all
 work unchanged.
 
-Because nothing is dosed, the dose-attribute names a `pk(...)` or `[odes]` model
-reserves — `F`, `LAGTIME`, and the compartment-indexed `F1`, `ALAG1`, `D2`, `R1`
-— carry no meaning here and are ordinary parameter names (a fraction, a factor
-level, a slope). They are neither bound to a dose route nor rejected for lacking
-one (#1358).
+Because nothing is dosed, the compartment-indexed dose-attribute names a
+`pk(...)` or `[odes]` model reserves — `F1`, `ALAG1`, `D2`, `R1` — carry no
+meaning here and are ordinary parameter names (a fraction, a factor level, a
+slope): they are neither bound to a dose route nor rejected for lacking one
+(#1358). The bare `F` / `LAGTIME` / `ALAG` still take their reserved parameter
+slots, as in an ODE model, so a compartment-free `LAGTIME` can still draw the
+negative-lag-time warning; prefer another name for a parameter that is not a
+lag.
 
 ### Worked example
 
