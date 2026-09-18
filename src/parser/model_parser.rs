@@ -18074,7 +18074,17 @@ fn build_pk_param_fn(
     // statements, and used only by the f64 `pk_param_fn` closure below — the
     // `IndivParamProgram` snapshot above already holds the unsplit list, so the
     // analytic-sensitivity chain and every dual evaluator are untouched.
-    let ip_split = split_ip_eta_independent_prefix(&stmts_owned, n_vars, n_theta_base, n_cov);
+    #[allow(unused_mut)]
+    let mut ip_split = split_ip_eta_independent_prefix(&stmts_owned, n_vars, n_theta_base, n_cov);
+    // Test-only kill switch, read on the thread that parses the model. It is
+    // what lets a test build the *same* model twice — hoisted and unhoisted —
+    // and require the two to agree bit-for-bit; see
+    // `ip_hoist_off` / `saem_hotpath_tests`.
+    #[cfg(test)]
+    if IP_HOIST_DISABLED.with(|c| c.get()) {
+        ip_split = None;
+    }
+    let ip_split = ip_split;
     let ip_model_id = IP_MODEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // One line per built closure under `FERX_IP_HOIST_REPORT=1`, so a benchmark
     // can say whether it hoisted anything or fell back — the question "which
@@ -18142,6 +18152,8 @@ fn build_pk_param_fn(
             let mut p = PkParams::default();
             FERX_SCRATCH.with(|cell| {
                 let mut scratch = cell.borrow_mut();
+                #[cfg(test)]
+                let (mut hits_delta, mut misses_delta) = (0u64, 0u64);
                 let FerxThreadScratch {
                     pk_cov,
                     pk_vars,
@@ -18218,10 +18230,18 @@ fn build_pk_param_fn(
                                 .zip(ip_key.iter())
                                 .all(|(a, b)| a.to_bits() == b.to_bits());
                         if hit {
+                            #[cfg(test)]
+                            {
+                                hits_delta += 1;
+                            }
                             for (&slot, &v) in split.writes.iter().zip(entry.vals.iter()) {
                                 pk_vars[slot] = v;
                             }
                         } else {
+                            #[cfg(test)]
+                            {
+                                misses_delta += 1;
+                            }
                             eval_statements_indexed_with_stack(
                                 &split.prefix,
                                 theta,
@@ -18276,6 +18296,11 @@ fn build_pk_param_fn(
                     for &(slot, var_slot) in &ode_assignment_mapping {
                         p.values[slot] = pk_vars[var_slot];
                     }
+                }
+                #[cfg(test)]
+                {
+                    scratch.ip_hits += hits_delta;
+                    scratch.ip_misses += misses_delta;
                 }
             });
             p
@@ -20973,11 +20998,47 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             Op::PushNnOutput(..) => d.dynamic = true,
             Op::PushTime => d.reads_time = true,
             Op::PushMixNum => d.reads_mixnum = true,
-            // θ, covariates, constants and every arithmetic op are all either in
-            // the cache key or pure. `PushThetaGather` pops its level index off
-            // the stack, and whatever pushed it is itself an op in this same
-            // loop, so its dependencies are already accounted for.
-            _ => {}
+            // Everything below reads nothing outside the bytecode itself: a
+            // constant lives in `bc.constants`, and every arithmetic / comparison
+            // / control op consumes only the stack. `PushThetaGather` pops its
+            // level index off that stack, and whatever pushed it is itself an op
+            // in this same loop, so its dependencies are already accounted for.
+            //
+            // **Listed one by one on purpose — no `_` arm.** The hoist is sound
+            // only if `d` names every input the statement can read, so a new
+            // `Op` that reads state (an occasion index, a record field, a second
+            // thread-local) must not be able to reach the prefix by silently
+            // matching a wildcard. Adding an `Op` variant now fails to compile
+            // here, which is the intended forcing function; classify it, do not
+            // widen the match.
+            Op::PushConst(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Pow
+            | Op::Exp
+            | Op::Ln
+            | Op::Sqrt
+            | Op::Abs
+            | Op::InvLogit
+            | Op::Logit
+            | Op::CmpLt
+            | Op::CmpLe
+            | Op::CmpGt
+            | Op::CmpGe
+            | Op::CmpEq
+            | Op::CmpNe
+            | Op::LogicAnd
+            | Op::LogicOr
+            | Op::LogicNot
+            | Op::IsPresent
+            | Op::JumpIfFalse(_)
+            | Op::Jump(_)
+            | Op::Mod
+            | Op::Floor
+            | Op::Ceil
+            | Op::Round => {}
         }
     }
 }
@@ -21249,6 +21310,66 @@ struct IpCacheEntry {
 /// Process-wide identity for one built `pk_param_fn` closure.
 static IP_MODEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, [`build_pk_param_fn`] keeps the unsplit program, so
+    /// the *same* model source can be compiled both ways and the two closures
+    /// compared bit-for-bit.
+    ///
+    /// Thread-local rather than a global, and read at parse time on the parsing
+    /// thread, so two tests running concurrently cannot see each other's
+    /// setting and none of this needs a lock.
+    pub(crate) static IP_HOIST_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`IP_HOIST_DISABLED`]. Restores the previous value
+/// on drop, including on an assertion unwind.
+#[cfg(test)]
+pub(crate) struct IpHoistOff(bool);
+
+#[cfg(test)]
+impl IpHoistOff {
+    pub(crate) fn enter() -> Self {
+        Self(IP_HOIST_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for IpHoistOff {
+    fn drop(&mut self) {
+        IP_HOIST_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
+/// Test-only: this thread's `(hits, misses)` on the η-independent-prefix cache.
+///
+/// Per-thread, like the cache itself, so a test reads only the lookups it
+/// performed — a process-wide counter would be polluted by every other test
+/// parsing and evaluating models at the same time, and "the cache was used at
+/// all" is exactly the assertion that stops a bit-identity test from passing
+/// vacuously because nothing ever hit.
+#[cfg(test)]
+pub(crate) fn ip_cache_counters() -> (u64, u64) {
+    FERX_SCRATCH.with(|cell| {
+        let s = cell.borrow();
+        (s.ip_hits, s.ip_misses)
+    })
+}
+
+/// Test-only: zero this thread's prefix-cache counters **and evict the cache**,
+/// so a following sequence of calls starts cold and its hit/miss counts mean
+/// what they say.
+#[cfg(test)]
+pub(crate) fn ip_cache_reset() {
+    FERX_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.ip_hits = 0;
+        s.ip_misses = 0;
+        s.ip_cache.clear();
+    })
+}
+
 /// FNV-1a over the raw bits of the key. Only used to pick a way; a collision
 /// costs a miss, never a wrong answer, because the full key is compared.
 fn ip_key_hash(model_id: u64, key: &[f64]) -> usize {
@@ -21294,6 +21415,11 @@ struct FerxThreadScratch {
     /// The cache itself, sized to [`IP_CACHE_WAYS`] on first use. Empty for a
     /// thread that has never evaluated a model with a hoistable prefix.
     ip_cache: Vec<IpCacheEntry>,
+    /// Test-only lookup counters for [`ip_cache_counters`].
+    #[cfg(test)]
+    ip_hits: u64,
+    #[cfg(test)]
+    ip_misses: u64,
 }
 
 impl FerxThreadScratch {
@@ -21307,6 +21433,10 @@ impl FerxThreadScratch {
             bc_stack: Vec::new(),
             ip_key: Vec::new(),
             ip_cache: Vec::new(),
+            #[cfg(test)]
+            ip_hits: 0,
+            #[cfg(test)]
+            ip_misses: 0,
         }
     }
 }

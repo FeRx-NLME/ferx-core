@@ -604,6 +604,58 @@ fn update_scalar_residual_sse(statistic: &mut Option<f64>, sample_sse: f64, gamm
 // Metropolis-Hastings step for one subject
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, [`run_saem`] runs with **no** per-subject
+    /// `EventSchedule` cache, i.e. the pre-#1447 behaviour of rebuilding the
+    /// schedule inside every NLL evaluation.
+    ///
+    /// The cache is claimed to be bit-identical, not merely close, so the test
+    /// for it is the same fit under both settings compared on the raw bits —
+    /// and that needs a way to ask for the old behaviour. Thread-local, read on
+    /// the thread that calls `run_saem` before any rayon fan-out, so concurrent
+    /// tests cannot see each other's setting and no lock is involved.
+    pub(crate) static SCHEDULE_CACHE_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`SCHEDULE_CACHE_DISABLED`], restoring the previous
+/// value on drop (including on an assertion unwind).
+#[cfg(test)]
+pub(crate) struct ScheduleCacheOff(bool);
+
+#[cfg(test)]
+impl ScheduleCacheOff {
+    pub(crate) fn enter() -> Self {
+        Self(SCHEDULE_CACHE_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScheduleCacheOff {
+    fn drop(&mut self) {
+        SCHEDULE_CACHE_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
+/// The per-subject `EventSchedule` cache [`run_saem`] runs with.
+///
+/// Delegates to the shared [`build_schedule_cache`](crate::estimation::inner_optimizer::build_schedule_cache)
+/// — the same builder the FOCE inner loop and the Bayes chain use, so the
+/// staleness rules live in one place — except under the test-only kill switch
+/// above, where it returns the all-`None` vector that reproduces the
+/// rebuild-per-call path exactly.
+fn saem_schedule_cache(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Option<crate::pk::event_driven::EventSchedule>> {
+    #[cfg(test)]
+    if SCHEDULE_CACHE_DISABLED.with(|c| c.get()) {
+        return population.subjects.iter().map(|_| None).collect();
+    }
+    crate::estimation::inner_optimizer::build_schedule_cache(model, population)
+}
+
 /// Every buffer one subject's MH sweep needs, owned by the rayon worker rather
 /// than rebuilt per proposal.
 ///
@@ -3069,7 +3121,7 @@ pub fn run_saem(
     // infusion) are stated in exactly one place — see `cacheable_schedule`. It
     // returns `None` per subject wherever reuse is unsound, which is then the
     // established rebuild-per-call behaviour.
-    let schedules = crate::estimation::inner_optimizer::build_schedule_cache(model, population);
+    let schedules = saem_schedule_cache(model, population);
 
     // Main loop
     for k in 1..=n_iter {
@@ -8018,3 +8070,7 @@ DV ~ additive(EPS)
         assert_ne!(eta[0], eta0[0], "unclamped coordinate should have moved");
     }
 }
+
+#[cfg(test)]
+#[path = "saem_hotpath_tests.rs"]
+mod hotpath_tests;

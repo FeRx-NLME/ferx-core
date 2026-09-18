@@ -558,6 +558,7 @@ impl IndividualNllScratch {
 /// costs one `Vec<usize>` copy per subject per iteration; for a `Selected`
 /// error model (a `[error_model]` with an `if`) it takes a per-observation
 /// closure evaluation off the proposal loop entirely.
+#[derive(Default)]
 pub(crate) struct IndividualNllPrep {
     err_keys: Vec<usize>,
     ruv_mult: Option<Vec<Vec<f64>>>,
@@ -572,15 +573,6 @@ impl IndividualNllPrep {
         self.err_keys
             .extend_from_slice(model.error_spec.obs_keys(subject).as_ref());
         self.ruv_mult = model.ruv_obs_mult(subject, theta);
-    }
-}
-
-impl Default for IndividualNllPrep {
-    fn default() -> Self {
-        Self {
-            err_keys: Vec::new(),
-            ruv_mult: None,
-        }
     }
 }
 

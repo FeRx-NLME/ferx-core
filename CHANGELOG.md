@@ -356,6 +356,27 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **SAEM: the E-step and M-step stop redoing η-independent work on every MH proposal.**
+  Three changes, all of them internal and all of them bit-identical — the same fit, the
+  same seed, the same estimates, objective and per-subject EBEs down to the last bit — so
+  there is no new option and no changed default to opt into. (1) The per-subject
+  `EventSchedule` is now built once for the whole fit and reused by the MH kernels and by
+  the θ/σ M-step objective, the way the FOCE inner loop and the Bayes chain already did;
+  a subject on the event-driven analytic path previously rebuilt a merged event sort plus
+  per-interval infusion bounds inside *every* likelihood evaluation, ~39 times per subject
+  per iteration. Subjects the shared `cacheable_schedule` gate declines (an η-dependent
+  lagtime, an `F`-reshaped rate-defined infusion, ODE or compartment-free models) keep the
+  previous rebuild-per-call behaviour exactly. (2) The MH proposal loop's seven heap
+  allocations per proposal are hoisted onto the Rayon worker, including making the
+  *recycling* likelihood entry point actually recycle and routing the IOV arms through the
+  scratch-taking IOV likelihood. (3) The `[individual_parameters]` program is split into an
+  η-independent prefix — covariate algebra such as FFM, allometry, CKD-EPI and maturation
+  `powf`s, which an MH sweep re-evaluated on every proposal although only η moved — and an
+  η-dependent suffix, with the prefix memoised per worker thread on exactly the θ,
+  covariates, `TIME` and `MIXNUM` it reads, behind a cost gate that declines models where
+  the lookup would cost more than the algebra. Measured at −4% to −25% CPU depending on the
+  model ([#1447](https://github.com/FeRx-NLME/ferx-core/issues/1447)).
+
 - Population fitting and prediction use the available worker budget more efficiently: Bayesian chains and underfilled AGQ grids run concurrently, small FOCE populations avoid fine-grained dispatch overhead, concurrent cold callers share pool construction, AGQ-IOV nodes avoid a heap allocation, and public `predict()` evaluates subjects in parallel ([#1385](https://github.com/FeRx-NLME/ferx-core/pull/1385)).
 
 - **FOCEI, Laplace, and `focei` with `n_agq > 1` now build each subject's `EventSchedule`
