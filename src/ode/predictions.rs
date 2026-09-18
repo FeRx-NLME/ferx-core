@@ -691,7 +691,7 @@ where
 /// observation; see the note at the top of that function for why the other half is the
 /// walk's anchor and not this one.
 #[inline]
-fn ss_run_in_params(
+pub(crate) fn ss_run_in_params(
     pk_params_flat: &[f64],
     pulse_at: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
@@ -2552,11 +2552,12 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// `[0, II)` as though virtual doses had arrived at `t_dose + k·II`, so a caller whose
 /// state was *not* built from such a train gets an anchor its own dose history does not
 /// justify — measured on #1263 as a 24.1% `ipred` divergence for one `SS=1` infusion
-/// whose end break lands past a virtual pulse. Since #1126 that also covers the pre-arrival
-/// window of a *seeded* SS dose, whose state comes from `ss_state_at_phase`; a caller that
-/// does not perform that seed must not consume this anchor there either. Callers that do
-/// not equilibrate an `SS` dose at all must warn (`W_SDE_STEADY_STATE`) rather than
-/// quietly consume it.
+/// whose end break lands past a virtual pulse, back when the EKF applied the record as a
+/// single dose (since #1260 it expands the train too, `ode::ekf::equilibrate_ss_ekf`).
+/// Since #1126 that also covers the pre-arrival window of a *seeded* SS dose, whose state
+/// comes from `ss_state_at_phase`; a caller that does not perform that seed must not
+/// consume this anchor there either. A caller that does not equilibrate an `SS` dose at
+/// all must warn rather than quietly consume it.
 #[inline]
 pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start: f64) -> f64 {
     // `.get(..).unwrap_or(0.0)`, not `dose_lagtimes[i]`: a short slice means "no lag on

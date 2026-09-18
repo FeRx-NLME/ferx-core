@@ -5309,12 +5309,14 @@ pub fn check_model_data_warnings(
     // own comment above (a modeled SS infusion may overlap on some occasions only), so
     // blanket suppression would drop a true finding.
     //
-    // `[diffusion]` is **not** excluded, and the reason is measured rather than assumed.
-    // `solve_ekf` seeds a finite TAFD anchor and never equilibrates (#1260), which reads like
-    // an exemption — but `ode_predictions_ekf_with_diffusion` computes the Kalman `R` from a
-    // standard `ode_predictions` pass, and that one does run the run-in, so the `NaN` reaches
-    // the likelihood anyway: the same model plus `[diffusion] central ~ 0.01` measures
-    // `OFV: NaN`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
+    // `[diffusion]` is **not** excluded, twice over. Since #1260 `solve_ekf` runs its own
+    // run-in (`ode::ekf::equilibrate_ss_ekf`) on the same cycle-local clock with the same
+    // `ss_run_in_params` anchors, so a `TAFD`-reading RHS reads `NaN` there first-hand and a
+    // `T` / `TIME`-reading one sees the cycle-local value on both engines. And even before
+    // that, `ode_predictions_ekf_with_diffusion` computed the Kalman `R` from a standard
+    // `ode_predictions` pass, which does run the run-in, so the `NaN` reached the likelihood
+    // anyway — measured then as `OFV: NaN` on the same model plus `[diffusion] central ~
+    // 0.01`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
     if let Some(prog) = model
         .ode_spec
         .as_ref()
@@ -5587,36 +5589,6 @@ pub fn check_model_data_warnings(
              Use an ODE or analytical model if the lag matters."
                 .to_string(),
         ));
-    }
-
-    // Steady-state doses are not equilibrated on the EKF/SDE path. `solve_ekf` applies an
-    // `SS=1` record as a single bolus and never runs the equilibration, so the state is
-    // the one-dose state while `tad_anchor_for`'s `ss` branch hands the RHS a `TAD`
-    // folded into `[0, II)` — an anchor describing a periodic pulse train that this
-    // engine did not build. Measured on #1263: 55% low against an explicit train on an
-    // autonomous model (90.48 vs 200.27), and a further 24.1% `ipred` divergence at
-    // t=150 for an `SS=1` infusion whose end break lands past a virtual pulse. Both are
-    // silent — hence a warning rather than a quiet wrong answer (#1260).
-    if model.is_sde() {
-        let n_ss_sde = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_periodic_ss_dose())
-            .count();
-        if n_ss_sde > 0 {
-            diags.push(Diagnostic::warning(
-                "W_SDE_STEADY_STATE",
-                format!(
-                    "{} subject(s) have SS=1 dose records with a [diffusion] (SDE) \
-                     model. Steady-state doses are not yet equilibrated on the EKF/SDE \
-                     path — the record is applied as a single dose, so predictions and \
-                     the objective reflect a one-dose history rather than a steady \
-                     state. Use an ODE or analytical model, or expand the steady state \
-                     into an explicit dose train.",
-                    n_ss_sde
-                ),
-            ));
-        }
     }
 
     // Negative typical-value lag time at the initial point (eta = 0).
