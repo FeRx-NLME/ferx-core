@@ -18074,7 +18074,7 @@ fn build_pk_param_fn(
     // statements, and used only by the f64 `pk_param_fn` closure below — the
     // `IndivParamProgram` snapshot above already holds the unsplit list, so the
     // analytic-sensitivity chain and every dual evaluator are untouched.
-    let ip_split = split_ip_eta_independent_prefix(&stmts_owned, n_vars);
+    let ip_split = split_ip_eta_independent_prefix(&stmts_owned, n_vars, n_theta_base, n_cov);
     let ip_model_id = IP_MODEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // One line per built closure under `FERX_IP_HOIST_REPORT=1`, so a benchmark
     // can say whether it hoisted anything or fell back — the question "which
@@ -18087,10 +18087,15 @@ fn build_pk_param_fn(
             ),
             Some(sp) => eprintln!(
                 "IP_HOIST model={ip_model_id} prefix={} suffix={} cached_slots={} \
-                 key_time={} key_mixnum={} n_vars={n_vars} n_cov={n_cov}",
+                 key_thetas={} key_covs={} key_time={} key_mixnum={} n_vars={n_vars} \
+                 n_theta={n_theta_base} n_cov={n_cov}",
                 sp.prefix.len(),
                 sp.suffix.len(),
                 sp.writes.len(),
+                sp.key_thetas
+                    .as_ref()
+                    .map_or("ALL".to_string(), |t| t.len().to_string()),
+                sp.key_covs.len(),
                 sp.key_time,
                 sp.key_mixnum,
             ),
@@ -18177,8 +18182,17 @@ fn build_pk_param_fn(
                         // reads them, which is what lets a time-varying model
                         // keep hitting the cache across its events.
                         ip_key.clear();
-                        ip_key.extend_from_slice(theta);
-                        ip_key.extend_from_slice(pk_cov);
+                        match &split.key_thetas {
+                            None => ip_key.extend_from_slice(theta),
+                            Some(idx) => ip_key
+                                .extend(idx.iter().map(|&i| theta.get(i).copied().unwrap_or(0.0))),
+                        }
+                        ip_key.extend(
+                            split
+                                .key_covs
+                                .iter()
+                                .map(|&i| pk_cov.get(i).copied().unwrap_or(0.0)),
+                        );
                         if split.key_time {
                             ip_key.push(time);
                         }
@@ -20918,12 +20932,43 @@ struct IpStmtDeps {
     dynamic: bool,
     reads_time: bool,
     reads_mixnum: bool,
+    /// θ indices the statement reads. Only these belong in the cache key: a
+    /// θ the prefix never reads cannot change its value, and leaving it out
+    /// both shortens the key and stops an unrelated θ move (the M-step
+    /// perturbs one coordinate at a time) from invalidating the entry.
+    thetas: Vec<usize>,
+    /// Covariate indices the statement reads, for the same reason.
+    covs: Vec<usize>,
+    /// A `ThetaGather` picks its θ at run time, so no index subset is sound;
+    /// the whole θ slice goes in the key.
+    all_thetas: bool,
+    /// Weighted op count — the work hoisting this statement saves per call.
+    /// See [`ip_op_cost`].
+    cost: u32,
+}
+
+/// Rough cost of one bytecode op, in units of a simple arithmetic op.
+///
+/// The only thing this has to get right is the order of magnitude between a
+/// transcendental and an add: on aarch64 a `powf` is tens of cycles against
+/// one or two for a multiply, so 20 is a deliberate under-estimate (it makes
+/// the hoist gate below *less* eager, not more).
+fn ip_op_cost(op: &Op) -> u32 {
+    match op {
+        Op::Pow | Op::Exp | Op::Ln | Op::Sqrt | Op::Logit | Op::InvLogit => 20,
+        Op::Div | Op::Mod => 4,
+        _ => 1,
+    }
 }
 
 fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
     for op in &bc.ops {
+        d.cost += ip_op_cost(op);
         match *op {
             Op::PushVar(i) => d.reads.push(i as usize),
+            Op::PushTheta(i) => d.thetas.push(i as usize),
+            Op::PushCov(i) => d.covs.push(i as usize),
+            Op::PushThetaGather(_) => d.all_thetas = true,
             Op::PushEta(_) => d.dynamic = true,
             Op::PushNnOutput(..) => d.dynamic = true,
             Op::PushTime => d.reads_time = true,
@@ -20938,8 +20983,11 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
 }
 
 fn ip_deps_expr(e: &Expression, d: &mut IpStmtDeps) {
+    d.cost += 1;
     match e {
-        Expression::Literal(_) | Expression::Theta(_) | Expression::CovariateIdx(_) => {}
+        Expression::Literal(_) => {}
+        Expression::Theta(i) => d.thetas.push(*i),
+        Expression::CovariateIdx(i) => d.covs.push(*i),
         Expression::VariableIdx(i) => d.reads.push(*i),
         Expression::Eta(_) | Expression::NnOutput { .. } => d.dynamic = true,
         Expression::Time => d.reads_time = true,
@@ -20957,7 +21005,10 @@ fn ip_deps_expr(e: &Expression, d: &mut IpStmtDeps) {
             ip_deps_expr(a, d);
             ip_deps_expr(b, d);
         }
-        Expression::ThetaGather { idx, .. } => ip_deps_expr(idx, d),
+        Expression::ThetaGather { idx, .. } => {
+            d.all_thetas = true;
+            ip_deps_expr(idx, d);
+        }
     }
 }
 
@@ -20990,17 +21041,29 @@ fn ip_deps_stmt(s: &Statement, d: &mut IpStmtDeps) {
             branches,
             else_body,
         } => {
+            // Reads/writes are the union over every arm (a *may*-read and a
+            // *may*-write, the conservative direction for both split rules).
+            // The cost is the **most expensive single arm**, because only one
+            // of them runs — summing would overstate what hoisting saves.
+            let mut worst_arm = 0;
             for (cond, body) in branches {
+                let before = d.cost;
                 ip_deps_cond(cond, d);
                 for s in body {
                     ip_deps_stmt(s, d);
                 }
+                worst_arm = worst_arm.max(d.cost - before);
+                d.cost = before;
             }
             if let Some(body) = else_body {
+                let before = d.cost;
                 for s in body {
                     ip_deps_stmt(s, d);
                 }
+                worst_arm = worst_arm.max(d.cost - before);
+                d.cost = before;
             }
+            d.cost += worst_arm;
         }
         // `Assign`/`DiffEq*` never appear in a resolved `[individual_parameters]`
         // list (the first is resolved away, the latter two are `[odes]`-only).
@@ -21025,6 +21088,11 @@ struct IpPrefixSplit {
     /// event (its η-independent statements are usually time-free).
     key_time: bool,
     key_mixnum: bool,
+    /// θ indices in the key, ascending; `None` means "the whole θ slice"
+    /// (a `ThetaGather` reads a run-time-chosen index).
+    key_thetas: Option<Vec<usize>>,
+    /// Covariate indices in the key, ascending.
+    key_covs: Vec<usize>,
 }
 
 /// Partition `stmts` into an η-independent prefix and the remainder.
@@ -21048,13 +21116,22 @@ struct IpPrefixSplit {
 ///
 /// Returns `None` when nothing is hoistable, in which case the caller keeps the
 /// single unsplit program and pays no key-building or lookup cost at all.
-fn split_ip_eta_independent_prefix(stmts: &[Statement], n_vars: usize) -> Option<IpPrefixSplit> {
+fn split_ip_eta_independent_prefix(
+    stmts: &[Statement],
+    n_vars: usize,
+    n_theta: usize,
+    n_cov: usize,
+) -> Option<IpPrefixSplit> {
     let mut tainted = vec![false; n_vars];
     let mut touched_by_suffix = vec![false; n_vars];
     let mut written_by_prefix = vec![false; n_vars];
     let mut prefix: Vec<Statement> = Vec::new();
     let mut suffix: Vec<Statement> = Vec::new();
     let (mut key_time, mut key_mixnum) = (false, false);
+    let mut key_theta_set = vec![false; n_theta];
+    let mut key_cov_set = vec![false; n_cov];
+    let mut all_thetas = false;
+    let mut prefix_cost: u32 = 0;
 
     for s in stmts {
         let mut d = IpStmtDeps::default();
@@ -21084,6 +21161,22 @@ fn split_ip_eta_independent_prefix(stmts: &[Statement], n_vars: usize) -> Option
             }
             key_time |= d.reads_time;
             key_mixnum |= d.reads_mixnum;
+            all_thetas |= d.all_thetas;
+            for &i in &d.thetas {
+                if i < n_theta {
+                    key_theta_set[i] = true;
+                } else {
+                    // An out-of-range θ index can only come from a malformed
+                    // program; widen the key rather than narrow it.
+                    all_thetas = true;
+                }
+            }
+            for &i in &d.covs {
+                if i < n_cov {
+                    key_cov_set[i] = true;
+                }
+            }
+            prefix_cost = prefix_cost.saturating_add(d.cost);
             prefix.push(s.clone());
         }
     }
@@ -21091,6 +21184,34 @@ fn split_ip_eta_independent_prefix(stmts: &[Statement], n_vars: usize) -> Option
     if prefix.is_empty() {
         return None;
     }
+    let key_thetas: Option<Vec<usize>> = if all_thetas {
+        None
+    } else {
+        Some((0..n_theta).filter(|&i| key_theta_set[i]).collect())
+    };
+    let key_covs: Vec<usize> = (0..n_cov).filter(|&i| key_cov_set[i]).collect();
+
+    // Is the hoist worth its own lookup? Building and comparing the key costs
+    // roughly two units per element (one to hash, one to compare) plus a fixed
+    // ~10 for the call, the bounds checks and the branch; the hoist saves
+    // `prefix_cost` units per call. Hoisting when it saves less than it costs
+    // is a *regression*, and a measured one: on B5 (pembrolizumab) the prefix
+    // is `IMAX`, `HILL` and `Q` — 27 weighted ops, one `powf` — against a
+    // 5-element key, and the first cut of this change came out **1.6 % slower
+    // in CPU time** there (52.9 s against 52.1 s, 3 interleaved reps) while B2
+    // gained 20 %. The gate below sends B5 back to the unsplit program.
+    //
+    // The comparison is `>=` with no tuned multiplier: hoist exactly when the
+    // work removed is at least the work added.
+    let key_len = key_thetas.as_ref().map_or(n_theta, |t| t.len())
+        + key_covs.len()
+        + usize::from(key_time)
+        + usize::from(key_mixnum);
+    let key_cost = 2 * key_len as u32 + 10;
+    if prefix_cost < key_cost {
+        return None;
+    }
+
     let writes: Vec<usize> = (0..n_vars).filter(|&i| written_by_prefix[i]).collect();
     Some(IpPrefixSplit {
         prefix,
@@ -21098,6 +21219,8 @@ fn split_ip_eta_independent_prefix(stmts: &[Statement], n_vars: usize) -> Option
         writes,
         key_time,
         key_mixnum,
+        key_thetas,
+        key_covs,
     })
 }
 

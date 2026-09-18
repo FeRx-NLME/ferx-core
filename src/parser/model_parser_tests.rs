@@ -25457,6 +25457,7 @@ fn e6_model_text(body: &str) -> String {
 /// the `tainted` test reddens `branch_on_eta` and `reassignment_after_an_eta_write`.
 #[test]
 fn eta_independent_split_is_value_preserving_on_every_shape() {
+    let mut n_split = 0usize;
     for (name, body) in e6_model_bodies() {
         let model = parse_model_string(&e6_model_text(body))
             .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
@@ -25467,7 +25468,12 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
             .unwrap_or_else(|| panic!("{name}: no indiv_param_program"));
         let stmts = &program.stmts;
         let n_vars = program.n_vars;
-        let Some(split) = split_ip_eta_independent_prefix(stmts, n_vars) else {
+        let Some(split) = split_ip_eta_independent_prefix(
+            stmts,
+            n_vars,
+            model.n_theta,
+            model.referenced_covariates.len(),
+        ) else {
             // A model with nothing to hoist still has to be covered by the
             // fallback path; there is nothing to compare here.
             continue;
@@ -25476,6 +25482,7 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
             !split.prefix.is_empty(),
             "{name}: split returned Some with an empty prefix"
         );
+        n_split += 1;
 
         let n_cov = model.referenced_covariates.len();
         let mut seed = 0x2545_F491_4F6C_DD1D_u64;
@@ -25525,6 +25532,13 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
             }
         }
     }
+    // The cost gate can decline to hoist, and a shape it declines is skipped
+    // above — so without this the whole test could pass by hoisting nothing.
+    assert!(
+        n_split >= 5,
+        "only {n_split} of the shapes produced a split; the comparison above is \
+         near-vacuous — check the cost gate in split_ip_eta_independent_prefix"
+    );
 }
 
 /// The *cache* must key on every input the prefix reads. A key missing one —
