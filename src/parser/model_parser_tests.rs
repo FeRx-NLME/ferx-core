@@ -25220,21 +25220,84 @@ fn a_second_model_name_line_is_rejected() {
     );
 }
 
-/// Only the preamble names the model. Inside a block the line belongs to that
-/// block: `[parameters]` rejects it as unrecognised text (#1377) where the old
-/// extractor skipped every in-block `model ` line *and* took it as the name.
+/// Only the preamble names the model. Inside a block an exact declaration is
+/// rejected by the extractor with one message naming the block, wherever the
+/// block is — a block whose parser skips unrecognised lines (`[data]`) or that
+/// is never read at all (`[odes]` on a `pk` model) would otherwise drop it in
+/// silence and the fit would carry the file stem, the fallback #1395 closes.
 /// The straddle (`model X` before the header names, after it rejects) is what
 /// pins "preamble only" — a scan of the whole file would pass the first arm and
-/// fail the second.
+/// fail the second. Reverting the extractor guard turns the `[data]` and
+/// `[odes]` arms into a green parse named by the stem.
 #[test]
-fn a_model_line_inside_a_block_is_that_blocks_line_not_the_name() {
+fn a_model_declaration_inside_any_block_is_rejected_naming_the_block() {
     assert_eq!(parsed_name("model outside"), "outside");
-    let src = named_model("").replacen("[parameters]\n", "[parameters]\n  model inside\n", 1);
-    let err = parse_err(&src);
-    assert!(
-        err.contains("model inside") && !err.contains("Malformed model name"),
-        "an in-block `model` line must be the block's own rejection, got: {err}"
+    let base = named_model("");
+    // `[data]` and `[odes]` lead: without the extractor guard those two parse
+    // green and the model is silently named by the stem (the review finding on
+    // #1417); `[parameters]` would still reject the line as unrecognised text.
+    let cases = [
+        ("", "[data]\n  path = x.csv\n  model inside\n", "data"),
+        ("", "[odes]\n  model inside\n", "odes"),
+        (
+            "[parameters]\n",
+            "[parameters]\n  model inside\n",
+            "parameters",
+        ),
+        (
+            "[parameters]\n",
+            "[parameters]\n  model = inside\n",
+            "parameters",
+        ),
+        ("", "[covariates WT]\n  model inside\n", "covariates WT"),
+    ];
+    for (needle, replacement, block) in cases {
+        let src = if needle.is_empty() {
+            format!("{base}\n{replacement}")
+        } else {
+            base.replacen(needle, replacement, 1)
+        };
+        // 1-based line of the offending declaration, read back from the source
+        // so the assertion cannot drift from the fixture.
+        let line = src
+            .lines()
+            .position(|l| l.trim().starts_with("model"))
+            .expect("fixture carries the declaration")
+            + 1;
+        let err = parse_err(&src);
+        assert!(
+            err.contains("Model name declaration `model inside`")
+                && err.contains(&format!("is inside `[{block}]`"))
+                && err.contains(&format!("(line {line})"))
+                && err.contains("`model NAME` or `model = NAME`"),
+            "{replacement:?}: {err}"
+        );
+    }
+}
+
+/// The in-block guard catches the exact declaration forms only: an assignment
+/// to a parameter that happens to be named `model` is that block's line.
+#[test]
+fn an_in_block_model_assignment_is_not_a_declaration() {
+    assert_eq!(model_name_declaration("model inside"), Some("inside"));
+    assert_eq!(model_name_declaration("model = inside"), Some("inside"));
+    assert_eq!(model_name_declaration("model=inside"), Some("inside"));
+    assert_eq!(model_name_declaration("model = CL * 2"), None);
+    assert_eq!(model_name_declaration("model = my model"), None);
+    assert_eq!(model_name_declaration("modelled = 3"), None);
+    assert_eq!(model_name_declaration("model"), None);
+    let src = named_model("").replacen(
+        "[individual_parameters]\n",
+        "[individual_parameters]\n  model = TVCL * 2\n",
+        1,
     );
+    match parse_full_model(&src) {
+        Ok(parsed) => assert_eq!(parsed.model.name, UNNAMED_MODEL),
+        Err(e) => assert!(
+            !e.contains("Model name declaration"),
+            "an in-block assignment must not trip the preamble guard: {e}"
+        ),
+    }
 }
 
 /// The preamble's other lines stay ignored — `tests/nonmem/covariate_cat.ferx`

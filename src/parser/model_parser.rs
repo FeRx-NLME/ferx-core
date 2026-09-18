@@ -13482,9 +13482,20 @@ fn strip_line_comment(line: &str) -> &str {
 /// where the old scan would have taken the first `model <word>` anywhere in
 /// the file — including, say, an `[individual_parameters]` assignment to a
 /// parameter named `model` — as the name.
+/// The name a line declares when it is exactly `model NAME`, `model = NAME` or
+/// `model=NAME` — `None` for anything else, including a line that merely starts
+/// with the keyword (`model = CL * 2` in `[individual_parameters]` is that
+/// block's assignment to a parameter named `model`, not a declaration).
+///
+/// Shared by `parse_model_name` (the preamble reader) and `extract_blocks` (the
+/// in-block guard) so the two cannot disagree on what a declaration looks like.
+fn model_name_declaration(trimmed: &str) -> Option<&str> {
+    let re = Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap();
+    re.captures(trimmed).map(|c| c.get(1).unwrap().as_str())
+}
+
 fn parse_model_name(content: &str) -> Result<String, String> {
     let header_re = Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap();
-    let model_re = Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap();
     let mut name: Option<String> = None;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = strip_line_comment(line).trim();
@@ -13502,7 +13513,7 @@ fn parse_model_name(content: &str) -> Result<String, String> {
         if !is_model_line {
             continue;
         }
-        let Some(caps) = model_re.captures(trimmed) else {
+        let Some(declared) = model_name_declaration(trimmed) else {
             return Err(format!(
                 "Malformed model name declaration `{trimmed}` (line {}) — expected \
                  {MODEL_NAME_FORMS}.",
@@ -13511,13 +13522,12 @@ fn parse_model_name(content: &str) -> Result<String, String> {
         };
         if let Some(first) = &name {
             return Err(format!(
-                "Model name declared twice: `{first}` and `{}` (line {}) — keep one \
+                "Model name declared twice: `{first}` and `{declared}` (line {}) — keep one \
                  `model NAME` line.",
-                &caps[1],
                 idx + 1
             ));
         }
-        name = Some(caps[1].to_string());
+        name = Some(declared.to_string());
     }
     Ok(name.unwrap_or_else(|| UNNAMED_MODEL.to_string()))
 }
@@ -13589,14 +13599,30 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             continue;
         }
 
-        // `end` is a bare terminator, dropped wherever it appears. The `model NAME`
-        // line is *not* dropped here any more: `parse_model_name` reads it from the
-        // preamble (where `current` is `None` and the line is ignored below anyway),
-        // and inside a block it is that block's line, so the block's own parser
-        // sees it — a stray `model X` in `[parameters]` is rejected there (#1377)
-        // instead of being skipped in silence (#1395).
+        // `end` is a bare terminator, dropped wherever it appears.
         if trimmed == "end" {
             continue;
+        }
+
+        // A `model NAME` declaration inside a block is an error here, not that
+        // block's line: `parse_model_name` reads it from the preamble only, and
+        // leaving it to the block would drop it in silence wherever the block
+        // parser skips unrecognised lines (`[data]` does) or is never read at all
+        // (`[odes]` on a `pk` model) — the exact silent fallback to the file stem
+        // that #1395 closes. The old extractor skipped every in-block `model `
+        // line the same way. Only the exact declaration forms are caught, so
+        // `model = CL * 2` in `[individual_parameters]` is still that block's
+        // assignment to a parameter named `model`.
+        if let (Some(target), Some(name)) = (current.as_ref(), model_name_declaration(trimmed)) {
+            let block = match target {
+                BlockTarget::Unnamed(ty) => ty.clone(),
+                BlockTarget::Named { ty, name: inst } => format!("{ty} {inst}"),
+            };
+            return Err(format!(
+                "Model name declaration `model {name}` (line {}) is inside `[{block}]` — \
+                 the name is read from the preamble only; write it as {MODEL_NAME_FORMS}.",
+                idx + 1
+            ));
         }
 
         match current.as_ref() {
