@@ -182,6 +182,19 @@ pub(crate) struct SubjectExclusion {
     pub fired: Vec<String>,
 }
 
+/// The clause the `W_CMT_DEFAULTED` summary uses to say that a `[data_selection]`
+/// rule reading `CMT` **deleted** rows from the fit (#1409).
+///
+/// Shared rather than spelled twice because `api::validation` matches on it: a
+/// warning carrying this clause is self-evidently about a live `CMT` consumer — the
+/// reader only counts such a row when the rule that removed it actually read `CMT` —
+/// so it must never be suppressed, including on the entry points that have no
+/// `&FitOptions` to answer the question with (`predict`, `simulate`, the adaptive
+/// driver). Matching the reader's own constant, not a prose guess, is what keeps the
+/// two from drifting.
+pub(crate) const CMT_FILTER_DELETED_MARKER: &str =
+    "row(s) were removed from the fit by a [data_selection] condition that reads CMT";
+
 /// Leading text of the "declared covariate column absent from data" error.
 /// Shared so the `ferx check` layer can classify the reader's error into the
 /// right diagnostic code without matching on the full (formatted) message.
@@ -523,6 +536,17 @@ impl ObsRouting {
     /// (#1409).
     pub(crate) fn routes_by_cmt(&self) -> bool {
         !self.tte.is_empty() || !self.discrete.is_empty() || !self.count.is_empty()
+    }
+
+    /// Whether every routed CMT is `cmt` — i.e. the routing tables name exactly one
+    /// compartment, and it is this one.
+    ///
+    /// Asked with [`DEFAULT_CMT`]: an endpoint model that routes **only** the
+    /// compartment the reader falls back to has nowhere else to send a defaulted row,
+    /// so the guess is provably the right answer rather than an ambiguity (#1409).
+    pub(crate) fn routes_only(&self, cmt: usize) -> bool {
+        let only = |set: &HashSet<usize>| set.iter().all(|c| *c == cmt);
+        self.routes_by_cmt() && only(&self.tte) && only(&self.discrete) && only(&self.count)
     }
 
     /// The integer-coded non-Gaussian endpoint kind (discrete-state or count) a
@@ -1208,9 +1232,8 @@ fn read_nonmem_csv_impl(
         // case.
         let filtered = if *n_filtered > 0 {
             format!(
-                ", and {n_filtered} row(s) were removed from the fit by a [data_selection] \
-                 condition that reads CMT — had the compartment been written out, those rows \
-                 would have been kept"
+                ", and {n_filtered} {CMT_FILTER_DELETED_MARKER} — had the compartment been \
+                 written out, those rows would have been kept"
             )
         } else {
             String::new()
@@ -1411,7 +1434,7 @@ fn parse_float_formatted_integer(t: &str) -> Option<f64> {
 /// The compartment a row falls back to when the dataset does not say which one.
 /// 1-based; the value all three `CMT` sites already used before #1009 made the
 /// fallback visible.
-const DEFAULT_CMT: usize = 1;
+pub(crate) const DEFAULT_CMT: usize = 1;
 
 /// At most this many distinct unparseable `CMT` spellings are quoted back in the
 /// `W_CMT_DEFAULTED` summary.

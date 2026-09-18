@@ -1166,7 +1166,29 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
 /// `W_CMT_DEFAULTED` without a second edit. The missing-DV policy does not enter the
 /// question, so the fitting policy is passed and the answer is the same either way.
 pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
-    obs_routing_for(model, MissingDvPolicy::Skip).routes_by_cmt()
+    let routing = obs_routing_for(model, MissingDvPolicy::Skip);
+    if !routing.routes_by_cmt() {
+        return false;
+    }
+    // The one endpoint shape where the default is provably the right answer, so
+    // reporting it is a false positive rather than a caught ambiguity: an
+    // **endpoint-only** model (no `[error_model]`, so no Gaussian grid to fall into)
+    // whose routing names **only** the compartment the reader falls back to. Every
+    // row keys to that endpoint whatever the cell said, and any other CMT is an
+    // `E_PER_CMT_ERROR_MODEL` error rather than a silent re-route. Documented as a known
+    // limit when the endpoint channel landed; closed here (#1409 review).
+    //
+    // Both halves are needed. Drop the Gaussian test and a model with a `cmt = 1`
+    // endpoint *and* ordinary observations stops reporting, although a defaulted row
+    // there really does pick between the endpoint and the Gaussian grid. Drop the
+    // `routes_only` test and a competing-risks model at `cmt = 1`/`cmt = 2` stops
+    // reporting, which is the #1404 measurement this whole channel exists for.
+    if !crate::api::validation::model_scores_gaussian_observations(model)
+        && routing.routes_only(crate::io::datareader::DEFAULT_CMT)
+    {
+        return false;
+    }
+    true
 }
 
 /// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`
