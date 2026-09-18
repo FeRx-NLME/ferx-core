@@ -2333,13 +2333,52 @@ fn test_stall_retry_rejects_a_non_finite_retry() {
 fn test_mid_descent_restart_skips_a_non_finite_objective() {
     use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
 
-    assert!(worth_restarting_mid_descent(true, 3209.8087));
-    assert!(worth_restarting_mid_descent(true, -676.7746));
-    assert!(!worth_restarting_mid_descent(true, f64::NAN));
-    assert!(!worth_restarting_mid_descent(true, f64::INFINITY));
-    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY));
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true));
+    assert!(worth_restarting_mid_descent(true, -676.7746, true));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, true));
+    assert!(!worth_restarting_mid_descent(true, f64::INFINITY, true));
+    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY, true));
     // A finite objective is not on its own a reason to restart.
-    assert!(!worth_restarting_mid_descent(false, 3209.8087));
+    assert!(!worth_restarting_mid_descent(false, 3209.8087, true));
+}
+
+/// A stall on the last permitted evaluation is not restarted (#1428): the
+/// restart continues the fit on the *remaining* `outer_maxiter` budget, and with
+/// none left there is nothing to continue with — `set_maxeval(0)` would give
+/// NLopt an unlimited budget, the opposite of what the user's `maxiter` said.
+/// The `budget_left = false` rows are the ones that fail if the argument is
+/// dropped or OR-ed instead of AND-ed.
+#[test]
+fn test_mid_descent_restart_needs_budget_left() {
+    use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
+
+    assert!(worth_restarting_mid_descent(true, 3209.8087, true));
+    assert!(!worth_restarting_mid_descent(true, 3209.8087, false));
+    assert!(!worth_restarting_mid_descent(false, 3209.8087, false));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN, false));
+}
+
+/// The restart leg's evaluation budget is the fit's budget less what the
+/// stalled leg spent, from the one formula both legs read (#1428). Measured on
+/// the #1277 fixture before this: `maxiter = 1` is 44 evals at `n = 43`, the
+/// stalled leg spent 12, and the restart was given a fresh 44 — 56 in all.
+#[test]
+fn test_outer_eval_budget_is_shared_by_both_legs() {
+    use crate::estimation::outer_optimizer::outer_eval_budget;
+
+    // Gradient methods: outer_maxiter × (n + 1).
+    assert_eq!(outer_eval_budget(nlopt::Algorithm::Lbfgs, 43, 1), 44);
+    assert_eq!(outer_eval_budget(nlopt::Algorithm::Slsqp, 3, 200), 800);
+    // BOBYQA carries its 40 × (n + 1) triangulation headroom on top.
+    assert_eq!(
+        outer_eval_budget(nlopt::Algorithm::Bobyqa, 3, 200),
+        800 + 160
+    );
+    // What the restart leg is left with after the stalled leg's 12 evals.
+    assert_eq!(
+        outer_eval_budget(nlopt::Algorithm::Lbfgs, 43, 1).saturating_sub(12),
+        32
+    );
 }
 
 /// The published escape verdict is measured against the **original** initial
@@ -2363,7 +2402,7 @@ fn test_mid_descent_restart_skips_a_non_finite_objective() {
 /// against an implementation that answered `true` unconditionally.
 #[test]
 fn test_published_escape_verdict_uses_the_original_start() {
-    use crate::estimation::outer_optimizer::optimize_nlopt_once;
+    use crate::estimation::outer_optimizer::{optimize_nlopt_once, RestartLeg};
 
     let model = make_model();
     let population = make_population(4);
@@ -2421,7 +2460,10 @@ fn test_published_escape_verdict_uses_the_original_start() {
         &options,
         false,
         &declines,
-        Some(&reference),
+        Some(RestartLeg {
+            escape_from: &reference,
+            spent_evals: 0,
+        }),
     );
 
     // The straddle itself, asserted so it cannot silently become a tautology: the
