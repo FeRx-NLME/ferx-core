@@ -6480,6 +6480,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Info, WarningCode::MultiStart)
     } else if lower.contains("cancelled by user") {
         (WarningSeverity::Info, WarningCode::Cancelled)
+    } else if lower.contains("thread count overridden") {
+        // #1416: a front end's explicit `--threads` beat the model file's
+        // `[fit_options] threads`. A Warning, not Info, for the same reason the
+        // `--data` override is one — the two inputs disagreed and one was dropped.
+        (WarningSeverity::Warning, WarningCode::Threads)
     } else if lower.contains("threads configured") || lower.contains("threads than subjects") {
         (WarningSeverity::Info, WarningCode::Threads)
     } else if lower.contains("n\u{00b2} ofv")
