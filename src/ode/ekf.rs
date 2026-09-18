@@ -20,7 +20,7 @@
 use crate::dosing::{
     is_real_infusion, note_ss_nonconvergence_if_capped, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
-use crate::ode::predictions::{active_infusions, ss_run_in_params, tad_anchor_for};
+use crate::ode::predictions::{active_infusions, ss_run_in_params};
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::types::DoseEvent;
 use nalgebra::{DMatrix, DVector};
@@ -178,8 +178,8 @@ fn kalman_update(
 ///
 /// The pulse train is expanded the way the ODE path's nonlinear fallback does it
 /// (`equilibrate_ss_pk_state`): from `u = 0, P = 0`, cycles of *(apply dose; integrate
-/// `II`)* on a monotone clock — bolus, or an `F`-reshaped active window followed by a quiet
-/// one — until the concatenated `(u, P)` stops moving by [`SsStopTracker`]'s criterion or
+/// `II`)* on that fallback's cycle-local clock — bolus, or an `F`-reshaped active window
+/// followed by a quiet one — until the concatenated `(u, P)` stops moving by [`SsStopTracker`]'s criterion or
 /// [`SS_EQUILIBRATION_CYCLES`] is spent, with the #867 non-convergence warning on a spent
 /// cap. No exact linear fixed point here: a bolus leaves `P` untouched, so `P`'s cycle map
 /// is the continuous Riccati flow over `II`, and the same Euler quadrature the walk uses is
@@ -187,6 +187,15 @@ fn kalman_update(
 /// the issue was measured against). `P` is carried alongside `u` rather than seeded after
 /// it because on a nonlinear right-hand side the Jacobian along the cycle depends on the
 /// mean's own phase, which is exactly what the one-dose mean got wrong.
+///
+/// Cost, measured on the #1260 fixture (`sde_integration`'s Michaelis–Menten subject, one
+/// objective evaluation in a debug build): the run-in early-stops after 16–21 cycles, and
+/// the evaluation takes 569 ms with the `SS=1` record against 996 ms with the 41 explicit
+/// records it stands for and 58 ms with the record read as a single dose. It is the price
+/// of the train the record abbreviates, paid on every evaluation and every FD perturbation
+/// of the filter; a linear right-hand side has a closed-form pair (the ODE path's affine
+/// fixed point for the mean, a discrete Lyapunov solve for `P`) that would remove most of
+/// it, should a dataset with an `SS=1` record on every occasion ever need it.
 ///
 /// Returns the zero pair — the pre-#1260 state — for the shapes the ODE run-in also
 /// declines: `II ≤ 0`, a compartment outside the state vector, or an infusion longer than
@@ -211,20 +220,17 @@ fn equilibrate_ss_ekf(
     if is_inf && t_inf > dose.ii {
         return (u, p_mat);
     }
-    // One ordinary pulse per cycle at `m·II`, so `tad_anchor_for` reads the pulse
-    // governing each cycle off the same rule as the walk (#1139).
-    let local_doses: Vec<DoseEvent> = (0..SS_EQUILIBRATION_CYCLES)
-        .map(|m| {
-            DoseEvent::new(
-                m as f64 * dose.ii,
-                dose.amt,
-                dose.cmt_raw(),
-                0.0,
-                false,
-                0.0,
-            )
-        })
-        .collect();
+    // Every window opens on a clock whose origin is its cycle's pulse — `(0, II)` for a
+    // bolus cycle, `(0, T_inf)` then `(0, II − T_inf)` for an infusion — the clock the ODE
+    // bolus/infusion run-in integrates on (`equilibrate_ss_pk_state`'s exact solve and its
+    // capped train alike). A right-hand side reading `T` / `TIME` therefore sees the same
+    // run-in on both engines; the objective mixes the ODE path's `IPRED` with this
+    // filter's `p_obs`, and a monotone `m·II` clock here would have equilibrated the two
+    // halves of one subject on different histories. `TAD` is anchored per window through
+    // `ss_run_in_params` — `0` for a window opening at the pulse, `−T_inf` for the quiet
+    // window that re-opens its clock after the active one — and `TAFD` is left `NaN`
+    // (#1139).
+    let ext_cycle = ss_run_in_params(pk_params_flat, 0.0);
     let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         rhs(y, p, t, dy);
         if cmt_idx < dy.len() {
@@ -259,16 +265,16 @@ fn equilibrate_ss_ekf(
     let mut early_stopped = false;
     let mut pair = vec![0.0f64; n + n * n];
     for m in 0..SS_EQUILIBRATION_CYCLES {
-        let t0 = m as f64 * dose.ii;
-        let ext = ss_run_in_params(pk_params_flat, tad_anchor_for(&local_doses, &[], t0));
         if is_inf {
-            p_mat = advance(&wrapped_rhs, &mut u, p_mat, t0, t0 + t_inf, &ext);
-            if dose.ii - t_inf > 0.0 {
-                p_mat = advance(rhs, &mut u, p_mat, t0 + t_inf, t0 + dose.ii, &ext);
+            p_mat = advance(&wrapped_rhs, &mut u, p_mat, 0.0, t_inf, &ext_cycle);
+            let quiet = dose.ii - t_inf;
+            if quiet > 0.0 {
+                let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
+                p_mat = advance(rhs, &mut u, p_mat, 0.0, quiet, &ext_quiet);
             }
         } else {
             u[cmt_idx] += f_bio * dose.amt;
-            p_mat = advance(rhs, &mut u, p_mat, t0, t0 + dose.ii, &ext);
+            p_mat = advance(rhs, &mut u, p_mat, 0.0, dose.ii, &ext_cycle);
         }
         pair[..n].copy_from_slice(&u);
         pair[n..].copy_from_slice(p_mat.as_slice());
@@ -2058,6 +2064,118 @@ mod tests {
             "the single-infusion arm must be far from the train: ipred {d_mean:.3e}, \
              p_obs {d_cov:.3e} (measured 5.2e-1 / 7.6e-1)"
         );
+    }
+
+    /// **The run-in integrates on the ODE run-in's cycle-local clock**, so a right-hand side
+    /// reading `T` / `TIME` is equilibrated identically by both engines — the objective takes
+    /// `IPRED` from the ODE path and `p_obs` from this filter, and they must describe one
+    /// history. For `dA/dt = −ke·A·(1 + c·T)` the cycle map on the local clock `(0, II)` is
+    /// the constant `M = exp(−ke·(II + c·II²/2))`, so the periodic trough is `D·M/(1 − M)`
+    /// in closed form, and the walk after the record at `t = 480` runs on the real clock:
+    /// `A(480 + Δ) = (trough + D)·exp(−ke·(Δ + c·((480 + Δ)² − 480²)/2))`. Both engines
+    /// are checked against that third reference, not only against each other.
+    ///
+    /// Regression it catches: a monotone `m·II` clock in the run-in (the first draft of
+    /// #1260). Its 50th cycle integrates over `T ∈ (588, 600)`, where elimination is 31×
+    /// the local-clock rate, so the trough collapses to ~0 and the seed is the single-dose
+    /// state — the `SS=0` arm is asserted far from the closed form so that answer cannot
+    /// pass. (A `TAD`-reading RHS cannot see the clock: its anchor moves with it, which is
+    /// what `ekf_ss_infusion_matches_the_explicit_train_on_a_tad_reading_rhs` pins.)
+    #[test]
+    fn ekf_ss_run_in_shares_the_ode_run_in_clock_on_a_time_reading_rhs() {
+        use crate::ode::predictions::{ode_predictions, OdeSpec};
+        use crate::types::Subject;
+        use std::collections::HashMap;
+
+        let (cl, v, c, ii, amt) = (1.0f64, 20.0f64, 0.05f64, 12.0f64, 100.0f64);
+        let ke = cl / v;
+        fn t_reading_rhs(y: &[f64], p: &[f64], t: f64, dy: &mut [f64]) {
+            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            dy[0] = -ke * y[0] * (1.0 + 0.05 * t);
+        }
+        let pk = make_pk(cl, v);
+        let (ss, _, single, obs_times) = ss_fixture(amt, 0.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let run = |doses: &[DoseEvent]| {
+            solve_ekf(
+                &t_reading_rhs,
+                1,
+                0,
+                &[0.0], // zero diffusion: the mean walk is plain integration
+                &pk,
+                &Default::default(),
+                &[],
+                doses,
+                &obs_times,
+                &vec![0.01; obs_times.len()],
+                opts,
+            )
+        };
+        let (got, was) = (run(&ss), run(&single));
+
+        let subj = Subject {
+            id: "1".into(),
+            doses: ss.clone(),
+            obs_times: obs_times.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; obs_times.len()],
+            obs_cmts: vec![1; obs_times.len()],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; obs_times.len()],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let ode_spec = OdeSpec {
+            chz_state_slots: Vec::new(),
+            rhs: Box::new(t_reading_rhs),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: crate::ode::OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            init_fn: None,
+            solver_opts: opts,
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+        let ode = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
+
+        let m = (-ke * (ii + c * ii * ii / 2.0)).exp();
+        let trough = amt * m / (1.0 - m);
+        for (j, &t) in obs_times.iter().enumerate() {
+            let d = t - 480.0;
+            let want = (trough + amt)
+                * (-ke * (d + c * ((480.0 + d).powi(2) - 480.0f64.powi(2)) / 2.0)).exp();
+            assert!(got[j].ipred.is_finite() && ode[j].is_finite() && was[j].ipred.is_finite());
+            // Measured against the closed form: EKF 8.5e-11 … 1.5e-9, ODE 8.6e-11 … 1.5e-9
+            // (15.08059537 at Δ = 2 on all three); the bound is three orders above.
+            assert_relative_eq!(got[j].ipred, want, max_relative = 1e-6);
+            assert_relative_eq!(ode[j], want, max_relative = 1e-6);
+            // The straddle: the single-dose seed is 4.58e-1 off at every sample, and under
+            // the monotone-clock mutation the EKF reads 8.16755988 at Δ = 2 — the
+            // single-dose arm's 8.16755980 to 8 figures — while the ODE twin stays put.
+            assert!(
+                (was[j].ipred - want).abs() / want > 0.2,
+                "single-dose arm {} must sit far from the periodic closed form {want}",
+                was[j].ipred
+            );
+        }
     }
 
     /// **An overlapping `SS=1` infusion (`T_inf > II`) is declined, not half-equilibrated.**

@@ -176,6 +176,13 @@ apply a lag time. A model can therefore show a correct `IPRED` and a wrong objec
 same time — which is why the warnings are raised by `fit()` and `ferx check` rather than at
 prediction time.
 
+`TIME` / `T` is the integration variable itself and has always been readable here. `TAFD`
+and `TAD` are passed in two extra parameter slots, and until #1131 the EKF was handed an
+array two slots short, so both evaluated to `NaN` for the whole trajectory. That failure was
+easy to miss: `IPRED` is computed on the ordinary ODE path and stayed correct, while the
+objective — which is what the filter actually contributes — became the diverged-subject
+sentinel. A right-hand side reading neither builtin was never affected.
+
 ### Steady-state records are equilibrated {#sde-steady-state}
 
 An `SS=1` record is equilibrated on the EKF path the way the ODE path's nonlinear run-in
@@ -196,12 +203,17 @@ so does an `SS=1` infusion against its explicit infusion train on a right-hand s
 `TAD`. An `SS=1` infusion longer than `II` (overlapping pulses) is the one steady-state
 shape neither engine equilibrates; `W_STEADY_STATE_INFUSION` names it at check time.
 
-`TIME` / `T` is the integration variable itself and has always been readable here. `TAFD`
-and `TAD` are passed in two extra parameter slots, and until #1131 the EKF was handed an
-array two slots short, so both evaluated to `NaN` for the whole trajectory. That failure was
-easy to miss: `IPRED` is computed on the ordinary ODE path and stayed correct, while the
-objective — which is what the filter actually contributes — became the diverged-subject
-sentinel. A right-hand side reading neither builtin was never affected.
+The run-in reads model time the way the ODE run-in does: each cycle is integrated on a
+clock whose origin is its own pulse, so `TAD` is anchored per window, `T` / `TIME` take
+that cycle-local value, and `TAFD` reads `NaN` — there is no periodic steady state for a
+quantity that grows without bound. A right-hand side reading `TAFD`, `T` or `TIME` under an
+`SS=1` record is named by `W_STEADY_STATE_ABSOLUTE_TIME` at check time, with or without a
+`[diffusion]` block.
+
+The run-in is the cost of the train the record abbreviates, paid on every objective
+evaluation: on the fixture above one evaluation takes 569 ms with the `SS=1` record against
+996 ms with the 41 explicit records and 58 ms with the record read as a single dose (debug
+build; the run-in stops after 16–21 cycles).
 
 ## ferx-r usage note
 

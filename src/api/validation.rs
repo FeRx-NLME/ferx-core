@@ -5309,12 +5309,14 @@ pub fn check_model_data_warnings(
     // own comment above (a modeled SS infusion may overlap on some occasions only), so
     // blanket suppression would drop a true finding.
     //
-    // `[diffusion]` is **not** excluded, and the reason is measured rather than assumed.
-    // `solve_ekf` seeds a finite TAFD anchor and never equilibrates (#1260), which reads like
-    // an exemption — but `ode_predictions_ekf_with_diffusion` computes the Kalman `R` from a
-    // standard `ode_predictions` pass, and that one does run the run-in, so the `NaN` reaches
-    // the likelihood anyway: the same model plus `[diffusion] central ~ 0.01` measures
-    // `OFV: NaN`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
+    // `[diffusion]` is **not** excluded, twice over. Since #1260 `solve_ekf` runs its own
+    // run-in (`ode::ekf::equilibrate_ss_ekf`) on the same cycle-local clock with the same
+    // `ss_run_in_params` anchors, so a `TAFD`-reading RHS reads `NaN` there first-hand and a
+    // `T` / `TIME`-reading one sees the cycle-local value on both engines. And even before
+    // that, `ode_predictions_ekf_with_diffusion` computed the Kalman `R` from a standard
+    // `ode_predictions` pass, which does run the run-in, so the `NaN` reached the likelihood
+    // anyway — measured then as `OFV: NaN` on the same model plus `[diffusion] central ~
+    // 0.01`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
     if let Some(prog) = model
         .ode_spec
         .as_ref()

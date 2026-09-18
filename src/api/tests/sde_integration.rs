@@ -538,17 +538,21 @@ mod sde_steady_state_scores_like_the_explicit_train {
         let (got, warnings) = ofv(&ss);
         let (want, _) = ofv(&train);
         let (was, _) = ofv(&single);
-        // Measured: bit-identical (10.125356 both).
+        // Measured: bit-identical (10.125356 both). The straddle is measured against the
+        // OLD behaviour itself, not inferred from the control below: with the `SS=1` hook
+        // in `solve_ekf` disabled, this arm scores **9.290403** — 0.835 *below* the train,
+        // `p_obs` 55 % low at the first sample and 2–3 % low after the first update on an
+        // `IPRED` that is the ODE path's and so already equilibrated. The bound sits six
+        // orders inside that gap. (The issue's 120.53 was on DVs with more residual
+        // leverage.)
         assert!(
             (got - want).abs() < 1e-6,
             "SS=1 record scores {got:.6} against the explicit train's {want:.6}"
         );
-        // Measured: 15.2427 against 10.1254, a 5.12 gap carried by `p_obs` alone — the
-        // objective takes only the filter covariance (`likelihood.rs` discards the EKF
-        // mean; `IPRED` is the ODE path's, equilibrated either way), 55 % low at the
-        // first sample and 2–3 % low after the first update. The issue's 120.53 sat on
-        // DVs with more residual leverage; the bound is a third of what this fixture
-        // measures.
+        // Non-degeneracy of the flag: the `SS=0` control scores 15.2427, a 5.12 gap. That is
+        // *not* the pre-fix number — with the flag off, the ODE path's `IPRED` is single-dose
+        // too, so both halves of the objective move — but it pins that this fixture can
+        // tell a record read as one dose from the train at all.
         assert!(
             (was - want).abs() > 1.5,
             "the single-dose control must sit far from the train ({was:.3} vs {want:.3}) \
