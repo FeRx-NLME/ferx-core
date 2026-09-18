@@ -170,7 +170,7 @@ Unlike the analytical engine there is no infusable subset: every declared state 
 
 ### When a defaulted `CMT` is reported (`W_CMT_DEFAULTED`)
 
-`CMT` addresses **two** things, and the warning covers both.
+`CMT` addresses **three** things, and the warning covers all of them.
 
 The first is **which compartment a dose lands in** — and that is not only an `[odes]` question. An oral model's `CMT=2` is the depot-bypassing central bolus and a 2-cpt IV model's `CMT=2` is a peripheral bolus, both routed through the event-driven walk and both anchored against NONMEM (`ADVAN2` central, `ADVAN3`/`ADVAN4` peripheral). So a dataset that meant one of those and lost its `CMT` column silently gets a compartment-1 bolus instead, exactly as a translated `DEFDOSE` model does. The warning therefore fires for any model with more than one compartment a dose can reach, and stays silent for the models where there is nothing to choose: `one_cpt_iv`, a one-state `[odes]` model, a compartment-free model, and the transit / inverse-Gaussian absorption models, whose closed form absorbs every dose through the depot whatever `CMT` says.
 
