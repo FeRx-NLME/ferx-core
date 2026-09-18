@@ -14,8 +14,8 @@
 //! compartment the reader chose.
 //!
 //! Since #1409 the predicate is an `any()` over [`CmtConsumer`], so the channels are
-//! also tested *as an enumeration*: `cmt_consumer_iter_visits_every_variant_once` pins
-//! the `next()` chain that *is* the list, and
+//! also tested *as an enumeration*: `cmt_consumer_all_is_generated_from_the_enum_itself`
+//! pins the macro-generated list, and
 //! `every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one` requires each
 //! variant to carry a model on which **it alone** reads `CMT` — so a new consumer is
 //! a compile error until someone builds the shape that makes it live, and no arm can
@@ -325,6 +325,43 @@ fn an_endpoint_model_reports_because_its_rows_route_by_cmt() {
 
 #[cfg(feature = "survival")]
 #[test]
+fn an_endpoint_at_the_default_compartment_still_reports_when_gaussian_rows_exist() {
+    // Both halves of the `routes_only(DEFAULT_CMT)` suppression, pinned apart.
+    //
+    // A lone endpoint at `cmt = 1` on an **endpoint-only** model is the documented
+    // false positive #1409 closed: the reader's fallback IS the endpoint, so the guess
+    // is provably right. But the same endpoint on a model that also scores Gaussian
+    // observations is a genuine ambiguity — a defaulted row picks between the endpoint
+    // and the Gaussian grid — and must still report.
+    //
+    // Without this case the suppression can be written as `routes_only(1)` alone and
+    // the whole suite stays green (verified by mutation), silently withdrawing the
+    // warning from every `cmt = 1` endpoint model that has ordinary observations too.
+    let gaussian_and_endpoint = with_tte_endpoint(analytical(PkModel::OneCptIv), 1);
+    assert!(
+        matches!(
+            gaussian_and_endpoint.error_spec,
+            crate::types::ErrorSpec::Single(_)
+        ),
+        "fixture must score Gaussian observations, or it is the endpoint-only case"
+    );
+    assert!(
+        CmtConsumer::EndpointRouting.is_live(&gaussian_and_endpoint, &no_filter()),
+        "a defaulted row picks between the cmt=1 endpoint and the Gaussian grid"
+    );
+
+    // The endpoint-only twin of the same shape: nothing else to fall into, so silent.
+    let mut endpoint_only = with_tte_endpoint(analytical(PkModel::OneCptIv), 1);
+    endpoint_only.error_spec = crate::types::ErrorSpec::PerCmt(std::collections::HashMap::new());
+    assert!(
+        !CmtConsumer::EndpointRouting.is_live(&endpoint_only, &no_filter()),
+        "an endpoint-only model whose only endpoint is the default compartment has \
+         one provably-right answer"
+    );
+}
+
+#[cfg(feature = "survival")]
+#[test]
 fn the_empty_error_map_and_the_routing_set_are_the_same_models() {
     // The safety condition for `PerCmtErrorModel` to require a non-empty map. An
     // empty `ErrorSpec::PerCmt` is the parser's marker for "no `[error_model]`
@@ -541,38 +578,47 @@ fn an_unparseable_data_selection_clause_is_answered_conservatively() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cmt_consumer_iter_visits_every_variant_once() {
-    // The enumeration is the `next()` chain, so this pins that the chain is a
-    // permutation rather than a path that skips or revisits: every variant the chain
-    // yields is distinct, and the head is reachable from nowhere else.
+fn cmt_consumer_all_is_generated_from_the_enum_itself() {
+    // The completeness guard, and what it now rests on. `CmtConsumer` and
+    // `CmtConsumer::ALL` are expanded from a single `cmt_consumers!` token list, so a
+    // variant cannot exist without being in `ALL` — there is no second list to forget.
     //
-    // What this replaced, and why: the first version kept a hand-written
-    // `CmtConsumer::ALL` array beside an exhaustive `index()`, and asserted only that
-    // each array slot indexed itself. The #1423 review found the hole by probe — a
-    // 7th variant with arms in `index`, `is_live` and `only_live` but missing from the
-    // array left all 22 tests in this file green while `cmt_defaulting_is_ambiguous`
-    // never asked it. With the array gone there is no second list to forget.
-    let seen: Vec<CmtConsumer> = CmtConsumer::iter().collect();
-    let mut deduped = seen.clone();
-    deduped.dedup();
-    assert_eq!(
-        seen, deduped,
-        "the next() chain must not revisit a variant: {seen:?}"
-    );
-    for c in &seen {
+    // Two earlier spellings both had a hole, each found by the same probe (a 7th
+    // variant with arms in every `match`): a hand-written `ALL: [CmtConsumer; 6]` left
+    // the suite green because the array simply stayed at six, and a `next()` chain left
+    // it green because a variant whose arm was `None` was unreachable from the
+    // iterator. Under the macro the probe reddens
+    // `every_cmt_consumer_has_a_fixture_where_it_is_the_only_live_one`, which is the
+    // behaviour we want: a new channel is not done until it has a fixture.
+    //
+    // This test pins the cheap structural half — no duplicates, and every channel this
+    // file builds a fixture for is present.
+    let all: Vec<CmtConsumer> = CmtConsumer::iter().collect();
+    for c in &all {
         assert_eq!(
-            seen.iter().filter(|x| *x == c).count(),
+            all.iter().filter(|x| *x == c).count(),
             1,
-            "{c:?} appears more than once in the chain: {seen:?}"
+            "{c:?} appears more than once in CmtConsumer::ALL: {all:?}"
         );
     }
-    // A chain that collapsed to its head would satisfy everything above, so pin that
-    // it actually walks: every channel this file builds a fixture for is in it.
-    assert!(
-        seen.len() >= 6,
-        "the chain lost variants — it yields only {:?}",
-        seen
+    assert_eq!(
+        all.len(),
+        CmtConsumer::ALL.len(),
+        "iter() must visit every entry of ALL"
     );
+    for expected in [
+        CmtConsumer::DoseCompartment,
+        CmtConsumer::PerCmtScaling,
+        CmtConsumer::PerCmtErrorModel,
+        CmtConsumer::PerCmtReadout,
+        CmtConsumer::EndpointRouting,
+        CmtConsumer::DataSelectionFilter,
+    ] {
+        assert!(
+            all.contains(&expected),
+            "{expected:?} is missing from CmtConsumer::ALL: {all:?}"
+        );
+    }
 }
 
 /// A model + options on which **exactly one** consumer reads `CMT`.

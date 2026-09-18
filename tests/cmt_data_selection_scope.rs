@@ -581,3 +581,206 @@ fn fit_from_files_reports_the_filter_its_own_read_applied() {
         result.warnings
     );
 }
+
+#[test]
+fn a_filter_deleted_row_is_reported_by_every_entry_point_including_predict() {
+    // The #1423 review's sixth finding. `predict()` / `simulate()` / the adaptive
+    // driver are handed a `Population` the caller already read, so they have no
+    // `&FitOptions` and cannot answer "does a `[data_selection]` clause read CMT?" —
+    // they passed `FitOptions::default()` and therefore suppressed a warning whose
+    // entire content was rows the filter had deleted on a guessed compartment.
+    // `read_population_for_simulation` is public and takes a `SelectionFilter`, so
+    // ferx-r can reach exactly that state.
+    //
+    // The fix does not thread options through four public entry points: the reader
+    // only counts a deleted row when the rule that removed it actually read `CMT`, so
+    // the finding carries its own proof and is never suppressed. This pins that the
+    // proof survives on the entry point that has nothing else to go on.
+    let src = model_src(IGNORE_CMT1_AT_T4);
+    let d = temp(&csv("x"), ".csv");
+    let parsed = parse_full_model(&src).expect("model parses");
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &[])
+        .expect("the clause parses");
+    let (population, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        d.path().to_str().unwrap(),
+        None,
+        None,
+        Some(&filter),
+        &parsed.column_map,
+    )
+    .expect("dataset loads");
+
+    // The reader really did delete a row on the guessed compartment, else there is
+    // nothing for the entry point to report and the assertion below is vacuous.
+    assert!(
+        population
+            .warnings
+            .iter()
+            .any(|w| w.contains("removed from the fit by a [data_selection] condition")),
+        "the reader must report the deletion: {:?}",
+        population.warnings
+    );
+
+    // `predict_diag` carries the same bundle as `simulate`/`simulate_adaptive`
+    // (`non_fit_diagnostics`), so one of the three is enough to pin the shared filter.
+    let out = ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "predict() must report a compartment guess that deleted rows from the data it \
+         was handed: {:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn predict_still_suppresses_a_cmt_guess_that_addresses_nothing() {
+    // The control, and the reason the arm above is keyed on the deletion rather than
+    // on "this is a W_CMT_DEFAULTED". A one-compartment model with no per-CMT
+    // anything and no filter reads `CMT` for nothing, so `predict()` must stay quiet —
+    // otherwise the change above would have widened the warning to every model.
+    let src = model_src(NO_SELECTION);
+    let d = temp(&csv("x"), ".csv");
+    let parsed = parse_full_model(&src).expect("model parses");
+    let (population, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        d.path().to_str().unwrap(),
+        None,
+        None,
+        None,
+        &parsed.column_map,
+    )
+    .expect("dataset loads");
+    assert!(
+        population
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "the reader still counts the guess — it is the model-aware filter that drops it"
+    );
+    let out = ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params);
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "nothing on this model reads CMT, so the guess changed no number: {:?}",
+        out.warnings
+    );
+}
+
+#[cfg(feature = "survival")]
+/// A TTE-only model whose single endpoint sits at `cmt`, with no `[error_model]`
+/// block — so the parser leaves its per-CMT error map empty and there is no Gaussian
+/// grid for a row to fall into.
+fn tte_only_src(cmt: usize) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = {cmt}
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+"#
+    )
+}
+
+#[cfg(feature = "survival")]
+/// Event rows on `cmt`, with the first subject's cell written as `spelling`.
+fn tte_csv(spelling: &str, other: usize) -> String {
+    format!(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+         1,12,1,0,.,{spelling},0\n\
+         2,30,0,0,.,{other},0\n\
+         3,22,1,0,.,{other},0\n"
+    )
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn a_lone_endpoint_at_the_default_compartment_is_not_reported() {
+    // The endpoint channel's documented false positive, closed. A TTE-only model whose
+    // only endpoint is at `cmt = 1` has exactly one place a row can go: the reader's
+    // fallback IS the endpoint, and any other CMT is an `E_ENDPOINT_UNROUTED` error
+    // rather than a silent re-route. So a defaulted cell changes nothing and the
+    // warning was pure noise.
+    //
+    // Measured, not asserted from the predicate: the objective is identical under both
+    // spellings, which is what "changes nothing" means here.
+    let src = tte_only_src(1);
+    let (n_readable, nll_readable) = scored(&src, &tte_csv("1", 1));
+    let (n_defaulted, nll_defaulted) = scored(&src, &tte_csv("x", 1));
+    assert_eq!(
+        (n_readable, n_defaulted),
+        (0, 0),
+        "TTE rows are event records, not Gaussian observations"
+    );
+    assert_eq!(
+        nll_readable.to_bits(),
+        nll_defaulted.to_bits(),
+        "the guessed compartment must change nothing on this model: \
+         {nll_readable} vs {nll_defaulted}"
+    );
+    assert!(
+        !warns_on_read(&src, &tte_csv("x", 1)),
+        "a lone endpoint at the default compartment leaves nothing to guess wrong"
+    );
+}
+
+#[cfg(feature = "survival")]
+/// Competing risks: two TTE endpoints, at `cmt = 1` and `cmt = 2`. No
+/// `[error_model]`, so still endpoint-only — but the routing names more than the
+/// default compartment.
+fn competing_risks_src() -> String {
+    r#"
+[parameters]
+  theta TVA(0.05, 0.001, 10.0)
+  theta TVB(0.03, 0.001, 10.0)
+  omega ETA_A ~ 0.09
+
+[event_model cause_a]
+  cmt    = 1
+  family = exponential
+  scale  = TVA * exp(ETA_A)
+
+[event_model cause_b]
+  cmt    = 2
+  family = exponential
+  scale  = TVB
+"#
+    .to_string()
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn an_endpoint_model_that_routes_more_than_the_default_is_still_reported() {
+    // The straddle, and the half that keeps the fix above from being a blanket
+    // silence for endpoint-only models. With endpoints at `cmt = 1` AND `cmt = 2`, a
+    // defaulted row keys to 1 — a real endpoint — so it is silently scored against
+    // `cause_a` when the dataset meant `cause_b`. That is the #1404 measurement this
+    // channel exists for (OFV 27.8497 against 28.3610 on its fixture), and
+    // `routes_only(DEFAULT_CMT)` is false here, so the suppression must not apply.
+    //
+    // A single endpoint at `cmt = 2` is deliberately NOT the straddle used: there the
+    // defaulted row leaves the endpoint for a Gaussian grid the model has no error
+    // model for, and ferx stops with `E_PER_CMT_ERROR_MODEL` — loud, not silent, so it
+    // is not what this warning is for. The end-to-end version of that shape, on a
+    // model that *does* carry an `[error_model]` and so takes the row silently, is
+    // `tests/cmt_endpoint_scope.rs`.
+    let src = competing_risks_src();
+    assert!(
+        warns_on_read(&src, &tte_csv("x", 2)),
+        "a defaulted row lands on cause_a although the dataset named cause_b"
+    );
+    assert!(
+        !warns_on_read(&src, &tte_csv("1", 2)),
+        "control: no defaulted cell, no finding"
+    );
+}
