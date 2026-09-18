@@ -170,7 +170,8 @@ harmless and still accepted. The same rule applies to the other two alias pairs,
 Prefer using only one of the two names per model.
 
 The mirror image — one variable under two **different** roles, `f=X, lagtime=X`
-— is rejected too ([#1359](https://github.com/FeRx-NLME/ferx-core/issues/1359)):
+— is rejected too ([#1359](https://github.com/FeRx-NLME/ferx-core/issues/1359));
+the rule covers every pair of roles, see [Structural model](structural-model.qmd):
 
 ```
 [structural_model]: `f=X` and `lagtime=X` bind one parameter to two different

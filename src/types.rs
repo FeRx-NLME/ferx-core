@@ -5042,12 +5042,35 @@ impl CompiledModel {
     ///      `ALAGn` is rejected at parse time, and one bound via `lagtime=` /
     ///      `alag=` is covered by route 1.)
     ///
+    ///   3. A numeric **literal** on the analytical line (`lagtime=0.5`) writes
+    ///      the slot with no variable behind it, so `pk_indices` cannot record
+    ///      it; the parser lists such slots in `indiv_param_partials`. Measured
+    ///      before this arm existed (review of #1441): `analytical_supported`
+    ///      was true, the sensitivity provider ran the lag-free walk and its
+    ///      values sat 120 % (oral, first sample) / 11 % (IV bolus) from the
+    ///      production predictor that applied the lag — a wrong gradient on the
+    ///      default estimator. A literal lag is a *fixed* break, but every
+    ///      consumer of this predicate handles a lag whose derivative is zero,
+    ///      so routing it through the lag-aware paths is correct and only
+    ///      forgoes the fast path.
+    ///
     /// Known gap, unchanged here: a `lagtime=` binding to a name assigned only
     /// inside an `if` without `else` resolves in `build_pk_param_fn` (which sees
     /// every assigned name) but is not in `indiv_param_names`, so route 1 misses
     /// it.
     pub fn has_lagtime(&self) -> bool {
-        self.pk_indices.contains(&PK_IDX_LAGTIME) || self.has_indexed_dose_attr(DoseAttr::Lag, None)
+        self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, None)
+    }
+
+    /// Routes 1 and 3 of [`Self::has_lagtime`]: the bare lag slot is written,
+    /// by a declared parameter (`pk_indices`) or by a literal on the `pk(...)`
+    /// line (`const_pk_slots`).
+    fn routes_lag_slot(&self) -> bool {
+        self.pk_indices.contains(&PK_IDX_LAGTIME)
+            || self
+                .indiv_param_partials
+                .const_pk_slots()
+                .contains(&PK_IDX_LAGTIME)
     }
 
     /// Route 2 of [`Self::has_lagtime`] / [`Self::has_bioavailability`]: an ODE
@@ -5086,8 +5109,7 @@ impl CompiledModel {
     /// (`ALAG2` while `cmt` is 1) does not count — used to scope the SS+lag
     /// rejection (#719 gap 1) to the actual SS-dosed compartment.
     pub fn has_lagtime_on_cmt(&self, cmt: usize) -> bool {
-        self.pk_indices.contains(&PK_IDX_LAGTIME)
-            || self.has_indexed_dose_attr(DoseAttr::Lag, Some(cmt))
+        self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, Some(cmt))
     }
 
     /// True when `subject` has a steady-state dose into a built-in absorption
@@ -5138,7 +5160,12 @@ impl CompiledModel {
     /// (`ode_param_slots` routes the canonical name to that slot); a
     /// compartment-indexed `Fn` routes on the ODE engine only and is found by
     /// name. An analytical `F` declared without an `f=` binding is never applied
-    /// and is not a bioavailability here (#1359). Used with
+    /// and is not a bioavailability here (#1359). A literal `f=0.8` is not one
+    /// either, deliberately: unlike the lag (route 3 of [`Self::has_lagtime`]) a
+    /// constant `F` is read off the slot by both the production predictor and the
+    /// sensitivity provider (measured equal to 1e-9 in the #1441 review), and this
+    /// predicate's one consumer asks whether `F` can *change* across the inner
+    /// search, which a literal cannot. Used with
     /// [`Subject::has_rate_defined_infusion`] to skip the event-driven
     /// [`crate::pk::event_driven::EventSchedule`] cache when `F` could reshape an
     /// infusion window across the inner search (#419).

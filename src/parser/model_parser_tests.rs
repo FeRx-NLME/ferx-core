@@ -2937,6 +2937,13 @@ fn one_variable_bound_to_two_pk_roles_collides_the_way_it_binds() {
         err.contains("two different PK roles"),
         "the lowercase compat spelling must collide like the exact one, got: {err}"
     );
+    // Both mappings quoted as written: the file says `f=X` and `lagtime=x`, and a
+    // message that spells the first one with the second's casing (`f=x`) names
+    // text the file does not contain (review of #1441).
+    assert!(
+        err.contains("`f=X`") && err.contains("`lagtime=x`") && !err.contains("`f=x`"),
+        "each mapping must be quoted in its own spelling, got: {err}"
+    );
     // Any pair of roles, not just the two dose attributes: the noun table has to
     // cover every slot `PkParams::name_to_index` hands out.
     let src = analytical_dose_attr_src("f=KA", "F  = TVF", "");
@@ -2945,6 +2952,34 @@ fn one_variable_bound_to_two_pk_roles_collides_the_way_it_binds() {
         err.contains("the absorption rate constant") && err.contains("the bioavailability"),
         "a non-dose-attribute role must be named too, got: {err}"
     );
+}
+
+#[test]
+fn case_distinct_names_under_two_roles_keep_their_own_slots() {
+    // Review of #1441: `pk_indices` used to come from a reversal of `pk_param_map`
+    // keyed on the UPPERCASED mapped name. Individual-parameter names are
+    // case-sensitive, so with both `X` and `x` declared and `f=X, lagtime=x` the
+    // two-roles reject sees two variables and passes — but both collapsed onto
+    // one `"X"` key in the reversal and both took whichever role `HashMap`
+    // insertion kept: the #1359 flip in another spelling. `pk_indices` now reads
+    // the resolved `(pk_slot, var_slot)` pairs, so each name keeps its own slot.
+    // Several parses, because `HashMap` ordering is per-instance.
+    let src = analytical_dose_attr_src("f=X, lagtime=x", "X  = TVF\n  x  = TVLAG", "");
+    for _ in 0..16 {
+        let m = super::parse_full_model(&src).unwrap().model;
+        let slot_of = |name: &str| {
+            let i = m.indiv_param_names.iter().position(|n| n == name).unwrap();
+            m.pk_indices[i]
+        };
+        assert_eq!(slot_of("X"), crate::types::PK_IDX_F, "{:?}", m.pk_indices);
+        assert_eq!(
+            slot_of("x"),
+            crate::types::PK_IDX_LAGTIME,
+            "{:?}",
+            m.pk_indices
+        );
+        assert!(m.has_lagtime() && m.has_bioavailability());
+    }
 }
 
 #[test]
