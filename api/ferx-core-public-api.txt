@@ -42,6 +42,9 @@ pub ferx_core::api::PreparedRun::init_params: ferx_core::ModelParameters
 pub ferx_core::api::PreparedRun::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::api::PreparedRun::parsed: ferx_core::ParsedModel
 pub ferx_core::api::PreparedRun::population: ferx_core::Population
+pub struct ferx_core::api::RunOverrides
+pub ferx_core::api::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::api::RunOverrides::threads: core::option::Option<usize>
 pub struct ferx_core::api::SimulateOptions
 pub ferx_core::api::SimulateOptions::horizon: core::option::Option<f64>
 pub ferx_core::api::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
@@ -96,8 +99,10 @@ pub fn ferx_core::api::read_population_for_simulation(model: &ferx_core::Compile
 pub fn ferx_core::api::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
 pub fn ferx_core::api::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::api::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::api::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::api::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::api::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::api::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::api::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> alloc::vec::Vec<ferx_core::SimulationResult>
 pub fn ferx_core::api::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, alloc::string::String> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
 pub fn ferx_core::api::simulate_adaptive_from_spec(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, alloc::string::String>
@@ -4736,6 +4741,9 @@ pub struct ferx_core::ResidualCorrelation
 pub ferx_core::ResidualCorrelation::rho: f64
 pub ferx_core::ResidualCorrelation::sigma_i: usize
 pub ferx_core::ResidualCorrelation::sigma_j: usize
+pub struct ferx_core::RunOverrides
+pub ferx_core::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
+pub ferx_core::RunOverrides::threads: core::option::Option<usize>
 #[non_exhaustive] pub struct ferx_core::RuvMagnitude
 pub ferx_core::RuvMagnitude::per_sigma: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
 pub ferx_core::RuvMagnitude::per_sigma_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
@@ -4948,8 +4956,10 @@ pub fn ferx_core::resolve_data_path(model_data_path: core::option::Option<&str>,
 pub fn ferx_core::run_covariance(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::run_from_file(path: &str) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::run_model_simulate(model_path: &str) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::run_model_simulate_with_overrides(model_path: &str, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::run_model_with_data(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::run_model_with_data_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
+pub fn ferx_core::run_model_with_overrides(model_path: &str, data_path: core::option::Option<&str>, overrides: &ferx_core::RunOverrides) -> core::result::Result<(ferx_core::FitResult, ferx_core::Population), alloc::string::String>
 pub fn ferx_core::run_sir(fit: &ferx_core::FitResult, model: core::option::Option<&ferx_core::CompiledModel>, population: core::option::Option<&ferx_core::Population>, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::simulate(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize) -> alloc::vec::Vec<ferx_core::SimulationResult>
 pub fn ferx_core::simulate_adaptive<F, C>(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, make_controller: F, opts: &ferx_core::AdaptiveSimulateOptions) -> core::result::Result<ferx_core::AdaptiveSimulationResult, alloc::string::String> where F: core::ops::function::Fn() -> C, C: core::ops::function::FnMut(&ferx_core::sim::adaptive::ControllerCtx<'_>) -> alloc::vec::Vec<ferx_core::sim::adaptive::DoseAction>
