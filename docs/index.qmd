@@ -44,21 +44,27 @@ NONMEM-compatible data through a command-line interface, Rust API, and
 | Analytical PK | Yes | Yes | Yes (`linCmt()`) | Yes | Yes |
 | ODE models | Yes | Yes | Yes | Yes | Yes |
 | Open source | Yes | No | Yes | No | No |
-| License | MIT | Commercial | GPL (≥ 3) | Commercial | Commercial |
+| License | MIT | Proprietary | GPL (≥ 3) | Proprietary^[Free academic license for non-commercial use.] | Proprietary^[Free academic access for non-commercial research and education.] |
 
 Method coverage is broadly the same across these engines: NONMEM has offered
 SAEM, importance sampling and Bayesian estimation alongside FOCE since NONMEM 7,
 and Monolix estimates with SAEM rather than FOCE. The table compares method
-availability only, as documented by each tool (checked September 2026). It does
-not rank how each engine computes gradients, which differs by method and option;
-for ferx's own approach see
+availability only, as documented by each tool (checked September 2026; sources
+below). It does not rank how each engine computes gradients, which differs by
+method and option; for ferx's own approach see
 [Gradient route (analytic vs FD)](estimation/foce.qmd#gradient-route-analytic-vs-fd).
+
+Sources:
+NONMEM — [Bauer, *NONMEM Tutorial Part II: Estimation Methods and Advanced Examples*, CPT:PSP 2019](https://ascpt.onlinelibrary.wiley.com/doi/10.1002/psp4.12422);
+nlmixr2 — [CRAN package page](https://cran.r-project.org/web/packages/nlmixr2/index.html) and [nlmixr2.org](https://nlmixr2.org/);
+Monolix — [SAEM task documentation](https://monolix.lixoft.com/tasks/population-parameter-estimation-using-saem/) and [licensing](https://monolixsuite.slp-software.com/getting-started/2024R1/licencing);
+Pumas — [estimation documentation](https://docs.pumas.ai/dev/basics/estimation/).
 
 ## Architecture Overview
 
 ferx-core uses a two-level optimization structure:
 
-- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt BOBYQA (default), SLSQP, L-BFGS, MMA, built-in BFGS, Newton trust-region, or Gauss-Newton (BHHH)
+- **Outer loop**: Optimizes population parameters (theta, omega, sigma) using NLopt L-BFGS, BOBYQA, SLSQP, MMA, built-in BFGS, Newton trust-region, or Gauss-Newton (BHHH). The default, `optimizer = auto`, picks L-BFGS when the exact analytic gradient is available and the derivative-free BOBYQA otherwise (see [Outer Optimizers](estimation/optimizers.qmd))
 - **Inner loop**: For each subject, finds empirical Bayes estimates (EBEs) of random effects by minimizing individual negative log-likelihood
 
 Parameters are internally transformed for unconstrained optimization: theta and sigma are log-transformed, and omega uses Cholesky factorization to guarantee positive-definiteness.
@@ -66,9 +72,9 @@ Parameters are internally transformed for unconstrained optimization: theta and 
 ## Project Structure
 
 ```
-src/
+src/                -- the ferx-core engine (one model, one dataset, one fit)
   types.rs          -- Core data structures
-  api.rs            -- Public API (fit, simulate, predict)
+  api/              -- Public API (fit, simulate, predict)
   parser/           -- .ferx model file parser
   pk/               -- Analytical PK solutions
   ode/              -- ODE solver and predictions
@@ -77,7 +83,9 @@ src/
   io/               -- Data reading and output writing
   sens/             -- Analytic Dual2 sensitivities (PkNum) for exact gradients
   nn/               -- Neural network components (DCM / NODE)
-  bin/run_model.rs  -- CLI binary
+crates/
+  ferx-tools/       -- Workflows that run many fits (bootstrap, model searches)
+  ferx-cli/         -- The `ferx` command-line binary
 ```
 
 ## License
