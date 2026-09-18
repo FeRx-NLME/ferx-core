@@ -226,6 +226,70 @@ fn saem_recovers_the_allometric_exponent() {
     );
 }
 
+/// Tier-3, #1415: the same allometric exponent with **no** mu-reference group —
+/// the weight covariate goes through a conditionally assigned local, which the
+/// #619 classifier rejects, so `TH_WT` carries no ETA and is moved only by the
+/// eta-frozen numerical M-step. Same data, same MLE, same NONMEM SAEM anchor as
+/// [`saem_recovers_the_allometric_exponent`].
+///
+/// Before #1415 this fixture reproduced the issue exactly: the M-step's NLopt
+/// solve started from a quarter-of-the-bound-range first design and stopped on
+/// a 1e-4 relative tolerance, so its "maximiser" was a few percent of a step,
+/// and the 0.03 exploration cap on top of that left `TH_WT` at 0.332 from its
+/// 0.3 start (release binary, seed 619) — the #619 stall, on the channel #619
+/// did not touch. With the local first design and no exploration cap it lands
+/// at 0.961 (realised |Δ| 0.040 against NONMEM's 0.921; the grouped model
+/// realises 8e-4, this channel is noisier by construction). A converged solve
+/// under the old 0.03 cap reached only 0.323, and caps of 0.1 / 0.3 reached
+/// 0.340 / 0.403: the cap divides the number of EM steps the exploration phase
+/// amounts to, and a covariate slope confounded with `ETA_CL` needs all of
+/// them. Mutation check: restore either the default first design or the 0.03
+/// cap and the `TH_WT` bound fails.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored numerical M-step (#1415): opt in with --features slow-tests"
+)]
+fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
+    let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
+    // The fixture must really be on the numerical channel, or it tests #619
+    // again: no covariate group, and the advisory names TH_WT.
+    assert!(
+        model.covariate_mu_refs.is_empty(),
+        "fixture must defeat covariate mu-ref detection: {:?}",
+        model.covariate_mu_refs
+    );
+    let result = fit(&model, &pop, &model.default_params, &saem_opts()).expect("SAEM must run");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("NO associated ETA") && w.contains("TH_WT")),
+        "TH_WT must be reported as the no-ETA numerical-M-step theta: {:?}",
+        result.warnings
+    );
+    let th_wt = theta(&result, "TH_WT");
+    assert_finite_close("TH_WT", th_wt, NM_POW_TH_WT, 0.12);
+    assert!(
+        (th_wt - BEFORE_TH_WT).abs() > 0.3,
+        "TH_WT = {th_wt:.4} must be clear of the pre-#1415 stall at {BEFORE_TH_WT}"
+    );
+    assert_finite_close("TVCL", theta(&result, "TVCL"), NM_POW_TVCL, 0.15);
+    assert_finite_close("TVV", theta(&result, "TVV"), NM_POW_TVV, 1.0);
+    assert_finite_close(
+        "omega^2(ETA_CL)",
+        omega(&result, "ETA_CL"),
+        NM_POW_OMEGA_CL,
+        0.02,
+    );
+    assert_finite_close(
+        "omega^2(ETA_V)",
+        omega(&result, "ETA_V"),
+        NM_POW_OMEGA_V,
+        0.01,
+    );
+}
+
 /// Tier-3: IMP shares the group step (exact engine on the importance-weighted
 /// posterior means). Same MLE as SAEM, so the same NONMEM finals are the
 /// reference; IMP's own Monte-Carlo noise is why the bounds are wider (realised

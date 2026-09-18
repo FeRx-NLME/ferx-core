@@ -7385,19 +7385,20 @@ pub struct FitOptions {
     /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
-    /// Exploration-phase cap on the stochastic-approximation step for the
-    /// **numerical θ/σ M-step** (issue #1011); `None` uses the
-    /// `MSTEP_SA_MAX_STEP` default of 0.03.
+    /// Optional exploration-phase cap on the stochastic-approximation step for
+    /// the **numerical θ/σ M-step** (issue #1011); `None` uses the model-keyed
+    /// default of `estimation::saem::default_mstep_damping`: `1.0` — **off** —
+    /// since #1415, except for a model with `iiv_on_ruv`, which keeps #1011's
+    /// `0.03` (the one shape on which the undamped channel was measured to
+    /// drift).
     ///
-    /// The M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)` rather than
-    /// assigned, because assigning it outright is `argmax` of a *single* MCMC η
-    /// draw rather than the SA average of `E[argmax]` — a Monte-Carlo bias that
-    /// does not decay with iteration count for a θ with no ETA. This is the
-    /// θ-side counterpart of the Ω cap; in the convergence phase the cap lifts
-    /// and the full decaying `γ = 1/(k−k1)` applies either way.
-    ///
-    /// Smaller damps harder. **`1.0` disables the damping**, reproducing the
-    /// pre-#1011 assignment exactly. Must be in `(0, 1]`.
+    /// Below `1.0` the M-step result is blended in as `θ ← θ + γ_θ·(θ* − θ)`
+    /// during exploration and averaged at `γ = 1/(k−k1)` in convergence,
+    /// instead of assigned. That cap divides the number of EM steps the
+    /// exploration phase amounts to, and was measured (#1415) to hold every
+    /// theta with no ETA near its initial estimate rather than estimate it;
+    /// it is kept as an opt-in for the FREM `iiv_on_ruv` shape of #1011, where
+    /// the undamped channel drifts. Smaller damps harder. Must be in `(0, 1]`.
     ///
     /// Ignored when the numerical M-step has no θ to estimate (every θ
     /// mu-referenced or `FIX`), and for mixture models — see

@@ -117,6 +117,14 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **`mstep_damping` now defaults to `1.0` (off), except for models with `iiv_on_ruv`.** The 0.03
+  exploration cap that #1011 introduced divides the number of EM steps the exploration phase
+  amounts to, and was measured to *hold* every no-ETA theta near its initial estimate rather than
+  estimate it — its FREM reprex ends at 0.361 from a 0.383 start and at 0.191 from a 0.2 start.
+  The drift that cap was answering is specific to the `iiv_on_ruv` coupling (the same model
+  without it lands on NONMEM IMP undamped), so an `iiv_on_ruv` model keeps the 0.03 default —
+  undamped it drifts to 0.18 from either start, 47 FOCEI-objective units worse than the held
+  start — and that drift is tracked as #1421. A value you set wins either way. (#1415)
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
 - **`method = laplace` no longer recomputes the sensitivity jet its grid anchor was just built
@@ -171,6 +179,25 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **SAEM now estimates thetas that carry no ETA instead of leaving them near their initial
+  values.** A theta with no random effect is moved only by the numerical (η-frozen) M-step, and
+  that solve started NLopt from a first design a quarter of the bound range wide and stopped on a
+  `1e-4` relative tolerance, so it returned a few percent of a step; the #1011 damping then blended
+  that at 3 % per exploration M-step. On the thiotepa model of #1415 eight of eight such thetas
+  ended within 13 % of the way to the FOCEI estimate and four within 2 % of their start. The solve
+  now starts local (a 0.1 log-unit trust radius) and converges (`1e-7`), and the exploration cap is
+  off by default: importance-sampled −2 log L 6047.8 → 5827.3 on thiotepa (5823.6 at the FOCEI
+  optimum), 2705.8 → 2684.0 on melphalan (NONMEM SAEM 2682.4), 17778.5 → 17764.3 on clofarabine;
+  the in-repo `covmuref_power` allometric exponent routed onto this channel now lands at 0.961
+  against NONMEM SAEM's 0.921 (0.332 before, from a 0.3 start). Mixture models keep the previous
+  M-step configuration: their class typical values come from a hard class draw, and a converged
+  per-class solve moves the NONMEM-anchored mixture fit off the MLE. (#1415)
+- **A method chain no longer drops the η–ε interaction from the reported objective.** The parser
+  cleared `interaction` for every `method = [...]` chain not ending in `focei`, so `[saem, imp]`
+  published SAEM's final FOCE objective *without* interaction — 175 units above the FOCEI objective
+  at the same estimates on the thiotepa model — while `method = saem` alone published it with. A
+  chain now sets the flag only from a final `focei` (on) or `foce` (off), as the single-method form
+  does. (#1415)
 - **`ferx model.ferx --threads 1` now runs on one thread even when the model file says `threads = 8`.** The CLI sized Rayon's global pool from the flag, but `[fit_options] threads` leases its own pool for the fit, so the model file won and nothing said so — the console line and `n_threads_used` in the fit YAML reported the file's count, and neither is something a caller re-reads after pinning the value on the command line. A thread count is exactly the setting that is pinned once and trusted, and getting it silently wrong does not fail a fit: it makes every timing number meaningless. Found while benchmarking four population PK models against NONMEM and nlmixr2 with every engine pinned to one core — the ferx runs used eight, and melphalan FOCEI is 7.05 s on 8 threads against 35.0 s on 1, so the "single-core" comparison was off by ~5×. An explicit `--threads` now wins, the way `--data` already beats the `[data]` block, and a disagreement is reported as a warning naming both counts. `--threads 0` / `--threads auto` counts as explicit: it names the engine's own worker count, so it overrides a pinned `threads = 8` rather than reading as an absent flag — the merge keys on whether the flag appeared, not on whether its value differs from the default, matching `ferx_fit(settings = ...)` on the R side. `--simulate` takes the same precedence. A run that does not pass `--threads` is unchanged ([#1416](https://github.com/FeRx-NLME/ferx-core/issues/1416)).
 - **A fit that stops mid-descent is now restarted from the point it reached, instead of being reported as-is.** NLopt can return a bare `Failure` while the objective is still falling by hundreds of units per evaluation — a line search that cannot make progress against the curvature estimate it has accumulated, not a minimum. ferx already told these apart from a genuine plateau, but only to label them `converged: false`; the estimates handed back were wherever the optimizer died. Such a run now gets one restart from its own best point, which resets the optimizer's curvature memory, and the result is adopted only if it ends **strictly lower**. Measured on the two-compartment deep-compartment model of `tests/fixtures/two_cpt_dcm_regularized.ferx`: L-BFGS quit at evaluation 12 with OFV `3209.81`, and the restart ran to convergence at `−676.77` — 3886 OFV units, on a fit that previously reported non-convergence and stopped. Fits that converge, that plateau, or that spend their `maxiter` budget are untouched and bit-identical; a cancelled run is never restarted, and a second stall is reported as a stall rather than restarted again ([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)).
 - **The adaptive-dosing frozen-schedule replay verifier now segments its timeline through the same break builder as the reactive driver it checks.** The verifier's own time-varying / IOV replay engine built its dose breaks by hand — a dose's time plus a real infusion's bioavailability-scaled end — so it pushed neither a per-route absorption onset nor a `zero_order()` window's edges. A zero-order window's constant rate is applied only to a segment the window fully contains, so an unbracketed edge dropped the rate for every segment straddling it and the replay under-delivered the absorbed mass: measured **100 % of the window short** (`0.0` against an exact `25.0`) on a two-dose `zero_order(dur = 2, lag = 1.5)` subject. The verifier is the designated internal oracle for adaptive dosing — the feature family that has no NONMEM comparator — so a divergence it reported there would have been its own artifact, and it was symmetrically blind to a real one. **Latent, not user-reachable:** an absorption-compartment dose under a time-varying covariate or IOV is a typed error today, on the base regimen (`#930`/`#931` scope) and at controller injection alike, so no run could reach the broken path; the fix lands ahead of any widening of that scope rather than after it. Every currently-reachable adaptive run is bit-identical ([#1188](https://github.com/FeRx-NLME/ferx-core/issues/1188)).
