@@ -905,6 +905,61 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
+/// Packed-length mask marking each Ω / Ω_IOV Cholesky **diagonal** coordinate
+/// whose eta is declared inside a `block_omega` / `block_kappa` — one with at
+/// least one structurally free off-diagonal (#1394).
+///
+/// [`omega_structural_zero_mask`]'s question asked per *eta* instead of per
+/// entry, and the point is that it is a **per-coordinate** property where
+/// `OmegaMatrix::diagonal` is a property of the whole matrix. A model mixing one
+/// `block_omega (ETA_CL, ETA_V)` with a diagonal `omega ETA_KA` packs Ω as a full
+/// Cholesky, so `!diagonal` holds for every coordinate while only two of the
+/// three etas are in a block — and a diagnostic keyed on the matrix flag then
+/// tells the user to lower the covariances of an eta that has none.
+///
+/// Everything else is `false`: off-diagonal coordinates, θ, Σ, the mixture Ω
+/// overrides (which the parser only permits over a diagonal base Ω) and the
+/// `block_sigma` ρ slots.
+///
+/// A one-eta `block_omega (ETA_CL)` has no off-diagonal and so reads as
+/// diagonal. That is the right answer rather than a gap: with no off-diagonals
+/// `L_ii²` *is* the declared variance, which is exactly the property the
+/// diagonal side of every such distinction rests on.
+pub(crate) fn omega_block_member_mask(template: &ModelParameters) -> Vec<bool> {
+    let segs = packed_segments(template);
+    let mut mask = vec![false; segs.total()];
+
+    // Same column-major lower-triangle walk as `pack_params` /
+    // `omega_structural_zero_mask`, so the position arithmetic is shared rather
+    // than re-derived.
+    //
+    // `lower_tri_iter` yields only `(i,i)` when the matrix is diagonal, which is
+    // both the right offsets (a diagonal Ω packs `n` coordinates, not
+    // `n(n+1)/2`) and the right answer: a diagonal Ω has no off-diagonal
+    // coordinate for any eta to share, and both `OmegaMatrix` constructors leave
+    // its `free_mask` off-diagonals false. That is why there is no second
+    // `if om.diagonal` guard here — two conditions rejecting the same inputs
+    // cover for each other, and neither can then be shown to fail.
+    let mark = |mask: &mut [bool], om: &OmegaMatrix, start: usize| {
+        let n = om.dim();
+        let mut p = start;
+        for (i, j) in lower_tri_iter(n, om.diagonal) {
+            if i == j {
+                mask[p] = (0..n).any(|k| k != i && om.free_mask[(i, k)]);
+            }
+            p += 1;
+        }
+    };
+
+    mark(&mut mask, &template.omega, segs.omega_start());
+
+    if let Some(ref iov) = template.omega_iov {
+        mark(&mut mask, iov, segs.iov_start());
+    }
+
+    mask
+}
+
 /// What kind of quantity a packed coordinate holds, in [`pack_params`] order.
 ///
 /// The distinction the runaway-guard check needs is whether a coordinate's two
@@ -3160,13 +3215,11 @@ mod tests {
         assert!(mask.iter().all(|&m| !m));
     }
 
-    #[test]
-    fn test_omega_structural_zero_mask_block_iov() {
-        // Diagonal BSV (1 eta) + sigma, then a block+diagonal Ω_IOV. The IOV
-        // structural zeros must be marked in the IOV region of the packed vector.
-        // Layout: theta(1) + bsvΩ(1) + sigma(1) + iovΩ(6) = 9.
-        //   iov packed offset 3: (0,0)=3 (1,0)=4 (2,0)=5 (1,1)=6 (2,1)=7 (2,2)=8
-        let template = ModelParameters {
+    /// Diagonal BSV (1 eta) + sigma, then a block+diagonal Ω_IOV.
+    /// Layout: theta(1) + bsvΩ(1) + sigma(1) + iovΩ(6) = 9.
+    ///   iov packed offset 3: (0,0)=3 (1,0)=4 (2,0)=5 (1,1)=6 (2,1)=7 (2,2)=8
+    fn block_plus_diag_iov_template() -> ModelParameters {
+        ModelParameters {
             residual_correlations: Vec::new(),
             residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
@@ -3184,7 +3237,14 @@ mod tests {
             omega_iov: Some(make_block_plus_diag_omega()),
             kappa_fixed: vec![false, false, false],
             mixture: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_omega_structural_zero_mask_block_iov() {
+        // The IOV structural zeros must be marked in the IOV region of the
+        // packed vector.
+        let template = block_plus_diag_iov_template();
         let mask = omega_structural_zero_mask(&template);
         assert_eq!(mask.len(), packed_len(&template)); // 1 + 1 + 1 + 6 = 9
         let expected_true = [5usize, 7]; // iov (2,0) and (2,1)
@@ -3201,6 +3261,87 @@ mod tests {
         let held = packed_fixed_mask(&template);
         for (i, &h) in held.iter().enumerate() {
             assert_eq!(h, expected_true.contains(&i), "held[{i}]");
+        }
+    }
+
+    /// #1394, the shape the bug was reported on: one `block_omega (ETA_CL,
+    /// ETA_V)` plus a standalone diagonal `omega ETA_KA`. `omega.diagonal` is
+    /// `false` for the whole matrix, so a per-*matrix* answer calls all three
+    /// etas block members; only ETA_CL and ETA_V are.
+    #[test]
+    fn test_omega_block_member_mask_block_plus_diagonal() {
+        let template = block_plus_diag_template();
+        let mask = omega_block_member_mask(&template);
+        // 2 theta + 6 Ω + 1 sigma = 9.
+        assert_eq!(mask.len(), packed_len(&template));
+        // Ω packed offsets from 2: (0,0)=2 (1,0)=3 (2,0)=4 (1,1)=5 (2,1)=6 (2,2)=7.
+        // ETA_CL's and ETA_V's diagonals are in the block; ETA_KA's is not, and
+        // no off-diagonal coordinate is a variance at all.
+        let expected_true = [2usize, 5];
+        for (i, &m) in mask.iter().enumerate() {
+            assert_eq!(
+                m,
+                expected_true.contains(&i),
+                "mask[{i}] should be {}",
+                expected_true.contains(&i)
+            );
+        }
+        // The premise that makes this fixture the differential one: the matrix
+        // flag — what the old answer read — says "block" for every coordinate.
+        assert!(!template.omega.diagonal);
+    }
+
+    /// The other half of the pair: a fully diagonal Ω marks nothing, so the
+    /// mask cannot be satisfied by an implementation that just returns `true`
+    /// on every diagonal coordinate.
+    #[test]
+    fn test_omega_block_member_mask_diagonal_is_all_false() {
+        let template = make_template();
+        let mask = omega_block_member_mask(&template);
+        assert_eq!(mask.len(), packed_len(&template));
+        assert!(mask.iter().all(|&m| !m));
+    }
+
+    /// A fully-free 2×2 block: both diagonals are block members, and the
+    /// **off-diagonal** coordinate between them is not — it is a covariance, not
+    /// a variance, and nothing keyed on this mask has a message for it.
+    #[test]
+    fn test_omega_block_member_mask_full_block() {
+        let template = make_block_template();
+        let mask = omega_block_member_mask(&template);
+        // 2 theta + 3 Ω + 1 sigma = 6.
+        assert_eq!(mask.len(), packed_len(&template));
+        // Ω packed offsets from 2: (0,0)=2 (1,0)=3 (1,1)=4.
+        let expected_true = [2usize, 4];
+        for (i, &m) in mask.iter().enumerate() {
+            assert_eq!(
+                m,
+                expected_true.contains(&i),
+                "mask[{i}] should be {}",
+                expected_true.contains(&i)
+            );
+        }
+    }
+
+    /// Ω_IOV takes the same walk at its own offset: a `block_kappa` mixed with a
+    /// standalone `kappa` splits the same way, and the BSV segment ahead of it
+    /// must not be swept in.
+    #[test]
+    fn test_omega_block_member_mask_block_iov() {
+        let template = block_plus_diag_iov_template();
+        let mask = omega_block_member_mask(&template);
+        // 1 theta + 1 BSV Ω + 1 sigma + 6 Ω_IOV = 9.
+        assert_eq!(mask.len(), packed_len(&template));
+        // iov (0,0)=3 and (1,1)=6 are in the block; (2,2)=8 is the standalone
+        // kappa. Index 1 is the diagonal BSV Ω — a variance, but not a block one.
+        let expected_true = [3usize, 6];
+        for (i, &m) in mask.iter().enumerate() {
+            assert_eq!(
+                m,
+                expected_true.contains(&i),
+                "mask[{i}] should be {}",
+                expected_true.contains(&i)
+            );
         }
     }
 

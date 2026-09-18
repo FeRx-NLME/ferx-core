@@ -3995,10 +3995,19 @@ fn rail_variance_is_the_floor(template: &ModelParameters, i: usize) -> bool {
 /// layout change that moves a segment reddens rather than silently
 /// mislabelling a declaration.
 fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<VarianceDecl>> {
-    use crate::estimation::parameterization::{coordinate_kinds, packed_segments, PackedCoordKind};
+    use crate::estimation::parameterization::{
+        coordinate_kinds, omega_block_member_mask, packed_segments, PackedCoordKind,
+    };
 
     let segs = packed_segments(template);
     let iov_end = segs.mixture_omega_start();
+    // Whether **this eta** is in a block, not whether the matrix is one (#1394).
+    // A `block_omega` anywhere in the model makes `omega.diagonal` false for
+    // every coordinate, so keying the message on the matrix flag gave a
+    // diagonally-declared eta the block wording — advice to "lower the
+    // covariances involving" an eta that has none, and, worse, in place of the
+    // `~ 0.0 FIX` repair this check exists to hand out (#1229).
+    let in_block = omega_block_member_mask(template);
 
     coordinate_kinds(template)
         .iter()
@@ -4007,14 +4016,13 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
             if *kind != PackedCoordKind::OmegaDiagonal {
                 return None;
             }
+            // One lookup covers Ω and Ω_IOV alike: the mask is packed-length and
+            // marks both segments.
+            let block = in_block.get(i).copied().unwrap_or(false);
             if i < segs.sigma_start() {
-                Some(VarianceDecl::Omega {
-                    block: !template.omega.diagonal,
-                })
+                Some(VarianceDecl::Omega { block })
             } else if i < iov_end {
-                Some(VarianceDecl::Kappa {
-                    block: template.omega_iov.as_ref().is_some_and(|m| !m.diagonal),
-                })
+                Some(VarianceDecl::Kappa { block })
             } else {
                 // A `[mixture]` Ω override (#977): one packed scalar each, in
                 // `omega_override_addr` order, immediately after the Ω_IOV

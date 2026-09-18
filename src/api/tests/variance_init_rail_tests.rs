@@ -536,6 +536,194 @@ fn indefinite_block_is_not_reported_as_a_declared_zero() {
     }
 }
 
+// ── a block and a diagonal in the same model (#1394) ────────────────────────
+
+/// A three-eta oral model — `examples/warfarin_block_omega.ferx`'s shape — whose
+/// `[parameters]` block is spliced in whole. `ETA_KA` is declared diagonally in
+/// every caller; only the CL/V declaration changes.
+fn three_eta_model(params_block: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n{params_block}\n\
+         \n\
+         [individual_parameters]\n\
+         CL = TVCL * exp(ETA_CL)\n\
+         V  = TVV  * exp(ETA_V)\n\
+         KA = TVKA * exp(ETA_KA)\n\
+         \n\
+         [structural_model]\n\
+         pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         \n\
+         [error_model]\n\
+         DV ~ proportional(PROP_ERR)\n"
+    );
+    crate::parser::model_parser::parse_model_string(&src)
+        .unwrap_or_else(|e| panic!("model must parse: {e}\n--- source ---\n{src}"))
+}
+
+/// The three-eta `[parameters]` block with the CL/V declaration substituted in.
+/// `ETA_KA ~ 0.0` is the coordinate under test in both halves of the pair.
+fn three_eta_params(cl_v_decl: &str) -> String {
+    format!(
+        "  theta TVCL(0.2, 0.001, 10.0)\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.5, 0.01, 50.0)\n\
+         \x20 {cl_v_decl}\n\
+         \x20 omega ETA_KA ~ 0.0\n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n"
+    )
+}
+
+/// Regression (#1394): `E_OMEGA_INIT_AT_RAIL` chose its message by whether the
+/// **matrix** was a block, so declaring an unrelated `block_omega` anywhere in
+/// the model changed what a diagonally-declared eta was told — from the `~ 0.0
+/// FIX` repair #1229 exists to hand out, to "lower the covariances involving
+/// ETA_KA", which has none, and "`FIX` the block", which would fix ETA_CL and
+/// ETA_V instead of the eta on the rail.
+///
+/// The pair differs by exactly one edit — how CL and V are declared — and
+/// `ETA_KA ~ 0.0` is byte-identical across it, so the message and the suggestion
+/// must be too. The premise is asserted: the two models really do straddle the
+/// old gate (`omega.diagonal` differs), or the pair would be two runs of the
+/// same arm agreeing for the wrong reason.
+#[test]
+fn a_diagonal_omega_is_unaffected_by_an_unrelated_block_in_the_model() {
+    let without = three_eta_model(&three_eta_params(
+        "omega ETA_CL ~ 0.09\n   omega ETA_V ~ 0.04",
+    ));
+    let with = three_eta_model(&three_eta_params(
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+    ));
+
+    // The straddle itself: the block half is what used to take the other arm.
+    assert!(
+        without.default_params.omega.diagonal && !with.default_params.omega.diagonal,
+        "the pair must straddle the matrix-level flag the bug read"
+    );
+
+    let d_without = rails_with_default_options(&without.default_params);
+    let d_with = rails_with_default_options(&with.default_params);
+    assert_eq!(d_without.len(), 1, "{d_without:#?}");
+    assert_eq!(d_with.len(), 1, "{d_with:#?}");
+
+    // Same eta, same repair, same words.
+    assert_eq!(d_with[0].code, d_without[0].code);
+    assert_eq!(d_with[0].message, d_without[0].message);
+    assert_eq!(d_with[0].suggestion, d_without[0].suggestion);
+
+    // And the words are the diagonal ones — an equality that would also be
+    // satisfied by both halves taking the *block* arm.
+    let msg = &d_with[0].message;
+    assert!(
+        msg.contains("`omega ETA_KA ~ 0.0` declares no variability"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("block_omega") && !msg.contains("correlation"),
+        "ETA_KA is in no block and has no covariances to lower: {msg}"
+    );
+    assert_eq!(
+        d_with[0].suggestion.as_deref(),
+        Some("write `omega ETA_KA ~ 0.0 FIX`, or start it at 0.09"),
+        "the #1229 repair is the whole point of this arm"
+    );
+}
+
+/// The per-coordinate claim inside a **single** model: a near-singular
+/// `block_omega` and a diagonal `omega ETA_KA ~ 0.0` are both on the rail, and
+/// each must be reported in the shape it was declared in. A model-level answer
+/// cannot produce these two messages at once, whichever way it decides.
+#[test]
+fn a_mixed_model_reports_the_block_eta_and_the_diagonal_eta_differently() {
+    let model = three_eta_model(&three_eta_params(
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.089997, 0.09]",
+    ));
+    let diags = rails_with_default_options(&model.default_params);
+    assert_eq!(
+        diags.len(),
+        2,
+        "both coordinates are on the rail: {diags:#?}"
+    );
+
+    let block = diags
+        .iter()
+        .find(|d| d.message.contains("ETA_V"))
+        .unwrap_or_else(|| panic!("the block's L₂₂ must be reported: {diags:#?}"));
+    let diagonal = diags
+        .iter()
+        .find(|d| d.message.contains("ETA_KA"))
+        .unwrap_or_else(|| panic!("the diagonal zero must be reported: {diags:#?}"));
+
+    // The block eta keeps the block wording — the `near_singular_block_*` pair
+    // above pins it in a pure-block model; here it has to survive a diagonal
+    // declaration sharing the matrix.
+    assert!(block.message.contains("`block_omega`"), "{}", block.message);
+    assert!(block.message.contains("correlation"), "{}", block.message);
+
+    // The diagonal eta gets the repair it can act on, in the same model.
+    assert!(
+        diagonal
+            .message
+            .contains("`omega ETA_KA ~ 0.0` declares no variability"),
+        "{}",
+        diagonal.message
+    );
+    assert!(
+        !diagonal.message.contains("block_omega"),
+        "ETA_KA was not declared in a block: {}",
+        diagonal.message
+    );
+}
+
+/// The Ω_IOV half of the same defect: `block_kappa` mixed with a standalone
+/// `kappa` splits exactly like Ω, and the two segments read the same mask, so a
+/// fix applied to one and not the other reddens here.
+#[test]
+fn a_diagonal_kappa_is_unaffected_by_an_unrelated_block_kappa() {
+    let model_src = "[parameters]\n\
+         \x20 theta TVCL(0.2, 0.001, 10.0)\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.5, 0.01, 50.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.02, 0.04]\n\
+         \x20 kappa KAPPA_KA ~ 0.0\n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n\
+         \n\
+         [individual_parameters]\n\
+         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n\
+         V  = TVV  * exp(KAPPA_V)\n\
+         KA = TVKA * exp(KAPPA_KA)\n\
+         \n\
+         [structural_model]\n\
+         pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         \n\
+         [error_model]\n\
+         DV ~ proportional(PROP_ERR)\n";
+    let model = crate::parser::model_parser::parse_model_string(model_src)
+        .unwrap_or_else(|e| panic!("mixed block_kappa model must parse: {e}"));
+    let iov = model
+        .default_params
+        .omega_iov
+        .as_ref()
+        .expect("model declares IOV");
+    assert!(!iov.diagonal, "premise: the Ω_IOV matrix is a block");
+
+    let diags = rails_with_default_options(&model.default_params);
+    assert_eq!(diags.len(), 1, "{diags:#?}");
+    let msg = &diags[0].message;
+    assert!(
+        msg.contains("`kappa KAPPA_KA ~ 0.0` declares no variability"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("block_kappa") && !msg.contains("correlation"),
+        "KAPPA_KA is in no block: {msg}"
+    );
+    assert_eq!(
+        diags[0].suggestion.as_deref(),
+        Some("write `kappa KAPPA_KA ~ 0.0 FIX`, or start it at 0.09")
+    );
+}
+
 // ── Ω_IOV ───────────────────────────────────────────────────────────────────
 
 /// Regression: the Ω_IOV segment skipped. `kappa` goes through the same
