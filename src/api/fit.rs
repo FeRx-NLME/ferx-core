@@ -1253,8 +1253,11 @@ fn fit_inner(
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
     accumulated_warnings.extend(pre_run_warnings);
-    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
-    // by read_nonmem_csv into population.warnings.
+    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING, W_MISSING_DV,
+    // W_CMT_DEFAULTED, …) accumulated by read_nonmem_csv into
+    // population.warnings. The list is illustrative, not exhaustive — every code
+    // the reader emits is in the `src/diagnostics.rs` registry table, which is the
+    // one place that has to stay complete.
     //
     // Through the shared filter, so `ferx check` suppresses exactly what `fit()`
     // does — see `reader_warning_suppressed`.

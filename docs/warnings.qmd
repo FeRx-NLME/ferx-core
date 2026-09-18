@@ -64,7 +64,7 @@ Carried, in this order:
 
 1. **Parse warnings** — e.g. `W_ABSORPTION_TWIN_DECLINED`, which changes what a
    prediction does.
-2. **Data-reader warnings** — `W_ADDL_MISSING_II`, `W_IOV_OCC_MISSING`, through
+2. **Data-reader warnings** — `W_CMT_DEFAULTED`, `W_ADDL_MISSING_II`, `W_IOV_OCC_MISSING`, through
    the same suppression filter `fit()` and `ferx check` use, so all three
    suppress exactly the same ones.
 3. **Model/data warnings** — `W_STEADY_STATE_*`, `W_SDE_*`,

@@ -1136,6 +1136,12 @@ fn classify_warning_roundtrips_every_engine_message() {
             "data_quality",
         ),
         (
+            "W_CMT_DEFAULTED: the dataset has no CMT column, so 10 dose row(s) and 110 \
+             observation row(s) were assigned compartment 1.",
+            Warning,
+            "data_quality",
+        ),
+        (
             "Stochastic differential equations ([diffusion] / Extended Kalman \
                  Filter) are an EXPERIMENTAL feature: validated only on a small set",
             Warning,

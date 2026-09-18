@@ -2330,7 +2330,7 @@ pub fn parse_full_model_with(
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
     let blocks = &extracted.unnamed;
-    let name = extract_model_name(content);
+    let name = parse_model_name(content)?;
 
     // ── Required blocks ──
     let param_lines = blocks
@@ -8497,8 +8497,22 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
                 if chain.is_empty() {
                     return Err("method = [] is empty; provide at least one method".into());
                 }
-                // Interaction flag follows the final stage of the chain.
-                opts.interaction = *chain.last().unwrap() == EstimationMethod::FoceI;
+                // A final `focei` switches interaction on and a final `foce`
+                // switches it off; any other final stage leaves the default
+                // (on) alone, as the single-method form below does. The chain
+                // form used to *clear* the flag for every chain not ending in
+                // `focei`, so `method = [saem, imp]` reported SAEM's final
+                // FOCE-approximation objective *without* interaction — 175
+                // units above the FOCEI objective at the same estimates on the
+                // thiotepa model of #1415 — and every SAEM-vs-FOCEI comparison
+                // built on that number compared two different objectives. A
+                // `foce` / `focei` *stage* still sets its own flag per stage in
+                // `api::fit` (FOCEI on, FOCE off).
+                match *chain.last().unwrap() {
+                    EstimationMethod::FoceI => opts.interaction = true,
+                    EstimationMethod::Foce => opts.interaction = false,
+                    _ => {}
+                }
                 opts.method = *chain.last().unwrap();
                 opts.methods = chain;
             } else {
@@ -13447,12 +13461,89 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
     Ok(())
 }
 
-fn extract_model_name(content: &str) -> String {
-    let re = Regex::new(r"(?m)^\s*model\s+(\w+)").unwrap();
-    re.captures(content)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| "Unnamed".to_string())
+/// The name a model carries when its file declares none. `api::run::set_model_name`
+/// and ferx-r both replace it with the file stem.
+pub(crate) const UNNAMED_MODEL: &str = "Unnamed";
+
+/// The one-line preamble line `model NAME` accepts, in the two spellings `ferx`
+/// settings use: the bare `model NAME` and the `KEY = value` form `model = NAME`.
+const MODEL_NAME_FORMS: &str = "`model NAME` or `model = NAME` (letters, digits and \
+                                 underscores), before the first `[block]` header";
+
+/// `line` with a trailing `#` / `//` comment removed. The block extractor and
+/// the preamble reader share one definition of "comment" so a `model` line and
+/// a `[block]` header cannot disagree on where a line ends.
+fn strip_line_comment(line: &str) -> &str {
+    match line.find('#').into_iter().chain(line.find("//")).min() {
+        Some(idx) => &line[..idx],
+        None => line,
+    }
+}
+
+/// The model's declared name, read from the **preamble** — the lines before the
+/// first `[block]` header — as `model NAME` or `model = NAME`; `UNNAMED_MODEL`
+/// when the preamble has no `model` line.
+///
+/// Both spellings are honoured because the `KEY = value` form is what every
+/// other ferx setting uses, and `model = NAME` used to be dropped in silence:
+/// the old regex needed whitespace after `model`, so the name fell back to the
+/// file stem with no diagnostic, and `ferx check --json` showed the stem for
+/// every spelling alike (#1395). A `model` line whose tail is neither form, or
+/// a second `model` line, is an error naming the accepted forms rather than a
+/// silent fallback — the #1377 rule for `[parameters]`, applied to the one line
+/// that lives outside every block. Only the preamble is read: a `model …` line
+/// inside a block is that block's line and is parsed (or rejected) as such,
+/// where the old scan would have taken the first `model <word>` anywhere in
+/// the file — including, say, an `[individual_parameters]` assignment to a
+/// parameter named `model` — as the name.
+/// The name a line declares when it is exactly `model NAME`, `model = NAME` or
+/// `model=NAME` — `None` for anything else, including a line that merely starts
+/// with the keyword (`model = CL * 2` in `[individual_parameters]` is that
+/// block's assignment to a parameter named `model`, not a declaration).
+///
+/// Shared by `parse_model_name` (the preamble reader) and `extract_blocks` (the
+/// in-block guard) so the two cannot disagree on what a declaration looks like.
+fn model_name_declaration(trimmed: &str) -> Option<&str> {
+    let re = Regex::new(r"^model(?:\s*=\s*|\s+)(\w+)$").unwrap();
+    re.captures(trimmed).map(|c| c.get(1).unwrap().as_str())
+}
+
+fn parse_model_name(content: &str) -> Result<String, String> {
+    let header_re = Regex::new(r"^\[\w+(?:\s+\w+)?\]$").unwrap();
+    let mut name: Option<String> = None;
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = strip_line_comment(line).trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if header_re.is_match(trimmed) {
+            break;
+        }
+        // The first token is `model`: `model NAME`, `model = NAME`, `model=NAME`,
+        // or a malformed line that still starts with the keyword.
+        let is_model_line = trimmed
+            .strip_prefix("model")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '=']));
+        if !is_model_line {
+            continue;
+        }
+        let Some(declared) = model_name_declaration(trimmed) else {
+            return Err(format!(
+                "Malformed model name declaration `{trimmed}` (line {}) — expected \
+                 {MODEL_NAME_FORMS}.",
+                idx + 1
+            ));
+        };
+        if let Some(first) = &name {
+            return Err(format!(
+                "Model name declared twice: `{first}` and `{declared}` (line {}) — keep one \
+                 `model NAME` line.",
+                idx + 1
+            ));
+        }
+        name = Some(declared.to_string());
+    }
+    Ok(name.unwrap_or_else(|| UNNAMED_MODEL.to_string()))
 }
 
 /// Extracted-block state: the original (unnamed) block map plus a second
@@ -13496,11 +13587,7 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
     let mut headers: Vec<(String, Option<String>, usize)> = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
-        let without_comment = match line.find('#').into_iter().chain(line.find("//")).min() {
-            Some(idx) => &line[..idx],
-            None => line,
-        };
-        let trimmed = without_comment.trim();
+        let trimmed = strip_line_comment(line).trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -13526,8 +13613,30 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
             continue;
         }
 
-        if trimmed.starts_with("model ") || trimmed == "end" {
+        // `end` is a bare terminator, dropped wherever it appears.
+        if trimmed == "end" {
             continue;
+        }
+
+        // A `model NAME` declaration inside a block is an error here, not that
+        // block's line: `parse_model_name` reads it from the preamble only, and
+        // leaving it to the block would drop it in silence wherever the block
+        // parser skips unrecognised lines (`[data]` does) or is never read at all
+        // (`[odes]` on a `pk` model) — the exact silent fallback to the file stem
+        // that #1395 closes. The old extractor skipped every in-block `model `
+        // line the same way. Only the exact declaration forms are caught, so
+        // `model = CL * 2` in `[individual_parameters]` is still that block's
+        // assignment to a parameter named `model`.
+        if let (Some(target), Some(name)) = (current.as_ref(), model_name_declaration(trimmed)) {
+            let block = match target {
+                BlockTarget::Unnamed(ty) => ty.clone(),
+                BlockTarget::Named { ty, name: inst } => format!("{ty} {inst}"),
+            };
+            return Err(format!(
+                "Model name declaration `model {name}` (line {}) is inside `[{block}]` — \
+                 the name is read from the preamble only; write it as {MODEL_NAME_FORMS}.",
+                idx + 1
+            ));
         }
 
         match current.as_ref() {
@@ -14224,6 +14333,7 @@ fn build_mixture_params(
                 base_omega.diagonal,
                 base_omega.free_mask.clone(),
             )
+            .with_block_declared(base_omega.block_declared.clone())
         })
         .collect();
     let sigma = (0..k)
@@ -15325,6 +15435,12 @@ fn build_omega_matrix(
         }
     }
 
+    // Declaration provenance for the diagnostics (#1394), recorded here because
+    // this is the last point that can still see how each eta was written. It
+    // includes a **one-eta** block, which sets no off-diagonal and so leaves no
+    // trace in `free_mask`.
+    let mut block_declared = vec![false; n];
+
     // Fill block entries from block specs (lower triangle, row-wise)
     for block in block_omegas {
         let block_n = block.names.len();
@@ -15333,6 +15449,7 @@ fn build_omega_matrix(
             let i = *name_to_idx.get(block.names[row].as_str()).ok_or_else(|| {
                 format!("block_omega references unknown eta '{}'", block.names[row])
             })?;
+            block_declared[i] = true;
             for col in 0..=row {
                 let j = *name_to_idx.get(block.names[col].as_str()).ok_or_else(|| {
                     format!("block_omega references unknown eta '{}'", block.names[col])
@@ -15346,12 +15463,10 @@ fn build_omega_matrix(
         }
     }
 
-    Ok(OmegaMatrix::from_matrix_with_mask(
-        matrix,
-        eta_names.to_vec(),
-        false,
-        free_mask,
-    ))
+    Ok(
+        OmegaMatrix::from_matrix_with_mask(matrix, eta_names.to_vec(), false, free_mask)
+            .with_block_declared(block_declared),
+    )
 }
 
 /// Build the per-eta `omega_fixed` flags from parsed diagonal + block specs.
