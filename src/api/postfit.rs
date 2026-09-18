@@ -2111,7 +2111,9 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `W_ABSORPTION_TWIN_DECLINED`, which changes what a *prediction* does.
 /// 2. [`Population::warnings`](crate::types::Population::warnings), through the same
 ///    `reader_warning_suppressed` filter `fit()` and `ferx check` use, so all three suppress
-///    exactly the same reader findings (`W_ADDL_MISSING_II`, `W_IOV_OCC_MISSING`).
+///    exactly the same reader findings. `W_CMT_DEFAULTED` is the one that filter
+///    actually withholds — from a model where `CMT` selects nothing (#1009);
+///    `W_ADDL_MISSING_II` and `W_IOV_OCC_MISSING` pass through it unchanged.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
 ///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` bundle.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is

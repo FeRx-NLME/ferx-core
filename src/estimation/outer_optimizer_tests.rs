@@ -2169,6 +2169,287 @@ fn test_stall_retry_keeps_the_better_attempt() {
     );
 }
 
+/// [`resolve_mid_descent_restart`] decides whether a run that quit while still
+/// descending is restarted from the point it reached, and which of the two
+/// attempts is reported (#1277). Driven with `T = f64` (the penalized objective
+/// itself) so every branch runs without two NLopt fits.
+///
+/// The regression each assertion exists to catch, since a restart that fires too
+/// eagerly costs a whole extra optimization and one that fires too rarely leaves
+/// the #1277 fit 3886 OFV units short:
+/// - a converged / plateaued fit must not pay for a restart at all — the
+///   `restart` closure panics, so a gate that lets one through is a failure, not
+///   a silently slower suite;
+/// - a cancelled run must not be restarted, however stalled it looks: it stopped
+///   through the objective's 1e20 short-circuit, not at a minimum; and
+/// - the restart is adopted only on a *strictly* lower objective, so it can
+///   never make the reported fit worse, and a tie leaves the first attempt (with
+///   its warnings) standing.
+#[test]
+fn test_mid_descent_restart_only_fires_for_a_live_stall() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+
+    // Not a mid-descent stall (converged, or a `Failure` the plateau check
+    // accepted): no second optimization.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            false,
+            (-286.0042, false),
+            |_: &f64| panic!("restart must not run for a fit that did not stall mid-descent"),
+            ofv,
+        ),
+        -286.0042
+    );
+
+    // Stalled mid-descent, but the user cancelled: still no second optimization.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            false,
+            true,
+            (3209.8087, true),
+            |_: &f64| panic!("restart must not run on a cancelled fit"),
+            ofv,
+        ),
+        3209.8087
+    );
+}
+
+#[test]
+fn test_mid_descent_restart_keeps_the_better_attempt() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+
+    // The #1277 case, measured on `tests/fixtures/two_cpt_dcm_regularized.ferx`
+    // at `nn_l2 = 0`: L-BFGS quit at eval 12 with the trace still falling, and a
+    // restart from that point ran to convergence 3886 OFV units lower. The
+    // restart is handed the stalled result — here the objective itself — so the
+    // assertion also pins that it starts from the reported point rather than
+    // from `x₀`. `verbose = true` covers the reporting line.
+    assert_eq!(
+        resolve_mid_descent_restart(
+            true,
+            false,
+            (3209.8087, true),
+            |stalled: &f64| {
+                assert_eq!(
+                    *stalled, 3209.8087,
+                    "restart must start from the stalled point"
+                );
+                -676.7746
+            },
+            ofv,
+        ),
+        -676.7746
+    );
+
+    // A restart that lands worse keeps the first attempt.
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| 3209.8087, ofv),
+        -676.7746
+    );
+
+    // Ties do not displace the first attempt.
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (-676.7746, true), |_: &f64| -676.7746, ofv),
+        -676.7746
+    );
+}
+
+/// A restart whose own objective is not a usable number must never displace a
+/// finite incumbent — the successor is screened, not just compared (#1277
+/// review).
+///
+/// `NaN` and `+inf` are rejected by the `<` comparison on their own, but
+/// **`−inf` is not**: `-inf < 3209.8` is `true`, so before the `ofv_is_valid`
+/// screen a restart that diverged to `−inf` was adopted, and the fit's usable
+/// estimates and diagnostics went with it. That is reachable the same way any
+/// non-finite objective is — `gate_converged_on_objective` exists precisely
+/// because the final cold solve can hand back a non-finite number after a trace
+/// that looked healthy — and demoting *that* run's `converged` does not stop it
+/// being ranked here.
+///
+/// The `−inf` row is the one that fails without the screen; `NaN` and `+inf` are
+/// held so that a later edit flipping the comparison cannot quietly re-open the
+/// other two.
+#[test]
+fn test_mid_descent_restart_rejects_a_non_finite_successor() {
+    use crate::estimation::outer_optimizer::resolve_mid_descent_restart;
+
+    let ofv = |x: &f64| *x;
+    for bad in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+        assert_eq!(
+            resolve_mid_descent_restart(false, false, (3209.8087, true), |_: &f64| bad, ofv),
+            3209.8087,
+            "a restart scoring {bad:?} must not displace a finite incumbent"
+        );
+    }
+    // The sentinel `DIVERGENCE_OFV` band is screened too — `ofv_is_valid` is the
+    // rule, not `is_finite`, so a repelled subject's 1e20 cannot be adopted as an
+    // improvement either. (It would not be, being larger; asserted so the screen
+    // is the documented one.)
+    assert_eq!(
+        resolve_mid_descent_restart(false, false, (3209.8087, true), |_: &f64| 1e20, ofv),
+        3209.8087
+    );
+}
+
+/// The same screen on the #751 sibling. `resolve_stall_retry` shares the
+/// adoption rule and had the same `−inf` hole; latent, because it only runs on a
+/// fit that never left its start, but two resolvers with one rule and only one
+/// screen is how they drift (#1277 review).
+#[test]
+fn test_stall_retry_rejects_a_non_finite_retry() {
+    use crate::estimation::outer_optimizer::resolve_stall_retry;
+
+    let ofv = |x: &f64| *x;
+    for bad in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+        assert_eq!(
+            resolve_stall_retry(
+                Optimizer::NloptLbfgs,
+                false,
+                (-250.87, false),
+                || (bad, true),
+                ofv,
+            ),
+            -250.87,
+            "a retry scoring {bad:?} must not displace a finite first attempt"
+        );
+    }
+}
+
+/// [`worth_restarting_mid_descent`] is the guard that keeps the #1277 restart off
+/// a run demoted by [`gate_converged_on_objective`] instead of by a stall.
+///
+/// Without it, every fit whose objective goes non-finite reads as a mid-descent
+/// stall — `converged` is false and the NLopt `Failure` verdict was deferred —
+/// and pays for a second optimization from the very estimates that poisoned the
+/// objective. The `NaN`/`±inf` rows are the ones that fail if the objective
+/// argument is dropped.
+#[test]
+fn test_mid_descent_restart_skips_a_non_finite_objective() {
+    use crate::estimation::outer_optimizer::worth_restarting_mid_descent;
+
+    assert!(worth_restarting_mid_descent(true, 3209.8087));
+    assert!(worth_restarting_mid_descent(true, -676.7746));
+    assert!(!worth_restarting_mid_descent(true, f64::NAN));
+    assert!(!worth_restarting_mid_descent(true, f64::INFINITY));
+    assert!(!worth_restarting_mid_descent(true, f64::NEG_INFINITY));
+    // A finite objective is not on its own a reason to restart.
+    assert!(!worth_restarting_mid_descent(false, 3209.8087));
+}
+
+/// The published escape verdict is measured against the **original** initial
+/// estimates, not against wherever the attempt that produced it started (#1277
+/// review).
+///
+/// The #1277 restart begins at a stalled fit's estimates. Measuring
+/// `OuterResult::left_init` against *that* start reports a fit which recovered
+/// thousands of OFV units as having never moved, whenever the restart's own step
+/// is small — and `model_selection::stalled_at_init` prefers this flag over its
+/// own `theta_init` comparison (`src/model_selection.rs`), so the recovered fit
+/// would carry `W_STALLED_AT_INIT` and be thrown out by the default
+/// `Strictness::reject_init_stall`. The estimates would be right and the fit
+/// rejected.
+///
+/// The #1277 DCM fixture cannot catch this: its restart moves a long way
+/// (‖W‖² 287.9 → 15340.6), so both references agree. This drives the geometry the
+/// fixture lacks — `outer_maxiter = 1`, so the leg barely moves — and asserts the
+/// **straddle**: the same run must read `false` against its own start and `true`
+/// against the distant origin. Without the straddle assertion the test would pass
+/// against an implementation that answered `true` unconditionally.
+#[test]
+fn test_published_escape_verdict_uses_the_original_start() {
+    use crate::estimation::outer_optimizer::optimize_nlopt_once;
+
+    let model = make_model();
+    let population = make_population(4);
+    let options = FitOptions {
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        ..Default::default()
+    };
+
+    // The straddle is built the *inverse* way round from the production case, for
+    // a reason worth stating: the production geometry (own start near, reference
+    // far) cannot be constructed deterministically on this fixture. A small
+    // `outer_maxiter` does not hold BOBYQA still — its setup phase alone is
+    // `40 * (n + 1)` evaluations regardless of the budget — and neither does
+    // starting at the optimum, because with 4 free parameters on 4 identical
+    // subjects the optimum is flat and the optimizer wanders off it by more than
+    // `INIT_ESCAPE_STEP_S`. FIXing everything does not work either: fixed
+    // parameters get degenerate bounds, and the reference is clamped to them, so
+    // it collapses onto the start.
+    //
+    // So the leg runs from the default start and is handed *its own converged
+    // estimates* as the reference. Displacement from its own start is then large
+    // and displacement from the reference ~0 — the same two verdicts, opposite
+    // signs. An implementation that ignores `escape_from` reports `true` here,
+    // which is exactly the bug.
+    let start = model.default_params.clone();
+    let declines =
+        crate::estimation::outer_optimizer::OuterFdDeclineLog::new(population.subjects.len());
+    let reference = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        None,
+    )
+    .0
+    .params;
+
+    let (own, own_outcome) = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        None,
+    );
+    let (from_reference, reference_outcome) = optimize_nlopt_once(
+        &model,
+        &population,
+        &start,
+        &options,
+        false,
+        &declines,
+        Some(&reference),
+    );
+
+    // The straddle itself, asserted so it cannot silently become a tautology: the
+    // two references must disagree about this one run.
+    assert_eq!(
+        own.left_init,
+        Some(true),
+        "fixture precondition: the leg must escape its OWN start, or this test \
+         cannot tell the two references apart"
+    );
+    assert_eq!(
+        from_reference.left_init,
+        Some(false),
+        "the published verdict must be measured against `escape_from`, which this \
+         leg ends on top of — not against the start it happened to run from"
+    );
+
+    // The *internal* verdict — what the #751 stall retry and
+    // `failure_is_converged_plateau` read — stays relative to this attempt's own
+    // start in both cases. Those ask "did this leg descend, or twitch and die?",
+    // which is a question about the leg, not about the pair.
+    assert!(own_outcome.left_init);
+    assert!(
+        reference_outcome.left_init,
+        "escape_from must not move the internal displacement test"
+    );
+}
+
 /// [`max_scaled_deviation`] is the L∞ "how far has the fit moved?" measure both
 /// the cap gate and the plateau verdict key off.
 #[test]

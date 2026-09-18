@@ -1537,3 +1537,287 @@ fn a_fit_option_or_error_model_line_that_matches_nothing_fails_the_check() {
     );
     let _ = std::fs::remove_file(&bad);
 }
+
+// ── #1009: the CMT-less dataset, through both surfaces ───────────────────────
+
+/// A two-state `[odes]` model whose **dosed** state is declared second, so the
+/// dataset has to say `CMT=2` on its dose rows. The shape the issue was filed
+/// from: a NONMEM model whose `DEFDOSE` is not compartment 1.
+const DEPOT_SECOND_ODE: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central, depot])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// A CMT-less dataset: two subjects, one dose and two observations each.
+const NO_CMT_CSV: &str = "\
+ID,TIME,DV,EVID,AMT,MDV
+1,0,.,1,100,1
+1,1,5.0,0,.,0
+1,2,7.0,0,.,0
+2,0,.,1,100,1
+2,1,4.0,0,.,0
+2,2,6.5,0,.,0
+";
+
+#[test]
+fn cmt_less_dataset_on_a_multi_state_ode_model_is_reported() {
+    // T2a. Both surfaces, because they are wired separately: `ferx check` maps the
+    // warning prefix to a diagnostic code, `fit()` extends `FitResult.warnings`,
+    // and each has its own way to lose the finding. Asserting only one lets the
+    // other regress silently — the #811 precedent two tests up.
+    let model = temp_model("cmt_defaulted_ode", DEPOT_SECOND_ODE);
+    let data = temp_data("cmt_defaulted_ode", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    let hits: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("W_CMT_DEFAULTED"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one W_CMT_DEFAULTED from `ferx check`, got: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+    // The code, not the `W_DATA` fallback: a consumer branches on this.
+    assert_eq!(hits[0].code, "W_CMT_DEFAULTED");
+    assert!(
+        hits[0]
+            .message
+            .contains("2 dose row(s) and 4 observation row(s)"),
+        "counts are per-population totals, not per-subject (2 doses, 4 obs), got: {}",
+        hits[0].message
+    );
+
+    // The same pair through `fit()` — the agreement this test is about.
+    let parsed = parse_full_model_file(&model).expect("probe model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("probe data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "fit() must carry it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+#[test]
+fn the_remedy_the_warning_prints_actually_silences_it() {
+    // The message tells the user to "map an existing header onto it with
+    // `CMT = <header>` in the [data] block". That remedy leans on a separate
+    // subsystem (#730/#742 column mapping), and nothing pinned that it works — a
+    // message can be confidently wrong. Two properties, because silencing the
+    // warning without routing the dose would be worse than not silencing it:
+    // the warning is gone AND the dose lands in compartment 2.
+    // The compartment lives under a non-standard header, exactly the shape the
+    // remedy addresses.
+    let mapped_csv = "\
+ID,TIME,DV,EVID,AMT,COMPT,MDV
+1,0,.,1,100,2,1
+1,1,5.0,0,.,1,0
+1,2,7.0,0,.,1,0
+";
+    let mapped = temp_data("cmt_remedy_mapped", mapped_csv);
+    let model = temp_model(
+        "cmt_remedy",
+        &DEPOT_SECOND_ODE.replace(
+            "[parameters]",
+            &format!(
+                "[data]\n  path = {}\n  CMT = COMPT\n\n[parameters]",
+                mapped.display()
+            ),
+        ),
+    );
+
+    // Half 1: the warning is silenced.
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "mapping the column is the remedy the message prints; it must silence it: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Half 2: the dose actually lands in compartment 2. Silencing the warning
+    // without routing the dose would be strictly worse than not silencing it, and
+    // half 1 alone cannot tell the two apart — `prepare_run` is what applies the
+    // `[data]` map, so this reads the population the fit would.
+    let prepared = ferx_core::prepare_run(model.to_str().unwrap(), None).expect("prepare_run");
+    assert_eq!(
+        prepared.population.subjects[0].doses[0].cmt_1based(),
+        2,
+        "the mapped COMPT column must route the dose to the declared second state"
+    );
+    assert_eq!(
+        prepared.population.subjects[0].obs_cmts,
+        vec![1, 1],
+        "and the mapped column feeds the observation rows too"
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&mapped);
+}
+
+#[test]
+fn cmt_less_dataset_on_an_analytical_pk_model_is_not_reported() {
+    // T2b, control. `one_cpt_iv` is the analytical topology with exactly **one**
+    // compartment a dose can reach (`channels: [Some(Central)]`), so a CMT-less
+    // dataset takes the only route there is and there is nothing to report.
+    //
+    // This control used to be `one_cpt_oral`, on the argument that ferx's analytic
+    // numbering equals NONMEM's ADVAN numbering so a CMT-less dataset doses what a
+    // fixed-DEFDOSE ADVAN doses. That is true and it is not the question: an oral
+    // model's `CMT=2` is the depot-bypassing central bolus (#350), anchored against
+    // ADVAN2 in `tests/nonmem_dose_compartment_anchor.rs`, where computing it as a
+    // depot dose gives 1.19324 instead of 1.8097. A dataset that meant that and lost
+    // its column gets the wrong compartment silently, so `one_cpt_oral` now belongs
+    // on the *reported* side — see the test below.
+    let model = temp_model(
+        "cmt_defaulted_analytical",
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let data = temp_data("cmt_defaulted_analytical", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "a 1-cpt IV model has exactly one compartment a dose can reach: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    let parsed = parse_full_model_file(&model).expect("control model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("control data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        "fit() must suppress it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+/// T2c. The other side of the analytical straddle, and the case the first version
+/// of this predicate got wrong: an **oral** model has two compartments a dose can
+/// reach, so a CMT-less dataset chose one of them.
+///
+/// Asserted next to the `one_cpt_iv` control above and on the *same* dataset, so
+/// the only variable is the topology. Without this pair, "analytical models are
+/// suppressed" and "analytical models are reported" are both satisfied by a
+/// predicate that ignores the topology entirely.
+///
+/// The number that makes it a finding rather than a nag is committed in
+/// `tests/nonmem_dose_compartment_anchor.rs`: NONMEM `ADVAN2` with a `CMT=2` bolus
+/// reads 1.8097 at t = 1 h, while computing that same dose as a depot dose — which
+/// is exactly what dropping the column does — reads 1.19324.
+#[test]
+fn cmt_less_dataset_on_an_analytical_oral_model_is_reported() {
+    let model = temp_model(
+        "cmt_defaulted_analytical_oral",
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    );
+    let data = temp_data("cmt_defaulted_analytical_oral", NO_CMT_CSV);
+
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_CMT_DEFAULTED")),
+        "an oral model's CMT=2 is a central bolus, so compartment 1 was a choice: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Both surfaces, because they are wired separately: `ferx check` filters through
+    // the check-report path and `fit()` through its own warning assembly.
+    let parsed = parse_full_model_file(&model).expect("model parses");
+    let pop = read_nonmem_csv(&data, None, None).expect("data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).expect("fit runs");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_CMT_DEFAULTED")),
+        "fit() must report it too: {:?}",
+        result.warnings
+    );
+
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
