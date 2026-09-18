@@ -1,0 +1,22 @@
+$PROBLEM ferx-core #1009 twin: 1-cpt oral ODE, DEFDOSE on compartment 2 (DEPOT declared second), dataset CMT cells float-formatted (2.0 / 1.0)
+$INPUT ID TIME DV EVID AMT CMT RATE MDV
+$DATA defdose_cmt2float.csv IGNORE=@
+$SUBROUTINE ADVAN13 TOL=9
+$MODEL
+  COMP=(CENTRAL, DEFOBS)
+  COMP=(DEPOT, DEFDOSE)
+$PK
+  CL = THETA(1)*EXP(ETA(1))
+  V  = THETA(2)*EXP(ETA(2))
+  KA = THETA(3)*EXP(ETA(3))
+$DES
+  DADT(1) = KA*A(2)/V - (CL/V)*A(1)
+  DADT(2) = -KA*A(2)
+$ERROR
+  IPRED = A(1)
+  Y = IPRED*(1+EPS(1))
+$THETA (0.001, 0.2, 10) (0.1, 10, 500) (0.01, 1.5, 50)
+$OMEGA 0.09 0.04 0.30
+$SIGMA 0.0004  ; ferx: sigma PROP_ERR ~ 0.02 (sd) = variance 0.0004
+$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 PRINT=1 NOABORT
+$TABLE ID TIME PRED IPRED NOPRINT ONEHEADER FORMAT=s1PE15.8 FILE=defdose_cmt2float.tab

@@ -2989,6 +2989,81 @@ fn provider_modeled_distinct_slot_coincident_ends_decline() {
     );
 }
 
+/// **The provider's decline is parameter-dependent, so no fixed probe point can predict
+/// it** (#1154 / PR #1418 review, finding 1).
+///
+/// `provider_modeled_distinct_slot_coincident_ends_decline` above already shows the θ
+/// half: `TVD2 = 2` declines, `TVD2 = 3` is served. This pins the **η** half, which is the
+/// one that bites a diagnostic: with `D2 = TVD2 * exp(ETA_V1)` and `TVD1 = TVD2 = 2`, the
+/// two infusion ends coincide exactly at the prior mode `η = 0` and separate at any
+/// non-zero `ETA_V1` — so a subject that declines at `η = 0` is served at its EBE.
+///
+/// The consequence for #1154 is the whole reason
+/// `outer_optimizer::OuterFdDeclineLog` records declines at the evaluated point instead of
+/// probing: a zero-η probe would report "this subject used a finite-difference outer
+/// gradient" for a subject that never took one.
+#[test]
+fn provider_modeled_decline_depends_on_eta_not_only_on_the_records() {
+    const TWOCPT_IV_D2_ETA: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  theta TVD2(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  D1 = TVD1
+  D2 = TVD2 * exp(ETA_V1)
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let model = parse_model_string(TWOCPT_IV_D2_ETA).expect("parse");
+    let doses = vec![
+        DoseEvent::modeled(
+            0.0,
+            1000.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        ),
+        DoseEvent::modeled(
+            0.0,
+            800.0,
+            2,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        ),
+    ];
+    // Same obs times as the sibling test, for the same reason: never on a window end.
+    let subject = subject_with_doses_and_resets(doses, &[0.5, 1.5, 3.5], Vec::new());
+    let theta = [10.0, 50.0, 5.0, 100.0, 2.0, 2.0];
+
+    // η = 0 — `D2 = 2·exp(0) = 2 = D1`, both ends at t = 2, distinct slots ⇒ decline.
+    assert!(
+        subject_sensitivities(&model, &subject, &theta, &[0.0, 0.0]).is_none(),
+        "at the prior mode the two modeled windows coincide and the provider must decline"
+    );
+    // The same records at a non-zero `ETA_V1` — `D2 = 2·exp(0.4) ≈ 2.98`, ends separate
+    // ⇒ served. Nothing about the subject's data changed; only where it is evaluated.
+    assert!(
+        subject_sensitivities(&model, &subject, &theta, &[0.0, 0.4]).is_some(),
+        "away from the prior mode the ends separate and the provider must serve the SAME \
+         subject — a decline is therefore not a property of the records"
+    );
+}
+
 #[test]
 fn provider_2cpt_steady_state_matches_production() {
     // SS bolus (II=12) and SS oral (II=24) — exercises the *_ss_g branches.

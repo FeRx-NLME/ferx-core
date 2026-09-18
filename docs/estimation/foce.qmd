@@ -45,6 +45,7 @@ The analytic route is the default (`gradient_method = auto`); one provider evalu
 What follows is the detail behind that one-line answer:
 
 - [Reading the resolved route](#reading-the-resolved-route) — what the startup banner tells you.
+- [The outer-loop route is reported as a warning](#outer-loop-fd-fallback) — why `gradient_method_outer` is model-level.
 - Analytic scope — [models and readouts](#analytic-scope-models-and-readouts),
   [likelihood and scaling](#analytic-scope-likelihood-and-scaling),
   [dose events](#analytic-scope-dose-events),
@@ -67,6 +68,23 @@ The startup banner reports the route **actually resolved** across the population
 When the population splits across routes, the banner shows per-route subject counts, e.g. `analytic (Dual2) ×118, FD ×3`.
 
 This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.qmd).
+
+### The outer-loop route is reported as a warning {#outer-loop-fd-fallback}
+
+The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
+
+The two can disagree. A subject the provider declines — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event, two modeled infusion windows that happen to coincide at the current estimates — is salvaged individually onto a reconverged finite-difference gradient, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. The results are correct; the fit is just slower on those subjects. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+
+```
+1 of 32 subjects fell outside the analytic sensitivity provider's scope during this fit
+(e.g. subject 7) and used finite-difference outer gradients; their results are correct
+but slower. The reported outer gradient method is the model-level route, not the
+per-subject one.
+```
+
+The count is **recorded as the fit runs**, from the gradient evaluations that actually happened — not predicted by probing the provider at some chosen parameter point. That distinction is load-bearing, because a decline is not purely a property of the subject's records: the separability check on modeled infusion windows reads the *resolved* durations and lag times, so a subject can decline at `η = 0` and be served at its EBE. A probe would announce a fallback that never occurred.
+
+Recording also means the warning is self-gating. A derivative-free BOBYQA fit (including a `[mixture]` model left on `optimizer = auto`, which resolves to BOBYQA), a Gauss-Newton or trust-region fit, a `reconverge_gradient_interval = 1` fit that forces the reconverged gradient on every evaluation, and an `outer_maxiter = 0` evaluation-only run never select the analytic branch, so they have nothing to record and say nothing. Conversely, any recorded decline is by construction a mismatch with the model-level label — including when *every* subject declines, which is the case that label gets most wrong.
 
 ### Analytic scope: models and readouts {#analytic-scope-models-and-readouts}
 
@@ -479,6 +497,37 @@ The outer loop terminates when any of:
 - The optimizer reports convergence (NLopt `XtolReached` or `FtolReached`)
 
 The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-5`, tight enough that residual EBE noise does not perturb the marginal objective the outer optimizer minimises — see [`fit-options.md`](../model-file/fit-options.qmd#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
+
+### When the optimizer stops without converging {#stopping-without-converging}
+
+NLopt has a fourth way to stop: a bare `Failure`, which its line search returns when it
+cannot make progress against the curvature estimate it has built up. That says nothing
+about *where* the fit is. It comes back both at a finished optimum — the objective is
+already flat to ~8 significant figures, so no step improves it — and at a point the fit was
+still descending through.
+
+ferx tells the two apart on the objective trace rather than on the gradient norm, which at
+these optima still reads O(1): the run must have a **flat tail** (several evaluations since
+the last real improvement), must have **moved off its initial estimates**, and a **cold
+re-solve** of the inner loop at the restored best point must reproduce the objective the
+optimizer saw. All three hold ⇒ the fit converged and is reported as converged
+([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)).
+
+When they do not, the optimizer is **restarted once from the best point it reached**
+([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)). That is what clears the
+curvature memory the failed line search was built on, and it usually costs nothing in the
+sense that matters: the restart is adopted only if it ends at a **strictly lower**
+objective, so it can never make a reported fit worse. On the two-compartment deep-compartment
+model in `tests/fixtures/two_cpt_dcm_regularized.ferx`, L-BFGS quit at evaluation 12 with the
+trace still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units
+lower (3209.81 → −676.77).
+
+Three cases are deliberately left alone. A run that spent its `maxiter` budget stops with
+NLopt's `MaxEvalReached`, not a `Failure`, so a restart can never hand a fit a second
+evaluation budget behind your back — raise `maxiter` instead. A **cancelled** run is not
+restarted. And a second stall is reported as a stall: you get `converged: false` and the
+`Outer optimization did not converge` warning, which is the honest signal and bounds the
+worst case at two optimizations.
 
 ## Warm Starting
 
