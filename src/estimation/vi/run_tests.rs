@@ -7,6 +7,17 @@ use crate::types::{
 };
 use std::collections::HashMap;
 
+/// Every other `parameterization` helper this file calls — `pack_params`,
+/// `clamp_to_bounds`, `unpack_params` — arrives unqualified through the
+/// `use super::*` above, because `run.rs` imports it for its own use.
+/// `compute_bounds` is called only from the `nn`-gated test below, so `run.rs`
+/// has no use for it and importing it there would be an unused import in every
+/// build without `cfg(test)`. It is imported here instead, under the same cfg as
+/// its only caller. (#1446: it was previously called neither way and the
+/// `ci,nn,slow-tests` check set was the only gate that compiled the call.)
+#[cfg(feature = "nn")]
+use crate::estimation::parameterization::compute_bounds;
+
 /// Closed-form 1-cpt IV, two random effects, three subjects. Data simulated from
 /// the model's own initial estimates so the fit has a real optimum to move toward
 /// rather than an arbitrary one.
@@ -1668,10 +1679,7 @@ fn vi_nn_l2_shrinks_the_network_weights() {
 fn vi_objective_trace_is_the_penalized_objective() {
     let (model, population, params) = dcm_fixture();
     let mut x0 = pack_params(&params);
-    clamp_to_bounds(
-        &mut x0,
-        &crate::estimation::parameterization::compute_bounds(&params),
-    );
+    clamp_to_bounds(&mut x0, &compute_bounds(&params));
 
     let o = FitOptions {
         nn_l2_lambda: 1e-2,

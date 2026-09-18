@@ -561,9 +561,24 @@ exit 0
 ///  * narrowing a `--features` set drops a whole cfg-gated surface out of the compile.
 ///    `ci,nn,slow-tests` becoming `ci` is exactly #1133 with the gate still present.
 ///
-/// The feature check is deliberately a **union over the whole group**, not a per-line
-/// assertion: it pins that the matrix still compiles each gated surface without caring how
-/// the lines are arranged, so splitting or merging feature sets stays a free refactor.
+/// The feature check is a **union over the whole group** where one feature alone is what
+/// opens a surface (`ci`, `markov`), so splitting or merging those lines stays a free
+/// refactor. It is a **per-command** check where the surface is opened only by a
+/// *conjunction*, because a union cannot see a conjunction being broken up: with
+/// `ci,survival,slow-tests` still in the list, narrowing `ci,nn,slow-tests` to `ci,nn`
+/// leaves every one of `ci`, `survival`, `slow-tests`, `markov`, `nn` present in the union
+/// and the command count unchanged, so a pure-union assertion stays green (measured on
+/// #1446 — the whole 10-test file passed under exactly that edit). What it silently stops
+/// compiling is the three `#[cfg(feature = "slow-tests")]` bodies inside `src/nn`'s
+/// `nn`-gated test module, whose own doc comment names this command as the thing that
+/// catches their bit-rot. Same shape on the survival side:
+/// `tests/tte_convergence.rs` and `tests/categorical_convergence.rs` are
+/// `#![cfg(all(feature = "survival", feature = "slow-tests"))]`.
+///
+/// The two halves are disjoint on purpose: `slow-tests`, `nn` and `survival` are checked
+/// ONLY by the pairings and `ci`/`markov` ONLY by the union. Asserting both ways for the
+/// same feature would be two gates rejecting the same edits, which is how a hole hides —
+/// delete either and the suite stays green, so neither can be mutation-tested.
 #[test]
 fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     let clippy = listed_commands("clippy");
@@ -742,30 +757,71 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         );
     }
 
-    // Union of every `--features` value in the check group.
+    // The `--features` value of each command in the check group, kept PER COMMAND so a
+    // conjunction can be asserted. A command with no `--features` contributes an empty set
+    // rather than being dropped, so the two views below stay derived from one parse.
     let check = listed_commands("check");
-    let mut features: Vec<String> = Vec::new();
-    for cmd in &check {
-        let mut parts = cmd.split_whitespace();
-        while let Some(p) = parts.next() {
-            if p == "--features" {
-                if let Some(list) = parts.next() {
-                    for f in list.split(',') {
-                        // Members take their features package-qualified (`ferx-core/ci`).
-                        let f = f.rsplit('/').next().unwrap_or(f);
-                        features.push(f.to_string());
+    let per_command: Vec<Vec<String>> = check
+        .iter()
+        .map(|cmd| {
+            let mut set = Vec::new();
+            let mut parts = cmd.split_whitespace();
+            while let Some(p) = parts.next() {
+                if p == "--features" {
+                    if let Some(list) = parts.next() {
+                        for f in list.split(',') {
+                            // Members take their features package-qualified (`ferx-core/ci`).
+                            set.push(f.rsplit('/').next().unwrap_or(f).to_string());
+                        }
                     }
                 }
             }
-        }
-    }
-    for want in ["ci", "survival", "slow-tests", "markov", "nn"] {
+            set
+        })
+        .collect();
+    let features: Vec<&String> = per_command.iter().flatten().collect();
+
+    // Features whose surface a single flag opens: a union over the group is the right
+    // question, and the only one, for these.
+    for want in ["ci", "markov"] {
         assert!(
-            features.iter().any(|f| f == want),
+            features.iter().any(|f| *f == want),
             "the `check` group compiles nothing under `{want}`, so every source and test \
              file behind that cfg is unchecked on this PR. #1133 is what that looks like: \
              one struct literal in an `nn`-gated file turned three CI jobs red after a \
              local run of 4634 tests reported clean.\nfeature sets seen: {features:?}\n  {}",
+            check.join("\n  ")
+        );
+    }
+
+    // Features whose surface is opened only by a CONJUNCTION. Asserted on a single
+    // command, because the union above is blind to the pair being split across two
+    // commands that each carry one half — see this test's doc comment.
+    for (a, b, what) in [
+        (
+            "nn",
+            "slow-tests",
+            "the three `#[cfg(feature = \"slow-tests\")]` bodies in `src/nn`'s test module \
+             (`l2_shrinks_weights_and_modulator_variation` and its two helpers), which are \
+             `#[cfg]`ed out rather than `#[ignore]`d so they do not read as missed patch \
+             lines (#293)",
+        ),
+        (
+            "survival",
+            "slow-tests",
+            "`tests/tte_convergence.rs` and `tests/categorical_convergence.rs`, both \
+             `#![cfg(all(feature = \"survival\", feature = \"slow-tests\"))]`",
+        ),
+    ] {
+        assert!(
+            per_command
+                .iter()
+                .any(|set| set.iter().any(|f| f == a) && set.iter().any(|f| f == b)),
+            "no single `check` command enables `{a}` AND `{b}` together, so {what} compile \
+             in no per-PR job at all. Both features appearing somewhere in the group is not \
+             enough — that is the state #1446 measured, where narrowing one line to \
+             `ci,{a}` left this whole file green.\nper-command feature sets: \
+             {per_command:?}\n  {}",
             check.join("\n  ")
         );
     }
