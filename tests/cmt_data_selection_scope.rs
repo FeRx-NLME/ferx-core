@@ -13,8 +13,8 @@
 //! `cmt_defaulting_scope.rs` uses for the dose channel:
 //!
 //! > A `[data_selection]` clause naming `CMT` makes the set of scored records
-//! > depend on the compartment the reader chose **if and only if** `ferx check`
-//! > raises `W_CMT_DEFAULTED` on that dataset.
+//! > depend on the compartment the reader chose **if and only if** `fit()` raises
+//! > `W_CMT_DEFAULTED` on that dataset.
 //!
 //! The left side is *measured* — the records are read both ways and counted, and the
 //! objective is evaluated on what survived — so the expectation cannot drift into a
@@ -22,16 +22,28 @@
 //! at all) is asserted in the same loop, because a one-sided table agrees with a
 //! predicate stuck at `true`.
 //!
-//! Tier 2: no `fit()`. The objective is `stats::likelihood::individual_nll` summed
-//! over the subjects at the model's own initial estimates — the same quantity the
-//! issue's OFV measurements moved, without an optimizer loop.
+//! **Both directions of the filter are covered**, and the Codex review of #1423 is
+//! why. A defaulted compartment can make a clause *stop* matching, so the row is
+//! wrongly kept — and a kept row is counted by the reader's observation arm like any
+//! other. Or it can make a clause *start* matching, so the row is wrongly deleted,
+//! and a deleted row hits the filter's `continue` long before that arm runs. The
+//! first version of this file tested only the first direction and used `ferx check`
+//! as its oracle; since `validate_model_file` reads with `filter: None`, that oracle
+//! could not observe the second direction at all, and the mirror case passed green
+//! against a reader that counted nothing (CLAUDE.md, "a green test is not evidence
+//! that it can fail"). The oracle is now `fit()`.
+//!
+//! Tier 2: `fit()` only at `outer_maxiter = 0` — one objective evaluation, no
+//! convergence loop — plus `stats::likelihood::individual_nll` summed over the
+//! subjects at the model's own initial estimates, which is the quantity the issue's
+//! OFV measurements moved.
 
 use ferx_core::api::read_population_for;
 use ferx_core::io::datareader::SelectionFilter;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::stats::likelihood::individual_nll;
-use ferx_core::validate_model_file;
 use ferx_core::OmegaMatrix;
+use ferx_core::{fit, validate_model_file, FitOptions};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -144,6 +156,55 @@ fn scored(src: &str, data: &str) -> (usize, f64) {
     (n, nll)
 }
 
+/// Whether the **fitting** path raises `W_CMT_DEFAULTED` — the population read
+/// *through the filter*, then passed through the same suppression predicate
+/// `api::fit` applies to `population.warnings`.
+///
+/// This, not [`warns`], is the oracle for anything the filter decides. `ferx check`
+/// reads with no filter at all (`validation.rs` passes `filter: None`), so it counts
+/// a row the fit never sees and reports the warning whether or not the fit does —
+/// which made the first version of the mirror case below pass green against a reader
+/// that counted nothing (CLAUDE.md: "a green test is not evidence that it can fail").
+/// The two entry points genuinely differ here; the last test in this file pins where.
+///
+/// Through `fit()` itself, at `outer_maxiter = 0` — one objective evaluation, no
+/// convergence loop — rather than through a re-spelling of the suppression predicate
+/// here. `reader_warning_suppressed` is `pub(crate)`, and a second copy of it in this
+/// file would agree with a wrong answer by construction; `fit()` applies the real one
+/// to the real filtered population, which is the thing under test.
+fn warns_on_read(src: &str, data: &str) -> bool {
+    let d = temp(data, ".csv");
+    let parsed = parse_full_model(src).expect("model parses");
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &[])
+        .expect("the fixtures' clauses all parse");
+    let (population, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        d.path().to_str().unwrap(),
+        None,
+        None,
+        Some(&filter).filter(|f| !f.is_empty()),
+        &parsed.column_map,
+    )
+    .expect("dataset loads");
+    let fit_opts = FitOptions {
+        outer_maxiter: 0,
+        ..opts.clone()
+    };
+    let result = fit(
+        &parsed.model,
+        &population,
+        &parsed.model.default_params,
+        &fit_opts,
+    )
+    .expect("a 0-iteration evaluation returns");
+    result
+        .warnings
+        .iter()
+        .any(|w| w.starts_with("W_CMT_DEFAULTED"))
+}
+
 /// Whether `ferx check` raises `W_CMT_DEFAULTED`. Through the public entry point, so
 /// this exercises the filter `fit()` applies rather than a private predicate.
 fn warns(src: &str, data: &str) -> bool {
@@ -167,16 +228,30 @@ const NO_SELECTION: &str = "";
 const IGNORE_CMT: &str = "\n[data_selection]\n  ignore = CMT == 2\n";
 const ACCEPT_CMT: &str = "\n[data_selection]\n  accept = CMT == 1\n";
 const IGNORE_DV: &str = "\n[data_selection]\n  ignore = DV < 0.001\n";
+/// The **mirror** case, and the one the `ignore = CMT == 2` row cannot reach: here
+/// the defaulted compartment makes the filter *remove* the row rather than keep it.
+/// `TIME == 4` narrows the clause to the one record whose cell differs between the
+/// two datasets, so the other three are untouched and the measurement isolates it.
+const IGNORE_CMT1_AT_T4: &str = "\n[data_selection]\n  ignore = CMT == 1 && TIME == 4\n";
 
 #[test]
 fn the_warning_fires_exactly_where_the_filter_reads_the_chosen_compartment() {
     // `(label, block, expected records kept on the readable dataset)`. The counts are
     // stated so a clause that silently stops firing — the way `ignore = CMT == 2`
     // does when the cell is unreadable — is visible as a number rather than inferred.
-    let cases: [(&str, &str, usize); 4] = [
+    //
+    // Both directions of the filter are present on purpose. A defaulted compartment
+    // can either make a clause *stop* matching (the row is wrongly kept) or *start*
+    // matching (the row is wrongly dropped), and the two reach the reader's
+    // defaulting counters completely differently: a kept row goes on to be counted
+    // by `record_dose`/`record_obs`, while a dropped one hits the filter's `continue`
+    // long before either. A table with only the first kind agrees with an
+    // implementation that counts nothing on the second (Codex review of #1423).
+    let cases: [(&str, &str, usize); 5] = [
         ("no [data_selection]", NO_SELECTION, 4),
         ("ignore = CMT == 2", IGNORE_CMT, 3),
         ("accept = CMT == 1", ACCEPT_CMT, 3),
+        ("ignore = CMT == 1 && TIME == 4", IGNORE_CMT1_AT_T4, 4),
         ("ignore = DV < 0.001", IGNORE_DV, 4),
     ];
 
@@ -196,7 +271,7 @@ fn the_warning_fires_exactly_where_the_filter_reads_the_chosen_compartment() {
         // principle keep the same number of records and still re-weight them.
         let observable = n_readable != n_defaulted
             || (nll_readable - nll_defaulted).abs() > 1e-9 * nll_readable.abs().max(1.0);
-        let warned = warns(&src, &csv("x"));
+        let warned = warns_on_read(&src, &csv("x"));
         table.push(format!(
             "  {label}: kept {n_readable} -> {n_defaulted}, −logL {nll_readable:.4} -> \
              {nll_defaulted:.4}, observable {observable}, warned {warned}"
@@ -246,7 +321,196 @@ fn the_filtered_row_is_silently_kept_and_scored_when_its_compartment_is_defaulte
         "an extra scored record must move the objective: {nll_readable} vs {nll_defaulted}"
     );
     assert!(
-        warns(&src, &csv("x")),
+        warns_on_read(&src, &csv("x")),
         "and ferx must say so — this is the `ok — 0 warning(s)` the issue measured"
+    );
+}
+
+/// The message text `fit()` reports, or `None` when it reports no `W_CMT_DEFAULTED`.
+fn warning_text(src: &str, data: &str) -> Option<String> {
+    let d = temp(data, ".csv");
+    let parsed = parse_full_model(src).expect("model parses");
+    let opts = &parsed.fit_options;
+    let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &[])
+        .expect("the fixtures' clauses all parse");
+    let (population, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        d.path().to_str().unwrap(),
+        None,
+        None,
+        Some(&filter).filter(|f| !f.is_empty()),
+        &parsed.column_map,
+    )
+    .expect("dataset loads");
+    let fit_opts = FitOptions {
+        outer_maxiter: 0,
+        ..opts.clone()
+    };
+    fit(
+        &parsed.model,
+        &population,
+        &parsed.model.default_params,
+        &fit_opts,
+    )
+    .expect("a 0-iteration evaluation returns")
+    .warnings
+    .into_iter()
+    .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+}
+
+#[test]
+fn a_defaulted_row_the_filter_deletes_is_still_reported() {
+    // The Codex review of #1423, and the mirror of the test above. There the
+    // defaulted compartment made a clause *stop* matching, so the row was wrongly
+    // kept — and being kept, it went on to be counted by the observation arm like
+    // any other row. Here it makes a clause *start* matching, so the row is wrongly
+    // deleted, and it hits the filter's `continue` long before `record_obs` can see
+    // it. Measured before the fix: records kept 4 -> 3, and `W_CMT_DEFAULTED` absent
+    // from `fit()` entirely.
+    //
+    // The whole summary is checked, not just its presence: the count has to be the
+    // deleted row, and the message has to say the row left the fit rather than
+    // repeat "assigned compartment 1", which would describe the opposite outcome.
+    let src = model_src(IGNORE_CMT1_AT_T4);
+    let (kept_readable, _) = scored(&src, &csv("2"));
+    let (kept_defaulted, _) = scored(&src, &csv("x"));
+    assert_eq!(
+        (kept_readable, kept_defaulted),
+        (4, 3),
+        "the t=4 row must survive when its cell is readable and be deleted when it is not"
+    );
+    let msg = warning_text(&src, &csv("x")).expect("the deleted row must be reported");
+    assert!(
+        msg.contains("1 row(s) were removed from the fit by a [data_selection] condition"),
+        "the summary must name the deleted row as deleted: {msg}"
+    );
+    assert!(
+        msg.contains("0 dose row(s) and 0 observation row(s)"),
+        "…and must not double-count it as a scored row: {msg}"
+    );
+    assert!(
+        msg.contains("not a compartment index (\"x\")"),
+        "…and must still name the offending spelling: {msg}"
+    );
+}
+
+#[test]
+fn an_exclusion_decided_by_another_column_stays_silent() {
+    // The scoping half, and the reason the count is keyed on the rule that actually
+    // fired rather than on "this block mentions CMT somewhere". Both clauses are
+    // present; the `DV` one fires first and deletes the row, and the row's defaulted
+    // compartment decided nothing — so there is nothing to report.
+    //
+    // Without this, the natural cheap implementation (`sel.references_column("cmt")`
+    // on the whole filter) passes every other test in this file and reports a row
+    // whose compartment was irrelevant.
+    //
+    // The CMT clause is written so it matches *neither* spelling (`CMT == 7`), which
+    // removes the ordering question entirely: only the `TIME` rule ever fires, so any
+    // count here can only have come from the mere presence of a CMT clause.
+    let src = model_src("\n[data_selection]\n  ignore = TIME == 4\n  ignore = CMT == 7\n");
+    // The t=4 row is the one deleted, and it is also the defaulted one.
+    let (kept_readable, _) = scored(&src, &csv("2"));
+    let (kept_defaulted, _) = scored(&src, &csv("x"));
+    assert_eq!(
+        (kept_readable, kept_defaulted),
+        (3, 3),
+        "the TIME rule must delete the t=4 row under both spellings, so the compartment \
+         changed nothing"
+    );
+    assert_eq!(
+        warning_text(&src, &csv("x")),
+        None,
+        "a row deleted for a DV reason must not be reported as a compartment guess"
+    );
+}
+
+#[test]
+fn a_deleted_evid_2_row_is_reported_even_though_a_kept_one_is_not() {
+    // `n_dose` / `n_obs` deliberately count only rows the fit uses, so an `EVID=2`
+    // covariate-change marker with a defaulted CMT is *not* reported when it is kept
+    // — it changes no compartment. Deleting it is different: the marker is gone from
+    // the fit, and a guessed compartment is why. Asserted in both directions on the
+    // same row, so the asymmetry is a decision rather than an accident of where the
+    // counter sits.
+    let rows = |spelling: &str| {
+        format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,WT\n\
+             1,0,.,1,100,1,1,70\n\
+             1,1,1.60,0,.,1,0,70\n\
+             1,2,.,2,.,{spelling},1,80\n\
+             1,8,0.85,0,.,1,0,80\n\
+             1,12,0.60,0,.,1,0,80\n"
+        )
+    };
+    let with_cov = |selection: &str| {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[covariates]
+  WT continuous
+
+[individual_parameters]
+  CL = TVCL * (WT/70) * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+{selection}
+"#
+        )
+    };
+
+    // Kept: the EVID=2 row survives, and its guessed compartment selects nothing.
+    let kept = with_cov("");
+    assert_eq!(
+        warning_text(&kept, &rows("x")),
+        None,
+        "a kept EVID=2 row's compartment addresses nothing, so it is not a guess \
+         worth reporting"
+    );
+
+    // Deleted by a CMT rule: the marker leaves the fit because of the guess.
+    let deleted = with_cov("\n[data_selection]\n  ignore = CMT == 1 && EVID == 2\n");
+    let msg = warning_text(&deleted, &rows("x"))
+        .expect("an EVID=2 row deleted by a CMT rule must be reported");
+    assert!(
+        msg.contains("1 row(s) were removed from the fit by a [data_selection] condition"),
+        "the deleted marker must be counted: {msg}"
+    );
+}
+
+#[test]
+fn ferx_check_reads_unfiltered_so_it_answers_a_different_question() {
+    // Recorded rather than asserted away. `validate_model_file` reads with
+    // `filter: None` (`api/validation.rs`), so on a dataset whose defaulted row the
+    // filter deletes, `ferx check` counts that row as a plain observation while
+    // `fit()` counts it as a deletion. Both report `W_CMT_DEFAULTED` — they agree on
+    // the finding — but not on the sentence, and a reader comparing the two should
+    // know why.
+    //
+    // This is also why `warns_on_read` exists: the first version of the mirror case
+    // above used `ferx check` as its oracle and passed green against a reader that
+    // counted nothing at all, because check never applied the filter that caused the
+    // defect.
+    let src = model_src(IGNORE_CMT1_AT_T4);
+    assert!(
+        warns(&src, &csv("x")),
+        "ferx check reports it (having counted the row as a kept observation)"
+    );
+    let fit_msg = warning_text(&src, &csv("x")).expect("and fit() reports it too");
+    assert!(
+        fit_msg.contains("0 dose row(s) and 0 observation row(s)")
+            && fit_msg.contains("removed from the fit"),
+        "but fit()'s sentence is about a deletion: {fit_msg}"
     );
 }
