@@ -14333,6 +14333,7 @@ fn build_mixture_params(
                 base_omega.diagonal,
                 base_omega.free_mask.clone(),
             )
+            .with_block_declared(base_omega.block_declared.clone())
         })
         .collect();
     let sigma = (0..k)
@@ -15434,6 +15435,12 @@ fn build_omega_matrix(
         }
     }
 
+    // Declaration provenance for the diagnostics (#1394), recorded here because
+    // this is the last point that can still see how each eta was written. It
+    // includes a **one-eta** block, which sets no off-diagonal and so leaves no
+    // trace in `free_mask`.
+    let mut block_declared = vec![false; n];
+
     // Fill block entries from block specs (lower triangle, row-wise)
     for block in block_omegas {
         let block_n = block.names.len();
@@ -15442,6 +15449,7 @@ fn build_omega_matrix(
             let i = *name_to_idx.get(block.names[row].as_str()).ok_or_else(|| {
                 format!("block_omega references unknown eta '{}'", block.names[row])
             })?;
+            block_declared[i] = true;
             for col in 0..=row {
                 let j = *name_to_idx.get(block.names[col].as_str()).ok_or_else(|| {
                     format!("block_omega references unknown eta '{}'", block.names[col])
@@ -15455,12 +15463,10 @@ fn build_omega_matrix(
         }
     }
 
-    Ok(OmegaMatrix::from_matrix_with_mask(
-        matrix,
-        eta_names.to_vec(),
-        false,
-        free_mask,
-    ))
+    Ok(
+        OmegaMatrix::from_matrix_with_mask(matrix, eta_names.to_vec(), false, free_mask)
+            .with_block_declared(block_declared),
+    )
 }
 
 /// Build the per-eta `omega_fixed` flags from parsed diagonal + block specs.
