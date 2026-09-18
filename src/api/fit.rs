@@ -1253,8 +1253,11 @@ fn fit_inner(
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
     accumulated_warnings.extend(pre_run_warnings);
-    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
-    // by read_nonmem_csv into population.warnings.
+    // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING, W_MISSING_DV,
+    // W_CMT_DEFAULTED, …) accumulated by read_nonmem_csv into
+    // population.warnings. The list is illustrative, not exhaustive — every code
+    // the reader emits is in the `src/diagnostics.rs` registry table, which is the
+    // one place that has to stay complete.
     //
     // Through the shared filter, so `ferx check` suppresses exactly what `fit()`
     // does — see `reader_warning_suppressed`.
@@ -1289,6 +1292,14 @@ fn fit_inner(
             accumulated_warnings.push(w);
         }
     }
+
+    // The outer-gradient FD-fallback notice (#1154) is *not* emitted here. It reports
+    // which subjects actually took the per-subject reconverged-FD outer gradient, which
+    // is only knowable once the gradient has run — `outer_optimizer::optimize_population`
+    // owns the runtime log and pushes the warning onto its own `OuterResult::warnings`.
+    // A probe at this point would have to guess a parameter point, and the provider's
+    // declines are parameter-dependent (`moving_bounds_separable` reads the resolved
+    // infusion windows and lag times), so a guess reports fallbacks that never happen.
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());

@@ -82,8 +82,9 @@ pub(crate) use run::{
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
-    resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
-    run_model_with_data_inits, PreparedRun,
+    resolve_data_path, run_from_file, run_model_simulate, run_model_simulate_with_overrides,
+    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, PreparedRun,
+    RunOverrides,
 };
 pub(crate) use simulate::obs_row_time;
 pub use simulate::{
@@ -191,8 +192,16 @@ mod auto_optimizer_gradient_coupling_tests;
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/threads_override_tests.rs"]
+mod threads_override_tests;
+
+#[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/reader_warning_suppression_tests.rs"]
+mod reader_warning_suppression_tests;
 
 #[cfg(test)]
 #[path = "tests/scaling_undefined_tests.rs"]

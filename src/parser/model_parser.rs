@@ -8497,8 +8497,22 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
                 if chain.is_empty() {
                     return Err("method = [] is empty; provide at least one method".into());
                 }
-                // Interaction flag follows the final stage of the chain.
-                opts.interaction = *chain.last().unwrap() == EstimationMethod::FoceI;
+                // A final `focei` switches interaction on and a final `foce`
+                // switches it off; any other final stage leaves the default
+                // (on) alone, as the single-method form below does. The chain
+                // form used to *clear* the flag for every chain not ending in
+                // `focei`, so `method = [saem, imp]` reported SAEM's final
+                // FOCE-approximation objective *without* interaction — 175
+                // units above the FOCEI objective at the same estimates on the
+                // thiotepa model of #1415 — and every SAEM-vs-FOCEI comparison
+                // built on that number compared two different objectives. A
+                // `foce` / `focei` *stage* still sets its own flag per stage in
+                // `api::fit` (FOCEI on, FOCE off).
+                match *chain.last().unwrap() {
+                    EstimationMethod::FoceI => opts.interaction = true,
+                    EstimationMethod::Foce => opts.interaction = false,
+                    _ => {}
+                }
                 opts.method = *chain.last().unwrap();
                 opts.methods = chain;
             } else {
