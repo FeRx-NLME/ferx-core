@@ -112,7 +112,7 @@ section of the SDLC for the versioning policy).
   The drift that cap was answering is specific to the `iiv_on_ruv` coupling (the same model
   without it lands on NONMEM IMP undamped), so an `iiv_on_ruv` model keeps the 0.03 default —
   undamped it drifts to 0.18 from either start, 47 FOCEI-objective units worse than the held
-  start — and that drift is tracked separately. A value you set wins either way. (#1415)
+  start — and that drift is tracked as #1421. A value you set wins either way. (#1415)
 - **SAEM now averages the residual sufficient statistic for eligible single additive and proportional error models, reducing final-draw Monte Carlo noise in the residual SD estimate (#1321).**
 
 - **`method = laplace` no longer recomputes the sensitivity jet its grid anchor was just built

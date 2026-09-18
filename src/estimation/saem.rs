@@ -177,8 +177,8 @@ const OMEGA_SA_MAX_STEP: f64 = 0.1;
 /// do not change it — so it is not plain E-step under-mixing. The
 /// importance-sampled objective cannot rank the two points on that 12-eta
 /// model (ESS/K = 0.001); the FOCEI objective can, and the drifted fit is 47
-/// units worse than the held one (7492.7 against 7445.3). It is left as its
-/// own issue; `mstep_damping = 0.03`
+/// units worse than the held one (7492.7 against 7445.3). It is tracked as
+/// #1421; `mstep_damping = 0.03`
 /// remains available as the documented hold for that shape of model, and its
 /// gate and no-effect warnings are unchanged.
 ///
@@ -202,8 +202,8 @@ const MSTEP_SA_MAX_STEP: f64 = 1.0;
 /// the E-step is modified — `η_RUV` is re-centred into σ every iteration (#904)
 /// — and a σ that shares the numerical M-step with the no-ETA thetas is what
 /// that channel's σ-side of the blend acts on; that is where the pathology
-/// lives, and it needs its own fix. Until then this cap holds those thetas
-/// near their start, which on that reprex is the better answer.
+/// lives, and it needs its own fix (#1421). Until then this cap holds those
+/// thetas near their start, which on that reprex is the better answer.
 const MSTEP_SA_MAX_STEP_IIV_ON_RUV: f64 = 0.03;
 
 /// Default `mstep_damping` for a fit that did not set one (#1415).

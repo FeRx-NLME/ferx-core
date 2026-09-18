@@ -322,7 +322,8 @@ omega removed lands undamped at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 —
 on NONMEM IMP's 0.394 / 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342
 / 2.228 / 147.5. Under `iiv_on_ruv` the E-step is modified (`η_RUV` is
 re-centred into σ every iteration) and σ shares the numerical M-step with the
-no-ETA thetas; that is where the pathology lives, and it needs its own fix. So
+no-ETA thetas; that is where the pathology lives, and it needs its own fix
+(#1421). So
 **the default is keyed to that shape**: a model with `iiv_on_ruv` keeps the
 0.03 cap, every other model runs undamped, and a value you set wins either
 way. `FIX` is the honest spelling of the same hold when the value is known.
