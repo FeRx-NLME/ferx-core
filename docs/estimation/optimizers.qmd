@@ -249,7 +249,14 @@ cold re-solve of the EBEs at the best point reproduce it?). Since #1277 a `Failu
 to call converged is **resumed** — L-BFGS is started again from the best point seen, with a fresh
 identity Hessian and the opening-step rescale re-armed, on whatever evaluation budget is left. A
 `Failure` at a plateaued, cold-consistent point is still reported converged exactly as before, and a
-launch that resumes and makes no progress is not resumed again. A resumed fit carries a warning saying
+launch that resumes and makes no progress is not resumed again. A resumed launch begins by re-evaluating
+the point it was resumed from; that one evaluation sits on the best OFV by construction and does not
+count toward the plateau, but the line-search probes that follow it do, so a launch that resumes off a
+too-short flat tail and then finds nothing can still complete the plateau. The verdict is also not one
+NLopt's own status can overrule: a resumed launch that makes no progress and ends `XtolReached` (or is
+stopped by the stagnation guard, whose window restarts with each launch) is reporting exactly the point
+the verdict rejected, so it is put through the same plateau-and-cold-re-solve test a `Failure` gets
+rather than reported converged on the strength of the status. A resumed fit carries a warning saying
 how many times it was resumed; one that exhausts `outer_maxiter` before finishing is reported as a spent
 budget ("increase maxiter"), not as a stall. On the fixture above both fits converge — the second to
 `XtolReached` at gradient norm 0.008.

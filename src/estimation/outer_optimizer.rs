@@ -1077,12 +1077,12 @@ struct NloptState {
     /// also counts objective-only line-search probes); drives the
     /// `reconverge_gradient_interval` schedule.
     n_grad_evals: usize,
-    /// The NLopt launch this state last saw (see `resume_descent`), and
-    /// `n_grad_evals` as it stood when that launch began. Their difference is
-    /// the per-launch gradient count that [`should_cap_gradient`] reads: each
-    /// launch starts L-BFGS from an identity Hessian, so the overshoot cap has
-    /// to fire on the first gradient of *every* launch, not only the first of
-    /// the run.
+    /// The NLopt launch this state last saw (see `resume_descent` and
+    /// [`note_launch`]), and `n_grad_evals` as it stood when that launch began.
+    /// Their difference is the per-launch gradient count that
+    /// [`should_cap_gradient`] reads: each launch starts L-BFGS from an identity
+    /// Hessian, so the overshoot cap has to fire on the first gradient of
+    /// *every* launch, not only the first of the run.
     launch: usize,
     grad_evals_at_launch: usize,
     /// Previous parameter vector — used to compute step_norm for the trace.
@@ -1185,6 +1185,29 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     } else {
         false
     }
+}
+
+/// Re-arm the per-launch bookkeeping when the driver starts a new NLopt launch
+/// (`resume_descent`); a no-op while `launch` is the one the state last saw.
+///
+/// Two things are per-launch, not per-run. The gradient count behind
+/// [`should_cap_gradient`]: each launch restarts L-BFGS from an identity Hessian
+/// and takes the overshoot step again, so the cap has to fire on the first
+/// gradient of every launch. And the stagnation guard's window
+/// ([`detect_stagnation`]): it counts evals since the last improvement, and a
+/// launch resumed with most of that window already spent by the launch that
+/// aborted would be latched a few evals in — every eval then returns `best_ofv`
+/// with a zero gradient, Luksan sees `gmax <= tolg` and returns `Success` —
+/// having been given no chance to do what it was resumed to do. The window
+/// restarts at the launch; `best_at_last_improvement` does not, so a resumed
+/// launch still has to *beat* the best point to count as improving.
+fn note_launch(state: &mut NloptState, launch: usize) {
+    if launch == state.launch {
+        return;
+    }
+    state.launch = launch;
+    state.grad_evals_at_launch = state.n_grad_evals;
+    state.last_improvement_eval = state.n_evals;
 }
 
 /// Should this evaluation's EBEs become the warm start for the next one? (#1290)
@@ -1992,6 +2015,46 @@ pub(crate) fn resume_descent(
     }
 }
 
+/// What the post-optimization verdict reads from the plateau tracker once the
+/// resume loop (`resume_descent`) has run: the feasible-eval count the flat tail
+/// is measured over, and whether the last launch made progress at all.
+///
+/// `at_last_resume` is `(last_sig_feasible_eval, feasible_evals)` as they stood
+/// when the last launch was resumed, `None` when nothing was. A resumed launch
+/// begins by re-evaluating the point it was resumed from, and that eval sits on
+/// the best OFV by construction — it is not evidence of a plateau and must not
+/// pad a 4-flat tail to 5. Everything after it is: the line-search probes of a
+/// launch that then found nothing are the same flat-tail evidence the aborted
+/// launch's probes were, so only the one re-evaluation is dropped, never the
+/// launch. A launch that *did* progress moved `last_sig_feasible_eval` past the
+/// re-evaluation, and the tail is measured from there unchanged.
+///
+/// The second field is what decides whether an `Ok` status from a resumed
+/// launch stands on its own. A resume only happens at a point the plateau
+/// verdict refused to call converged — for a too-short tail, or because the
+/// cold re-solve did not reproduce the best-seen OFV (the #751 warm-start
+/// artifact). A resumed launch that then makes no progress and ends `Ok` —
+/// `XtolReached`, or the stagnation guard forcing `Success` — is reporting
+/// exactly the point that verdict rejected, and an `Ok` status must not launder
+/// it: the caller routes such a result through the same verdict a `Failure`
+/// gets, so the consistency check still has to hold.
+fn plateau_trace_after_resume(
+    last_sig_feasible_eval: usize,
+    feasible_evals: usize,
+    at_last_resume: Option<(usize, usize)>,
+) -> (usize, bool) {
+    let Some((sig_at_resume, feasible_at_resume)) = at_last_resume else {
+        return (feasible_evals, true);
+    };
+    if last_sig_feasible_eval > sig_at_resume {
+        return (feasible_evals, true);
+    }
+    (
+        feasible_evals.saturating_sub(1).max(feasible_at_resume),
+        false,
+    )
+}
+
 /// The best point an optimizer has seen so far — a run's single source of truth
 /// for "where the fit actually is".
 ///
@@ -2433,12 +2496,9 @@ fn optimize_nlopt_once(
             return state.best_ofv;
         }
         // A new launch (`resume_descent`) restarts L-BFGS from an identity
-        // Hessian, so the gradient count the overshoot cap reads starts over.
-        let current_launch = launch_cl.load(Ordering::Relaxed);
-        if current_launch != state.launch {
-            state.launch = current_launch;
-            state.grad_evals_at_launch = state.n_grad_evals;
-        }
+        // Hessian: the gradient count the overshoot cap reads and the
+        // stagnation guard's window both start over.
+        note_launch(state, launch_cl.load(Ordering::Relaxed));
         // Unscale from optimizer space to real (log/Cholesky) space.
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
         let params = unpack_params(&x, init_params);
@@ -2960,11 +3020,10 @@ fn optimize_nlopt_once(
     // resume from the best-seen point instead of reporting wherever the abort
     // left it (#1277, see `resume_descent`).
     let mut result = opt.optimize(&mut x0);
-    // Plateau-tracker `(last_sig_feasible_eval, feasible_evals)` at the end of the
-    // last launch that made progress. A resumed launch that then makes none has
-    // only re-evaluated the best point, and that eval must not pad the flat tail
-    // the plateau verdict reads — see `resume_descent`.
-    let mut plateau_at_last_progress: Option<(usize, usize)> = None;
+    // Plateau-tracker `(last_sig_feasible_eval, feasible_evals)` as they stood at
+    // the last resume. The post-optimization block reads the trace relative to
+    // it — see `plateau_trace_after_resume`.
+    let mut plateau_at_last_resume: Option<(usize, usize)> = None;
     let mut budget_exhausted_mid_descent = false;
     let mut n_resumes = 0usize;
     // The cold solve the resume loop ran at the best-seen point, keyed by that
@@ -2981,7 +3040,7 @@ fn optimize_nlopt_once(
             (best.x.clone(), best.ofv_clean)
         };
         let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
-        let feasible_at_launch = plateau_at_last_progress.map_or(0, |(_, feasible)| feasible);
+        let feasible_at_launch = plateau_at_last_resume.map_or(0, |(_, feasible)| feasible);
         let evals_used = n_evals_outer.load(Ordering::Relaxed) as u32;
         // The same verdict the post-optimization block reaches for a `Failure`
         // that is *not* resumed: a plateaued, cold-consistent best point is a
@@ -3023,12 +3082,30 @@ fn optimize_nlopt_once(
             );
         }
         n_resumes += 1;
-        plateau_at_last_progress = Some((last_sig_feasible_eval, feasible_evals));
+        plateau_at_last_resume = Some((last_sig_feasible_eval, feasible_evals));
         x0.copy_from_slice(&best_x);
         launch.fetch_add(1, Ordering::Relaxed);
+        // NLopt counts evals per `optimize()` call, so this is the launch's own
+        // budget. Luksan's `plis` also sizes its L-BFGS memory from `maxeval`
+        // (`mf = maxeval` whenever that is below `MEMAVAIL / n`, which for any
+        // ferx-sized `n` it always is) — a small `remaining` therefore also
+        // means a short memory, but never a binding one: a launch cannot take
+        // more iterations than it has evals, so the memory always holds every
+        // curvature pair the launch can produce.
         opt.set_maxeval(remaining).unwrap();
         result = opt.optimize(&mut x0);
     }
+    // The trace the verdicts below read, relative to the last resume: the
+    // feasible-eval count with the resumed launch's re-evaluation of its start
+    // point dropped, and whether that launch progressed at all.
+    let (plateau_feasible_evals, progressed_since_resume) = {
+        let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
+        plateau_trace_after_resume(
+            last_sig_feasible_eval,
+            feasible_evals,
+            plateau_at_last_resume,
+        )
+    };
     if n_resumes > 0 {
         warnings.push(format!(
             "Outer optimizer ({algo:?}) aborted {n_resumes} time(s) before reaching a \
@@ -3079,6 +3156,21 @@ fn optimize_nlopt_once(
             }
         }
     };
+    // An `Ok` from a resumed launch that made no progress reports the very point
+    // the in-loop plateau verdict refused to call converged — a cold-inconsistent
+    // best point is still cold-inconsistent after L-BFGS fails to leave it. The
+    // status alone cannot overturn that: route it through the same verdict a
+    // `Failure` gets (see `plateau_trace_after_resume`).
+    if converged && !progressed_since_resume {
+        if options.verbose {
+            eprintln!(
+                "NLopt finished a resumed launch without progress; deferring `converged` \
+                 to the plateau verdict at the best-seen point."
+            );
+        }
+        stationarity_check_pending = true;
+        converged = false;
+    }
 
     drop(opt);
 
@@ -3312,15 +3404,8 @@ fn optimize_nlopt_once(
     // true by construction and the check would stop rejecting warm-start artifacts).
     let consistency_ofv = cold_ofv.unwrap_or(final_ofv);
     if stationarity_check_pending {
-        let (_, last_sig_feasible_eval, mut feasible_evals) = *plateau_tracker.lock().unwrap();
-        // A resumed launch that made no progress only re-evaluated the point it
-        // was resumed from: read the trace as it stood before that launch, so the
-        // re-evaluation cannot pad the flat tail into a plateau.
-        if let Some((sig_before, feasible_before)) = plateau_at_last_progress {
-            if last_sig_feasible_eval == sig_before {
-                feasible_evals = feasible_before;
-            }
-        }
+        let (_, last_sig_feasible_eval, _) = *plateau_tracker.lock().unwrap();
+        let feasible_evals = plateau_feasible_evals;
         if failure_is_converged_plateau(
             feasible_evals,
             last_sig_feasible_eval,

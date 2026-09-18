@@ -3260,6 +3260,98 @@ fn resume_descent_is_lbfgs_only() {
     }
 }
 
+/// A resumed launch re-evaluates the point it was resumed from, and only that
+/// eval is dropped from the flat tail: the launch's own probes stay. Review of
+/// #1411 — the first cut reset the count to the pre-launch value, discarding a
+/// no-progress launch's entire tail, so a fit that resumed off a 3-eval tail and
+/// then burned ten flat reductions on a cold-consistent plateau (a 14-eval tail)
+/// was still reported non-converged. Mutation: `feasible_at_resume` in place of
+/// `feasible_evals - 1` fails the second case; dropping the `- 1` fails the first.
+#[test]
+fn plateau_trace_after_resume_drops_only_the_re_evaluation() {
+    // No resume: the trace is read as-is and counts as progressed.
+    assert_eq!(plateau_trace_after_resume(20, 23, None), (23, true));
+    // Resumed at (20, 23); the launch re-evaluated (24) and quit — the tail is
+    // still 3, not 4.
+    assert_eq!(
+        plateau_trace_after_resume(20, 24, Some((20, 23))),
+        (23, false)
+    );
+    // Resumed at (20, 23); re-evaluation (24), then ten flat probes (25–34): a
+    // 13-eval tail on top of the 3 the launch inherited — 34 − 1 − 20 = 13.
+    assert_eq!(
+        plateau_trace_after_resume(20, 34, Some((20, 23))),
+        (33, false)
+    );
+    // A launch that quit before its own re-evaluation counted never goes below
+    // the count it was resumed at.
+    assert_eq!(
+        plateau_trace_after_resume(20, 23, Some((20, 23))),
+        (23, false)
+    );
+    // The launch progressed: the tail is measured from its own last
+    // improvement and nothing is dropped.
+    assert_eq!(
+        plateau_trace_after_resume(30, 41, Some((20, 23))),
+        (41, true)
+    );
+}
+
+/// `note_launch` re-arms what is per-launch and nothing else. Review of #1411:
+/// the stagnation guard's window kept counting across launches, so a launch
+/// resumed after 39 quiet evals was latched 11 evals in and returned `Success`
+/// on a point the plateau verdict had just rejected. Mutation: drop the
+/// `last_improvement_eval` reset and the window assertion fails; drop the
+/// `launch` guard and the second call moves the marks again.
+#[test]
+fn note_launch_rearms_the_cap_count_and_the_stagnation_window_once_per_launch() {
+    let mut state = fresh_state();
+    state.n_evals = 39;
+    state.n_grad_evals = 30;
+    state.best_ofv = -113.0;
+    state.best_at_last_improvement = -113.0;
+    state.last_improvement_eval = 0;
+
+    // Same launch: nothing moves.
+    note_launch(&mut state, 0);
+    assert_eq!(
+        (state.grad_evals_at_launch, state.last_improvement_eval),
+        (0, 0)
+    );
+
+    note_launch(&mut state, 1);
+    assert_eq!(state.launch, 1);
+    assert_eq!(
+        state.grad_evals_at_launch, 30,
+        "the overshoot cap fires on the first gradient of the new launch"
+    );
+    assert_eq!(
+        state.last_improvement_eval, 39,
+        "the stagnation window restarts at the launch"
+    );
+    assert_eq!(
+        state.best_at_last_improvement, -113.0,
+        "the improvement reference is the run's best, not reset with the window"
+    );
+    // The resumed launch gets a full window: 49 quiet evals do not latch, the
+    // 50th does — measured from the launch, not from the run's eval 0.
+    let n = 3; // window = max(3·(n+1), 50) = 50
+    for _ in 0..49 {
+        state.n_evals += 1;
+        assert!(!detect_stagnation(&mut state, n, true));
+    }
+    state.n_evals += 1;
+    assert!(detect_stagnation(&mut state, n, true));
+
+    // Re-noting the same launch is a no-op even after evals have moved on.
+    let before = (state.grad_evals_at_launch, state.last_improvement_eval);
+    note_launch(&mut state, 1);
+    assert_eq!(
+        (state.grad_evals_at_launch, state.last_improvement_eval),
+        before
+    );
+}
+
 // ── #833: which of the final inner loop's EBE candidates is reported ──────────
 
 #[test]
