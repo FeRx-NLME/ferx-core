@@ -88,18 +88,35 @@ fn non_finite_dw_never_warns() {
 /// A one-compartment ODE model whose fixed effects cannot follow a
 /// two-compartment truth: `CL/V = 0.1` against a biexponential.
 ///
-/// No `omega`, deliberately. With a random effect on `CL` the inner loop moves
-/// each subject's elimination rate and absorbs part of the very drift this
-/// fixture exists to create, which would make the Durbin-Watson value depend on
-/// the EBE search rather than on the fixture.
+/// It carries an `omega`, and that is measured rather than argued. An earlier
+/// version dropped it on the theory that a random effect on `CL` would absorb
+/// the drift through the EBE search; the numbers say otherwise, because a
+/// scalar on `CL` cannot bend a mono-exponential into a bi-exponential —
+/// ω collapses instead (η shrinkage 98 %). Durbin-Watson on this fixture, one
+/// variable changed at a time:
+///
+/// | variant | `outer_maxiter: 1` | converged |
+/// |---|---|---|
+/// | no `omega` | 0.2645 | 0.2845 |
+/// | `omega ETA_CL ~ 0.09` | 0.2934 | 0.2845 |
+///
+/// Worst case 0.29 against a bound of 1.5, so the `omega` is free. Keeping it
+/// matters for what the test can *see*: with `n_eta = 0` the fixture cannot
+/// observe a suffix gated on `model.n_eta > 0`, and it sits off the analytic
+/// inner-gradient path (see #1432).
+///
+/// `TVV` is `FIX`ed because the observation is the compartment **amount**, so
+/// `V` enters only through `CL / V` — free, it is a flat direction rather than
+/// an estimated parameter.
 fn one_cpt_model() -> CompiledModel {
     let src = r#"
 [parameters]
   theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
+  theta TVV(10.0, 1.0, 500.0) FIX
+  omega ETA_CL ~ 0.09
   sigma PROP ~ 0.04
 [individual_parameters]
-  CL = TVCL
+  CL = TVCL * exp(ETA_CL)
   V  = TVV
 [structural_model]
   ode(obs_cmt=central, states=[central])
@@ -145,16 +162,23 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
     }
 }
 
-/// What `fit_inner` pushes is the helper's message, unmodified.
+/// What `fit_inner` pushes is the helper's message, unmodified — and it pushes
+/// nothing else about autocorrelation.
 ///
 /// The four tests above pin `dw_autocorrelation_warning` in isolation, and that
 /// left the pre-PR user-visible behaviour reachable through the *caller*:
 /// re-appending `" For ODE models, SDE process noise may also help."` to `msg`
 /// inside `fit_inner` passed the entire `ferx-core/ci` lib suite (measured on
 /// review of `1d816920`). Nothing under `tests/` or `crates/` looked at the text
-/// either. This is the wiring assertion that was missing — equality against the
-/// helper's own return, so any caller-side edit fails it: a suffix, a prefix, or
-/// a second `push` of a reworded copy.
+/// either.
+///
+/// The first version of this test filtered the warnings on
+/// `contains("autocorrelation")` — the helper's own vocabulary — so the same
+/// recommendation pushed as its **own** entry still passed (measured on review
+/// of `c7c38c13`). Hence the assertion below is over the *whole*
+/// `result.warnings`: every entry must be either the helper's message or one of
+/// the warnings this fixture is entitled to emit, so a suffix, a prefix, a
+/// second `push`, and a reworded copy all fail.
 ///
 /// The fixture is an **ODE** model on purpose. The removed suffix was gated on
 /// `model.ode_spec.is_some()`, so an analytic model cannot observe its return,
@@ -199,18 +223,58 @@ fn fit_pushes_exactly_the_helpers_message() {
 
     let expected = dw_autocorrelation_warning(result.dw_statistic)
         .expect("a DW below 1.5 must produce a message");
-    let emitted: Vec<&String> = result
+
+    // Every warning this fixture is *entitled* to emit, by its opening words.
+    // Anything else — including a recommendation pushed as its own entry rather
+    // than appended to the message — is unaccounted for and fails below.
+    //
+    // Categories would be the tidier gate and do not work: `classify_warning`
+    // sends an unrecognised sentence to the `General` fallback, and this
+    // fixture already emits two legitimate `General` warnings (the default-method
+    // notice and the evaluation-budget notice), so a stray sentence would hide
+    // among them. Measured, not assumed: the six entries here classify as
+    // General ×2, Convergence, Threads, EtaShrinkage, DwAutocorrelation.
+    //
+    // The thread notice opens with a machine-dependent count, so it is matched
+    // on `classify_warning`'s own key rather than a prefix.
+    let accounted = |w: &str| {
+        w == expected
+            || w.starts_with("No estimation method was specified")
+            || w.starts_with("Outer optimization hit the evaluation budget")
+            || w.starts_with("Outer optimization did not converge")
+            || w.starts_with("High ETA shrinkage")
+            || w.contains("threads configured")
+    };
+
+    // The gate can fire: the sentence this PR removed is not accounted for by
+    // any arm above, so pushing it as a separate warning fails the assertion
+    // rather than slipping past a filter keyed on the helper's own vocabulary.
+    assert!(
+        !accounted("For ODE models, SDE process noise may also help."),
+        "the allow-list must not absorb the removed recommendation"
+    );
+
+    let unaccounted: Vec<&String> = result.warnings.iter().filter(|w| !accounted(w)).collect();
+    assert!(
+        unaccounted.is_empty(),
+        "fit() emitted warnings this fixture does not account for: {unaccounted:#?}"
+    );
+
+    let dw_entries: Vec<&String> = result
         .warnings
         .iter()
-        .filter(|w| w.contains("autocorrelation"))
+        .filter(|w| {
+            crate::types::classify_warning(w).category
+                == crate::types::WarningCode::DwAutocorrelation
+        })
         .collect();
     assert_eq!(
-        emitted.len(),
+        dw_entries.len(),
         1,
-        "expected exactly one autocorrelation warning, got {emitted:?}"
+        "expected exactly one dw_autocorrelation warning, got {dw_entries:#?}"
     );
     assert_eq!(
-        *emitted[0], expected,
+        *dw_entries[0], expected,
         "fit_inner must push the helper's message unmodified"
     );
 }
