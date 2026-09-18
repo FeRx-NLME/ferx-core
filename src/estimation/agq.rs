@@ -1455,8 +1455,11 @@ fn accumulate_fixed_b_packed_gradient_fd(
 /// `log|H̃|` and **no** EBE-response term — those belong to the Laplace marginal, not to
 /// `nll(η)` at a fixed η.
 ///
-/// Returns `None` when the subject is outside the provider's scope, which drops the whole
-/// population to the FD gradient (all-or-nothing, like `population_gradient_sens`).
+/// Returns `None` only when this subject's Ω block itself could not be formed. A subject
+/// the *provider* declines is salvaged in place by `accumulate_fixed_b_packed_gradient_fd`
+/// (see the comment at that fallback), so a scope gap no longer drops the whole population
+/// to `reconverged_fd_gradient` the way the all-or-nothing `population_gradient_sens` did
+/// (#251 review #8).
 fn accumulate_fixed_eta_packed_gradient(
     model: &CompiledModel,
     subject: &Subject,

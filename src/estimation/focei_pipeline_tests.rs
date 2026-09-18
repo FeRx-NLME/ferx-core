@@ -244,14 +244,30 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                         *acc += 2.0 * value;
                     }
                 }
+                // #1154: the same assembly records which subjects it salvaged onto the
+                // per-subject FD gradient. Asserted here, inside the existing
+                // `iov` × `mixed` sweep, because it is the only place both the IOV and
+                // the non-IOV `declines.record(i)` arms are exercised — a decline log
+                // tested on one engine only is an assertion against a constant on the
+                // other (mutating the IOV `record` alone left the whole suite green).
+                let declines = OuterFdDeclineLog::new(pop.subjects.len());
                 let actual = if iov {
                     population_gradient_sens_iov_mixed(
-                        &x, params, &model, &pop, &etas, &kappas, &bounds, &opts,
+                        &x, params, &model, &pop, &etas, &kappas, &bounds, &opts, &declines,
                     )
                 } else {
-                    population_gradient_sens_mixed(&x, params, &model, &pop, &etas, &bounds, &opts)
+                    population_gradient_sens_mixed(
+                        &x, params, &model, &pop, &etas, &bounds, &opts, &declines,
+                    )
                 };
                 assert_eq!(bits(&expected), bits(&actual));
+                let expected_declines: Vec<usize> = if mixed { vec![0] } else { vec![] };
+                assert_eq!(
+                    declines.declined_indices(),
+                    expected_declines,
+                    "iov = {iov}, mixed = {mixed}, interaction = {interaction}: the decline \
+                     log must name exactly the subjects the assembly sent to FD"
+                );
             }
         }
     }

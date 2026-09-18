@@ -3475,6 +3475,32 @@ fn test_parse_method_chain_final_foce() {
     assert!(!opts.interaction);
 }
 
+/// #1415: a chain whose final stage is neither `foce` nor `focei` keeps the
+/// default interaction flag, exactly as the single-method form does. The chain
+/// form used to clear it, so `[saem, imp]` published a no-interaction FOCE
+/// objective for SAEM while `method = saem` published the FOCEI one.
+#[test]
+fn test_parse_method_chain_final_non_foce_keeps_interaction_default() {
+    for chain in ["[saem, imp]", "[saem]", "[imp, impmap]", "[bayes]"] {
+        let opts = parse_fit_options(&[format!("method = {chain}")]).unwrap();
+        assert!(
+            opts.interaction,
+            "{chain}: interaction must stay at its default (true), matching the single-method form"
+        );
+    }
+    // The single-method forms it has to agree with.
+    assert!(
+        parse_fit_options(&["method = saem".to_string()])
+            .unwrap()
+            .interaction
+    );
+    assert!(
+        parse_fit_options(&["method = imp".to_string()])
+            .unwrap()
+            .interaction
+    );
+}
+
 #[test]
 fn test_method_default_warning() {
     // A model file with no `method` key leaves `user_set_keys` without

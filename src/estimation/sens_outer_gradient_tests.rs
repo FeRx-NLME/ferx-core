@@ -2097,8 +2097,10 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
         ..Default::default()
     };
     let bounds = compute_bounds(&template);
-    let mixed =
-        population_gradient_sens_mixed(&x, &template, &model, &pop, &ehs, &bounds, &options);
+    let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
+    let mixed = population_gradient_sens_mixed(
+        &x, &template, &model, &pop, &ehs, &bounds, &options, &declines,
+    );
 
     // FD reference, per subject mirroring the mixed assembly: in-scope
     // subjects via the analytic-EBE `marginal_nll`, the out-of-scope one via
