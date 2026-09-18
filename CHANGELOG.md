@@ -20,6 +20,25 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
+  same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
+  `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
+  no longer warns that it is). The penalty enters VI's objective on the same scale as
+  FOCEI, so a given `nn_l2` means the same thing under both. Convergence and early
+  stopping are judged on the **penalized** objective the optimizer actually descends,
+  while the reported `vi.elbo_trace` and OFV stay the clean, penalty-free bound (the
+  split FOCE uses when it reports the clean OFV). This is what lets a regularized VI DCM
+  settle and early-stop instead of burning the full `vi_iters` ceiling — judging on the
+  clean bound would run to the ceiling as the two quantities drift apart. The penalized
+  objective is exposed as the new `vi.objective_trace`, populated only when regularization
+  is active — an empty/omitted trace is the sentinel for "identical to `elbo_trace`", so an
+  unregularized fit's result and YAML are unchanged. **Breaking for struct-literal
+  construction**: `ViResult` gained the `objective_trace` field and is now
+  `#[non_exhaustive]`, so downstream Rust code can no longer build or exhaustively match it
+  with a struct literal (its fields stay public to read, which is all the R wrapper and the
+  YAML/`FitResult` consumers do); making it `#[non_exhaustive]` keeps the next field
+  addition non-breaking. This is the breaking change that takes the workspace to `0.4.0`.
+  No effect on `.ferx` models, the CLI, or reading a fit result (#1305).
 
 - **Standard errors, eigenvalues and condition numbers now say which estimator produced them.**
   `FitResult` carried `cov_condition_number` and `cov_eigenvalues` and printed standard errors,
@@ -137,6 +156,19 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **ferx no longer recommends `[diffusion]` as a remedy for residual autocorrelation.** The IWRES
+  Durbin-Watson warning has dropped its "For ODE models, SDE process noise may also help" suffix,
+  and the docs no longer describe the SDE path as a filtered state. The Kalman filter behind
+  `[diffusion]` propagates the state covariance but never corrects the state mean with the
+  observed data, so what is fitted is the deterministic ODE prediction with an inflated
+  observation variance: it re-weights the fit rather than following a subject's drift, there is no
+  filtered `IPRED` or posterior state trajectory, and sdtab `IWRES` — scaled by the residual error
+  alone — reads over-dispersed. Measured on a two-compartment population fitted as one
+  compartment, adding `central ~ 0.01` improved the objective by 669 for one parameter while
+  leaving the statistic below its threshold (0.40 to 0.77) and moving CL from 0.99 to 2.49 against
+  a truth of 1.0. `W_EXPERIMENTAL_SDE` now states the limitation on every SDE fit. Nothing
+  numerical changes; the mean update itself is still open
+  ([#1285](https://github.com/FeRx-NLME/ferx-core/issues/1285)).
 - **`mstep_damping` now defaults to `1.0` (off), except for models with `iiv_on_ruv`.** The 0.03
   exploration cap that #1011 introduced divides the number of EM steps the exploration phase
   amounts to, and was measured to *hold* every no-ETA theta near its initial estimate rather than
@@ -199,6 +231,7 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A fit restarted mid-descent now runs on the remaining `maxiter` budget and says so.** The [#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277) restart gave its second leg a fresh evaluation budget — measured as 56 evaluations on a `maxiter = 1` (44-evaluation) fit — while documenting that it could not; it now continues on what the stalled leg left, a stall with the budget already spent is reported (with its own "increase maxiter" warning) rather than restarted, and an adopted restart is named in `FitResult.warnings` as an `optimizer_health` entry (it was visible only under `verbose`). Fits that are not restarted are bit-identical ([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)).
 - **A diagonally declared `omega` at the rail is no longer given the `block_omega` message because some *other* eta is in a block.** `E_OMEGA_INIT_AT_RAIL` chose its wording from whether the whole Ω matrix packs as a block, and one `block_omega` anywhere makes that true for every coordinate — so on `examples/warfarin_block_omega.ferx` a plain `omega ETA_KA ~ 0.0` was told "the block is near-singular in ETA_KA: lower the covariances involving it, or `FIX` the block". ETA_KA is in no block and has no covariances, and `FIX`-ing the block would have fixed ETA_CL and ETA_V instead of the eta on the rail. Worse, that wording *replaced* the `write ... FIX` repair the check exists to hand out ([#1229](https://github.com/FeRx-NLME/ferx-core/issues/1229)). The message is now chosen per **eta** — block wording only for an eta with a structurally free off-diagonal, i.e. one actually declared in a `block_omega` / `block_kappa` — so a model mixing the two spellings reports each eta in the shape it was written in. Same for Ω_IOV. A **one-eta** `block_omega (ETA_CL) = [0.0]` is the one case where the two questions come apart — it is spelled as a block but is correlated with nothing — and it now gets the declared-zero explanation in its own spelling, `` write `block_omega (ETA_CL) = [0.0] FIX` ``, instead of being told to reduce covariances it does not have (which is what it was told before this change too). A block of two or more etas, and a pure-diagonal model, are unchanged ([#1394](https://github.com/FeRx-NLME/ferx-core/issues/1394)).
 - **`model = NAME` names the model.** Only the bare `model NAME` spelling was read; the `KEY = value` form every other setting uses was dropped in silence and the fit (`model_name`, the `ferx run` summary line, `-fit.json`) and ferx-r fell back to the file stem. Both spellings now name the model, a `model` line the parser cannot read (or a second one) is an error naming the accepted forms, only the preamble before the first `[block]` header is read, and `ferx check --json` reports the same name the fit will carry instead of always the stem. **Widening reject:** a `model NAME` / `model = NAME` declaration placed *inside* a block used to be skipped silently (the model kept the stem); it is now an error naming the block and the preamble form, so the misplaced line cannot fall through a block that ignores unrecognised text (`[data]`) or is never read (`[odes]` on a `pk` model). Output filenames (`{stem}-fit.yaml`, `{stem}-sdtab.csv`) are unchanged: they are always the file stem ([#1395](https://github.com/FeRx-NLME/ferx-core/issues/1395)).
 - **An `SS=1` steady-state record under a `[diffusion]` (SDE) model is now equilibrated by the filter.** The EKF applied the record as a single dose from an empty state with zero covariance, so the objective scored a one-dose history: on the Michaelis–Menten fixture it was reported on, one `SS=1, II=12` record scored 610.41 where the 41 explicit doses it stands for scored 489.88, while the ODE path gave the same objective both ways. The filter now expands the pulse train for its mean **and** its covariance, the way the ODE run-in does and on the same cycle-local clock — the covariance at the record is the stationary Riccati value rather than zero, and on a nonlinear right-hand side the Jacobian is linearised along the steady-state mean — until both stop moving or the cycle cap is spent (in which case the ODE run-in's non-convergence warning is attached). An `SS=1` bolus or non-overlapping infusion now scores like its explicit train to `1e-9`; an infusion longer than `II` is still declined (`W_STEADY_STATE_INFUSION`). The `W_SDE_STEADY_STATE` warning that named the gap is retired ([#1260](https://github.com/FeRx-NLME/ferx-core/issues/1260)).

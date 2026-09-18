@@ -514,17 +514,41 @@ optimizer saw. All three hold ⇒ the fit converged and is reported as converged
 ([#751](https://github.com/FeRx-NLME/ferx-core/issues/751)).
 
 When they do not, the optimizer is **restarted once from the best point it reached**
-([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)). That is what clears the
-curvature memory the failed line search was built on, and it usually costs nothing in the
-sense that matters: the restart is adopted only if it ends at a **strictly lower**
-objective, so it can never make a reported fit worse. On the two-compartment deep-compartment
-model in `tests/fixtures/two_cpt_dcm_regularized.ferx`, L-BFGS quit at evaluation 12 with the
-trace still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units
-lower (3209.81 → −676.77).
+([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)), on whatever is left of the
+fit's `maxiter` budget. It usually costs nothing in the sense that matters: the restart is
+adopted only if it ends at a **strictly lower** objective, so it can never make a reported
+fit worse. On the two-compartment deep-compartment model in
+`tests/fixtures/two_cpt_dcm_regularized.ferx`, L-BFGS quit at evaluation 12 with the trace
+still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units lower
+(3209.81 → −676.77).
+
+Why a fresh start helps depends on which of L-BFGS's two line-search caps fired. NLopt's
+L-BFGS (Luksan's `plis`) allows ten step reductions and ten extrapolations per line search,
+and a cap hit on an iteration where the algorithm has just restarted — the first iteration
+always is one — ends the run with a bare `Failure`, discarding every point accepted on the
+way. The evaluation-12 abort above is the *extrapolation* cap inside the first line search:
+the [opening-step rescale](optimizers.qmd#leaving-the-initial-estimates) had shrunk the first gradient by
+$1.7 \times 10^5$, so every trial point showed a large real decrease next to a tiny predicted
+slope and the search extrapolated eleven times. No curvature memory exists yet at that
+point; what the restart does is re-arm that rescale around a gradient that is now O(1).
+Later in the same fixture the other cap fires — a subject switches EBE mode, the curvature
+pair goes degenerate, the next direction is ~$10^{17}$ long and ten reductions cannot find a
+decrease — and there the restart's fresh curvature memory is what helps.
+
+A restarted fit says so: `FitResult.warnings` carries an `optimizer_health` entry naming
+the objective and evaluation count it was restarted from, and the run's own `converged`
+says how the restart ended. It is not gated on the optimizer — the test is "stopped with a
+bare `Failure` while still descending", which SLSQP and the derivative-free methods can
+also produce, and the strictly-lower rule makes a pointless restart cost one optimization
+and change nothing.
 
 Three cases are deliberately left alone. A run that spent its `maxiter` budget stops with
-NLopt's `MaxEvalReached`, not a `Failure`, so a restart can never hand a fit a second
-evaluation budget behind your back — raise `maxiter` instead. A **cancelled** run is not
+NLopt's `MaxEvalReached`, not a `Failure`, and a run that stalls with its budget already
+spent is not restarted either: the restart runs on the *remaining* budget, so the two legs
+together are bounded by the `maxiter` you set the way a single run is (NLopt checks the
+bound between line searches, so a few evaluations of overshoot are possible either way),
+and a stall that cannot be restarted for lack of budget says so with its own "increase
+maxiter" warning ([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)). A **cancelled** run is not
 restarted. And a second stall is reported as a stall: you get `converged: false` and the
 `Outer optimization did not converge` warning, which is the honest signal and bounds the
 worst case at two optimizations.

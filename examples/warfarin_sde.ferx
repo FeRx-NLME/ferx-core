@@ -1,13 +1,16 @@
 # One-compartment oral PK model (warfarin) with SDE process noise
 #
 # Identical to the standard warfarin model but written as an ODE so that a
-# [diffusion] block can be added.  The DIFF_CENTRAL parameter captures
-# within-subject system noise on the central compartment — useful when
-# IWRES shows autocorrelation that cannot be absorbed by the residual error
-# alone (structural misspecification, unmodelled absorption variability, etc.).
+# [diffusion] block can be added.  DIFF_CENTRAL measures how much unexplained
+# variance accumulates on the central compartment between observations; a value
+# large relative to sigma is evidence that the ODE structure is missing a
+# mechanism.
 #
-# The EKF inflates the residual variance at each observation by the
-# integrated covariance: V_total = P[central] + sigma^2(PRED).
+# It is not a remedy for IWRES autocorrelation.  ferx implements the covariance
+# half of the EKF: the state mean stays the deterministic ODE solution and is
+# never corrected by the observed values, so nothing is filtered — the filter
+# only inflates the residual variance at each observation by the integrated
+# covariance: V_total = P[central] + sigma^2(PRED).
 # DIFF_CENTRAL is estimated on the variance scale (not SD).
 #
 # Note: the ODE+EKF path has no analytic-sensitivity provider, so gradients

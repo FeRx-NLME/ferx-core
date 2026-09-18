@@ -683,6 +683,23 @@ fn classify_warning_simulation_beats_optimizer_health_degenerate() {
 }
 
 #[test]
+fn classify_warning_mid_descent_restart_is_optimizer_health() {
+    // The #1277 restart notice (`outer_optimizer::mid_descent_restart_warning`,
+    // #1428) is an optimizer-health event, not a convergence verdict: the fit
+    // went on and its own `converged` says how it ended. It contains neither
+    // "did not converge" nor "degenerate", so it needs its own key. Proxy of the
+    // emitter's string; the key phrase is the one the emitter and the fast nn
+    // regression test share.
+    let w = classify_warning(
+        "Outer optimizer (nlopt_lbfgs) stopped mid-descent (bare Failure at OFV = 7901.994 \
+         after 12 evaluations) and was resumed from the best point seen on the remaining \
+         maxiter budget; the reported estimates are from the resumed run.",
+    );
+    assert_eq!(w.category, WarningCode::OptimizerHealth);
+    assert_eq!(w.severity, WarningSeverity::Warning);
+}
+
+#[test]
 fn classify_warning_flip_flop_beats_optimizer_health() {
     // Both absorption flip-flop warnings — the twin-carrying heads-up (#776) and
     // the twin-less EBE warning (#785) — say "flip-flop regime". The EBE message
