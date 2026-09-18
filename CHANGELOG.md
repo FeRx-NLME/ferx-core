@@ -21,6 +21,25 @@ section of the SDLC for the versioning policy).
 
 ### Added
 
+- **Standard errors, eigenvalues and condition numbers now say which estimator produced them.**
+  `FitResult` carried `cov_condition_number` and `cov_eigenvalues` and printed standard errors,
+  but recorded nothing about whether they came from `R⁻¹`, `S⁻¹` or the `R⁻¹SR⁻¹` sandwich —
+  `covariance_method` lived on `FitOptions`, which a fit object, a `{model}-fit.yaml` or a
+  `.fitrx` bundle does not carry. One fit measured a condition number of 1.42e8 under the
+  sandwich and 3.68e5 under `covariance_method = s`, both correct for their estimator and
+  indistinguishable in the output — which matters the moment the figure is compared against
+  NONMEM, whose `$COVARIANCE` default is `RSR` and ferx's is `R`. A new
+  `FitResult::covariance_method` records the estimator that actually **ran**, which is not always
+  the one requested (above 100 free parameters a defaulted `r` is routed onto the cross-product),
+  and it is reported next to the `SE` column, on the `Covariance:` and `Condition number:` lines,
+  in the fit YAML/JSON, in the `.fitrx` bundle and in the `condition_number` /
+  `covariance_regularized` warning `details` payloads — everywhere as the same `r` / `s` / `rsr`
+  token `[fit_options]` accepts. `None`, and the key omitted, when no covariance matrix was
+  produced — including `covariance_failed`, which by definition has none. `run_covariance`
+  relabels the result it returns instead of inheriting the incoming fit's estimator, and now
+  replaces that fit's covariance-step warnings rather than carrying them alongside a covariance
+  block it has recomputed (#1382).
+
 - **`W_CMT_DEFAULTED` — a warning naming every dose and observation row whose compartment ferx chose.** A dataset with no `CMT` column, or with cells that are missing or unreadable, gets compartment 1; NONMEM has no such gap, because `$MODEL` lets a model declare `DEFDOSE` on any compartment and NM-TRAN resolves an undecorated dose against it. A translated model whose `DEFDOSE` is not the first declared state therefore gets its drug in the wrong place, silently. The warning gives the dose and observation row counts — and, when a defaulted row carried `ADDL`, the expanded dose count, since one cell can deliver thirty-one doses to the guessed compartment — plus the cause (absent column, or how many cells were missing versus unreadable, with examples) and the remedy. It reaches both `fit()` and `ferx check`, and is raised whenever `CMT` selects something on that model: more than one compartment a dose can reach — more than one `[odes]` state, **or** an analytical model whose `CMT=2` is a real target (an oral model's depot-bypassing central bolus, a 2-cpt model's peripheral) — **or** an observation-side dispatcher (`[scaling] obs_scale[CMT=N]`, a `CMT=N:` error model, a per-CMT `y[CMT=N]` readout on either engine). It stays silent where `CMT` chooses nothing: `one_cpt_iv`, a one-state `[odes]` model, a compartment-free model, and the transit / inverse-Gaussian absorption models, which absorb every dose through the depot whatever `CMT` says. An **endpoint-only** model (one with no `[error_model]` block, so the parser leaves its per-CMT error map empty) is reported too, duplicating `E_ENDPOINT_NO_RECORDS` on an absent column: suppressing it there hid a measurable re-routing between endpoints on a *bad cell*, where that error cannot fire. An endpoint model that also carries an `[error_model]` is **not** yet covered — the arm keys on the empty error map rather than on the model's endpoints, which is one of the gaps [#1409](https://github.com/FeRx-NLME/ferx-core/issues/1409) closes ([#1009](https://github.com/FeRx-NLME/ferx-core/issues/1009)).
 - **A fit now says when subjects fall out of the analytic outer-gradient scope.** A subject whose
   data shape the sensitivity provider declines at runtime — a rate-defined infusion under `F ≠ 1`,
