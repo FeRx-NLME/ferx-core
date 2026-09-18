@@ -4778,7 +4778,8 @@ pub fn parse_full_model_with(
     // TV-covariate / `TIME` / IOV / SS / infusion subject rerouted — invisible to the model
     // author and to the parse tests. Three point guards in `absorption_ode_equivalent_source`
     // were added one-per-incident for exactly this (`f=V1` slot collision, `[adaptive_dosing]`
-    // re-emission, a dose-attribute param in a disposition role); this makes the class
+    // re-emission, a dose-attribute param in a disposition role — the last since retired, as
+    // #1359 rejects that binding at parse time); this makes the class
     // structurally unreachable, so a *new* ODE-only check cannot re-arm it.
     //
     // Declining is the standing policy of the desugar, and it is not silent-wrong: without a
@@ -10827,22 +10828,14 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         .get("lagtime")
         .or_else(|| roles.get("alag"))
         .map(String::as_str);
-    // #993 companion to the guard above. That one asks "is this reserved-name param the
-    // intended mapping for its slot?"; it never asks whether the same param *also* fills a
-    // disposition role. `pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)` passes it — `F`
-    // is the `f=` mapping — but the twin then emits `d/dt(central) = … − (CL/F) * central`
-    // and `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. That is a
-    // dose-attribute double use, so the twin's own parse rejects it. Decline here, per this
-    // function's standing policy: keep the model closed-form. (Since #1008 an unguarded case
-    // like this no longer panics — the attach site declines the twin and warns — but naming
-    // the case here keeps the *reason* for the decline specific instead of generic.)
-    if disposition
-        .iter()
-        .filter_map(|role| roles.get(*role))
-        .any(|p| Some(p.as_str()) == f_param || Some(p.as_str()) == lag_param)
-    {
-        return None;
-    }
+    // A dose-attribute parameter that *also* fills a disposition role
+    // (`pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)`) used to need its own
+    // decline here (#993 companion): the twin emitted `d/dt(central) = … − (CL/F) *
+    // central` reading a name `ode_param_slots` routes to the F slot, a double use
+    // its own parse rejects. Since #1359 one variable under two PK roles is a parse
+    // error in `build_pk_param_fn`, so the primary never reaches the twin build and
+    // the guard would be a second gate covering the same input — removed rather than
+    // left to mask the first (`one_variable_bound_to_two_pk_roles_is_rejected_*`).
     let mut twin_param_names: Vec<String> = Vec::new();
     if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
         for line in ip_lines {
@@ -11612,11 +11605,12 @@ fn analytical_dose_attr_slot_map(
     indiv_var_names: &[String],
 ) -> Vec<usize> {
     let mut slots = vec![usize::MAX; indiv_var_names.len()];
-    // Iterate in sorted key order. `pk_param_map` is a `HashMap`, and a parameter
-    // bound to *both* roles (`pk(..., f=X, lagtime=X)`) is written twice — so with
-    // arbitrary iteration order the surviving slot, and therefore the diagnostic
-    // `check_dose_attr_double_use` emits, differed between runs of the identical
-    // model. Same reason `build_pk_param_fn` sorts its `pk_entries`.
+    // Iterate in sorted key order. `pk_param_map` is a `HashMap`; a parameter
+    // bound to *both* roles (`pk(..., f=X, lagtime=X)`) used to be written twice
+    // here, so the surviving slot — and the diagnostic `check_dose_attr_double_use`
+    // emitted — differed between runs of the identical model. That binding is now
+    // a parse error in `build_pk_param_fn` (#1359), which runs first; the sort
+    // stays so this map never depends on iteration order again.
     let mut entries: Vec<(&String, &String)> = pk_param_map.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (key, value) in entries {
@@ -17720,14 +17714,27 @@ fn pk_mapped_value_display(value: &str) -> &str {
     }
 }
 
-/// Noun for a PK slot, for the conflicting-alias diagnostic (#1048). Only the
-/// three slots reachable under two role spellings can produce that error; the
-/// fallback exists so a future alias pair cannot make the message nonsense.
+/// Noun for a PK slot, for the conflicting-alias diagnostic (#1048) and the
+/// one-variable-two-roles diagnostic (#1359). #1048 can only reach the three
+/// slots with two role spellings; #1359 can reach any pair, so every slot
+/// [`PkParams::name_to_index`] hands out has a noun. The fallback exists so a
+/// future slot cannot make the message nonsense.
 fn pk_slot_noun(slot: usize) -> &'static str {
+    use crate::types::*;
     match slot {
-        crate::types::PK_IDX_V => "the central volume",
-        crate::types::PK_IDX_Q => "the inter-compartmental clearance",
-        crate::types::PK_IDX_LAGTIME => "the absorption lag time",
+        PK_IDX_CL => "the clearance",
+        PK_IDX_V => "the central volume",
+        PK_IDX_Q => "the inter-compartmental clearance",
+        PK_IDX_V2 => "the peripheral volume",
+        PK_IDX_KA => "the absorption rate constant",
+        PK_IDX_F => "the bioavailability",
+        PK_IDX_Q3 => "the second inter-compartmental clearance",
+        PK_IDX_V3 => "the second peripheral volume",
+        PK_IDX_LAGTIME => "the absorption lag time",
+        PK_IDX_N => "the transit compartment count",
+        PK_IDX_MTT => "the mean transit time",
+        PK_IDX_MAT => "the mean absorption time",
+        PK_IDX_CV2 => "the absorption-time relative dispersion (CV²)",
         _ => "the same PK parameter",
     }
 }
@@ -17866,6 +17873,16 @@ fn build_pk_param_fn(
     // that agree (`lagtime=X, alag=X`) are merely redundant and stay legal, so
     // the `analytical_role_binding` tie-break still has a case to tie-break.
     let mut slot_seen: HashMap<usize, (&str, &str, PkSlotBinding)> = HashMap::new();
+    // #1359: the converse of #1048 — one *variable* under two role keys that
+    // land on two different slots (`f=X, lagtime=X`). `pk_param_fn` writes both
+    // slots, but `pk_indices` holds one slot per declared name, built by
+    // reversing `pk_param_map` into a `HashMap` keyed by variable — so only one
+    // role survives there, chosen by the per-process hash seed, and
+    // `has_lagtime()` / `has_bioavailability()` flip between parses of the
+    // identical file (measured: `[0, 1, 4, 5]` or `[0, 1, 4, 8]` over 64 parses)
+    // while the lag is applied every time. Keyed by *var slot*, not name, so the
+    // lowercase compat lookup (`f=x, lagtime=X`) collides the way it binds.
+    let mut var_seen: HashMap<usize, (&str, usize)> = HashMap::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -17953,6 +17970,25 @@ fn build_pk_param_fn(
             continue;
         }
         slot_seen.insert(pk_slot, (pk_name.as_str(), var_name.as_str(), binding));
+        if let PkSlotBinding::Var(var_slot) = binding {
+            if let Some(&(prev_key, prev_slot)) = var_seen.get(&var_slot) {
+                // `slot_seen` already collapsed a same-slot alias pair, so a
+                // repeat here is always a second, *different* slot.
+                debug_assert_ne!(prev_slot, pk_slot);
+                return Err(format!(
+                    "[structural_model]: `{prev_key}={var_name}` and `{pk_name}={var_name}` \
+                     bind one parameter to two different PK roles ({} and {}). Each \
+                     role needs its own [individual_parameters] variable — e.g. \
+                     `{pk_name}={var_name}_{}` with `{var_name}_{} = {var_name}` \
+                     declared in the block.",
+                    pk_slot_noun(prev_slot),
+                    pk_slot_noun(pk_slot),
+                    pk_name.to_uppercase(),
+                    pk_name.to_uppercase(),
+                ));
+            }
+            var_seen.insert(var_slot, (pk_name.as_str(), pk_slot));
+        }
         match (var_slot, binding) {
             // `Var` and `Time` both come from a resolved individual parameter
             // (the TIME desugaring declares its synthetic one), so the slot write

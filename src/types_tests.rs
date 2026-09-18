@@ -1371,10 +1371,13 @@ fn has_bioavailability_detects_f_on_either_engine() {
     m.pk_indices = vec![PK_IDX_F];
     assert!(m.has_bioavailability());
 
-    // Either engine: a bare `F` (any case) in `[individual_parameters]`.
+    // Analytical engine: a bare `F` in `[individual_parameters]` with no `f=`
+    // binding never reaches PK_IDX_F, so it is not a bioavailability (#1359).
+    // On the ODE layout the same name is routed by `ode_param_slots`, which is
+    // what puts PK_IDX_F into `pk_indices` — covered by the parser tests.
     let mut m = test_helpers::analytical_model(GradientMethod::Auto);
     m.indiv_param_names = vec!["CL".into(), "f".into()];
-    assert!(m.has_bioavailability());
+    assert!(!m.has_bioavailability());
 
     // ODE engine only: a compartment-indexed `Fn` routes via the DoseAttrMap.
     let mut m = test_helpers::ode_model(GradientMethod::Auto);
@@ -1385,6 +1388,41 @@ fn has_bioavailability_detects_f_on_either_engine() {
     let mut m = test_helpers::analytical_model(GradientMethod::Auto);
     m.indiv_param_names = vec!["CL".into(), "F1".into()];
     assert!(!m.has_bioavailability());
+}
+
+#[test]
+fn has_lagtime_answers_from_routed_slots_and_indexed_names_only() {
+    // #1359: both lag predicates share `has_indexed_dose_attr`, so pin its three
+    // arms — the slot, the ODE-only indexed name, and the compartment scoping
+    // that separates `has_lagtime_on_cmt` from `has_lagtime`.
+    let base = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!base.has_lagtime() && !base.has_lagtime_on_cmt(1));
+
+    // Route 1, either engine: the slot in `pk_indices` is the whole answer.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_LAGTIME];
+    assert!(m.has_lagtime() && m.has_lagtime_on_cmt(1) && m.has_lagtime_on_cmt(2));
+
+    // A bare name alone — the analytical false positive — is no longer a lag.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "LAGTIME".into(), "ALAG".into()];
+    assert!(!m.has_lagtime() && !m.has_lagtime_on_cmt(1));
+
+    // Route 2, ODE only: `ALAG2` is a lag on compartment 2 and on the model, not
+    // on compartment 1.
+    let mut m = test_helpers::ode_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "ALAG2".into()];
+    assert!(m.has_lagtime());
+    assert!(m.has_lagtime_on_cmt(2));
+    assert!(
+        !m.has_lagtime_on_cmt(1),
+        "ALAG2 must not count for compartment 1"
+    );
+
+    // The same `ALAG2` on the analytical engine routes nothing (no ode_spec).
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "ALAG2".into()];
+    assert!(!m.has_lagtime() && !m.has_lagtime_on_cmt(2));
 }
 
 #[test]
