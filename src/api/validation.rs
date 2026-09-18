@@ -6231,6 +6231,10 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 #[path = "tests/block_name_diagnostic_tests.rs"]
 mod block_name_diagnostic_tests;
 
+#[cfg(test)]
+#[path = "tests/model_name_report_tests.rs"]
+mod model_name_report_tests;
+
 /// Give a block-header diagnostic its message plus whatever location the
 /// message text carries.
 ///
@@ -6304,21 +6308,27 @@ fn line_spans(msg: &str) -> impl Iterator<Item = ((usize, usize), usize)> + '_ {
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
     use crate::parser::model_parser::parse_full_model_file;
 
-    let model_name = Path::new(model_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model")
-        .to_string();
-
     // 1. Parse. A parse failure is terminal — without an AST there is nothing
-    //    further to validate, so return a report carrying just that diagnostic.
+    //    further to validate, so return a report carrying just that diagnostic,
+    //    under the file stem (the declared name is not recoverable without a parse).
     let mut parsed = match parse_full_model_file(Path::new(model_path)) {
         Ok(p) => p,
         Err(e) => {
+            let stem = Path::new(model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string();
             let data = data_path.map(|s| s.to_string());
-            return CheckReport::new(model_name, data, vec![parse_error_to_diagnostic(&e)]);
+            return CheckReport::new(stem, data, vec![parse_error_to_diagnostic(&e)]);
         }
     };
+    // The report's `model` is the name the fit will carry — the declared
+    // `model NAME`, else the file stem — resolved by the same function the
+    // fit entry points use, so `ferx check` and `ferx run` cannot disagree on
+    // it (#1395: the check report used the stem unconditionally).
+    super::run::set_model_name(&mut parsed.model, model_path);
+    let model_name = parsed.model.name.clone();
 
     // Resolve which dataset (if any) to check against: an explicit
     // `data_path` wins over the model's `[data]` block; absence of both just
