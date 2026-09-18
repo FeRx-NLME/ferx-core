@@ -1668,7 +1668,10 @@ fn vi_nn_l2_shrinks_the_network_weights() {
 fn vi_objective_trace_is_the_penalized_objective() {
     let (model, population, params) = dcm_fixture();
     let mut x0 = pack_params(&params);
-    clamp_to_bounds(&mut x0, &compute_bounds(&params));
+    clamp_to_bounds(
+        &mut x0,
+        &crate::estimation::parameterization::compute_bounds(&params),
+    );
 
     let o = FitOptions {
         nn_l2_lambda: 1e-2,
