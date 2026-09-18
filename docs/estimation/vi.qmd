@@ -614,9 +614,17 @@ the subjects trivially separable, and that is when `Ω` goes.
   trustworthy here in principle — its outer loop simply never reached the memorising optimum
   that VI's Adam found.
 
-Regularizing the network (weight decay / curvature penalties) is the direct fix and is not yet
-implemented; until it is, size the network to the design and check `Ω` against a second
-estimator.
+Regularizing the network is the direct fix: `nn_l2` (weight decay) and `nn_smooth` (curvature)
+apply under `vi`, on the same scale as under FOCEI — see
+[Covariate-NN regularization](../model-file/fit-options.qmd#covariate-nn-regularization-nn_l2-nn_smooth).
+A positive `nn_l2` shrinks the spurious covariate-driven variation the collapse is made of, and,
+as a side effect of pinning the network's weight symmetry, lets the fit settle and early-stop
+rather than running the full `vi_iters` ceiling. Convergence is judged on the **penalized**
+objective the optimizer descends — reported as `vi.objective_trace`, which is populated only when
+regularization is active (empty means "identical to `vi.elbo_trace`") — while `vi.elbo_trace`
+stays the clean bound. It is not a
+substitute for sizing the network to the design and checking `Ω` against a second estimator — do
+both regardless.
 
 ## Inter-occasion variability
 

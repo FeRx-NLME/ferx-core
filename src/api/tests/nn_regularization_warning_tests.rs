@@ -42,13 +42,15 @@ fn plain_model() -> CompiledModel {
 }
 
 #[test]
-fn foce_family_applies_the_penalty_and_the_rest_does_not() {
+fn foce_family_and_vi_apply_the_penalty_and_the_rest_does_not() {
     for m in [
         EstimationMethod::Foce,
         EstimationMethod::FoceI,
         EstimationMethod::Laplace,
         EstimationMethod::FoceGn,
         EstimationMethod::FoceGnHybrid,
+        // VI folds the same penalty gradient into its Adam step (`run_vi`).
+        EstimationMethod::Vi,
     ] {
         assert!(applies_nn_regularization(m), "{m:?} must apply the penalty");
     }
@@ -57,7 +59,6 @@ fn foce_family_applies_the_penalty_and_the_rest_does_not() {
         EstimationMethod::Imp,
         EstimationMethod::Impmap,
         EstimationMethod::Bayes,
-        EstimationMethod::Vi,
     ] {
         assert!(
             !applies_nn_regularization(m),
