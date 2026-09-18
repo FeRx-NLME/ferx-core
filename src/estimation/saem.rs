@@ -58,6 +58,25 @@ pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bob
 /// 5827.3, at 2.3× the wall time), so the budget is left alone.
 const MSTEP_INITIAL_STEP: f64 = 0.1;
 
+/// Initial BOBYQA step for one packed coordinate: [`MSTEP_INITIAL_STEP`],
+/// bounded by a quarter of the coordinate's own interval.
+///
+/// BOBYQA requires `upper - lower >= 2 * step` on every free coordinate and
+/// otherwise rejects the *whole* problem with `NLOPT_INVALID_ARGS` before the
+/// first evaluation (#1420 review). A quarter of the width is NLopt's own
+/// default and leaves the factor-of-two margin; a pinned coordinate
+/// (`upper == lower`) is eliminated by NLopt before BOBYQA runs and keeps the
+/// nominal step, which only has to be positive. An unbounded coordinate
+/// (`+∞` width) keeps the nominal step too.
+fn mstep_initial_step(lower: f64, upper: f64) -> f64 {
+    let width = upper - lower;
+    if width > 0.0 && width.is_finite() {
+        MSTEP_INITIAL_STEP.min(width / 4.0)
+    } else {
+        MSTEP_INITIAL_STEP
+    }
+}
+
 /// Relative objective tolerance of the numerical θ/σ M-step (#1415).
 ///
 /// Was `1e-4`: on a conditional objective of a few thousand units that stops
@@ -1137,13 +1156,34 @@ fn theta_sigma_mstep_light(
         // Every coordinate gets the same trust radius in packed units, undone
         // through the optional magnitude scaling so the radius is the same
         // fraction of the parameter either way.
-        let initial_step: Vec<f64> = (0..n).map(|i| MSTEP_INITIAL_STEP / scale[i]).collect();
+        //
+        // Bounded by the coordinate's own interval: BOBYQA refuses the whole
+        // problem (`NLOPT_INVALID_ARGS`, before a single evaluation) if any
+        // free coordinate has `upper - lower < 2 * step`, and the error is
+        // discarded below, so a theta declared on a narrow interval — CL on
+        // (1.9, 2.1) is 0.10008 log units wide — would silently turn every
+        // M-step into a no-op for θ *and* σ (#1420 review). A quarter of the
+        // width is NLopt's own default and leaves the required factor-of-two
+        // margin. A pinned coordinate (`upper == lower`) is eliminated by NLopt
+        // before BOBYQA sees it; it keeps the nominal step, which must stay
+        // positive.
+        let initial_step: Vec<f64> = (0..n)
+            .map(|i| mstep_initial_step(lower[i], upper[i]) / scale[i])
+            .collect();
         opt.set_initial_step(&initial_step).unwrap();
     }
 
-    match opt.optimize(&mut xs) {
-        Ok(_) | Err(_) => {}
-    }
+    let outcome = opt.optimize(&mut xs);
+    // A configuration NLopt rejects outright is a bug in this function, not a
+    // property of the fit; `xs` is then untouched and the M-step is a silent
+    // no-op. Loud in debug (every unit and slow test), swallowed in release
+    // like every other NLopt outcome here.
+    debug_assert!(
+        !matches!(outcome, Err((nlopt::FailState::InvalidArgs, _))),
+        "SAEM numerical M-step: NLopt rejected the problem (InvalidArgs) — \
+         check the initial step against the bounds"
+    );
+    let _ = outcome;
 
     // Unscale back to log-space.
     let x_final: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
@@ -5549,6 +5589,46 @@ mod tests {
         );
     }
 
+    /// #1415 fixture: a 1-cpt IV model whose two thetas carry no ETA, three
+    /// subjects, data generated at `CL = 2, V = 20` for a 100 mg bolus with a
+    /// fixed ±10 % pattern (so σ has a non-degenerate maximiser).
+    fn noeta_mstep_fixture() -> (CompiledModel, crate::types::Population) {
+        use std::io::Write as _;
+
+        const MODEL: &str = r#"
+[parameters]
+theta TVCL(1.0, 0.01, 200.0)
+theta TVV(10.0, 0.1, 500.0)
+sigma EPS ~ 0.05
+
+[individual_parameters]
+CL = TVCL
+V = TVV
+
+[structural_model]
+pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+DV ~ proportional(EPS)
+"#;
+        let model = crate::parser::model_parser::parse_model_string(MODEL).unwrap();
+
+        let (cl, v, dose) = (2.0_f64, 20.0_f64, 100.0_f64);
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
+        for id in 1..=3 {
+            csv.push_str(&format!("{id},0,0,{dose},1,1\n"));
+            for (j, t) in [1.0_f64, 2.0, 4.0, 8.0, 12.0].iter().enumerate() {
+                let c = dose / v * (-cl / v * t).exp();
+                let bump = if (id + j) % 2 == 0 { 1.1 } else { 0.9 };
+                csv.push_str(&format!("{id},{t},{:.6},0,0,1\n", c * bump));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+        (model, pop)
+    }
+
     /// #1415: the budgeted, warm-started numerical M-step must return the
     /// *nearby maximiser* of the η-frozen conditional likelihood, not a point
     /// somewhere along the way to it — or, as the old configuration did on this
@@ -5586,39 +5666,8 @@ mod tests {
     /// comparison stops meaning anything).
     #[test]
     fn budgeted_mstep_returns_the_converged_conditional_maximiser() {
-        use std::io::Write as _;
-
-        const MODEL: &str = r#"
-[parameters]
-theta TVCL(1.0, 0.01, 200.0)
-theta TVV(10.0, 0.1, 500.0)
-sigma EPS ~ 0.05
-
-[individual_parameters]
-CL = TVCL
-V = TVV
-
-[structural_model]
-pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-DV ~ proportional(EPS)
-"#;
-        let model = crate::parser::model_parser::parse_model_string(MODEL).unwrap();
-
-        let (cl, v, dose) = (2.0_f64, 20.0_f64, 100.0_f64);
-        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT\n");
-        for id in 1..=3 {
-            csv.push_str(&format!("{id},0,0,{dose},1,1\n"));
-            for (j, t) in [1.0_f64, 2.0, 4.0, 8.0, 12.0].iter().enumerate() {
-                let c = dose / v * (-cl / v * t).exp();
-                let bump = if (id + j) % 2 == 0 { 1.1 } else { 0.9 };
-                csv.push_str(&format!("{id},{t},{:.6},0,0,1\n", c * bump));
-            }
-        }
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(csv.as_bytes()).unwrap();
-        let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+        let (model, pop) = noeta_mstep_fixture();
+        let (cl, v) = (2.0_f64, 20.0_f64);
         let etas: Vec<Vec<f64>> = vec![vec![]; pop.subjects.len()];
 
         // Start 0.05 log units from the generating values, on every coordinate.
@@ -5740,6 +5789,106 @@ DV ~ proportional(EPS)
             theta_mix[0],
             theta_ref[0]
         );
+    }
+
+    /// The per-coordinate initial step is bounded by the coordinate's own
+    /// interval (#1420 review): BOBYQA requires `upper − lower ≥ 2·step`.
+    #[test]
+    fn mstep_initial_step_is_bounded_by_the_interval() {
+        // Wide interval: the nominal step.
+        assert_eq!(
+            mstep_initial_step((0.01_f64).ln(), (200.0_f64).ln()),
+            MSTEP_INITIAL_STEP
+        );
+        assert_eq!(mstep_initial_step(-8.0, 5.0), MSTEP_INITIAL_STEP);
+        // Narrow interval: a quarter of the width, leaving the factor-of-two
+        // margin BOBYQA needs. CL on (1.9, 2.1) is 0.10008 log units wide.
+        let (lo, hi) = ((1.9_f64).ln(), (2.1_f64).ln());
+        let step = mstep_initial_step(lo, hi);
+        assert!(step < MSTEP_INITIAL_STEP);
+        assert!((step - (hi - lo) / 4.0).abs() < 1e-15);
+        assert!(hi - lo >= 2.0 * step);
+        // Exactly at the threshold and just above: still bounded by the width.
+        assert!(mstep_initial_step(0.0, 0.4) <= 0.1 && mstep_initial_step(0.0, 0.4) > 0.0);
+        assert!((mstep_initial_step(0.0, 0.2) - 0.05).abs() < 1e-15);
+        // Pinned and unbounded coordinates keep a positive nominal step.
+        assert_eq!(mstep_initial_step(0.7, 0.7), MSTEP_INITIAL_STEP);
+        assert_eq!(
+            mstep_initial_step(f64::NEG_INFINITY, f64::INFINITY),
+            MSTEP_INITIAL_STEP
+        );
+        assert_eq!(mstep_initial_step(0.0, f64::INFINITY), MSTEP_INITIAL_STEP);
+    }
+
+    /// #1420 review (P1): a free theta declared on an interval narrower than
+    /// twice the nominal step made BOBYQA reject the whole problem before its
+    /// first evaluation, and because the outcome is discarded the joint θ/σ
+    /// M-step silently returned its start on every iteration — freezing θ *and*
+    /// σ. Same fixture as above with CL bounded to (1.9, 2.1), 0.10008 log
+    /// units wide, started at 1.95. Mutation check: use the unbounded
+    /// `MSTEP_INITIAL_STEP` for every coordinate and this fails on the
+    /// `f_b < f_start` assertion with the start returned unchanged (in a debug
+    /// build the `debug_assert!` on `InvalidArgs` fires first).
+    #[test]
+    fn mstep_moves_a_theta_declared_on_a_narrow_interval() {
+        let (model, pop) = noeta_mstep_fixture();
+        let etas: Vec<Vec<f64>> = vec![vec![]; pop.subjects.len()];
+
+        let start_theta = vec![(1.95_f64).ln(), (20.0_f64).ln() + 0.05];
+        let start_sigma = vec![(0.1_f64).ln() + 0.05];
+        let theta_lower = vec![(1.9_f64).ln(), (0.1_f64).ln()];
+        let theta_upper = vec![(2.1_f64).ln(), (500.0_f64).ln()];
+        let sigma_lower = vec![-8.0];
+        let sigma_upper = vec![5.0];
+        let packs_log = vec![true, true];
+        assert!(
+            theta_upper[0] - theta_lower[0] < 2.0 * MSTEP_INITIAL_STEP,
+            "fixture must be narrower than twice the nominal step to exercise the bound"
+        );
+
+        let objective = |lt: &[f64], ls: &[f64]| {
+            let th: Vec<f64> = lt.iter().map(|x| x.exp()).collect();
+            let sg: Vec<f64> = ls.iter().map(|x| x.exp()).collect();
+            obs_nll_sum(&model, &pop, &th, &sg, &etas)
+        };
+        let f_start = objective(&start_theta, &start_sigma);
+        let (theta_b, sigma_b) = theta_sigma_mstep_light(
+            &model,
+            &pop,
+            &etas,
+            None,
+            &start_theta,
+            &start_sigma,
+            &theta_lower,
+            &theta_upper,
+            &sigma_lower,
+            &sigma_upper,
+            2,
+            1,
+            5,
+            false,
+            &packs_log,
+            None,
+        );
+        let f_b = objective(&theta_b, &sigma_b);
+        assert!(f_b.is_finite() && f_start.is_finite());
+        assert!(
+            f_b < f_start - 0.5,
+            "the M-step must improve the conditional objective from a narrow-interval start: \
+             {f_b} vs {f_start} (an unchanged start means NLopt rejected the problem)"
+        );
+        // Every free coordinate moved — the failure mode was all three frozen.
+        assert!(
+            (theta_b[0] - start_theta[0]).abs() > 1e-4,
+            "CL did not move"
+        );
+        assert!((theta_b[1] - start_theta[1]).abs() > 1e-3, "V did not move");
+        assert!(
+            (sigma_b[0] - start_sigma[0]).abs() > 1e-3,
+            "sigma did not move"
+        );
+        // And CL stayed inside its declared interval.
+        assert!(theta_b[0] >= theta_lower[0] - 1e-12 && theta_b[0] <= theta_upper[0] + 1e-12);
     }
 
     #[test]
