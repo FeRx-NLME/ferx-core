@@ -36,15 +36,23 @@ NONMEM-compatible data through a command-line interface, Rust API, and
 
 ## How It Compares
 
-| Feature | ferx-core | NONMEM | Monolix | Pumas |
-|---------|-----------|--------|---------|-------|
-| Language | Rust | Fortran | C++ | Julia |
-| FOCE/FOCEI | Yes | Yes | No | Yes |
-| SAEM | Yes | No | Yes | Yes |
-| Analytical PK | Yes | Yes | Yes | Yes |
-| ODE models | Yes | Yes | Yes | Yes |
-| Exact gradients | Yes (analytic sensitivities) | No | No | Yes (ForwardDiff) |
-| Open source | Yes | No | No | No |
+| Feature | ferx-core | NONMEM | nlmixr2 | Monolix | Pumas |
+|---------|-----------|--------|---------|---------|-------|
+| Language | Rust | Fortran | R, C/C++ (rxode2) | C++ | Julia |
+| FOCE/FOCEI | Yes | Yes | Yes | No | Yes |
+| SAEM | Yes | Yes | Yes | Yes | Yes |
+| Analytical PK | Yes | Yes | Yes (`linCmt()`) | Yes | Yes |
+| ODE models | Yes | Yes | Yes | Yes | Yes |
+| Open source | Yes | No | Yes | No | No |
+| License | MIT | Commercial | GPL (≥ 3) | Commercial | Commercial |
+
+Method coverage is broadly the same across these engines: NONMEM has offered
+SAEM, importance sampling and Bayesian estimation alongside FOCE since NONMEM 7,
+and Monolix estimates with SAEM rather than FOCE. The table compares method
+availability only, as documented by each tool (checked September 2026). It does
+not rank how each engine computes gradients, which differs by method and option;
+for ferx's own approach see
+[Gradient route (analytic vs FD)](estimation/foce.qmd#gradient-route-analytic-vs-fd).
 
 ## Architecture Overview
 
