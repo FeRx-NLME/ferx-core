@@ -118,7 +118,7 @@ matter of tolerance — tracked as
   the inflation already explained.  Do not read `IWRES`, `CWRES` or a residual
   plot from a `[diffusion]` fit as a goodness-of-fit summary.
 
-The `W_EXPERIMENTAL_SDE` warning repeats the first and third points on every
+The `W_EXPERIMENTAL_SDE` warning repeats all three points on every
 fit.  The mean update is planned; until it lands, read `DIFF_<STATE>` as a
 variance-inflation parameter and nothing more.
 

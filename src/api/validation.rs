@@ -5950,12 +5950,12 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
              Standard errors and convergence behaviour are not yet proven across \
              diverse datasets — validate results carefully before relying on \
              them. The filter is covariance-only: the state mean is propagated \
-             by the ODE and is never corrected by the observed data, so what is \
-             fitted is the deterministic ODE prediction with an inflated \
-             observation variance. There is no filtered state trajectory, and \
-             sdtab IWRES is scaled by the residual error alone, so it reads \
-             over-dispersed on these fits (issue #1285). See the Feature \
-             Maturity page in the documentation.",
+             by the ODE and is never corrected by the observed data, so a \
+             [diffusion] fit scores the deterministic ODE prediction with an \
+             inflated observation variance rather than a filtered state. There \
+             is no filtered state trajectory, and sdtab IWRES from such a fit \
+             is scaled by the residual error alone, so it reads over-dispersed. \
+             See the Feature Maturity and SDE pages in the documentation.",
         ));
     }
     #[cfg(feature = "nn")]
