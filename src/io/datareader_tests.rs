@@ -2987,10 +2987,11 @@ fn a_long_or_quoted_example_cell_is_truncated_and_escaped() {
         !w.contains("a\"b"),
         "an embedded quote must not survive verbatim: {w}"
     );
-    assert!(
-        !w.contains('\u{2028}'),
-        "a Unicode line separator must not reach a one-line warning: {w}"
-    );
+    // The standalone `!w.contains('\u{2028}')` that used to sit here was deleted: the
+    // loop below already rejects that character, and two gates excluding the same
+    // input are a test hole rather than belt-and-braces — deleting either left the
+    // suite green, so neither could fail alone (CLAUDE.md, "two redundant gates cover
+    // for each other").
     assert!(
         w.contains("p\u{fffd}q"),
         "it is replaced in place rather than dropped, so the cell stays recognisable: {w}"
