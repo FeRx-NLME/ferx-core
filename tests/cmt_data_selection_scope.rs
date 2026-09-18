@@ -708,9 +708,16 @@ fn tte_csv(spelling: &str, other: usize) -> String {
 fn a_lone_endpoint_at_the_default_compartment_is_not_reported() {
     // The endpoint channel's documented false positive, closed. A TTE-only model whose
     // only endpoint is at `cmt = 1` has exactly one place a row can go: the reader's
-    // fallback IS the endpoint, and any other CMT is an `E_ENDPOINT_UNROUTED` error
-    // rather than a silent re-route. So a defaulted cell changes nothing and the
-    // warning was pure noise.
+    // fallback IS the endpoint, and a row explicitly assigned any other compartment
+    // lands in the Gaussian vectors, where the empty per-CMT error map stops it with
+    // `E_PER_CMT_ERROR_MODEL`. So a defaulted cell changes nothing, getting it wrong
+    // on purpose is loud, and the warning was pure noise.
+    //
+    // That error code is asserted below rather than described. The first version of
+    // this comment named `E_ENDPOINT_UNROUTED`, which is a different condition — it
+    // detects Gaussian observations sitting on a *declared endpoint* CMT because the
+    // population was read without endpoint routing (#1199) — and nothing here would
+    // have caught the wrong claim (Codex review of #1440).
     //
     // Measured, not asserted from the predicate: the objective is identical under both
     // spellings, which is what "changes nothing" means here.
@@ -731,6 +738,28 @@ fn a_lone_endpoint_at_the_default_compartment_is_not_reported() {
     assert!(
         !warns_on_read(&src, &tte_csv("x", 1)),
         "a lone endpoint at the default compartment leaves nothing to guess wrong"
+    );
+
+    // The "loud, not silent" half of the argument for suppressing it: a row that
+    // really is on another compartment is refused, with the code named above.
+    let m = temp(&src, ".ferx");
+    let off_endpoint = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+                        1,12,1,0,.,1,0\n\
+                        2,20,0,0,.,1,0\n\
+                        3,15,5.0,0,.,2,0\n";
+    let d = temp(off_endpoint, ".csv");
+    let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
+    let codes: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .filter(|x| x.code.starts_with('E'))
+        .map(|x| x.code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["E_PER_CMT_ERROR_MODEL"],
+        "an observation outside the lone endpoint must be refused, and by this code — \
+         the suppression above is only safe because getting it wrong is loud"
     );
 }
 

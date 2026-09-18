@@ -1175,7 +1175,7 @@ pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
     // **endpoint-only** model (no `[error_model]`, so no Gaussian grid to fall into)
     // whose routing names **only** the compartment the reader falls back to. Every
     // row keys to that endpoint whatever the cell said, and any other CMT is an
-    // `E_ENDPOINT_UNROUTED` error rather than a silent re-route. Documented as a known
+    // `E_PER_CMT_ERROR_MODEL` error rather than a silent re-route. Documented as a known
     // limit when the endpoint channel landed; closed here (#1409 review).
     //
     // Both halves are needed. Drop the Gaussian test and a model with a `cmt = 1`
