@@ -25337,3 +25337,322 @@ fn preamble_prose_and_model_prefixed_words_are_not_model_lines() {
     );
     assert_eq!(parsed_name("modelled = 3\nmodel real_name"), "real_name");
 }
+
+// ─── E6: η-independent prefix hoisting ────────────────────────────────────
+
+/// Deterministic xorshift — a seeded generator so a failure reproduces from the
+/// printed seed without pulling `rand` into this module.
+fn e6_rng(state: &mut u64) -> f64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    // 53-bit mantissa in [0, 1), then spread over a range that exercises both
+    // sides of every comparison in the generated models.
+    ((*state >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 1.0
+}
+
+/// Model bodies covering the shapes the split has to get right: plain covariate
+/// algebra, an η-dependent statement *between* two η-independent ones (which
+/// only a reordering split can hoist), `if`/`else if`/`else` on a covariate and
+/// on η, the `TIME` built-in, local reassignment of a slot, and a statement
+/// that reads a slot an η-dependent statement wrote.
+fn e6_model_bodies() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "covariate_algebra_then_etas",
+            "  BMI = WT / (HT / 100)^2\n\
+             \x20 FFM = 9270 * WT / (6680 + 216 * BMI)\n\
+             \x20 CL  = TVCL * (FFM / 55)^0.75 * exp(ETA_CL)\n\
+             \x20 V   = TVV * (FFM / 55) * exp(ETA_V)\n\
+             \x20 KA  = TVKA * (FFM / 55)^0.1\n",
+        ),
+        (
+            "eta_statement_between_two_hoistable",
+            "  CL   = TVCL * exp(ETA_CL)\n\
+             \x20 FFM  = 9270 * WT / (6680 + 216 * WT / (HT / 100)^2)\n\
+             \x20 V    = TVV * (FFM / 55)^0.9 * exp(ETA_V)\n\
+             \x20 KA   = TVKA * (FFM / 55)^0.25\n",
+        ),
+        (
+            "branch_on_covariate",
+            "  if (SEX == 1) {\n\
+             \x20   FFM = 9270 * WT / (6680 + 216 * WT / (HT / 100)^2)\n\
+             \x20 } else {\n\
+             \x20   FFM = 9270 * WT / (8780 + 244 * WT / (HT / 100)^2)\n\
+             \x20 }\n\
+             \x20 CL = TVCL * (FFM / 55)^0.75 * exp(ETA_CL)\n\
+             \x20 V  = TVV * exp(ETA_V)\n\
+             \x20 KA = TVKA * (FFM / 55)^0.2\n",
+        ),
+        (
+            "branch_on_eta",
+            "  BMI = WT / (HT / 100)^2\n\
+             \x20 CL  = TVCL * exp(ETA_CL)\n\
+             \x20 if (CL > 1.0) {\n\
+             \x20   V = TVV * BMI\n\
+             \x20 } else {\n\
+             \x20   V = TVV / (BMI + 1)\n\
+             \x20 }\n\
+             \x20 KA = TVKA * BMI\n",
+        ),
+        (
+            "time_builtin",
+            "  BMI  = WT / (HT / 100)^2\n\
+             \x20 DECAY = exp(-0.01 * TIME)\n\
+             \x20 CL   = TVCL * BMI^0.3 * DECAY * exp(ETA_CL)\n\
+             \x20 V    = TVV * exp(ETA_V)\n\
+             \x20 KA   = TVKA * DECAY\n",
+        ),
+        (
+            "reassignment_after_an_eta_write",
+            "  BMI = WT / (HT / 100)^2\n\
+             \x20 CL  = TVCL * BMI * exp(ETA_CL)\n\
+             \x20 BMI = BMI + 1\n\
+             \x20 V   = TVV * BMI * exp(ETA_V)\n\
+             \x20 KA  = TVKA * BMI\n",
+        ),
+        (
+            "hoistable_write_read_by_an_eta_statement_then_rewritten",
+            "  SCALE = WT / 70\n\
+             \x20 CL    = TVCL * SCALE * exp(ETA_CL)\n\
+             \x20 SCALE = SCALE * 2\n\
+             \x20 V     = TVV * SCALE * exp(ETA_V)\n\
+             \x20 KA    = TVKA\n",
+        ),
+        (
+            "conditional_expression_on_covariate",
+            "  CRCL = if (CR < 0.7) (142 / 16.7) * (CR / 0.7)^(-0.241) else (142 / 16.7) * (CR / 0.7)^(-1.2)\n\
+             \x20 CL   = TVCL * (CRCL / 5)^0.8 * exp(ETA_CL)\n\
+             \x20 V    = TVV * exp(ETA_V)\n\
+             \x20 KA   = TVKA * (CRCL / 5)^0.2\n",
+        ),
+    ]
+}
+
+fn e6_model_text(body: &str) -> String {
+    format!(
+        "[parameters]\n\
+         \x20 theta TVCL(2.0, 0.1, 100.0)\n\
+         \x20 theta TVV(20.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.0, 0.01, 50.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 omega ETA_V ~ 0.09\n\
+         \x20 sigma PROP ~ 0.04\n\
+         \n[individual_parameters]\n{body}\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    )
+}
+
+/// The split must be *value-preserving*: running the prefix then the suffix
+/// must leave every variable slot bit-identical to running the original
+/// statement list, for every input. This is the property the whole hoist rests
+/// on — the reordering is only legal because the data dependencies make it
+/// invisible.
+///
+/// Mutation check (run, not reasoned): dropping the `conflicts` test in
+/// `split_ip_eta_independent_prefix` reddens
+/// `hoistable_write_read_by_an_eta_statement_then_rewritten` (the rewritten
+/// `SCALE` hoists ahead of the statement that reads the old value); dropping
+/// the `tainted` test reddens `branch_on_eta` and `reassignment_after_an_eta_write`.
+#[test]
+fn eta_independent_split_is_value_preserving_on_every_shape() {
+    for (name, body) in e6_model_bodies() {
+        let model = parse_model_string(&e6_model_text(body))
+            .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: no indiv_param_program"));
+        let stmts = &program.stmts;
+        let n_vars = program.n_vars;
+        let Some(split) = split_ip_eta_independent_prefix(stmts, n_vars) else {
+            // A model with nothing to hoist still has to be covered by the
+            // fallback path; there is nothing to compare here.
+            continue;
+        };
+        assert!(
+            !split.prefix.is_empty(),
+            "{name}: split returned Some with an empty prefix"
+        );
+
+        let n_cov = model.referenced_covariates.len();
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for trial in 0..64 {
+            let theta: Vec<f64> = (0..model.n_theta)
+                .map(|_| 1.0 + e6_rng(&mut seed))
+                .collect();
+            let eta: Vec<f64> = (0..model.n_eta).map(|_| e6_rng(&mut seed) * 0.4).collect();
+            let cov: Vec<f64> = (0..n_cov).map(|_| 1.0 + e6_rng(&mut seed)).collect();
+            let time = 10.0 * (1.0 + e6_rng(&mut seed));
+            let _guard = ModelTimeGuard::enter(time);
+            let nn: Vec<Vec<f64>> = Vec::new();
+            let mut stack: Vec<f64> = Vec::new();
+
+            let mut want = vec![0.0f64; n_vars];
+            eval_statements_indexed_with_stack(
+                stmts, &theta, &eta, &cov, &mut want, None, &nn, &mut stack,
+            );
+
+            let mut got = vec![0.0f64; n_vars];
+            eval_statements_indexed_with_stack(
+                &split.prefix,
+                &theta,
+                &eta,
+                &cov,
+                &mut got,
+                None,
+                &nn,
+                &mut stack,
+            );
+            eval_statements_indexed_with_stack(
+                &split.suffix,
+                &theta,
+                &eta,
+                &cov,
+                &mut got,
+                None,
+                &nn,
+                &mut stack,
+            );
+            for (slot, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name}: trial {trial}, slot {slot}: unsplit {a} vs split {b}"
+                );
+            }
+        }
+    }
+}
+
+/// The *cache* must key on every input the prefix reads. A key missing one —
+/// `TIME`, a covariate, a θ — serves a stale hit, and the only way to see it is
+/// to interleave inputs so a stale entry is still resident when a different
+/// input arrives.
+///
+/// So: compute a reference for each input tuple with a cold evaluator, then
+/// replay the tuples through the real `pk_param_fn` in an order that guarantees
+/// hits and near-misses (each tuple twice, then all of them round-robin twice
+/// more) and require bit-equality every time. Mutation check: dropping
+/// `split.key_time` from the key reddens `time_builtin`; dropping the covariate
+/// slice reddens every other model.
+#[test]
+fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
+    use std::collections::HashMap;
+    for (name, body) in e6_model_bodies() {
+        let model = parse_model_string(&e6_model_text(body))
+            .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: no indiv_param_program"))
+            .clone();
+        let cov_names = model.referenced_covariates.clone();
+
+        // Inputs: vary θ, η, covariates and TIME independently, including two
+        // tuples that differ in exactly one covariate and two that differ only
+        // in TIME — the pairs a partial key cannot tell apart.
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut inputs: Vec<(Vec<f64>, Vec<f64>, HashMap<String, f64>, f64)> = Vec::new();
+        for i in 0..24 {
+            let theta: Vec<f64> = (0..model.n_theta)
+                .map(|_| 1.0 + e6_rng(&mut seed))
+                .collect();
+            let eta: Vec<f64> = (0..model.n_eta).map(|_| e6_rng(&mut seed) * 0.4).collect();
+            let mut cov = HashMap::new();
+            for (j, n) in cov_names.iter().enumerate() {
+                cov.insert(n.clone(), 1.0 + e6_rng(&mut seed) + (j as f64) * 0.01);
+            }
+            inputs.push((theta, eta, cov, 5.0 * (i as f64)));
+        }
+        // One-covariate-apart and one-TIME-apart twins of input 0.
+        if !cov_names.is_empty() {
+            let mut twin = inputs[0].clone();
+            *twin.2.get_mut(&cov_names[0]).unwrap() += 0.5;
+            inputs.push(twin);
+        }
+        let mut twin = inputs[0].clone();
+        twin.3 += 1.0;
+        inputs.push(twin);
+
+        // Reference: the unsplit statement list, evaluated cold.
+        let want: Vec<[f64; MAX_PK_PARAMS]> = inputs
+            .iter()
+            .map(|(theta, eta, cov, time)| {
+                let _guard = ModelTimeGuard::enter(*time);
+                let cov_vec: Vec<f64> = cov_names
+                    .iter()
+                    .map(|n| cov.get(n).copied().unwrap_or(0.0))
+                    .collect();
+                let mut vars = vec![0.0f64; program.n_vars];
+                let mut stack: Vec<f64> = Vec::new();
+                eval_statements_indexed_with_stack(
+                    &program.stmts,
+                    theta,
+                    eta,
+                    &cov_vec,
+                    &mut vars,
+                    None,
+                    &[],
+                    &mut stack,
+                );
+                let mut p = [0.0f64; MAX_PK_PARAMS];
+                for &(pk_slot, var_slot) in &program.pk_var_slots {
+                    p[pk_slot] = vars[var_slot];
+                }
+                p
+            })
+            .collect();
+
+        // Replay through the production closure: each tuple twice back to back
+        // (forces a hit), then two round-robin sweeps (forces eviction and
+        // near-miss lookups).
+        let mut order: Vec<usize> = Vec::new();
+        for i in 0..inputs.len() {
+            order.push(i);
+            order.push(i);
+        }
+        order.extend(0..inputs.len());
+        order.extend((0..inputs.len()).rev());
+        for &i in &order {
+            let (theta, eta, cov, time) = &inputs[i];
+            let got = (model.pk_param_fn)(theta, eta, cov, *time);
+            for &(pk_slot, _) in &program.pk_var_slots {
+                assert_eq!(
+                    got.values[pk_slot].to_bits(),
+                    want[i][pk_slot].to_bits(),
+                    "{name}: input {i}, pk slot {pk_slot}: closure {} vs unsplit reference {}",
+                    got.values[pk_slot],
+                    want[i][pk_slot]
+                );
+            }
+        }
+    }
+}
+
+/// A `[covariate_nn]` output is recomputed outside the statement list on every
+/// call and is not in the cache key, so any statement reading one must stay in
+/// the suffix. Checked on the dependency analysis directly — the `nn` feature
+/// is not always compiled, but `Expression::NnOutput` always exists.
+#[test]
+fn an_nn_output_read_is_never_hoistable() {
+    let mut d = IpStmtDeps::default();
+    ip_deps_expr(
+        &Expression::NnOutput {
+            nn_idx: 0,
+            output_idx: 0,
+        },
+        &mut d,
+    );
+    assert!(
+        d.dynamic,
+        "an NN output read must mark the statement dynamic"
+    );
+    // And the same for an unresolved name, which carries no slot index.
+    let mut d = IpStmtDeps::default();
+    ip_deps_expr(&Expression::Variable("X".into()), &mut d);
+    assert!(d.dynamic, "an unresolved variable read must be dynamic");
+}
