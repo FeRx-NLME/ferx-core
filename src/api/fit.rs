@@ -1671,6 +1671,9 @@ fn fit_inner(
                         h_matrices,
                         kappas,
                         covariance_matrix: None,
+                        // No covariance step on an evaluation-only stage, so no
+                        // estimator to name (#1382).
+                        covariance_method: None,
                         covariance_wall_time_secs: 0.0,
                         warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
@@ -1757,6 +1760,9 @@ fn fit_inner(
                     h_matrices,
                     kappas,
                     covariance_matrix: None,
+                    // No covariance step on an evaluation-only stage, so no
+                    // estimator to name (#1382).
+                    covariance_method: None,
                     covariance_wall_time_secs: 0.0,
                     warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
@@ -2744,6 +2750,12 @@ fn fit_inner(
         max_unconverged_subjects: result.max_unconverged_subjects,
         total_ebe_fallbacks: result.total_ebe_fallbacks,
         covariance_status,
+        // #1382: the estimator that actually produced `covariance_matrix`, carried
+        // up from the covariance step rather than read back off
+        // `options.covariance_method` — the two part company whenever #1064's
+        // large-problem router swaps a defaulted `r` for the cross-product, and
+        // `stage_opts` is a per-stage clone besides.
+        covariance_method: result.covariance_method,
         shrinkage_eta,
         cond_dist: result.cond_dist.clone(),
         shrinkage_eps,

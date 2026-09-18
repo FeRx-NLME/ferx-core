@@ -43,6 +43,15 @@ pub struct OuterResult {
     /// Per-occasion kappa EBEs for each subject. Empty vecs when `n_kappa == 0`.
     pub kappas: Vec<Vec<DVector<f64>>>,
     pub covariance_matrix: Option<DMatrix<f64>>,
+    /// Which estimator produced `covariance_matrix` — `R⁻¹`, `S⁻¹` or the
+    /// `R⁻¹SR⁻¹` sandwich (#1382). Lifted onto
+    /// [`crate::types::FitResult::covariance_method`].
+    ///
+    /// Carried rather than re-derived from `FitOptions::covariance_method`,
+    /// because above [`crate::types::COV_HESSIAN_MAX_DIM`] free parameters a
+    /// defaulted `r` is routed onto the cross-product (#1064) and the two stop
+    /// agreeing. `Some` exactly when `covariance_matrix` is `Some`.
+    pub covariance_method: Option<crate::types::CovarianceMethod>,
     /// Wall-clock time spent inside this stage's covariance-step block
     /// (`compute_covariance` / SIR-fallback construction), in seconds.
     /// `0.0` when `run_covariance_step` was false for this stage.
@@ -552,7 +561,7 @@ fn evaluate_at_initial_params(
     // Mixture (#983 Phase 6): the covariance step now builds its FD Hessian on the
     // K-fold mixture OFV (`compute_covariance` branches on `template.mixture`), so
     // it runs for mixtures exactly like the single-population path.
-    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = {
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
             init_params,
@@ -569,9 +578,15 @@ fn evaluate_at_initial_params(
             wall_time_secs,
             warnings: cov_warnings,
             sir_fallback_proposal,
+            method: covariance_method,
         } = out;
         warnings.extend(cov_warnings);
-        (matrix, wall_time_secs, sir_fallback_proposal)
+        (
+            matrix,
+            wall_time_secs,
+            sir_fallback_proposal,
+            covariance_method,
+        )
     };
 
     OuterResult {
@@ -593,6 +608,7 @@ fn evaluate_at_initial_params(
         h_matrices,
         kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
@@ -3407,7 +3423,7 @@ fn optimize_nlopt_once(
     // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
-    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal) = {
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x0,
             init_params,
@@ -3424,9 +3440,15 @@ fn optimize_nlopt_once(
             wall_time_secs,
             warnings: cov_warnings,
             sir_fallback_proposal,
+            method: covariance_method,
         } = out;
         warnings.extend(cov_warnings);
-        (matrix, wall_time_secs, sir_fallback_proposal)
+        (
+            matrix,
+            wall_time_secs,
+            sir_fallback_proposal,
+            covariance_method,
+        )
     };
 
     // #1303. Placed *before* the plain "did not converge" line so a demoted run
@@ -3505,6 +3527,7 @@ fn optimize_nlopt_once(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
@@ -4010,6 +4033,7 @@ fn optimize_bfgs(
         wall_time_secs: covariance_wall_time_secs,
         warnings: cov_warnings,
         sir_fallback_proposal,
+        method: covariance_method,
     } = out;
     warnings.extend(cov_warnings);
 
@@ -4038,6 +4062,7 @@ fn optimize_bfgs(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_method,
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,

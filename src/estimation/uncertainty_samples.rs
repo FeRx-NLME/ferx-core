@@ -445,6 +445,7 @@ mod tests {
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             covariance_status: crate::types::CovarianceStatus::Computed,
+            covariance_method: Some(crate::types::CovarianceMethod::Hessian),
             shrinkage_eta: vec![],
             cond_dist: None,
             shrinkage_eps: f64::NAN,

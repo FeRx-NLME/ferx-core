@@ -173,6 +173,45 @@ fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
     );
 }
 
+/// The covariance-step status with the estimator that produced it appended, e.g.
+/// `computed (R⁻¹SR⁻¹, covariance_method = rsr)` (#1382).
+///
+/// A condition number is not comparable across estimators — the same fit was
+/// measured at 1.42e8 under the sandwich and 3.68e5 under `s`, both correct —
+/// so the status line has to say which one it is before the figure below it can
+/// be compared to NONMEM (whose `$COVARIANCE` default is `RSR`, not `R`) or to
+/// another ferx run. Falls back to the bare status when there is no matrix and
+/// hence no estimator to name.
+fn covariance_status_label(result: &FitResult) -> String {
+    let status = match result.covariance_status {
+        CovarianceStatus::Computed => "computed",
+        CovarianceStatus::Failed => "FAILED",
+        CovarianceStatus::NotRequested => "not requested",
+        CovarianceStatus::SirFallback => "SIR fallback",
+    };
+    match result.covariance_method {
+        Some(m) => format!(
+            "{status} ({}, covariance_method = {})",
+            m.formula(),
+            m.label()
+        ),
+        None => status.to_string(),
+    }
+}
+
+/// The note printed directly above the first `SE` column, naming the estimator
+/// those standard errors were inverted out of (#1382). `None` when no covariance
+/// matrix was produced, in which case every `SE` cell renders as `---` anyway.
+fn standard_error_source_note(result: &FitResult) -> Option<String> {
+    result.covariance_method.map(|m| {
+        format!(
+            "Standard errors from {} (covariance_method = {})",
+            m.formula(),
+            m.label()
+        )
+    })
+}
+
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
@@ -232,6 +271,9 @@ pub fn print_results(result: &FitResult) {
 
     // Theta estimates
     eprintln!("\n--- THETA Estimates ---");
+    if let Some(note) = standard_error_source_note(result) {
+        eprintln!("{note}");
+    }
     eprintln!(
         "{:<16} {:>12} {:>12} {:>10}",
         "Parameter", "Estimate", "SE", "%RSE"
@@ -659,13 +701,7 @@ pub fn print_results(result: &FitResult) {
 
     // Run info
     eprintln!("\n--- Run Info ---");
-    let cov_str = match result.covariance_status {
-        crate::types::CovarianceStatus::Computed => "computed",
-        crate::types::CovarianceStatus::Failed => "FAILED",
-        crate::types::CovarianceStatus::NotRequested => "not requested",
-        crate::types::CovarianceStatus::SirFallback => "SIR fallback",
-    };
-    eprintln!("  Covariance: {}", cov_str);
+    eprintln!("  Covariance: {}", covariance_status_label(result));
     eprintln!("  Wall time:  {:.1}s", result.wall_time_secs);
     eprintln!("  ferx v{}", result.ferx_version);
 
@@ -783,6 +819,9 @@ pub fn format_summary(result: &FitResult) -> String {
 
     // --- THETA ---
     let _ = writeln!(out, "\n--- THETA ---");
+    if let Some(note) = standard_error_source_note(result) {
+        let _ = writeln!(out, "  {note}");
+    }
     let _ = writeln!(
         out,
         "  {:<16} {:>12} {:>12} {:>8}",
@@ -936,15 +975,24 @@ pub fn format_summary(result: &FitResult) -> String {
 
     // --- Diagnostics ---
     let _ = writeln!(out, "\n--- Diagnostics ---");
-    let cov_str = match result.covariance_status {
-        CovarianceStatus::Computed => "computed",
-        CovarianceStatus::Failed => "FAILED",
-        CovarianceStatus::NotRequested => "not requested",
-        CovarianceStatus::SirFallback => "SIR fallback",
-    };
-    let _ = writeln!(out, "  Covariance: {}", cov_str);
+    let _ = writeln!(out, "  Covariance: {}", covariance_status_label(result));
     if let Some(cn) = result.cov_condition_number {
-        let _ = writeln!(out, "  Condition number: {:.1}", cn);
+        // The estimator is named on the line above; repeat the token here because
+        // a condition number is the figure most often copied out on its own, and
+        // it means different things under `r`, `s` and `rsr` (#1382).
+        match result.covariance_method {
+            Some(m) => {
+                let _ = writeln!(
+                    out,
+                    "  Condition number: {:.1}  (covariance_method = {})",
+                    cn,
+                    m.label()
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  Condition number: {:.1}", cn);
+            }
+        }
     }
     if !result.shrinkage_eta.is_empty() {
         let parts: Vec<String> = result
@@ -1927,6 +1975,14 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         writeln!(f, "  method_chain: [{}]", chain.join(", ")).map_err(|e| e.to_string())?;
     }
+    // Which estimator produced every SE, eigenvalue and condition number below
+    // (#1382). Emitted only when a covariance matrix exists — a fit with no
+    // covariance step has no estimator to name, and an unconditional `null` key
+    // would read as "the label is missing" rather than "there is nothing to
+    // label". Spelled as the `[fit_options]` token so it can be pasted back.
+    if let Some(m) = result.covariance_method {
+        writeln!(f, "  covariance_method: {}", m.label()).map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  uses_ode_solver: {}", result.uses_ode_solver).map_err(|e| e.to_string())?;
     writeln!(f, "  uses_sde: {}", result.uses_sde).map_err(|e| e.to_string())?;
     if let Some(n_hmc) = result.saem_n_subjects_hmc {
@@ -2638,6 +2694,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
              (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored"
         )
         .map_err(|e| e.to_string())?;
+        // #1382: a bootstrap / SIR / uncertainty-propagation tool reading this block
+        // is consuming one of three different matrices; say which.
+        if let Some(m) = result.covariance_method {
+            writeln!(f, "  estimator: {} # {}", m.label(), m.formula())
+                .map_err(|e| e.to_string())?;
+        }
         writeln!(f, "  parameters: [{}]", names.join(", ")).map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
@@ -2828,6 +2890,7 @@ mod tests {
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
+            covariance_method: None,
             shrinkage_eta: Vec::new(),
             cond_dist: None,
             shrinkage_eps: f64::NAN,
@@ -2932,6 +2995,92 @@ mod tests {
         assert!(s.contains("EPS shrinkage: 8.0%"));
         assert!(s.contains("Warnings: 1"));
         assert!(s.contains("heads up"));
+        // #1382 non-degeneracy for the test below: this fixture has no estimator,
+        // so the bare forms are what an unlabelled result must still print.
+        assert!(s.contains("  Covariance: computed\n"));
+        assert!(s.contains("Condition number: 42.0\n"));
+    }
+
+    /// #1382: the printed summary names the estimator behind the SE column, the
+    /// covariance status and the condition number.
+    ///
+    /// Three places, not one, and each is separately load-bearing: the SE note is
+    /// the only thing on screen next to the `SE` column, the status line is where
+    /// a reader looks for "did the covariance step work", and the condition number
+    /// is the figure most often copied out on its own — 1.42e8 under `rsr` and
+    /// 3.68e5 under `s` are the same fit, and only one is comparable to a given
+    /// NONMEM run.
+    ///
+    /// The `format_summary_contains_key_sections` fixture above pins the
+    /// *unlabelled* rendering of the same two lines, so this cannot pass by the
+    /// suffix being unconditional.
+    #[test]
+    fn format_summary_names_the_covariance_estimator() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = vec![1.5];
+        r.theta_names = vec!["CL".into()];
+        r.theta_fixed = vec![false];
+        r.se_theta = Some(vec![0.15]);
+        r.covariance_status = CovarianceStatus::Computed;
+        r.cov_condition_number = Some(1.42e8);
+        r.covariance_method = Some(crate::types::CovarianceMethod::Sandwich);
+
+        let s = format_summary(&r);
+        assert!(
+            s.contains("Standard errors from R⁻¹SR⁻¹ (covariance_method = rsr)"),
+            "the SE column must say what was inverted:\n{s}"
+        );
+        assert!(
+            s.contains("Covariance: computed (R⁻¹SR⁻¹, covariance_method = rsr)"),
+            "the status line must name the estimator:\n{s}"
+        );
+        // The whole line, not the two halves (#1382 review): asserting
+        // `contains("(covariance_method = rsr)")` separately from
+        // `contains("Condition number: …")` passes on the *SE note's* suffix, so
+        // deleting the suffix from this line alone left the test green. Verified
+        // by deleting it: the split form passed, this form fails.
+        assert!(
+            s.contains("  Condition number: 142000000.0  (covariance_method = rsr)\n"),
+            "the condition number must carry the estimator on its own line — it is \
+             the figure most often copied out alone:\n{s}"
+        );
+    }
+
+    /// #1382: the fit YAML records the estimator, spelled as the `[fit_options]`
+    /// token so it can be pasted straight back into a model file — and omits the
+    /// key entirely when there is no matrix to label, rather than emitting a
+    /// `null` that reads as a missing label for a number that exists.
+    #[test]
+    fn write_estimates_yaml_records_the_covariance_estimator() {
+        let mut r = comprehensive_result();
+        r.covariance_method = Some(crate::types::CovarianceMethod::CrossProduct);
+        r.covariance_matrix = Some(DMatrix::identity(3, 3));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(
+            yaml.contains("  covariance_method: s\n"),
+            "the model block must record the estimator:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("  estimator: s # S⁻¹"),
+            "the covariance_matrix block feeds bootstrap / SIR / uncertainty \
+             propagation, which consume one of three different matrices:\n{yaml}"
+        );
+
+        // No matrix → no label anywhere, and no `null` key.
+        let mut bare = comprehensive_result();
+        bare.covariance_method = None;
+        bare.covariance_matrix = None;
+        let path2 = dir.path().join("bare.yaml");
+        write_estimates_yaml(&bare, path2.to_str().unwrap()).expect("yaml write");
+        let yaml2 = std::fs::read_to_string(&path2).expect("yaml read");
+        assert!(
+            !yaml2.contains("covariance_method:"),
+            "an unlabelled fit must omit the key, not emit null:\n{yaml2}"
+        );
     }
 
     #[test]
@@ -3539,6 +3688,7 @@ mod tests {
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             covariance_status: CovarianceStatus::NotRequested,
+            covariance_method: None,
             shrinkage_eta: Vec::new(),
             cond_dist: None,
             shrinkage_eps: f64::NAN,

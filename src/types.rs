@@ -1929,6 +1929,23 @@ pub struct OmegaMatrix {
     /// Used by the SAEM M-step to zero sampling correlations that bleed into
     /// structurally-absent entries via `(1/N) Σ ηη^T`.
     pub free_mask: DMatrix<bool>,
+    /// Per-eta: was this eta **declared inside** a `block_omega` /
+    /// `block_kappa` line, rather than on its own `omega` / `kappa` line?
+    ///
+    /// Declaration provenance, which `free_mask` cannot supply: a **one-eta**
+    /// `block_omega (ETA_CL) = [0.09]` is accepted, and has no off-diagonal, so
+    /// it is indistinguishable from a standalone `omega ETA_CL` by covariance
+    /// structure alone (#1394). Only a diagnostic that quotes the user's own
+    /// spelling back at them needs this; every numerical path reads `free_mask`
+    /// and `diagonal`, which are unchanged.
+    ///
+    /// Empty, or all-`false`, means "no block declaration is recorded" — which
+    /// is the honest answer for every `OmegaMatrix` rebuilt from a bare matrix
+    /// (`from_matrix`, and so the ferx-r entry points): there the caller passed
+    /// numbers, not a declaration, so there is no spelling to preserve.
+    /// `pub(crate)` on purpose: it is a diagnostic-wording aid, not public API,
+    /// and nothing outside the crate builds an `OmegaMatrix` by struct literal.
+    pub(crate) block_declared: Vec<bool>,
     /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
     /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
     /// matrix, run Cholesky, and invert on every evaluation.
@@ -1985,9 +2002,22 @@ impl OmegaMatrix {
             eta_names: names,
             diagonal,
             free_mask,
+            block_declared: vec![false; n],
             inv,
             log_det,
         }
+    }
+
+    /// Record which etas were declared inside a `block_omega` / `block_kappa`
+    /// line (#1394). The parser is the only caller: it is the only place that
+    /// has seen the declaration. A length that disagrees with the matrix
+    /// dimension is ignored rather than panicking, since the field only steers
+    /// how a diagnostic is worded.
+    pub(crate) fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
+        if block_declared.len() == self.dim() {
+            self.block_declared = block_declared;
+        }
+        self
     }
 
     pub fn from_matrix(m: DMatrix<f64>, names: Vec<String>, diagonal: bool) -> Self {
@@ -2062,6 +2092,7 @@ impl OmegaMatrix {
             eta_names: names,
             diagonal,
             free_mask,
+            block_declared: vec![false; n],
             inv,
             log_det,
         }
@@ -5946,19 +5977,70 @@ pub enum CovarianceFallback {
 /// NONMEM's `$COVARIANCE MATRIX=` options. All three share the same FD Hessian
 /// `R` (the observed information) and per-subject score cross-product
 /// `S = Σᵢ gᵢgᵢᵀ`; they differ only in how those are combined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialized (and printed) as the same token the `[fit_options]` key accepts —
+/// `r` / `s` / `rsr` — so the value a user writes, the value a fit reports and
+/// the value a `.fitrx` bundle stores are one spelling rather than three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CovarianceMethod {
     /// `R⁻¹` — inverse observed-information (Hessian) matrix. The model-based
     /// covariance; assumes the model is correctly specified (default, NONMEM
     /// `MATRIX=R`).
     #[default]
+    #[serde(rename = "r")]
     Hessian,
     /// `S⁻¹` — inverse cross-product (outer-product-of-gradients) matrix. The
     /// empirical-information covariance (NONMEM `MATRIX=S`).
+    #[serde(rename = "s")]
     CrossProduct,
     /// `R⁻¹ S R⁻¹` — the Huber–White "sandwich". Robust to model
     /// mis-specification; NONMEM's default (`MATRIX=RSR`).
+    #[serde(rename = "rsr")]
     Sandwich,
+}
+
+impl CovarianceMethod {
+    /// The `[fit_options] covariance_method` token for this estimator — `r`,
+    /// `s` or `rsr`.
+    ///
+    /// **The single spelling.** The serde rename above, the `.fitrx` wire value,
+    /// the fit YAML, the CLI diagnostics line and the warning `details` payload
+    /// all read this, and [`CovarianceMethod::from_label`] is its inverse, so a
+    /// reported estimator can be pasted straight back into a model file. The
+    /// parser additionally accepts the long aliases (`hessian` / `cross_product`
+    /// / `sandwich`); those are input-only and are never emitted.
+    pub fn label(self) -> &'static str {
+        match self {
+            CovarianceMethod::Hessian => "r",
+            CovarianceMethod::CrossProduct => "s",
+            CovarianceMethod::Sandwich => "rsr",
+        }
+    }
+
+    /// The matrix expression this estimator inverts — `R⁻¹`, `S⁻¹` or
+    /// `R⁻¹SR⁻¹`. Printed next to [`label`](CovarianceMethod::label) wherever a
+    /// standard error or condition number is reported, because the token alone
+    /// does not say what was inverted.
+    pub fn formula(self) -> &'static str {
+        match self {
+            CovarianceMethod::Hessian => "R⁻¹",
+            CovarianceMethod::CrossProduct => "S⁻¹",
+            CovarianceMethod::Sandwich => "R⁻¹SR⁻¹",
+        }
+    }
+
+    /// Inverse of [`label`](CovarianceMethod::label): the canonical token back to
+    /// the variant. `None` for anything else — the long parser aliases are
+    /// deliberately not accepted here, so a round-trip through `label` is the
+    /// only thing that round-trips.
+    pub fn from_label(s: &str) -> Option<CovarianceMethod> {
+        match s {
+            "r" => Some(CovarianceMethod::Hessian),
+            "s" => Some(CovarianceMethod::CrossProduct),
+            "rsr" => Some(CovarianceMethod::Sandwich),
+            _ => None,
+        }
+    }
 }
 
 /// Severity level for a structured warning entry.
@@ -6733,6 +6815,24 @@ pub struct FitResult {
     pub total_ebe_fallbacks: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
+    /// Which estimator produced `covariance_matrix`, the standard errors,
+    /// `cov_eigenvalues` and `cov_condition_number` — `R⁻¹`, `S⁻¹` or the
+    /// `R⁻¹SR⁻¹` sandwich (#1382).
+    ///
+    /// **Not a copy of [`FitOptions::covariance_method`].** Above
+    /// [`COV_HESSIAN_MAX_DIM`] free parameters a *defaulted* `r` is routed onto
+    /// the cross-product (#1064), so the estimator that ran is not always the
+    /// one that was asked for; this field is the one that ran, carried up from
+    /// the covariance step rather than re-derived.
+    ///
+    /// `Some` exactly when `covariance_matrix` is `Some`. A step that was not
+    /// requested, was skipped, failed, or fell back to SIR produces no matrix
+    /// and therefore no label — there is nothing for an estimator name to
+    /// describe. The numbers this labels are not comparable across estimators:
+    /// the same fit was measured at condition number 1.42e8 under the sandwich
+    /// and 3.68e5 under `s`, and both are correct for their estimator.
+    #[serde(default)]
+    pub covariance_method: Option<CovarianceMethod>,
     /// ETA shrinkage per random effect: `1 - SD(eta_hat_k) / sqrt(omega_kk)`.
     /// `NaN` when `omega_kk` is zero. Computed from the conditional **mode**
     /// (EBE); for the distribution-based counterpart see

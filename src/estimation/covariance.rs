@@ -1483,6 +1483,32 @@ pub(crate) struct CovStepOutcome {
     pub wall_time_secs: f64,
     pub warnings: Vec<String>,
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
+    /// Which estimator produced `matrix` (#1382) — the **routed** one, which is
+    /// not always the requested one (see [`scale_routed_covariance_method`]).
+    /// `None` exactly when `matrix` is `None`; see
+    /// [`published_covariance_method`].
+    pub method: Option<crate::types::CovarianceMethod>,
+}
+
+/// The estimator label to publish alongside a covariance matrix: `Some(routed)`
+/// when a matrix was produced, `None` otherwise (#1382).
+///
+/// `routed` is the post-[`scale_routed_covariance_method`] choice — the one
+/// `compute_covariance` was actually configured with — never
+/// `FitOptions::covariance_method`, which is what was *asked for*. The two
+/// differ whenever a defaulted `r` is routed onto the cross-product above
+/// [`crate::types::COV_HESSIAN_MAX_DIM`] free parameters, and a label that
+/// reported the request there would be wrong precisely on the fits where the
+/// user could not have predicted the answer.
+///
+/// The `None`-without-a-matrix half is the other invariant: a failed, skipped or
+/// SIR-fallback step publishes no matrix, no standard errors, no eigenvalues and
+/// no condition number, so there is nothing for an estimator name to describe.
+pub(crate) fn published_covariance_method(
+    matrix: Option<&DMatrix<f64>>,
+    routed: crate::types::CovarianceMethod,
+) -> Option<crate::types::CovarianceMethod> {
+    matrix.map(|_| routed)
 }
 
 /// Which covariance estimator to actually assemble at `n` free coordinates, and
@@ -1621,6 +1647,12 @@ pub(crate) fn run_covariance_step_inner(
         }
     };
     CovStepOutcome {
+        // `routed`, not `options.covariance_method` as it arrived: the two are the
+        // same binding by construction here (`options` is rebound to
+        // `scaled_options` exactly when they differ), but naming `routed` is what
+        // makes it read as the estimator `compute_covariance` was configured with
+        // rather than the one the caller asked for (#1382).
+        method: published_covariance_method(matrix.as_ref(), routed),
         matrix,
         wall_time_secs: cov_timer.elapsed().as_secs_f64(),
         warnings,
@@ -1655,6 +1687,8 @@ pub(crate) fn run_covariance_step(
             wall_time_secs: 0.0,
             warnings: Vec::new(),
             sir_fallback_proposal: None,
+            // No step ran, so no estimator to name (#1382).
+            method: None,
         }
     }
 }
@@ -1665,8 +1699,67 @@ mod tests {
     // (they reach the moved symbols via the cross-module import added there). The
     // `run_covariance_step` gate + match is exercised end-to-end by every
     // estimator finalizer's integration/lib tests.
-    use super::{diagnostic_omega, packed_param_label, scale_routed_covariance_method};
+    use super::{
+        diagnostic_omega, packed_param_label, published_covariance_method,
+        scale_routed_covariance_method,
+    };
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
+    use nalgebra::DMatrix;
+
+    // ── #1382: the estimator label published alongside the matrix ────────────
+
+    /// **L1 — the label names the estimator that ran, not the one requested.**
+    ///
+    /// This is the composition the whole field exists for. At scale a *defaulted*
+    /// `covariance_method = r` is routed onto the cross-product (#1064), so a
+    /// label read back off `FitOptions::covariance_method` would report `r` for
+    /// SEs that came out of `S⁻¹`. The two are asserted to disagree first, so the
+    /// case cannot quietly become one where both spellings are the same answer.
+    ///
+    /// Composed here rather than driven through `run_covariance_step_inner`, for
+    /// the same reason the routing tests above are: reaching the branch needs a
+    /// fit with several hundred free parameters.
+    ///
+    /// Mutation: label from `requested` instead of `routed` → the second
+    /// assertion fires.
+    #[test]
+    fn the_published_label_names_the_routed_estimator_not_the_requested_one() {
+        let requested = CovarianceMethod::Hessian;
+        let (routed, _warning) = scale_routed_covariance_method(
+            COV_HESSIAN_MAX_DIM + 1,
+            requested,
+            /* explicitly_set */ false,
+            /* has_priors */ false,
+        );
+        assert_ne!(
+            routed, requested,
+            "the premise: this input must be one where the router actually swaps the \
+             estimator, or the assertion below is satisfied by either spelling"
+        );
+
+        let matrix = DMatrix::<f64>::identity(2, 2);
+        assert_eq!(
+            published_covariance_method(Some(&matrix), routed),
+            Some(CovarianceMethod::CrossProduct),
+            "the label must describe the matrix that was produced (S⁻¹), not the \
+             estimator the caller asked for (R⁻¹)"
+        );
+    }
+
+    /// **L2 — no matrix, no estimator.** A failed, skipped or SIR-fallback step
+    /// publishes no SEs, no eigenvalues and no condition number, so there is
+    /// nothing for a name to describe; labelling one would invite a reader to
+    /// compare a figure that was never computed.
+    #[test]
+    fn a_step_that_produced_no_matrix_publishes_no_estimator() {
+        for m in [
+            CovarianceMethod::Hessian,
+            CovarianceMethod::CrossProduct,
+            CovarianceMethod::Sandwich,
+        ] {
+            assert_eq!(published_covariance_method(None, m), None, "{m:?}");
+        }
+    }
 
     // ── #1064: routing the covariance step away from `R` at scale ───────────
     //

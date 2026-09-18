@@ -3414,3 +3414,63 @@ fn eval_only_trailing_stage_leaves_the_covariance_step_on_bayes() {
     assert_eq!(estimating.covariance_stage(), Some(EstimationMethod::Imp));
     assert!(estimating.unsupported_keys_warnings().is_empty());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #1382 — one spelling for the covariance estimator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **L3 — the serde token *is* `label()`.**
+///
+/// The point of the field is that a reported estimator can be pasted straight
+/// back into a `[fit_options]` block, so the JSON value, the `.fitrx` value, the
+/// YAML value and the model-file value have to be one string. Derived serde would
+/// have emitted `"CrossProduct"`; the explicit renames make it `"s"`. Asserting
+/// the *equality* rather than the literals separately is what stops a later
+/// rename of one from drifting past the other.
+#[test]
+fn the_serialized_covariance_method_is_the_fit_option_token() {
+    for m in [
+        CovarianceMethod::Hessian,
+        CovarianceMethod::CrossProduct,
+        CovarianceMethod::Sandwich,
+    ] {
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert_eq!(
+            json,
+            format!("\"{}\"", m.label()),
+            "the wire token and the fit-option token must be the same string for {m:?}"
+        );
+        let back: CovarianceMethod = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, m);
+        assert_eq!(CovarianceMethod::from_label(m.label()), Some(m));
+    }
+    // The three tokens are what the parser accepts, and they are distinct — a
+    // label collision would make two estimators indistinguishable in every
+    // output this issue is about.
+    assert_eq!(CovarianceMethod::Hessian.label(), "r");
+    assert_eq!(CovarianceMethod::CrossProduct.label(), "s");
+    assert_eq!(CovarianceMethod::Sandwich.label(), "rsr");
+    assert_eq!(CovarianceMethod::from_label("hessian"), None);
+    assert_eq!(CovarianceMethod::from_label(""), None);
+}
+
+/// **L4 — `formula()` says what was inverted, and says something different for
+/// each estimator.** The token alone does not tell a reader why 1.42e8 and
+/// 3.68e5 are both correct for the same fit; `R⁻¹` vs `R⁻¹SR⁻¹` does.
+#[test]
+fn each_covariance_estimator_prints_a_distinct_matrix_expression() {
+    let all = [
+        CovarianceMethod::Hessian,
+        CovarianceMethod::CrossProduct,
+        CovarianceMethod::Sandwich,
+    ];
+    let formulas: Vec<&str> = all.iter().map(|m| m.formula()).collect();
+    let unique: std::collections::HashSet<&&str> = formulas.iter().collect();
+    assert_eq!(
+        unique.len(),
+        all.len(),
+        "two estimators share a printed expression: {formulas:?}"
+    );
+    assert_eq!(CovarianceMethod::Hessian.formula(), "R⁻¹");
+    assert_eq!(CovarianceMethod::Sandwich.formula(), "R⁻¹SR⁻¹");
+}
