@@ -894,6 +894,8 @@ fn read_nonmem_csv_impl(
     let mut subjects = Vec::new();
     let mut total_occ_failures: usize = 0;
     let mut total_missing_dv: usize = 0;
+    // Rows whose compartment the reader chose, summed across subjects (#1009).
+    let mut total_cmt_defaults = CmtDefaults::default();
     // Rows dropped despite a nonzero AMT, summed across subjects (#262).
     let mut total_amt_ignored: usize = 0;
     let mut subjects_with_amt_ignored: usize = 0;
@@ -913,31 +915,39 @@ fn read_nonmem_csv_impl(
         ..Default::default()
     };
     for (id, rows) in &rows_by_id {
-        let (subject, occ_failures, missing_dv, subj_excl, subj_warnings, amt_ignored) =
-            parse_subject(
-                id,
-                rows,
-                time_col,
-                dv_col,
-                evid_col,
-                amt_col,
-                cmt_col,
-                rate_col,
-                mdv_col,
-                ii_col,
-                ss_col,
-                cens_col,
-                occ_col,
-                addl_col,
-                fremtype_col,
-                l2_col,
-                &cov_indices,
-                filter,
-                routing,
-                tentry_col,
-            )?;
+        let (
+            subject,
+            occ_failures,
+            missing_dv,
+            subj_excl,
+            subj_warnings,
+            amt_ignored,
+            subj_cmt_defaults,
+        ) = parse_subject(
+            id,
+            rows,
+            time_col,
+            dv_col,
+            evid_col,
+            amt_col,
+            cmt_col,
+            rate_col,
+            mdv_col,
+            ii_col,
+            ss_col,
+            cens_col,
+            occ_col,
+            addl_col,
+            fremtype_col,
+            l2_col,
+            &cov_indices,
+            filter,
+            routing,
+            tentry_col,
+        )?;
         total_occ_failures += occ_failures;
         total_missing_dv += missing_dv;
+        total_cmt_defaults.absorb(subj_cmt_defaults);
         total_amt_ignored += amt_ignored;
         if amt_ignored > 0 {
             subjects_with_amt_ignored += 1;
@@ -1052,6 +1062,68 @@ fn read_nonmem_csv_impl(
                 total_missing_dv
             ),
         });
+    }
+
+    // Compartment-defaulting summary (#1009). The reader is model-blind, so it
+    // reports only *how many* rows it had to choose a compartment for; whether
+    // choosing was ambiguous depends on how many states the model addresses, and
+    // that call belongs to `reader_warning_suppressed`, which `fit()` and
+    // `ferx check` share. Counted rows are post-filter and post-missing-DV, so
+    // the numbers match the rows the fit actually uses.
+    if total_cmt_defaults.any() {
+        let CmtDefaults {
+            n_dose,
+            n_dose_events,
+            n_obs,
+            n_missing_cell,
+            n_unparseable_cell,
+            // Both are the business of `example_list`, which owns the quoting and
+            // the "was anything withheld" decision; destructured exhaustively so a
+            // field added to `CmtDefaults` has to be answered for here.
+            examples: _,
+            examples_capped: _,
+        } = &total_cmt_defaults;
+        // An `ADDL` row is one cell to fix but many doses delivered, so name both
+        // when they differ — the row count alone understates how much drug went to
+        // the guessed compartment (`ADDL = 30` reads as "1 dose row").
+        let expanded = if n_dose_events > n_dose {
+            format!(" ({n_dose_events} doses after ADDL expansion)")
+        } else {
+            String::new()
+        };
+        // With no column there is no cell to blame, so the cause is the header
+        // itself; the per-row counters cannot tell an absent column from a column
+        // of missing cells, which is why this reads `cmt_col` directly. A row
+        // *shorter* than the header is a missing cell, not an absent column — see
+        // `resolve_row_cmt`.
+        let cause = if cmt_col.is_none() {
+            "the dataset has no CMT column".to_string()
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if *n_missing_cell > 0 {
+                parts.push(format!(
+                    "{n_missing_cell} row(s) had a missing CMT cell (`.`/blank/`NA`)"
+                ));
+            }
+            if *n_unparseable_cell > 0 {
+                parts.push(format!(
+                    "{n_unparseable_cell} row(s) had a CMT cell that is not a compartment index ({})",
+                    total_cmt_defaults.example_list()
+                ));
+            }
+            parts.join(" and ")
+        };
+        population_warnings.push(format!(
+            "W_CMT_DEFAULTED: {cause}, so {n_dose} dose row(s){expanded} and {n_obs} observation \
+             row(s) were assigned compartment 1. Wherever CMT selects something this is a guess \
+             rather than a default, and a wrong guess changes the numbers with no error: which \
+             compartment a dose lands in (an `[odes]` model with several states, or a `pk` model \
+             whose CMT=2 is a real target — an oral model's central bolus, a multi-compartment \
+             model's peripheral), and which readout, scale or error model an observation uses. \
+             Give the dataset a 1-based CMT column ordered like the model's compartments, or map \
+             an existing header onto it with `CMT = <header>` in the [data] block. Writing CMT=1 \
+             explicitly on every row silences this."
+        ));
     }
 
     // Dose-coverage warnings (#262), surfaced via FitResult.warnings. Most
@@ -1208,11 +1280,281 @@ fn parse_l2_id(s: &str) -> Option<i64> {
     if let Ok(i) = t.parse::<i64>() {
         return Some(i);
     }
-    let f = t.parse::<f64>().ok()?;
-    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+    let f = parse_float_formatted_integer(t)?;
+    if f >= i64::MIN as f64 && f <= i64::MAX as f64 {
         Some(f as i64)
     } else {
         None
+    }
+}
+
+/// A cell that should hold an integer but was written with a fractional part by
+/// the exporter: `"10.0"`, `"2.0"`, `"2e0"`.
+///
+/// pandas and R float-format a whole integer column once any cell in it is blank,
+/// which is why both [`parse_l2_id`] (#830) and [`parse_cmt_cell`] (#1009) need it.
+/// Those two grew the same parse independently and the second one was written
+/// *because* the first's lesson had not reached `CMT` — so it lives here once, and
+/// the next export quirk lands in one place. Returns the value as `f64`; each
+/// caller applies its own range and sign policy, which is the part that genuinely
+/// differs (`L2` accepts negatives, a compartment index does not).
+///
+/// `None` for a genuinely fractional value (`"2.4"`), an infinity, or anything that
+/// is not a number at all.
+fn parse_float_formatted_integer(t: &str) -> Option<f64> {
+    let f = t.parse::<f64>().ok()?;
+    (f.is_finite() && f.fract() == 0.0).then_some(f)
+}
+
+/// The compartment a row falls back to when the dataset does not say which one.
+/// 1-based; the value all three `CMT` sites already used before #1009 made the
+/// fallback visible.
+const DEFAULT_CMT: usize = 1;
+
+/// At most this many distinct unparseable `CMT` spellings are quoted back in the
+/// `W_CMT_DEFAULTED` summary.
+const MAX_CMT_EXAMPLES: usize = 3;
+
+/// A `CMT` cell, resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CmtCell {
+    /// A 1-based compartment index.
+    Value(usize),
+    /// Blank / `.` / `NA` / `NaN` — the NONMEM missing spellings.
+    Missing,
+    /// Present, but not a compartment index (`"-1"`, `"2.5"`, `"x"`).
+    Unparseable,
+}
+
+/// Parse a `CMT` cell. Accepts an integer literal or a *float-formatted integer*
+/// (`"2.0"`), for the same reason [`parse_l2_id`] does (#830): the three `CMT`
+/// sites used a bare `parse::<usize>()` that fell through to compartment 1 —
+/// silently dosing the wrong compartment rather than failing (#1009).
+///
+/// A negative, fractional or out-of-range value is `Unparseable` rather than
+/// rounded: the caller defaults it *and reports it*, so a mistyped compartment is
+/// loud instead of wrong.
+///
+/// Two range traps, both measured, both closed by the guard below rather than by a
+/// `contains` range:
+///
+/// - **`-0`.** `(0.0..=usize::MAX as f64).contains(&-0.0)` is `true`, because IEEE
+///   says `-0.0 == 0.0`, and `(-0.0f64) as usize` is `0`. So `-0` used to read as
+///   compartment 0 — the *default dose compartment*, silently accepted — while
+///   `-1` in the same column was reported. `is_sign_negative()` rejects both alike.
+/// - **2^64.** `usize::MAX as f64` rounds *up* to 18446744073709551616.0, so an
+///   inclusive range against it admits a value one past the end, which `as usize`
+///   then saturates to `usize::MAX`. The strict `<` rejects it. (`f as u64 as f64
+///   == f` does **not** close this: the saturated `u64::MAX` rounds back to 2^64
+///   and compares equal.)
+///
+/// That rounding makes the strict `<` reject `usize::MAX` written in float form too
+/// — `"18446744073709551615"` is `Value`, `"18446744073709551615.0"` is
+/// `Unparseable` — since the literal rounds to the same 2^64. Measured, and left
+/// as it is: the two spellings disagree only for a compartment index 1.8e19 past
+/// anything a model can declare, and both ends of the disagreement are reported
+/// rather than silently defaulted.
+fn parse_cmt_cell(s: &str) -> CmtCell {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        return CmtCell::Missing;
+    }
+    if let Ok(n) = t.parse::<usize>() {
+        return CmtCell::Value(n);
+    }
+    match parse_float_formatted_integer(t) {
+        Some(f) if !f.is_sign_negative() && f < usize::MAX as f64 => CmtCell::Value(f as usize),
+        _ => CmtCell::Unparseable,
+    }
+}
+
+/// How the reader arrived at a compartment the dataset did not give it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CmtDefaultCause {
+    /// The dataset carries no `CMT` column at all.
+    NoColumn,
+    /// The column is present and this row's cell is blank / `.` / `NA` / `NaN`.
+    MissingCell,
+    /// The column is present and this row's cell is not a compartment index.
+    /// Carries the offending text for the summary's examples.
+    UnparseableCell(String),
+}
+
+/// Resolve a row's `CMT` to a 1-based compartment index, saying when the reader
+/// had to choose it. Shared by the dose row, the observation row and the `[data]`
+/// selection filter's [`RowContext`] so the three cannot disagree about what a
+/// given cell means (#1009).
+fn resolve_row_cmt(row: &[String], cmt_col: Option<usize>) -> (usize, Option<CmtDefaultCause>) {
+    // `NoColumn` is reserved for a dataset with no CMT header at all, because that
+    // is the only case the summary cannot describe from the per-row counters. A
+    // row that is merely *shorter* than its header is a missing cell: the reader
+    // is built with `.flexible(true)` (see `read_nonmem_csv_impl`) and never pads,
+    // so `row.get(c)` returning `None` on a dataset that does declare CMT is a
+    // ragged row, not an absent column. Conflating the two emitted a summary with
+    // an empty cause clause — `W_CMT_DEFAULTED: , so 1 dose row(s) …` — because
+    // the cause was chosen from `cmt_col` while the counters came from the rows.
+    let Some(col) = cmt_col else {
+        return (DEFAULT_CMT, Some(CmtDefaultCause::NoColumn));
+    };
+    let Some(cell) = row.get(col) else {
+        return (DEFAULT_CMT, Some(CmtDefaultCause::MissingCell));
+    };
+    match parse_cmt_cell(cell) {
+        CmtCell::Value(n) => (n, None),
+        CmtCell::Missing => (DEFAULT_CMT, Some(CmtDefaultCause::MissingCell)),
+        CmtCell::Unparseable => (
+            DEFAULT_CMT,
+            Some(CmtDefaultCause::UnparseableCell(truncate_example(cell))),
+        ),
+    }
+}
+
+/// Longest cell text quoted back in the `W_CMT_DEFAULTED` summary.
+const MAX_CMT_EXAMPLE_LEN: usize = 24;
+
+/// A `CMT` cell rendered safe to interpolate into a warning: trimmed, any embedded
+/// quote or control character replaced, and cut to [`MAX_CMT_EXAMPLE_LEN`] with an
+/// ellipsis.
+///
+/// The cell is arbitrary user text that ends up in `FitResult.warnings`, the fit
+/// YAML and the `ferx check` report. Un-truncated, a mis-mapped free-text column
+/// puts a whole sentence in each; unescaped, a cell containing `"` produces
+/// `"a"b"`. Char-boundary safe, so a multi-byte cell cannot panic the reader.
+fn truncate_example(cell: &str) -> String {
+    let cleaned: String = cell
+        .trim()
+        .chars()
+        .map(|c| {
+            // `is_control` is the Cc category only, which leaves the Unicode line
+            // separators U+2028 / U+2029 intact — and this string lands in a
+            // one-line warning and in the fit YAML, both of which a line break
+            // would split. Named explicitly rather than widened to
+            // `!is_ascii_graphic()`, which would also mangle the non-ASCII cells
+            // the truncation test deliberately keeps legible.
+            if c == '"' || c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.chars().count() <= MAX_CMT_EXAMPLE_LEN {
+        return cleaned;
+    }
+    cleaned
+        .chars()
+        .take(MAX_CMT_EXAMPLE_LEN)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// Rows whose compartment the reader chose because the dataset did not say
+/// (#1009). Summed across subjects into one `W_CMT_DEFAULTED` line, which
+/// [`crate::api::validation::reader_warning_suppressed`] then withholds from
+/// models that have only one compartment to choose.
+#[derive(Debug, Default, Clone)]
+struct CmtDefaults {
+    /// Dose rows (EVID 1/4) assigned the default compartment.
+    n_dose: usize,
+    /// Dose *events* those rows produced — `ADDL` expansions included. Always
+    /// `>= n_dose`, and strictly greater whenever a defaulted row carried `ADDL`.
+    /// Reported separately because the two answer different questions: the row
+    /// count says how many cells to fix, the event count how much drug went to the
+    /// guessed compartment. An `ADDL = 30` row is one cell and thirty-one doses.
+    n_dose_events: usize,
+    /// Scored observation rows (EVID=0, MDV=0) likewise.
+    n_obs: usize,
+    /// Of the rows counted above, those whose `CMT` cell was present but missing.
+    /// Zero when the column is absent — there is no cell to blame.
+    n_missing_cell: usize,
+    /// Of the rows counted above, those whose cell was present but unparseable.
+    n_unparseable_cell: usize,
+    /// Up to [`MAX_CMT_EXAMPLES`] distinct unparseable spellings, first seen first.
+    examples: Vec<String>,
+    /// Whether a *distinct* spelling was seen that [`Self::examples`] had no room
+    /// for — the one thing that licenses the trailing `…`.
+    ///
+    /// Tracked rather than inferred from the counters. Comparing
+    /// `n_unparseable_cell` (a count of **rows**) against `examples.len()` (a count
+    /// of **spellings**) answers a different question, and gets it wrong in the
+    /// commonest case there is: five rows that all say `x` are one spelling, and the
+    /// row comparison printed `("x", …)` — claiming spellings it had not withheld.
+    examples_capped: bool,
+}
+
+impl CmtDefaults {
+    /// Remember one distinct offending spelling, up to the cap, and record whether
+    /// anything was turned away. The single owner of that policy: `record_*` and
+    /// `absorb` both route here, so raising the cap or changing the ordering cannot
+    /// land in the per-subject path and miss the cross-subject one.
+    fn push_example(&mut self, text: &str) {
+        if self.examples.iter().any(|e| e == text) {
+            return;
+        }
+        if self.examples.len() >= MAX_CMT_EXAMPLES {
+            self.examples_capped = true;
+            return;
+        }
+        self.examples.push(text.to_string());
+    }
+
+    /// One dose row that produced `n_events` dose events (`1 + ADDL`).
+    fn record_dose(&mut self, cause: &CmtDefaultCause, n_events: usize) {
+        self.n_dose += 1;
+        self.n_dose_events += n_events;
+        self.note_cause(cause);
+    }
+
+    /// One scored observation row.
+    fn record_obs(&mut self, cause: &CmtDefaultCause) {
+        self.n_obs += 1;
+        self.note_cause(cause);
+    }
+
+    fn note_cause(&mut self, cause: &CmtDefaultCause) {
+        match cause {
+            CmtDefaultCause::NoColumn => {}
+            CmtDefaultCause::MissingCell => self.n_missing_cell += 1,
+            CmtDefaultCause::UnparseableCell(text) => {
+                self.n_unparseable_cell += 1;
+                self.push_example(text);
+            }
+        }
+    }
+
+    fn absorb(&mut self, other: CmtDefaults) {
+        self.n_dose += other.n_dose;
+        self.n_dose_events += other.n_dose_events;
+        self.n_obs += other.n_obs;
+        self.n_missing_cell += other.n_missing_cell;
+        self.n_unparseable_cell += other.n_unparseable_cell;
+        // A subject that already had to withhold a spelling keeps that fact when it
+        // is folded in, and pushing its examples can newly fill us up.
+        self.examples_capped |= other.examples_capped;
+        for text in other.examples {
+            self.push_example(&text);
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.n_dose > 0 || self.n_obs > 0
+    }
+
+    /// The offending spellings, quoted, with an ellipsis when a spelling was
+    /// withheld. Without it a message reading `9 row(s) … ("-1", "2.5", "x")`
+    /// presents three spellings as if they were all that occurred; with it keyed on
+    /// the row count instead, `5 row(s) … ("x", …)` invents two more.
+    fn example_list(&self) -> String {
+        let mut s = self
+            .examples
+            .iter()
+            .map(|e| format!("\"{e}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.examples_capped {
+            s.push_str(", …");
+        }
+        s
     }
 }
 
@@ -1461,7 +1803,18 @@ fn parse_subject(
     routing: &ObsRouting,
     // Column index of the TENTRY (left-truncation time) column, if present.
     _tentry_col: Option<usize>,
-) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize), String> {
+) -> Result<
+    (
+        Subject,
+        usize,
+        usize,
+        SubjectExclusion,
+        Vec<String>,
+        usize,
+        CmtDefaults,
+    ),
+    String,
+> {
     let mut doses = Vec::new();
     // File-order record index (position in `rows`) of each dose / observation,
     // parallel to `doses` (pre-sort) and `obs_times`. Used after the loop to
@@ -1484,6 +1837,9 @@ fn parse_subject(
     // changes how many rows the dataset contributes, so either one is worth a
     // summary line.
     let mut missing_dv_rows: usize = 0;
+    // Dose / observation rows this subject contributed whose compartment the
+    // reader chose (#1009).
+    let mut cmt_defaults = CmtDefaults::default();
     let mut excl_n_obs: usize = 0;
     let mut excl_n_dose: usize = 0;
     let mut excl_n_other: usize = 0;
@@ -1661,10 +2017,12 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64_or_nan(s))
                 .unwrap_or(f64::NAN);
-            let cmt_for_ctx = cmt_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
-                .unwrap_or(1);
+            // Resolved exactly as the dose and observation arms below resolve it,
+            // so a `select`/`ignore` on CMT filters the same compartment the row
+            // is actually assigned (#1009). The cause is dropped here: the filter
+            // sees every record, including the EVID 2/3 rows the summary does not
+            // count, and the row may yet be excluded.
+            let (cmt_for_ctx, _) = resolve_row_cmt(row, cmt_col);
             let rate_for_ctx = rate_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64_or_nan(s))
@@ -1800,17 +2158,11 @@ fn parse_subject(
         } else if is_dose_evid(evid) {
             // Dose record
             let amt = row_amt;
-            let cmt = cmt_col
-                .and_then(|c| row.get(c))
-                .and_then(|s| {
-                    let t = s.trim();
-                    if t == "." || t.is_empty() {
-                        None
-                    } else {
-                        t.parse::<usize>().ok()
-                    }
-                })
-                .unwrap_or(1);
+            let (cmt, cmt_default_cause) = resolve_row_cmt(row, cmt_col);
+            // How many doses this row ends up producing is only known after ADDL
+            // expansion below, so remember where this row's doses start and record
+            // the finding once the row is fully expanded.
+            let doses_before_this_row = doses.len();
             let rate = rate_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
@@ -1914,23 +2266,23 @@ fn parse_subject(
                     }
                 }
             }
+
+            // Record the finding now that the row's full dose train exists (#1009).
+            // `doses.len() - doses_before_this_row` is `1 + ADDL` for an expanded
+            // row, so the summary can say both how many *cells* to fix and how much
+            // drug actually went to the guessed compartment.
+            if let Some(cause) = &cmt_default_cause {
+                cmt_defaults.record_dose(cause, doses.len() - doses_before_this_row);
+            }
         } else if evid == 0 && mdv == 0 {
             // Observation record
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
-            // Guard "." / blank the same way the dose path does: parse_usize maps
-            // these to 0 (an invalid compartment), but a missing CMT on an
-            // observation row must default to compartment 1.
-            let cmt = cmt_col
-                .and_then(|c| row.get(c))
-                .and_then(|s| {
-                    let t = s.trim();
-                    if t == "." || t.is_empty() {
-                        None
-                    } else {
-                        t.parse::<usize>().ok()
-                    }
-                })
-                .unwrap_or(1);
+            // Resolved exactly as the dose path resolves it: a missing or
+            // unparseable cell defaults to compartment 1 and is counted, rather
+            // than falling to `parse_usize`'s 0 (an invalid compartment). The
+            // count is deferred until `skip_missing_dv` is known below, so a row
+            // the reader drops is not reported as one it routed.
+            let (cmt, cmt_default_cause) = resolve_row_cmt(row, cmt_col);
 
             // A missing DV cell (`.` / `NA` / blank) means "no observation" when
             // the DV is an input: `parse_f64` coerced it to `0.0` above, so
@@ -2147,6 +2499,17 @@ fn parse_subject(
                     obs_covariates.push(locf_state.clone());
                 }
             }
+
+            // Count the chosen compartment **last** (#1009). Every arm above either
+            // pushed a row or `continue`d, so reaching this line is exactly "the
+            // row became an observation" — which is what the summary claims its
+            // counts mean. Counting before the branch instead swept up two kinds of
+            // row the fit never sees: a missing-DV row skipped under #258 (already
+            // reported by `W_MISSING_DV`, so it would be one row reported as two
+            // findings) and a TTE row the `TENTRY > TIME` guard drops as malformed.
+            if let Some(cause) = &cmt_default_cause {
+                cmt_defaults.record_obs(cause);
+            }
         } else if evid == 2 && any_tv {
             // EVID=2 "other event" — typically a covariate-change marker.
             // NONMEM/nlmixr2 run $PK at this time with this row's
@@ -2294,6 +2657,7 @@ fn parse_subject(
         },
         parse_warnings,
         amt_ignored_rows,
+        cmt_defaults,
     ))
 }
 

@@ -181,6 +181,7 @@ A YAML file containing parameter estimates, standard errors, and model diagnosti
 model:
   converged: true
   method: FOCE
+  covariance_method: r
 objective_function:
   ofv: -280.1838
   aic: -266.1838
@@ -258,9 +259,13 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
   observations). The Delattre-style variants a model search ranks on (`mixed`,
   `iiv`, `random`) are computed from the same result by `ferx_core::bic()` — see
   [Ranking candidates](api/fitting.qmd#ranking-candidates-bic-variants-and-strictness).
-- **se**: Standard error from the covariance step
+- **se**: Standard error from the covariance step — see
+  [Which covariance estimator produced these numbers](#covariance-estimator)
+  before comparing one against another tool
 - **rse_pct**: Relative standard error as percentage (SE/estimate * 100)
 - **cv_pct**: Coefficient of variation for omega (sqrt(variance) * 100)
+- **covariance_method**: which estimator produced the standard errors — `r`, `s`
+  or `rsr`. Present only when a covariance matrix was produced; see below.
 
 The `estimation:` block replaces the standalone `{model}-timing.txt` file
 (removed in #704): `wall_time_secs` measures only the estimation step itself
@@ -353,6 +358,56 @@ The warning used to add "SDE process noise may also help" on ODE models. It no l
 | `Computed` | Covariance step succeeded; SE values are valid |
 | `Failed` | Hessian was singular or inversion failed; SE fields are `None` |
 | `NotRequested` | `covariance = false` was set; SE fields are `None` |
+
+### Which covariance estimator produced these numbers {#covariance-estimator}
+
+`covariance_method: Option<CovarianceMethod>` records which of the three
+estimators produced `covariance_matrix`, the `se_*` fields, `cov_eigenvalues`
+and `cov_condition_number`:
+
+| Value | Written as | Matrix | NONMEM equivalent |
+|-------|-----------|--------|-------------------|
+| `Hessian` | `r` | `R⁻¹` | `$COVARIANCE MATRIX=R` |
+| `CrossProduct` | `s` | `S⁻¹` | `$COVARIANCE MATRIX=S` |
+| `Sandwich` | `rsr` | `R⁻¹SR⁻¹` | `$COVARIANCE MATRIX=RSR` (NONMEM's default) |
+
+**None of those numbers is comparable across estimators.** One fit measured a
+condition number of **1.42e8** under the sandwich and **3.68e5** under `s` —
+both correct for their estimator. Comparing a ferx condition number against
+NONMEM without matching the estimator compares two different quantities, and
+ferx's default (`r`) is *not* NONMEM's default (`RSR`). The same caution applies
+to the gradient mode: the same data under `gradient = auto` and `gradient = fd`
+measured 3.68e5 and 5.68e4, so quote `gradient_method_outer` /
+`gradient_method_inner` alongside the estimator.
+
+The value is `Some` exactly when `covariance_matrix` is `Some`. A step that was
+not requested, failed, or fell back to SIR produces no matrix, no standard
+errors and no condition number, so there is nothing for an estimator name to
+describe and the field is `None` (and the YAML key is omitted, never `null`).
+
+**It is the estimator that ran, not the one requested.** Above 100 free
+parameters a *defaulted* `covariance_method = r` is routed onto the
+cross-product, because the `R` matrix would need `n(n+1)/2` re-converged
+objective evaluations; the substitution is reported as a warning and this field
+reports `s`. Reading `covariance_method` back off `[fit_options]` would report
+`r` for standard errors that came out of `S⁻¹`.
+
+Where it appears:
+
+- the console summary — next to the `SE` column heading, on the
+  `Covariance:` line, and on the `Condition number:` line;
+- `{model}-fit.yaml` — `model.covariance_method`, plus an `estimator` key inside
+  the `covariance_matrix:` block for tools that consume the raw matrix;
+- `{model}-fit.json` and the `.fitrx` bundle — as the same `r` / `s` / `rsr`
+  token, so a recorded value can be pasted straight back into `[fit_options]`;
+- the `condition_number` and `covariance_regularized` warning `details` payloads
+  — see [Details payloads](warnings.qmd#details). Not `covariance_failed`: that
+  code means the step produced no matrix, so by the rule above there is no
+  estimator to name and the key is omitted.
+
+A `.fitrx` bundle written before this field existed loads with
+`covariance_method: None`: the file does not record it, and a default would be a
+fabricated provenance.
 
 ### Run Record Fields
 

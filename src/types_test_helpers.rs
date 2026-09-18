@@ -330,6 +330,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         covariance_status: CovarianceStatus::NotRequested,
+        covariance_method: None,
         shrinkage_eta: Vec::new(),
         cond_dist: None,
         shrinkage_eps: f64::NAN,
@@ -463,6 +464,10 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         covariance_status: CovarianceStatus::Computed,
+        // This fixture carries a covariance matrix, so it carries the estimator
+        // that produced it — the `Some(matrix) ⟺ Some(method)` pairing #1382
+        // introduced holds for hand-built fixtures too.
+        covariance_method: Some(crate::types::CovarianceMethod::Hessian),
         shrinkage_eta: vec![0.1, 0.15],
         cond_dist: None,
         shrinkage_eps: 0.05,

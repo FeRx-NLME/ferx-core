@@ -99,6 +99,21 @@ impl PkTopology {
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         self.infusable
     }
+
+    /// How many compartments a dose row's `CMT` can actually route to on this
+    /// model — the count of live entries in [`Self::channels`], which is the same
+    /// table [`Self::dose_channel`] dispatches on.
+    ///
+    /// Counted rather than read off `n_states` because the two genuinely differ:
+    /// the transit and inverse-Gaussian models carry `n_states` 2 or 3 but
+    /// `channels: &[]`, since their closed form absorbs every dose through the
+    /// depot and `single_dose_concentration` never reads `dose.cmt` at all. For
+    /// those a `CMT` the reader had to invent changes nothing, and answering with
+    /// `n_states` would claim otherwise (#1009).
+    #[inline]
+    pub(crate) fn addressable_dose_compartments(&self) -> usize {
+        self.channels.iter().flatten().count()
+    }
 }
 
 use Channel::{Central, Depot, Periph1, Periph2};

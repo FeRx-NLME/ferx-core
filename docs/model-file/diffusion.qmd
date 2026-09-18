@@ -222,21 +222,12 @@ equivalence:
 |---|---|---|
 | `EVID=3`/`4` system reset | `W_SDE_RESET` | the reset is ignored; compartment amounts carry through |
 | `lagtime` / `ALAGn` | `W_SDE_LAGTIME` | every dose is applied at its record time |
-| `SS=1` steady-state dose | `W_SDE_STEADY_STATE` | the record is applied as a single dose, not equilibrated |
 
 These are **fitting** gaps, not prediction gaps. The filter runs only inside the objective, so
 `predict()` and `simulate()` on the same model go through the ordinary ODE path, which does
-equilibrate a steady-state dose and does apply a lag time. A model can therefore show a correct
-`IPRED` and a wrong objective at the same time — which is why the warnings are raised by `fit()`
-and `ferx check` rather than at prediction time.
-
-The steady-state gap is the one most likely to be mistaken for a converged answer: on a
-1-cpt model with `CL = 1`, `V = 20`, one `SS=1, II=12` record and an autonomous right-hand
-side, the EKF returns `90.48` where an explicit eleven-dose train returns `200.27`. The
-`TAD` anchor is folded into `[0, II)` for that record as though the train existed, so a
-right-hand side reading `TAD` diverges further still — `45.60` against `36.74` at `t = 150`
-for an `SS=1` infusion whose end lands inside a dosing interval. Expand the steady state
-into explicit dose records, or fit the model without `[diffusion]`.
+apply a lag time. A model can therefore show a correct `IPRED` and a wrong objective at the
+same time — which is why the warnings are raised by `fit()` and `ferx check` rather than at
+prediction time.
 
 `TIME` / `T` is the integration variable itself and has always been readable here. `TAFD`
 and `TAD` are passed in two extra parameter slots, and until #1131 the EKF was handed an
@@ -244,6 +235,38 @@ array two slots short, so both evaluated to `NaN` for the whole trajectory. That
 easy to miss: `IPRED` is computed on the ordinary ODE path and stayed correct, while the
 objective — which is what the filter actually contributes — became the diverged-subject
 sentinel. A right-hand side reading neither builtin was never affected.
+
+### Steady-state records are equilibrated {#sde-steady-state}
+
+An `SS=1` record is equilibrated on the EKF path the way the ODE path's nonlinear run-in
+does it: from an empty state, cycles of *(dose; integrate `II`)* are expanded until the
+filter's **mean and covariance** both stop moving, or the cycle cap is spent — in which
+case the same non-convergence warning the ODE run-in raises is attached to the fit. Both
+halves matter. The covariance at the record is the stationary Riccati value rather than
+zero (on `dA/dt = −k·A` that is `q / 2k` exactly), and on a nonlinear right-hand side the
+Riccati Jacobian is linearised along the *steady-state* mean, whose phase a one-dose mean
+gets wrong.
+
+Measured on the fixture the gap was reported on (Michaelis–Menten elimination, `VMAX = 20`,
+`KM = 50`, `central ~ 5.0`, 100 mg every 12 h for 480 h, four samples after the last
+dose): one `SS=1, II=12` record scored **610.41** where the 41 explicit records scored
+**489.88**, while the ODE path gave the identical objective both ways. The two spellings
+now agree to `1e-9` relative in `IPRED` and in the filter covariance at every sample, and
+so does an `SS=1` infusion against its explicit infusion train on a right-hand side reading
+`TAD`. An `SS=1` infusion longer than `II` (overlapping pulses) is the one steady-state
+shape neither engine equilibrates; `W_STEADY_STATE_INFUSION` names it at check time.
+
+The run-in reads model time the way the ODE run-in does: each cycle is integrated on a
+clock whose origin is its own pulse, so `TAD` is anchored per window, `T` / `TIME` take
+that cycle-local value, and `TAFD` reads `NaN` — there is no periodic steady state for a
+quantity that grows without bound. A right-hand side reading `TAFD`, `T` or `TIME` under an
+`SS=1` record is named by `W_STEADY_STATE_ABSOLUTE_TIME` at check time, with or without a
+`[diffusion]` block.
+
+The run-in is the cost of the train the record abbreviates, paid on every objective
+evaluation: on the fixture above one evaluation takes 569 ms with the `SS=1` record against
+996 ms with the 41 explicit records and 58 ms with the record read as a single dose (debug
+build; the run-in stops after 16–21 cycles).
 
 ## ferx-r usage note
 

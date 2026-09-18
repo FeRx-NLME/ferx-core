@@ -200,6 +200,10 @@ mod threads_override_tests;
 mod dose_compartment_tests;
 
 #[cfg(test)]
+#[path = "tests/reader_warning_suppression_tests.rs"]
+mod reader_warning_suppression_tests;
+
+#[cfg(test)]
 #[path = "tests/scaling_undefined_tests.rs"]
 mod scaling_undefined_tests;
 
@@ -253,6 +257,10 @@ mod extract_se_tests;
 #[cfg(test)]
 #[path = "tests/tests_cov_diagnostics.rs"]
 mod tests_cov_diagnostics;
+
+#[cfg(test)]
+#[path = "tests/covariance_method_label_tests.rs"]
+mod covariance_method_label_tests;
 
 #[cfg(test)]
 #[path = "tests/tests_sir_fallback.rs"]

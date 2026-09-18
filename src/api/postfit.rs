@@ -74,6 +74,7 @@ pub(crate) fn rebuild_warnings_structured(result: &mut FitResult) {
         shrinkage_eps: result.shrinkage_eps,
         cov_condition_number: result.cov_condition_number,
         cov_eigenvalues: result.cov_eigenvalues.as_deref(),
+        covariance_method: result.covariance_method,
         shrinkage_eta: &result.shrinkage_eta,
         eta_names: &result.eta_names,
     };
@@ -103,6 +104,9 @@ pub(crate) struct DiagStats<'a> {
     pub(crate) shrinkage_eps: f64,
     pub(crate) cov_condition_number: Option<f64>,
     pub(crate) cov_eigenvalues: Option<&'a [f64]>,
+    /// Which estimator produced the two above (#1382). `None` when no covariance
+    /// matrix was produced, in which case neither statistic exists either.
+    pub(crate) covariance_method: Option<crate::types::CovarianceMethod>,
     pub(crate) shrinkage_eta: &'a [f64],
     pub(crate) eta_names: &'a [String],
 }
@@ -160,27 +164,58 @@ pub(crate) fn diagnostic_details(
                 }))
             }
         }
+        // #1382: the condition number goes out with the estimator that produced
+        // it. `docs/warnings.qmd` listed this payload as `condition_number` alone,
+        // which is not enough to act on — 1.42e8 under `rsr` and 3.68e5 under `s`
+        // are the same fit, and only one of them is comparable to a NONMEM run.
+        // The key is omitted, not `null`, when there is no matrix to label.
         WarningCode::ConditionNumber => match s.cov_condition_number {
-            Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
+            Some(c) if c.is_finite() => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("condition_number".to_string(), serde_json::json!(c));
+                insert_covariance_method(&mut obj, s.covariance_method);
+                Some(serde_json::Value::Object(obj))
+            }
             _ => None,
         },
-        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => {
-            covariance_details(s.cov_condition_number, s.cov_eigenvalues)
-        }
+        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => covariance_details(
+            s.cov_condition_number,
+            s.cov_eigenvalues,
+            s.covariance_method,
+        ),
         _ => None,
     }
 }
 
-/// `details` for the covariance-step warning codes: the condition number and,
-/// when the covariance matrix was produced (so eigenvalues exist — typically
-/// the regularized case, not a hard failure), the smallest eigenvalue and the
-/// count of negative ones (which diagnose a non-PD Hessian). Non-finite values
-/// are skipped; returns `None` if nothing usable is available.
+/// Add the `covariance_method` token to a `details` object when there is one
+/// (#1382). Absent — not `null` — when no covariance matrix was produced, which
+/// is the `CovarianceFailed` case: naming an estimator for a matrix that does not
+/// exist would invite a reader to compare a number that was never computed.
+fn insert_covariance_method(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    covariance_method: Option<crate::types::CovarianceMethod>,
+) {
+    if let Some(m) = covariance_method {
+        obj.insert(
+            "covariance_method".to_string(),
+            serde_json::json!(m.label()),
+        );
+    }
+}
+
+/// `details` for the covariance-step warning codes: the estimator that produced
+/// the matrix (#1382), the condition number and, when the covariance matrix was
+/// produced (so eigenvalues exist — typically the regularized case, not a hard
+/// failure), the smallest eigenvalue and the count of negative ones (which
+/// diagnose a non-PD Hessian). Non-finite values are skipped; returns `None` if
+/// nothing usable is available.
 fn covariance_details(
     cov_condition_number: Option<f64>,
     cov_eigenvalues: Option<&[f64]>,
+    covariance_method: Option<crate::types::CovarianceMethod>,
 ) -> Option<serde_json::Value> {
     let mut obj = serde_json::Map::new();
+    insert_covariance_method(&mut obj, covariance_method);
     if let Some(c) = cov_condition_number {
         if c.is_finite() {
             obj.insert("condition_number".to_string(), serde_json::json!(c));
@@ -2111,7 +2146,9 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `W_ABSORPTION_TWIN_DECLINED`, which changes what a *prediction* does.
 /// 2. [`Population::warnings`](crate::types::Population::warnings), through the same
 ///    `reader_warning_suppressed` filter `fit()` and `ferx check` use, so all three suppress
-///    exactly the same reader findings (`W_ADDL_MISSING_II`, `W_IOV_OCC_MISSING`).
+///    exactly the same reader findings. `W_CMT_DEFAULTED` is the one that filter
+///    actually withholds — from a model where `CMT` selects nothing (#1009);
+///    `W_ADDL_MISSING_II` and `W_IOV_OCC_MISSING` pass through it unchanged.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
 ///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` bundle.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
