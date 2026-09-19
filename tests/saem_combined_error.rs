@@ -280,6 +280,17 @@ fn sparse_fit(
 /// | SAEM before #1445 | 0.011 / 0.0025 / 0.011 | 0.133 / 0.137 / 0.135 |
 /// | SAEM after #1445 | 1.697 / 1.161 / 1.746 | 0.137 / 0.143 / 0.138 |
 ///
+/// **NONMEM anchor.** `nonmem_anchor/saem_sparse_combined_saem.ctl` runs
+/// NONMEM 7.5.1 `METHOD=SAEM` on this exact dataset — `data/saem_sparse_combined.csv`,
+/// which `committed_nonmem_csv_still_describes_the_fixture` pins to the fixture
+/// built here — and lands at additive SD **1.5425**, proportional SD **0.1370**
+/// (`ISAMPLE=10`; 1.6463 / 0.1491 at NONMEM's `ISAMPLE=2` default, which also
+/// collapses two Ω diagonals on this design). ferx SAEM after the fix is
+/// 1.42 [1.11, 1.75] over 8 seeds; before it, 0.011 / 0.0025 / 0.011. The bounds
+/// below are set from the simulation truth rather than from NONMEM because the
+/// truth is known here and is the tighter statement, but NONMEM sits inside
+/// them (1.5425 ∈ (0.9, 3.6)) and *outside* every mutation's answer.
+///
 /// **Bounds, measured.** Over 8 seeds × 2 schedules (150/250 and 300/700) after
 /// the fix, `ADD_ERR` realises [1.112, 1.776] — worst |Δ| from truth 0.688 — and
 /// `PROP_ERR` realises [0.1338, 0.1446], worst |Δ| 0.0146. The gates below are a
@@ -350,16 +361,20 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
             add.is_finite() && prop.is_finite(),
             "seed {seed}: sigma must be finite, got PROP={prop} ADD={add}"
         );
-        assert!(
-            add > SIGMA_FLOOR * 1000.0,
-            "seed {seed}: ADD={add:.6} is {:.1}× the optimizer floor {SIGMA_FLOOR:.3e} — \
-             the #1445 collapse (reference seeds: 0.011, 0.0025, 0.011)",
-            add / SIGMA_FLOOR
-        );
+        // ONE lower gate, not two. A separate `add > SIGMA_FLOOR * 1000`
+        // (= 0.335) alongside this one would reject nothing the factor-of-two
+        // bound (0.9) does not already reject — the "two redundant gates cover
+        // for each other" hole in CLAUDE.md — so the floor lives in the message
+        // as a distance rather than in a predicate of its own.
         assert!(
             add > SPARSE_TRUE_ADD / 2.0 && add < SPARSE_TRUE_ADD * 2.0,
-            "seed {seed}: ADD={add:.4} must stay within a factor of two of the simulation \
-             truth {SPARSE_TRUE_ADD} (worst realised over 8 seeds × 2 schedules: 1.112)"
+            "seed {seed}: ADD={add:.6} must stay within a factor of two of the simulation \
+             truth {SPARSE_TRUE_ADD}. Distances: {:.0}× the optimizer floor \
+             {SIGMA_FLOOR:.3e} (truth is 5366× it, and the #1445 collapse reached \
+             1.05× it), and |Δ| {:.3} from truth against a worst realised 0.688 over \
+             8 seeds × 2 schedules",
+            add / SIGMA_FLOOR,
+            (add - SPARSE_TRUE_ADD).abs()
         );
         // The proportional half must not absorb the additive term's variance
         // either — a σ_prop that ran away would be the same defect wearing the
@@ -370,4 +385,87 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
              {SPARSE_TRUE_PROP} (worst realised |Δ| over 8 seeds × 2 schedules: 0.0146)"
         );
     }
+}
+
+/// The committed NONMEM anchor scores `data/saem_sparse_combined.csv`; this
+/// test scores a fixture built in-process. Those are two spellings of one
+/// dataset, and nothing else makes them agree — so pin them.
+///
+/// Without this, a change to `sparse_template_population` (the LCG, the
+/// sampling window, the dose train) or to `simulate_with_seed` would leave the
+/// NONMEM numbers quoted in `nonmem_anchor/saem_sparse_combined_saem.ctl`
+/// silently describing a dataset that no longer exists, and the anchor would go
+/// on reading as evidence. The CSV carries six decimals, which is the only
+/// slack allowed here.
+///
+/// Not `slow-tests`-gated: it builds the fixture and reads a file, no fit.
+#[test]
+fn committed_nonmem_csv_still_describes_the_fixture() {
+    let model = parse_model_string(SPARSE_MODEL).expect("sparse combined model parses");
+    let pop = sparse_simulated_population(&model, 300);
+
+    let csv = std::fs::read_to_string("data/saem_sparse_combined.csv")
+        .expect("data/saem_sparse_combined.csv — the NONMEM anchor's dataset");
+    let mut lines = csv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("ID,TIME,AMT,RATE,DV,MDV,EVID,CMT"),
+        "unexpected header"
+    );
+    // (ID, TIME, DV) for every observation row, in file order.
+    let csv_obs: Vec<(String, f64, f64)> = lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .filter(|f| f[5] == "0") // MDV == 0
+        .map(|f| (f[0].clone(), f[1].parse().unwrap(), f[4].parse().unwrap()))
+        .collect();
+
+    let fixture_obs: Vec<(String, f64, f64)> = pop
+        .subjects
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| {
+            s.obs_times
+                .iter()
+                .zip(s.observations.iter())
+                .map(move |(t, y)| ((i + 1).to_string(), *t, *y))
+        })
+        .collect();
+
+    assert_eq!(
+        csv_obs.len(),
+        fixture_obs.len(),
+        "observation count drifted: CSV {} vs fixture {}",
+        csv_obs.len(),
+        fixture_obs.len()
+    );
+    // The anchor's headline numbers are quoted for 300 subjects / 464
+    // observations; if that shape moves, the .ctl header is wrong too.
+    assert_eq!(fixture_obs.len(), 464);
+    assert_eq!(pop.subjects.len(), 300);
+
+    let mut worst_time = 0.0_f64;
+    let mut worst_dv = 0.0_f64;
+    for (i, (csv_row, fix_row)) in csv_obs.iter().zip(fixture_obs.iter()).enumerate() {
+        assert_eq!(csv_row.0, fix_row.0, "row {i}: subject id drifted");
+        assert!(
+            csv_row.1.is_finite() && csv_row.2.is_finite(),
+            "row {i}: CSV carries a non-finite TIME/DV"
+        );
+        assert!(
+            fix_row.1.is_finite() && fix_row.2.is_finite(),
+            "row {i}: fixture carries a non-finite TIME/DV"
+        );
+        worst_time = worst_time.max((csv_row.1 - fix_row.1).abs());
+        worst_dv = worst_dv.max((csv_row.2 - fix_row.2).abs());
+    }
+    // Six decimals in the file; the realised worst rounding error is 5e-7 on
+    // both columns, so 1e-6 is the rounding and nothing else.
+    assert!(
+        worst_time < 1e-6 && worst_dv < 1e-6,
+        "the committed CSV no longer describes the fixture: worst |ΔTIME| {worst_time:.3e}, \
+         worst |ΔDV| {worst_dv:.3e} (six-decimal rounding is 5e-7). Regenerate it, and re-run \
+         nonmem_anchor/saem_sparse_combined_saem.ctl — its quoted results now describe a \
+         different dataset."
+    );
 }

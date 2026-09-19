@@ -94,7 +94,7 @@ $$
 
 **Damped Ω step.** The θ M-step uses the full $\gamma_k$ (1.0 during exploration), but the Ω sufficient statistic uses a *capped* step $\gamma_k^\Omega = \min(\gamma_k, 0.1)$. With the full $\gamma=1$, Ω would be overwritten every exploration iteration by a single warm-started, not-yet-equilibrated MCMC draw; for a correlated block that one snapshot is biased toward the chain's current correlation, and the bias feeds back through $\mathrm{chol}(\Omega)$ into the next proposal — the same rank-1 runaway the componentwise kernel guards against, here attacked from the M-step side. Capping the Ω learning rate during exploration averages those draws (Robbins-Monro) and breaks the feedback while θ still moves at full speed. The cap applies during exploration only; in the convergence phase it is lifted and Ω uses the full decaying $\gamma_k = 1/(k-K_1)$ — the same Robbins-Monro schedule as θ — so the SA estimate settles correctly (by then the chain is equilibrated, so the single-draw overwrite risk no longer applies).
 
-**Damped σ step.** The residual σ that rides the numerical M-step gets its own capped step, $\gamma_k^\sigma = \min(\gamma_k,\,0.2,\,\gamma_k^\theta)$, applied to $\sigma^2$ rather than to $\log\sigma$ (issue #1445). Until then it was the one SAEM statistic with no stochastic approximation at all — assigned outright in both phases — so the reported σ was a single draw of the M-step maximiser rather than its average. The cap is on in **both** phases, which is what distinguishes it from the Ω step: Ω accepts the $\gamma=1$ assignment at the first convergence iteration because $(1/N)\sum_i \eta_i\eta_i^T$ over $N$ subjects is a well-determined statistic, while the σ maximiser of a *minority* variance component is not. The additive half of a `combined(PROP, ADD)` model on sparse data is exactly that: its single-draw conditional maximiser is boundary-heavy, so an assigned σ reports whichever value the last iteration happened to draw. Beyond $k-K_1 = 5$ the cap no longer binds and the full decaying $\gamma_k = 1/(k-K_1)$ takes over, which is what lets the SA estimate settle. Averaging on the variance scale is deliberate — it is the scale the [scalar residual sufficient statistic](#scalar-residual-error-update) already averages on, and a geometric mean of a sequence with mass near zero collapses where the arithmetic mean of $\sigma^2$ does not (measured: $\log\sigma$ averaging leaves the #1445 fixture's $\sigma_{\text{add}}$ at 0.47 against a truth of 1.8, where the $\sigma^2$ average reaches 1.4). The third term keeps σ from ever stepping faster than θ, so a fit that sets `mstep_damping` (see [The exploration cap](#what-saem-does-about-it-now)) keeps the two locked together as before.
+**Damped σ step.** The residual σ that rides the numerical M-step gets its own capped step, $\gamma_k^\sigma = \min(\gamma_k,\,0.2,\,\gamma_k^\theta)$, applied to $\sigma^2$ rather than to $\log\sigma$ (issue #1445). Until then it was the one SAEM statistic with no stochastic approximation at all — assigned outright in both phases — so the reported σ was a single draw of the M-step maximiser rather than its average. The cap is on in **both** phases, which is what distinguishes it from the Ω step: Ω accepts the $\gamma=1$ assignment at the first convergence iteration because $(1/N)\sum_i \eta_i\eta_i^T$ over $N$ subjects is a well-determined statistic, while the σ maximiser of a *minority* variance component is not. The additive half of a `combined(PROP, ADD)` model on sparse data is exactly that: its single-draw conditional maximiser is boundary-heavy, so an assigned σ reports whichever value the last iteration happened to draw. Beyond $k-K_1 = 5$ the cap no longer binds and the full decaying $\gamma_k = 1/(k-K_1)$ takes over, which is what lets the SA estimate settle. Averaging on the variance scale is deliberate — it is the scale the [scalar residual sufficient statistic](#scalar-residual-error-update) already averages on, and a geometric mean of a sequence with mass near zero collapses where the arithmetic mean of $\sigma^2$ does not (measured: $\log\sigma$ averaging leaves the #1445 fixture's $\sigma_{\text{add}}$ at 0.47 against a truth of 1.8, where the $\sigma^2$ average reaches 1.4). The third term is one-sided: σ never steps *faster* than θ, but the two are not always equal. They are equal during **exploration** whenever `mstep_damping` is at or below 0.2 (the `iiv_on_ruv` default of 0.03 is), and from the fifth convergence iteration on, where $1/(k-K_1) \le 0.2$. They differ over the four hand-off iterations $k-K_1 \in \{1,2,3,4\}$ — θ takes 1, ½, ⅓, ¼ while σ takes 0.2 — and during exploration for any `mstep_damping` above 0.2, where σ is the slower of the two. So no configuration, `iiv_on_ruv` included, is bit-identical to before; what is preserved is that σ is never given a larger step than the θ it shares a maximiser with.
 
 ### 3. M-Step for Omega (Closed Form)
 
@@ -650,8 +650,8 @@ For a `block_omega` (correlated) random-effects block, a faulty E-step/M-step co
 ### The additive term of a `combined()` error model
 
 Before ferx #1445 the additive component of `combined(PROP, ADD)` could be
-driven onto its optimizer lower bound on sparse data where FOCEI and NONMEM both
-estimate a clearly non-zero value, and it got *worse* with more iterations. The
+driven onto its optimizer lower bound on sparse data where NONMEM's own SAEM
+estimates a clearly non-zero value, and it got *worse* with more iterations. The
 cause was the σ half of the numerical M-step being assigned outright rather than
 averaged: the additive term of a combined model is often a **minority** variance
 component, identified only where $\sigma_{\text{add}}$ and
@@ -659,6 +659,40 @@ $\sigma_{\text{prop}}\cdot f$ are comparable, and the conditional maximiser of a
 weakly identified variance component from a single η draw sits near zero a large
 fraction of the time. The [damped σ step](#stochastic-approximation-update) makes
 the estimate the average of that sequence rather than its last draw.
+
+Anchored against NONMEM 7.5.1 `METHOD=SAEM` on the same 300-subject,
+median-one-observation dataset (`nonmem_anchor/saem_sparse_combined_saem.ctl`
+and `data/saem_sparse_combined.csv`, which is the fixture
+`tests/saem_combined_error.rs` scores; results in
+`nonmem_anchor/results/saem_sparse_combined_saem.ext`, read from the `.ext`
+because a SAEM+IMP chain truncates its `.lst`):
+
+| | additive SD (truth 1.8) | proportional SD (truth 0.13) |
+|---|---|---|
+| NONMEM SAEM, `ISAMPLE=10` | 1.5425 | 0.1370 |
+| NONMEM SAEM, `ISAMPLE=2` (its default) | 1.6463 | 0.1491 |
+| ferx SAEM **after** #1445, 8 seeds | 1.42 [1.11, 1.75] | 0.139 |
+| ferx SAEM **before** #1445, 3 seeds | 0.011 / 0.0025 / 0.011 | 0.135 |
+| ferx FOCEI | 3.220 | 0.1200 |
+
+ferx SAEM now agrees with NONMEM SAEM on the additive term to 8% of the
+simulation truth and on the proportional term to 1.5%, where before it sat four
+orders of magnitude below it. (NONMEM's `ISAMPLE=2` default collapses the two
+weakly identified Ω diagonals on this design — 8.8e-4 and 0.032 against truths
+0.15 and 0.69 — which is why the `ISAMPLE=10` arm is the headline; the σ
+estimate moves only from 1.65 to 1.54 between them.) On a real dataset,
+`ferx-testdata/cefepime_jordan` run64, NONMEM FOCEI estimates the additive RUV
+at 1.550 (`nm/run64.ext`, THETA(6)); ferx SAEM reports 1.16 [0.97, 1.34] after
+the change and ~1e-3 before it.
+
+Note what the objective does **not** say here: on the simulated fixture the
+importance-sampled −2 log L is 3183.1 after against 3183.4 before, a 0.2
+difference that is pure noise. That is not a defect in the comparison, it is the
+whole problem restated — a minority variance component is weakly identified, the
+likelihood is nearly flat in it, and an estimator that reports a single draw of
+a flat direction will wander to the boundary while barely moving the objective.
+Rank the two by the parameter against a known truth and an external engine, not
+by the likelihood they are nearly tied on.
 
 The price is that σ now *lags*: it is a Robbins-Monro average over the
 convergence phase, so a run that is too short reports a σ still on its way down

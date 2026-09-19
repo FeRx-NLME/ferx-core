@@ -408,10 +408,21 @@ fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64,
 /// SA step for the **σ half** of the same numerical M-step result (#1445).
 ///
 /// `min(γ_k, SIGMA_SA_MAX_STEP, γ_mstep)` — see [`SIGMA_SA_MAX_STEP`] for why the
-/// cap applies in both phases. The third term keeps the σ side from ever taking
-/// a *larger* step than the θ side: with `mstep_damping` set (the `iiv_on_ruv`
-/// default, and the #1011 shape) the two stay locked together as before, so that
-/// configuration is unchanged except for the first five convergence iterations.
+/// cap applies in both phases. The third term is a one-sided guarantee: σ never
+/// steps *faster* than θ. It does not make the two equal, and where they differ
+/// is worth being precise about, because `mstep_damping` is the one knob a user
+/// can point at this:
+///
+/// * `mstep_damping ≤ 0.2` (the `iiv_on_ruv` default of 0.03 is here):
+///   **exploration** has `γ_σ = γ_θ = cap`, unchanged from before #1445.
+/// * `mstep_damping > 0.2` (up to and including the "off" sentinel `1.0`):
+///   exploration has `γ_θ = cap` but `γ_σ = 0.2`, so σ is the slower of the two.
+/// * **Convergence**, either way: `γ_θ = 1/(k−k1)` uncapped, `γ_σ` capped at
+///   0.2, so they differ for `k − k1 ∈ {1, 2, 3, 4}` (θ takes 1, ½, ⅓, ¼ while
+///   σ takes 0.2) and are equal from `k − k1 = 5` on, where `1/(k−k1) ≤ 0.2`.
+///
+/// So even the `iiv_on_ruv` shape is not bit-identical: it changes over exactly
+/// those four hand-off iterations.
 ///
 /// **On [`mstep_sa_step`]'s "one γ for both components" argument.** That doc is
 /// right that `theta_sigma_mstep_light` returns a *joint* maximiser, and that
@@ -3085,10 +3096,10 @@ pub fn run_saem(
         // the convergence phase. Left at 1.0 (undamped, pre-#1011) when NLopt has
         // no θ to estimate, so those fits are unchanged.
         //
-        // Named for the M-step, not for θ: it blends the *joint* `[θ; σ]`
-        // maximiser `theta_sigma_mstep_light` returns, so both components take
-        // this same γ. See `mstep_sa_step` for why splitting them would be an
-        // inconsistent partial step.
+        // Named for the M-step, but since #1445 it blends only the θ half of
+        // the joint `[θ; σ]` maximiser `theta_sigma_mstep_light` returns; σ has
+        // its own γ below, which is never larger than this one. See
+        // `mstep_sa_step` and `sigma_mstep_sa_step`.
         let gamma_mstep = mstep_sa_step(
             numerically_estimated_theta,
             k <= k1,
@@ -4883,12 +4894,12 @@ mod tests {
         assert_eq!(mstep_sa_step(true, false, 0.004, MSTEP_SA_MAX_STEP), 1.0);
     }
 
-    /// The σ schedule (#1445): `min(γ, 0.1, γ_mstep)`, capped in **both**
+    /// The σ schedule (#1445): `min(γ, 0.2, γ_mstep)`, capped in **both**
     /// phases. The two properties that matter are the ones the collapse turned
     /// on — exploration must not assign, and the first convergence iteration
     /// (where `γ = 1/(k−k1) = 1`) must not assign either — plus the decay
-    /// surviving intact past `k − k1 = 10`, without which the SA estimate never
-    /// settles.
+    /// surviving intact once `1/(k−k1) ≤ 0.2` (`k − k1 ≥ 5`), without which the
+    /// SA estimate never settles.
     ///
     /// Regression this exists to catch: dropping either cap puts σ back on a
     /// single draw of the M-step maximiser, which is #1445. Mutation check —
@@ -4994,9 +5005,10 @@ mod tests {
     /// "simplification" — which is a geometric mean of the maximiser sequence.
     /// The last assertion is the discriminator: on a two-point sequence with the
     /// boundary-heavy shape a minority variance component actually produces, the
-    /// two spellings differ by a factor of ~3, and log space is the collapsed
-    /// one. A test that only checked the γ ≥ 1 and pinned cases would pass under
-    /// either spelling.
+    /// two spellings differ by a **measured 10.000125×**, and log space is the
+    /// collapsed one. A test that only checked the γ ≥ 1 and pinned cases would
+    /// pass under either spelling. Every bound below is a closed form plus a
+    /// floating-point tolerance, not a fitted number.
     #[test]
     fn damp_mstep_sigma_variance_blends_on_the_variance_scale() {
         // γ ≥ 1 assigns, bit-for-bit — the undamped path stays reproducible.
@@ -5019,19 +5031,27 @@ mod tests {
             }
         }
 
-        // The blend itself: σ² += γ·(σ_new² − σ²).
+        // The blend itself: σ² += γ·(σ_new² − σ²). A closed form, so the bound
+        // is a floating-point tolerance and nothing else:
+        // σ = √(0.75·2² + 0.25·4²) = √7 = 2.6457513110645906.
         let mut cur = [(2.0_f64).ln()];
         damp_mstep_sigma_variance(&mut cur, &[(4.0_f64).ln()], 0.25);
-        let want = (0.75 * 4.0 + 0.25 * 16.0_f64).sqrt(); // = 2.6457…
+        let want = 7.0_f64.sqrt();
         assert!(
             (cur[0].exp() - want).abs() < 1e-12,
             "variance blend: got {}, want {want}",
             cur[0].exp()
         );
-        // ...which is NOT the packed-scale blend, whose answer here is
-        // exp(0.75·ln2 + 0.25·ln4) = 2.3784.
+        // ...which is NOT the packed-scale blend, whose closed form here is
+        // exp(0.75·ln2 + 0.25·ln4) = 2.3784142300054421. The gap is a measured
+        // 0.267337, so the 1e-12 tolerance above is ~11 orders below the
+        // difference it has to resolve and cannot pass on the wrong formula.
         let log_space = (0.75 * (2.0_f64).ln() + 0.25 * (4.0_f64).ln()).exp();
-        assert!((cur[0].exp() - log_space).abs() > 0.25);
+        let gap = cur[0].exp() - log_space;
+        assert!(
+            (gap - 0.267_337).abs() < 1e-5,
+            "the two spellings must differ by the measured 0.267337, got {gap}"
+        );
 
         // A non-finite maximiser leaves that coordinate alone rather than
         // poisoning the running average with NaN.
@@ -5045,6 +5065,12 @@ mod tests {
         // something usable on the variance scale and collapses in log space.
         // The numbers are the shape measured on the #1445 repro (floor-adjacent
         // draws of 0.01 against healthy draws of 2.0).
+        //
+        // Both limits are closed forms at γ_i = 1/i. The log-space one is the
+        // plain geometric mean √(0.01·2) = √0.02 = 0.1414213562373095; the
+        // variance-scale one is 1.4142312399321406 — close to √2 but not equal
+        // to it, because the last step's γ = 1/8 leaves the 0.01 draw a residue.
+        // Realised separation: **10.000125×**.
         let seq = [0.01_f64, 2.0, 0.01, 2.0, 0.01, 2.0, 0.01, 2.0];
         let mut var_scale = [(1.0_f64).ln()];
         let mut log_scale = [(1.0_f64).ln()];
@@ -5053,17 +5079,23 @@ mod tests {
             damp_mstep_sigma_variance(&mut var_scale, &[s.ln()], g);
             damp_mstep(&mut log_scale, &[s.ln()], g);
         }
+        let want_var = 1.414_231_239_932_140_6_f64;
+        let want_log = 0.02_f64.sqrt(); // the geometric mean of 0.01 and 2
         assert!(
-            var_scale[0].exp() > 1.0,
-            "variance-scale average collapsed: {}",
+            (var_scale[0].exp() - want_var).abs() < 1e-12,
+            "variance-scale average: got {}, want {want_var}",
             var_scale[0].exp()
         );
         assert!(
-            log_scale[0].exp() < 0.5,
-            "log-scale average was expected to collapse: {}",
+            (log_scale[0].exp() - want_log).abs() < 1e-12,
+            "log-scale average: got {}, want {want_log}",
             log_scale[0].exp()
         );
-        assert!(var_scale[0].exp() / log_scale[0].exp() > 3.0);
+        let ratio = var_scale[0].exp() / log_scale[0].exp();
+        assert!(
+            (ratio - 10.000_125).abs() < 1e-5,
+            "the measured separation is 10.000125×, got {ratio}"
+        );
     }
 
     /// The default cap is keyed to the one shape it was measured to help
