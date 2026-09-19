@@ -859,6 +859,39 @@ mod tests {
     }
 
     #[test]
+    fn test_suggest_start_iv_model_uses_the_iv_nca_route() {
+        // The oral and IV routes are two different `par_iter` arms of `run_nca`, and every
+        // other test here is oral (warfarin), so without this one the IV arm is never
+        // entered — a change to it, or to the pool the pass runs on (#1460), would be
+        // invisible.
+        let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).unwrap();
+        assert!(
+            matches!(
+                model.pk_model,
+                PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv
+            ),
+            "fixture must take the IV arm, got {:?}",
+            model.pk_model
+        );
+        let population = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).unwrap();
+        let result = inits_from_nca(&model, &population, NcaInit::Nca);
+        for (i, &theta) in result.params.theta.iter().enumerate() {
+            let lo = result.params.theta_lower[i];
+            let hi = result.params.theta_upper[i];
+            assert!(
+                theta.is_finite() && theta >= lo && theta <= hi,
+                "theta[{i}] = {theta} outside bounds [{lo}, {hi}]"
+            );
+        }
+        // An IV dataset has concentrations and doses, so NCA has something to work with:
+        // the suggestion must actually move off the model's defaults.
+        assert_ne!(
+            result.params.theta, model.default_params.theta,
+            "NCA returned the model defaults on a dataset it can analyse"
+        );
+    }
+
+    #[test]
     fn test_suggest_start_respects_bounds() {
         let model = parse_model_file(Path::new("examples/warfarin.ferx")).unwrap();
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();

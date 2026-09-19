@@ -41,4 +41,23 @@ fn a_declared_thread_count_reaches_parallel_work_outside_a_fit() {
         "Rayon's global pool already existed: something ran ambient parallel work, at \
          one worker per logical CPU rather than the declared 2"
     );
+
+    // Once-per-process, as the `build_global` this replaced was. Asserted here rather
+    // than in a `--lib` test because the width is a process-global: a unit test that
+    // wrote it would change the pool every other test in that binary sees. Re-declaring
+    // the count in force is accepted (nothing changes) …
+    ferx_core::configure_global_thread_pool(2).expect("re-declaring the same count");
+    // … and a different one is refused, naming both. Without that, `configure 2 → fit →
+    // configure 4` reports success while the pool stays 2 and `PoolPlan::from_budget(0, …)`
+    // reads 4 — the disagreement #1115 exists to prevent.
+    let err = ferx_core::configure_global_thread_pool(4)
+        .expect_err("a differing count must not be accepted after the first");
+    assert!(
+        err.contains('2') && err.contains('4'),
+        "the refusal must name the count in force and the one asked for: {err}"
+    );
+    assert!(
+        ferx_core::configure_global_thread_pool(0).is_err(),
+        "0 is not a width"
+    );
 }
