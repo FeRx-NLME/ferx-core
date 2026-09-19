@@ -15,13 +15,14 @@
 //! body and a single fixture could otherwise carry all three. Every fixture below
 //! therefore asserts that its own channel is the *only* live one before asserting
 //! anything about the warning.
-use crate::api::check_model_data_warnings;
 use crate::api::validation::CmtConsumer;
+use crate::api::{check_model_data_warnings, predict_diag, simulate_with_options_diag};
 use crate::diagnostics::Diagnostic;
 use crate::io::datareader::SelectionFilter;
 use crate::parser::model_parser::parse_full_model;
 use crate::read_nonmem_csv;
 use crate::types::{CompiledModel, FitOptions, Population, WarningCode};
+use crate::SimulateOptions;
 use std::io::Write;
 
 const CODE: &str = "W_PER_CMT_UNMATCHED";
@@ -36,6 +37,36 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 2,0,.,1,100,1,1
 2,1,7.5,0,.,1,0
 2,4,4.8,0,.,1,0
+";
+
+/// Observations on compartment **2** only — the mirror of `OBS_CMT1_ONLY`, and the
+/// set on which the "your CMT column is missing" advice is false: the column is
+/// present, correct, and being read.
+const OBS_CMT2_ONLY: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,0.9,0,.,2,0
+1,4,0.6,0,.,2,0
+2,0,.,1,100,1,1
+2,1,0.8,0,.,2,0
+2,4,0.5,0,.,2,0
+";
+
+/// Observations on compartments 1 and **3**, with nothing on 2. The dataset that
+/// separates "the filter removed the rows that would have matched" from "the filter
+/// removed rows that could not have matched anything declared".
+const OBS_CMT1_AND_3: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,8.0,0,.,1,0
+1,4,5.0,0,.,1,0
+1,1,0.9,0,.,3,0
+1,4,0.6,0,.,3,0
+2,0,.,1,100,1,1
+2,1,7.5,0,.,1,0
+2,4,4.8,0,.,1,0
+2,1,0.8,0,.,3,0
+2,4,0.5,0,.,3,0
 ";
 
 /// Dose records only — subjects present, not one scored observation between them.
@@ -117,15 +148,22 @@ fn unmatched_messages(model: &CompiledModel, pop: &Population) -> Vec<String> {
 /// the shared walk would leave both tests green — exactly the twin whose second leg
 /// is never exercised.
 fn assert_only_live_channel(model: &CompiledModel, want: CmtConsumer) {
+    assert_live_channels(model, &[want]);
+}
+
+/// The same guard for a fixture that is *deliberately* multi-channel: the exact live
+/// set, not "at least these", so a fixture that quietly gains a third channel is a red
+/// test rather than a silently broader assertion.
+fn assert_live_channels(model: &CompiledModel, want: &[CmtConsumer]) {
     let opts = FitOptions::default();
     let live: Vec<CmtConsumer> = CmtConsumer::iter()
         .filter(|c| c.is_live(model, &opts))
         .collect();
     assert_eq!(
         live,
-        vec![want],
-        "fixture must make {want:?} the only live CMT consumer, else one fixture \
-         carries several channels of the shared walk"
+        want.to_vec(),
+        "fixture must make exactly {want:?} live, else one fixture carries channels of \
+         the shared walk it does not mean to"
     );
 }
 
@@ -250,6 +288,49 @@ fn per_cmt_analytic_readout_model(declared: &str) -> CompiledModel {
   DV ~ proportional(PROP)
 "
     ))
+}
+
+/// Per-CMT scaling **and** a per-CMT `[error_model]` on one model — what a real
+/// multi-analyte model looks like, and the shape `assert_only_live_channel` forbids
+/// on every fixture above.
+///
+/// The single-channel fixtures pin that a walk which loses a channel reddens the test
+/// for the channel it lost; this one pins the other half — that one model producing two
+/// dead entries produces **two** findings, each carrying its own syntax and its own
+/// `[block]`, rather than one merged report or the first channel only.
+///
+/// `[odes]` and not an analytical `pk` block, because the parser rejects the pairing
+/// outright on one: "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based
+/// [structural_model]". The readout stays the plain `obs_cmt` one so the third channel
+/// is inert and the live set is exactly two.
+fn two_live_per_cmt_channels_model() -> CompiledModel {
+    model_of(
+        "[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+  sigma ADD ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  obs_scale[CMT=1] = 1
+  obs_scale[CMT=2] = 1000
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP)
+  CMT=2: DV ~ additive(ADD)
+",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -582,12 +663,17 @@ fn the_warning_classifies_by_its_own_token() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn declared_cmts_is_some_exactly_when_the_channel_is_live() {
+fn declared_cmts_is_some_only_when_the_channel_is_live() {
     // The coupling that replaces an `is_live` call inside the walk:
     // `check_model_data_warnings` has no `&FitOptions` to pass, so the check gates on
-    // `declared_cmts` alone. That is only safe while the two agree — a channel that
-    // declares compartments while inert would warn about a map nothing reads, and a
-    // live channel with no declared set would never be checked.
+    // `declared_cmts` alone. The direction that matters for safety is the one asserted
+    // here — `Some ⟹ is_live`, so the walk never warns about a map nothing reads.
+    //
+    // **Not** the converse, which is false by construction and deliberately so:
+    // `PerCmtScaling` and `PerCmtReadout` are live on any `PerCmt` value, while their
+    // `declared_cmts` arms carry a non-empty guard, so an empty map is live with no
+    // declared set. That costs nothing — an empty map has an empty difference and
+    // could never produce a finding anyway.
     //
     // Asserted over every fixture below rather than once, so a mutation that makes a
     // non-per-CMT arm return `Some` (the "is_live forced true" probe) fails here
@@ -622,7 +708,7 @@ fn declared_cmts_is_some_exactly_when_the_channel_is_live() {
     let mut any_some = false;
     for m in &fixtures {
         for c in CmtConsumer::iter() {
-            if let Some((syntax, declared)) = c.declared_cmts(m) {
+            if let Some((syntax, block, declared)) = c.declared_cmts(m) {
                 any_some = true;
                 assert!(
                     c.is_live(m, &opts),
@@ -631,6 +717,13 @@ fn declared_cmts_is_some_exactly_when_the_channel_is_live() {
                 assert!(
                     !declared.is_empty(),
                     "{c:?} must not report an empty declared set as Some"
+                );
+                // The block travels with the syntax (#1456 review r1, finding 4), so
+                // a new channel cannot inherit `"scaling"` from a `_` arm in the
+                // caller. Pinned as the containing block of the syntax it ships with.
+                assert!(
+                    syntax.starts_with(&format!("[{block}]")),
+                    "{c:?} reports block `{block}` for syntax `{syntax}`"
                 );
             }
         }
@@ -644,9 +737,11 @@ fn declared_cmts_is_some_exactly_when_the_channel_is_live() {
 #[test]
 fn every_channel_without_a_declared_map_says_why() {
     // The three channels with no declared-side map are not oversights, and a
-    // reviewer should not have to infer that. Pinned as a list so a new
-    // `cmt_consumers!` entry that lands in the `None` half is a deliberate choice
-    // someone made here, next to the arm.
+    // reviewer should not have to infer that. What enforces that a *new* channel is
+    // considered at all is the exhaustive `match` in `declared_cmts`, not this list —
+    // a new variant landing in the `None` half does not redden anything here. What
+    // this does pin is that these three stay `None`: flipping one to `Some` without
+    // a fixture and a message is a red test.
     let opts = FitOptions::default();
     let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
     for c in [
@@ -667,4 +762,301 @@ fn every_channel_without_a_declared_map_says_why() {
     // Non-degeneracy: the model above really does make one of the *other* channels
     // live, so this test is not passing because nothing is configured.
     assert!(CmtConsumer::PerCmtScaling.is_live(&m, &opts));
+}
+
+// ---------------------------------------------------------------------------
+// The advice half — gated on the observed set (#1456 review r1, finding 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_missing_column_advice_is_offered_only_when_the_data_reads_column_less() {
+    // Review r1's first measured finding: the message ended "The usual cause is on the
+    // data side: a missing or mis-mapped CMT column keys every observation to
+    // compartment 1. Check the CMT column" on a dataset whose CMT column was present,
+    // correct and read — the PR body's own *after* block was that case. `{1}` is what
+    // the reader defaults a column-less dataset to (#1009), so it is the one observed
+    // set for which the sentence is a live hypothesis.
+    //
+    // The straddle, asserted here and not split across two tests so it cannot quietly
+    // become a tautology: the same model and the same declared entries against two
+    // datasets that differ in the observed compartment and nothing else. One is on each
+    // side of the gate, and the assertion on each side is the *negation* of the other's
+    // — deleting the gate (either branch always taken) reddens one of the two halves.
+    const COLUMN_ADVICE: &str = "missing or mis-mapped CMT column";
+    let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
+    assert_only_live_channel(&m, CmtConsumer::PerCmtScaling);
+
+    // Observed {1} — reads exactly like a dataset with no CMT column.
+    let on = unmatched_messages(&m, &population(OBS_CMT1_ONLY));
+    assert_eq!(on.len(), 1, "expected one finding, got {on:?}");
+    assert!(
+        on[0].contains("(observed: 1)"),
+        "this side of the pair must observe {{1}}: {}",
+        on[0]
+    );
+    assert!(
+        on[0].contains(COLUMN_ADVICE),
+        "observed {{1}} is the case the column advice is true of: {}",
+        on[0]
+    );
+
+    // Observed {2} — same block, same declared set, a column that is being read.
+    let off = unmatched_messages(&m, &population(OBS_CMT2_ONLY));
+    assert_eq!(off.len(), 1, "expected one finding, got {off:?}");
+    assert!(
+        off[0].contains("declares compartment(s) 1 ") && off[0].contains("(observed: 2)"),
+        "this side of the pair must observe {{2}} and leave entry 1 unmatched: {}",
+        off[0]
+    );
+    assert!(
+        !off[0].contains(COLUMN_ADVICE),
+        "the column advice is false here — the column is present and correct: {}",
+        off[0]
+    );
+    // And the message is still actionable rather than merely shorter: dropping the
+    // whole advice half (the mutation that killed 0 of 15 tests in review r1) leaves
+    // no instruction at all, and this is what fails then.
+    assert!(
+        off[0].contains("delete them") && off[0].contains("CMT column is being read"),
+        "the other branch must still say what to do: {}",
+        off[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blaming `[data_selection]` — only for compartments it actually emptied
+// (#1456 review r1, finding 3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_filter_is_blamed_only_for_the_compartments_it_emptied() {
+    // Review r1's third measured finding: the note gated on `n_obs_excluded > 0`, so
+    // `ignore = CMT == 3` against a dataset observing {1, 3} named `[data_selection]`
+    // as a possible cause of a dead `[CMT=2]` entry — a block that cannot be the
+    // reason, since entry 2 had nothing to match before the filter ran either. The fix
+    // is on the data side: `ExclusionSummary::obs_cmts_excluded` records *which*
+    // compartments went, so the note can intersect.
+    //
+    // One clause, one dataset, one variable: the declared set. Entry 2 is unmatched for
+    // a reason the filter had nothing to do with; entry 3 is unmatched exactly because
+    // of it. Both halves land in the *same* message below, which is what makes this a
+    // straddle rather than two unrelated assertions — the note must name 3 and must not
+    // name 2, in one string.
+    let m = per_cmt_scaling_model(
+        "  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500",
+    );
+    // Non-degeneracy: unfiltered, only entry 2 is dead and no filter is mentioned.
+    let unfiltered = unmatched_messages(&m, &population(OBS_CMT1_AND_3));
+    assert_eq!(
+        unfiltered.len(),
+        1,
+        "expected one finding, got {unfiltered:?}"
+    );
+    assert!(
+        unfiltered[0].contains("declares compartment(s) 2 ")
+            && !unfiltered[0].contains("data_selection"),
+        "before the filter, entry 2 is dead and nothing is blamed for it: {}",
+        unfiltered[0]
+    );
+
+    let pop = filtered_population(&m, OBS_CMT1_AND_3, "CMT == 3");
+    let excl = pop
+        .exclusions
+        .as_ref()
+        .expect("a filtered read records its exclusions");
+    assert_eq!(
+        excl.obs_cmts_excluded,
+        vec![3],
+        "the clause must remove compartment 3's observations and only those: {excl:?}"
+    );
+
+    let msgs = unmatched_messages(&m, &pop);
+    assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
+    let msg = &msgs[0];
+    assert!(
+        msg.contains("declares compartment(s) 2, 3 "),
+        "both entries are now unmatched: {msg}"
+    );
+    assert!(
+        msg.contains("removed every scored observation on compartment(s) 3 "),
+        "the filter must be named for compartment 3, which it emptied: {msg}"
+    );
+    // The finding itself. A note reading "compartment(s) 2, 3" — the whole unmatched
+    // list rather than the intersection — is the defect review r1 measured.
+    assert!(
+        !msg.contains("compartment(s) 2, 3 from this read"),
+        "the filter must NOT be blamed for entry 2, which it never touched: {msg}"
+    );
+}
+
+#[test]
+fn a_filter_that_emptied_no_declared_compartment_is_not_blamed_at_all() {
+    // The same clause and the same dataset as above with one entry removed from the
+    // block, which is review r1's case verbatim: declared {1, 2}, observed {1, 3},
+    // `ignore = CMT == 3` — the filter removed real observation rows, so the old
+    // `n_obs_excluded > 0` gate fired, and not one of them could have matched anything
+    // declared.
+    //
+    // This is also the mutation control the test above cannot be: with entry 3 gone
+    // from the block, blaming `filtered_cmts` *without* intersecting it with `unmatched`
+    // names compartment 3 — a compartment the model never declares — and the assertion
+    // below is what sees it.
+    let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
+    let pop = filtered_population(&m, OBS_CMT1_AND_3, "CMT == 3");
+    let excl = pop
+        .exclusions
+        .as_ref()
+        .expect("a filtered read records its exclusions");
+    assert!(
+        excl.n_obs_excluded > 0 && excl.obs_cmts_excluded == vec![3],
+        "the clause must really have removed observation rows, all on compartment 3, \
+         or this is the no-op-filter test again: {excl:?}"
+    );
+
+    let msgs = unmatched_messages(&m, &pop);
+    assert_eq!(msgs.len(), 1, "the entry is still dead, got {msgs:?}");
+    assert!(
+        msgs[0].contains("declares compartment(s) 2 "),
+        "entry 2 is the dead one: {}",
+        msgs[0]
+    );
+    assert!(
+        !msgs[0].contains("data_selection"),
+        "a filter that emptied no declared compartment must not be offered as the \
+         cause: {}",
+        msgs[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two live channels on one model (#1456 review r1, finding 5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_model_with_two_live_per_cmt_channels_reports_both() {
+    // Every fixture above is single-channel by construction, which is what makes a
+    // lost channel visible — but it left the real multi-analyte model unfixtured: a
+    // per-CMT `[scaling]` block and a per-CMT `[error_model]` on the same model, both
+    // declaring an endpoint the dataset does not carry.
+    //
+    // The property is that the shared walk reports the channels *independently*: two
+    // findings, each with its own syntax and its own `[block]`, not one merged report
+    // and not the first channel only. A `break` in the loop, or a `diags.push` moved
+    // outside it, passes every single-channel test above.
+    let m = two_live_per_cmt_channels_model();
+    assert_live_channels(
+        &m,
+        &[CmtConsumer::PerCmtScaling, CmtConsumer::PerCmtErrorModel],
+    );
+
+    let diags: Vec<_> = warnings_of(&m, &population(OBS_CMT1_ONLY))
+        .into_iter()
+        .filter(|d| d.code == CODE)
+        .collect();
+    assert_eq!(
+        diags.len(),
+        2,
+        "one finding per live channel, got {diags:?}"
+    );
+
+    let scaling = diags
+        .iter()
+        .find(|d| d.message.contains("obs_scale[CMT=N]"))
+        .unwrap_or_else(|| panic!("no scaling finding in {diags:?}"));
+    let errmodel = diags
+        .iter()
+        .find(|d| d.message.contains("[error_model] CMT=N:"))
+        .unwrap_or_else(|| panic!("no error-model finding in {diags:?}"));
+    // The `[block]` each finding is filed under, which `ferx check` prints as its
+    // location. Before review r1 this came from a `_` wildcard over `CmtConsumer` in
+    // the caller; it now travels with the syntax, and this is the only test that sees
+    // both values at once.
+    assert_eq!(scaling.block.as_deref(), Some("scaling"));
+    assert_eq!(errmodel.block.as_deref(), Some("error_model"));
+    for d in &diags {
+        assert!(
+            d.message.contains("declares compartment(s) 2 ") && d.message.contains("(observed: 1)"),
+            "each finding names its own dead entry: {}",
+            d.message
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The other entry points (#1456 review r1, finding 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn predict_and_simulate_report_it_too() {
+    // Decided rather than inherited. `check_model_data_warnings` is item 3 of
+    // `postfit::non_fit_diagnostics`, so this warning reaches `predict()` and
+    // `simulate()` as well as `fit()` — that was true when the check landed and
+    // untested, which is the finding.
+    //
+    // It is kept, for the reason that function's own doc gives: the bundle carries
+    // findings about *the model and the data*, and this is one — the declared map and
+    // the observed compartments are both properties of what the caller handed in, with
+    // no fit and no optimizer in the statement. Dropping a code there because it reads
+    // oddly outside a fit is the per-entry-point filtering #1280 was filed about. It is
+    // also true on those paths in the strict sense: `predict()` dispatches through the
+    // same per-CMT map, so an entry no row matches is exactly as inert there.
+    //
+    // What made it read wrong outside a fit was the advice half, and that is finding 1:
+    // the gated message states the fact and, on a population that is legitimately
+    // partial, no longer tells the caller their CMT column is broken.
+    let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
+    let pop = population(OBS_CMT1_ONLY);
+
+    let predicted = predict_diag(&m, &pop, &m.default_params);
+    assert!(
+        predicted.warnings.iter().any(|w| w.contains(CODE)),
+        "predict() must carry the finding: {:?}",
+        predicted.warnings
+    );
+
+    let simulated = simulate_with_options_diag(
+        &m,
+        &pop,
+        &m.default_params,
+        1,
+        &SimulateOptions {
+            seed: Some(7),
+            ..Default::default()
+        },
+    )
+    .expect("simulate");
+    assert!(
+        simulated.warnings.iter().any(|w| w.contains(CODE)),
+        "simulate() must carry the finding: {:?}",
+        simulated.warnings
+    );
+
+    // The control both halves need: a model whose entries are all matched must be
+    // silent on these paths too, or the assertions above are satisfied by a path that
+    // reports the bundle unconditionally.
+    let matched = population(OBS_BOTH_CMTS);
+    assert!(
+        !predict_diag(&m, &matched, &m.default_params)
+            .warnings
+            .iter()
+            .any(|w| w.contains(CODE)),
+        "predict() must stay silent when every entry is exercised"
+    );
+    assert!(
+        !simulate_with_options_diag(
+            &m,
+            &matched,
+            &m.default_params,
+            1,
+            &SimulateOptions {
+                seed: Some(7),
+                ..Default::default()
+            },
+        )
+        .expect("simulate")
+        .warnings
+        .iter()
+        .any(|w| w.contains(CODE)),
+        "simulate() must stay silent when every entry is exercised"
+    );
 }
