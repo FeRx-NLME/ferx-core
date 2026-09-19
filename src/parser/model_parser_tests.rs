@@ -2119,25 +2119,22 @@ fn coded_rate_param_read_in_adaptive_observe_is_recorded() {
 }
 
 #[test]
-fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
+fn dose_attr_param_reused_as_a_disposition_role_is_rejected_before_the_twin() {
     // Second door into the same panic, found probing the first. `F` here is the `f=`
     // mapping — so the #735 shadow guard allows it — *and* the `v=` role, so the
-    // generated twin emits `d/dt(central) = … − (CL/F) * central` with
+    // generated twin emitted `d/dt(central) = … − (CL/F) * central` with
     // `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. The
-    // twin's own parse rejects that as a #993 double use, which (before #1008 made
+    // twin's own parse rejected that as a #993 double use, which (before #1008 made
     // the build a parse-time decline) `get_or_build` `.expect()`ed — so a model the
-    // analytical primary accepts crashed the moment a TV-covariate / `TIME` / IOV
-    // subject rerouted to the twin.
+    // analytical primary accepted crashed the moment a TV-covariate / `TIME` / IOV
+    // subject rerouted to the twin. A dedicated decline in
+    // `absorption_ode_equivalent_source` kept it closed-form.
     //
-    // The specific guard is kept even though #1008's attach-site decline would now
-    // catch this generically: it declines *before* reconstructing a twin known to be
-    // unusable, so the model needs no `W_ABSORPTION_TWIN_DECLINED` warning for a case
-    // the desugar can name exactly. (`state_named_parameter_declines_the_absorption_
-    // twin_with_a_warning` covers the generic backstop.)
-    //
-    // The model is pharmacological nonsense (bioavailability used as a volume), but
-    // nonsense must not panic. Declining keeps it closed-form — exactly what it was
-    // before the twin existed.
+    // Since #1359 the primary itself rejects one variable under two PK roles, so the
+    // model never reaches the twin build and that decline was retired as a redundant
+    // gate. What this test now pins: the rejection is the parse-time one (the model
+    // is pharmacological nonsense — bioavailability used as a volume — and nonsense
+    // must error, not panic and not silently fit), and it names both roles.
     let src = "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
@@ -2159,22 +2156,25 @@ fn dose_attr_param_reused_as_a_disposition_role_declines_the_twin() {
 [error_model]
   DV ~ proportional(EPS1)
 ";
-    let parsed = parse_full_model(src).expect("the analytical primary still parses");
+    let err = expect_parse_err(src);
     assert!(
-        parsed.model.absorption_ode_equivalent.is_none(),
-        "a dose-attribute parameter reused as a disposition role must decline the twin, \
-         not build one that panics"
+        err.contains("`f=F`")
+            && err.contains("`v=F`")
+            && err.contains("two different PK roles")
+            && err.contains("the bioavailability")
+            && err.contains("the central volume"),
+        "the double-role binding must be the parse-time rejection, got: {err}"
     );
-    // The desugar names this case, so it declines *before* reconstructing a source —
-    // no generic build-failure warning is raised.
+    // Control: the same model with its own volume parses and builds its twin — the
+    // rejection above is the binding, not the transit form.
+    let ok = src.replace("v=F,", "v=V,").replace(
+        "  F   = inv_logit(THETA_F)",
+        "  V   = 50.0\n  F   = inv_logit(THETA_F)",
+    );
+    let parsed = parse_full_model(&ok).expect("the control parses");
     assert!(
-        !parsed
-            .model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("W_ABSORPTION_TWIN_DECLINED")),
-        "a guard-recognised decline must not fall through to the generic build-failure \
-         warning; warnings: {:?}",
+        parsed.model.absorption_ode_equivalent.is_some(),
+        "the control must build its twin; warnings: {:?}",
         parsed.model.parse_warnings
     );
 }
@@ -2886,20 +2886,20 @@ fn analytical_dose_attr_remedy_quotes_the_mapping_as_written() {
 }
 
 #[test]
-fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
-    // `pk_param_map` is a `HashMap`, and one parameter can fill both dose-attribute
-    // roles. With arbitrary iteration order the surviving slot — and therefore the
-    // noun and the quoted role — differed between parses of the identical source,
-    // and the two halves disagreed with each other ("bioavailability … remove the
-    // `lagtime=X` mapping"). Sorted iteration in `analytical_dose_attr_slot_map`
-    // plus an `attr`-filtered role lookup makes both stable and mutually
-    // consistent. Several parses in one process, because `HashMap`'s ordering is
-    // per-instance.
-    let src = analytical_dose_attr_src(
-        "f=X, lagtime=X",
-        "X  = TVF",
-        "[scaling]\n  obs_scale = 2.0 * X",
-    );
+fn one_variable_bound_to_two_pk_roles_is_rejected_deterministically() {
+    // #1359 §2. `pk_indices` is built by reversing `pk_param_map` into a
+    // `HashMap` keyed by variable, so with `f=X, lagtime=X` only one role survived
+    // there — chosen by the per-process hash seed (measured `[0, 1, 4, 5]` or
+    // `[0, 1, 4, 8]` over 64 parses) — while `pk_param_fn` wrote both slots every
+    // time. `has_lagtime()` therefore flipped between parses of one file, and the
+    // lag-free fast paths could run with a lag applied. The binding is rejected at
+    // parse time; nothing downstream (the #993 double-use check this fixture used
+    // to reach) sees it any more.
+    //
+    // This test used to pin that the *downstream* diagnostic was deterministic
+    // across parses for exactly this fixture; the property is kept — the message
+    // must not depend on iteration order — against the new rejection.
+    let src = analytical_dose_attr_src("f=X, lagtime=X", "X  = TVF", "");
     let first = expect_parse_err(&src);
     for _ in 0..16 {
         assert_eq!(
@@ -2908,11 +2908,175 @@ fn analytical_dose_attr_diagnostic_is_deterministic_across_parses() {
             "the diagnostic must not depend on HashMap iteration order"
         );
     }
-    // And the noun must agree with the role the clause tells the user to remove.
     assert!(
-        first.contains("absorption lag") && first.contains("remove the `lagtime=X` mapping"),
-        "noun and quoted role must describe the same slot, got: {first}"
+        first.contains("`f=X`")
+            && first.contains("`lagtime=X`")
+            && first.contains("two different PK roles")
+            && first.contains("the bioavailability")
+            && first.contains("the absorption lag time"),
+        "must name both mappings and both roles, got: {first}"
     );
+    // And it must be the parse-time rejection, not the #993 readout check the old
+    // fixture reached (there is no `[scaling]` here to read `X`).
+    assert!(
+        !first.contains("remove the"),
+        "the double-role rejection must fire before the dose-attribute read check: {first}"
+    );
+}
+
+#[test]
+fn one_variable_bound_to_two_pk_roles_collides_the_way_it_binds() {
+    // `build_pk_param_fn` resolves a mapped name exactly or, failing that, by its
+    // lowercase form (the legacy `vars.get(to_lowercase())` compat lookup), so
+    // `f=X, lagtime=x` binds ONE declared `x` under two roles — the collision has
+    // to be keyed on the resolved var slot, not the spelling, or the compat form
+    // slips through and reproduces the #1359 flip.
+    let src = analytical_dose_attr_src("f=X, lagtime=x", "x  = TVF", "");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("two different PK roles"),
+        "the lowercase compat spelling must collide like the exact one, got: {err}"
+    );
+    // Both mappings quoted as written: the file says `f=X` and `lagtime=x`, and a
+    // message that spells the first one with the second's casing (`f=x`) names
+    // text the file does not contain (review of #1441).
+    assert!(
+        err.contains("`f=X`") && err.contains("`lagtime=x`") && !err.contains("`f=x`"),
+        "each mapping must be quoted in its own spelling, got: {err}"
+    );
+    // Any pair of roles, not just the two dose attributes: the noun table has to
+    // cover every slot `PkParams::name_to_index` hands out.
+    let src = analytical_dose_attr_src("f=KA", "F  = TVF", "");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("the absorption rate constant") && err.contains("the bioavailability"),
+        "a non-dose-attribute role must be named too, got: {err}"
+    );
+}
+
+#[test]
+fn case_distinct_names_under_two_roles_keep_their_own_slots() {
+    // Review of #1441: `pk_indices` used to come from a reversal of `pk_param_map`
+    // keyed on the UPPERCASED mapped name. Individual-parameter names are
+    // case-sensitive, so with both `X` and `x` declared and `f=X, lagtime=x` the
+    // two-roles reject sees two variables and passes — but both collapsed onto
+    // one `"X"` key in the reversal and both took whichever role `HashMap`
+    // insertion kept: the #1359 flip in another spelling. `pk_indices` now reads
+    // the resolved `(pk_slot, var_slot)` pairs, so each name keeps its own slot.
+    // Several parses, because `HashMap` ordering is per-instance.
+    let src = analytical_dose_attr_src("f=X, lagtime=x", "X  = TVF\n  x  = TVLAG", "");
+    for _ in 0..16 {
+        let m = super::parse_full_model(&src).unwrap().model;
+        let slot_of = |name: &str| {
+            let i = m.indiv_param_names.iter().position(|n| n == name).unwrap();
+            m.pk_indices[i]
+        };
+        assert_eq!(slot_of("X"), crate::types::PK_IDX_F, "{:?}", m.pk_indices);
+        assert_eq!(
+            slot_of("x"),
+            crate::types::PK_IDX_LAGTIME,
+            "{:?}",
+            m.pk_indices
+        );
+        assert!(m.has_lagtime() && m.has_bioavailability());
+    }
+}
+
+#[test]
+fn pk_slot_noun_names_every_slot_name_to_index_hands_out() {
+    // The two-roles diagnostic can name any pair of slots, so every slot a role
+    // key can reach must have its own noun — the `_` fallback is for a slot that
+    // does not exist yet, not for one of these. Driven off `name_to_index` so a
+    // new role key added there without a noun fails here.
+    let names = [
+        "cl", "v", "v1", "q", "q2", "v2", "ka", "f", "q3", "v3", "lagtime", "alag", "n", "mtt",
+        "mat", "cv2",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let slot = crate::types::PkParams::name_to_index(name)
+            .unwrap_or_else(|| panic!("`{name}` must be a role key"));
+        let noun = super::pk_slot_noun(slot);
+        assert_ne!(
+            noun, "the same PK parameter",
+            "slot {slot} (`{name}`) has no noun"
+        );
+        assert!(
+            noun.starts_with("the "),
+            "`{noun}` must read as a noun phrase"
+        );
+        seen.insert(slot);
+    }
+    // Every slot name_to_index can produce was visited (13 distinct slots).
+    assert_eq!(seen.len(), 13, "{seen:?}");
+    // And the fallback still exists for a slot outside the table.
+    assert_eq!(super::pk_slot_noun(usize::MAX), "the same PK parameter");
+}
+
+#[test]
+fn one_variable_under_two_spellings_of_one_role_stays_legal() {
+    // The #1359 gate is keyed on the *slot*, so the #1048 redundancy
+    // (`lagtime=X, alag=X`: one slot, two spellings) is untouched — `slot_seen`
+    // collapses it before the variable is looked at a second time. A model that
+    // parsed on `main` must keep parsing.
+    let src = analytical_dose_attr_src("lagtime=X, alag=X", "X = TVLAG", "");
+    let parsed = super::parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("two spellings of one role must stay legal: {e}"));
+    assert!(parsed.model.has_lagtime());
+    assert!(!parsed.model.has_bioavailability());
+    assert_eq!(
+        parsed
+            .model
+            .pk_indices
+            .iter()
+            .filter(|&&s| s == crate::types::PK_IDX_LAGTIME)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn analytical_unbound_lagtime_and_f_are_not_a_lag_or_bioavailability() {
+    // #1359 §1. On the analytical engine `LAGTIME` / `F` declared in
+    // `[individual_parameters]` but not bound with `lagtime=` / `f=` never reach
+    // their slot (the parser warns they are computed but never used) — yet the
+    // name scan in `has_lagtime` / `has_bioavailability` returned true, taking the
+    // model off the lag-free fast paths (explicit sensitivity kernels, cached
+    // event schedule) for nothing. Fails on `main`; restoring the bare-name arm
+    // reddens it.
+    let src = analytical_dose_attr_src("", "LAGTIME = TVLAG\n  F = TVF", "");
+    let parsed = super::parse_full_model(&src).unwrap();
+    let m = &parsed.model;
+    assert!(
+        m.indiv_param_names.iter().any(|n| n == "LAGTIME")
+            && m.indiv_param_names.iter().any(|n| n == "F"),
+        "fixture must declare both bare names: {:?}",
+        m.indiv_param_names
+    );
+    assert!(
+        !m.pk_indices.contains(&crate::types::PK_IDX_LAGTIME)
+            && !m.pk_indices.contains(&crate::types::PK_IDX_F),
+        "unbound names must not reach the reserved slots: {:?}",
+        m.pk_indices
+    );
+    assert!(!m.has_lagtime(), "unbound analytical LAGTIME is not a lag");
+    assert!(!m.has_lagtime_on_cmt(1), "…nor on the dosed compartment");
+    assert!(
+        !m.has_bioavailability(),
+        "unbound analytical F is not a bioavailability"
+    );
+    // The parser still tells the user the declarations are dead.
+    let unused = m.parse_warnings.join("\n");
+    assert!(
+        unused.contains("LAGTIME") && unused.contains("F"),
+        "the never-used warning is what tells the user, got: {unused}"
+    );
+
+    // Control — the same declarations *bound* on the `pk(...)` line are live on
+    // every predicate, via `pk_indices` alone.
+    let src = analytical_dose_attr_src("lagtime=LAGTIME, f=F", "LAGTIME = TVLAG\n  F = TVF", "");
+    let m = super::parse_full_model(&src).unwrap().model;
+    assert!(m.has_lagtime() && m.has_lagtime_on_cmt(1) && m.has_bioavailability());
 }
 
 #[test]
@@ -3633,6 +3797,51 @@ fn test_apply_fit_option_known_applies() {
 
     assert_eq!(apply_fit_option(&mut opts, "omega_burnin", "30"), Ok(true));
     assert_eq!(opts.saem_omega_burnin, 30);
+}
+
+/// `n_mh_steps` takes a count or the word `auto` (#1459), which is the default
+/// and is stored as the `SAEM_N_MH_STEPS_AUTO` sentinel for
+/// `estimation::saem::resolve_n_mh_steps` to expand against the dataset.
+///
+/// The spelling matters beyond this crate: `apply_fit_option` is what the R
+/// wrapper's `settings` argument goes through, so `settings = list(n_mh_steps
+/// = "auto")` has to reach the same place a model file's `n_mh_steps = auto`
+/// does.
+#[test]
+fn test_n_mh_steps_accepts_auto_and_a_count() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_n_mh_steps,
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        "the default is the sentinel"
+    );
+
+    assert_eq!(apply_fit_option(&mut opts, "n_mh_steps", "12"), Ok(true));
+    assert_eq!(
+        opts.saem_n_mh_steps, 12,
+        "an explicit count is stored as-is"
+    );
+
+    for spelling in ["auto", "AUTO", "Auto"] {
+        assert_eq!(
+            apply_fit_option(&mut opts, "n_mh_steps", spelling),
+            Ok(true)
+        );
+        assert_eq!(
+            opts.saem_n_mh_steps,
+            crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+            "`{spelling}` must reach the sentinel"
+        );
+        // Put it back to a count so the next spelling has to move it again —
+        // otherwise every iteration after the first would pass on the value
+        // the previous one left behind.
+        opts.saem_n_mh_steps = 12;
+    }
+
+    assert!(
+        apply_fit_option(&mut opts, "n_mh_steps", "sometimes").is_err(),
+        "a word that is not `auto` is still a parse error, not a silent 0"
+    );
 }
 
 /// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
@@ -22313,6 +22522,16 @@ fn algebraic_structural_model_rejects_compartment_only_blocks() {
         ("odes", "  d/dt(central) = -0.1 * central\n"),
         ("initial_conditions", "  init(central) = 1.0\n"),
         ("diffusion", "  central ~ 0.1\n"),
+        // #1443: the controller emits doses; the observe check's analytical arm
+        // would otherwise read a parameter named `F1` as a dose attribute of the
+        // placeholder `pk_model` and demand an `f=F1` mapping on a `pk(...)` call
+        // the user never wrote.
+        (
+            "adaptive_dosing",
+            "  observe = E0\n  at = every 24 from 0 to 48\n  start_dose = 100\n  \
+             route = bolus(cmt=1)\n  dose_bounds = [0, 400]\n  \
+             when signal < 10 : increase 25%\n",
+        ),
     ] {
         let src = format!(
             "{}\n[{block}]\n{body}",
@@ -22512,6 +22731,155 @@ fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartm
         });
         assert!(model.is_algebraic());
     }
+}
+
+/// #1358: a compartment-free model has no doses, so no dose-attribute name means
+/// anything there — `F1`, `ALAG1`, `D2`, `R1` are ordinary parameter names (a
+/// factor level, a fraction, a slope). The analytical modeled-dose loop used to run
+/// on the placeholder `pk_model` (gated on `!is_ode`, not `!uses_ode_param_layout`),
+/// so `F1`/`ALAG1` hit the analytical dose-route reject and `D2` the
+/// infusable-compartment reject — both about a `pk(...)` model the user never wrote.
+/// Each value must be readable through `pk_indices` like any other parameter, and
+/// the dose-attribute map must stay empty — `D1`/`R1` *parsed* under the old gate,
+/// so for those two arms `dose_attr_map.is_empty()` is the one assertion that
+/// sees the defect: the loop recorded them as an analytical modeled dose at spare
+/// slot 9 while `ode_param_slots` had put the value at slot 1. (`parse_warnings`
+/// is a guard against any other diagnostic; the dead-parameter census skips
+/// compartment-free models, so it cannot fire here either way.)
+#[test]
+fn algebraic_structural_model_accepts_dose_attribute_shaped_parameter_names() {
+    for (name, value) in [
+        ("F1", 0.25),
+        ("ALAG1", 0.5),
+        ("D1", 1.5),
+        ("D2", 2.0),
+        ("R1", 3.0),
+    ] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 theta TVX({value}, 0.01, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 E0 = TVE0\n\
+            \x20 {name} = TVX\n\n\
+            [structural_model]\n\
+            \x20 y = E0 * {name} * TIME\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| {
+            panic!("`{name}` is an ordinary parameter in a compartment-free model: {e}")
+        });
+        assert!(model.is_algebraic());
+        assert!(
+            model.parse_warnings.is_empty(),
+            "`{name}`: no warning expected, got {:?}",
+            model.parse_warnings
+        );
+        assert!(
+            model.dose_attr_map.is_empty(),
+            "`{name}`: a compartment-free model has no doses, so no dose attribute"
+        );
+        assert!(!model.has_lagtime(), "`{name}`: no lag route");
+        assert!(!model.has_bioavailability(), "`{name}`: no bioavailability");
+        // The value lands in the slot `pk_indices` names for it.
+        let i = model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("`{name}` missing from {:?}", model.indiv_param_names));
+        let pk = (model.pk_param_fn)(&[10.0, value], &[], &HashMap::new(), 0.0);
+        assert_eq!(
+            pk.values[model.pk_indices[i]], value,
+            "`{name}`: value not readable through pk_indices[{i}] = {}",
+            model.pk_indices[i]
+        );
+    }
+}
+
+/// #1443: the "computed but never used" census used to skip compartment-free
+/// models outright (its gate was `!pk_param_map.is_empty() || is_ode`, and a
+/// compartment-free model is neither), so an unread parameter drew no warning.
+/// It now runs with its own wording — the equations live in `[structural_model]`,
+/// not `[odes]` or a `pk(...)` mapping — and with no dose-attribute carve-out,
+/// since nothing is dosed. `EMAX` is declared and never read; `E0` is read.
+#[test]
+fn algebraic_structural_model_warns_on_an_unused_parameter() {
+    let model = parse_model_string(&algebraic_model_str("  y = E0 * ET50\n"))
+        .expect("an unused parameter is a warning, not an error");
+    assert!(model.is_algebraic());
+    let w = model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("computed but never used"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a dead-parameter warning, got {:?}",
+                model.parse_warnings
+            )
+        });
+    assert!(
+        w.contains("`EMAX`") && !w.contains("`E0`") && !w.contains("`ET50`"),
+        "names the dead parameter only: {w}"
+    );
+    assert!(
+        w.contains("[structural_model]") && !w.contains("[odes]") && !w.contains("pk("),
+        "compartment-free wording, not the ODE or analytical one: {w}"
+    );
+}
+
+/// The census must not exempt a dose-attribute-shaped name on a compartment-free
+/// model: with no doses, an unread `F1` is exactly as dead as an unread `EMAX`.
+/// (An ODE model exempts `F1`, an analytical model exempts `D1`/`R1`; here nothing
+/// is load-bearing without a textual reference.)
+#[test]
+fn algebraic_structural_model_census_has_no_dose_attribute_exemption() {
+    for name in ["F1", "ALAG1", "D1", "R1"] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 theta TVX(1.0, 0.01, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 E0 = TVE0\n\
+            \x20 {name} = TVX\n\n\
+            [structural_model]\n\
+            \x20 y = E0 * TIME\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| panic!("`{name}`: {e}"));
+        assert!(
+            model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used") && w.contains(&format!("`{name}`"))),
+            "`{name}` unread on a compartment-free model must be reported dead, got {:?}",
+            model.parse_warnings
+        );
+    }
+}
+
+/// #1443: a per-CMT `[error_model]` on a compartment-free model is still rejected
+/// (one prediction, no compartments), but the reason names *this* model class
+/// rather than "analytical PK models", which the user never wrote.
+#[test]
+fn algebraic_structural_model_per_cmt_error_model_reject_names_the_model_class() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0\n\n\
+        [structural_model]\n\
+        \x20 y = E0 * TIME\n\n\
+        [error_model]\n\
+        \x20 CMT=1: DV ~ proportional(PROP)\n";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("compartment-free") && !err.contains("analytical PK models"),
+        "got: {err}"
+    );
 }
 
 // ── #1064: θ level blocks ────────────────────────────────────────

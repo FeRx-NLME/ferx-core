@@ -32,6 +32,12 @@ section of the SDLC for the versioning policy).
   [SAEM docs](docs/estimation/saem.qmd) for the recursion, the scope and the full
   measurement (#1458).
 
+- **`install_on_engine_pool(f)`** runs population-wide parallel work that is not a `fit()`
+  on the engine's worker pool instead of Rayon's process-global one. This is what makes a
+  declared thread count reach GAM screening and the other standalone parallel entry points;
+  a tool built on ferx-core (the `ferx-tools` GAM screener is the first caller) wraps its
+  `par_iter` in it, and work already running on a worker is left there rather than nesting
+  a second pool ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
@@ -183,6 +189,23 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **SAEM's `n_mh_steps` default is now `auto`, sized from the dataset instead of a flat
+  20 (#1459).** The block-MH proposal count per subject per iteration is resolved as
+  `2.5 × observations per subject per random effect`, clamped to `[6, 20]`, and the
+  componentwise sweep count is derived from the resolved value exactly as before. A
+  dataset dense enough to reach the cap — the Emax PKPD benchmark the old default was
+  calibrated on has 8 observations per η — keeps the historical 20 and fits unchanged;
+  a sparse population gets 6 or 7. On four real datasets (cefepime 458 subjects,
+  vancomycin 100, busulfan 600, pembrolizumab 303) six seeds could not distinguish the
+  resolved count from 20 on the importance-sampled −2 log L or on final-estimate
+  distance, for **29–41 % less CPU** in the SAEM stage. The rule is a function of the
+  data only, so a fit stays reproducible; `verbose` prints the resolved count and its
+  source. Set an explicit `n_mh_steps = <n>` to override it, and raise it if the
+  acceptance diagnostic reports a chain far from target. `method = bayes` reads the same
+  option but **not** the rule: under `auto` its η block keeps the historical fixed 20,
+  since the rule is calibrated on SAEM quantities and on a kernel that sampler does not
+  run.
+
 - **ferx no longer recommends `[diffusion]` as a remedy for residual autocorrelation.** The IWRES
   Durbin-Watson warning has dropped its "For ODE models, SDE process noise may also help" suffix,
   and the docs no longer describe the SDE path as a filtered state. The Kalman filter behind
@@ -258,6 +281,8 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **Compartment-free (`$PRED`-style) models get compartment-free diagnostics.** Dose records in such a model's dataset were silently dropped (the reader is model-blind, and `W_NO_DOSES` is suppressed for this class); they are now reported once with counts as `W_COMPARTMENT_FREE_DOSES`, and the dose-level checks that read a compartment topology are skipped for this class: a coded `RATE=-1` / `-2` row no longer demands a `D{n}` / `R{n}` parameter the model cannot consume, and a `CMT=2` row is no longer "out of range" for the one-compartment placeholder the parser installs (which `fit()` rejected before the warning could be reached, and `predict()` / `simulate()` panicked on). `[adaptive_dosing]` is rejected by name (it emits doses into compartments), instead of its `observe` check reading a parameter named `F1` as a dose attribute of a `pk(...)` model the user never wrote. The "computed but never used" census now covers compartment-free models, with its own wording (it used to skip them entirely). A per-`CMT` `[error_model]` on such a model is still rejected, but the reason names the model class rather than "analytical PK models". (#1443)
+- **A compartment-free (`$PRED`-style) model can name a parameter `F1`, `ALAG1`, `D2` or `R1`.** Such a model has no doses, so a dose-attribute-shaped name is an ordinary parameter there — but the parser ran the analytical modeled-dose loop against its placeholder `pk` model and rejected `F{n}`/`ALAG{n}` with the analytical dose-route error (about a `pk(...)` line the user never wrote), rejected a `D{n}`/`R{n}` off compartment 1 as non-infusable, and recorded a `D1`/`R1` as a modeled dose. The loop is now skipped for compartment-free models; analytical `pk(...)` models keep every reject. (#1358)
 - **SAEM now reports an acceptance rate that never reached its target**
   ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)). The existing mixing
   warning only fired below 1% cumulative acceptance, so a chain parked at 2–4% for an
@@ -292,6 +317,8 @@ section of the SDLC for the versioning policy).
 - **SAEM no longer reports the residual σ of a `combined()` model as a single M-step draw.** The θ/σ M-step's σ half was *assigned* outright in both phases once `mstep_damping` defaulted to off ([#1415](https://github.com/FeRx-NLME/ferx-core/issues/1415)), leaving it as the only SAEM statistic with no stochastic approximation at all — Ω has its own capped SA step, and a single free additive/proportional σ has an averaged sufficient statistic. For a well-identified σ that is harmless, but the additive component of `combined(PROP, ADD)` on sparse data is a *minority* variance component whose single-draw maximiser is boundary-heavy: on a 300-subject, median-one-observation simulated fixture the per-M-step σ_add swung between 0.0087 and 2.34 (median 0.035) against a truth of 1.8, and the fit reported whichever value the last iteration drew — 0.011, 0.0025 and 0.011 on three seeds, and 4.3e-4 / 4.5e-4 (the `exp(-8)` optimizer floor) on the two real datasets in the report, *worse* with more iterations. σ now takes a Robbins-Monro step of `min(γ_k, 0.2, γ_θ)` on the **variance** scale — the scale the scalar-σ sufficient statistic already averages on, and not the packed log scale, whose geometric mean is dominated by the near-zero draws (measured: log-scale averaging leaves that fixture's σ_add at 0.47). Measured over 8 seeds: the fixture's σ_add goes 0.011/0.0025/0.011 → 1.42 [1.11, 1.75] against a simulation truth of 1.8 and **NONMEM 7.5.1 SAEM's 1.5425** on the same dataset (new anchor `nonmem_anchor/saem_sparse_combined_saem.ctl`; ferx FOCEI 3.22), and `ferx-testdata/cefepime_jordan` run64 goes ~1e-3 → 1.16 [0.97, 1.34] against NONMEM FOCEI's 1.550 and ferx FOCEI's 1.837 — with the importance-sampled −2 log L at the SAEM estimate *improving* from 4299.5 ± 4.9 to 4295.3 ± 0.9 (three seeds), the Laplace OFV from 4337.0 to 4331.7, and the `covmuref_power` no-ETA θ anchor from #1415 moving closer to NONMEM (`TH_WT` 0.9612 → 0.9026 against 0.9213). The trade is that σ is now an average and therefore lags: read it from a run long enough for it to settle rather than from a short one. σ is never given a larger step than the θ it shares a maximiser with, so a fit that sets `mstep_damping` at or below 0.2 (including the `iiv_on_ruv` default of 0.03) keeps the pair equal throughout exploration and changes only over the four convergence hand-off iterations where `1/(k−k1) > 0.2`. A single-σ additive or proportional model on the averaged-sufficient-statistic path is untouched ([#1445](https://github.com/FeRx-NLME/ferx-core/issues/1445)).
 
 - **A fit restarted mid-descent now runs on the remaining `maxiter` budget and says so.** The [#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277) restart gave its second leg a fresh evaluation budget — measured as 56 evaluations on a `maxiter = 1` (44-evaluation) fit — while documenting that it could not; it now continues on what the stalled leg left, a stall with the budget already spent is reported (with its own "increase maxiter" warning) rather than restarted, and an adopted restart is named in `FitResult.warnings` as an `optimizer_health` entry (it was visible only under `verbose`). Fits that are not restarted are bit-identical ([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)).
+- **An analytical `LAGTIME` / `F` declared but not bound on the `pk(...)` line no longer counts as a lag / bioavailability, and one variable bound to two PK roles is rejected.** `has_lagtime()` / `has_bioavailability()` scanned `[individual_parameters]` for the bare names, so a `LAGTIME` the parser already warned was "computed but never used" still took the model off the lag-free fast paths (the explicit sensitivity kernels and the cached event schedule) — correct numbers, slower fit. They now answer from the routed slots alone; the never-used warning is what tells the user the declaration is dead. Separately, `pk(..., f=X, lagtime=X)` writes both slots but `pk_indices` can record only one of them, chosen by hash order — measured `has_lagtime()` flipping between parses of one file while the lag was applied every time. **Widening reject:** one variable under two different roles is now a parse error naming both roles — *any* two roles, not only `f`/`lagtime`: a shared-parameter constraint such as `q=Q, q3=Q` or `v2=VP, v3=VP` is rejected too, because the per-parameter slot table (`pk_indices`) can hold one slot per variable, so the second role was invisible to everything that reads it — the path-routing predicates and the closed-form η-derivative fallback — and which of the two it recorded depended on hash order. Give each role its own variable (`Q3 = Q`, then `q3=Q3`). `lagtime=X, alag=X` (two spellings of one role) stays legal ([#1359](https://github.com/FeRx-NLME/ferx-core/issues/1359)).
+- **A literal lag on the `pk(...)` line (`lagtime=0.5`, `alag=0.5`) now gets correct FOCE/FOCEI gradients.** The slot was written but no variable carried it, so the model counted as lag-free and the analytic sensitivity provider ran the lag-free walk against a production predictor that applied the lag — measured 120 % apart at the first post-dose sample on a 1-cpt oral model and 11 % on an IV bolus, i.e. gradients for a different model than the one whose OFV was reported. The literal is now routed through the lag-aware paths; the OFV at a given point is unchanged, the gradient is now the gradient of that OFV, and `Dual2`-vs-FD parity is pinned on both fixtures. A literal `f=0.5` was already applied identically on both sides and is unchanged (found in the review of [#1441](https://github.com/FeRx-NLME/ferx-core/pull/1441)).
 - **A diagonally declared `omega` at the rail is no longer given the `block_omega` message because some *other* eta is in a block.** `E_OMEGA_INIT_AT_RAIL` chose its wording from whether the whole Ω matrix packs as a block, and one `block_omega` anywhere makes that true for every coordinate — so on `examples/warfarin_block_omega.ferx` a plain `omega ETA_KA ~ 0.0` was told "the block is near-singular in ETA_KA: lower the covariances involving it, or `FIX` the block". ETA_KA is in no block and has no covariances, and `FIX`-ing the block would have fixed ETA_CL and ETA_V instead of the eta on the rail. Worse, that wording *replaced* the `write ... FIX` repair the check exists to hand out ([#1229](https://github.com/FeRx-NLME/ferx-core/issues/1229)). The message is now chosen per **eta** — block wording only for an eta with a structurally free off-diagonal, i.e. one actually declared in a `block_omega` / `block_kappa` — so a model mixing the two spellings reports each eta in the shape it was written in. Same for Ω_IOV. A **one-eta** `block_omega (ETA_CL) = [0.0]` is the one case where the two questions come apart — it is spelled as a block but is correlated with nothing — and it now gets the declared-zero explanation in its own spelling, `` write `block_omega (ETA_CL) = [0.0] FIX` ``, instead of being told to reduce covariances it does not have (which is what it was told before this change too). A block of two or more etas, and a pure-diagonal model, are unchanged ([#1394](https://github.com/FeRx-NLME/ferx-core/issues/1394)).
 - **`model = NAME` names the model.** Only the bare `model NAME` spelling was read; the `KEY = value` form every other setting uses was dropped in silence and the fit (`model_name`, the `ferx run` summary line, `-fit.json`) and ferx-r fell back to the file stem. Both spellings now name the model, a `model` line the parser cannot read (or a second one) is an error naming the accepted forms, only the preamble before the first `[block]` header is read, and `ferx check --json` reports the same name the fit will carry instead of always the stem. **Widening reject:** a `model NAME` / `model = NAME` declaration placed *inside* a block used to be skipped silently (the model kept the stem); it is now an error naming the block and the preamble form, so the misplaced line cannot fall through a block that ignores unrecognised text (`[data]`) or is never read (`[odes]` on a `pk` model). Output filenames (`{stem}-fit.yaml`, `{stem}-sdtab.csv`) are unchanged: they are always the file stem ([#1395](https://github.com/FeRx-NLME/ferx-core/issues/1395)).
 - **An `SS=1` steady-state record under a `[diffusion]` (SDE) model is now equilibrated by the filter.** The EKF applied the record as a single dose from an empty state with zero covariance, so the objective scored a one-dose history: on the Michaelis–Menten fixture it was reported on, one `SS=1, II=12` record scored 610.41 where the 41 explicit doses it stands for scored 489.88, while the ODE path gave the same objective both ways. The filter now expands the pulse train for its mean **and** its covariance, the way the ODE run-in does and on the same cycle-local clock — the covariance at the record is the stationary Riccati value rather than zero, and on a nonlinear right-hand side the Jacobian is linearised along the steady-state mean — until both stop moving or the cycle cap is spent (in which case the ODE run-in's non-convergence warning is attached). An `SS=1` bolus or non-overlapping infusion now scores like its explicit train to `1e-9`; an infusion longer than `II` is still declined (`W_STEADY_STATE_INFUSION`). The `W_SDE_STEADY_STATE` warning that named the gap is retired ([#1260](https://github.com/FeRx-NLME/ferx-core/issues/1260)).
@@ -416,6 +443,25 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **`ferx --threads N` now holds `N` worker threads, not `2N`.** The flag sized Rayon's
+  process-global pool *and* the fit then leased a separate `N`-worker pool of its own —
+  the one carrying the 32 MiB stacks wide analytic gradients need — so the global `N`
+  never received any work. Per-thread profiles of a `--threads 2` SAEM fit measured the
+  two fit-pool workers at 85–99% busy and the two global-pool threads at 0.0% for the
+  whole run; measured end to end, a `--threads 2` run drops from 5 live OS threads to 3
+  (main + 2 workers). Nothing about the fit itself changes — same estimates, same
+  `n_threads_used` — but a shared machine or a CPU-quota'd container is no longer charged
+  for twice the threads you asked for, `N × 2 MiB` of worker stack is no longer reserved
+  for nothing, and a whole-process profile of a ferx run stops reporting idle-thread wait
+  as if it were estimator headroom. `configure_global_thread_pool(n)` (the library entry
+  point behind the flag) accordingly no longer builds Rayon's global pool: it declares the
+  worker count ferx's own pools are sized from, it is once-per-process (a second, differing
+  count is an error rather than a silently ignored one), and **parallel work that is not a
+  `fit()` now honours it too** — GAM covariate screening, standalone `run_sir` /
+  `run_covariance`, the NCA initial-estimate pass and `npde`. Those ran on Rayon's global
+  pool, i.e. one worker per logical CPU: on a 15-core host `ferx gam --threads 2` screened
+  15 wide. They now run on the engine's pool at the requested width
+  ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 - **SAEM: the E-step and M-step stop redoing η-independent work on every MH proposal.**
   Three changes, all of them internal and all of them bit-identical — the same fit, the
   same seed, the same estimates, objective and per-subject EBEs down to the last bit — so
@@ -448,6 +494,20 @@ section of the SDLC for the versioning policy).
   likelihood call. Widening the gate also benefits FOCE/FOCEI, Laplace, AGQ and the Bayes
   chain, which share it. Results are unchanged in both cases
   ([#1447](https://github.com/FeRx-NLME/ferx-core/issues/1447)).
+- FO/FOCEI and multi-node AGQ (under either anchor, so `laplace` with `n_agq > 1`
+  included) inner optimization now seed dense BFGS from the current analytical
+  Gauss–Newton eta Hessian through a Cholesky solve, fusing the seed and first
+  gradient in one first-order sensitivity pass; one-node Laplace uses its exact
+  conditional eta Hessian as the initial BFGS metric for robustness. Objective-only
+  Laplace evaluations reuse the exact terminal eta Hessian retained from the inner
+  solve — only where it is the anchor Laplace would otherwise recompute (analytic
+  score scope; joint PK-TTE / discrete / CTMM models and `gradient = fd` keep their
+  FD anchor). Laplace skips generic one-node grid construction, while AGQ caches log
+  weights and stores retained node modes contiguously to reduce allocator pressure.
+  Unsupported or non-positive-definite seeds reproduce the previous initialization
+  exactly, and the seed is fit-scoped, so a later `predict()` / VPC / bootstrap in
+  the same process is unaffected
+  ([#1389](https://github.com/FeRx-NLME/ferx-core/pull/1389)).
 
 - Population fitting and prediction use the available worker budget more efficiently: Bayesian chains and underfilled AGQ grids run concurrently, small FOCE populations avoid fine-grained dispatch overhead, concurrent cold callers share pool construction, AGQ-IOV nodes avoid a heap allocation, and public `predict()` evaluates subjects in parallel ([#1385](https://github.com/FeRx-NLME/ferx-core/pull/1385)).
 

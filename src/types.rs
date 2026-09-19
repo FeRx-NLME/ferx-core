@@ -5018,49 +5018,74 @@ impl CompiledModel {
             .collect()
     }
 
-    /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
-    /// `ALAG` alias). Used by the prediction dispatcher and inner optimizer
+    /// Returns true when the model routes a compartment lag time to
+    /// [`PK_IDX_LAGTIME`]. Used by the prediction dispatcher and inner optimizer
     /// to choose between cached-schedule / AD fast paths and the lagtime-
     /// aware slow paths.
     ///
-    /// Checks both routes by which lagtime can be wired in:
-    ///   1. `pk_indices` contains `PK_IDX_LAGTIME` whenever a parameter is
-    ///      routed to the lag slot: on the analytical engine by a `lagtime=` /
+    /// Checks the two routes by which a lag can be wired in:
+    ///   1. `pk_indices` contains `PK_IDX_LAGTIME` whenever a *declared* parameter
+    ///      is routed to the lag slot: on the analytical engine by a `lagtime=` /
     ///      `alag=` binding on the `[structural_model]` line, on the ODE (and
     ///      compartment-free) layout by `ode_param_slots` sending a bare
-    ///      `LAGTIME`/`ALAG` name to its canonical slot. Two analytical
-    ///      exceptions write the lag slot without `pk_indices` recording it: a
-    ///      variable bound to two roles (e.g. `f=X, lagtime=X`) records only one
-    ///      of them, chosen by `HashMap` iteration order (#1359); and a
-    ///      `lagtime=` binding to a name assigned only inside an `if` without
-    ///      `else` is not in `indiv_param_names` at all.
+    ///      `LAGTIME`/`ALAG` name to its canonical slot. A bare `LAGTIME` declared
+    ///      on the analytical engine *without* a `lagtime=` binding never reaches
+    ///      the slot (the parser warns that it is computed but never used) and is
+    ///      deliberately **not** a lag here — the earlier name scan that made it
+    ///      one took such models off the lag-free fast paths for nothing (#1359).
+    ///      One variable bound to two roles (`f=X, lagtime=X`), which would leave
+    ///      `pk_indices` recording only one of them, is a parse error (#1359).
     ///   2. On the ODE engine, a compartment-indexed `ALAGn`/`LAGTIMEn` (#369)
     ///      is not a canonical PK name, so `ode_param_slots` gives it an ordinary
     ///      structural slot that `pk_indices` cannot identify; it is found by
     ///      scanning `indiv_param_names`. (On the analytical engine an unbound
     ///      `ALAGn` is rejected at parse time, and one bound via `lagtime=` /
-    ///      `alag=` is covered by route 1.) The scan also matches a bare `LAGTIME`/`ALAG`
-    ///      on every engine: redundant with route 1 on the ODE and
-    ///      compartment-free layout, and on the analytical engine a false
-    ///      positive for a `LAGTIME` declared without a `[structural_model]`
-    ///      binding — that value never reaches `PK_IDX_LAGTIME` and no lag is
-    ///      applied, yet the model is taken off the lag-free fast paths (the
-    ///      explicit sensitivity kernels and the cached event schedule).
+    ///      `alag=` is covered by route 1.)
+    ///
+    ///   3. A numeric **literal** on the analytical line (`lagtime=0.5`) writes
+    ///      the slot with no variable behind it, so `pk_indices` cannot record
+    ///      it; the parser lists such slots in `indiv_param_partials`. Measured
+    ///      before this arm existed (review of #1441): `analytical_supported`
+    ///      was true, the sensitivity provider ran the lag-free walk and its
+    ///      values sat 120 % (oral, first sample) / 11 % (IV bolus) from the
+    ///      production predictor that applied the lag — a wrong gradient on the
+    ///      default estimator. A literal lag is a *fixed* break, but every
+    ///      consumer of this predicate handles a lag whose derivative is zero,
+    ///      so routing it through the lag-aware paths is correct and only
+    ///      forgoes the fast path.
+    ///
+    /// Known gap, unchanged here: a `lagtime=` binding to a name assigned only
+    /// inside an `if` without `else` resolves in `build_pk_param_fn` (which sees
+    /// every assigned name) but is not in `indiv_param_names`, so route 1 misses
+    /// it.
     pub fn has_lagtime(&self) -> bool {
-        if self.pk_indices.contains(&PK_IDX_LAGTIME) {
-            return true;
-        }
-        self.indiv_param_names.iter().any(|n| {
-            let u = n.to_uppercase();
-            // A compartment-indexed `ALAGn`/`LAGTIMEn` (issue #369) only routes lag
-            // on the ODE engine, so gate it on `ode_spec`. The analytical engine has
-            // a single dose route: an unbound `ALAGn` is rejected at parse time, and
-            // a bound one already put `PK_IDX_LAGTIME` into `pk_indices` above.
-            u == "LAGTIME"
-                || u == "ALAG"
-                || (self.ode_spec.is_some()
-                    && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::Lag, _))))
-        })
+        self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, None)
+    }
+
+    /// Routes 1 and 3 of [`Self::has_lagtime`]: the bare lag slot is written,
+    /// by a declared parameter (`pk_indices`) or by a literal on the `pk(...)`
+    /// line (`const_pk_slots`).
+    fn routes_lag_slot(&self) -> bool {
+        self.pk_indices.contains(&PK_IDX_LAGTIME)
+            || self
+                .indiv_param_partials
+                .const_pk_slots()
+                .contains(&PK_IDX_LAGTIME)
+    }
+
+    /// Route 2 of [`Self::has_lagtime`] / [`Self::has_bioavailability`]: an ODE
+    /// model declaring a compartment-indexed `ALAGn`/`LAGTIMEn`/`Fn` (#369). Only
+    /// the ODE engine routes those; `ode_param_slots` gives them ordinary
+    /// structural slots, so they are recognised by name. With `cmt = Some(c)` only
+    /// the entry indexed for 1-based `c` counts ([`Self::has_lagtime_on_cmt`]).
+    fn has_indexed_dose_attr(&self, attr: DoseAttr, cmt: Option<usize>) -> bool {
+        self.ode_spec.is_some()
+            && self.indiv_param_names.iter().any(|n| {
+                matches!(
+                    DoseAttr::from_indexed_name(n),
+                    Some((a, indexed_cmt)) if a == attr && cmt.is_none_or(|c| c == indexed_cmt)
+                )
+            })
     }
 
     /// True when any built-in absorption input-rate forcing carries a per-route
@@ -5084,19 +5109,7 @@ impl CompiledModel {
     /// (`ALAG2` while `cmt` is 1) does not count — used to scope the SS+lag
     /// rejection (#719 gap 1) to the actual SS-dosed compartment.
     pub fn has_lagtime_on_cmt(&self, cmt: usize) -> bool {
-        if self.pk_indices.contains(&PK_IDX_LAGTIME) {
-            return true;
-        }
-        self.indiv_param_names.iter().any(|n| {
-            let u = n.to_uppercase();
-            u == "LAGTIME"
-                || u == "ALAG"
-                || (self.ode_spec.is_some()
-                    && matches!(
-                        DoseAttr::from_indexed_name(n),
-                        Some((DoseAttr::Lag, indexed_cmt)) if indexed_cmt == cmt
-                    ))
-        })
+        self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, Some(cmt))
     }
 
     /// True when `subject` has a steady-state dose into a built-in absorption
@@ -5144,23 +5157,20 @@ impl CompiledModel {
     /// either engine). Mirrors [`Self::has_lagtime`]: [`PK_IDX_F`] is in
     /// `pk_indices` when `f=` binds it on the analytical `[structural_model]`
     /// line, or when an ODE / compartment-free model declares a bare `F`
-    /// (`ode_param_slots` routes the canonical name to that slot); the same two
-    /// analytical exceptions as for the lag slot apply to `f=`. The name scan
-    /// below adds a compartment-indexed `Fn`, which routes on the ODE engine
-    /// only. It also matches a bare `F` on every engine: redundant on the ODE
-    /// layout, and on the analytical engine a false positive for an `F` declared
-    /// without an `f=` binding, which is never applied. Used with [`Subject::has_rate_defined_infusion`] to skip the
-    /// event-driven [`crate::pk::event_driven::EventSchedule`] cache when `F`
-    /// could reshape an infusion window across the inner search (#419).
+    /// (`ode_param_slots` routes the canonical name to that slot); a
+    /// compartment-indexed `Fn` routes on the ODE engine only and is found by
+    /// name. An analytical `F` declared without an `f=` binding is never applied
+    /// and is not a bioavailability here (#1359). A literal `f=0.8` is not one
+    /// either, deliberately: unlike the lag (route 3 of [`Self::has_lagtime`]) a
+    /// constant `F` is read off the slot by both the production predictor and the
+    /// sensitivity provider (measured equal to 1e-9 in the #1441 review), and this
+    /// predicate's one consumer asks whether `F` can *change* across the inner
+    /// search, which a literal cannot. Used with
+    /// [`Subject::has_rate_defined_infusion`] to skip the event-driven
+    /// [`crate::pk::event_driven::EventSchedule`] cache when `F` could reshape an
+    /// infusion window across the inner search (#419).
     pub fn has_bioavailability(&self) -> bool {
-        if self.pk_indices.contains(&PK_IDX_F) {
-            return true;
-        }
-        self.indiv_param_names.iter().any(|n| {
-            n.eq_ignore_ascii_case("F")
-                || (self.ode_spec.is_some()
-                    && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::F, _))))
-        })
+        self.pk_indices.contains(&PK_IDX_F) || self.has_indexed_dose_attr(DoseAttr::F, None)
     }
 
     /// Residual variance for one observation, dispatching on its compartment.
@@ -6565,6 +6575,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_missing_dv") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.contains("no dose is applied") {
+        // #1443: dose records on a compartment-free model, from
+        // `check_model_data_warnings`. `fit()` pushes the message without its
+        // `W_` code, so the route is the phrase — placed with the other data-quality
+        // arms so ferx-r's remediation table (keyed on the category) finds it.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_cmt_defaulted") {
         // #1009: rows whose compartment the reader chose because the dataset did
         // not say. Matched on its `W_` token and placed with the other reader
@@ -7519,17 +7535,34 @@ pub struct FitOptions {
     pub saem_n_exploration: usize,
     pub saem_n_convergence: usize,
     /// Number of block-kernel MH proposals per subject per SAEM outer
-    /// iteration. The default 20 mixes well on hard cold-start surfaces
-    /// (e.g. Emax PKPD with stressful initial values, where chains at 3
-    /// proposals can lock the M-step into a degenerate basin with the
-    /// PD-curve thetas at boundary values) and, together with the
-    /// componentwise kernel (run automatically for multi-η models), keeps a
-    /// block Ω from collapsing to a near rank-1 correlation matrix. The
-    /// componentwise sweep count `max(2, n_mh_steps / n_eta)` is derived from
-    /// this value (the kernel is skipped entirely for single-η models).
-    /// Reduce to 3-10 for the older/faster behaviour on simpler
-    /// well-identified models; raise (30-50) only when the diagnostic shows
-    /// the M-step is still tracking correlated samples.
+    /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
+    /// file — to size it from the dataset.
+    ///
+    /// The automatic rule is `estimation::saem::auto_n_mh_steps`: `2.5`
+    /// proposals per observation per subject per η, clamped to `[6, 20]`.
+    /// A dataset dense enough to reach the cap keeps exactly the pre-#1459
+    /// fixed default of 20; a sparse one — where the step-scale controller
+    /// holds the kernel at its acceptance target and every extra proposal is
+    /// linear cost for no extra mixing — gets 6 or 7, for 29–41 % less CPU at
+    /// indistinguishable estimates on four real datasets (#1459).
+    ///
+    /// The componentwise sweep count `max(2, n_mh_steps / n_eta)`
+    /// (`estimation::saem::componentwise_sweeps`)
+    /// is derived from the *resolved* value (the kernel is skipped entirely for
+    /// single-η models); together the two keep a block Ω from collapsing to a
+    /// near rank-1 correlation matrix (#191).
+    ///
+    /// Set an explicit count to override the rule: raise it (30–50) when the
+    /// acceptance diagnostic shows the chain far from target or the M-step
+    /// still tracking correlated samples, lower it for the older/faster
+    /// behaviour on a simple well-identified model.
+    ///
+    /// **`method = bayes` reads this option but not the rule**: under `auto` its
+    /// η block keeps the historical fixed count of 20. The rule is calibrated on
+    /// SAEM quantities, and what makes a low count safe there is SAEM's
+    /// componentwise kernel, which that sampler does not run — see
+    /// `estimation::saem::resolve_n_mh_steps_bayes`. An explicit count applies
+    /// to both.
     pub saem_n_mh_steps: usize,
     /// Iterations between step-scale adaptations under
     /// [`ScaleAdaptation::Interval`]. Also governs the κ (IOV) scales under
@@ -8222,7 +8255,9 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: 150,
             saem_n_convergence: 250,
-            saem_n_mh_steps: 20,
+            // 0 = `auto`: resolved from the dataset by
+            // `estimation::saem::auto_n_mh_steps` (#1459).
+            saem_n_mh_steps: 0,
             saem_adapt_interval: 50,
             saem_scale_adaptation: ScaleAdaptation::Interval,
             saem_mstep_damping: None,

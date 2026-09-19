@@ -1371,10 +1371,13 @@ fn has_bioavailability_detects_f_on_either_engine() {
     m.pk_indices = vec![PK_IDX_F];
     assert!(m.has_bioavailability());
 
-    // Either engine: a bare `F` (any case) in `[individual_parameters]`.
+    // Analytical engine: a bare `F` in `[individual_parameters]` with no `f=`
+    // binding never reaches PK_IDX_F, so it is not a bioavailability (#1359).
+    // On the ODE layout the same name is routed by `ode_param_slots`, which is
+    // what puts PK_IDX_F into `pk_indices` — covered by the parser tests.
     let mut m = test_helpers::analytical_model(GradientMethod::Auto);
     m.indiv_param_names = vec!["CL".into(), "f".into()];
-    assert!(m.has_bioavailability());
+    assert!(!m.has_bioavailability());
 
     // ODE engine only: a compartment-indexed `Fn` routes via the DoseAttrMap.
     let mut m = test_helpers::ode_model(GradientMethod::Auto);
@@ -1385,6 +1388,41 @@ fn has_bioavailability_detects_f_on_either_engine() {
     let mut m = test_helpers::analytical_model(GradientMethod::Auto);
     m.indiv_param_names = vec!["CL".into(), "F1".into()];
     assert!(!m.has_bioavailability());
+}
+
+#[test]
+fn has_lagtime_answers_from_routed_slots_and_indexed_names_only() {
+    // #1359: both lag predicates share `has_indexed_dose_attr`, so pin its three
+    // arms — the slot, the ODE-only indexed name, and the compartment scoping
+    // that separates `has_lagtime_on_cmt` from `has_lagtime`.
+    let base = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!base.has_lagtime() && !base.has_lagtime_on_cmt(1));
+
+    // Route 1, either engine: the slot in `pk_indices` is the whole answer.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_LAGTIME];
+    assert!(m.has_lagtime() && m.has_lagtime_on_cmt(1) && m.has_lagtime_on_cmt(2));
+
+    // A bare name alone — the analytical false positive — is no longer a lag.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "LAGTIME".into(), "ALAG".into()];
+    assert!(!m.has_lagtime() && !m.has_lagtime_on_cmt(1));
+
+    // Route 2, ODE only: `ALAG2` is a lag on compartment 2 and on the model, not
+    // on compartment 1.
+    let mut m = test_helpers::ode_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "ALAG2".into()];
+    assert!(m.has_lagtime());
+    assert!(m.has_lagtime_on_cmt(2));
+    assert!(
+        !m.has_lagtime_on_cmt(1),
+        "ALAG2 must not count for compartment 1"
+    );
+
+    // The same `ALAG2` on the analytical engine routes nothing (no ode_spec).
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "ALAG2".into()];
+    assert!(!m.has_lagtime() && !m.has_lagtime_on_cmt(2));
 }
 
 #[test]
@@ -2034,30 +2072,43 @@ fn test_lagtime_from_hashmap_primary_and_alias() {
     assert_eq!(p_alias.lagtime(), 2.0);
 }
 
-/// Guard the SAEM MH-step default. An early value (3) was too low for hard
-/// cold-start surfaces — the chain didn't decorrelate between SAEM outer
-/// iterations, so the single-draw stochastic M-step received sticky
-/// correlated ETAs and locked the population-θ M-step into a degenerate
-/// basin (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150
-/// OFV units worse than the correct basin). The default was raised to 10,
-/// then to 20 alongside the componentwise eta kernel and the damped Ω
-/// stochastic-approximation step — both added to stop a block (correlated)
-/// Ω collapsing to a near rank-1 correlation matrix (UVM 2-cpt: every
-/// off-diagonal correlation → ~0.99, one variance → 0). The larger default
-/// also sizes the componentwise sweep count (`max(2, n_mh_steps / n_eta)`).
+/// Guard the SAEM MH-step default, which is the `auto` sentinel (#1459).
 ///
-/// If a future change drops the default below ~5, re-run both the Emax PKPD
-/// basin regression and the UVM block-Ω collapse regression in the
-/// experiment repo before merging — both fail silently (OFV looks fine;
-/// parameters wrong).
+/// History, because the value is not free to move: an early fixed 3 was too low
+/// for hard cold-start surfaces — the chain didn't decorrelate between SAEM
+/// outer iterations, so the single-draw stochastic M-step received sticky
+/// correlated ETAs and locked the population-θ M-step into a degenerate basin
+/// (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150 OFV units
+/// worse than the correct basin). It was raised to 10, then to 20 alongside the
+/// componentwise eta kernel and the damped Ω stochastic-approximation step —
+/// both added to stop a block (correlated) Ω collapsing to a near rank-1
+/// correlation matrix (UVM 2-cpt: every off-diagonal correlation → ~0.99, one
+/// variance → 0). The count also sizes the componentwise sweep
+/// (`max(2, n_mh_steps / n_eta)`).
+///
+/// #1459 replaced the fixed 20 with
+/// [`auto_n_mh_steps`](crate::estimation::saem::auto_n_mh_steps), which returns
+/// **20 on the Emax PKPD shape that calibrated it** (8 observations per η, the
+/// cap) and 6–7 on sparse PK data, where six real-dataset benchmarks could not
+/// distinguish 6 from 20 at 27–45 % of the CPU.
+///
+/// A future change that makes this a small fixed number again drops the Emax
+/// case to that number too: re-run the Emax PKPD basin regression and the UVM
+/// block-Ω collapse regression (`tests/saem_block_omega_collapse.rs`) first —
+/// both fail silently (OFV looks fine; parameters wrong).
 #[test]
-fn saem_n_mh_steps_default_is_20() {
+fn saem_n_mh_steps_default_is_auto() {
     let opts = FitOptions::default();
     assert_eq!(
-        opts.saem_n_mh_steps, 20,
-        "saem_n_mh_steps default changed — see comment above this test \
-             for the basin-trap and block-Ω-collapse regression rationale \
-             before adjusting."
+        opts.saem_n_mh_steps,
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        "saem_n_mh_steps default changed — see comment above this test for the \
+             basin-trap and block-Ω-collapse regression rationale before adjusting."
+    );
+    assert_eq!(
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        0,
+        "the sentinel is 0 — a model file writes it as `n_mh_steps = auto`"
     );
 }
 

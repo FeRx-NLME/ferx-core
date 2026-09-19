@@ -103,5 +103,5 @@ SAEM produces the same output fields as FOCE for IOV: a `KAPPA (IOV) Estimates` 
 - **SAEM is slower than FOCE** for small datasets. Use FOCE by default; switch to SAEM when FOCE fails to converge or produces large shrinkage warnings.
 - **Seed reproducibility**: SAEM draws random samples. Fix `seed` for reproducible output across runs.
 - **`omega_burnin`**: holds the Omega matrix fixed for the first N SAEM iterations while the sampler warms up. Increase to 50 if the parameter traces show early instability.
-- **`n_mh_steps`**: number of Metropolis-Hastings steps per SAEM iteration. 3 is a reasonable default; increase to 5–10 for models with many random effects or strong correlations.
+- **`n_mh_steps`**: number of block Metropolis-Hastings steps per subject per SAEM iteration. Leave it at the default `auto`, which sizes it from the observations per subject per random effect (6–20; see [Choosing `n_mh_steps`](../estimation/saem.qmd#choosing-n_mh_steps)); the `3` in the model above is this example's own deliberately small setting, kept so the page runs quickly. Raise it above the rule's answer for a model with strong random-effect correlations.
 - **Polishing**: for a final production run, add `method = [saem, focei]` to polish the SAEM estimates with FOCEI, which typically improves the OFV by 1–5 units and gives more accurate SE values.

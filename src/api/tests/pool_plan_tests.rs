@@ -502,3 +502,51 @@ fn a_fit_whose_every_start_is_refused_says_why() {
         "the engine's own reason is carried: {err}"
     );
 }
+
+// ── ambient parallel work runs on a ferx pool, not Rayon's global one (#1460) ─
+
+#[test]
+fn work_outside_a_fit_runs_on_a_ferx_pool_of_the_requested_width() {
+    // The regression this exists to catch: a population-wide `par_iter` reached from
+    // outside `fit()` (GAM screening, standalone SIR/covariance, the NCA pass) runs on
+    // whatever pool the calling thread belongs to — off a worker, that is Rayon's global
+    // pool, sized by Rayon at one thread per logical CPU. Measured on a 15-core host
+    // after `configure_global_thread_pool(2)`: the bare `par_iter` ran 15 wide.
+    //
+    // A route back to the ambient pool is caught here on every host except one with
+    // exactly 3 logical CPUs, where Rayon's global width would coincide with the request.
+    // That gap is why the paired `tests/ambient_parallel_work.rs` exists: in a process of
+    // its own it pins the same property against a *declared* width and proves the global
+    // pool was never built at all, which no core count can fake.
+    // Both routes to a pool are exercised, and which one a given width takes is a
+    // property of the host: the shared default pool when it is already that wide (no new
+    // threads at all), a lease from `fit()`'s own cache otherwise. `default_thread_count()`
+    // is the first by construction and `+ 5` cannot be, on any machine.
+    for n in [default_thread_count(), default_thread_count() + 5, 3] {
+        let (index, width) = install_on_pool_sized(n, || {
+            (rayon::current_thread_index(), rayon::current_num_threads())
+        });
+        assert!(
+            index.is_some(),
+            "the closure did not run on a Rayon worker at width {n}"
+        );
+        assert_eq!(width, n, "expected a {n}-worker ferx pool");
+    }
+}
+
+#[test]
+fn work_already_on_a_worker_stays_there_instead_of_nesting_a_pool() {
+    // The other half: reached from inside a fit (or a tool's replicate pool), this must
+    // not lease a second pool underneath the caller's budget — a `PoolPlan` that pinned
+    // one thread per replicate would otherwise get `threads_per_fit` ignored by every
+    // post-fit diagnostic.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let width = pool.install(|| install_on_pool_sized(3, rayon::current_num_threads));
+    assert_eq!(
+        width, 1,
+        "an enclosing pool must be kept, not widened to the requested count"
+    );
+}

@@ -3108,9 +3108,19 @@ pub fn parse_full_model_with(
     // `build_pk_param_fn` so its closure writes the value alongside the canonical
     // PK assignments. Empty (and the map stays `Default`) for ODE models and for
     // the common analytical model with no `RATE=-1`/`-2` dosing.
+    //
+    // Keyed on `uses_ode_param_layout`, **not** `is_ode` (#1358): a compartment-free
+    // model (#811) has `is_ode == false` but no doses at all, so a dose-attribute
+    // name means nothing there — `F1` / `ALAG1` / `D2` are ordinary parameter names
+    // (a factor level, a fraction). Gating on `is_ode` ran this loop against its
+    // placeholder `pk_model` and empty `pk_param_map`, so `F{n}`/`ALAG{n}` hit the
+    // dose-route reject below (about a `pk(...)` model the user never wrote), a
+    // `D{n}`/`R{n}` off the placeholder's one infusable compartment hit the
+    // infusable reject, and `D1`/`R1` were recorded as an analytical modeled dose
+    // at a spare slot `ode_param_slots` never gave them.
     let mut analytical_dose_attr_map = crate::types::DoseAttrMap::default();
     let mut analytical_modeled_slots: Vec<(String, usize)> = Vec::new();
-    if !is_ode {
+    if !uses_ode_param_layout {
         let mut next_slot = crate::types::PK_IDX_LAGTIME + 1;
         for name in &indiv_var_names {
             // Only the modeled-`RATE` attributes (`D{cmt}` duration, `R{cmt}`
@@ -3288,6 +3298,10 @@ pub fn parse_full_model_with(
             &covariate_nns_for_closure,
         )?;
 
+    // The resolved `(pk_slot, var_slot)` pairs, for `pk_indices` below — copied
+    // out before the program is moved into `ode_spec` (#1359).
+    let analytical_pk_var_slots: Vec<(usize, usize)> = indiv_param_program.pk_var_slots.clone();
+
     // Attach the individual-parameter program to the ODE spec (if any) for the
     // analytic-sensitivity η/θ chain (issue #367). The analytical PK provider
     // reads its copy from `indiv_param_partials` (ODE models route to the ODE
@@ -3435,7 +3449,8 @@ pub fn parse_full_model_with(
         ParsedErrorModel::Selected { covariates, .. } => covariates.clone(),
         _ => Vec::new(),
     };
-    let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
+    let (error_model, error_spec) =
+        build_error_spec(parsed_error_model, &sigma_names, is_ode, is_algebraic)?;
     let (residual_correlations, residual_correlation_fixed) =
         build_residual_correlations(&block_sigmas, &sigma_names)?;
     validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
@@ -3621,25 +3636,30 @@ pub fn parse_full_model_with(
     // Build pk_indices: maps each individual parameter (by declaration order)
     // to its PK parameter index. Needed for AD to place values in correct slots.
     let pk_indices: Vec<usize> = if !pk_param_map.is_empty() {
-        // Reverse the pk_param_map: variable_name → pk_param_name
-        let var_to_pk: HashMap<String, String> = pk_param_map
-            .iter()
-            .map(|(pk_name, var_name)| (var_name.to_uppercase(), pk_name.clone()))
-            .collect();
-        // #650: readout-referenced non-structural params get their allocated slot
-        // (so the readout program's `indiv_to_pk` points at the value `pk_param_fn`
-        // writes), instead of aliasing the `CL` slot via the `unwrap_or(0)` below.
-        let extra_slot: HashMap<&str, usize> = readout_extra_slots
-            .iter()
-            .map(|(n, s)| (n.as_str(), *s))
-            .collect();
-        indiv_var_names
-            .iter()
-            .map(|var_name| {
-                var_to_pk
-                    .get(&var_name.to_uppercase())
-                    .and_then(|pk_name| PkParams::name_to_index(pk_name))
-                    .or_else(|| extra_slot.get(var_name.as_str()).copied())
+        // Read the slot off the `(pk_slot, var_slot)` pairs `build_pk_param_fn`
+        // resolved — the same pairs the closure writes and the analytic
+        // sensitivity program carries in `pk_var_slots` — rather than a second,
+        // name-keyed reversal of `pk_param_map`. That reversal was keyed on the
+        // uppercased name, so two declared names differing only in case (`X` and
+        // `x`, bound `f=X, lagtime=x`) collapsed onto one key and both took
+        // whichever slot `HashMap` insertion kept — the #1359 hash-order flip
+        // surviving the one-variable-two-roles reject in another spelling. One
+        // slot per variable is guaranteed by that reject; the pairs arrive in
+        // sorted role-key order, so `find` is deterministic regardless. The #650
+        // readout-referenced non-structural params are already in the pairs
+        // (`build_pk_param_fn` merges `readout_extra_slots`), so they land on
+        // their allocated slot instead of aliasing `CL` via the `unwrap_or(0)`.
+        // The modeled-dose `D{cmt}`/`R{cmt}` pairs (#324) are skipped: they were
+        // never in `pk_param_map`, so this vector has always given them `0`, and
+        // `analytical_supported` keys its FD routing on the slots it sees here —
+        // keeping them out keeps that routing exactly as it was.
+        let modeled: Vec<usize> = analytical_modeled_slots.iter().map(|(_, s)| *s).collect();
+        (0..indiv_var_names.len())
+            .map(|var_slot| {
+                analytical_pk_var_slots
+                    .iter()
+                    .find(|&&(slot, vs)| vs == var_slot && !modeled.contains(&slot))
+                    .map(|&(slot, _)| slot)
                     .unwrap_or(0)
             })
             .collect()
@@ -4778,7 +4798,8 @@ pub fn parse_full_model_with(
     // TV-covariate / `TIME` / IOV / SS / infusion subject rerouted — invisible to the model
     // author and to the parse tests. Three point guards in `absorption_ode_equivalent_source`
     // were added one-per-incident for exactly this (`f=V1` slot collision, `[adaptive_dosing]`
-    // re-emission, a dose-attribute param in a disposition role); this makes the class
+    // re-emission, a dose-attribute param in a disposition role — the last since retired, as
+    // #1359 rejects that binding at parse time); this makes the class
     // structurally unreachable, so a *new* ODE-only check cannot re-arm it.
     //
     // Declining is the standing policy of the desugar, and it is not silent-wrong: without a
@@ -5038,19 +5059,28 @@ pub fn parse_full_model_with(
     // `alag`) are applied to the dose by the engine without ever appearing in the
     // RHS, so their textual absence does not make them dead (#315). Analytical
     // models bind F/lagtime only via an explicit `pk(...)` mapping, which the
-    // census counts, so they need no carve-out there. Pure-TTE models (no `pk(...)`,
-    // no `[odes]`) are skipped: their params live in named `[event_model LABEL]`
-    // blocks, which the census deliberately does not tokenize (see below).
+    // census counts, so they need no carve-out there. Compartment-free models
+    // (#811) run it too (#1443): their equations were moved into the unnamed
+    // `scaling` block by `apply_algebraic_structural`, so a parameter the readout
+    // reads is counted there, and with no doses there is no dose-attribute
+    // carve-out at all. Endpoint-only models (no `pk(...)`, no `[odes]`, no
+    // compartment-free block) are skipped: they carry no `[individual_parameters]`
+    // block, and their params live in named `[event_model LABEL]` blocks, which the
+    // census deliberately does not tokenize (see below).
     //
     // A raw-text census (rather than resolving against the parsed ASTs) is the
     // deliberate choice: it covers *every* block uniformly — including ones whose
     // references aren't retained as walkable ASTs at this point (`[output]`,
     // `[scaling]`, …) — so it cannot false-positive by overlooking a usage site.
-    // It iterates `blocks.values()` = the *unnamed* blocks only; this is safe
-    // because individual-parameter names are confined to unnamed blocks (named
-    // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
-    // covariates, never indiv params — so a param can't be "used" solely there).
-    if !pk_param_map.is_empty() || is_ode {
+    // It iterates `blocks.values()` = the *unnamed* blocks only. `[covariate_nn
+    // NAME]` blocks reference thetas/etas/covariates, never indiv params. A named
+    // `[event_model LABEL]` / `[binary_model LABEL]` predictor CAN read an
+    // individual parameter (`restrict_and_validate_indiv_stmts` keeps exactly the
+    // statements it reads), and those blocks are not tokenised here — so a
+    // parameter read *only* by a named endpoint block is reported dead. That is a
+    // pre-existing false positive of this census (joint `pk`/ODE + named hazard),
+    // reachable for compartment-free models too since #1443; tracked in #1455.
+    if !pk_param_map.is_empty() || is_ode || is_algebraic {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for lines in blocks.values() {
@@ -5090,9 +5120,13 @@ pub fn parse_full_model_with(
             //    NOT exempt here: the analytical engine binds F/lag only via an
             //    explicit `pk(...)` mapping (which the census counts), so an
             //    unmapped `F1` really is dead.
+            //  * compartment-free models: nothing — no dose is ever applied, so no
+            //    name is load-bearing without a textual reference (#1443).
             .filter(|(i, name)| {
                 use crate::types::DoseAttr;
-                let exempt = if is_ode {
+                let exempt = if is_algebraic {
+                    false
+                } else if is_ode {
                     ode_slot_map
                         .get(*i)
                         .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
@@ -5120,8 +5154,15 @@ pub fn parse_full_model_with(
                 ("are", "they", "them", "have")
             };
             // Shared scaffold; only the cause clause and the remediation hint
-            // differ between analytical (`pk(...)`) and ODE models.
-            let (cause, fix) = if is_ode {
+            // differ between analytical (`pk(...)`), ODE and compartment-free models.
+            let (cause, fix) = if is_algebraic {
+                (
+                    "not referenced in the [structural_model] equations or any other block",
+                    format!(
+                        "Reference {obj} in [structural_model] (or [derived]/[output]) or remove {obj}."
+                    ),
+                )
+            } else if is_ode {
                 (
                     "not referenced in the [odes] RHS or any other block",
                     format!(
@@ -8838,7 +8879,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
         "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
-        "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
+        // `auto` (the default) sizes the block kernel from the dataset — see
+        // `estimation::saem::auto_n_mh_steps` (#1459). It is spelled out here
+        // rather than left as a bare 0 so a model file can say what it means.
+        "n_mh_steps" => {
+            opts.saem_n_mh_steps = if value.eq_ignore_ascii_case("auto") {
+                crate::estimation::saem::SAEM_N_MH_STEPS_AUTO
+            } else {
+                parse_usize("n_mh_steps")?
+            }
+        }
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "scale_adaptation" | "saem_scale_adaptation" => {
@@ -10865,22 +10915,14 @@ fn absorption_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<Strin
         .get("lagtime")
         .or_else(|| roles.get("alag"))
         .map(String::as_str);
-    // #993 companion to the guard above. That one asks "is this reserved-name param the
-    // intended mapping for its slot?"; it never asks whether the same param *also* fills a
-    // disposition role. `pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)` passes it — `F`
-    // is the `f=` mapping — but the twin then emits `d/dt(central) = … − (CL/F) * central`
-    // and `obs_scale = F`, reading a name `ode_param_slots` routes to the F slot. That is a
-    // dose-attribute double use, so the twin's own parse rejects it. Decline here, per this
-    // function's standing policy: keep the model closed-form. (Since #1008 an unguarded case
-    // like this no longer panics — the attach site declines the twin and warns — but naming
-    // the case here keeps the *reason* for the decline specific instead of generic.)
-    if disposition
-        .iter()
-        .filter_map(|role| roles.get(*role))
-        .any(|p| Some(p.as_str()) == f_param || Some(p.as_str()) == lag_param)
-    {
-        return None;
-    }
+    // A dose-attribute parameter that *also* fills a disposition role
+    // (`pk one_cpt_transit(cl=CL, v=F, n=N, mtt=MTT, f=F)`) used to need its own
+    // decline here (#993 companion): the twin emitted `d/dt(central) = … − (CL/F) *
+    // central` reading a name `ode_param_slots` routes to the F slot, a double use
+    // its own parse rejects. Since #1359 one variable under two PK roles is a parse
+    // error in `build_pk_param_fn`, so the primary never reaches the twin build and
+    // the guard would be a second gate covering the same input — removed rather than
+    // left to mask the first (`one_variable_bound_to_two_pk_roles_is_rejected_*`).
     let mut twin_param_names: Vec<String> = Vec::new();
     if let Some(ip_lines) = extracted.unnamed.get("individual_parameters") {
         for line in ip_lines {
@@ -11650,11 +11692,12 @@ fn analytical_dose_attr_slot_map(
     indiv_var_names: &[String],
 ) -> Vec<usize> {
     let mut slots = vec![usize::MAX; indiv_var_names.len()];
-    // Iterate in sorted key order. `pk_param_map` is a `HashMap`, and a parameter
-    // bound to *both* roles (`pk(..., f=X, lagtime=X)`) is written twice — so with
-    // arbitrary iteration order the surviving slot, and therefore the diagnostic
-    // `check_dose_attr_double_use` emits, differed between runs of the identical
-    // model. Same reason `build_pk_param_fn` sorts its `pk_entries`.
+    // Iterate in sorted key order. `pk_param_map` is a `HashMap`; a parameter
+    // bound to *both* roles (`pk(..., f=X, lagtime=X)`) used to be written twice
+    // here, so the surviving slot — and the diagnostic `check_dose_attr_double_use`
+    // emitted — differed between runs of the identical model. That binding is now
+    // a parse error in `build_pk_param_fn` (#1359), which runs first; the sort
+    // stays so this map never depends on iteration order again.
     let mut entries: Vec<(&String, &String)> = pk_param_map.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (key, value) in entries {
@@ -15934,6 +15977,13 @@ fn apply_algebraic_structural(extracted: &mut ExtractedBlocks) -> Result<(), Str
             "diffusion",
             "adds SDE diffusion to compartment states, and this model has none",
         ),
+        // #1443: the controller emits doses into compartments; with none there is
+        // nothing for a dose to land in. Rejected by name so the `observe` check
+        // never runs its analytical dose-attribute arm on a placeholder `pk_model`.
+        (
+            "adaptive_dosing",
+            "emits doses into compartments, and this model has none",
+        ),
     ] {
         if extracted.unnamed.contains_key(block) {
             return Err(format!(
@@ -17173,6 +17223,10 @@ fn build_error_spec(
     parsed: ParsedErrorModel,
     sigma_names: &[String],
     is_ode: bool,
+    // Only read to word the per-CMT reject: a compartment-free model (#811) has
+    // one prediction and no compartments, which is a different reason for the
+    // same reject than "the analytical closed form has a single output" (#1443).
+    is_algebraic: bool,
 ) -> Result<(ErrorModel, ErrorSpec), String> {
     match parsed {
         ParsedErrorModel::Single(model, args, _exponent) => {
@@ -17276,12 +17330,18 @@ fn build_error_spec(
             // An empty PerCmt arises for TTE-only models (no [error_model] block) —
             // allow it regardless of is_ode.  Non-empty PerCmt still requires ODE.
             if !entries.is_empty() && !is_ode {
-                return Err(
+                return Err(if is_algebraic {
+                    "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
+                     [structural_model]; a compartment-free ($PRED-equivalent) model has \
+                     one prediction and no compartments to key an error model on, so it \
+                     takes a single error model (`DV ~ ...`)."
+                        .to_string()
+                } else {
                     "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
                      [structural_model]; analytical PK models support a single error \
                      model only."
-                        .to_string(),
-                );
+                        .to_string()
+                });
             }
             let mut map = HashMap::new();
             let mut representative = None;
@@ -17758,14 +17818,27 @@ fn pk_mapped_value_display(value: &str) -> &str {
     }
 }
 
-/// Noun for a PK slot, for the conflicting-alias diagnostic (#1048). Only the
-/// three slots reachable under two role spellings can produce that error; the
-/// fallback exists so a future alias pair cannot make the message nonsense.
+/// Noun for a PK slot, for the conflicting-alias diagnostic (#1048) and the
+/// one-variable-two-roles diagnostic (#1359). #1048 can only reach the three
+/// slots with two role spellings; #1359 can reach any pair, so every slot
+/// [`PkParams::name_to_index`] hands out has a noun. The fallback exists so a
+/// future slot cannot make the message nonsense.
 fn pk_slot_noun(slot: usize) -> &'static str {
+    use crate::types::*;
     match slot {
-        crate::types::PK_IDX_V => "the central volume",
-        crate::types::PK_IDX_Q => "the inter-compartmental clearance",
-        crate::types::PK_IDX_LAGTIME => "the absorption lag time",
+        PK_IDX_CL => "the clearance",
+        PK_IDX_V => "the central volume",
+        PK_IDX_Q => "the inter-compartmental clearance",
+        PK_IDX_V2 => "the peripheral volume",
+        PK_IDX_KA => "the absorption rate constant",
+        PK_IDX_F => "the bioavailability",
+        PK_IDX_Q3 => "the second inter-compartmental clearance",
+        PK_IDX_V3 => "the second peripheral volume",
+        PK_IDX_LAGTIME => "the absorption lag time",
+        PK_IDX_N => "the transit compartment count",
+        PK_IDX_MTT => "the mean transit time",
+        PK_IDX_MAT => "the mean absorption time",
+        PK_IDX_CV2 => "the absorption-time relative dispersion (CV²)",
         _ => "the same PK parameter",
     }
 }
@@ -17904,6 +17977,16 @@ fn build_pk_param_fn(
     // that agree (`lagtime=X, alag=X`) are merely redundant and stay legal, so
     // the `analytical_role_binding` tie-break still has a case to tie-break.
     let mut slot_seen: HashMap<usize, (&str, &str, PkSlotBinding)> = HashMap::new();
+    // #1359: the converse of #1048 — one *variable* under two role keys that
+    // land on two different slots (`f=X, lagtime=X`). `pk_param_fn` writes both
+    // slots, but `pk_indices` holds one slot per declared name, built by
+    // reversing `pk_param_map` into a `HashMap` keyed by variable — so only one
+    // role survives there, chosen by the per-process hash seed, and
+    // `has_lagtime()` / `has_bioavailability()` flip between parses of the
+    // identical file (measured: `[0, 1, 4, 5]` or `[0, 1, 4, 8]` over 64 parses)
+    // while the lag is applied every time. Keyed by *var slot*, not name, so the
+    // lowercase compat lookup (`f=x, lagtime=X`) collides the way it binds.
+    let mut var_seen: HashMap<usize, (&str, &str, usize)> = HashMap::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -17991,6 +18074,27 @@ fn build_pk_param_fn(
             continue;
         }
         slot_seen.insert(pk_slot, (pk_name.as_str(), var_name.as_str(), binding));
+        if let PkSlotBinding::Var(var_slot) = binding {
+            if let Some(&(prev_key, prev_val, prev_slot)) = var_seen.get(&var_slot) {
+                // `slot_seen` already collapsed a same-slot alias pair, so a
+                // repeat here is always a second, *different* slot. Both mappings
+                // are quoted as the file spells them — under the compat lookup
+                // `f=X, lagtime=x` the two spellings differ.
+                debug_assert_ne!(prev_slot, pk_slot);
+                return Err(format!(
+                    "[structural_model]: `{prev_key}={prev_val}` and `{pk_name}={var_name}` \
+                     bind one parameter to two different PK roles ({} and {}). Each \
+                     role needs its own [individual_parameters] variable — e.g. \
+                     `{pk_name}={var_name}_{}` with `{var_name}_{} = {var_name}` \
+                     declared in the block.",
+                    pk_slot_noun(prev_slot),
+                    pk_slot_noun(pk_slot),
+                    pk_name.to_uppercase(),
+                    pk_name.to_uppercase(),
+                ));
+            }
+            var_seen.insert(var_slot, (pk_name.as_str(), var_name.as_str(), pk_slot));
+        }
         match (var_slot, binding) {
             // `Var` and `Time` both come from a resolved individual parameter
             // (the TIME desugaring declares its synthetic one), so the slot write
@@ -18001,6 +18105,13 @@ fn build_pk_param_fn(
         }
     }
     let is_analytical_pk = !pk_param_map.is_empty();
+    // Literal-bound slots, so `CompiledModel::has_lagtime` can see a
+    // `lagtime=0.5` that no variable carries (#1359 follow-up). Sorted: the
+    // entries arrived in role-key order, which is not slot order. Taken here,
+    // before the closure below moves `pk_const_mapping`.
+    let mut indiv_partials = indiv_partials;
+    indiv_partials.const_pk_slots = pk_const_mapping.iter().map(|&(slot, _)| slot).collect();
+    indiv_partials.const_pk_slots.sort_unstable();
 
     // #650: merge readout-referenced non-structural individual parameters into the
     // structural mapping, so they are written by the closure below AND land in the
@@ -24548,6 +24659,17 @@ pub struct IndivParamPartials {
     pub(crate) indiv_param_program: Option<IndivParamProgram>,
     /// Additive parser metadata kept behind this existing opaque public field.
     pub(crate) theta_blocks: ThetaBlocks,
+    /// PK slots an analytical `pk(...)` line binds to a numeric **literal**
+    /// (`lagtime=0.5`, `f=0.8`), in ascending slot order. Such a binding writes
+    /// the slot through `pk_const_mapping` but has no `[individual_parameters]`
+    /// variable, so nothing in `pk_indices` records it — the model-level
+    /// predicates ([`crate::CompiledModel::has_lagtime`]) read it from here
+    /// (#1359 follow-up: with a literal lag `has_lagtime()` was `false`, and the
+    /// analytic sensitivity provider ran the lag-free walk against a production
+    /// predictor that applied the lag — measured 120 % apart at the first
+    /// post-dose sample). Empty for ODE / compartment-free models and for
+    /// hand-built fixtures.
+    pub(crate) const_pk_slots: Vec<usize>,
 }
 
 impl IndivParamPartials {
@@ -24562,7 +24684,14 @@ impl IndivParamPartials {
             d_d_eta: Vec::new(),
             indiv_param_program: None,
             theta_blocks: ThetaBlocks::empty(),
+            const_pk_slots: Vec::new(),
         }
+    }
+
+    /// PK slots bound to a numeric literal on the `pk(...)` line — see the
+    /// field doc on `const_pk_slots`.
+    pub(crate) fn const_pk_slots(&self) -> &[usize] {
+        &self.const_pk_slots
     }
 }
 
@@ -24660,6 +24789,7 @@ fn build_indiv_param_partials(
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,
         theta_blocks: ThetaBlocks::empty(),
+        const_pk_slots: Vec::new(),
     }
 }
 

@@ -91,13 +91,35 @@ use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Su
 /// NLME integrand.
 pub const MAX_AGQ_NODES: usize = 21;
 
-static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
+static GAUSS_HERMITE_RULES: [OnceLock<(Vec<f64>, Vec<f64>, Vec<f64>)>; MAX_AGQ_NODES] =
     [const { OnceLock::new() }; MAX_AGQ_NODES];
 
-fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64]) {
+fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64], &'static [f64]) {
     assert!((1..=MAX_AGQ_NODES).contains(&n));
-    let (nodes, weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| gauss_hermite(n));
-    (nodes, weights)
+    let (nodes, weights, log_weights) = GAUSS_HERMITE_RULES[n - 1].get_or_init(|| {
+        let (nodes, weights) = gauss_hermite(n);
+        let log_weights = weights.iter().map(|w| w.ln()).collect();
+        (nodes, weights, log_weights)
+    });
+    (nodes, weights, log_weights)
+}
+
+fn cached_log_weights_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_AGQ_LOG_WEIGHT_CACHE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
+fn laplace_one_point_fast_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_ONE_POINT_FAST")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
 }
 
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
@@ -292,7 +314,8 @@ static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
 /// to the gradient requested by the same optimizer callback.
 struct PreparedGrid {
     h: DMatrix<f64>,
-    bs: Vec<Vec<f64>>,
+    /// Row-major quadrature modes (`n_grid × d`) in one allocation.
+    bs: Vec<f64>,
     softmax: Vec<f64>,
     base_jet: Option<SubjectSens>,
 }
@@ -709,6 +732,7 @@ pub(crate) fn agq_subject_nll(
         anchor,
         false,
         schedule,
+        None,
     )
     .0
 }
@@ -733,6 +757,7 @@ fn agq_subject_evaluate(
     anchor: HessianAnchor,
     retain_gradient_work: bool,
     schedule: Option<&pk::event_driven::EventSchedule>,
+    terminal_hessian: Option<&DMatrix<f64>>,
 ) -> (f64, Option<PreparedGrid>) {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
@@ -751,7 +776,21 @@ fn agq_subject_evaluate(
         return (nll, None);
     }
 
-    let anchor_work = if retain_gradient_work {
+    let anchor_work = if !retain_gradient_work && matches!(anchor, HessianAnchor::Exact) {
+        terminal_hessian.cloned().map(|h| (h, None)).or_else(|| {
+            anchor_hessian(
+                anchor,
+                model,
+                subject,
+                params,
+                stack,
+                b_hat,
+                &mut scratch,
+                schedule,
+            )
+            .map(|h| (h, None))
+        })
+    } else if retain_gradient_work {
         anchor_hessian_and_base_jet(
             anchor,
             model,
@@ -788,6 +827,20 @@ fn agq_subject_evaluate(
     let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
         return (NLL_SENTINEL, None);
     };
+
+    // One-point AGQ is Laplace exactly.  Avoid constructing the one-element tensor
+    // grid and its coordinate/work vectors on objective-only evaluations: at z=0
+    // the transformed node is b_hat, while the sqrt(PI) rule weight cancels the
+    // d/2*log(PI) normalization term algebraically.
+    if nodes.len() == 1 && !retain_gradient_work && laplace_one_point_fast_enabled() {
+        let mode_nll = stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule);
+        let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
+        return if nll.is_finite() {
+            (nll, None)
+        } else {
+            (NLL_SENTINEL, None)
+        };
+    }
 
     let (bs, terms) = agq_nodes_and_terms(
         model,
@@ -838,12 +891,12 @@ fn agq_nodes_and_terms(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     retain_nodes: bool,
-) -> (Vec<Vec<f64>>, Vec<f64>) {
+) -> (Vec<f64>, Vec<f64>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
     let mut bs = if retain_nodes {
-        Vec::with_capacity(cap)
+        Vec::with_capacity(cap * d)
     } else {
         Vec::new()
     };
@@ -894,7 +947,7 @@ fn agq_nodes_and_terms(
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
         if retain_nodes {
-            bs.push(b.clone());
+            bs.extend_from_slice(&b);
         }
 
         // Mixed-radix increment over the d-dimensional tensor grid.
@@ -1038,17 +1091,23 @@ pub fn agq_population_nll(
     anchor: HessianAnchor,
 ) -> f64 {
     agq_population_nll_impl(
-        model, population, params, eta_hats, kappas, n_nodes, anchor, None,
+        model, population, params, eta_hats, kappas, n_nodes, anchor, None, None,
     )
 }
 
-/// Same objective as [`agq_population_nll`], but with a caller-hoisted
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`] so every subject's
-/// per-eval schedule rebuild is skipped in favor of the one built for the whole fit.
-/// Used only by the FOCEI/Laplace/AGQ outer hot loop (`outer_optimizer.rs`); every other
-/// caller goes through [`agq_population_nll`] and pays the per-call rebuild.
+/// Same objective as [`agq_population_nll`], for the FOCEI/Laplace/AGQ outer hot loop
+/// (`outer_optimizer.rs`): a caller-hoisted
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`] skips every subject's
+/// per-eval schedule rebuild, and `terminal_hessians` — each subject's exact conditional
+/// Hessian retained from its inner solve (`EbeResult::terminal_hessian`) — replaces the
+/// anchor recomputation under [`HessianAnchor::Exact`]. Either may be `None`; every other
+/// caller goes through [`agq_population_nll`] and pays both.
+///
+/// A retained Hessian is trusted verbatim, so the producer must guarantee it is the matrix
+/// `anchor_hessian(Exact)` would compute at `eta_hats[i]` — `analytic_terminal_work` gates
+/// on the same `analytic_score_supported` predicate for exactly that reason.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn agq_population_nll_with_schedules(
+pub(crate) fn agq_population_nll_prepared(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -1056,7 +1115,8 @@ pub(crate) fn agq_population_nll_with_schedules(
     kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
     anchor: HessianAnchor,
-    schedules: &[Option<pk::event_driven::EventSchedule>],
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
 ) -> f64 {
     agq_population_nll_impl(
         model,
@@ -1066,7 +1126,8 @@ pub(crate) fn agq_population_nll_with_schedules(
         kappas,
         n_nodes,
         anchor,
-        Some(schedules),
+        schedules,
+        terminal_hessians,
     )
 }
 
@@ -1080,9 +1141,16 @@ fn agq_population_nll_impl(
     n_nodes: usize,
     anchor: HessianAnchor,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
 ) -> f64 {
-    let (nodes, weights) = cached_gauss_hermite(n_nodes);
-    let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
+    let uncached_log_weights;
+    let log_weights = if cached_log_weights_enabled() {
+        cached_log_weights
+    } else {
+        uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
+        &uncached_log_weights
+    };
     let per_subject: Vec<f64> = population
         .subjects
         .par_iter()
@@ -1092,17 +1160,20 @@ fn agq_population_nll_impl(
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let schedule = schedules.and_then(|s| s[i].as_ref());
-            agq_subject_nll(
+            agq_subject_evaluate(
                 model,
                 subject,
                 params,
                 &stack,
                 &b_hat,
                 nodes,
-                &log_weights,
+                log_weights,
                 anchor,
+                false,
                 schedule,
+                terminal_hessians.and_then(|all| all[i].as_ref()),
             )
+            .0
         })
         .collect();
     per_subject.iter().sum()
@@ -1133,7 +1204,7 @@ pub(crate) fn agq_population_evaluate(
 
 /// Same evaluation as [`agq_population_evaluate`], but with a caller-hoisted
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`] — see
-/// [`agq_population_nll_with_schedules`]. Used only by the FOCEI/Laplace/AGQ outer hot loop.
+/// [`agq_population_nll_prepared`]. Used only by the FOCEI/Laplace/AGQ outer hot loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_population_evaluate_with_schedules(
     model: &CompiledModel,
@@ -1211,6 +1282,7 @@ fn agq_population_evaluate_impl(
                 anchor,
                 true,
                 schedule,
+                None,
             );
             let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
             let score = context.score_with_prepared(
@@ -1755,7 +1827,7 @@ fn grid_response_correction(
     b_hat: &[f64],
     nodes: &[f64],
     log_weights: &[f64],
-    bs: &[Vec<f64>],
+    bs: &[f64],
     softmax: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
@@ -1764,6 +1836,7 @@ fn grid_response_correction(
 ) -> Option<()> {
     use crate::estimation::parameterization::packed_fixed_mask;
 
+    let d = stack.d();
     let fixed = packed_fixed_mask(template);
 
     // `H = ∂²nll/∂η²|_{η̂(x)}` depends on `x` **twice**: explicitly through θ/Ω/σ, and
@@ -1787,7 +1860,7 @@ fn grid_response_correction(
     let mult = model.ruv_obs_mult(subject, &params.theta);
     let err_keys = model.error_spec.obs_keys(subject);
     let node_grads: Option<Vec<Vec<f64>>> = if parallel_grid {
-        bs.par_iter()
+        bs.par_chunks(d)
             .map_init(
                 || {
                     (
@@ -1817,7 +1890,7 @@ fn grid_response_correction(
         let mut obs_grad_recycle = Vec::new();
         let mut eta_work = DVector::zeros(model.n_eta);
         let mut prior_work = DVector::zeros(model.n_eta);
-        bs.iter()
+        bs.chunks_exact(d)
             .map(|b| {
                 node_nll_gradient(
                     model,
@@ -2574,7 +2647,7 @@ fn finish_agq_subject_gradient(
     anchor: HessianAnchor,
     parallel_grid: bool,
     h: &DMatrix<f64>,
-    bs: &[Vec<f64>],
+    bs: &[f64],
     softmax: &[f64],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
@@ -2582,26 +2655,29 @@ fn finish_agq_subject_gradient(
     out: &mut [f64],
 ) -> Option<()> {
     if parallel_grid {
-        let node_scores: Option<Vec<Vec<f64>>> = bs
-            .par_iter()
+        let d = stack.d();
+        let score_width = out.len();
+        let mut node_scores = vec![0.0; softmax.len() * score_width];
+        node_scores
+            .par_chunks_mut(score_width)
+            .zip(bs.par_chunks(d))
             .zip(softmax.par_iter())
-            .map(|(b_j, &w)| {
-                let mut score = vec![0.0; out.len()];
+            .try_for_each(|((score, b_j), &w)| {
                 if w != 0.0 {
                     accumulate_fixed_eta_packed_gradient(
-                        model, subject, params, template, stack, b_j, w, &mut score,
+                        model, subject, params, template, stack, b_j, w, score,
                     )?;
                 }
-                Some(score)
-            })
-            .collect();
-        for score in node_scores? {
+                Some(())
+            })?;
+        // Preserve the former node-major summation order exactly.
+        for score in node_scores.chunks_exact(score_width) {
             for (dst, value) in out.iter_mut().zip(score) {
-                *dst += value;
+                *dst += *value;
             }
         }
     } else {
-        for (b_j, &w) in bs.iter().zip(softmax.iter()) {
+        for (b_j, &w) in bs.chunks_exact(stack.d()).zip(softmax.iter()) {
             if w == 0.0 {
                 continue; // exp underflow — contributes nothing to the average
             }
@@ -2661,7 +2737,8 @@ impl<'a> SubjectScoreContext<'a> {
         bounds: &'a crate::estimation::parameterization::PackedBounds,
         force_fd: bool,
     ) -> Self {
-        let (nodes, weights) = cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
+        let (nodes, weights, _) =
+            cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
         Self {
             model,
             template,
@@ -3091,7 +3168,7 @@ mod tests {
         let mut eta_work = DVector::zeros(model.n_eta);
         let mut prior_work = DVector::zeros(model.n_eta);
         let node_grads: Vec<Vec<f64>> = bs
-            .iter()
+            .chunks_exact(stack.d())
             .map(|b| {
                 node_nll_gradient(
                     &model,
@@ -3582,7 +3659,7 @@ mod tests {
                 let mut eta_work = DVector::zeros(model.n_eta);
                 let mut prior_work = DVector::zeros(model.n_eta);
                 let node_grads: Vec<Vec<f64>> = bs
-                    .iter()
+                    .chunks_exact(stack.d())
                     .map(|b| {
                         node_nll_gradient(
                             &model,
@@ -4209,13 +4286,15 @@ mod tests {
 
     #[test]
     fn cached_gauss_hermite_reuses_the_exact_rule_storage() {
-        let (nodes_a, weights_a) = cached_gauss_hermite(3);
-        let (nodes_b, weights_b) = cached_gauss_hermite(3);
+        let (nodes_a, weights_a, logs_a) = cached_gauss_hermite(3);
+        let (nodes_b, weights_b, logs_b) = cached_gauss_hermite(3);
         assert!(std::ptr::eq(nodes_a.as_ptr(), nodes_b.as_ptr()));
         assert!(std::ptr::eq(weights_a.as_ptr(), weights_b.as_ptr()));
+        assert!(std::ptr::eq(logs_a.as_ptr(), logs_b.as_ptr()));
         let (expected_nodes, expected_weights) = gauss_hermite(3);
         assert_eq!(nodes_a, expected_nodes);
         assert_eq!(weights_a, expected_weights);
+        assert_eq!(logs_a, weights_a.iter().map(|w| w.ln()).collect::<Vec<_>>());
     }
 
     /// Weights sum to `√π = ∫ e^{−x²} dx`, and the rule is exact for polynomials up to
@@ -4470,9 +4549,11 @@ mod tests {
         assert_eq!(grid_size(21, 50), usize::MAX);
     }
 
-    /// `agq_population_nll_with_schedules` / `agq_population_evaluate_with_schedules` must be
+    /// `agq_population_nll_prepared` / `agq_population_evaluate_with_schedules` must be
     /// bit-identical to the uncached `agq_population_nll` / `agq_population_evaluate` they
-    /// wrap. Mixes a subject with an `EVID 3/4` reset (`cacheable_schedule` returns `Some`)
+    /// wrap — with the schedule cache alone, and with the terminal Hessians the inner solve
+    /// actually retains (`analytic_terminal_work`, the production producer; not
+    /// `anchor_hessian` fed back into itself, which would only assert `f(x) == f(x)`). Mixes a subject with an `EVID 3/4` reset (`cacheable_schedule` returns `Some`)
     /// and one with neither a reset nor a time-varying covariate (`None`) in the same
     /// population, since that mix is what would expose the cache's per-subject index ever
     /// drifting out of alignment with `population.subjects`.
@@ -4535,7 +4616,7 @@ mod tests {
             };
             let uncached_nll =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
-            let cached_nll = agq_population_nll_with_schedules(
+            let cached_nll = agq_population_nll_prepared(
                 &model,
                 &population,
                 &params,
@@ -4543,13 +4624,67 @@ mod tests {
                 &kappas,
                 3,
                 anchor,
-                &schedules,
+                Some(&schedules),
+                None,
             );
             assert_eq!(
                 uncached_nll.to_bits(),
                 cached_nll.to_bits(),
                 "{anchor:?}: cached population NLL diverged from the uncached rebuild"
             );
+            if matches!(anchor, HessianAnchor::Exact) {
+                let terminal_hessians: Vec<_> = population
+                    .subjects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, subject)| {
+                        let retained = crate::estimation::inner_optimizer::analytic_terminal_work(
+                            &model,
+                            subject,
+                            &params,
+                            eta_hats[i].as_slice(),
+                        )
+                        .map(|(_, h)| h)
+                        .expect("in-scope Gaussian subject retains a terminal Hessian");
+                        // The retained matrix must be *the* anchor, not merely close to it:
+                        // the objective trusts it verbatim in place of `anchor_hessian`.
+                        let stack = Stack::new(&model, &params, 0);
+                        let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+                        let anchored = anchor_hessian(
+                            anchor,
+                            &model,
+                            subject,
+                            &params,
+                            &stack,
+                            eta_hats[i].as_slice(),
+                            &mut scratch,
+                            schedules[i].as_ref(),
+                        )
+                        .expect("exact anchor always yields a matrix");
+                        assert_eq!(
+                            retained, anchored,
+                            "subject {i}: retained terminal Hessian is not the exact anchor"
+                        );
+                        Some(retained)
+                    })
+                    .collect();
+                let reused = agq_population_nll_prepared(
+                    &model,
+                    &population,
+                    &params,
+                    &eta_hats,
+                    &kappas,
+                    3,
+                    anchor,
+                    Some(&schedules),
+                    Some(&terminal_hessians),
+                );
+                assert_eq!(
+                    cached_nll.to_bits(),
+                    reused.to_bits(),
+                    "terminal Hessian reuse changed the exact-anchor objective"
+                );
+            }
 
             let uncached_eval = agq_population_evaluate(
                 &model,

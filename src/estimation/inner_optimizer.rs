@@ -453,6 +453,10 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
+    /// Exact conditional eta Hessian at the returned mode when the second-order
+    /// sensitivity provider can produce it.  Laplace/AGQ may reuse this instead
+    /// of immediately repeating the same `Dual2` evaluation.
+    pub(crate) terminal_hessian: Option<DMatrix<f64>>,
     /// True when the optimizer (BFGS or Nelder-Mead) met its tolerance criterion.
     /// False on iteration-limit exit regardless of which optimizer was used.
     pub converged: bool,
@@ -472,6 +476,282 @@ pub struct EbeResult {
     /// OFV. Unlike plain non-convergence this forces rejection regardless of
     /// `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
     pub hard_reject: bool,
+}
+
+/// Positive conditional Gauss–Newton metric for dense-BFGS initialization.
+/// The common diagonal-Gaussian path needs only `f` and `df/deta`, so use the
+/// light inner provider rather than paying for the full theta/mixed `Dual2` jet.
+/// Special residual/FREM cases retain the full-provider fallback.
+#[allow(clippy::too_many_arguments)]
+fn analytic_inner_seed_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
+    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    exact: bool,
+) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
+    if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        return None;
+    }
+    // The light path fuses the first BFGS gradient, so it must assemble exactly the
+    // terms `analytic_eta_nll_gradient_with_schedule` does. Everything that routine
+    // routes elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only
+    // subject) declines here to the full provider, whose seed carries no gradient.
+    #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+    let mut light_supported = model.residual_error_eta.is_none()
+        && params.residual_correlations.is_empty()
+        && model.frem_config.is_none()
+        && !subject.obs_times.is_empty();
+    // A CTMM subject's inner gradient carries the `ctmm_subject_eta_grad` block on top of
+    // the Gaussian one; this loop does not fold it, so a fused gradient here would hand
+    // BFGS the gradient of a different objective than `obj` scores.
+    #[cfg(feature = "markov")]
+    {
+        light_supported = light_supported && !model.has_ctmm();
+    }
+    if light_supported && !exact {
+        let hint = std::mem::take(obs_grad_recycle);
+        if let Some(sens) = crate::sens::provider::subject_eta_grad_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            schedule,
+            hint,
+        ) {
+            let mut htilde = params.omega.inv.clone();
+            let mut gradient = vec![0.0; model.n_eta];
+            let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+            let mut valid = sens.len() == subject.observations.len();
+            for (j, obs) in sens.iter().enumerate() {
+                if !valid || obs.df_deta.len() != model.n_eta {
+                    valid = false;
+                    break;
+                }
+                let mult_row = mult.and_then(|rows| rows.get(j)).map(Vec::as_slice);
+                let (r, d, d2) = crate::stats::residual_error::residual_rd2(
+                    &model.error_spec,
+                    err_keys[j],
+                    obs.f,
+                    &params.sigma.values,
+                    mult_row,
+                );
+                if !(r.is_finite() && r > 0.0) {
+                    valid = false;
+                    break;
+                }
+                // Same rule as the ordinary gradient: a CENS flag is a censored kernel
+                // only under `bloq_method = m3`; otherwise the row scores Gaussian.
+                let cens = if m3 {
+                    subject.cens.get(j).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                let Some((coef, _)) = residual_inner_obs(
+                    model,
+                    err_keys[j],
+                    subject.observations[j],
+                    obs.f,
+                    &params.sigma.values,
+                    mult_row,
+                    1.0,
+                    false,
+                    cens,
+                ) else {
+                    valid = false;
+                    break;
+                };
+                let p = if m3 && cens != 0 {
+                    crate::stats::special::m3_censored_outer(
+                        subject.observations[j],
+                        obs.f,
+                        r,
+                        d,
+                        d2,
+                        cens,
+                    )
+                    .1
+                } else {
+                    crate::estimation::sens_outer_gradient::err_terms(
+                        r,
+                        d,
+                        d2,
+                        subject.observations[j] - obs.f,
+                    )
+                    .p
+                };
+                if !p.is_finite() {
+                    valid = false;
+                    break;
+                }
+                for k in 0..model.n_eta {
+                    gradient[k] += coef * obs.df_deta[k];
+                    for l in 0..model.n_eta {
+                        htilde[(k, l)] += p * obs.df_deta[k] * obs.df_deta[l];
+                    }
+                }
+            }
+            *obs_grad_recycle = sens;
+            if valid && htilde.iter().all(|v| v.is_finite()) {
+                let prior = &params.omega.inv * DVector::from_column_slice(eta);
+                for (g, p) in gradient.iter_mut().zip(prior.iter()) {
+                    *g += p;
+                }
+                if gradient.iter().all(|v| v.is_finite()) {
+                    return Some((htilde, Some(gradient)));
+                }
+            }
+        }
+    }
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
+    crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta,
+        model.residual_error_eta,
+    )
+    .map(|core| {
+        if exact {
+            // Laplace's integration correction is defined by the exact
+            // conditional Hessian. Use that same curvature for its BFGS seed;
+            // `init_h_inv` accepts it only when Cholesky proves it SPD.
+            (core.h_inner, None)
+        } else {
+            // nlmixr2est's normal-endpoint `warm="calc"` seed: the positive
+            // Gauss-Newton/Almquist curvature is the FO-family metric.
+            (core.htilde, None)
+        }
+    })
+}
+
+/// Terminal `(∂f/∂η Jacobian, exact conditional η-Hessian)` at the converged EBE, from one
+/// second-order provider pass, for Laplace/AGQ to reuse instead of recomputing the anchor.
+///
+/// The Hessian is only reusable if it is **the matrix `agq::anchor_hessian(Exact)` would
+/// compute at this η̂**, so this gates on the same model-level predicate that arm does
+/// (`analytic_score_supported`). Without the gate a joint PK-TTE / discrete / CTMM subject —
+/// or any model under `gradient = fd` — would hand back `Ω⁻¹ + Gaussian curvature`, which
+/// the provider serves happily but which omits the hazard/endpoint curvature the anchor's
+/// FD sweep includes, and the objective-only Laplace path would minimise a `½log|H|` that
+/// disagrees with the reported one.
+pub(crate) fn analytic_terminal_work(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> Option<(DMatrix<f64>, DMatrix<f64>)> {
+    if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        return None;
+    }
+    if !crate::estimation::agq::analytic_score_supported(model) {
+        return None;
+    }
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
+    let core = crate::estimation::sens_outer_gradient::score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta,
+        model.residual_error_eta,
+    )?;
+    let mut jac = DMatrix::zeros(subject.obs_times.len(), model.n_eta);
+    if sens.obs.len() != jac.nrows() {
+        return None;
+    }
+    for (row, obs) in sens.obs.iter().enumerate() {
+        for col in 0..model.n_eta {
+            jac[(row, col)] = obs.df_deta[col];
+        }
+    }
+    overwrite_frem_pseudo_obs_rows(&mut jac, model, subject, model.n_eta);
+    Some((jac, core.h_inner))
+}
+
+/// `FERX_NO_TERMINAL_HESSIAN_REUSE=1` — internal A/B switch that keeps Laplace/AGQ
+/// recomputing the anchor Hessian from scratch on objective-only evaluations.
+fn terminal_hessian_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_TERMINAL_HESSIAN_REUSE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
+/// How the inner dense BFGS seeds its initial inverse metric.
+///
+/// Derived per call from the stage's `FitOptions` ([`InnerHessianSeed::for_options`]) and
+/// threaded explicitly to the solve — never process state. A global here raced: two
+/// concurrent `fit()`s (a bootstrap, or the unit-test binary) with different methods would
+/// flip each other's seed mid-fit, and a `predict()` after a fit inherited the last stage's
+/// choice. Callers outside an estimation stage (post-fit `predict`, VPC, covariance, SAEM)
+/// pass [`InnerHessianSeed::None`] and run the historical unseeded solve.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InnerHessianSeed {
+    /// Historical identity / diagonal-preconditioner metric.
+    #[default]
+    None,
+    /// The positive conditional Gauss–Newton (Almquist `H̃`) metric — the FO-family and
+    /// multi-node AGQ seed.
+    GaussNewton,
+    /// The exact conditional Hessian `∂²nll/∂η²` — one-node Laplace's own anchor.
+    Exact,
+}
+
+impl InnerHessianSeed {
+    /// The seed for a stage running `options` (#1389). FOCE and FOCEI intentionally share the
+    /// positive conditional Gauss-Newton metric: their EBE objective is identical, and their
+    /// distinct interaction/non-interaction Hessians enter the population marginal, not this
+    /// inner solve. Multi-node AGQ — under either anchor, so `laplace, n_agq > 1` included —
+    /// uses that same robust metric; one-node Laplace uses its exact conditional Hessian,
+    /// the matrix its own `½log|H|` correction is built from. Both pass through the same SPD
+    /// Cholesky gate and prior-metric fallback in [`seed_h_inv`].
+    /// `FERX_NO_INNER_HESSIAN_SEED=1` is the internal A/B switch back to `None`.
+    pub(crate) fn for_options(options: &crate::types::FitOptions) -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var("FERX_NO_INNER_HESSIAN_SEED")
+                .map(|v| v != "1")
+                .unwrap_or(true)
+        });
+        if !enabled {
+            return Self::None;
+        }
+        use crate::types::EstimationMethod;
+        match (options.method, options.agq_nodes()) {
+            (_, Some(1)) => Self::Exact,
+            (_, Some(_)) => Self::GaussNewton,
+            (
+                EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::FoceGnHybrid,
+                None,
+            ) => Self::GaussNewton,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Per-call inner-solve policy: the BFGS seed and whether to retain the terminal exact
+/// Hessian (see `find_ebe_impl`). `Default` is the historical solve.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InnerSolvePolicy {
+    pub(crate) seed: InnerHessianSeed,
+    /// Retain `EbeResult::terminal_hessian` — a full second-order provider pass per subject.
+    /// Only the objective-only Laplace/AGQ evaluation under the exact anchor reads it.
+    pub(crate) capture_terminal_hessian: bool,
 }
 
 /// Aggregate statistics from running the inner loop over all subjects.
@@ -825,6 +1105,7 @@ pub fn find_ebe(
         mu_k,
         restarts,
         schedule.as_ref(),
+        InnerSolvePolicy::default(),
     )
 }
 
@@ -847,9 +1128,10 @@ pub(crate) fn find_ebe_cached(
     mu_k: Option<&[f64]>,
     restarts: usize,
     schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
 ) -> EbeResult {
     find_ebe_impl(
-        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule,
+        model, subject, params, max_iter, tol, eta_init, mu_k, restarts, schedule, policy,
     )
 }
 
@@ -869,6 +1151,11 @@ pub(crate) fn build_schedule_cache(
         .collect()
 }
 
+/// `policy.capture_terminal_hessian` asks for `EbeResult::terminal_hessian` — the exact
+/// conditional η-Hessian at the returned mode — which costs a full second-order provider pass
+/// per subject. Only the objective-only Laplace/AGQ evaluation under the exact anchor reads it
+/// (see `outer_optimizer::run_inner_loop_and_nll_prepared`); every other caller leaves it off.
+#[allow(clippy::too_many_arguments)]
 fn find_ebe_impl(
     model: &CompiledModel,
     subject: &Subject,
@@ -879,6 +1166,7 @@ fn find_ebe_impl(
     mu_k: Option<&[f64]>,
     restarts: usize,
     schedule: Option<&pk::event_driven::EventSchedule>,
+    policy: InnerSolvePolicy,
 ) -> EbeResult {
     let n_eta = model.n_eta;
 
@@ -1024,7 +1312,11 @@ fn find_ebe_impl(
     // one the BFGS converged on mislabels weakly-identified flat-basin EBEs (#587 review).
     let use_analytic = analytic_inner_grad_supported(model, subject);
     let profile = inner_profile_enabled();
+    let fused_first_gradient = RefCell::new(None::<Vec<f64>>);
     let agrad = |e: &[f64]| -> Vec<f64> {
+        if let Some(g) = fused_first_gradient.borrow_mut().take() {
+            return g;
+        }
         if !use_analytic {
             return gradient_fd(&obj, e, n_eta);
         }
@@ -1063,6 +1355,42 @@ fn find_ebe_impl(
             }
         }
     };
+    // nlmixr2est's `warm="calc"` idea: seed dense BFGS from the conditional
+    // Gauss-Newton metric at the current warm EBE and population parameters.
+    // The common path obtains that metric and the first gradient in one light
+    // first-order sensitivity pass; special cases retain the full provider.
+    // A failed/out-of-scope factorization falls through to the historical
+    // identity/diagonal metric.
+    //
+    // Only the dense BFGS consumes the seed: skip the provider pass outright when the
+    // stage routes this subject to Nelder–Mead or to L-BFGS (`inner_minimize_with_grad`),
+    // where the matrix would be computed and dropped.
+    let seed_kind = policy.seed;
+    let dense_bfgs_route = !matches!(
+        inner_optimizer_mode(),
+        crate::types::InnerOptimizer::NelderMead
+    ) && !inner_use_lbfgs(n_eta);
+    let seed = (seed_kind != InnerHessianSeed::None && dense_bfgs_route)
+        .then(|| {
+            analytic_inner_seed_hessian(
+                model,
+                subject,
+                params,
+                &eta,
+                schedule,
+                mult.as_deref(),
+                err_keys.as_ref(),
+                &mut obs_grad_recycle.borrow_mut(),
+                seed_kind == InnerHessianSeed::Exact,
+            )
+        })
+        .flatten();
+    let initial_hessian = seed.map(|(hessian, gradient)| {
+        if use_analytic {
+            *fused_first_gradient.borrow_mut() = gradient;
+        }
+        hessian
+    });
     let result = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -1071,6 +1399,7 @@ fn find_ebe_impl(
         max_iter,
         tol,
         precond.as_deref(),
+        initial_hessian.as_ref(),
         stop_precond,
         enable_stall,
     );
@@ -1187,6 +1516,7 @@ fn find_ebe_impl(
                         max_iter,
                         tol,
                         precond.as_deref(),
+                        None,
                         stop_precond,
                         enable_stall,
                     );
@@ -1272,10 +1602,26 @@ fn find_ebe_impl(
     // and then overridden, which keeps the diff minimal and trivially
     // revertible while the values come from the exact sensitivities.
     let t_jac = std::time::Instant::now();
+    let terminal_work = (policy.capture_terminal_hessian && terminal_hessian_reuse_enabled())
+        .then(|| analytic_terminal_work(model, subject, params, &eta_true))
+        .flatten();
+    let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
+    // The captured pass already carries `∂f/∂η`; take it as the Jacobian under exactly the
+    // conditions the dedicated light call below would run (same scope predicate, same
+    // finiteness filter), so capturing a Hessian never widens which subjects get an
+    // analytic Jacobian.
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
-        crate::sens::provider::subject_eta_jacobian(model, subject, &params.theta, &eta_true)
-            .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j))
-            .filter(|j| j.iter().all(|v| v.is_finite()))
+        match terminal_work {
+            Some((jac, _)) => Some(jac),
+            None => crate::sens::provider::subject_eta_jacobian(
+                model,
+                subject,
+                &params.theta,
+                &eta_true,
+            )
+            .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), n_eta, &j)),
+        }
+        .filter(|j| j.iter().all(|v| v.is_finite()))
     } else {
         None
     };
@@ -1309,6 +1655,7 @@ fn find_ebe_impl(
     EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
+        terminal_hessian,
         converged: ebe_converged,
         used_fallback,
         grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
@@ -1466,6 +1813,7 @@ fn find_ebe_iov(
         return EbeResult {
             eta: DVector::from_column_slice(&bsv_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            terminal_hessian: None,
             converged: false,
             used_fallback: false,
             grad_norm: 0.0,
@@ -1482,6 +1830,7 @@ fn find_ebe_iov(
         n_flat,
         max_iter,
         tol,
+        None,
         None,
         None,
         enable_stall,
@@ -1600,6 +1949,7 @@ fn find_ebe_iov(
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
+        terminal_hessian: None,
         converged: (bfgs_converged || nm_converged) && nll.is_finite(),
         used_fallback,
         grad_norm: 0.0,
@@ -2856,9 +3206,28 @@ fn preconditioner_from_parts(
     Some(precond)
 }
 
-/// Initial inverse-Hessian for the inner BFGS: `diag(precond)` when a
-/// preconditioner is supplied, else identity.
-fn init_h_inv(n: usize, precond: Option<&[f64]>) -> DMatrix<f64> {
+/// Inverse of an analytic Hessian seed through a Cholesky solve, or `None` when there is
+/// no seed, it is mis-shaped, not SPD (the exact Laplace `h_inner` routinely is not, away
+/// from the mode), or its inverse is non-finite. `None` means "the seed was **not**
+/// applied", and [`dense_bfgs_core`] keys both the metric *and* the historical `1/gnorm`
+/// first-step scaling on that — a rejected seed must reproduce the unseeded solve exactly,
+/// not an unscaled identity step.
+fn seed_h_inv(n: usize, hessian_seed: Option<&DMatrix<f64>>) -> Option<DMatrix<f64>> {
+    let h = hessian_seed?;
+    if h.nrows() != n || h.ncols() != n {
+        return None;
+    }
+    let solved = h.clone().cholesky()?.solve(&DMatrix::identity(n, n));
+    solved.iter().all(|v| v.is_finite()).then_some(solved)
+}
+
+/// Initial inverse-Hessian for the inner BFGS: the accepted analytic seed inverse when
+/// [`seed_h_inv`] produced one, else `diag(precond)` when a preconditioner is supplied,
+/// else identity.
+fn init_h_inv(n: usize, precond: Option<&[f64]>, seed_inv: Option<&DMatrix<f64>>) -> DMatrix<f64> {
+    if let Some(inv) = seed_inv {
+        return inv.clone();
+    }
     match precond {
         Some(p) => DMatrix::from_diagonal(&DVector::from_column_slice(p)),
         None => DMatrix::identity(n, n),
@@ -2908,6 +3277,7 @@ fn inner_minimize_with_grad(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
 ) -> bool {
@@ -2938,6 +3308,7 @@ fn inner_minimize_with_grad(
             max_iter,
             tol,
             precond,
+            hessian_seed,
             stop_precond,
             enable_stall,
         )
@@ -3055,10 +3426,12 @@ fn dense_bfgs_core(
     max_iter: usize,
     tol: f64,
     precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
 ) -> bool {
-    let mut h_inv = init_h_inv(n, precond);
+    let seed_inv = seed_h_inv(n, hessian_seed);
+    let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
     let mut g = grad(x);
     let mut g_vec = DVector::zeros(n);
     let mut d_vec = DVector::zeros(n);
@@ -3095,7 +3468,9 @@ fn dense_bfgs_core(
         // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
         // `None`, so `gnorm` here is the raw L2 norm; a diagonal preconditioner
         // already sets the per-dim scale.
-        if precond.is_none() && first_step && gnorm > 1.0 {
+        // An accepted analytic seed already carries the scale, so it skips this; a
+        // *rejected* one (`seed_inv.is_none()`) takes the historical path unchanged.
+        if precond.is_none() && seed_inv.is_none() && first_step && gnorm > 1.0 {
             h_inv *= 1.0 / gnorm;
             first_step = false;
         }
@@ -3112,7 +3487,7 @@ fn dense_bfgs_core(
             // Reset to the (preconditioned) steepest-descent metric, not raw
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
-            h_inv = init_h_inv(n, precond);
+            h_inv = init_h_inv(n, precond, seed_inv.as_ref());
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
             let (alpha, f_new) =
@@ -3596,6 +3971,40 @@ pub fn run_inner_loop_warm(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
+    run_inner_loop_warm_seeded(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        InnerHessianSeed::None,
+    )
+}
+
+/// [`run_inner_loop_warm`] with the stage's BFGS seed ([`InnerHessianSeed::for_options`]).
+/// The estimation stages call this; the public entry point above is the unseeded solve.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_inner_loop_warm_seeded(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    seed: InnerHessianSeed,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+) {
     let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
         model,
         population,
@@ -3606,43 +4015,10 @@ pub fn run_inner_loop_warm(
         mu_k,
         min_obs,
         restarts,
-        |_, _| (),
-    );
-    (etas, h_matrices, stats, kappas)
-}
-
-/// Same as [`run_inner_loop_warm`], but reuses a [`build_schedule_cache`] built once per
-/// fit instead of paying a fresh [`cacheable_schedule`] rebuild for every subject on every
-/// outer-loop evaluation. See [`find_ebe_cached`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_inner_loop_warm_cached(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    max_iter: usize,
-    tol: f64,
-    prev_etas: Option<&[DVector<f64>]>,
-    mu_k: Option<&[f64]>,
-    min_obs: usize,
-    restarts: usize,
-    schedules: &[Option<pk::event_driven::EventSchedule>],
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    InnerLoopStats,
-    Vec<Vec<DVector<f64>>>,
-) {
-    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map_cached(
-        model,
-        population,
-        params,
-        max_iter,
-        tol,
-        prev_etas,
-        mu_k,
-        min_obs,
-        restarts,
-        schedules,
+        InnerSolvePolicy {
+            seed,
+            capture_terminal_hessian: false,
+        },
         |_, _| (),
     );
     (etas, h_matrices, stats, kappas)
@@ -3662,6 +4038,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
     mu_k: Option<&[f64]>,
     min_obs: usize,
     restarts: usize,
+    policy: InnerSolvePolicy,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -3681,6 +4058,7 @@ pub(crate) fn run_inner_loop_warm_map<T: Send>(
         min_obs,
         restarts,
         None,
+        policy,
         finish_subject,
     )
 }
@@ -3700,6 +4078,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
     min_obs: usize,
     restarts: usize,
     schedules: &[Option<pk::event_driven::EventSchedule>],
+    policy: InnerSolvePolicy,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -3719,6 +4098,7 @@ pub(crate) fn run_inner_loop_warm_map_cached<T: Send>(
         min_obs,
         restarts,
         Some(schedules),
+        policy,
         finish_subject,
     )
 }
@@ -3735,6 +4115,7 @@ fn run_inner_loop_warm_map_impl<T: Send>(
     min_obs: usize,
     restarts: usize,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    policy: InnerSolvePolicy,
     finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
 ) -> (
     Vec<DVector<f64>>,
@@ -3751,20 +4132,20 @@ fn run_inner_loop_warm_map_impl<T: Send>(
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            let ebe = match schedules {
-                Some(cache) => find_ebe_cached(
-                    model,
-                    subject,
-                    params,
-                    max_iter,
-                    tol,
-                    init,
-                    mu_k,
-                    restarts,
-                    cache[i].as_ref(),
-                ),
-                None => find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts),
+            // Both arms route through `find_ebe_cached` so the policy reaches the solve
+            // either way; the uncached arm just builds its schedule per call.
+            let local_schedule = if schedules.is_none() {
+                cacheable_schedule(model, subject)
+            } else {
+                None
             };
+            let schedule = match schedules {
+                Some(cache) => cache[i].as_ref(),
+                None => local_schedule.as_ref(),
+            };
+            let ebe = find_ebe_cached(
+                model, subject, params, max_iter, tol, init, mu_k, restarts, schedule, policy,
+            );
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })

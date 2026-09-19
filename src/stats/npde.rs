@@ -104,108 +104,113 @@ pub fn compute_npde_npd(
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
-    population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
-            let n_obs = subject.observations.len();
+    // A standalone caller (R, a script) is not on a Rayon worker, so this would run on
+    // Rayon's global pool at machine width rather than the engine's declared count
+    // (#1460); reached from inside `fit()`'s post-fit step it is a no-op.
+    crate::api::install_on_engine_pool(|| {
+        population
+            .subjects
+            .par_iter()
+            .enumerate()
+            .map(|(i, subject)| {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
+                let n_obs = subject.observations.len();
 
-            // sims[(j, k)] — observation j, replicate k. Column-per-replicate
-            // layout so the covariance is one D·Dᵀ gemm and decorrelation is one
-            // batched triangular solve.
-            let mut sims = DMatrix::<f64>::zeros(n_obs, nsim);
-            // Custom residual magnitude (#484): η-independent (θ/covariate/TIME
-            // only), so build the per-observation multiplier matrix once and
-            // reuse it across all replicates.
-            let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
-            // IOV (#734): the per-occasion κ draw needs the subject's occasion
-            // groups in the exact order `predict_iov` indexes its `kappas`
-            // argument by. A function of the subject alone, so this side builds
-            // it once instead of once per replicate. `predict_iov` still builds
-            // its own copy (plus the `occ_to_k` map) on every call — the group
-            // walk is not part of its signature — so the reference costs two
-            // builds per replicate, not one; only the second is hoistable from
-            // here. Worth plumbing through only if the walk ever shows up in a
-            // profile, since the estimation hot path pays the same duplicate.
-            // Empty when the subject carries no occasion labels, in which case
-            // `predict_iov` falls back to κ = 0 (matching the fit-time
-            // no-occasion diagnostic).
-            let iov: Option<(&crate::types::OmegaMatrix, Vec<(u32, Vec<usize>)>)> = params
-                .omega_iov
-                .as_ref()
-                .filter(|_| model.n_kappa > 0)
-                .map(|om| (om, crate::stats::likelihood::iov_occasion_groups(subject)));
-            for k in 0..nsim {
-                // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
-                let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
-                let eta = &params.omega.chol * DVector::from_column_slice(&z);
-                let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
-                eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                // sims[(j, k)] — observation j, replicate k. Column-per-replicate
+                // layout so the covariance is one D·Dᵀ gemm and decorrelation is one
+                // batched triangular solve.
+                let mut sims = DMatrix::<f64>::zeros(n_obs, nsim);
+                // Custom residual magnitude (#484): η-independent (θ/covariate/TIME
+                // only), so build the per-observation multiplier matrix once and
+                // reuse it across all replicates.
+                let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+                // IOV (#734): the per-occasion κ draw needs the subject's occasion
+                // groups in the exact order `predict_iov` indexes its `kappas`
+                // argument by. A function of the subject alone, so this side builds
+                // it once instead of once per replicate. `predict_iov` still builds
+                // its own copy (plus the `occ_to_k` map) on every call — the group
+                // walk is not part of its signature — so the reference costs two
+                // builds per replicate, not one; only the second is hoistable from
+                // here. Worth plumbing through only if the walk ever shows up in a
+                // profile, since the estimation hot path pays the same duplicate.
+                // Empty when the subject carries no occasion labels, in which case
+                // `predict_iov` falls back to κ = 0 (matching the fit-time
+                // no-occasion diagnostic).
+                let iov: Option<(&crate::types::OmegaMatrix, Vec<(u32, Vec<usize>)>)> = params
+                    .omega_iov
+                    .as_ref()
+                    .filter(|_| model.n_kappa > 0)
+                    .map(|om| (om, crate::stats::likelihood::iov_occasion_groups(subject)));
+                for k in 0..nsim {
+                    // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
+                    let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
+                    let eta = &params.omega.chol * DVector::from_column_slice(&z);
+                    let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-                // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
-                // occasion through the occasion-aware `predict_iov`, mirroring
-                // `simulate()`'s `emit_subject_rows` (#723). Holding κ at zero
-                // would leave the reference distribution without its
-                // inter-occasion component and over-disperse every score.
-                // Non-IOV models take the TV-covariate-aware dispatcher
-                // unchanged — matching simulate()/predict() (#506): a per-event
-                // covariate snapshot must drive NPDE IPREDs, not the
-                // baseline-only `pk_param_fn(subject.covariates)` — and draw no
-                // extra randoms, so their sims are byte-identical.
-                let ipreds = match &iov {
-                    Some((omega_iov, occ_groups)) => {
-                        let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
-                            .map(|_| {
-                                let z: Vec<f64> = (0..model.n_kappa)
-                                    .map(|_| normal.sample(&mut rng))
-                                    .collect();
-                                (&omega_iov.chol * DVector::from_column_slice(&z))
-                                    .iter()
-                                    .copied()
-                                    .collect()
-                            })
-                            .collect();
-                        crate::pk::predict_iov(
+                    // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
+                    // occasion through the occasion-aware `predict_iov`, mirroring
+                    // `simulate()`'s `emit_subject_rows` (#723). Holding κ at zero
+                    // would leave the reference distribution without its
+                    // inter-occasion component and over-disperse every score.
+                    // Non-IOV models take the TV-covariate-aware dispatcher
+                    // unchanged — matching simulate()/predict() (#506): a per-event
+                    // covariate snapshot must drive NPDE IPREDs, not the
+                    // baseline-only `pk_param_fn(subject.covariates)` — and draw no
+                    // extra randoms, so their sims are byte-identical.
+                    let ipreds = match &iov {
+                        Some((omega_iov, occ_groups)) => {
+                            let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+                                .map(|_| {
+                                    let z: Vec<f64> = (0..model.n_kappa)
+                                        .map(|_| normal.sample(&mut rng))
+                                        .collect();
+                                    (&omega_iov.chol * DVector::from_column_slice(&z))
+                                        .iter()
+                                        .copied()
+                                        .collect()
+                                })
+                                .collect();
+                            crate::pk::predict_iov(
+                                model,
+                                subject,
+                                &params.theta,
+                                &eta_slice[..n_eta],
+                                &kappas,
+                            )
+                        }
+                        None => crate::pk::compute_predictions_with_tv(
                             model,
                             subject,
                             &params.theta,
-                            &eta_slice[..n_eta],
-                            &kappas,
-                        )
+                            &eta_slice,
+                        ),
+                    };
+
+                    // IIV on residual error (#409): the simulated eta draw includes
+                    // the residual-error eta, so scale the residual variance by
+                    // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
+                    let ruv_scale = model.residual_var_scale(&eta_slice);
+                    for (j, &ip) in ipreds.iter().enumerate() {
+                        let var = model.sim_residual_variance(
+                            subject,
+                            j,
+                            ip,
+                            &params.sigma.values,
+                            ruv_scale,
+                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                        );
+                        let eps: f64 = normal.sample(&mut rng);
+                        sims[(j, k)] = ip + var.sqrt() * eps;
                     }
-                    None => crate::pk::compute_predictions_with_tv(
-                        model,
-                        subject,
-                        &params.theta,
-                        &eta_slice,
-                    ),
-                };
-
-                // IIV on residual error (#409): the simulated eta draw includes
-                // the residual-error eta, so scale the residual variance by
-                // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
-                let ruv_scale = model.residual_var_scale(&eta_slice);
-                for (j, &ip) in ipreds.iter().enumerate() {
-                    let var = model.sim_residual_variance(
-                        subject,
-                        j,
-                        ip,
-                        &params.sigma.values,
-                        ruv_scale,
-                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    );
-                    let eps: f64 = normal.sample(&mut rng);
-                    sims[(j, k)] = ip + var.sqrt() * eps;
                 }
-            }
 
-            let npd = npd_scores(&subject.observations, &subject.cens, &sims);
-            let npde = npde_scores(&subject.observations, &subject.cens, &sims);
-            SubjectNpde { npd, npde }
-        })
-        .collect()
+                let npd = npd_scores(&subject.observations, &subject.cens, &sims);
+                let npde = npde_scores(&subject.observations, &subject.cens, &sims);
+                SubjectNpde { npd, npde }
+            })
+            .collect()
+    })
 }
 
 /// Per-observation empirical-CDF normal scores, without decorrelation. Censored

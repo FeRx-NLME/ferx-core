@@ -3225,6 +3225,144 @@ fn saem_state_to_params(
 }
 
 // ---------------------------------------------------------------------------
+// E-step sizing
+// ---------------------------------------------------------------------------
+
+/// Value of [`FitOptions::saem_n_mh_steps`] that selects
+/// [`auto_n_mh_steps`] — the shipped default, written `n_mh_steps = auto` in a
+/// model file.
+pub(crate) const SAEM_N_MH_STEPS_AUTO: usize = 0;
+
+/// Block proposals the automatic rule asks for per observation per random
+/// effect (issue #1459).
+const AUTO_MH_STEPS_PER_OBS_PER_ETA: f64 = 2.5;
+
+/// Floor of the automatic block-proposal count.
+pub(crate) const AUTO_MH_STEPS_MIN: usize = 6;
+
+/// Cap of the automatic block-proposal count — the pre-#1459 fixed default, so
+/// a dataset dense enough to need it keeps exactly the historical E-step.
+pub(crate) const AUTO_MH_STEPS_MAX: usize = 20;
+
+/// Block-kernel proposals per subject per SAEM iteration, chosen from the shape
+/// of the dataset (issue #1459).
+///
+/// ## Why this is not a constant
+///
+/// The step-scale controller holds the block kernel at its 40 % acceptance
+/// target on every sparse benchmark measured (0.39–0.46 realised on cefepime,
+/// vancomycin, busulfan and pembrolizumab, at every count from 2 to 20), so
+/// each proposal there is worth the same fraction of a move, and 20 of them
+/// buy the same E-step as 6 for roughly three times the proposal traffic. The one benchmark where extra
+/// proposals *do* pay is the one where the controller cannot reach its target:
+/// the Emax PKPD model of `docs/estimation/saem.qmd`, 16 observations per
+/// subject against 2 η, realises **0.246**, and its final-estimate distance and
+/// cross-seed stability are 2–3× better at 20 proposals than at 4–8 (measured,
+/// 6 seeds — see the issue). A conditional much narrower than the prior is what
+/// both facts have in common: it drives the adapted scale down, and it is what
+/// makes a warm-started chain slow to follow a moving mode.
+///
+/// Observations per subject per η is the cheapest available proxy for that
+/// narrowing — it is the information the conditional is built from — so the
+/// rule is `2.5 · n_obs / (n_subjects · n_eta)`, clamped to
+/// `[AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX]`. The cap is the historical fixed
+/// default, so nothing changes on a dataset dense enough to earn it; the floor
+/// is where the sparse benchmarks stop being distinguishable from 20.
+///
+/// It is a rule about the *dataset*, not about the run: identical inputs give
+/// an identical count, so a fit stays reproducible. `verbose` prints the
+/// resolved value, and an explicit `n_mh_steps = <n>` overrides it entirely.
+pub(crate) fn auto_n_mh_steps(n_obs: usize, n_subjects: usize, n_eta: usize) -> usize {
+    if n_subjects == 0 || n_eta == 0 {
+        // Nothing to read the density off. Neither shape reaches a kernel —
+        // SAEM rejects `n_eta == 0` up front and an empty population earlier
+        // still — so this is only about not dividing by zero; answer with the
+        // historical default rather than with the cheap end.
+        return AUTO_MH_STEPS_MAX;
+    }
+    let obs_per_eta = n_obs as f64 / (n_subjects as f64 * n_eta as f64);
+    let steps = (AUTO_MH_STEPS_PER_OBS_PER_ETA * obs_per_eta).round();
+    // `steps` is finite and non-negative here (n_obs / positive), so the cast
+    // after the clamp cannot be a saturating surprise.
+    (steps as usize).clamp(AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX)
+}
+
+/// The η-block proposal count for the **Bayes** sampler: the requested value,
+/// or — under [`SAEM_N_MH_STEPS_AUTO`] — the historical fixed count, *not*
+/// [`auto_n_mh_steps`].
+///
+/// [`auto_n_mh_steps`] is calibrated on SAEM quantities (a controller-held
+/// acceptance rate, final-estimate distance against a long-run reference), and
+/// what makes a low count safe there is SAEM's componentwise kernel carrying
+/// the dense case (#1466). The Bayes η block is the block kernel alone and is
+/// judged on posterior mixing, which none of that measured — so `auto` means
+/// "unchanged" here until there is a Bayes benchmark to move it (#1459).
+pub(crate) fn resolve_n_mh_steps_bayes(requested: usize) -> usize {
+    if requested == SAEM_N_MH_STEPS_AUTO {
+        AUTO_MH_STEPS_MAX
+    } else {
+        requested
+    }
+}
+
+/// The `verbose` line describing the resolved E-step kernel sizes. Kept as a
+/// pure function so the wording is unit-testable, like
+/// [`saem_final_ofv_report`].
+fn mh_steps_report(requested: usize, resolved: usize, n_cw_sweeps: usize) -> String {
+    let origin = if requested == SAEM_N_MH_STEPS_AUTO {
+        "auto, from observations per subject per eta"
+    } else {
+        "set in fit options"
+    };
+    format!(
+        "SAEM: {resolved} block MH proposals/subject/iteration ({origin}), \
+         {n_cw_sweeps} componentwise sweeps"
+    )
+}
+
+/// The block-proposal count a run actually uses: the requested value, or
+/// [`auto_n_mh_steps`] when the caller left it at [`SAEM_N_MH_STEPS_AUTO`].
+///
+/// Every consumer of [`FitOptions::saem_n_mh_steps`] goes through here — the
+/// main loop, the conditional-distribution pass and the Bayes η block — so the
+/// sentinel cannot reach a kernel as a literal zero-proposal count.
+pub(crate) fn resolve_n_mh_steps(
+    requested: usize,
+    n_obs: usize,
+    n_subjects: usize,
+    n_eta: usize,
+) -> usize {
+    if requested == SAEM_N_MH_STEPS_AUTO {
+        auto_n_mh_steps(n_obs, n_subjects, n_eta)
+    } else {
+        requested
+    }
+}
+
+/// Componentwise sweeps per E-step iteration (Kuhn–Lavielle kernel 2), given
+/// the block-kernel proposal count.
+///
+/// Each sweep is `n_eta` single-coordinate proposals, so sizing it
+/// `n_mh_steps / n_eta` keeps the kernel's NLL-eval cost roughly on par with
+/// the block kernel, at a floor of 2 sweeps — the kernel is what stops a block
+/// Ω collapsing to a near rank-1 correlation matrix (#191), so it must not
+/// vanish when the block count is small. Skipped entirely for single-η models,
+/// where there is no off-diagonal to decorrelate and the kernel would only
+/// duplicate the block move.
+///
+/// Shared by the main loop and the conditional-distribution pass
+/// ([`saem_conddist`](crate::estimation::saem_conddist)) so the two cannot
+/// drift: both sample the same conditional with the same two kernels, and a
+/// second copy of this arithmetic is a second definition of the E-step.
+pub(crate) fn componentwise_sweeps(n_mh_steps: usize, n_eta: usize) -> usize {
+    if n_eta >= 2 {
+        (n_mh_steps / n_eta).max(2)
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main SAEM loop
 // ---------------------------------------------------------------------------
 
@@ -3255,17 +3393,13 @@ pub fn run_saem(
     // estimated. Clamped to the exploration length — burning in past K1 would
     // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
     let omega_burnin = options.saem_omega_burnin.min(k1);
-    let n_mh_steps = options.saem_n_mh_steps;
-    // Componentwise sweeps per iteration (Kuhn-Lavielle kernel 2). Each sweep is
-    // `n_eta` single-coordinate proposals, so sizing it `n_mh_steps / n_eta`
-    // keeps the kernel's NLL-eval cost roughly on par with the block kernel.
-    // Skipped entirely for single-η models, where there is no off-diagonal to
-    // decorrelate and the kernel would duplicate the block move.
-    let n_cw_sweeps = if n_eta >= 2 {
-        (n_mh_steps / n_eta).max(2)
-    } else {
-        0
-    };
+    let n_mh_steps = resolve_n_mh_steps(
+        options.saem_n_mh_steps,
+        population.n_obs(),
+        n_subjects,
+        n_eta,
+    );
+    let n_cw_sweeps = componentwise_sweeps(n_mh_steps, n_eta);
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -3310,6 +3444,13 @@ pub fn run_saem(
         eprintln!(
             "SAEM: {} subjects, {} ETAs, {} total iter ({} explore + {} converge)",
             n_subjects, n_eta, n_iter, k1, k2
+        );
+        // The block count is data-derived unless the caller pinned it, so say
+        // which of the two a run is using — otherwise a reader cannot tell the
+        // resolved count from a coincidence.
+        eprintln!(
+            "{}",
+            mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps)
         );
     }
 
@@ -10344,6 +10485,164 @@ DV ~ additive(EPS)
             "coordinate with block scale 0 must not move"
         );
         assert_ne!(eta[0], eta0[0], "unclamped coordinate should have moved");
+    }
+
+    // ── E-step sizing (#1459) ────────────────────────────────────────────────
+
+    /// The automatic count on the shapes it was measured on. Each row is a real
+    /// benchmark from issue #1459, with its observations-per-η and the count
+    /// the rule gives it; a mutation that drops the density term (always the
+    /// floor, or always the cap) reddens a different subset of these rows, so
+    /// no single constant satisfies the table.
+    #[test]
+    fn auto_n_mh_steps_tracks_observations_per_eta() {
+        // The expected counts below are written out rather than spelled with
+        // the clamp constants, so that moving a clamp reddens this test instead
+        // of moving the expectations with it.
+        assert_eq!((AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX), (6, 20));
+
+        // (n_obs, n_subjects, n_eta, expected, what it is)
+        let cases = [
+            // cefepime: 702 obs / 458 subjects / 3 η = 0.51 per η → 1.3 → floor.
+            (702, 458, 3, 6, "cefepime, 0.51 obs/eta"),
+            // vancomycin: 274 / 100 / 3 = 0.91 per η → 2.3 → floor.
+            (274, 100, 3, 6, "vancomycin, 0.91 obs/eta"),
+            // pembrolizumab: 1231 / 303 / 4 = 1.02 per η → 2.5 → floor.
+            (1231, 303, 4, 6, "pembrolizumab, 1.02 obs/eta"),
+            // busulfan: 5259 / 600 / 3 = 2.92 per η → 7.3 → 7, the arm where
+            // the density term actually decides the answer.
+            (5259, 600, 3, 7, "busulfan, 2.92 obs/eta"),
+            // Emax PKPD: 1600 / 100 / 2 = 8.0 per η → 20 → the cap, i.e. the
+            // pre-#1459 default is kept exactly where it was calibrated.
+            (1600, 100, 2, 20, "emax PKPD, 8.0 obs/eta"),
+            // Denser still must not exceed the cap.
+            (100_000, 100, 2, 20, "500 obs/eta"),
+            // A single observation per subject against 6 η cannot go below it.
+            (300, 300, 6, 6, "0.17 obs/eta"),
+            // Just under and just over the knee where the density term takes
+            // over from the floor (2.4 obs/η ⇒ exactly 6).
+            (2400, 1000, 1, 6, "2.4 obs/eta, 1 eta"),
+            (2500, 1000, 1, 6, "2.5 obs/eta, 1 eta — rounds to 6"),
+            (
+                2600,
+                1000,
+                1,
+                7,
+                "2.6 obs/eta, 1 eta — first count above the floor",
+            ),
+        ];
+        for (n_obs, n_subjects, n_eta, want, what) in cases {
+            assert_eq!(
+                auto_n_mh_steps(n_obs, n_subjects, n_eta),
+                want,
+                "{what}: {n_obs} obs / {n_subjects} subjects / {n_eta} eta"
+            );
+        }
+    }
+
+    /// Degenerate inputs must not divide by zero or return a zero count — a
+    /// zero would reach `mh_steps` as "propose nothing".
+    #[test]
+    fn auto_n_mh_steps_is_safe_on_degenerate_shapes() {
+        for (n_obs, n_subjects, n_eta) in [(0, 0, 0), (0, 10, 2), (10, 0, 2), (10, 10, 0)] {
+            let n = auto_n_mh_steps(n_obs, n_subjects, n_eta);
+            assert!(
+                (AUTO_MH_STEPS_MIN..=AUTO_MH_STEPS_MAX).contains(&n),
+                "auto count out of range on ({n_obs}, {n_subjects}, {n_eta}): {n}"
+            );
+        }
+    }
+
+    /// An explicit count is passed through untouched — including one that
+    /// equals neither clamp, and one the rule would never produce.
+    #[test]
+    fn resolve_n_mh_steps_passes_an_explicit_count_through() {
+        // The sparse shape whose auto count is the floor.
+        let (n_obs, n_subj, n_eta) = (274, 100, 3);
+        assert_eq!(
+            resolve_n_mh_steps(SAEM_N_MH_STEPS_AUTO, n_obs, n_subj, n_eta),
+            AUTO_MH_STEPS_MIN,
+            "the sentinel must resolve"
+        );
+        for requested in [1, 3, 40, 200] {
+            assert_eq!(
+                resolve_n_mh_steps(requested, n_obs, n_subj, n_eta),
+                requested,
+                "an explicit count must survive the resolver"
+            );
+        }
+    }
+
+    /// The Bayes η block resolves `auto` to the historical fixed count, *not*
+    /// to the rule — on a shape where the two visibly differ, so the test reads
+    /// "does not consult the rule" rather than "agrees with it here".
+    #[test]
+    fn resolve_n_mh_steps_bayes_keeps_the_historical_count() {
+        // A sparse shape the SAEM rule answers with the floor.
+        let (n_obs, n_subj, n_eta) = (274, 100, 3);
+        assert_eq!(
+            resolve_n_mh_steps(SAEM_N_MH_STEPS_AUTO, n_obs, n_subj, n_eta),
+            AUTO_MH_STEPS_MIN,
+            "precondition: the SAEM rule gives this shape the floor, not the cap"
+        );
+        assert_ne!(
+            AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX,
+            "precondition: the two answers are distinguishable"
+        );
+        assert_eq!(
+            resolve_n_mh_steps_bayes(SAEM_N_MH_STEPS_AUTO),
+            AUTO_MH_STEPS_MAX,
+            "Bayes keeps the historical count under `auto` (see the fn docs)"
+        );
+        for requested in [1, 6, 40] {
+            assert_eq!(
+                resolve_n_mh_steps_bayes(requested),
+                requested,
+                "an explicit count applies to Bayes too"
+            );
+        }
+    }
+
+    /// The componentwise sweep count, including the floor that keeps the
+    /// anti-collapse kernel alive at a small block count (#191) and the
+    /// single-η case where the kernel is skipped entirely.
+    #[test]
+    fn componentwise_sweeps_floor_and_single_eta() {
+        assert_eq!(componentwise_sweeps(20, 3), 6, "20/3 = 6 sweeps");
+        assert_eq!(componentwise_sweeps(20, 2), 10);
+        assert_eq!(
+            componentwise_sweeps(6, 3),
+            2,
+            "6/3 = 2, which is also the floor"
+        );
+        assert_eq!(
+            componentwise_sweeps(6, 4),
+            2,
+            "6/4 = 1 must be lifted to the floor, not left to vanish"
+        );
+        assert_eq!(
+            componentwise_sweeps(0, 4),
+            2,
+            "even a zero block count keeps the anti-collapse kernel"
+        );
+        assert_eq!(
+            componentwise_sweeps(20, 1),
+            0,
+            "single-η models skip the componentwise kernel"
+        );
+    }
+
+    /// The verbose line says which of the two sources the count came from.
+    #[test]
+    fn mh_steps_report_names_its_source() {
+        let auto = mh_steps_report(SAEM_N_MH_STEPS_AUTO, 6, 2);
+        assert!(auto.contains("6 block MH proposals"), "got: {auto}");
+        assert!(auto.contains("auto"), "got: {auto}");
+        assert!(auto.contains("2 componentwise sweeps"), "got: {auto}");
+
+        let explicit = mh_steps_report(20, 20, 6);
+        assert!(explicit.contains("set in fit options"), "got: {explicit}");
+        assert!(!explicit.contains("auto"), "got: {explicit}");
     }
 }
 

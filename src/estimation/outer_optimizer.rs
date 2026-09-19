@@ -1,5 +1,6 @@
 use crate::estimation::inner_optimizer::{
-    find_ebe, run_inner_loop_warm, run_inner_loop_warm_map, InnerLoopStats,
+    find_ebe, run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed,
+    InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_iov};
@@ -344,7 +345,7 @@ fn freeze_flat_thetas(
     // optimizer iteration would run, so the pre-flight costs roughly one iteration.
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let cold_etas = vec![DVector::zeros(n_eta); n_subj];
-    let (ehs, hms, _stats, kappas) = run_inner_loop_warm(
+    let (ehs, hms, _stats, kappas) = run_inner_loop_warm_seeded(
         model,
         population,
         &params,
@@ -354,6 +355,7 @@ fn freeze_flat_thetas(
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
+        InnerHessianSeed::for_options(options),
     );
     let mut grad_eval_idx = 0usize;
     let grad = population_gradient(
@@ -415,7 +417,7 @@ fn freeze_flat_thetas(
         let mut p = params.clone();
         p.theta[theta_i] = value;
         let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
-        let (e, h, _s, k) = run_inner_loop_warm(
+        let (e, h, _s, k) = run_inner_loop_warm_seeded(
             model,
             population,
             &p,
@@ -425,6 +427,7 @@ fn freeze_flat_thetas(
             Some(&mu),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
+            InnerHessianSeed::for_options(options),
         );
         2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options)
     };
@@ -532,7 +535,7 @@ fn evaluate_at_initial_params(
         // system resets / TV-covariates, or a weakly-identified random effect (#891)
         // — is re-seeded here instead of silently reporting a sub-optimal mode. This
         // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
-        let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
+        let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm_seeded(
             model,
             population,
             &params,
@@ -542,6 +545,7 @@ fn evaluate_at_initial_params(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
+            InnerHessianSeed::for_options(options),
         );
         let ofv = 2.0
             * pop_nll_opts(
@@ -974,8 +978,22 @@ fn run_inner_loop_and_nll_prepared(
     Option<crate::estimation::agq::PopulationEvaluation>,
 ) {
     if options.agq_nodes().is_some() {
-        let (etas, h_matrices, stats, kappas) = match schedules {
-            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_cached(
+        // Capture each subject's terminal exact Hessian only where the objective below will
+        // actually read it: the objective-only evaluation under the exact anchor (#1389).
+        // The Gauss-Newton anchor never reuses it, and the gradient path recomputes the
+        // whole second-order jet for its Laplace derivative sweep anyway, so capturing there
+        // would be a full provider pass per subject thrown away.
+        let policy = InnerSolvePolicy {
+            seed: InnerHessianSeed::for_options(options),
+            capture_terminal_hessian: agq_gradient_inputs.is_none()
+                && matches!(options.hessian_anchor(), HessianAnchor::Exact),
+        };
+        let take_terminal_hessian =
+            |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
+                ebe.terminal_hessian.clone()
+            };
+        let (etas, h_matrices, stats, kappas, terminal_hessians) = match schedules {
+            Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
                 model,
                 population,
                 params,
@@ -986,8 +1004,10 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 cache,
+                policy,
+                take_terminal_hessian,
             ),
-            None => run_inner_loop_warm(
+            None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
                 model,
                 population,
                 params,
@@ -997,6 +1017,8 @@ fn run_inner_loop_and_nll_prepared(
                 mu_k,
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
+                policy,
+                take_terminal_hessian,
             ),
         };
         let n_nodes = options.agq_nodes().expect("AGQ branch");
@@ -1030,8 +1052,8 @@ fn run_inner_loop_and_nll_prepared(
             ),
         });
         let nll = evaluation.as_ref().map_or_else(
-            || match schedules {
-                Some(cache) => crate::estimation::agq::agq_population_nll_with_schedules(
+            || {
+                crate::estimation::agq::agq_population_nll_prepared(
                     model,
                     population,
                     params,
@@ -1039,22 +1061,18 @@ fn run_inner_loop_and_nll_prepared(
                     &kappas,
                     n_nodes,
                     options.hessian_anchor(),
-                    cache,
-                ),
-                None => crate::estimation::agq::agq_population_nll(
-                    model,
-                    population,
-                    params,
-                    &etas,
-                    &kappas,
-                    n_nodes,
-                    options.hessian_anchor(),
-                ),
+                    schedules,
+                    Some(&terminal_hessians),
+                )
             },
             |evaluation| evaluation.nll,
         );
         return (etas, h_matrices, stats, kappas, nll, evaluation);
     }
+    let policy = InnerSolvePolicy {
+        seed: InnerHessianSeed::for_options(options),
+        capture_terminal_hessian: false,
+    };
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
             subject_nll(
@@ -1079,6 +1097,7 @@ fn run_inner_loop_and_nll_prepared(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
             cache,
+            policy,
             finish_subject,
         )
     } else {
@@ -1092,6 +1111,7 @@ fn run_inner_loop_and_nll_prepared(
             mu_k,
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
+            policy,
             finish_subject,
         )
     };
@@ -3262,7 +3282,7 @@ fn optimize_nlopt_once(
                     (ehs, hms, kappas, 2.0 * nll)
                 };
             let solve_at = |seed: Option<&[DVector<f64>]>| {
-                let (ehs, hms, _, kappas) = run_inner_loop_warm(
+                let (ehs, hms, _, kappas) = run_inner_loop_warm_seeded(
                     model,
                     population,
                     &final_params,
@@ -3272,6 +3292,7 @@ fn optimize_nlopt_once(
                     Some(&final_mu_k),
                     options.min_obs_for_convergence_check as usize,
                     options.inner_restarts,
+                    InnerHessianSeed::for_options(options),
                 );
                 score(ehs, hms, kappas)
             };
@@ -4010,7 +4031,7 @@ fn optimize_bfgs(
 
     let final_params = unpack_params(&x_final, init_params);
     let bfgs_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm(
+    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm_seeded(
         model,
         population,
         &final_params,
@@ -4020,6 +4041,7 @@ fn optimize_bfgs(
         Some(&bfgs_final_mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
+        InnerHessianSeed::for_options(options),
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
@@ -4124,7 +4146,7 @@ fn reconverged_fd_gradient(
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
             model,
             population,
             &params,
@@ -4134,6 +4156,7 @@ fn reconverged_fd_gradient(
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
+            InnerHessianSeed::for_options(options),
         );
         let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         if !raw.is_finite()
@@ -4202,7 +4225,7 @@ fn reporting_fd_gradient(
             (m.ofv, stats)
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+            let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
                 model,
                 population,
                 &params,
@@ -4212,6 +4235,7 @@ fn reporting_fd_gradient(
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
+                InnerHessianSeed::for_options(options),
             );
             let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (2.0 * nll, ebe_stats)
