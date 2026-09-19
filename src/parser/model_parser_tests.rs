@@ -22609,6 +22609,71 @@ fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartm
     }
 }
 
+/// #1358: a compartment-free model has no doses, so no dose-attribute name means
+/// anything there — `F1`, `ALAG1`, `D2`, `R1` are ordinary parameter names (a
+/// factor level, a fraction, a slope). The analytical modeled-dose loop used to run
+/// on the placeholder `pk_model` (gated on `!is_ode`, not `!uses_ode_param_layout`),
+/// so `F1`/`ALAG1` hit the analytical dose-route reject and `D2` the
+/// infusable-compartment reject — both about a `pk(...)` model the user never wrote.
+/// Each value must be readable through `pk_indices` like any other parameter, and
+/// the dose-attribute map must stay empty — `D1`/`R1` *parsed* under the old gate,
+/// so for those two arms `dose_attr_map.is_empty()` is the one assertion that
+/// sees the defect: the loop recorded them as an analytical modeled dose at spare
+/// slot 9 while `ode_param_slots` had put the value at slot 1. (`parse_warnings`
+/// is a guard against any other diagnostic; the dead-parameter census skips
+/// compartment-free models, so it cannot fire here either way.)
+#[test]
+fn algebraic_structural_model_accepts_dose_attribute_shaped_parameter_names() {
+    for (name, value) in [
+        ("F1", 0.25),
+        ("ALAG1", 0.5),
+        ("D1", 1.5),
+        ("D2", 2.0),
+        ("R1", 3.0),
+    ] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 theta TVX({value}, 0.01, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 E0 = TVE0\n\
+            \x20 {name} = TVX\n\n\
+            [structural_model]\n\
+            \x20 y = E0 * {name} * TIME\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| {
+            panic!("`{name}` is an ordinary parameter in a compartment-free model: {e}")
+        });
+        assert!(model.is_algebraic());
+        assert!(
+            model.parse_warnings.is_empty(),
+            "`{name}`: no warning expected, got {:?}",
+            model.parse_warnings
+        );
+        assert!(
+            model.dose_attr_map.is_empty(),
+            "`{name}`: a compartment-free model has no doses, so no dose attribute"
+        );
+        assert!(!model.has_lagtime(), "`{name}`: no lag route");
+        assert!(!model.has_bioavailability(), "`{name}`: no bioavailability");
+        // The value lands in the slot `pk_indices` names for it.
+        let i = model
+            .indiv_param_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("`{name}` missing from {:?}", model.indiv_param_names));
+        let pk = (model.pk_param_fn)(&[10.0, value], &[], &HashMap::new(), 0.0);
+        assert_eq!(
+            pk.values[model.pk_indices[i]], value,
+            "`{name}`: value not readable through pk_indices[{i}] = {}",
+            model.pk_indices[i]
+        );
+    }
+}
+
 // ── #1064: θ level blocks ────────────────────────────────────────
 //
 // An unstructured placebo effect in an MBMA model gives every (study ×

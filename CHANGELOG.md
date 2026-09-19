@@ -246,6 +246,7 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **A compartment-free (`$PRED`-style) model can name a parameter `F1`, `ALAG1`, `D2` or `R1`.** Such a model has no doses, so a dose-attribute-shaped name is an ordinary parameter there — but the parser ran the analytical modeled-dose loop against its placeholder `pk` model and rejected `F{n}`/`ALAG{n}` with the analytical dose-route error (about a `pk(...)` line the user never wrote), rejected a `D{n}`/`R{n}` off compartment 1 as non-infusable, and recorded a `D1`/`R1` as a modeled dose. The loop is now skipped for compartment-free models; analytical `pk(...)` models keep every reject. (#1358)
 - **SAEM now reports an acceptance rate that never reached its target**
   ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)). The existing mixing
   warning only fired below 1% cumulative acceptance, so a chain parked at 2–4% for an
