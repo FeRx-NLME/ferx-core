@@ -18070,6 +18070,48 @@ fn build_pk_param_fn(
         n_top_level_vars: vars_in_order.len(),
     };
 
+    // η-independent prefix split (E6). Computed once here, on the *resolved*
+    // statements, and used only by the f64 `pk_param_fn` closure below — the
+    // `IndivParamProgram` snapshot above already holds the unsplit list, so the
+    // analytic-sensitivity chain and every dual evaluator are untouched.
+    #[allow(unused_mut)]
+    let mut ip_split = split_ip_eta_independent_prefix(&stmts_owned, n_vars, n_theta_base, n_cov);
+    // Test-only kill switch, read on the thread that parses the model. It is
+    // what lets a test build the *same* model twice — hoisted and unhoisted —
+    // and require the two to agree bit-for-bit; see
+    // `ip_hoist_off` / `saem_hotpath_tests`.
+    #[cfg(test)]
+    if IP_HOIST_DISABLED.with(|c| c.get()) {
+        ip_split = None;
+    }
+    let ip_split = ip_split;
+    let ip_model_id = IP_MODEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // One line per built closure under `FERX_IP_HOIST_REPORT=1`, so a benchmark
+    // can say whether it hoisted anything or fell back — the question "which
+    // models does this help" has no other observable answer.
+    if std::env::var("FERX_IP_HOIST_REPORT").as_deref() == Ok("1") {
+        match &ip_split {
+            None => eprintln!(
+                "IP_HOIST model={ip_model_id} prefix=0 suffix={} FALLBACK (nothing η-independent)",
+                stmts_owned.len()
+            ),
+            Some(sp) => eprintln!(
+                "IP_HOIST model={ip_model_id} prefix={} suffix={} cached_slots={} \
+                 key_thetas={} key_covs={} key_time={} key_mixnum={} n_vars={n_vars} \
+                 n_theta={n_theta_base} n_cov={n_cov}",
+                sp.prefix.len(),
+                sp.suffix.len(),
+                sp.writes.len(),
+                sp.key_thetas
+                    .as_ref()
+                    .map_or("ALL".to_string(), |t| t.len().to_string()),
+                sp.key_covs.len(),
+                sp.key_time,
+                sp.key_mixnum,
+            ),
+        }
+    }
+
     // Snapshot the NN handles into the closure. Empty when no
     // `[covariate_nn]` blocks are present, in which case the per-call
     // forward-pass loop below is a no-op (just an empty `Vec<Vec<f64>>`
@@ -18110,10 +18152,14 @@ fn build_pk_param_fn(
             let mut p = PkParams::default();
             FERX_SCRATCH.with(|cell| {
                 let mut scratch = cell.borrow_mut();
+                #[cfg(test)]
+                let (mut hits_delta, mut misses_delta) = (0u64, 0u64);
                 let FerxThreadScratch {
                     pk_cov,
                     pk_vars,
                     bc_stack,
+                    ip_key,
+                    ip_cache,
                     ..
                 } = &mut *scratch;
 
@@ -18131,16 +18177,109 @@ fn build_pk_param_fn(
                 // pk_param_fn doesn't compute derivatives — no `du` to pass.
                 // Call the stack-threaded evaluator directly while this scratch
                 // borrow is live; the wrapper would re-enter FERX_SCRATCH.
-                eval_statements_indexed_with_stack(
-                    &stmts_owned,
-                    theta,
-                    eta,
-                    pk_cov,
-                    pk_vars,
-                    None,
-                    &nn_outputs,
-                    bc_stack,
-                );
+                match &ip_split {
+                    None => eval_statements_indexed_with_stack(
+                        &stmts_owned,
+                        theta,
+                        eta,
+                        pk_cov,
+                        pk_vars,
+                        None,
+                        &nn_outputs,
+                        bc_stack,
+                    ),
+                    Some(split) => {
+                        // Key = every input the prefix can read. `TIME` and
+                        // `MIXNUM` are appended only when the prefix actually
+                        // reads them, which is what lets a time-varying model
+                        // keep hitting the cache across its events.
+                        ip_key.clear();
+                        match &split.key_thetas {
+                            None => ip_key.extend_from_slice(theta),
+                            Some(idx) => ip_key
+                                .extend(idx.iter().map(|&i| theta.get(i).copied().unwrap_or(0.0))),
+                        }
+                        ip_key.extend(
+                            split
+                                .key_covs
+                                .iter()
+                                .map(|&i| pk_cov.get(i).copied().unwrap_or(0.0)),
+                        );
+                        if split.key_time {
+                            ip_key.push(time);
+                        }
+                        if split.key_mixnum {
+                            ip_key.push(current_mixture_class() as f64);
+                        }
+                        if ip_cache.len() != IP_CACHE_WAYS {
+                            ip_cache.clear();
+                            ip_cache.resize_with(IP_CACHE_WAYS, IpCacheEntry::default);
+                        }
+                        let way = ip_key_hash(ip_model_id, ip_key);
+                        let entry = &mut ip_cache[way];
+                        let hit = entry.occupied
+                            && entry.model_id == ip_model_id
+                            && entry.key.len() == ip_key.len()
+                            // Bit equality, not `==`, and the two cases pull in
+                            // opposite directions. `-0.0 == 0.0` is true but the
+                            // two are different inputs to the prefix (`1/x`
+                            // alone separates them), so `==` would serve a false
+                            // hit; bits give the miss. `NaN == NaN` is false —
+                            // and a `NaN` covariate is #1111's missing-value
+                            // encoding, so it is a real input, not an error —
+                            // so `==` would miss forever on such a subject;
+                            // bits give the hit, which is correct because the
+                            // prefix is deterministic: same bits in, same values
+                            // out.
+                            && entry
+                                .key
+                                .iter()
+                                .zip(ip_key.iter())
+                                .all(|(a, b)| a.to_bits() == b.to_bits());
+                        if hit {
+                            #[cfg(test)]
+                            {
+                                hits_delta += 1;
+                            }
+                            for (&slot, &v) in split.writes.iter().zip(entry.vals.iter()) {
+                                pk_vars[slot] = v;
+                            }
+                        } else {
+                            #[cfg(test)]
+                            {
+                                misses_delta += 1;
+                            }
+                            eval_statements_indexed_with_stack(
+                                &split.prefix,
+                                theta,
+                                eta,
+                                pk_cov,
+                                pk_vars,
+                                None,
+                                &nn_outputs,
+                                bc_stack,
+                            );
+                            entry.model_id = ip_model_id;
+                            entry.key.clear();
+                            entry.key.extend_from_slice(ip_key);
+                            entry.vals.clear();
+                            entry
+                                .vals
+                                .extend(split.writes.iter().map(|&slot| pk_vars[slot]));
+                            entry.occupied = true;
+                        }
+                        eval_statements_indexed_with_stack(
+                            &split.suffix,
+                            theta,
+                            eta,
+                            pk_cov,
+                            pk_vars,
+                            None,
+                            &nn_outputs,
+                            bc_stack,
+                        );
+                    }
+                }
 
                 if is_analytical_pk {
                     for &(pk_slot, var_slot) in &pk_assignment_mapping {
@@ -18164,6 +18303,11 @@ fn build_pk_param_fn(
                     for &(slot, var_slot) in &ode_assignment_mapping {
                         p.values[slot] = pk_vars[var_slot];
                     }
+                }
+                #[cfg(test)]
+                {
+                    scratch.ip_hits += hits_delta;
+                    scratch.ip_misses += misses_delta;
                 }
             });
             p
@@ -18904,7 +19048,7 @@ thread_local! {
 // class NLL lands with the mixture objective (#977 Phase 3). Until then the
 // thread-local stays at its class-1 default and `MIXNUM` resolves to 1.
 
-fn current_mixture_class() -> usize {
+pub(crate) fn current_mixture_class() -> usize {
     MIXTURE_CLASS.with(std::cell::Cell::get)
 }
 
@@ -20788,6 +20932,466 @@ enum Op {
     Round, // unary
 }
 
+// ─── η-independent prefix hoisting for `[individual_parameters]` (E6) ──────
+//
+// A samply profile of SAEM attributes ~51% of on-CPU work to the bytecode
+// interpreter for this block, re-run on every likelihood evaluation — once per
+// MH proposal on the analytic path, once per *event* on the time-varying path —
+// although most of it is η-independent covariate algebra (allometry, FFM,
+// CRCL, maturation: several `powf` each) that only changes when θ, the
+// covariates, `TIME` or `MIXNUM` change.
+//
+// The split below partitions the statement list into an η-independent part and
+// the rest, and the closure memoizes the η-independent part on exactly the
+// inputs it reads. **Nothing is recomputed differently**: the hoisted
+// statements are the same statements, in the same relative order, evaluated by
+// the same interpreter on bit-identical inputs. A cache hit replays the f64
+// values the miss produced, so every downstream value is bit-identical by
+// construction rather than by tolerance.
+
+/// What one `[individual_parameters]` statement reads and writes, for the
+/// η-independence split.
+#[derive(Default)]
+struct IpStmtDeps {
+    /// Variable slots the statement reads.
+    reads: Vec<usize>,
+    /// Variable slots the statement may write (an `if` body's writes are
+    /// *may*-writes, which is the conservative direction for both rules below).
+    writes: Vec<usize>,
+    /// The statement depends on something the cache key cannot carry — η, or a
+    /// `[covariate_nn]` output (recomputed per call outside the statement list),
+    /// or an unresolved name. Such a statement can never be hoisted.
+    dynamic: bool,
+    reads_time: bool,
+    reads_mixnum: bool,
+    /// θ indices the statement reads. Only these belong in the cache key: a
+    /// θ the prefix never reads cannot change its value, and leaving it out
+    /// both shortens the key and stops an unrelated θ move (the M-step
+    /// perturbs one coordinate at a time) from invalidating the entry.
+    thetas: Vec<usize>,
+    /// Covariate indices the statement reads, for the same reason.
+    covs: Vec<usize>,
+    /// A `ThetaGather` picks its θ at run time, so no index subset is sound;
+    /// the whole θ slice goes in the key.
+    all_thetas: bool,
+    /// Weighted op count — the work hoisting this statement saves per call.
+    /// See [`ip_op_cost`].
+    cost: u32,
+}
+
+/// Rough cost of one bytecode op, in units of a simple arithmetic op.
+///
+/// The only thing this has to get right is the order of magnitude between a
+/// transcendental and an add: on aarch64 a `powf` is tens of cycles against
+/// one or two for a multiply, so 20 is a deliberate under-estimate (it makes
+/// the hoist gate below *less* eager, not more).
+fn ip_op_cost(op: &Op) -> u32 {
+    match op {
+        Op::Pow | Op::Exp | Op::Ln | Op::Sqrt | Op::Logit | Op::InvLogit => 20,
+        Op::Div | Op::Mod => 4,
+        _ => 1,
+    }
+}
+
+fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
+    for op in &bc.ops {
+        d.cost += ip_op_cost(op);
+        match *op {
+            Op::PushVar(i) => d.reads.push(i as usize),
+            Op::PushTheta(i) => d.thetas.push(i as usize),
+            Op::PushCov(i) => d.covs.push(i as usize),
+            Op::PushThetaGather(_) => d.all_thetas = true,
+            Op::PushEta(_) => d.dynamic = true,
+            Op::PushNnOutput(..) => d.dynamic = true,
+            Op::PushTime => d.reads_time = true,
+            Op::PushMixNum => d.reads_mixnum = true,
+            // Everything below reads nothing outside the bytecode itself: a
+            // constant lives in `bc.constants`, and every arithmetic / comparison
+            // / control op consumes only the stack. `PushThetaGather` pops its
+            // level index off that stack, and whatever pushed it is itself an op
+            // in this same loop, so its dependencies are already accounted for.
+            //
+            // **Listed one by one on purpose — no `_` arm.** The hoist is sound
+            // only if `d` names every input the statement can read, so a new
+            // `Op` that reads state (an occasion index, a record field, a second
+            // thread-local) must not be able to reach the prefix by silently
+            // matching a wildcard. Adding an `Op` variant now fails to compile
+            // here, which is the intended forcing function; classify it, do not
+            // widen the match.
+            Op::PushConst(_)
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Pow
+            | Op::Exp
+            | Op::Ln
+            | Op::Sqrt
+            | Op::Abs
+            | Op::InvLogit
+            | Op::Logit
+            | Op::CmpLt
+            | Op::CmpLe
+            | Op::CmpGt
+            | Op::CmpGe
+            | Op::CmpEq
+            | Op::CmpNe
+            | Op::LogicAnd
+            | Op::LogicOr
+            | Op::LogicNot
+            | Op::IsPresent
+            | Op::JumpIfFalse(_)
+            | Op::Jump(_)
+            | Op::Mod
+            | Op::Floor
+            | Op::Ceil
+            | Op::Round => {}
+        }
+    }
+}
+
+fn ip_deps_expr(e: &Expression, d: &mut IpStmtDeps) {
+    d.cost += 1;
+    match e {
+        Expression::Literal(_) => {}
+        Expression::Theta(i) => d.thetas.push(*i),
+        Expression::CovariateIdx(i) => d.covs.push(*i),
+        Expression::VariableIdx(i) => d.reads.push(*i),
+        Expression::Eta(_) | Expression::NnOutput { .. } => d.dynamic = true,
+        Expression::Time => d.reads_time = true,
+        Expression::MixNum => d.reads_mixnum = true,
+        // An unresolved name means `resolve_variable_indices` did not reach this
+        // node; we cannot say which slot it is, so refuse to hoist the statement.
+        Expression::Covariate(_) | Expression::Variable(_) => d.dynamic = true,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            ip_deps_expr(a, d);
+            ip_deps_expr(b, d);
+        }
+        Expression::UnaryFn(_, a) => ip_deps_expr(a, d),
+        Expression::Conditional(c, a, b) => {
+            ip_deps_cond(c, d);
+            ip_deps_expr(a, d);
+            ip_deps_expr(b, d);
+        }
+        Expression::ThetaGather { idx, .. } => {
+            d.all_thetas = true;
+            ip_deps_expr(idx, d);
+        }
+    }
+}
+
+fn ip_deps_cond(c: &Condition, d: &mut IpStmtDeps) {
+    match c {
+        Condition::Compare(a, _, b) => {
+            ip_deps_expr(a, d);
+            ip_deps_expr(b, d);
+        }
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            ip_deps_cond(a, d);
+            ip_deps_cond(b, d);
+        }
+        Condition::Not(a) => ip_deps_cond(a, d),
+        Condition::Present(e) => ip_deps_expr(e, d),
+    }
+}
+
+fn ip_deps_stmt(s: &Statement, d: &mut IpStmtDeps) {
+    match s {
+        Statement::AssignBc(idx, bc) => {
+            d.writes.push(*idx);
+            ip_deps_bytecode(bc, d);
+        }
+        Statement::AssignIdx(idx, e) => {
+            d.writes.push(*idx);
+            ip_deps_expr(e, d);
+        }
+        Statement::If {
+            branches,
+            else_body,
+        } => {
+            // Reads/writes are the union over every arm (a *may*-read and a
+            // *may*-write, the conservative direction for both split rules).
+            // The cost is the **most expensive single arm**, because only one
+            // of them runs — summing would overstate what hoisting saves.
+            let mut worst_arm = 0;
+            for (cond, body) in branches {
+                let before = d.cost;
+                ip_deps_cond(cond, d);
+                for s in body {
+                    ip_deps_stmt(s, d);
+                }
+                worst_arm = worst_arm.max(d.cost - before);
+                d.cost = before;
+            }
+            if let Some(body) = else_body {
+                let before = d.cost;
+                for s in body {
+                    ip_deps_stmt(s, d);
+                }
+                worst_arm = worst_arm.max(d.cost - before);
+                d.cost = before;
+            }
+            d.cost += worst_arm;
+        }
+        // `Assign`/`DiffEq*` never appear in a resolved `[individual_parameters]`
+        // list (the first is resolved away, the latter two are `[odes]`-only).
+        // Refuse to hoist rather than guess.
+        Statement::Assign(..) | Statement::DiffEq(..) | Statement::DiffEqBc(..) => d.dynamic = true,
+        Statement::DiffEqIdx(..) => d.dynamic = true,
+    }
+}
+
+/// The η-independent split of an `[individual_parameters]` statement list.
+struct IpPrefixSplit {
+    /// Statements evaluated once per (θ, covariates, `TIME`, `MIXNUM`), in
+    /// their original relative order.
+    prefix: Vec<Statement>,
+    /// Everything else, in its original relative order.
+    suffix: Vec<Statement>,
+    /// Variable slots the prefix may write — the values the cache stores.
+    writes: Vec<usize>,
+    /// Whether the prefix reads the `TIME` / `MIXNUM` built-ins, and so whether
+    /// they belong in the cache key. Leaving out a built-in the prefix does not
+    /// read is what lets a time-varying model still hit the cache on every
+    /// event (its η-independent statements are usually time-free).
+    key_time: bool,
+    key_mixnum: bool,
+    /// θ indices in the key, ascending; `None` means "the whole θ slice"
+    /// (a `ThetaGather` reads a run-time-chosen index).
+    key_thetas: Option<Vec<usize>>,
+    /// Covariate indices in the key, ascending.
+    key_covs: Vec<usize>,
+}
+
+/// Partition `stmts` into an η-independent prefix and the remainder.
+///
+/// The prefix is **reordered to the front**, which is sound under two rules
+/// applied as the list is walked once:
+///
+/// * a statement that reads a slot any *suffix* statement has written is itself
+///   pushed to the suffix (taint), so a hoisted statement never reads a value
+///   produced by a statement that stays behind; and
+/// * a statement that writes a slot any suffix statement has already **read or
+///   written** is pushed to the suffix (conflict), so hoisting can neither
+///   overwrite a value a suffix statement is about to read nor lose a write
+///   that the original order performed last.
+///
+/// Within each part the original relative order is preserved, so a hoisted
+/// statement reading a slot written by an earlier hoisted statement — or by
+/// nobody, and therefore reading the zero-fill — sees exactly what it saw
+/// before. Together these give: the same statements, on the same inputs, in an
+/// order with the same data dependencies, hence the same f64 values.
+///
+/// Returns `None` when nothing is hoistable, in which case the caller keeps the
+/// single unsplit program and pays no key-building or lookup cost at all.
+fn split_ip_eta_independent_prefix(
+    stmts: &[Statement],
+    n_vars: usize,
+    n_theta: usize,
+    n_cov: usize,
+) -> Option<IpPrefixSplit> {
+    let mut tainted = vec![false; n_vars];
+    let mut touched_by_suffix = vec![false; n_vars];
+    let mut written_by_prefix = vec![false; n_vars];
+    let mut prefix: Vec<Statement> = Vec::new();
+    let mut suffix: Vec<Statement> = Vec::new();
+    let (mut key_time, mut key_mixnum) = (false, false);
+    let mut key_theta_set = vec![false; n_theta];
+    let mut key_cov_set = vec![false; n_cov];
+    let mut all_thetas = false;
+    let mut prefix_cost: u32 = 0;
+
+    for s in stmts {
+        let mut d = IpStmtDeps::default();
+        ip_deps_stmt(s, &mut d);
+        // A slot index outside the declared width can only come from an
+        // unresolved node (`usize::MAX`); treat it the way `eval` does — as
+        // something we do not understand — and keep the statement behind.
+        let out_of_range = d.reads.iter().chain(d.writes.iter()).any(|&i| i >= n_vars);
+        let depends_on_eta = d.dynamic || out_of_range || d.reads.iter().any(|&i| tainted[i]);
+        let conflicts = d.writes.iter().any(|&i| touched_by_suffix[i]);
+        if depends_on_eta || conflicts {
+            for &i in &d.writes {
+                if i < n_vars {
+                    tainted[i] = true;
+                    touched_by_suffix[i] = true;
+                }
+            }
+            for &i in &d.reads {
+                if i < n_vars {
+                    touched_by_suffix[i] = true;
+                }
+            }
+            suffix.push(s.clone());
+        } else {
+            for &i in &d.writes {
+                written_by_prefix[i] = true;
+            }
+            key_time |= d.reads_time;
+            key_mixnum |= d.reads_mixnum;
+            all_thetas |= d.all_thetas;
+            for &i in &d.thetas {
+                if i < n_theta {
+                    key_theta_set[i] = true;
+                } else {
+                    // An out-of-range θ index can only come from a malformed
+                    // program; widen the key rather than narrow it.
+                    all_thetas = true;
+                }
+            }
+            for &i in &d.covs {
+                if i < n_cov {
+                    key_cov_set[i] = true;
+                }
+            }
+            prefix_cost = prefix_cost.saturating_add(d.cost);
+            prefix.push(s.clone());
+        }
+    }
+
+    if prefix.is_empty() {
+        return None;
+    }
+    let key_thetas: Option<Vec<usize>> = if all_thetas {
+        None
+    } else {
+        Some((0..n_theta).filter(|&i| key_theta_set[i]).collect())
+    };
+    let key_covs: Vec<usize> = (0..n_cov).filter(|&i| key_cov_set[i]).collect();
+
+    // Is the hoist worth its own lookup? Building and comparing the key costs
+    // roughly two units per element (one to hash, one to compare) plus a fixed
+    // ~10 for the call, the bounds checks and the branch; the hoist saves
+    // `prefix_cost` units per call. Hoisting when it saves less than it costs
+    // is a *regression*, and a measured one: on B5 (pembrolizumab) the prefix
+    // is `IMAX`, `HILL` and `Q` — 27 weighted ops, one `powf` — against a
+    // 5-element key, and the first cut of this change came out **1.6 % slower
+    // in CPU time** there (52.9 s against 52.1 s, 3 interleaved reps) while B2
+    // gained 20 %. The gate below sends B5 back to the unsplit program.
+    //
+    // The comparison is `>=` with no tuned multiplier: hoist exactly when the
+    // work removed is at least the work added.
+    let key_len = key_thetas.as_ref().map_or(n_theta, |t| t.len())
+        + key_covs.len()
+        + usize::from(key_time)
+        + usize::from(key_mixnum);
+    let key_cost = 2 * key_len as u32 + 10;
+    if prefix_cost < key_cost {
+        return None;
+    }
+
+    let writes: Vec<usize> = (0..n_vars).filter(|&i| written_by_prefix[i]).collect();
+    Some(IpPrefixSplit {
+        prefix,
+        suffix,
+        writes,
+        key_time,
+        key_mixnum,
+        key_thetas,
+        key_covs,
+    })
+}
+
+/// Entries in the per-thread η-independent-prefix cache. A power of two so the
+/// index is a mask; 64 covers a time-varying subject's event count on the
+/// benchmarks (B5's longest subject has 41 records) while costing ~16 KB per
+/// worker thread.
+const IP_CACHE_WAYS: usize = 64;
+
+/// One memoized evaluation of a model's η-independent prefix.
+///
+/// `model_id` distinguishes the closures of different `CompiledModel`s sharing a
+/// worker thread (a joint PK-TTE fit, a `ferx-tools` search, a test binary), so
+/// a stale entry from another model can never be served: it is compared, not
+/// assumed.
+#[derive(Debug, Default)]
+struct IpCacheEntry {
+    model_id: u64,
+    /// `θ ‖ covariates ‖ [TIME] ‖ [MIXNUM]` — every input the prefix can read.
+    key: Vec<f64>,
+    /// The prefix's output slots, parallel to `IpPrefixSplit::writes`.
+    vals: Vec<f64>,
+    occupied: bool,
+}
+
+/// Process-wide identity for one built `pk_param_fn` closure.
+static IP_MODEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, [`build_pk_param_fn`] keeps the unsplit program, so
+    /// the *same* model source can be compiled both ways and the two closures
+    /// compared bit-for-bit.
+    ///
+    /// Thread-local rather than a global, and read at parse time on the parsing
+    /// thread, so two tests running concurrently cannot see each other's
+    /// setting and none of this needs a lock.
+    pub(crate) static IP_HOIST_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`IP_HOIST_DISABLED`]. Restores the previous value
+/// on drop, including on an assertion unwind.
+#[cfg(test)]
+pub(crate) struct IpHoistOff(bool);
+
+#[cfg(test)]
+impl IpHoistOff {
+    pub(crate) fn enter() -> Self {
+        Self(IP_HOIST_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for IpHoistOff {
+    fn drop(&mut self) {
+        IP_HOIST_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
+/// Test-only: this thread's `(hits, misses)` on the η-independent-prefix cache.
+///
+/// Per-thread, like the cache itself, so a test reads only the lookups it
+/// performed — a process-wide counter would be polluted by every other test
+/// parsing and evaluating models at the same time, and "the cache was used at
+/// all" is exactly the assertion that stops a bit-identity test from passing
+/// vacuously because nothing ever hit.
+#[cfg(test)]
+pub(crate) fn ip_cache_counters() -> (u64, u64) {
+    FERX_SCRATCH.with(|cell| {
+        let s = cell.borrow();
+        (s.ip_hits, s.ip_misses)
+    })
+}
+
+/// Test-only: zero this thread's prefix-cache counters **and evict the cache**,
+/// so a following sequence of calls starts cold and its hit/miss counts mean
+/// what they say.
+#[cfg(test)]
+pub(crate) fn ip_cache_reset() {
+    FERX_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.ip_hits = 0;
+        s.ip_misses = 0;
+        s.ip_cache.clear();
+    })
+}
+
+/// FNV-1a over the raw bits of the key. Only used to pick a way; a collision
+/// costs a miss, never a wrong answer, because the full key is compared.
+fn ip_key_hash(model_id: u64, key: &[f64]) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(model_id);
+    for &v in key {
+        mix(v.to_bits());
+    }
+    (h as usize) & (IP_CACHE_WAYS - 1)
+}
+
 // ─── Consolidated per-thread scratch ───────────────────────────────────────
 //
 // All hot-path closures in this module need their own `Vec<f64>` scratch:
@@ -20812,6 +21416,17 @@ struct FerxThreadScratch {
     y_vars: Vec<f64>,
     y_cov: Vec<f64>,
     bc_stack: Vec<f64>,
+    /// Key scratch for the η-independent prefix cache (E6), reused so building
+    /// the key costs no allocation.
+    ip_key: Vec<f64>,
+    /// The cache itself, sized to [`IP_CACHE_WAYS`] on first use. Empty for a
+    /// thread that has never evaluated a model with a hoistable prefix.
+    ip_cache: Vec<IpCacheEntry>,
+    /// Test-only lookup counters for [`ip_cache_counters`].
+    #[cfg(test)]
+    ip_hits: u64,
+    #[cfg(test)]
+    ip_misses: u64,
 }
 
 impl FerxThreadScratch {
@@ -20823,6 +21438,12 @@ impl FerxThreadScratch {
             y_vars: Vec::new(),
             y_cov: Vec::new(),
             bc_stack: Vec::new(),
+            ip_key: Vec::new(),
+            ip_cache: Vec::new(),
+            #[cfg(test)]
+            ip_hits: 0,
+            #[cfg(test)]
+            ip_misses: 0,
         }
     }
 }

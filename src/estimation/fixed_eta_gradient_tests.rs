@@ -66,14 +66,14 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
     let n = n_theta + n_sigma;
 
     // Compute reference gradient via forward-FD of obs_nll_sum.
-    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
+    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas, &[]);
     let h = 1e-5;
     let mut ref_grad = vec![0.0f64; n];
     // Theta perturbations (in natural scale).
     for i in 0..n_theta {
         let mut theta_p = theta.clone();
         theta_p[i] += h;
-        let fp = obs_nll_sum(&model, &population, &theta_p, &sigma_values, &etas);
+        let fp = obs_nll_sum(&model, &population, &theta_p, &sigma_values, &etas, &[]);
         // FD in natural scale; convert to log-packed space (d/d_log = theta * d/d_theta)
         ref_grad[i] = theta[i] * (fp - f0) / h;
     }
@@ -81,7 +81,7 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
     {
         let mut sigma_p = sigma_values.clone();
         sigma_p[0] += h;
-        let fp = obs_nll_sum(&model, &population, &theta, &sigma_p, &etas);
+        let fp = obs_nll_sum(&model, &population, &theta, &sigma_p, &etas, &[]);
         ref_grad[n_theta] = sigma_values[0] * (fp - f0) / h;
     }
 
@@ -424,19 +424,19 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
     let n = n_theta + n_sigma;
 
     // Reference gradient: forward-FD of obs_nll_sum, in log-packed space.
-    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
+    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas, &[]);
     let h = 1e-6;
     let mut ref_grad = vec![0.0f64; n];
     for i in 0..n_theta {
         let mut tp = theta.clone();
         tp[i] += h;
-        let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas);
+        let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas, &[]);
         ref_grad[i] = theta[i] * (fp - f0) / h;
     }
     for k in 0..n_sigma {
         let mut sp = sigma_values.clone();
         sp[k] += h;
-        let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas);
+        let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas, &[]);
         ref_grad[n_theta + k] = sigma_values[k] * (fp - f0) / h;
     }
 
@@ -567,19 +567,19 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     let n_sigma = 2;
     let n = n_theta + n_sigma;
 
-    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
+    let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas, &[]);
     let h = 1e-6;
     let mut ref_grad = vec![0.0f64; n];
     for i in 0..n_theta {
         let mut tp = theta.clone();
         tp[i] += h;
-        let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas);
+        let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas, &[]);
         ref_grad[i] = theta[i] * (fp - f0) / h;
     }
     for k in 0..n_sigma {
         let mut sp = sigma_values.clone();
         sp[k] += h;
-        let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas);
+        let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas, &[]);
         ref_grad[n_theta + k] = sigma_values[k] * (fp - f0) / h;
     }
 
@@ -662,20 +662,20 @@ fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_value
     let n_sigma = sigma_values.len();
     let n = n_theta + n_sigma;
 
-    let f0 = obs_nll_sum(model, &population, theta, sigma_values, &etas);
+    let f0 = obs_nll_sum(model, &population, theta, sigma_values, &etas, &[]);
     let h = 1e-6;
     let mut ref_grad = vec![0.0f64; n];
     for i in 0..n_theta {
         let mut tp = theta.to_vec();
         tp[i] += h;
         ref_grad[i] =
-            theta[i] * (obs_nll_sum(model, &population, &tp, sigma_values, &etas) - f0) / h;
+            theta[i] * (obs_nll_sum(model, &population, &tp, sigma_values, &etas, &[]) - f0) / h;
     }
     for k in 0..n_sigma {
         let mut sp = sigma_values.to_vec();
         sp[k] += h;
         ref_grad[n_theta + k] =
-            sigma_values[k] * (obs_nll_sum(model, &population, theta, &sp, &etas) - f0) / h;
+            sigma_values[k] * (obs_nll_sum(model, &population, theta, &sp, &etas, &[]) - f0) / h;
     }
 
     let mask = vec![true; n_theta];

@@ -25337,3 +25337,802 @@ fn preamble_prose_and_model_prefixed_words_are_not_model_lines() {
     );
     assert_eq!(parsed_name("modelled = 3\nmodel real_name"), "real_name");
 }
+
+// ─── E6: η-independent prefix hoisting ────────────────────────────────────
+
+/// Deterministic xorshift — a seeded generator so a failure reproduces from the
+/// printed seed without pulling `rand` into this module.
+fn e6_rng(state: &mut u64) -> f64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    // 53-bit mantissa in [0, 1), then spread over a range that exercises both
+    // sides of every comparison in the generated models.
+    ((*state >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 1.0
+}
+
+/// Model bodies covering the shapes the split has to get right: plain covariate
+/// algebra, an η-dependent statement *between* two η-independent ones (which
+/// only a reordering split can hoist), `if`/`else if`/`else` on a covariate and
+/// on η, the `TIME` built-in, local reassignment of a slot, and a statement
+/// that reads a slot an η-dependent statement wrote.
+fn e6_model_bodies() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "covariate_algebra_then_etas",
+            "  BMI = WT / (HT / 100)^2\n\
+             \x20 FFM = 9270 * WT / (6680 + 216 * BMI)\n\
+             \x20 CL  = TVCL * (FFM / 55)^0.75 * exp(ETA_CL)\n\
+             \x20 V   = TVV * (FFM / 55) * exp(ETA_V)\n\
+             \x20 KA  = TVKA * (FFM / 55)^0.1\n",
+        ),
+        (
+            "eta_statement_between_two_hoistable",
+            "  CL   = TVCL * exp(ETA_CL)\n\
+             \x20 FFM  = 9270 * WT / (6680 + 216 * WT / (HT / 100)^2)\n\
+             \x20 V    = TVV * (FFM / 55)^0.9 * exp(ETA_V)\n\
+             \x20 KA   = TVKA * (FFM / 55)^0.25\n",
+        ),
+        (
+            "branch_on_covariate",
+            "  if (SEX == 1) {\n\
+             \x20   FFM = 9270 * WT / (6680 + 216 * WT / (HT / 100)^2)\n\
+             \x20 } else {\n\
+             \x20   FFM = 9270 * WT / (8780 + 244 * WT / (HT / 100)^2)\n\
+             \x20 }\n\
+             \x20 CL = TVCL * (FFM / 55)^0.75 * exp(ETA_CL)\n\
+             \x20 V  = TVV * exp(ETA_V)\n\
+             \x20 KA = TVKA * (FFM / 55)^0.2\n",
+        ),
+        (
+            "branch_on_eta",
+            "  BMI = WT / (HT / 100)^2\n\
+             \x20 CL  = TVCL * exp(ETA_CL)\n\
+             \x20 if (CL > 1.0) {\n\
+             \x20   V = TVV * BMI\n\
+             \x20 } else {\n\
+             \x20   V = TVV / (BMI + 1)\n\
+             \x20 }\n\
+             \x20 KA = TVKA * BMI\n",
+        ),
+        (
+            "time_builtin",
+            "  BMI  = WT / (HT / 100)^2\n\
+             \x20 DECAY = exp(-0.01 * TIME)\n\
+             \x20 CL   = TVCL * BMI^0.3 * DECAY * exp(ETA_CL)\n\
+             \x20 V    = TVV * exp(ETA_V)\n\
+             \x20 KA   = TVKA * DECAY\n",
+        ),
+        (
+            "reassignment_after_an_eta_write",
+            "  BMI = WT / (HT / 100)^2\n\
+             \x20 CL  = TVCL * BMI * exp(ETA_CL)\n\
+             \x20 BMI = BMI + 1\n\
+             \x20 V   = TVV * BMI * exp(ETA_V)\n\
+             \x20 KA  = TVKA * BMI\n",
+        ),
+        (
+            "hoistable_write_read_by_an_eta_statement_then_rewritten",
+            "  SCALE = WT / 70\n\
+             \x20 CL    = TVCL * SCALE * exp(ETA_CL)\n\
+             \x20 SCALE = SCALE * 2\n\
+             \x20 V     = TVV * SCALE * exp(ETA_V)\n\
+             \x20 KA    = TVKA\n",
+        ),
+        (
+            "conditional_expression_on_covariate",
+            "  CRCL = if (CR < 0.7) (142 / 16.7) * (CR / 0.7)^(-0.241) else (142 / 16.7) * (CR / 0.7)^(-1.2)\n\
+             \x20 CL   = TVCL * (CRCL / 5)^0.8 * exp(ETA_CL)\n\
+             \x20 V    = TVV * exp(ETA_V)\n\
+             \x20 KA   = TVKA * (CRCL / 5)^0.2\n",
+        ),
+    ]
+}
+
+fn e6_model_text(body: &str) -> String {
+    format!(
+        "[parameters]\n\
+         \x20 theta TVCL(2.0, 0.1, 100.0)\n\
+         \x20 theta TVV(20.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.0, 0.01, 50.0)\n\
+         \x20 omega ETA_CL ~ 0.09\n\
+         \x20 omega ETA_V ~ 0.09\n\
+         \x20 sigma PROP ~ 0.04\n\
+         \n[individual_parameters]\n{body}\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    )
+}
+
+/// The split must be *value-preserving*: running the prefix then the suffix
+/// must leave every variable slot bit-identical to running the original
+/// statement list, for every input. This is the property the whole hoist rests
+/// on — the reordering is only legal because the data dependencies make it
+/// invisible.
+///
+/// Mutation check (run, not reasoned): dropping the `conflicts` test in
+/// `split_ip_eta_independent_prefix` reddens
+/// `hoistable_write_read_by_an_eta_statement_then_rewritten` (the rewritten
+/// `SCALE` hoists ahead of the statement that reads the old value); dropping
+/// the `tainted` test reddens `branch_on_eta` and `reassignment_after_an_eta_write`.
+#[test]
+fn eta_independent_split_is_value_preserving_on_every_shape() {
+    let mut n_split = 0usize;
+    for (name, body) in e6_model_bodies() {
+        let model = parse_model_string(&e6_model_text(body))
+            .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: no indiv_param_program"));
+        let stmts = &program.stmts;
+        let n_vars = program.n_vars;
+        let Some(split) = split_ip_eta_independent_prefix(
+            stmts,
+            n_vars,
+            model.n_theta,
+            model.referenced_covariates.len(),
+        ) else {
+            // A model with nothing to hoist still has to be covered by the
+            // fallback path; there is nothing to compare here.
+            continue;
+        };
+        assert!(
+            !split.prefix.is_empty(),
+            "{name}: split returned Some with an empty prefix"
+        );
+        n_split += 1;
+
+        let n_cov = model.referenced_covariates.len();
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for trial in 0..64 {
+            let theta: Vec<f64> = (0..model.n_theta)
+                .map(|_| 1.0 + e6_rng(&mut seed))
+                .collect();
+            let eta: Vec<f64> = (0..model.n_eta).map(|_| e6_rng(&mut seed) * 0.4).collect();
+            let cov: Vec<f64> = (0..n_cov).map(|_| 1.0 + e6_rng(&mut seed)).collect();
+            let time = 10.0 * (1.0 + e6_rng(&mut seed));
+            let _guard = ModelTimeGuard::enter(time);
+            let nn: Vec<Vec<f64>> = Vec::new();
+            let mut stack: Vec<f64> = Vec::new();
+
+            let mut want = vec![0.0f64; n_vars];
+            eval_statements_indexed_with_stack(
+                stmts, &theta, &eta, &cov, &mut want, None, &nn, &mut stack,
+            );
+
+            let mut got = vec![0.0f64; n_vars];
+            eval_statements_indexed_with_stack(
+                &split.prefix,
+                &theta,
+                &eta,
+                &cov,
+                &mut got,
+                None,
+                &nn,
+                &mut stack,
+            );
+            eval_statements_indexed_with_stack(
+                &split.suffix,
+                &theta,
+                &eta,
+                &cov,
+                &mut got,
+                None,
+                &nn,
+                &mut stack,
+            );
+            for (slot, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name}: trial {trial}, slot {slot}: unsplit {a} vs split {b}"
+                );
+            }
+        }
+    }
+    // The cost gate can decline to hoist, and a shape it declines is skipped
+    // above — so without this the whole test could pass by hoisting nothing.
+    assert!(
+        n_split >= 5,
+        "only {n_split} of the shapes produced a split; the comparison above is \
+         near-vacuous — check the cost gate in split_ip_eta_independent_prefix"
+    );
+}
+
+/// The *cache* must key on every input the prefix reads. A key missing one —
+/// `TIME`, a covariate, a θ — serves a stale hit, and the only way to see it is
+/// to interleave inputs so a stale entry is still resident when a different
+/// input arrives.
+///
+/// So: compute a reference for each input tuple with a cold evaluator, then
+/// replay the tuples through the real `pk_param_fn` in an order that guarantees
+/// hits and near-misses (each tuple twice, then all of them round-robin twice
+/// more) and require bit-equality every time. Mutation check: dropping
+/// `split.key_time` from the key reddens `time_builtin`; dropping the covariate
+/// slice reddens every other model.
+#[test]
+fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
+    use std::collections::HashMap;
+    for (name, body) in e6_model_bodies() {
+        let model = parse_model_string(&e6_model_text(body))
+            .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let program = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: no indiv_param_program"))
+            .clone();
+        let cov_names = model.referenced_covariates.clone();
+
+        // Inputs: vary θ, η, covariates and TIME independently, including two
+        // tuples that differ in exactly one covariate and two that differ only
+        // in TIME — the pairs a partial key cannot tell apart.
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut inputs: Vec<(Vec<f64>, Vec<f64>, HashMap<String, f64>, f64)> = Vec::new();
+        for i in 0..24 {
+            let theta: Vec<f64> = (0..model.n_theta)
+                .map(|_| 1.0 + e6_rng(&mut seed))
+                .collect();
+            let eta: Vec<f64> = (0..model.n_eta).map(|_| e6_rng(&mut seed) * 0.4).collect();
+            let mut cov = HashMap::new();
+            for (j, n) in cov_names.iter().enumerate() {
+                cov.insert(n.clone(), 1.0 + e6_rng(&mut seed) + (j as f64) * 0.01);
+            }
+            inputs.push((theta, eta, cov, 5.0 * (i as f64)));
+        }
+        // One-covariate-apart and one-TIME-apart twins of input 0.
+        if !cov_names.is_empty() {
+            let mut twin = inputs[0].clone();
+            *twin.2.get_mut(&cov_names[0]).unwrap() += 0.5;
+            inputs.push(twin);
+        }
+        let mut twin = inputs[0].clone();
+        twin.3 += 1.0;
+        inputs.push(twin);
+
+        // Reference: the unsplit statement list, evaluated cold.
+        let want: Vec<[f64; MAX_PK_PARAMS]> = inputs
+            .iter()
+            .map(|(theta, eta, cov, time)| {
+                let _guard = ModelTimeGuard::enter(*time);
+                let cov_vec: Vec<f64> = cov_names
+                    .iter()
+                    .map(|n| cov.get(n).copied().unwrap_or(0.0))
+                    .collect();
+                let mut vars = vec![0.0f64; program.n_vars];
+                let mut stack: Vec<f64> = Vec::new();
+                eval_statements_indexed_with_stack(
+                    &program.stmts,
+                    theta,
+                    eta,
+                    &cov_vec,
+                    &mut vars,
+                    None,
+                    &[],
+                    &mut stack,
+                );
+                let mut p = [0.0f64; MAX_PK_PARAMS];
+                for &(pk_slot, var_slot) in &program.pk_var_slots {
+                    p[pk_slot] = vars[var_slot];
+                }
+                p
+            })
+            .collect();
+
+        // Replay through the production closure: each tuple twice back to back
+        // (forces a hit), then two round-robin sweeps (forces eviction and
+        // near-miss lookups).
+        let mut order: Vec<usize> = Vec::new();
+        for i in 0..inputs.len() {
+            order.push(i);
+            order.push(i);
+        }
+        order.extend(0..inputs.len());
+        order.extend((0..inputs.len()).rev());
+        for &i in &order {
+            let (theta, eta, cov, time) = &inputs[i];
+            let got = (model.pk_param_fn)(theta, eta, cov, *time);
+            for &(pk_slot, _) in &program.pk_var_slots {
+                assert_eq!(
+                    got.values[pk_slot].to_bits(),
+                    want[i][pk_slot].to_bits(),
+                    "{name}: input {i}, pk slot {pk_slot}: closure {} vs unsplit reference {}",
+                    got.values[pk_slot],
+                    want[i][pk_slot]
+                );
+            }
+        }
+    }
+}
+
+/// A `[covariate_nn]` output is recomputed outside the statement list on every
+/// call and is not in the cache key, so any statement reading one must stay in
+/// the suffix. Checked on the dependency analysis directly — the `nn` feature
+/// is not always compiled, but `Expression::NnOutput` always exists.
+#[test]
+fn an_nn_output_read_is_never_hoistable() {
+    let mut d = IpStmtDeps::default();
+    ip_deps_expr(
+        &Expression::NnOutput {
+            nn_idx: 0,
+            output_idx: 0,
+        },
+        &mut d,
+    );
+    assert!(
+        d.dynamic,
+        "an NN output read must mark the statement dynamic"
+    );
+    // And the same for an unresolved name, which carries no slot index.
+    let mut d = IpStmtDeps::default();
+    ip_deps_expr(&Expression::Variable("X".into()), &mut d);
+    assert!(d.dynamic, "an unresolved variable read must be dynamic");
+}
+
+// ─── E6: the prefix cache key ─────────────────────────────────────────────
+//
+// The hoist replaces "evaluate the η-independent statements" with "look them
+// up on the inputs they read". A key that omits one of those inputs is not a
+// slow path or a missed optimisation — it is a **silently wrong answer**, and
+// it is the one failure this change must not be able to ship. So the tests
+// below vary one keyed input at a time against a resident entry and demand
+// bit-equality with a cold evaluation of the unsplit program.
+//
+// Two ways such a test can pass while testing nothing, both guarded here:
+//
+//  * the varied input might not move the answer at all, in which case dropping
+//    it from the key reddens nothing. Every probe therefore asserts that its
+//    variant **differs** from the base result before asserting it is correct;
+//  * the cache might never be consulted (the cost gate declined the model, or
+//    the sequence never repeats an input), in which case a stale hit is
+//    unreachable. Every probe therefore asserts this thread recorded at least
+//    one cache **hit**.
+
+/// One `pk_param_fn` evaluation, returned as raw bits so a comparison cannot
+/// quietly become a tolerance.
+fn ip_eval_bits(
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    cov: &std::collections::HashMap<String, f64>,
+    time: f64,
+    class: Option<usize>,
+) -> Vec<u64> {
+    let _class_guard = class.map(MixtureClassGuard::enter);
+    let p = (model.pk_param_fn)(theta, eta, cov, time);
+    p.values.iter().map(|v| v.to_bits()).collect()
+}
+
+/// The same evaluation through the **unsplit** statement list — the reference
+/// the hoist has to reproduce. Built by re-parsing the identical source with
+/// the hoist switched off, so the comparison is closure-against-closure and
+/// exercises the production path on both sides rather than a hand-rolled
+/// re-implementation of it.
+fn ip_unhoisted_model(src: &str) -> CompiledModel {
+    let _off = IpHoistOff::enter();
+    let model = parse_model_string(src).expect("unhoisted parse");
+    assert!(
+        split_ip_eta_independent_prefix(
+            &model
+                .indiv_param_partials
+                .indiv_param_program
+                .as_ref()
+                .expect("program")
+                .stmts,
+            model
+                .indiv_param_partials
+                .indiv_param_program
+                .as_ref()
+                .expect("program")
+                .n_vars,
+            model.n_theta,
+            model.referenced_covariates.len(),
+        )
+        .is_some(),
+        "the fixture must be one the hoist actually applies to, or the \
+         comparison below is between two identical unsplit programs"
+    );
+    model
+}
+
+/// A model whose η-independent prefix reads a θ, two covariates and `TIME`, so
+/// one fixture can probe every non-`MIXNUM` slot of the key. The allometry and
+/// the maturation term are what push it past the cost gate.
+const IP_KEY_PROBE_MODEL: &str = r"
+[parameters]
+  theta TVCL(3.0, 0.1, 30.0)
+  theta TVV(20.0, 2.0, 200.0)
+  theta MATSLOPE(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  FFM  = 9270 * WT / (6680 + 216 * WT / (HT / 100)^2)
+  MAT  = (AGE^MATSLOPE) / (AGE^MATSLOPE + 2.0^MATSLOPE)
+  DRIFT = exp(-0.01 * TIME)
+  CL   = TVCL * (FFM / 55)^0.75 * MAT * DRIFT * exp(ETA_CL)
+  V    = TVV * (FFM / 55)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+/// Every input the prefix reads must be in the key: changing it must change the
+/// answer, and the answer must be the cold one, with a resident entry for the
+/// *other* value sitting in the cache at the time.
+///
+/// Mutation check (run, not reasoned — see the PR body for the transcript):
+/// deleting the covariate extend from the key in `build_pk_param_fn` reddens
+/// the `WT` / `HT` / `AGE` probes; deleting the `key_time` push reddens `TIME`;
+/// replacing the θ subset with an empty key reddens `MATSLOPE`; dropping
+/// `entry.model_id == ip_model_id` reddens
+/// `hoist_cache_never_serves_another_models_entry`.
+#[test]
+fn hoist_cache_key_covers_every_prefix_input() {
+    use std::collections::HashMap;
+
+    let hoisted = parse_model_string(IP_KEY_PROBE_MODEL).expect("hoisted parse");
+    let cold = ip_unhoisted_model(IP_KEY_PROBE_MODEL);
+
+    let base_theta = vec![3.0, 20.0, 1.5];
+    let eta = vec![0.13];
+    let base_cov: HashMap<String, f64> = HashMap::from([
+        ("WT".to_string(), 70.0),
+        ("HT".to_string(), 175.0),
+        ("AGE".to_string(), 4.0),
+    ]);
+    let base_time = 8.0;
+
+    // Each probe changes exactly one keyed input.
+    let probes: Vec<(&str, Vec<f64>, HashMap<String, f64>, f64)> = vec![
+        (
+            "theta MATSLOPE",
+            vec![3.0, 20.0, 2.25],
+            base_cov.clone(),
+            base_time,
+        ),
+        (
+            "covariate WT",
+            base_theta.clone(),
+            {
+                let mut c = base_cov.clone();
+                c.insert("WT".into(), 92.0);
+                c
+            },
+            base_time,
+        ),
+        (
+            "covariate HT",
+            base_theta.clone(),
+            {
+                let mut c = base_cov.clone();
+                c.insert("HT".into(), 150.0);
+                c
+            },
+            base_time,
+        ),
+        (
+            "covariate AGE",
+            base_theta.clone(),
+            {
+                let mut c = base_cov.clone();
+                c.insert("AGE".into(), 11.0);
+                c
+            },
+            base_time,
+        ),
+        ("TIME", base_theta.clone(), base_cov.clone(), 33.0),
+    ];
+
+    ip_cache_reset();
+    // Two identical calls first: the second must be a hit, so every probe below
+    // runs against a resident entry rather than an empty cache.
+    let base = ip_eval_bits(&hoisted, &base_theta, &eta, &base_cov, base_time, None);
+    let base_again = ip_eval_bits(&hoisted, &base_theta, &eta, &base_cov, base_time, None);
+    assert_eq!(
+        base, base_again,
+        "a repeated identical input must be stable"
+    );
+    let (hits_after_base, _) = ip_cache_counters();
+    assert!(
+        hits_after_base >= 1,
+        "the fixture never hit the cache, so no probe below can observe a stale \
+         hit — check the cost gate"
+    );
+
+    for (name, theta, cov, time) in &probes {
+        let got = ip_eval_bits(&hoisted, theta, &eta, cov, *time, None);
+        // Non-degeneracy: if the varied input does not move the answer, leaving
+        // it out of the key would be invisible and this probe proves nothing.
+        assert_ne!(
+            got, base,
+            "{name}: the probe does not change the result, so it cannot detect \
+             a key that omits it"
+        );
+        let want = ip_eval_bits(&cold, theta, &eta, cov, *time, None);
+        assert_eq!(
+            got, want,
+            "{name}: hoisted result differs from the unsplit program"
+        );
+        // And the base entry must still be served correctly afterwards — a key
+        // collision that overwrote it would show up here.
+        let back = ip_eval_bits(&hoisted, &base_theta, &eta, &base_cov, base_time, None);
+        assert_eq!(
+            back, base,
+            "{name}: the base entry did not survive the probe"
+        );
+    }
+}
+
+/// `MIXNUM` is a thread-local the prefix can read without it appearing in any
+/// argument, so it gets its own probe: the same θ/covariates/TIME under two
+/// mixture classes must not collide.
+///
+/// Mutation check: dropping the `split.key_mixnum` push from the key reddens
+/// this test and nothing else in the suite.
+#[test]
+fn hoist_cache_key_covers_mixnum() {
+    use std::collections::HashMap;
+    const SRC: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.001, 100.0)
+  theta TVCL2(3.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta BWT(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT*WT
+  omega(2) ETA_CL ~ 0.4
+
+[individual_parameters]
+  SCALE = if (MIXNUM == 1) (WT / 70)^0.75 * exp(0.01 * WT) else (WT / 70)^1.25 * exp(0.02 * WT)
+  CL = TVCL1 * SCALE * exp(ETA_CL)
+  V  = TVV * SCALE
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let hoisted = parse_model_string(SRC).expect("hoisted parse");
+    let cold = ip_unhoisted_model(SRC);
+    let theta = vec![1.0, 3.0, 10.0, 0.0, 0.0];
+    let eta = vec![0.05];
+    let cov: HashMap<String, f64> = HashMap::from([("WT".to_string(), 83.0)]);
+
+    ip_cache_reset();
+    let c1 = ip_eval_bits(&hoisted, &theta, &eta, &cov, 0.0, Some(1));
+    let c1_again = ip_eval_bits(&hoisted, &theta, &eta, &cov, 0.0, Some(1));
+    assert_eq!(c1, c1_again);
+    let (hits, _) = ip_cache_counters();
+    assert!(
+        hits >= 1,
+        "class 1 never hit the cache; the probe below is inert"
+    );
+
+    let c2 = ip_eval_bits(&hoisted, &theta, &eta, &cov, 0.0, Some(2));
+    assert_ne!(
+        c1, c2,
+        "the two classes must differ, or MIXNUM's absence from the key would be \
+         invisible"
+    );
+    assert_eq!(
+        c2,
+        ip_eval_bits(&cold, &theta, &eta, &cov, 0.0, Some(2)),
+        "class 2 served a class 1 entry"
+    );
+    assert_eq!(
+        c1,
+        ip_eval_bits(&hoisted, &theta, &eta, &cov, 0.0, Some(1)),
+        "class 1 did not survive the class 2 evaluation"
+    );
+}
+
+/// The cache lives on the worker thread, not on the subject, so one thread
+/// evaluates many subjects' covariates through it — the SAEM E-step's actual
+/// access pattern. Interleaving three subjects (and, for two of them, the same
+/// covariates at two occasions, the IOV shape) must give each the cold answer
+/// every time.
+///
+/// Mutation check: dropping the covariate slice from the key reddens this at
+/// the first interleaved evaluation.
+#[test]
+fn hoist_cache_is_per_thread_not_per_subject() {
+    use std::collections::HashMap;
+    let hoisted = parse_model_string(IP_KEY_PROBE_MODEL).expect("hoisted parse");
+    let cold = ip_unhoisted_model(IP_KEY_PROBE_MODEL);
+    let theta = vec![3.0, 20.0, 1.5];
+    let eta = vec![-0.07];
+
+    // Three "subjects", the middle one carrying two occasions that differ only
+    // in the occasion-varying covariate WT.
+    let subjects: Vec<HashMap<String, f64>> = [
+        (70.0, 175.0, 4.0),
+        (54.0, 160.0, 9.5),
+        (54.0, 160.0, 9.5), // same subject, later occasion …
+        (61.0, 160.0, 9.5), // … with a different WT
+        (98.0, 188.0, 31.0),
+    ]
+    .iter()
+    .map(|&(wt, ht, age)| {
+        HashMap::from([
+            ("WT".to_string(), wt),
+            ("HT".to_string(), ht),
+            ("AGE".to_string(), age),
+        ])
+    })
+    .collect();
+
+    let want: Vec<Vec<u64>> = subjects
+        .iter()
+        .map(|c| ip_eval_bits(&cold, &theta, &eta, c, 2.0, None))
+        .collect();
+    // The occasion pair must actually differ, else "occasion-varying covariate"
+    // is not being tested.
+    assert_ne!(want[2], want[3], "the two occasions are indistinguishable");
+
+    ip_cache_reset();
+    // Round-robin twice, then reverse: every lookup finds some *other*
+    // subject's entry resident in the way it hashes to.
+    let order: Vec<usize> = (0..subjects.len())
+        .chain(0..subjects.len())
+        .chain((0..subjects.len()).rev())
+        .collect();
+    for &i in &order {
+        assert_eq!(
+            ip_eval_bits(&hoisted, &theta, &eta, &subjects[i], 2.0, None),
+            want[i],
+            "subject/occasion {i} was served another one's prefix"
+        );
+    }
+    let (hits, misses) = ip_cache_counters();
+    assert!(
+        hits >= 1,
+        "no hits in {} lookups ({misses} misses) — the interleave never reused \
+         an entry, so a cross-subject stale hit could not have been observed",
+        order.len()
+    );
+}
+
+/// Two models on one thread share the cache, and their slot indices mean
+/// different things. `entry.model_id == ip_model_id` is what keeps them apart.
+///
+/// **The obvious version of this test cannot fail.** Written with two models it
+/// stayed green under the mutation that deletes that comparison, because
+/// `ip_key_hash` also mixes `model_id` in, so two models with an identical key
+/// land in *different* ways and the comparison is never reached. The hash is a
+/// distribution device, not a correctness gate — it has only [`IP_CACHE_WAYS`]
+/// outputs — so the way to exercise the gate is to make the collision certain:
+/// more models than there are ways, all with the *same* key, evaluated
+/// round-robin. By pigeonhole some pair shares a way, and each such lookup finds
+/// the other model's entry with a bit-equal key of equal length; only
+/// `model_id` rejects it.
+#[test]
+fn hoist_cache_never_serves_another_models_entry() {
+    use std::collections::HashMap;
+    // Identical shape (so the keys are bit-equal and the same length) with a
+    // different exponent, so every model's answer is distinct.
+    let mk = |exp: f64| {
+        format!(
+            r"
+[parameters]
+  theta TVCL(3.0, 0.1, 30.0)
+  theta TVV(20.0, 2.0, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  SCALE = (WT / 70)^{exp} * exp(0.013 * WT) * (WT / 70)^0.25
+  CL = TVCL * SCALE * exp(ETA_CL)
+  V  = TVV * SCALE
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"
+        )
+    };
+    // Strictly more than IP_CACHE_WAYS, so a collision is guaranteed rather
+    // than likely; `IP_MODEL_ID` is a process-wide counter, so the ids these
+    // parses receive depend on what else the test binary has parsed and cannot
+    // be chosen.
+    let n_models = IP_CACHE_WAYS + 8;
+    let exps: Vec<f64> = (0..n_models).map(|i| 0.5 + i as f64 * 0.01).collect();
+    let models: Vec<CompiledModel> = exps
+        .iter()
+        .map(|&e| parse_model_string(&mk(e)).expect("model parses"))
+        .collect();
+    // One unhoisted twin is enough to confirm the fixture is one the hoist
+    // applies to at all; the per-model references come from the closed form
+    // below, which is cheaper than re-parsing 129 models.
+    drop(ip_unhoisted_model(&mk(exps[0])));
+
+    let theta = vec![3.0, 20.0];
+    let eta = vec![0.0];
+    let wt = 88.0_f64;
+    let cov: HashMap<String, f64> = HashMap::from([("WT".to_string(), wt)]);
+
+    // Each reference is taken against a **cold** cache, so the references
+    // themselves cannot be corrupted by the very defect this test hunts —
+    // otherwise a cross-model stale hit poisons `want` too and the test fails
+    // on the wrong assertion.
+    let want: Vec<Vec<u64>> = models
+        .iter()
+        .map(|m| {
+            ip_cache_reset();
+            ip_eval_bits(m, &theta, &eta, &cov, 0.0, None)
+        })
+        .collect();
+    // Every model must give a different answer, or a cross-model stale hit
+    // would be invisible.
+    let mut distinct: Vec<&Vec<u64>> = want.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        want.len(),
+        "the models are not all distinguishable"
+    );
+
+    ip_cache_reset();
+    for _ in 0..3 {
+        for (i, m) in models.iter().enumerate() {
+            // Twice each: the first lookup is the cross-model one (the way it
+            // hashes to still holds whichever earlier model shares it), the
+            // second is a genuine hit. Without the second, 72 models
+            // round-robin through 64 ways evict each other every time and the
+            // run records *no* hits at all — which is how the first version of
+            // this test managed to exercise a cache it never once consulted.
+            for _ in 0..2 {
+                assert_eq!(
+                    ip_eval_bits(m, &theta, &eta, &cov, 0.0, None),
+                    want[i],
+                    "model {i} was served another model's prefix"
+                );
+            }
+        }
+    }
+    let (hits, _) = ip_cache_counters();
+    assert!(
+        hits >= 1,
+        "no model ever hit the cache, so `model_id` was never consulted"
+    );
+}
+
+/// The hoist must be invisible to the analytic-sensitivity chain: `pk_param_fn`
+/// is split, the `IndivParamProgram` snapshot that `sens/` and every `Dual2`
+/// evaluator read is not.
+#[test]
+fn hoist_leaves_the_indiv_param_program_unsplit() {
+    let hoisted = parse_model_string(IP_KEY_PROBE_MODEL).expect("hoisted parse");
+    let cold = ip_unhoisted_model(IP_KEY_PROBE_MODEL);
+    let hp = hoisted
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    let cp = cold
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    assert_eq!(
+        hp.stmts.len(),
+        cp.stmts.len(),
+        "the snapshot the dual evaluators read must be the unsplit list"
+    );
+    assert_eq!(hp.n_vars, cp.n_vars);
+    assert_eq!(hp.pk_var_slots, cp.pk_var_slots);
+}

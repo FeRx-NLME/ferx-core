@@ -684,9 +684,17 @@ fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
 ///   likewise moves the baked-in window as eta varies. Duration-defined infusions keep
 ///   the cache (`F` scales their rate, not the window).
 ///
-/// Only subjects that actually take the event-driven analytical path (TV covariates or
-/// EVID-3/4 resets, closed-form PK) can use a schedule at all; the no-TV fast path never
-/// calls `event_driven_predictions`, so `None` costs it nothing.
+/// Only subjects that actually take the event-driven analytical path can use a schedule at
+/// all; the static fast path never calls `event_driven_predictions`, so `None` costs it
+/// nothing. **The routing predicate has three arms, not two**: the dispatcher in
+/// `pk::compute_predictions_with_tv_recycle_with_schedule` takes the event-driven branch on
+/// `has_tv || has_resets || model_uses_time_anywhere`, so a subject with only *baseline*
+/// covariates in a model whose `[individual_parameters]` (or `[odes]` RHS) reads `TIME`
+/// walks event-driven too. That third arm was missing here until #1452's review: such a
+/// subject rebuilt its schedule inside every likelihood call while the gate said it had no
+/// use for one. `TIME` does not enter `EventSchedule::for_subject` — it is built from the
+/// subject's dose times and durations — so admitting those subjects changes nothing about
+/// the staleness argument above, only about who gets the reuse.
 ///
 /// Shared by the inner EBE loop ([`find_ebe`]) and the AGQ node sweep
 /// ([`crate::estimation::agq`]), which both hold `eta` variable over one subject — so the
@@ -695,7 +703,9 @@ pub(crate) fn cacheable_schedule(
     model: &CompiledModel,
     subject: &Subject,
 ) -> Option<pk::event_driven::EventSchedule> {
-    if (subject.has_tv_covariates() || subject.has_resets())
+    if (subject.has_tv_covariates()
+        || subject.has_resets()
+        || pk::model_uses_time_anywhere(model))
         && model.ode_spec.is_none()
         // A compartment-free model (#811) never runs the event-driven walk — the
         // predictor short-circuits before it — and its `pk_model` is a placeholder,

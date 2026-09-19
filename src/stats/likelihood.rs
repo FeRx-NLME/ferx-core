@@ -514,6 +514,149 @@ pub fn individual_nll_into_with_schedule(
     )
 }
 
+/// Caller-owned buffers for repeated [`individual_nll`] evaluations of one
+/// subject — the SAEM MH loop's counterpart to [`pk::EventPkParams`].
+///
+/// What it hoists is what [`individual_nll_into_with_schedule`] allocates on
+/// **every** call: the prediction vector (that wrapper hands
+/// `compute_predictions_with_tv_recycle_with_schedule` a fresh `Vec::new()`, so
+/// on the SAEM path nothing was ever actually recycled), and the two
+/// `DVector`s of the η-prior quadratic form. Three heap allocations per MH
+/// proposal, ~39 proposals per subject per SAEM iteration.
+///
+/// Purely buffers: every field is fully overwritten before it is read, so a
+/// reused scratch scores bit-identically to a fresh one. `pk` is public because
+/// the callers that still need a bare [`pk::EventPkParams`] (the mixture class
+/// draw, the IOV NLL) borrow it directly rather than keeping a second buffer.
+#[derive(Default)]
+pub(crate) struct IndividualNllScratch {
+    pub pk: pk::EventPkParams,
+    preds: Vec<f64>,
+    eta_work: DVector<f64>,
+    prior_work: DVector<f64>,
+}
+
+impl IndividualNllScratch {
+    /// Size the η-prior work vectors. A no-op once they match, so this is free
+    /// on every call after the first (`n_eta` is fixed for a whole fit).
+    fn ensure_eta(&mut self, n_eta: usize) {
+        if self.eta_work.len() != n_eta {
+            self.eta_work = DVector::zeros(n_eta);
+            self.prior_work = DVector::zeros(n_eta);
+        }
+    }
+}
+
+/// The η-independent inputs of one subject's individual NLL: the per-observation
+/// residual dispatch keys and the `#484` residual-magnitude multipliers.
+///
+/// Neither depends on η — `obs_keys` reads the CMT column or a covariate
+/// selector, `ruv_obs_mult` reads (θ, covariates, TIME) — so an MH sweep, which
+/// holds θ and σ fixed and varies only η, can build them once per subject
+/// instead of once per proposal. For an `ErrorSpec::Single`/`PerCmt` model
+/// `obs_keys` borrows and `ruv_obs_mult` returns `None` immediately, so this
+/// costs one `Vec<usize>` copy per subject per iteration; for a `Selected`
+/// error model (a `[error_model]` with an `if`) it takes a per-observation
+/// closure evaluation off the proposal loop entirely.
+#[derive(Default)]
+pub(crate) struct IndividualNllPrep {
+    err_keys: Vec<usize>,
+    ruv_mult: Option<Vec<Vec<f64>>>,
+    /// Test-only: the `MIXNUM` value in effect when [`Self::refresh`] ran.
+    ///
+    /// Both halves of this prep can read the mixture class — `ruv_obs_mult`'s
+    /// per-sigma programs resolve `Expression::MixNum` through the
+    /// `MIXTURE_CLASS` thread-local, and `validate_ruv_expr` rejects η and NN
+    /// outputs but not the class index, so a `[mixture]` model may legally write
+    /// `DV ~ proportional(EPS * (1 + 0.5*(MIXNUM-1)))`. The wrapper this prep
+    /// replaced evaluated them inside the MH proposal loop and therefore inside
+    /// the drawn class's `MixtureClassGuard`; hoisting them out is only correct
+    /// if the caller refreshes **under the same guard**.
+    ///
+    /// That is an ordering contract between two call sites, invisible in the
+    /// types, and PR #1452 got it wrong on the first pass — `run_saem`'s E-step
+    /// refreshed one line above `MixtureClassGuard::enter`, serving class 1's
+    /// residual variance to every class-2 subject. So the contract is checked
+    /// where the prep is *consumed*, which makes every mixture test in the
+    /// suite a detector for it rather than only a dedicated one.
+    #[cfg(test)]
+    mix_class_at_refresh: usize,
+}
+
+impl IndividualNllPrep {
+    /// Point an existing (possibly empty) prep at a subject, reusing the key
+    /// buffer's allocation. There is deliberately no `new`: every caller holds a
+    /// long-lived scratch and refreshes it per subject.
+    pub(crate) fn refresh(&mut self, model: &CompiledModel, subject: &Subject, theta: &[f64]) {
+        self.err_keys.clear();
+        self.err_keys
+            .extend_from_slice(model.error_spec.obs_keys(subject).as_ref());
+        self.ruv_mult = model.ruv_obs_mult(subject, theta);
+        #[cfg(test)]
+        {
+            self.mix_class_at_refresh = crate::parser::model_parser::current_mixture_class();
+        }
+    }
+}
+
+/// Scratch-reusing, bit-identical form of [`individual_nll_into`].
+///
+/// Same arithmetic in the same order — it differs from the wrapper only in
+/// where the buffers come from (`prep`/`scratch` rather than four fresh
+/// allocations) — so a fit that switches to it reproduces the previous trace
+/// exactly. `residual_correlations` is `model.residual_correlations` for the
+/// same reason [`individual_nll_into`] uses it: every caller of this form holds
+/// ρ at its declaration.
+pub(crate) fn individual_nll_prepared(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    prep: &IndividualNllPrep,
+    // The subject's cached event-driven schedule, or `None` where reuse is
+    // unsound (see `estimation::inner_optimizer::cacheable_schedule`) and the
+    // predictor must rebuild it per call, as it always did.
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    scratch: &mut IndividualNllScratch,
+) -> f64 {
+    #[cfg(test)]
+    assert_eq!(
+        prep.mix_class_at_refresh,
+        crate::parser::model_parser::current_mixture_class(),
+        "IndividualNllPrep was refreshed under mixture class {} but is being \
+         consumed under class {}. Both `obs_keys` and `ruv_obs_mult` may read \
+         MIXNUM, so the caller must refresh inside the drawn class's \
+         MixtureClassGuard (#1452 review round 2).",
+        prep.mix_class_at_refresh,
+        crate::parser::model_parser::current_mixture_class(),
+    );
+    scratch.ensure_eta(eta.len());
+    let IndividualNllScratch {
+        pk,
+        preds,
+        eta_work,
+        prior_work,
+    } = scratch;
+    individual_nll_into_prepared_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma_values,
+        &model.residual_correlations,
+        pk,
+        schedule,
+        &prep.err_keys,
+        prep.ruv_mult.as_deref(),
+        preds,
+        eta_work,
+        prior_work,
+    )
+}
+
 /// Inner-loop form of [`individual_nll_into_with_schedule`] with subject-static
 /// residual dispatch and magnitude inputs prepared by the caller, plus a
 /// caller-owned prediction vector reused across objective evaluations.
@@ -770,7 +913,42 @@ pub(crate) fn obs_nll_subject_into(
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    obs_nll_subject_into_with_schedule(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        residual_correlations,
+        eta,
+        pk_scratch,
+        None,
+    )
+}
+
+/// [`obs_nll_subject_into`] with the subject's cached event-driven schedule.
+///
+/// Same relationship as [`individual_nll_into`] to
+/// [`individual_nll_into_with_schedule`], and for the same reason: on the
+/// event-driven path the uncached call rebuilds `EventSchedule::for_subject`
+/// — a merged event sort plus a per-interval bounds `Vec` — inside every
+/// evaluation, and the SAEM M-step evaluates this once per subject per NLopt
+/// step, tens of times per iteration. `None` is exactly the previous behaviour,
+/// and is what a subject whose schedule cannot be reused
+/// (`inner_optimizer::cacheable_schedule`) still gets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_into_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    eta: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
+    let preds = pk::compute_predictions_with_tv_into_with_schedule(
+        model, subject, theta, eta, pk_scratch, schedule,
+    );
     obs_nll_subject_from_preds(
         model,
         subject,
@@ -2553,6 +2731,41 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
     sigma_values: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
+    individual_nll_iov_with_scratch_and_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        kappas,
+        omega,
+        omega_iov,
+        sigma_values,
+        pk_scratch,
+        None,
+    )
+}
+
+/// [`individual_nll_iov_with_scratch`] with the subject's cached
+/// [`EventSchedule`](pk::event_driven::EventSchedule).
+///
+/// Without this the IOV arm of the SAEM E-step held a schedule cache it could
+/// not hand to anything: `predict_iov` took no schedule, so every MH proposal on
+/// an IOV model rebuilt the merged event sort it was built to avoid (#1452
+/// review). `None` reproduces the previous behaviour exactly, and is what a
+/// subject the shared `cacheable_schedule` gate declines still gets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[K],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
     if kappas.is_empty() {
         return individual_nll(model, subject, theta, eta, omega, sigma_values);
     }
@@ -2587,7 +2800,9 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
-    let preds = pk::predict_iov_with_scratch(model, subject, theta, eta, kappas, pk_scratch);
+    let preds = pk::predict_iov_with_scratch_and_schedule(
+        model, subject, theta, eta, kappas, pk_scratch, schedule,
+    );
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
     // the PK residual error, so the FREM etas are sampled against the right
     // variance (mirrors the FOCE paths and the non-IOV individual_nll).

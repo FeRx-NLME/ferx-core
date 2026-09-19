@@ -45,6 +45,37 @@ use std::sync::OnceLock;
 // `FERX_PROFILE=1` accumulates the count and wall-time of the f64 event-driven
 // prediction across the whole fit (printed by the CLI via [`profile_report`]).
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`EventSchedule::for_subject`] calls on **this thread**.
+    ///
+    /// The whole point of a schedule cache is that this number stops growing with
+    /// the number of likelihood evaluations, and an equality A/B between a cached
+    /// and an uncached fit cannot see that — both arms agree whether or not the
+    /// cache is wired up at all (#1452 review). This counter is the assertion that
+    /// can: it distinguishes "a schedule was built" from "a schedule was *reused*".
+    ///
+    /// Thread-local, not a global `AtomicU64`, so a test reads only the builds it
+    /// caused. A process-wide counter would be polluted by every other test in the
+    /// binary building schedules concurrently, which is exactly the kind of
+    /// approximate assertion this is meant to replace. A caller that fans out over
+    /// rayon reads it from inside a single-worker `install`, where every task runs
+    /// on the reading thread — see `saem_hotpath_tests::schedule_builds_in`.
+    pub(crate) static SCHEDULE_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: this thread's [`EventSchedule::for_subject`] count.
+#[cfg(test)]
+pub(crate) fn schedule_build_count() -> u64 {
+    SCHEDULE_BUILDS.with(|c| c.get())
+}
+
+/// Test-only: zero this thread's [`EventSchedule::for_subject`] count.
+#[cfg(test)]
+pub(crate) fn reset_schedule_build_count() {
+    SCHEDULE_BUILDS.with(|c| c.set(0));
+}
+
 static PROFILE_PRED_CALLS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_PRED_NANOS: AtomicU64 = AtomicU64::new(0);
 
@@ -193,6 +224,8 @@ impl EventSchedule {
         doses: &[DoseEvent],
         dose_lagtimes: &[f64],
     ) -> Self {
+        #[cfg(test)]
+        SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
         assert_eq!(
             doses.len(),
             subject.doses.len(),

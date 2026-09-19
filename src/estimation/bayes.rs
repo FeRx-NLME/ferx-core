@@ -612,33 +612,13 @@ pub fn run_bayes(
     // subject's doses + the PK model, not on θ/η/σ) and reuse it across every
     // NLL evaluation. Without this `subject_nll` rebuilds the dose/infusion
     // schedule on every call — O(subjects · n_pop · sweeps · chains) times.
-    // Gating mirrors the FOCE inner loop (`inner_optimizer.rs`): only analytical
-    // event-driven subjects with TV covariates or resets, and only when no
-    // (possibly η-dependent) lagtime would make a baked-in schedule stale.
-    let schedules: Vec<Option<crate::pk::event_driven::EventSchedule>> = population
-        .subjects
-        .iter()
-        .map(|subject| {
-            if (subject.has_tv_covariates() || subject.has_resets())
-                && model.ode_spec.is_none()
-                // Compartment-free models (#811) never take the event-driven walk;
-                // see the twin guard in `inner_optimizer::cacheable_schedule`.
-                && !model.is_algebraic()
-                && crate::pk::event_driven::supports_event_driven(model.pk_model)
-                && !model.has_lagtime()
-                && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
-            {
-                Some(crate::pk::event_driven::EventSchedule::for_subject(
-                    subject,
-                    model.pk_model,
-                    &subject.doses,
-                    &[],
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
+    // One implementation, not a hand-copied twin: this is the same
+    // `cacheable_schedule` gate the FOCE inner loop and the SAEM E-step use, so
+    // the staleness rules (no possibly-η-dependent lagtime, no `F`-reshaped
+    // rate-defined infusion, no compartment-free model) cannot drift between
+    // the three callers. It used to be spelled out again here (#1447).
+    let schedules: Vec<Option<crate::pk::event_driven::EventSchedule>> =
+        crate::estimation::inner_optimizer::build_schedule_cache(model, population);
 
     // Chains are statistically independent. Each chain owns all mutable state,
     // including its RNG and posterior-eta accumulator; collecting an indexed
@@ -650,6 +630,9 @@ pub fn run_bayes(
             let mut rng =
                 StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
             let mut scratch = EventPkParams::default();
+            // The block MH kernel owns its own buffers (`MhScratch`), which
+            // carry the η-independent NLL inputs alongside the `EventPkParams`.
+            let mut mh_scratch = crate::estimation::saem::MhScratch::default();
             let mut eta_sum: Vec<DVector<f64>> =
                 (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
             let mut eta_record_count = 0u64;
@@ -835,6 +818,7 @@ pub fn run_bayes(
                         } else {
                             let kappas_opt =
                                 omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
+                            mh_scratch.begin_subject(model, &population.subjects[i], &theta, n_eta);
                             mh_steps(
                                 &mut etas[i],
                                 nll[i],
@@ -847,7 +831,8 @@ pub fn run_bayes(
                                 None,
                                 &mut rng,
                                 n_eta_mh,
-                                &mut scratch,
+                                &mut mh_scratch,
+                                schedules[i].as_ref(),
                                 kappas_opt,
                             )
                         };
@@ -896,6 +881,8 @@ pub fn run_bayes(
                                 &sigma,
                                 kappa_scale,
                                 &mut rng,
+                                schedules[i].as_ref(),
+                                &mut scratch,
                             )
                         };
                         nll[i] = nll_new;

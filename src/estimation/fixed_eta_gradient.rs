@@ -47,15 +47,53 @@ pub(crate) fn obs_nll_subject_into_iov(
     sigma_values: &[f64],
     eta: &[f64],
     kappas: &[Vec<f64>],
-    _pk_scratch: &mut crate::pk::EventPkParams,
+    pk_scratch: &mut crate::pk::EventPkParams,
+) -> f64 {
+    obs_nll_subject_into_iov_with_schedule(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+        kappas,
+        pk_scratch,
+        None,
+    )
+}
+
+/// [`obs_nll_subject_into_iov`] with the subject's cached
+/// [`EventSchedule`](crate::pk::event_driven::EventSchedule).
+///
+/// The IOV θ/σ M-step objective is evaluated `mstep_maxiter·(n+1)` times per
+/// SAEM iteration, each a full per-occasion prediction per subject, and it had
+/// no way to reuse a schedule — the same gap the E-step's IOV arm had (#1452
+/// review). `None` reproduces the previous behaviour exactly.
+///
+/// This also starts *using* the caller's `EventPkParams`. It was previously
+/// accepted and ignored (`_pk_scratch`, "retained for signature stability"),
+/// with `predict_iov` allocating a fresh one per call;
+/// `predict_iov_with_scratch_and_schedule` clears all four event vectors at
+/// entry, so a reused scratch scores bit-identically to a fresh one — the
+/// property `pk::iov_scratch_tests` already pins for that entry point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_into_iov_with_schedule(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    pk_scratch: &mut crate::pk::EventPkParams,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> f64 {
     use crate::stats::likelihood::m3_logcdf;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
-    // consistent. `_pk_scratch` is retained for signature stability but unused
-    // (predict_iov manages its own per-event params).
-    let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
+    // consistent.
+    let preds = crate::pk::predict_iov_with_scratch_and_schedule(
+        model, subject, theta, eta, kappas, pk_scratch, schedule,
+    );
     // FREM covariate pseudo-observations (FREMTYPE > 0) use the covariate sigma
     // (EPSCOV), not the PK residual error — otherwise their near-zero residuals
     // drag PROP/ADD toward zero. See build_frem_r_override.
