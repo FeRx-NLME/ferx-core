@@ -977,6 +977,37 @@ pub(crate) fn obs_nll_subject_from_preds(
     residual_correlations: &[ResidualCorrelation],
     eta: &[f64],
 ) -> f64 {
+    obs_nll_subject_from_preds_with_semantics(
+        model,
+        subject,
+        preds,
+        theta,
+        sigma_values,
+        residual_correlations,
+        eta,
+        PredNllSemantics::Marginal,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredNllSemantics {
+    Marginal,
+    Conditional,
+    ConditionalIov,
+}
+
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
+fn obs_nll_subject_from_preds_with_semantics(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    theta: &[f64],
+    sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
+    eta: &[f64],
+    semantics: PredNllSemantics,
+) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // FREM covariate rows use EPSCOV, not the PK residual error (see
     // build_frem_r_override); FREM covariate rows are never BLOQ.
@@ -990,7 +1021,11 @@ pub(crate) fn obs_nll_subject_from_preds(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !residual_correlations.is_empty() && !m3 && !has_frem_rows {
+    if semantics != PredNllSemantics::ConditionalIov
+        && !residual_correlations.is_empty()
+        && !m3
+        && !has_frem_rows
+    {
         // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
         // for the SAEM M-step, so no EKF process noise enters here.
         match dense_residual_data_term(
@@ -1023,26 +1058,50 @@ pub(crate) fn obs_nll_subject_from_preds(
                 continue;
             }
             let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+            if semantics == PredNllSemantics::Conditional && frem_var.is_some() {
+                if let Some(ref fc) = model.frem_config {
+                    let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
+                    if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&fremtype_val) {
+                        let frem_pred = theta[theta_idx] + eta[eta_idx];
+                        let frem_sigma = sigma_values[fc.covariate_sigma_index];
+                        let frem_v = (frem_sigma * frem_sigma).max(1e-12);
+                        let resid = y - frem_pred;
+                        nll += 0.5 * (resid * resid / frem_v + frem_v.ln());
+                        continue;
+                    }
+                }
+            }
             // FREM covariate pseudo-observations predict a covariate *value* (any
             // real: centered/standardized/log-scale covariates are routinely ≤ 0),
             // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
             // covariate prediction up to 1e-12 fabricates a huge residual and, on the
             // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
             // (#406). Ordinary PK rows keep the positivity clamp.
-            let f = if frem_var.is_some() {
+            let f = if frem_var.is_some() || semantics != PredNllSemantics::Marginal {
                 f
             } else {
                 model.floor_prediction(f)
             };
             let v = match frem_var {
-                Some(vv) => vv.max(1e-12),
-                None => (model.residual_variance_at_scaled(
-                    err_keys[j],
-                    f,
-                    sigma_values,
-                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                ) * ruv_scale)
-                    .max(1e-12),
+                Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
+                Some(vv) => vv,
+                None if semantics == PredNllSemantics::Marginal => {
+                    (model.residual_variance_at_scaled(
+                        err_keys[j],
+                        f,
+                        sigma_values,
+                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                    ) * ruv_scale)
+                        .max(1e-12)
+                }
+                None => {
+                    model.residual_variance_at_scaled(
+                        err_keys[j],
+                        f,
+                        sigma_values,
+                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                    ) * ruv_scale
+                }
             };
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
@@ -1083,95 +1142,21 @@ pub(crate) fn conditional_obs_nll_from_preds(
     eta: &[f64],
     iov: bool,
 ) -> f64 {
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    let ruv_scale = model.residual_var_scale(eta);
-    let ruv_mult = model.ruv_obs_mult(subject, theta);
-    let err_keys = model.error_spec.obs_keys(subject);
-    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    let frem_ov = if iov {
-        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values)
+    let semantics = if iov {
+        PredNllSemantics::ConditionalIov
     } else {
-        None
+        PredNllSemantics::Conditional
     };
-    let mut data_ll = 0.0;
-
-    if !iov && !residual_correlations.is_empty() && !m3 && !has_frem_rows {
-        data_ll = match dense_residual_data_term(
-            model,
-            subject,
-            preds,
-            sigma_values,
-            residual_correlations,
-            ruv_scale,
-            &[],
-            ruv_mult.as_deref(),
-        ) {
-            Some(term) => term,
-            None => return 1e20,
-        };
-    } else {
-        for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds).enumerate() {
-            #[cfg(feature = "survival")]
-            if !model.endpoints.is_empty()
-                && subject
-                    .obs_cmts
-                    .get(j)
-                    .is_some_and(|c| model.endpoints.contains_key(c))
-            {
-                continue;
-            }
-            if !iov {
-                let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
-                if fremtype_val > 0 {
-                    if let Some(ref fc) = model.frem_config {
-                        if let Some(&(theta_idx, eta_idx)) =
-                            fc.fremtype_to_indices.get(&fremtype_val)
-                        {
-                            let frem_pred = theta[theta_idx] + eta[eta_idx];
-                            let frem_sigma = sigma_values[fc.covariate_sigma_index];
-                            let frem_v = (frem_sigma * frem_sigma).max(1e-12);
-                            let resid = y - frem_pred;
-                            data_ll += resid * resid / frem_v + frem_v.ln();
-                            continue;
-                        }
-                    }
-                }
-            }
-            let v = if iov {
-                match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
-                    Some(vv) => vv,
-                    None => {
-                        model.residual_variance_at_scaled(
-                            err_keys[j],
-                            f_pred,
-                            sigma_values,
-                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                        ) * ruv_scale
-                    }
-                }
-            } else {
-                model.residual_variance_at_scaled(
-                    err_keys[j],
-                    f_pred,
-                    sigma_values,
-                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                ) * ruv_scale
-            };
-            let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if m3 && cens != 0 {
-                data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
-            } else {
-                let resid = y - f_pred;
-                data_ll += resid * resid / v + v.ln();
-            }
-        }
-    }
-
-    #[cfg(feature = "survival")]
-    if !subject.obs_records.is_empty() {
-        accumulate_non_gaussian_nll(model, subject, theta, eta, None, 2.0, &mut data_ll);
-    }
-    0.5 * data_ll
+    obs_nll_subject_from_preds_with_semantics(
+        model,
+        subject,
+        preds,
+        theta,
+        sigma_values,
+        residual_correlations,
+        eta,
+        semantics,
+    )
 }
 
 /// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
