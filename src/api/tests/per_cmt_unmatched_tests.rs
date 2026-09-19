@@ -38,6 +38,15 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 2,4,4.8,0,.,1,0
 ";
 
+/// Dose records only — subjects present, not one scored observation between them.
+/// The *second* observation-free shape, and the one that distinguishes a guard on the
+/// observed set from a guard on the subject list.
+const DOSES_ONLY: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+2,0,.,1,100,1,1
+";
+
 /// The same data with compartment 2 also observed — the matched control. Written
 /// with a `STUDY` column so one fixture can serve the `[data_selection]` case too.
 const OBS_BOTH_CMTS: &str = "\
@@ -212,6 +221,37 @@ fn per_cmt_readout_model(declared: &str) -> CompiledModel {
     ))
 }
 
+/// The **other** struct that carries `OdeReadout::PerCmt`: Form C per-CMT on an
+/// analytical `pk` model (`AnalyticReadout::readout`, since #650).
+///
+/// `PerCmtReadout` unions two legs, and a fixture on the `[odes]` leg alone cannot
+/// see the analytic one — deleting it would leave `unmatched_per_cmt_readout_entry_warns`
+/// green. #1404 round 2 inspected only one of the two structs; the point of having
+/// both fixtures is that each mutation names its own side.
+fn per_cmt_analytic_readout_model(declared: &str) -> CompiledModel {
+    model_of(&format!(
+        "[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+{declared}
+
+[error_model]
+  DV ~ proportional(PROP)
+"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Channel 1 — ScalingSpec::PerCmt
 // ---------------------------------------------------------------------------
@@ -335,6 +375,36 @@ fn matched_per_cmt_readout_entries_are_silent() {
     assert_eq!(unmatched_messages(&m, &pop), Vec::<String>::new());
 }
 
+#[test]
+fn unmatched_per_cmt_readout_entry_warns_on_the_analytic_readout_too() {
+    // The second leg of the `PerCmtReadout` union, asserted separately so each
+    // mutation names its own side. The test above runs on `OdeSpec::readout`; this
+    // one on `AnalyticReadout::readout`, which is a different struct reached through
+    // a different `if let` — dropping either leg leaves the other test green, which
+    // is precisely the twin-with-an-unexercised-leg shape #1223 was about.
+    let m = per_cmt_analytic_readout_model("  y[CMT=1] = CENTRAL / V\n  y[CMT=2] = CENTRAL / V");
+    assert!(
+        m.ode_spec.is_none(),
+        "fixture must carry NO ode_spec, or it exercises the other leg"
+    );
+    assert!(
+        m.analytic_readout.is_some(),
+        "fixture must carry an analytic readout"
+    );
+    assert_only_live_channel(&m, CmtConsumer::PerCmtReadout);
+    let pop = population(OBS_CMT1_ONLY);
+
+    let msgs = unmatched_messages(&m, &pop);
+    assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
+    assert!(
+        msgs[0].contains("y[CMT=N]")
+            && msgs[0].contains("declares compartment(s) 2 ")
+            && msgs[0].contains("(observed: 1)"),
+        "must name the channel and both sets: {}",
+        msgs[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The rendered list
 // ---------------------------------------------------------------------------
@@ -378,6 +448,27 @@ fn an_observation_free_population_is_silent() {
     };
     assert!(empty.n_obs() == 0, "fixture must carry no observations");
     assert_eq!(unmatched_messages(&m, &empty), Vec::<String>::new());
+}
+
+#[test]
+fn a_dose_only_population_is_silent_too() {
+    // The second observation-free shape, and the reason the first one is not enough:
+    // a guard written `population.subjects.is_empty()` is satisfied by the test above
+    // and wrong here. A design dataset read for `simulate()` — or a `--data` file whose
+    // observations were all filtered or all MDV=1 — has subjects, doses and no scored
+    // observation, and every declared entry would be reported as dead.
+    let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
+    let pop = population(DOSES_ONLY);
+    assert!(
+        !pop.subjects.is_empty(),
+        "fixture must carry subjects, or it is the previous test again"
+    );
+    assert_eq!(pop.n_obs(), 0, "fixture must carry no scored observation");
+    assert!(
+        pop.subjects.iter().all(|s| s.obs_cmts.is_empty()),
+        "fixture must carry no observed compartment"
+    );
+    assert_eq!(unmatched_messages(&m, &pop), Vec::<String>::new());
 }
 
 #[test]
@@ -471,10 +562,29 @@ fn declared_cmts_is_some_exactly_when_the_channel_is_live() {
     // non-per-CMT arm return `Some` (the "is_live forced true" probe) fails here
     // instead of silently widening the walk.
     let opts = FitOptions::default();
+    // The shape the parser hands an endpoint-only model: `ErrorSpec::PerCmt` with an
+    // **empty** map, which `is_live` deliberately excludes (it dispatches no error
+    // model at all). Built by clearing the map rather than through a `[event_model]`,
+    // so the case is reachable without the `survival` feature — and it is the fixture
+    // that makes the non-empty guard in `declared_cmts` observable: without it, an arm
+    // returning `Some(∅)` is behaviour-neutral and nothing here can fail.
+    let mut empty_per_cmt_map =
+        per_cmt_error_model("  CMT=1: DV ~ proportional(PROP)\n  CMT=2: DV ~ additive(ADD)");
+    match &mut empty_per_cmt_map.error_spec {
+        crate::types::ErrorSpec::PerCmt(map) => map.clear(),
+        other => panic!("fixture must be ErrorSpec::PerCmt, got {other:?}"),
+    }
+    assert!(
+        !CmtConsumer::PerCmtErrorModel.is_live(&empty_per_cmt_map, &opts),
+        "an empty PerCmt map must read as inert, or this fixture proves nothing"
+    );
+
     let fixtures: Vec<CompiledModel> = vec![
         per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000"),
         per_cmt_error_model("  CMT=1: DV ~ proportional(PROP)\n  CMT=2: DV ~ additive(ADD)"),
         per_cmt_readout_model("  y[CMT=1] = central / V\n  y[CMT=2] = central / V * 1000"),
+        per_cmt_analytic_readout_model("  y[CMT=1] = CENTRAL / V\n  y[CMT=2] = CENTRAL / V"),
+        empty_per_cmt_map,
         // A model with no per-CMT anything: every declared-side arm must be `None`.
         per_cmt_scaling_model("  obs_scale = V"),
     ];
