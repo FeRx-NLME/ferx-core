@@ -450,6 +450,14 @@ section of the SDLC for the versioning policy).
   pool, i.e. one worker per logical CPU: on a 15-core host `ferx gam --threads 2` screened
   15 wide. They now run on the engine's pool at the requested width
   ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
+
+- **One-node Laplace no longer repeats work already completed at the EBE mode.**
+  Fused objective/gradient evaluations avoid capturing an exact terminal Hessian that
+  the analytic gradient must rebuild together with its sensitivity jet, and the sole
+  quadrature node reuses the converged mode NLL. Across diagonal-Ω, block-Ω, and ODE
+  fixtures this removes 9% of full sensitivity-provider calls and improves median wall
+  time by 5.6–11.9%, without changing the objective or gradient (#1463).
+
 - **SAEM: the E-step and M-step stop redoing η-independent work on every MH proposal.**
   Three changes, all of them internal and all of them bit-identical — the same fit, the
   same seed, the same estimates, objective and per-subject EBEs down to the last bit — so
