@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 use super::*;
+use approx::assert_relative_eq;
 use std::collections::HashMap;
 #[cfg(profiling_allocations)]
 use std::{
@@ -1874,6 +1875,48 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
     );
 
     let params = &model.default_params;
+    let eta0 = vec![0.0; model.n_eta];
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let (light_seed, light_gradient) = analytic_inner_seed_hessian(
+        &model,
+        &subject,
+        params,
+        &eta0,
+        None,
+        None,
+        &err_keys,
+        &mut Vec::new(),
+    )
+    .expect("fixture supports the light seed");
+    let ordinary_gradient = analytic_eta_nll_gradient(
+        &model,
+        &subject,
+        &params.theta,
+        &eta0,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .expect("fixture supports the ordinary gradient");
+    assert_eq!(
+        light_gradient.expect("light path fuses the gradient"),
+        ordinary_gradient
+    );
+    let full_sens =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta0)
+            .expect("fixture supports full sensitivities");
+    let full_seed = crate::estimation::sens_outer_gradient::score_core(
+        &model,
+        &subject,
+        params,
+        &full_sens,
+        model.n_eta,
+        &params.omega.inv,
+        &eta0,
+        None,
+    )
+    .expect("fixture supports full score")
+    .htilde;
+    assert_relative_eq!(light_seed, full_seed, epsilon = 1e-12);
     let off = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
     let on = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 3);
 

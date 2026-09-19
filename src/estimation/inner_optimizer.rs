@@ -478,16 +478,115 @@ pub struct EbeResult {
     pub hard_reject: bool,
 }
 
-/// Exact conditional eta Hessian from the shared second-order sensitivity pass.
-/// `None` is a cheap scope decision for models/subjects without a `Dual2` route.
+/// Positive conditional Gauss–Newton metric for dense-BFGS initialization.
+/// The common diagonal-Gaussian path needs only `f` and `df/deta`, so use the
+/// light inner provider rather than paying for the full theta/mixed `Dual2` jet.
+/// Special residual/FREM cases retain the full-provider fallback.
+#[allow(clippy::too_many_arguments)]
 fn analytic_inner_seed_hessian(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     eta: &[f64],
-) -> Option<DMatrix<f64>> {
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    mult: Option<&[Vec<f64>]>,
+    err_keys: &[usize],
+    obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
         return None;
+    }
+    let light_supported = model.residual_error_eta.is_none()
+        && params.residual_correlations.is_empty()
+        && model.frem_config.is_none()
+        && !subject.obs_times.is_empty();
+    if light_supported {
+        let hint = std::mem::take(obs_grad_recycle);
+        if let Some(sens) = crate::sens::provider::subject_eta_grad_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            eta,
+            schedule,
+            hint,
+        ) {
+            let mut htilde = params.omega.inv.clone();
+            let mut gradient = vec![0.0; model.n_eta];
+            let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+            let mut valid = sens.len() == subject.observations.len();
+            for (j, obs) in sens.iter().enumerate() {
+                if !valid || obs.df_deta.len() != model.n_eta {
+                    valid = false;
+                    break;
+                }
+                let mult_row = mult.and_then(|rows| rows.get(j)).map(Vec::as_slice);
+                let (r, d, d2) = crate::stats::residual_error::residual_rd2(
+                    &model.error_spec,
+                    err_keys[j],
+                    obs.f,
+                    &params.sigma.values,
+                    mult_row,
+                );
+                if !(r.is_finite() && r > 0.0) {
+                    valid = false;
+                    break;
+                }
+                let cens = subject.cens.get(j).copied().unwrap_or(0);
+                let Some((coef, _)) = residual_inner_obs(
+                    model,
+                    err_keys[j],
+                    subject.observations[j],
+                    obs.f,
+                    &params.sigma.values,
+                    mult_row,
+                    1.0,
+                    false,
+                    cens,
+                ) else {
+                    valid = false;
+                    break;
+                };
+                let p = if m3 && cens != 0 {
+                    crate::stats::special::m3_censored_outer(
+                        subject.observations[j],
+                        obs.f,
+                        r,
+                        d,
+                        d2,
+                        cens,
+                    )
+                    .1
+                } else {
+                    crate::estimation::sens_outer_gradient::err_terms(
+                        r,
+                        d,
+                        d2,
+                        subject.observations[j] - obs.f,
+                    )
+                    .p
+                };
+                if !p.is_finite() {
+                    valid = false;
+                    break;
+                }
+                for k in 0..model.n_eta {
+                    gradient[k] += coef * obs.df_deta[k];
+                    for l in 0..model.n_eta {
+                        htilde[(k, l)] += p * obs.df_deta[k] * obs.df_deta[l];
+                    }
+                }
+            }
+            *obs_grad_recycle = sens;
+            if valid && htilde.iter().all(|v| v.is_finite()) {
+                let prior = &params.omega.inv * DVector::from_column_slice(eta);
+                for (g, p) in gradient.iter_mut().zip(prior.iter()) {
+                    *g += p;
+                }
+                if gradient.iter().all(|v| v.is_finite()) {
+                    return Some((htilde, Some(gradient)));
+                }
+            }
+        }
     }
     let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)?;
     crate::estimation::sens_outer_gradient::score_core(
@@ -504,7 +603,7 @@ fn analytic_inner_seed_hessian(
     // Gauss-Newton/Almquist curvature is a robust optimizer metric.  The exact
     // Hessian remains the Laplace/AGQ integration anchor below, but can be
     // indefinite away from the mode and was slower as a BFGS seed in A/B runs.
-    .map(|core| core.htilde)
+    .map(|core| (core.htilde, None))
 }
 
 fn analytic_terminal_work(
@@ -1125,7 +1224,11 @@ fn find_ebe_impl(
     // one the BFGS converged on mislabels weakly-identified flat-basin EBEs (#587 review).
     let use_analytic = analytic_inner_grad_supported(model, subject);
     let profile = inner_profile_enabled();
+    let fused_first_gradient = RefCell::new(None::<Vec<f64>>);
     let agrad = |e: &[f64]| -> Vec<f64> {
+        if let Some(g) = fused_first_gradient.borrow_mut().take() {
+            return g;
+        }
         if !use_analytic {
             return gradient_fd(&obj, e, n_eta);
         }
@@ -1164,13 +1267,32 @@ fn find_ebe_impl(
             }
         }
     };
-    // nlmixr2est's `warm="calc"` idea, using ferx's exact `Dual2` curvature:
-    // seed dense BFGS from the conditional Hessian at the current warm EBE and
-    // current population parameters. A failed/out-of-scope factorization falls
-    // through to the historical identity/diagonal metric.
-    let initial_hessian = hessian_seed_enabled()
-        .then(|| analytic_inner_seed_hessian(model, subject, params, &eta))
+    // nlmixr2est's `warm="calc"` idea: seed dense BFGS from the conditional
+    // Gauss-Newton metric at the current warm EBE and population parameters.
+    // The common path obtains that metric and the first gradient in one light
+    // first-order sensitivity pass; special cases retain the full provider.
+    // A failed/out-of-scope factorization falls through to the historical
+    // identity/diagonal metric.
+    let seed = hessian_seed_enabled()
+        .then(|| {
+            analytic_inner_seed_hessian(
+                model,
+                subject,
+                params,
+                &eta,
+                schedule,
+                mult.as_deref(),
+                err_keys.as_ref(),
+                &mut obs_grad_recycle.borrow_mut(),
+            )
+        })
         .flatten();
+    let initial_hessian = seed.map(|(hessian, gradient)| {
+        if use_analytic {
+            *fused_first_gradient.borrow_mut() = gradient;
+        }
+        hessian
+    });
     let result = inner_minimize_with_grad(
         &obj,
         &agrad,

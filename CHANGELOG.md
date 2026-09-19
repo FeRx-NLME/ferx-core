@@ -439,13 +439,15 @@ section of the SDLC for the versioning policy).
   likelihood call. Widening the gate also benefits FOCE/FOCEI, Laplace, AGQ and the Bayes
   chain, which share it. Results are unchanged in both cases
   ([#1447](https://github.com/FeRx-NLME/ferx-core/issues/1447)).
-- FO/FOCEI inner optimization now seeds dense BFGS from the current analytical
-  Gauss–Newton eta Hessian through a Cholesky solve; Laplace/AGQ fuse the terminal
-  prediction Jacobian with their exact Hessian and reuse that curvature in the
-  quadrature objective. Laplace skips generic one-node grid construction, while
-  AGQ caches log weights and stores retained node modes contiguously to reduce
-  allocator pressure. Unsupported or non-positive-definite seeds retain the
-  previous initialization ([#1389](https://github.com/FeRx-NLME/ferx-core/pull/1389)).
+- FO/FOCEI and multi-node AGQ inner optimization now seed dense BFGS from the
+  current analytical Gauss–Newton eta Hessian through a Cholesky solve, fusing
+  the seed and first gradient in one first-order sensitivity pass; Laplace/AGQ
+  fuse the terminal prediction Jacobian with their exact Hessian and reuse that
+  curvature in the quadrature objective. Laplace skips generic one-node grid
+  construction, while AGQ caches log weights and stores retained node modes
+  contiguously to reduce allocator pressure. Unsupported or non-positive-
+  definite seeds retain the previous initialization
+  ([#1389](https://github.com/FeRx-NLME/ferx-core/pull/1389)).
 
 - Population fitting and prediction use the available worker budget more efficiently: Bayesian chains and underfilled AGQ grids run concurrently, small FOCE populations avoid fine-grained dispatch overhead, concurrent cold callers share pool construction, AGQ-IOV nodes avoid a heap allocation, and public `predict()` evaluates subjects in parallel ([#1385](https://github.com/FeRx-NLME/ferx-core/pull/1385)).
 

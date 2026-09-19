@@ -1631,18 +1631,22 @@ fn fit_inner(
         let mut stage_opts = options.clone();
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
+        let quadrature_nodes = stage_opts.agq_nodes();
         crate::estimation::inner_optimizer::set_capture_terminal_hessian(
-            stage_opts.agq_nodes().is_some(),
+            quadrature_nodes.is_some(),
         );
+        // The current-point seed reduces work for FO-family objectives and for
+        // multi-node AGQ.  One-node Laplace keeps terminal-Hessian reuse but not
+        // the seed: on the large stress anchor it increased inner gradient steps
+        // by 2.45% (196,945 -> 201,769) and wall time by 2.54%.
         crate::estimation::inner_optimizer::set_hessian_seed_for_fit(
-            stage_opts.agq_nodes().is_none()
-                && matches!(
-                    method,
-                    EstimationMethod::Foce
-                        | EstimationMethod::FoceI
-                        | EstimationMethod::FoceGn
-                        | EstimationMethod::FoceGnHybrid
-                ),
+            matches!(
+                method,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::FoceGn
+                    | EstimationMethod::FoceGnHybrid
+            ) && quadrature_nodes != Some(1),
         );
         // Per-stage interaction flag: FOCEI=on, FOCE=off, others inherit from user options.
         match method {
