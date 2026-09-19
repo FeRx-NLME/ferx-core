@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **SAEM: two opt-in estimators for the numerical θ/σ M-step that remove or shrink its
+  Jensen bias (`mstep_solver = score_sa`, `mstep_draws = K`).** A θ with no ETA is moved
+  only by the η-frozen numerical M-step, which adopts the *maximiser* at each iteration's
+  single η draw — a nonlinear function of that draw, so the recursion converges to
+  `E[θ*(η)]` rather than to the maximiser of `E[Q(θ, η)]`, and the gap grows when the
+  E-step mixes *better*. On the busulfan benchmark (600 subjects, 6 seeds, IS −2 log L)
+  freeing such a θ costs **+9.75** under the default solver and **+3.37** under
+  `score_sa`, at the same CPU. Both are off by default, bit-identical to before when
+  unset, and restricted to the plain Gaussian residual scope — see the
+  [SAEM docs](docs/estimation/saem.qmd) for the recursion, the scope and the full
+  measurement (#1458).
+
 - **`install_on_engine_pool(f)`** runs population-wide parallel work that is not a `fit()`
   on the engine's worker pool instead of Rayon's process-global one. This is what makes a
   declared thread count reach GAM screening and the other standalone parallel entry points;

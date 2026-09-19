@@ -8919,6 +8919,30 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.saem_mstep_damping = Some(v);
         }
+        "mstep_solver" | "saem_mstep_solver" => {
+            opts.saem_mstep_solver = match value.to_lowercase().as_str() {
+                "bobyqa" | "maximiser" | "maximizer" | "legacy" => {
+                    crate::types::SaemMstepSolver::Bobyqa
+                }
+                "score_sa" | "score-sa" | "sa" => crate::types::SaemMstepSolver::ScoreSa,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected bobyqa/score_sa"
+                    ));
+                }
+            };
+        }
+        "mstep_draws" | "saem_mstep_draws" => {
+            let v = parse_usize(key)?;
+            if v == 0 {
+                return Err(format!(
+                    "fit option `{key}` must be at least 1 — it is the number of E-step draws \
+                     the SAEM M-step objective is averaged over, and 1 is the historical \
+                     single-draw objective (#1458), got {v}"
+                ));
+            }
+            opts.saem_mstep_draws = v;
+        }
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,
         "conddist_nsamp" => opts.saem_conddist_nsamp = parse_usize("conddist_nsamp")?,

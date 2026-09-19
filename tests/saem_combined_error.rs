@@ -32,7 +32,7 @@
 //! rather than a comparison against another estimator that might collapse too.
 
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::types::{DoseEvent, OmegaMatrix, Population};
+use ferx_core::types::{DoseEvent, OmegaMatrix, Population, SaemMstepSolver};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions};
 
 mod common;
@@ -383,6 +383,75 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
             (prop - SPARSE_TRUE_PROP).abs() < 0.05,
             "seed {seed}: PROP={prop:.4} must stay near the simulation truth \
              {SPARSE_TRUE_PROP} (worst realised |Δ| over 8 seeds × 2 schedules: 0.0146)"
+        );
+    }
+}
+
+/// Tier-3, #1458. The `mstep_solver = score_sa` arm on the **same** #1445
+/// fixture.
+///
+/// σ does not get a separate treatment under that solver: it rides the one
+/// Newton step on the Robbins-Monro averaged score and information, and
+/// `sigma_mstep_sa_step`'s extra blend is deliberately *not* applied on top
+/// (applying both would step σ at `γ²`). That makes this fixture the check on
+/// whether #1445's collapse comes back through the new path — the additive term
+/// is a minority variance component here, which is the only regime in which the
+/// collapse can happen at all.
+///
+/// The bounds are the ones the default solver has to satisfy above, for the
+/// same reason: a factor of two either side of the simulation truth, with the
+/// collapsed answer (0.0025–0.011, i.e. 1.05× the `exp(−8)` optimizer floor)
+/// three orders of magnitude outside them. Sharing the bounds is the point —
+/// the claim being pinned is that the new solver is not worse on σ, not that it
+/// is better.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn score_sa_does_not_bring_back_the_additive_sigma_collapse() {
+    let model = parse_model_string(SPARSE_MODEL).expect("sparse combined model parses");
+    let pop = sparse_simulated_population(&model, 300);
+
+    for seed in [1_u64, 2, 3] {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::Saem;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        opts.outer_maxiter = 400;
+        opts.saem_n_exploration = 150;
+        opts.saem_n_convergence = 250;
+        opts.saem_seed = Some(seed);
+        opts.saem_mstep_solver = SaemMstepSolver::ScoreSa;
+        let saem = fit(&model, &pop, &model.default_params, &opts).expect("fit must succeed");
+
+        // The arm has to be in force, or this is a duplicate of the test above.
+        assert!(
+            !saem
+                .warnings
+                .iter()
+                .any(|w| w.contains("score_sa") && w.contains("not available")),
+            "seed {seed}: the scope gate refused this fixture: {:?}",
+            saem.warnings
+        );
+
+        let add = saem.sigma[1];
+        let prop = saem.sigma[0];
+        assert!(
+            add.is_finite() && prop.is_finite(),
+            "seed {seed}: sigma must be finite, got PROP={prop} ADD={add}"
+        );
+        assert!(
+            add > SPARSE_TRUE_ADD / 2.0 && add < SPARSE_TRUE_ADD * 2.0,
+            "seed {seed}: score_sa ADD={add:.6} must stay within a factor of two of the \
+             simulation truth {SPARSE_TRUE_ADD} — {:.0}× the optimizer floor \
+             {SIGMA_FLOOR:.3e}, where the #1445 collapse reached 1.05× it",
+            add / SIGMA_FLOOR
+        );
+        assert!(
+            (prop - SPARSE_TRUE_PROP).abs() < 0.05,
+            "seed {seed}: score_sa PROP={prop:.4} must stay near the simulation truth \
+             {SPARSE_TRUE_PROP}"
         );
     }
 }
