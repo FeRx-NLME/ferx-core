@@ -143,10 +143,24 @@ switches the lint off for every future link too, and
 `tests/preflight_owns_the_fast_gates.rs` fails if one appears. `docs` is the
 structural linter on `docs/**/*.qmd` described below.
 
-Two traps it exists to cover: clippy runs `--all-targets` (without it, every
-`#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the
+Three traps it exists to cover: clippy runs `--all-targets` (without it, every
+`#[cfg(test)]` module and all of `tests/` goes unlinted — #1023); the
 workspace members need **package-qualified** features (`ferx-core/ci`, not `ci`,
-which fails outright — #1114).
+which fails outright — #1114); and every clippy line ends in `-- -Dunused`,
+because **`cargo clippy` exits 0 on warn-level findings**. Only its `correctness`
+group is deny-by-default — that is why #1023's `approx_constant` findings were
+caught, they were *errors* — so before #1470 the group printed
+`warning: unused import: individual_nll_into` and then `preflight OK`, exit 0, across
+the six commits that landed on `main` after the import was orphaned. `-Dunused` is
+rustc's long-stable group (`unused_imports`, `dead_code`, `unused_variables`,
+`unused_must_use`, …): the factual claim that a refactor left something behind, not a
+style preference. It is deliberately **not**
+`-Dwarnings` — the same run emits ~1,000 warn-level clippy findings today, and CI
+installs a fresh nightly every run, so denying the whole moving surface would
+redden PRs on lints that did not exist when they were opened. So a green `Clippy`
+job means *no dead code and no correctness lint*, not a warning-free tree. What it
+still cannot see is an unused item inside a `slow-tests`-gated body, which this
+group does not compile.
 
 `tests/preflight_owns_the_fast_gates.rs` pins the whole arrangement, and the
 invariant worth knowing when editing the script is that **`run` exits rather
