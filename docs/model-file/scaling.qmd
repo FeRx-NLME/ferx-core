@@ -577,10 +577,17 @@ all three per-CMT channels, `obs_scale[CMT=N]`, `y[CMT=N]` and
 carries the declared value — a typo, an endpoint removed by
 `[data_selection]`, or a block carried over from another model. On a
 dataset with *no* `CMT` column every observation is keyed to compartment
-1 and `W_CMT_DEFAULTED` reports that separately; this code is what
-catches a column that is present and simply never says `2`. Validating a
-model without `--data` reports nothing here: an empty population is no
-evidence about which entries are exercised.
+1 and **both** codes fire: `W_CMT_DEFAULTED` for the defaulting itself,
+this one for the entries the defaulting left dead. The message offers
+that reading only when the data is consistent with it — every
+observation on compartment 1 — so a model whose observations sit on
+compartment 2 is told its entries are inert without being sent to audit
+a `CMT` column that is present and correct. When a `[data_selection]`
+clause emptied one of the dead compartments the message says so and
+names it; a clause that removed rows on some *other* compartment is not
+offered as the cause. Validating a model without `--data` reports
+nothing here: an empty population is no evidence about which entries are
+exercised.
 
 ### Mixing rule
 
