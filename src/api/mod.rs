@@ -223,6 +223,10 @@ mod simulation_design_covariates_tests;
 #[path = "tests/endpoint_routing_tests.rs"]
 mod endpoint_routing_tests;
 
+#[cfg(test)]
+#[path = "tests/per_cmt_unmatched_tests.rs"]
+mod per_cmt_unmatched_tests;
+
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.
 //

@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **A declared per-CMT entry that no observation matches is now reported** as
+  `W_PER_CMT_UNMATCHED` by `fit()` and `ferx check --data` (#1405). The per-CMT coverage
+  checks only ever looked one way — every *observed* compartment needs an entry — so
+  `obs_scale[CMT=2]`, `y[CMT=2]` or a `CMT=2: DV ~ ...` line on a dataset with no CMT-2
+  row validated clean and silently did nothing, usually because the `CMT` column was
+  missing or mis-mapped. The warning names the channel and the dead compartments, offers
+  `[data_selection]` as a cause when the read excluded observation records, and stays
+  silent on `ferx check` without `--data`.
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
