@@ -562,6 +562,25 @@ impl IndividualNllScratch {
 pub(crate) struct IndividualNllPrep {
     err_keys: Vec<usize>,
     ruv_mult: Option<Vec<Vec<f64>>>,
+    /// Test-only: the `MIXNUM` value in effect when [`Self::refresh`] ran.
+    ///
+    /// Both halves of this prep can read the mixture class — `ruv_obs_mult`'s
+    /// per-sigma programs resolve `Expression::MixNum` through the
+    /// `MIXTURE_CLASS` thread-local, and `validate_ruv_expr` rejects η and NN
+    /// outputs but not the class index, so a `[mixture]` model may legally write
+    /// `DV ~ proportional(EPS * (1 + 0.5*(MIXNUM-1)))`. The wrapper this prep
+    /// replaced evaluated them inside the MH proposal loop and therefore inside
+    /// the drawn class's `MixtureClassGuard`; hoisting them out is only correct
+    /// if the caller refreshes **under the same guard**.
+    ///
+    /// That is an ordering contract between two call sites, invisible in the
+    /// types, and PR #1452 got it wrong on the first pass — `run_saem`'s E-step
+    /// refreshed one line above `MixtureClassGuard::enter`, serving class 1's
+    /// residual variance to every class-2 subject. So the contract is checked
+    /// where the prep is *consumed*, which makes every mixture test in the
+    /// suite a detector for it rather than only a dedicated one.
+    #[cfg(test)]
+    mix_class_at_refresh: usize,
 }
 
 impl IndividualNllPrep {
@@ -573,6 +592,10 @@ impl IndividualNllPrep {
         self.err_keys
             .extend_from_slice(model.error_spec.obs_keys(subject).as_ref());
         self.ruv_mult = model.ruv_obs_mult(subject, theta);
+        #[cfg(test)]
+        {
+            self.mix_class_at_refresh = crate::parser::model_parser::current_mixture_class();
+        }
     }
 }
 
@@ -598,6 +621,17 @@ pub(crate) fn individual_nll_prepared(
     schedule: Option<&pk::event_driven::EventSchedule>,
     scratch: &mut IndividualNllScratch,
 ) -> f64 {
+    #[cfg(test)]
+    assert_eq!(
+        prep.mix_class_at_refresh,
+        crate::parser::model_parser::current_mixture_class(),
+        "IndividualNllPrep was refreshed under mixture class {} but is being \
+         consumed under class {}. Both `obs_keys` and `ruv_obs_mult` may read \
+         MIXNUM, so the caller must refresh inside the drawn class's \
+         MixtureClassGuard (#1452 review round 2).",
+        prep.mix_class_at_refresh,
+        crate::parser::model_parser::current_mixture_class(),
+    );
     scratch.ensure_eta(eta.len());
     let IndividualNllScratch {
         pk,

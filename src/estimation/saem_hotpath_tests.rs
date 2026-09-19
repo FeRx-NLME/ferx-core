@@ -1125,3 +1125,153 @@ fn baseline_cov_population() -> Population {
     }
     pop
 }
+
+// ─── The prep must be built inside the drawn mixture class ───────────────
+
+/// A 2-class mixture whose **residual-magnitude** expression reads `MIXNUM`,
+/// with the mixing logit fixed so far negative that every subject is drawn into
+/// class 2. `magnitude` is spliced in so the twin below differs in exactly one
+/// expression.
+fn mixnum_magnitude_model(magnitude: &str) -> CompiledModel {
+    parse_model_string(&format!(
+        r"
+[parameters]
+  theta TVCL(3.0, 0.5, 30.0)
+  theta TVV(20.0, 2.0, 200.0)
+  theta MIXL(-20.0, FIX)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.05
+  sigma PROP ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  FFM = 9270 * WT / (6680 + 216 * WT / (HT / 100)^2)
+  CL  = TVCL * (FFM / 55)^0.75 * exp(ETA_CL)
+  V   = TVV * (FFM / 55) * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional({magnitude})
+"
+    ))
+    .unwrap_or_else(|e| panic!("mixture/MIXNUM-magnitude model must parse: {e}"))
+}
+
+/// `IndividualNllPrep` hoists `model.ruv_obs_mult(..)` and
+/// `error_spec.obs_keys(..)` out of the MH proposal loop. Both may read
+/// `MIXNUM` — `validate_ruv_expr` rejects η and NN outputs, not the class index
+/// — so the hoist is only correct if the caller refreshes the prep **inside**
+/// the drawn class's `MixtureClassGuard`. The wrapper it replaced computed them
+/// inside the loop and therefore inside the guard; PR #1452 as first posted
+/// refreshed one line *above* `MixtureClassGuard::enter`, which served class
+/// 1's residual variance to every class-2 subject's acceptance ratio.
+///
+/// Three things are checked, in the order that makes the last one mean
+/// something:
+///
+/// 1. the fixture's magnitude really does depend on `MIXNUM` (1.0 under class
+///    1, 1.5 under class 2) — otherwise nothing below can observe the class it
+///    was evaluated at;
+/// 2. the seam itself: refreshing under class 2 and consuming under class 2
+///    reproduces `individual_nll_into_with_schedule` (which computes the
+///    multiplier itself) bit for bit, and refreshing under class 1 does **not**
+///    — so the ordering is load-bearing rather than incidental;
+/// 3. a whole mixture SAEM fit runs clean. It is the consumption-point
+///    assertion inside `individual_nll_prepared` that makes this an assertion at
+///    all: every `individual_nll_prepared` call in the E-step compares the class
+///    the prep was refreshed at against the class in effect, so a fit that gets
+///    the order wrong panics on its first proposal.
+///
+/// Mutation check (run, not reasoned): moving `mh_scratch.begin_subject(..)`
+/// back above `let _class_guard = ..` in `run_saem`'s E-step — the code as
+/// posted — reddens part 3 here and, because the check lives at the consumption
+/// point rather than in this test, the pre-existing mixture SAEM tests as well.
+#[test]
+fn e_step_prep_is_built_inside_the_drawn_mixture_class() {
+    use crate::parser::model_parser::MixtureClassGuard;
+    use crate::stats::likelihood::{
+        individual_nll_into_with_schedule, individual_nll_prepared, IndividualNllPrep,
+        IndividualNllScratch,
+    };
+
+    // `1 + 0.5·(MIXNUM−1)`: 1.0 in class 1, 1.5 in class 2.
+    let model = mixnum_magnitude_model("PROP * (1.0 + 0.5 * (MIXNUM - 1))");
+    let pop = tv_population(false);
+    let subject = &pop.subjects[0];
+    let p = &model.default_params;
+    let eta = vec![0.12, -0.08];
+
+    // (1) Non-degeneracy: the multiplier must actually move with the class.
+    let m1 = {
+        let _g = MixtureClassGuard::enter(1);
+        model.ruv_obs_mult(subject, &p.theta)
+    };
+    let m2 = {
+        let _g = MixtureClassGuard::enter(2);
+        model.ruv_obs_mult(subject, &p.theta)
+    };
+    assert_ne!(
+        m1, m2,
+        "the fixture's residual magnitude does not depend on MIXNUM, so nothing          below can observe which class it was evaluated at"
+    );
+
+    // (2) The seam. Oracle is the wrapper, which reads the class itself.
+    let want = {
+        let _g = MixtureClassGuard::enter(2);
+        individual_nll_into_with_schedule(
+            &model,
+            subject,
+            &p.theta,
+            &eta,
+            &p.omega,
+            &p.sigma.values,
+            &model.residual_correlations,
+            &mut crate::pk::EventPkParams::default(),
+            None,
+        )
+    };
+    let prepared_under = |refresh_class: usize| -> f64 {
+        let mut prep = IndividualNllPrep::default();
+        {
+            let _g = MixtureClassGuard::enter(refresh_class);
+            prep.refresh(&model, subject, &p.theta);
+        }
+        let _g = MixtureClassGuard::enter(2);
+        // The consumption-point check is what this test is ultimately about, so
+        // it must not fire here for the deliberately-wrong arm.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            individual_nll_prepared(
+                &model,
+                subject,
+                &p.theta,
+                &eta,
+                &p.omega,
+                &p.sigma.values,
+                &prep,
+                None,
+                &mut IndividualNllScratch::default(),
+            )
+        }))
+        .unwrap_or(f64::NAN)
+    };
+    assert_eq!(
+        prepared_under(2).to_bits(),
+        want.to_bits(),
+        "refreshed and consumed under class 2, the prepared form must reproduce          the wrapper exactly"
+    );
+    let wrong = prepared_under(1);
+    assert!(
+        wrong.is_nan() || wrong.to_bits() != want.to_bits(),
+        "refreshing under class 1 and consuming under class 2 gave the same          answer ({wrong}), so the ordering is not observable and this test          cannot fail"
+    );
+
+    // (3) A whole mixture SAEM fit, policed by the consumption-point assertion.
+    let r = run_saem(&model, &pop, &model.default_params, &saem_opts())
+        .expect("mixture SAEM run must succeed");
+    assert!(r.ofv.is_finite(), "mixture SAEM produced a non-finite OFV");
+}

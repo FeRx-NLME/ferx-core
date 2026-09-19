@@ -979,7 +979,6 @@ pub(crate) fn mh_steps_componentwise(
 ///
 /// Returns `(n_accepted, n_proposed, updated_nll)`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn mh_kappa_steps(
     kappas: &mut [Vec<f64>],
     nll_current: f64,
@@ -3344,11 +3343,6 @@ pub fn run_saem(
                     MhScratch::default,
                     |mh_scratch, (i, ((((eta, &nll), &scale), cw_sc_i), kappas_i))| {
                         let subject = &population.subjects[i];
-                        // Point the worker's buffers at this subject and rebuild
-                        // the η-independent half of the NLL's inputs (residual
-                        // dispatch keys, `#484` magnitude multipliers) — once per
-                        // subject, not once per proposal.
-                        mh_scratch.begin_subject(model, subject, theta_ref, n_eta);
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
                                 .wrapping_add(k as u64 * 100_000)
@@ -3381,6 +3375,25 @@ pub fn run_saem(
                             0
                         };
                         let _class_guard = mix_ref.map(|_| MixtureClassGuard::enter(mix_class + 1));
+                        // Point the worker's buffers at this subject and rebuild
+                        // the η-independent half of the NLL's inputs (residual
+                        // dispatch keys, `#484` magnitude multipliers) — once per
+                        // subject, not once per proposal.
+                        //
+                        // **After the class guard, not before.** `IndividualNllPrep`
+                        // hoists `model.ruv_obs_mult(..)` out of the proposal loop,
+                        // and a residual-magnitude expression may legally read
+                        // `MIXNUM` (`validate_ruv_expr` rejects η and NN outputs,
+                        // not the class index), which resolves through the
+                        // `MIXTURE_CLASS` thread-local this guard sets. The wrapper
+                        // this replaced computed the multiplier *inside* the loop
+                        // and therefore inside the guard; building it one line
+                        // earlier evaluated it at the ambient class — class 1 — and
+                        // served that to every class-2 subject's acceptance ratio.
+                        // `draw_class` above only reads `mh_scratch.pk()`, which
+                        // `begin_subject` does not touch, so the order is free to
+                        // be the correct one.
+                        mh_scratch.begin_subject(model, subject, theta_ref, n_eta);
                         let (omega_ref, sigma_ref, cw_sd_ref): (&OmegaMatrix, &[f64], &[f64]) =
                             if mix_ref.is_some() {
                                 (

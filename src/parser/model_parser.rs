@@ -19041,7 +19041,7 @@ thread_local! {
 // class NLL lands with the mixture objective (#977 Phase 3). Until then the
 // thread-local stays at its class-1 default and `MIXNUM` resolves to 1.
 
-fn current_mixture_class() -> usize {
+pub(crate) fn current_mixture_class() -> usize {
     MIXTURE_CLASS.with(std::cell::Cell::get)
 }
 
