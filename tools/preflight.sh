@@ -314,11 +314,15 @@ group_clippy() {
   # wrong answer, across the six commits that landed on `main` after it.
   #
   # Why the `unused` GROUP and not `-Dwarnings`. `-Dwarnings` is not reachable from
-  # here: the same run emits ~1,000 warn-level clippy findings today (356 in
-  # `ferx-core` lib, 579 in lib test, the rest across the test binaries — 274
-  # `field_reassign_with_default`, 140 `too_many_arguments`, 129 `type_complexity`,
-  # …), so denying everything would be a thousand-finding cleanup wearing a CI change
-  # as a hat, and it would put a MOVING surface in the gate: CI installs a fresh
+  # here: the ferx-core command alone PRINTS 819 warn-level clippy findings today —
+  # 272 `field_reassign_with_default`, 74 `too_many_arguments`, 67 `type_complexity`,
+  # 55 `doc_lazy_continuation`, 51 `neg_cmp_op_on_partial_ord`, … — so denying
+  # everything would be an 800-finding cleanup wearing a CI change as a hat. (Count
+  # the printed diagnostics, not cargo's per-unit counters: those read 356 for `lib`
+  # and 579 for `lib test`, and 354 of the second number is the first counted again,
+  # so adding them overstates the total by a third. Measured that way once here, and
+  # the corrected figures are the ones above.) It would also put a MOVING surface in
+  # the gate: CI installs a fresh
   # nightly every run (see the note below), and clippy's warn-level lint set grows
   # with it, so an unrelated PR would go red on a lint that did not exist when it was
   # opened. `unused` is the opposite on both counts. It is one long-stable rustc group
@@ -360,6 +364,12 @@ group_clippy() {
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
   # ferx-core line) because the members' test code is a meaningful share of their
   # line count while they are still small.
+  #
+  # The `--` args reach BOTH `-p` packages, not just the last one — worth stating
+  # because the opposite would make half this line decoration, and it is not obvious
+  # from cargo's docs. Verified by injecting an unused import into each crate on its
+  # own: ferx-tools alone and ferx-cli alone each give `error: unused import` and
+  # exit 101 from this exact command.
   run cargo clippy -p ferx-tools -p ferx-cli --tests --no-default-features \
     --features ferx-core/ci,ferx-core/markov,ferx-core/nn -- -Dunused
 }

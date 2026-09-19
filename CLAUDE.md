@@ -155,9 +155,11 @@ the six commits that landed on `main` after the import was orphaned. `-Dunused` 
 rustc's long-stable group (`unused_imports`, `dead_code`, `unused_variables`,
 `unused_must_use`, …): the factual claim that a refactor left something behind, not a
 style preference. It is deliberately **not**
-`-Dwarnings` — the same run emits ~1,000 warn-level clippy findings today, and CI
-installs a fresh nightly every run, so denying the whole moving surface would
-redden PRs on lints that did not exist when they were opened. So a green `Clippy`
+`-Dwarnings` — the ferx-core clippy command alone prints 819 warn-level findings
+today (272 `field_reassign_with_default`, 74 `too_many_arguments`, 67
+`type_complexity`, …), and CI installs a fresh nightly every run, so denying the
+whole moving surface would redden PRs on lints that did not exist when they were
+opened. So a green `Clippy`
 job means *no dead code and no correctness lint*, not a warning-free tree. What it
 still cannot see is an unused item inside a `slow-tests`-gated body, which this
 group does not compile.
