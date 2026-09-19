@@ -1635,18 +1635,24 @@ fn fit_inner(
         crate::estimation::inner_optimizer::set_capture_terminal_hessian(
             quadrature_nodes.is_some(),
         );
-        // The current-point seed reduces work for FO-family objectives and for
-        // multi-node AGQ.  One-node Laplace keeps terminal-Hessian reuse but not
-        // the seed: on the large stress anchor it increased inner gradient steps
-        // by 2.45% (196,945 -> 201,769) and wall time by 2.54%.
+        // FOCE and FOCEI intentionally share the positive conditional
+        // Gauss-Newton metric: their EBE objective is identical. Their distinct
+        // interaction/non-interaction Hessians enter the population marginal,
+        // not this inner solve. Multi-node AGQ uses that same robust metric;
+        // one-node Laplace uses its exact conditional Hessian for robustness.
+        // Both pass through the same SPD Cholesky gate and prior-metric fallback.
+        crate::estimation::inner_optimizer::set_exact_hessian_seed_for_fit(
+            quadrature_nodes == Some(1),
+        );
         crate::estimation::inner_optimizer::set_hessian_seed_for_fit(
-            matches!(
-                method,
-                EstimationMethod::Foce
-                    | EstimationMethod::FoceI
-                    | EstimationMethod::FoceGn
-                    | EstimationMethod::FoceGnHybrid
-            ) && quadrature_nodes != Some(1),
+            quadrature_nodes == Some(1)
+                || (matches!(
+                    method,
+                    EstimationMethod::Foce
+                        | EstimationMethod::FoceI
+                        | EstimationMethod::FoceGn
+                        | EstimationMethod::FoceGnHybrid
+                ) && quadrature_nodes != Some(1)),
         );
         // Per-stage interaction flag: FOCEI=on, FOCE=off, others inherit from user options.
         match method {

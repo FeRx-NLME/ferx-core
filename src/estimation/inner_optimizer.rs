@@ -492,6 +492,7 @@ fn analytic_inner_seed_hessian(
     mult: Option<&[Vec<f64>]>,
     err_keys: &[usize],
     obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
+    exact: bool,
 ) -> Option<(DMatrix<f64>, Option<Vec<f64>>)> {
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
         return None;
@@ -500,7 +501,7 @@ fn analytic_inner_seed_hessian(
         && params.residual_correlations.is_empty()
         && model.frem_config.is_none()
         && !subject.obs_times.is_empty();
-    if light_supported {
+    if light_supported && !exact {
         let hint = std::mem::take(obs_grad_recycle);
         if let Some(sens) = crate::sens::provider::subject_eta_grad_with_schedule(
             model,
@@ -599,11 +600,18 @@ fn analytic_inner_seed_hessian(
         eta,
         model.residual_error_eta,
     )
-    // Match nlmixr2est's normal-endpoint `warm="calc"` seed: the positive
-    // Gauss-Newton/Almquist curvature is a robust optimizer metric.  The exact
-    // Hessian remains the Laplace/AGQ integration anchor below, but can be
-    // indefinite away from the mode and was slower as a BFGS seed in A/B runs.
-    .map(|core| (core.htilde, None))
+    .map(|core| {
+        if exact {
+            // Laplace's integration correction is defined by the exact
+            // conditional Hessian. Use that same curvature for its BFGS seed;
+            // `init_h_inv` accepts it only when Cholesky proves it SPD.
+            (core.h_inner, None)
+        } else {
+            // nlmixr2est's normal-endpoint `warm="calc"` seed: the positive
+            // Gauss-Newton/Almquist curvature is the FO-family metric.
+            (core.htilde, None)
+        }
+    })
 }
 
 fn analytic_terminal_work(
@@ -672,6 +680,13 @@ static HESSIAN_SEED_FOR_FIT: std::sync::atomic::AtomicBool =
 
 pub(crate) fn set_hessian_seed_for_fit(on: bool) {
     HESSIAN_SEED_FOR_FIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static EXACT_HESSIAN_SEED_FOR_FIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_exact_hessian_seed_for_fit(on: bool) {
+    EXACT_HESSIAN_SEED_FOR_FIT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Aggregate statistics from running the inner loop over all subjects.
@@ -1284,6 +1299,7 @@ fn find_ebe_impl(
                 mult.as_deref(),
                 err_keys.as_ref(),
                 &mut obs_grad_recycle.borrow_mut(),
+                EXACT_HESSIAN_SEED_FOR_FIT.load(std::sync::atomic::Ordering::Relaxed),
             )
         })
         .flatten();

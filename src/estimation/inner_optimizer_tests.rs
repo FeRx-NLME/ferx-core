@@ -1886,6 +1886,7 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
         None,
         &err_keys,
         &mut Vec::new(),
+        false,
     )
     .expect("fixture supports the light seed");
     let ordinary_gradient = analytic_eta_nll_gradient(
@@ -1904,7 +1905,7 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
     let full_sens =
         crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta0)
             .expect("fixture supports full sensitivities");
-    let full_seed = crate::estimation::sens_outer_gradient::score_core(
+    let full_core = crate::estimation::sens_outer_gradient::score_core(
         &model,
         &subject,
         params,
@@ -1914,9 +1915,22 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
         &eta0,
         None,
     )
-    .expect("fixture supports full score")
-    .htilde;
-    assert_relative_eq!(light_seed, full_seed, epsilon = 1e-12);
+    .expect("fixture supports full score");
+    assert_relative_eq!(light_seed, full_core.htilde, epsilon = 1e-12);
+    let (exact_seed, exact_gradient) = analytic_inner_seed_hessian(
+        &model,
+        &subject,
+        params,
+        &eta0,
+        None,
+        None,
+        &err_keys,
+        &mut Vec::new(),
+        true,
+    )
+    .expect("fixture supports the exact Laplace seed");
+    assert_eq!(exact_gradient, None);
+    assert_eq!(exact_seed, full_core.h_inner);
     let off = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
     let on = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 3);
 

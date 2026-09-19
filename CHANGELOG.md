@@ -441,10 +441,11 @@ section of the SDLC for the versioning policy).
   ([#1447](https://github.com/FeRx-NLME/ferx-core/issues/1447)).
 - FO/FOCEI and multi-node AGQ inner optimization now seed dense BFGS from the
   current analytical Gauss–Newton eta Hessian through a Cholesky solve, fusing
-  the seed and first gradient in one first-order sensitivity pass; Laplace/AGQ
-  fuse the terminal prediction Jacobian with their exact Hessian and reuse that
-  curvature in the quadrature objective. Laplace skips generic one-node grid
-  construction, while AGQ caches log weights and stores retained node modes
+  the seed and first gradient in one first-order sensitivity pass; Laplace uses
+  its exact conditional eta Hessian as the initial BFGS metric for robustness.
+  Laplace/AGQ also fuse the terminal prediction Jacobian with their exact Hessian
+  and reuse that curvature in the quadrature objective. Laplace skips generic
+  one-node grid construction, while AGQ caches log weights and stores retained node modes
   contiguously to reduce allocator pressure. Unsupported or non-positive-
   definite seeds retain the previous initialization
   ([#1389](https://github.com/FeRx-NLME/ferx-core/pull/1389)).
