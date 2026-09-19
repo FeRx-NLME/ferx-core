@@ -131,6 +131,18 @@ fn laplace_mode_nll_reuse_enabled() -> bool {
     })
 }
 
+/// Benchmark-only A/B switch for reusing the exact anchor's base sensitivity jet in
+/// `deta_hat/dx`. Both routes call the same response assembly; the disabled route merely
+/// rebuilds the identical jet first.
+fn laplace_eta_dx_base_jet_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_ETA_DX_BASE_JET_REUSE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
 /// [`crate::api::check_model_options`]. The tensor rule costs one full likelihood
 /// evaluation per node per subject per outer iteration, so the grid — not the node count —
@@ -1877,7 +1889,18 @@ fn grid_response_correction(
     // sensitivity provider already supplies and the EBE predictor already relies on). No
     // inner re-solve is needed.
     let db_dx = eta_dx(
-        model, subject, params, template, stack, x, b_hat, scratch, schedule,
+        model,
+        subject,
+        params,
+        template,
+        stack,
+        x,
+        b_hat,
+        base_jet
+            .as_ref()
+            .filter(|_| laplace_eta_dx_base_jet_reuse_enabled()),
+        scratch,
+        schedule,
     )?;
 
     // `∂nll/∂b` at every base node — the node-response factor. Independent of `k`, so this is
@@ -2467,6 +2490,7 @@ fn eta_dx(
     stack: &Stack,
     x: &[f64],
     b_hat: &[f64],
+    base_jet: Option<&crate::sens::provider::SubjectSens>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Option<Vec<nalgebra::DVector<f64>>> {
@@ -2483,9 +2507,14 @@ fn eta_dx(
                 model, subject, template, x, b_hat,
             )
         } else {
-            crate::estimation::sens_outer_gradient::subject_eta_dx(
-                model, subject, template, x, b_hat,
-            )
+            match base_jet {
+                Some(sens) => crate::estimation::sens_outer_gradient::subject_eta_dx_from_sens(
+                    model, subject, params, template, x, b_hat, sens,
+                ),
+                None => crate::estimation::sens_outer_gradient::subject_eta_dx(
+                    model, subject, template, x, b_hat,
+                ),
+            }
         };
         if let Some(v) = exact {
             return Some(v);
@@ -3188,6 +3217,7 @@ mod tests {
             &stack,
             &x,
             ebe.eta.as_slice(),
+            None,
             &mut scratch2,
             schedule.as_ref(),
         )
@@ -3679,6 +3709,7 @@ mod tests {
                     &stack,
                     &x,
                     b_hat,
+                    None,
                     &mut scratch,
                     schedule.as_ref(),
                 )
