@@ -508,6 +508,37 @@ fn a_filtered_read_names_data_selection_as_a_cause() {
     );
 }
 
+#[test]
+fn a_filter_that_removed_no_observation_is_not_blamed() {
+    // The other side of the note's gate, and the one a mutation sweep found missing:
+    // the test above fixes `exclusions = None` against `exclusions = Some(n > 0)`, so
+    // relaxing the gate from `n_obs_excluded > 0` to "a filter was applied at all"
+    // changed nothing on any fixture and survived.
+    //
+    // `Population::exclusions` is `Some` whenever a `[data_selection]` block exists,
+    // fired or not. A clause that matched nothing — or one that only removed dose
+    // records — leaves every observation in place, so it cannot be why an entry is
+    // unmatched, and naming it sends the user to edit a block that is not the cause.
+    let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
+    let pop = filtered_population(&m, OBS_CMT1_ONLY, "TIME == 999");
+    let excl = pop
+        .exclusions
+        .as_ref()
+        .expect("a filtered read records its exclusions even when no clause fires");
+    assert_eq!(
+        excl.n_obs_excluded, 0,
+        "this clause must remove no observation row, or it is the previous test: {excl:?}"
+    );
+
+    let msgs = unmatched_messages(&m, &pop);
+    assert_eq!(msgs.len(), 1, "the entry is still dead, got {msgs:?}");
+    assert!(
+        !msgs[0].contains("data_selection"),
+        "a filter that removed no observation must not be offered as the cause: {}",
+        msgs[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The second taxonomy — `classify_warning`
 // ---------------------------------------------------------------------------
