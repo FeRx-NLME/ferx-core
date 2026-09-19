@@ -10,6 +10,30 @@ use crate::estimation::covariance::{
 };
 use crate::estimation::parameterization::{compute_bounds, pack_params};
 
+/// Terminal-curvature capture is an input to each inner solve, not mutable process state.
+/// Opposing objective-only and fused-gradient fits may therefore overlap without changing
+/// each other's policy.
+#[test]
+fn concurrent_laplace_evaluations_keep_opposing_capture_policies() {
+    let mut options = FitOptions::default();
+    options.method = EstimationMethod::Laplace;
+    let barrier = std::sync::Barrier::new(2);
+
+    std::thread::scope(|scope| {
+        let objective = scope.spawn(|| {
+            barrier.wait();
+            (0..1_000).all(|_| agq_inner_solve_policy(&options, false).capture_terminal_hessian)
+        });
+        let gradient = scope.spawn(|| {
+            barrier.wait();
+            (0..1_000).all(|_| !agq_inner_solve_policy(&options, true).capture_terminal_hessian)
+        });
+
+        assert!(objective.join().expect("objective policy thread"));
+        assert!(gradient.join().expect("gradient policy thread"));
+    });
+}
+
 #[path = "focei_pipeline_tests.rs"]
 mod pipeline;
 
