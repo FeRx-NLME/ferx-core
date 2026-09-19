@@ -928,6 +928,69 @@ fn a_filter_that_emptied_no_declared_compartment_is_not_blamed_at_all() {
     );
 }
 
+#[test]
+fn the_missing_column_advice_is_withdrawn_when_the_filter_shows_the_column_carries_others() {
+    // The residual of finding 1 that only became reachable once finding 3 recorded the
+    // excluded compartments, and it was measured through the CLI rather than reasoned
+    // about: declared {1,2,3}, observed {1,3}, `ignore = CMT == 3`. After the filter
+    // `observed == {1}`, so the gate on `observed` alone fired and the message read
+    //
+    //   "... A `[data_selection]` clause removed every scored observation on
+    //    compartment(s) 3 ... The usual cause is ... a missing or mis-mapped CMT column
+    //    keys every observation to compartment 1. Check the CMT column ..."
+    //
+    // — two sentences of one message contradicting each other. `obs_cmts_excluded = {3}`
+    // is proof the column carries a 3, so the column hypothesis is refuted by data the
+    // check is holding. The gate now tests `observed ∪ excluded`: every scored
+    // observation the *file* carried, kept or dropped.
+    //
+    // Straddle: the same clause against a dataset that really is column-less cannot be
+    // built (a clause naming CMT needs the column), so the other side of the pair is the
+    // *unfiltered* read of this same file, which leaves `observed == {1, 3}` and must
+    // also withhold the advice — and `the_missing_column_advice_is_offered_only_when_the_data_reads_column_less`
+    // holds the `{1}`-side. What this pins is that the union, not `observed`, is what is
+    // tested: a gate on `observed` alone passes that test and fails this one.
+    const COLUMN_ADVICE: &str = "missing or mis-mapped CMT column";
+    let m = per_cmt_scaling_model(
+        "  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500",
+    );
+    let pop = filtered_population(&m, OBS_CMT1_AND_3, "CMT == 3");
+    let excl = pop
+        .exclusions
+        .as_ref()
+        .expect("a filtered read records its exclusions");
+    assert_eq!(
+        excl.obs_cmts_excluded,
+        vec![3],
+        "the clause must have emptied compartment 3: {excl:?}"
+    );
+    assert!(
+        pop.subjects
+            .iter()
+            .flat_map(|s| s.obs_cmts.iter())
+            .all(|c| *c == 1),
+        "post-filter the population must observe only compartment 1, or the gate on \
+         `observed` alone would not have fired and this test proves nothing"
+    );
+
+    let msgs = unmatched_messages(&m, &pop);
+    assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
+    let msg = &msgs[0];
+    assert!(
+        msg.contains("(observed: 1)"),
+        "the observed set really is {{1}} here: {msg}"
+    );
+    assert!(
+        msg.contains("removed every scored observation on compartment(s) 3 "),
+        "the filter note must still name compartment 3: {msg}"
+    );
+    assert!(
+        !msg.contains(COLUMN_ADVICE),
+        "the excluded set proves the column carries a 3, so the column hypothesis must \
+         not be offered: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Two live channels on one model (#1456 review r1, finding 5)
 // ---------------------------------------------------------------------------

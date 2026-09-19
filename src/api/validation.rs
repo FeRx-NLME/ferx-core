@@ -243,26 +243,6 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         return Vec::new();
     }
 
-    // The advice half depends on the observed set and not on the channel, so it is
-    // built once, outside the loop.
-    //
-    // **Gated, because the missing-column reading is not always true.** `{1}` is
-    // exactly what the reader defaults a column-less dataset to (`W_CMT_DEFAULTED`,
-    // #1009), so it is the one observed set for which "a missing or mis-mapped CMT
-    // column keys every observation to compartment 1" is a live hypothesis. With
-    // observations on compartment 2 the column is present, correct and being read, and
-    // the sentence sent the user to audit the one thing that was right — measured on
-    // the PR's own *after* block, which is that case (#1456 review r1).
-    let advice = if observed.len() == 1 && observed.contains(&1) {
-        "The usual cause is on the data side: a missing or mis-mapped CMT column keys \
-         every observation to compartment 1. Check the CMT column, or delete the unused \
-         entries."
-    } else {
-        "The CMT column is being read — observations are recorded on other \
-         compartment(s) — so check that these entries name the compartments this dataset \
-         actually uses, or delete them."
-    };
-
     // Which compartments a `[data_selection]` clause took away. Named rather than
     // special-cased: a filter legitimately removes rows, so a live entry can read as
     // dead, and suppressing the warning there re-silences the case this check exists
@@ -275,6 +255,35 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         .as_ref()
         .map(|e| e.obs_cmts_excluded.iter().copied().collect())
         .unwrap_or_default();
+
+    // The advice half depends on the data and not on the channel, so it is built once,
+    // outside the loop.
+    //
+    // **Gated, because the missing-column reading is not always true.** `{1}` is exactly
+    // what the reader defaults a column-less dataset to (`W_CMT_DEFAULTED`, #1009), so
+    // it is the one set for which "a missing or mis-mapped CMT column keys every
+    // observation to compartment 1" is a live hypothesis. With observations on
+    // compartment 2 the column is present, correct and being read, and the sentence sent
+    // the user to audit the one thing that was right — measured on the PR's own *after*
+    // block, which is that case (#1456 review r1).
+    //
+    // The set tested is `observed ∪ excluded`, not `observed`: every scored observation
+    // the *file* carried, kept or dropped. A `[data_selection]` clause that removed the
+    // CMT-3 rows leaves `observed == {1}` on a dataset whose column plainly does carry a
+    // 3, and `obs_cmts_excluded` is the evidence that refutes the hypothesis — measured
+    // end to end, where the filter note correctly named compartment 3 while the advice
+    // half was still telling the user to go and check the column.
+    let mut seen = observed.clone();
+    seen.extend(filtered_cmts.iter().copied());
+    let advice = if seen.len() == 1 && seen.contains(&1) {
+        "The usual cause is on the data side: a missing or mis-mapped CMT column keys \
+         every observation to compartment 1. Check the CMT column, or delete the unused \
+         entries."
+    } else {
+        "The CMT column is being read — observations are recorded on other \
+         compartment(s) — so check that these entries name the compartments this dataset \
+         actually uses, or delete them."
+    };
 
     let mut diags = Vec::new();
     for (syntax, block, declared) in declared {
