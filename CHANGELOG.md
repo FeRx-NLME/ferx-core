@@ -463,6 +463,13 @@ section of the SDLC for the versioning policy).
   15 wide. They now run on the engine's pool at the requested width
   ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 
+- **Laplace reuses its exact-anchor sensitivity jet when differentiating the EBE mode.**
+  The same jet already needed for the Hessian derivative now also supplies
+  `dη̂/dx`, eliminating one full sensitivity traversal per subject-gradient
+  evaluation. This removes 9.9% of provider calls and lowers median CPU by 2.2–3.0%
+  across diagonal-Ω, block-Ω, and ODE fixtures without changing the objective or
+  gradient (#1467).
+
 - **One-node Laplace no longer repeats work already completed at the EBE mode.**
   Fused objective/gradient evaluations avoid capturing an exact terminal Hessian that
   the analytic gradient must rebuild together with its sensitivity jet, and the sole
