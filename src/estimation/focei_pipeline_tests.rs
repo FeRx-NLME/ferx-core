@@ -1,4 +1,7 @@
 use super::*;
+use crate::estimation::inner_optimizer::{
+    run_inner_loop_warm, run_inner_loop_warm_seeded, InnerHessianSeed,
+};
 use crate::parser::model_parser::parse_model_string;
 
 fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
@@ -58,7 +61,10 @@ fn fused_inner_and_marginal_match_separate_passes() {
                     .build()
                     .unwrap();
                 pool.install(|| {
-                    let reference = run_inner_loop_warm(
+                    // The fused pass runs the stage's BFGS seed (#1389); the separate
+                    // reference must run the same one, so what is compared is fusion alone.
+                    let seed = InnerHessianSeed::for_options(&opts);
+                    let reference = run_inner_loop_warm_seeded(
                         &model,
                         &pop,
                         params,
@@ -68,9 +74,10 @@ fn fused_inner_and_marginal_match_separate_passes() {
                         Some(&mu),
                         4,
                         opts.inner_restarts,
+                        seed,
                     );
                     for warm in [None, Some(reference.0.as_slice())] {
-                        let separate = run_inner_loop_warm(
+                        let separate = run_inner_loop_warm_seeded(
                             &model,
                             &pop,
                             params,
@@ -80,6 +87,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             Some(&mu),
                             4,
                             opts.inner_restarts,
+                            seed,
                         );
                         let expected_nll = if iov {
                             crate::stats::likelihood::foce_population_nll_iov(
@@ -145,7 +153,10 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             inner_maxiter: 3,
             ..Default::default()
         };
-        let separate = run_inner_loop_warm(
+        // Same seed as the fused pass (exact for one-node Laplace, Gauss–Newton for AGQ), so
+        // the comparison isolates the fused dispatch — including, for Laplace, the reuse of
+        // the retained terminal Hessian against `pop_nll_opts`'s from-scratch anchor.
+        let separate = run_inner_loop_warm_seeded(
             &model,
             &pop,
             params,
@@ -155,6 +166,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             None,
             opts.min_obs_for_convergence_check as usize,
             opts.inner_restarts,
+            InnerHessianSeed::for_options(&opts),
         );
         let expected = pop_nll_opts(
             &model,
@@ -287,6 +299,7 @@ fn inner_map_completes_each_subject_before_returning_its_buffers() {
         None,
         0,
         0,
+        InnerSolvePolicy::default(),
         |subject, ebe| {
             (
                 subject.id.clone(),

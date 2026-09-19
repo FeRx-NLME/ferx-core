@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 use super::*;
+use approx::assert_relative_eq;
 use std::collections::HashMap;
 #[cfg(profiling_allocations)]
 use std::{
@@ -887,7 +888,7 @@ fn inner_solver_scaling_bench() {
             t0.elapsed().as_secs_f64() * 1e3 / runs as f64
         };
         let t_dense =
-            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, None, false));
         let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
         eprintln!(
             "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
@@ -1132,7 +1133,7 @@ fn run_dense_scratch_fixture(n: usize, legacy: bool) -> (bool, Vec<u64>, u64, us
     let converged = if legacy {
         legacy_dense_bfgs(&obj, &grad, &mut x, n, 200, 1e-10)
     } else {
-        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, false)
+        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, None, false)
     };
     let final_objective = obj(&x).to_bits();
     (
@@ -1327,7 +1328,7 @@ fn dense_bfgs_converges_on_quadratic() {
         |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
     let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
     let mut x = vec![0.0, 0.0];
-    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, false);
+    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, None, false);
     assert!(ok, "BFGS should report convergence");
     assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
     assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -1412,6 +1413,7 @@ fn test_ebe_result_converged_flag() {
     let r = EbeResult {
         eta: nalgebra::DVector::zeros(2),
         h_matrix: nalgebra::DMatrix::identity(2, 2),
+        terminal_hessian: None,
         converged: true,
         used_fallback: false,
         grad_norm: 0.0,
@@ -1425,6 +1427,270 @@ fn test_ebe_result_converged_flag() {
 }
 
 #[test]
+fn hessian_seed_is_applied_through_a_cholesky_solve() {
+    let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
+    let got = seed_h_inv(2, Some(&h)).expect("SPD seed is accepted");
+    let identity = &h * &got;
+    assert!((identity - DMatrix::identity(2, 2)).norm() < 1e-12);
+    assert_eq!(init_h_inv(2, None, Some(&got)), got);
+    // An accepted seed outranks the diagonal preconditioner.
+    assert_eq!(init_h_inv(2, Some(&[10.0, 20.0]), Some(&got)), got);
+
+    // An indefinite analytical seed is *rejected* — `None`, so the caller can tell — and the
+    // metric falls back to the legacy identity / preconditioner.
+    let bad = DMatrix::from_diagonal(&DVector::from_column_slice(&[1.0, -1.0]));
+    assert_eq!(seed_h_inv(2, Some(&bad)), None);
+    assert_eq!(init_h_inv(2, None, None), DMatrix::identity(2, 2));
+    assert_eq!(
+        init_h_inv(2, Some(&[10.0, 20.0]), None),
+        DMatrix::from_diagonal(&DVector::from_column_slice(&[10.0, 20.0]))
+    );
+    // Wrong shape and a non-finite entry are rejected the same way.
+    let wrong_shape = DMatrix::identity(3, 3);
+    assert_eq!(seed_h_inv(2, Some(&wrong_shape)), None);
+    let nan = DMatrix::from_row_slice(2, 2, &[f64::NAN, 0.0, 0.0, 1.0]);
+    assert_eq!(seed_h_inv(2, Some(&nan)), None);
+}
+
+/// A seed that fails the SPD gate must reproduce the **unseeded** dense BFGS exactly — same
+/// iterates, same number of objective evaluations. The gate lives in `seed_h_inv`, but the
+/// `1/gnorm` first-step scaling is keyed separately; when it was keyed on `hessian_seed.
+/// is_some()` rather than on the seed being *accepted*, a rejected seed produced an
+/// unscaled identity first step (`−g` at full length) and a different trajectory from the
+/// baseline it claims to preserve. Start with `‖g‖ ≈ 16 > 1` so the scaling is live.
+#[test]
+fn rejected_hessian_seed_reproduces_the_unseeded_solve() {
+    use std::cell::Cell;
+    let n_obj = Cell::new(0usize);
+    let obj = |x: &[f64]| -> f64 {
+        n_obj.set(n_obj.get() + 1);
+        (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0)
+    };
+    let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
+    let run = |seed: Option<&DMatrix<f64>>| {
+        n_obj.set(0);
+        let mut x = vec![0.0, 0.0];
+        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, seed, None, false);
+        assert!(ok);
+        (x, n_obj.get())
+    };
+    let (x_unseeded, evals_unseeded) = run(None);
+    let bad = DMatrix::from_diagonal(&DVector::from_column_slice(&[1.0, -1.0]));
+    let (x_rejected, evals_rejected) = run(Some(&bad));
+    assert_eq!(
+        x_rejected, x_unseeded,
+        "rejected seed changed the iterate path"
+    );
+    assert_eq!(
+        evals_rejected, evals_unseeded,
+        "rejected seed changed the objective-evaluation count"
+    );
+
+    // Control: an *accepted* exact seed (`H = diag(2, 8)`) is a different — one-step — solve,
+    // so the equality above is not vacuous.
+    let exact = DMatrix::from_diagonal(&DVector::from_column_slice(&[2.0, 8.0]));
+    let (x_seeded, evals_seeded) = run(Some(&exact));
+    assert!((x_seeded[0] - 1.0).abs() < 1e-9 && (x_seeded[1] + 2.0).abs() < 1e-9);
+    assert!(
+        evals_seeded < evals_unseeded,
+        "accepted seed {evals_seeded} vs unseeded {evals_unseeded} objective evaluations"
+    );
+}
+
+/// Under the default `bloq_method = drop` a `CENS` flag on a row is *not* a censored kernel —
+/// `analytic_eta_nll_gradient_with_schedule` scores the row Gaussian (`cens = if m3 {..} else
+/// {0}`). The fused first gradient must apply the same rule; passing the raw flag through
+/// hands BFGS `−log Φ` rows against an `obj` that scores them Gaussian, so a warm start at the
+/// mode fails `gnorm < tol` and takes a non-descent first step. Both arms are asserted: the
+/// Gaussian rule under `drop`, and the censored kernel under `m3`, each bit-identical to the
+/// ordinary gradient at the same point.
+#[test]
+fn light_seed_gradient_applies_cens_only_under_m3() {
+    let (mut model, mut subject) = wellidentified_oral_fixture();
+    // Row 5 (the 1.5 at t = 12) becomes a BLOQ row with LLOQ = 1.5 held in `observations`.
+    subject.cens[5] = 1;
+    let params = model.default_params.clone();
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let eta = vec![0.05, -0.02, 0.1];
+    for bloq in [crate::types::BloqMethod::Drop, crate::types::BloqMethod::M3] {
+        model.bloq_method = bloq;
+        let (_, fused) = analytic_inner_seed_hessian(
+            &model,
+            &subject,
+            &params,
+            &eta,
+            None,
+            None,
+            &err_keys,
+            &mut Vec::new(),
+            false,
+        )
+        .expect("fixture supports the light seed");
+        let ordinary = analytic_eta_nll_gradient(
+            &model,
+            &subject,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+        )
+        .expect("fixture supports the ordinary gradient");
+        assert_eq!(
+            fused.expect("light path fuses the gradient"),
+            ordinary,
+            "{}: fused first gradient diverged from the ordinary inner gradient",
+            bloq.label()
+        );
+    }
+    // The two arms genuinely differ on the CENS row, so agreement in each is not a tautology.
+    model.bloq_method = crate::types::BloqMethod::Drop;
+    let g_drop = analytic_eta_nll_gradient(
+        &model,
+        &subject,
+        &params.theta,
+        &eta,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .unwrap();
+    model.bloq_method = crate::types::BloqMethod::M3;
+    let g_m3 = analytic_eta_nll_gradient(
+        &model,
+        &subject,
+        &params.theta,
+        &eta,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .unwrap();
+    assert_ne!(
+        g_drop, g_m3,
+        "test premise: the CENS row must be live under m3"
+    );
+}
+
+/// `analytic_terminal_work`'s Hessian is trusted verbatim by the objective-only Laplace path in
+/// place of `agq::anchor_hessian(Exact)`, so it must decline exactly where that arm would not
+/// take the provider: outside `analytic_score_supported` — `gradient = fd`, and any
+/// non-Gaussian endpoint (the provider's `score_core` folds no hazard curvature, so on a joint
+/// PK-TTE model it would return `Ω⁻¹ + Gaussian curvature` and the fit would minimise a
+/// `½log|H|` that disagrees with the reported OFV). Without the gate every arm below is `Some`.
+#[test]
+fn analytic_terminal_work_declines_outside_the_exact_anchors_scope() {
+    let (mut model, subject) = wellidentified_oral_fixture();
+    let params = model.default_params.clone();
+    let params = &params;
+    let eta = vec![0.05, -0.02, 0.1];
+    assert!(
+        crate::estimation::agq::analytic_score_supported(&model),
+        "test premise: the Gaussian fixture is in the analytic score scope"
+    );
+    let (jac, h) = analytic_terminal_work(&model, &subject, params, &eta)
+        .expect("in-scope Gaussian subject retains a terminal Hessian");
+    assert_eq!(jac.shape(), (subject.obs_times.len(), model.n_eta));
+    assert_eq!(h.shape(), (model.n_eta, model.n_eta));
+    // Same jet the terminal Jacobian path already used, so swapping it in changes nothing.
+    let light = crate::sens::provider::subject_eta_jacobian(&model, &subject, &params.theta, &eta)
+        .map(|j| DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &j))
+        .expect("light Jacobian in scope");
+    assert_relative_eq!(jac, light, epsilon = 1e-12);
+
+    // `gradient = fd`: the anchor's FD sweep is what the user asked for.
+    model.gradient_method = crate::types::GradientMethod::Fd;
+    assert!(!crate::estimation::agq::analytic_score_supported(&model));
+    assert!(
+        analytic_terminal_work(&model, &subject, params, &eta).is_none(),
+        "gradient = fd must not retain a provider Hessian"
+    );
+
+    // A non-Gaussian endpoint on the same PK model: the anchor is the FD Hessian of the full
+    // conditional NLL, hazard curvature included, even for a subject with no event records.
+    #[cfg(feature = "survival")]
+    {
+        let joint = crate::parser::model_parser::parse_model_string(
+            "[parameters]
+  theta TVCL(0.2,0.001,10.0)
+  theta TVV(10.0,0.1,500.0)
+  theta TVKA(1.5,0.01,50.0)
+  theta TVLAMBDA(0.05,0.001,5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  LAMBDA = TVLAMBDA * exp(ETA_CL)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[event_model]
+  cmt = 2
+  family = exponential
+  scale = LAMBDA
+[fit_options]
+  method = laplace
+",
+        )
+        .expect("parse joint PK-TTE model");
+        assert!(joint.has_tte() && !crate::estimation::agq::analytic_score_supported(&joint));
+        let joint_params = &joint.default_params;
+        assert!(
+            crate::sens::provider::subject_sensitivities(
+                &joint,
+                &subject,
+                &joint_params.theta,
+                &eta
+            )
+            .is_some(),
+            "test premise: the provider itself serves the PK part, so only the gate declines"
+        );
+        assert!(
+            analytic_terminal_work(&joint, &subject, joint_params, &eta).is_none(),
+            "a non-Gaussian model must not retain a Gaussian-only Hessian"
+        );
+    }
+}
+
+/// The stage seed is a pure function of the stage's options — no process state, so two
+/// concurrent fits cannot flip each other's seed and a post-fit `predict()` cannot inherit one.
+/// Pins the mapping: one-node Laplace → exact; any multi-node quadrature (either anchor) →
+/// Gauss–Newton; the FO family → Gauss–Newton; everything else (SAEM, Bayes, VI, …) → none.
+#[test]
+fn inner_hessian_seed_is_a_pure_function_of_the_stage_options() {
+    use crate::types::{EstimationMethod, FitOptions};
+    let seed = |method: EstimationMethod, n_agq: usize| {
+        InnerHessianSeed::for_options(&FitOptions {
+            method,
+            n_agq,
+            ..FitOptions::default()
+        })
+    };
+    assert_eq!(seed(EstimationMethod::Laplace, 1), InnerHessianSeed::Exact);
+    assert_eq!(
+        seed(EstimationMethod::Laplace, 3),
+        InnerHessianSeed::GaussNewton
+    );
+    assert_eq!(
+        seed(EstimationMethod::FoceI, 3),
+        InnerHessianSeed::GaussNewton
+    );
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+    ] {
+        assert_eq!(seed(m, 1), InnerHessianSeed::GaussNewton, "{m:?}");
+    }
+    assert_eq!(seed(EstimationMethod::Saem, 1), InnerHessianSeed::None);
+    assert_eq!(InnerSolvePolicy::default().seed, InnerHessianSeed::None);
+    assert!(!InnerSolvePolicy::default().capture_terminal_hessian);
+}
+
+#[test]
 fn test_inner_loop_stats_min_obs_filter() {
     // min_obs filter: subjects with fewer obs than min_obs are excluded
     // from n_unconverged count. We exercise this logic by constructing
@@ -1433,6 +1699,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            terminal_hessian: None,
             converged: false, // unconverged
             used_fallback: false,
             grad_norm: 0.0,
@@ -1443,6 +1710,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            terminal_hessian: None,
             converged: false, // also unconverged
             used_fallback: true,
             grad_norm: 0.0,
@@ -1474,6 +1742,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
     let make = |hard_reject: bool| EbeResult {
         eta: nalgebra::DVector::zeros(1),
         h_matrix: nalgebra::DMatrix::zeros(1, 1),
+        terminal_hessian: None,
         converged: false,
         used_fallback: false,
         grad_norm: 0.0,
@@ -1814,14 +2083,10 @@ fn weakly_identified_coords_skips_fixed_and_nonfinite() {
     assert_eq!(flags_bad, vec![false, false]);
 }
 
-/// No-regression: a well-identified, unimodal subject (no resets / TV-covariates)
-/// must return a bit-identical EBE with the guarded multi-start on
-/// (`inner_restarts = 3`) and off (`inner_restarts = 0`). The #891 probe may scan
-/// weakly-informed coordinates, but every alternate seed reconverges to the same
-/// basin and is rejected by the `+1e-9` improvement guard, so the returned η̂ and
-/// its objective are unchanged — the added cost buys no spurious mode change.
-#[test]
-fn inner_restarts_bit_identical_on_wellidentified_subject() {
+/// One-compartment oral fixture with six informative observations across the profile, so
+/// every η is well identified and the light seed path (`analytic_inner_seed_hessian`) is in
+/// scope. Shared by the restart, seed and fused-gradient tests below.
+fn wellidentified_oral_fixture() -> (CompiledModel, Subject) {
     use crate::types::{DoseEvent, Subject};
     use std::collections::HashMap;
     let model = crate::parser::model_parser::parse_model_string(
@@ -1857,6 +2122,85 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
         "test premise: subject must exercise the #891 (non reset/TV) probe path"
     );
 
+    (model, subject)
+}
+
+/// The light FO-family seed fuses the first BFGS gradient with the Gauss–Newton metric in one
+/// first-order provider pass. Both halves are pinned against the paths they replace: the
+/// fused gradient must be bit-identical to `analytic_eta_nll_gradient` (the gradient every
+/// later step uses), and the metric must equal the full provider's `htilde`. The exact
+/// (Laplace) seed is the full provider's `h_inner` and carries no fused gradient.
+#[test]
+fn light_seed_matches_full_provider_and_fuses_the_ordinary_gradient() {
+    let (model, subject) = wellidentified_oral_fixture();
+    let params = &model.default_params;
+    let eta0 = vec![0.0; model.n_eta];
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let (light_seed, light_gradient) = analytic_inner_seed_hessian(
+        &model,
+        &subject,
+        params,
+        &eta0,
+        None,
+        None,
+        &err_keys,
+        &mut Vec::new(),
+        false,
+    )
+    .expect("fixture supports the light seed");
+    let ordinary_gradient = analytic_eta_nll_gradient(
+        &model,
+        &subject,
+        &params.theta,
+        &eta0,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .expect("fixture supports the ordinary gradient");
+    assert_eq!(
+        light_gradient.expect("light path fuses the gradient"),
+        ordinary_gradient
+    );
+    let full_sens =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta0)
+            .expect("fixture supports full sensitivities");
+    let full_core = crate::estimation::sens_outer_gradient::score_core(
+        &model,
+        &subject,
+        params,
+        &full_sens,
+        model.n_eta,
+        &params.omega.inv,
+        &eta0,
+        None,
+    )
+    .expect("fixture supports full score");
+    assert_relative_eq!(light_seed, full_core.htilde, epsilon = 1e-12);
+    let (exact_seed, exact_gradient) = analytic_inner_seed_hessian(
+        &model,
+        &subject,
+        params,
+        &eta0,
+        None,
+        None,
+        &err_keys,
+        &mut Vec::new(),
+        true,
+    )
+    .expect("fixture supports the exact Laplace seed");
+    assert_eq!(exact_gradient, None);
+    assert_eq!(exact_seed, full_core.h_inner);
+}
+
+/// No-regression: a well-identified, unimodal subject (no resets / TV-covariates)
+/// must return a bit-identical EBE with the guarded multi-start on
+/// (`inner_restarts = 3`) and off (`inner_restarts = 0`). The #891 probe may scan
+/// weakly-informed coordinates, but every alternate seed reconverges to the same
+/// basin and is rejected by the `+1e-9` improvement guard, so the returned η̂ and
+/// its objective are unchanged — the added cost buys no spurious mode change.
+#[test]
+fn inner_restarts_bit_identical_on_wellidentified_subject() {
+    let (model, subject) = wellidentified_oral_fixture();
     let params = &model.default_params;
     let off = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 0);
     let on = find_ebe(&model, &subject, params, 100, 1e-8, None, None, 3);
@@ -2016,7 +2360,7 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
 
 /// A subject with an `EVID 3/4` reset makes `cacheable_schedule` return `Some`; a plain
 /// subject with neither a reset nor a time-varying covariate makes it return `None` (see
-/// `cacheable_schedule`'s guard). `run_inner_loop_warm_cached` must produce results
+/// `cacheable_schedule`'s guard). `run_inner_loop_warm_map_cached` must produce results
 /// bit-identical to the uncached `run_inner_loop_warm` in both cases — including when
 /// `build_schedule_cache`'s per-subject `Some`/`None` entries are mixed in the same
 /// population, which is the scenario that would expose an index misalignment between the
@@ -2101,7 +2445,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
     assert!(schedules[3].is_some());
 
     let uncached = run_inner_loop_warm(&model, &population, params, 50, 1e-8, None, None, 0, 0);
-    let cached = run_inner_loop_warm_cached(
+    let cached = run_inner_loop_warm_map_cached(
         &model,
         &population,
         params,
@@ -2112,6 +2456,8 @@ fn cached_schedule_inner_loop_matches_uncached() {
         0,
         0,
         &schedules,
+        InnerSolvePolicy::default(),
+        |_, _| (),
     );
 
     for i in 0..population.subjects.len() {
