@@ -2432,6 +2432,9 @@ pub ferx_core::types::RateMode::ModeledRate
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
+pub enum ferx_core::types::SaemMstepSolver
+pub ferx_core::types::SaemMstepSolver::Bobyqa
+pub ferx_core::types::SaemMstepSolver::ScoreSa
 pub enum ferx_core::types::ScaleAdaptation
 pub ferx_core::types::ScaleAdaptation::Interval
 pub ferx_core::types::ScaleAdaptation::RobbinsMonro
@@ -2915,6 +2918,8 @@ pub ferx_core::types::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::types::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::types::FitOptions::saem_conddist_nsamp: usize
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
+pub ferx_core::types::FitOptions::saem_mstep_draws: usize
+pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
 pub ferx_core::types::FitOptions::saem_n_convergence: usize
 pub ferx_core::types::FitOptions::saem_n_exploration: usize
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
@@ -3753,6 +3758,9 @@ pub ferx_core::RateMode::ModeledRate
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
+pub enum ferx_core::SaemMstepSolver
+pub ferx_core::SaemMstepSolver::Bobyqa
+pub ferx_core::SaemMstepSolver::ScoreSa
 pub enum ferx_core::ScaleAdaptation
 pub ferx_core::ScaleAdaptation::Interval
 pub ferx_core::ScaleAdaptation::RobbinsMonro
@@ -4360,6 +4368,8 @@ pub ferx_core::FitOptions::saem_conddist_burnin: usize
 pub ferx_core::FitOptions::saem_conddist_keep_samples: bool
 pub ferx_core::FitOptions::saem_conddist_nsamp: usize
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
+pub ferx_core::FitOptions::saem_mstep_draws: usize
+pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
 pub ferx_core::FitOptions::saem_n_convergence: usize
 pub ferx_core::FitOptions::saem_n_exploration: usize
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
