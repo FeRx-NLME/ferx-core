@@ -3799,6 +3799,51 @@ fn test_apply_fit_option_known_applies() {
     assert_eq!(opts.saem_omega_burnin, 30);
 }
 
+/// `n_mh_steps` takes a count or the word `auto` (#1459), which is the default
+/// and is stored as the `SAEM_N_MH_STEPS_AUTO` sentinel for
+/// `estimation::saem::resolve_n_mh_steps` to expand against the dataset.
+///
+/// The spelling matters beyond this crate: `apply_fit_option` is what the R
+/// wrapper's `settings` argument goes through, so `settings = list(n_mh_steps
+/// = "auto")` has to reach the same place a model file's `n_mh_steps = auto`
+/// does.
+#[test]
+fn test_n_mh_steps_accepts_auto_and_a_count() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_n_mh_steps,
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        "the default is the sentinel"
+    );
+
+    assert_eq!(apply_fit_option(&mut opts, "n_mh_steps", "12"), Ok(true));
+    assert_eq!(
+        opts.saem_n_mh_steps, 12,
+        "an explicit count is stored as-is"
+    );
+
+    for spelling in ["auto", "AUTO", "Auto"] {
+        assert_eq!(
+            apply_fit_option(&mut opts, "n_mh_steps", spelling),
+            Ok(true)
+        );
+        assert_eq!(
+            opts.saem_n_mh_steps,
+            crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+            "`{spelling}` must reach the sentinel"
+        );
+        // Put it back to a count so the next spelling has to move it again —
+        // otherwise every iteration after the first would pass on the value
+        // the previous one left behind.
+        opts.saem_n_mh_steps = 12;
+    }
+
+    assert!(
+        apply_fit_option(&mut opts, "n_mh_steps", "sometimes").is_err(),
+        "a word that is not `auto` is still a parse error, not a silent 0"
+    );
+}
+
 /// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
 /// so the calibrated constant applies, and rejects anything outside `(0, 1]` —
 /// `1.0` is the documented "off" value and must stay accepted.
@@ -3843,6 +3888,75 @@ fn test_mstep_damping_round_trips_and_validates() {
     assert!(err.contains("`saem_mstep_damping`"), "got: {err}");
     // A rejected value must not have clobbered the last good one.
     assert_eq!(opts.saem_mstep_damping, Some(1.0));
+}
+
+/// `mstep_solver` and `mstep_draws` (#1458) round-trip under both spellings,
+/// default to the historical single-draw maximiser, and reject what they cannot
+/// act on.
+#[test]
+fn test_mstep_solver_and_draws_round_trip_and_validate() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::Bobyqa,
+        "the default must stay the historical solver"
+    );
+    assert_eq!(opts.saem_mstep_draws, 1, "the default must stay one draw");
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_solver", "score_sa"),
+        Ok(true)
+    );
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::ScoreSa
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_solver", "BOBYQA"),
+        Ok(true)
+    );
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::Bobyqa
+    );
+    let err = apply_fit_option(&mut opts, "mstep_solver", "newton")
+        .expect_err("an unknown solver must be rejected");
+    assert!(err.contains("bobyqa/score_sa"), "got: {err}");
+    assert!(err.contains("newton"), "value not echoed, got: {err}");
+
+    assert_eq!(apply_fit_option(&mut opts, "mstep_draws", "3"), Ok(true));
+    assert_eq!(opts.saem_mstep_draws, 3);
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_draws", "1"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_draws, 1);
+    let err =
+        apply_fit_option(&mut opts, "mstep_draws", "0").expect_err("zero draws must be rejected");
+    assert!(err.contains("at least 1"), "got: {err}");
+    // A rejected value must not have clobbered the last good one.
+    assert_eq!(opts.saem_mstep_draws, 1);
+}
+
+/// Both keys are advertised as SAEM-specific, so using them under FOCEI warns
+/// rather than silently doing nothing.
+#[test]
+fn test_mstep_solver_and_draws_under_focei_warn() {
+    let opts = parse_fit_options(&[
+        "method = focei".to_string(),
+        "mstep_solver = score_sa".to_string(),
+        "mstep_draws = 2".to_string(),
+    ])
+    .unwrap();
+    let warnings = opts.unsupported_keys_warnings();
+    assert!(
+        warnings.iter().any(|w| w.contains("mstep_solver")),
+        "mstep_solver under FOCEI must warn: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("mstep_draws")),
+        "mstep_draws under FOCEI must warn: {warnings:?}"
+    );
 }
 
 /// The key is advertised as SAEM-specific, so using it under FOCEI warns rather

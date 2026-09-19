@@ -354,31 +354,40 @@ pub fn gam_screen_raw(
         .map(|((&name, &vals), &kind)| (name, vals, kind))
         .collect();
 
-    let results_and_warnings: Vec<(EtaGamResult, Vec<String>)> = eta_names
-        .par_iter()
-        .zip(eta_cols.par_iter())
-        .zip(shrinkage.par_iter())
-        .map(|((&eta_name, &eta_vals), &shrink)| {
-            let mut eta_warnings = Vec::new();
-            if let Some(w) = shrinkage_warning(eta_name, shrink, opts.shrinkage_warn_threshold) {
-                eta_warnings.push(w);
-            }
-            let (aic_null, covariate_scores, screen_warnings) =
-                screen_eta_raw(eta_vals, &cov_refs, opts);
-            eta_warnings.extend(
-                screen_warnings
-                    .into_iter()
-                    .map(|w| format!("{eta_name}: {w}")),
-            );
-            let result = EtaGamResult {
-                eta_name: eta_name.to_string(),
-                shrinkage: shrink,
-                aic_null,
-                covariate_scores,
-            };
-            (result, eta_warnings)
-        })
-        .collect();
+    // On the engine's pool, not the ambient one: screening is reached from a CLI or a
+    // script *outside* any fit, and a bare `par_iter` there runs on Rayon's global pool —
+    // one worker per logical CPU, whatever `--threads` said (#1460). Inside a fit or a
+    // tool's replicate pool this is a no-op and the enclosing budget is kept.
+    let results_and_warnings: Vec<(EtaGamResult, Vec<String>)> =
+        ferx_core::install_on_engine_pool(|| {
+            eta_names
+                .par_iter()
+                .zip(eta_cols.par_iter())
+                .zip(shrinkage.par_iter())
+                .map(|((&eta_name, &eta_vals), &shrink)| {
+                    let mut eta_warnings = Vec::new();
+                    if let Some(w) =
+                        shrinkage_warning(eta_name, shrink, opts.shrinkage_warn_threshold)
+                    {
+                        eta_warnings.push(w);
+                    }
+                    let (aic_null, covariate_scores, screen_warnings) =
+                        screen_eta_raw(eta_vals, &cov_refs, opts);
+                    eta_warnings.extend(
+                        screen_warnings
+                            .into_iter()
+                            .map(|w| format!("{eta_name}: {w}")),
+                    );
+                    let result = EtaGamResult {
+                        eta_name: eta_name.to_string(),
+                        shrinkage: shrink,
+                        aic_null,
+                        covariate_scores,
+                    };
+                    (result, eta_warnings)
+                })
+                .collect()
+        });
 
     let mut eta_results = Vec::with_capacity(results_and_warnings.len());
     let mut warnings = Vec::new();

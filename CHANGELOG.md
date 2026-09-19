@@ -20,6 +20,24 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **SAEM: two opt-in estimators for the numerical θ/σ M-step that remove or shrink its
+  Jensen bias (`mstep_solver = score_sa`, `mstep_draws = K`).** A θ with no ETA is moved
+  only by the η-frozen numerical M-step, which adopts the *maximiser* at each iteration's
+  single η draw — a nonlinear function of that draw, so the recursion converges to
+  `E[θ*(η)]` rather than to the maximiser of `E[Q(θ, η)]`, and the gap grows when the
+  E-step mixes *better*. On the busulfan benchmark (600 subjects, 6 seeds, IS −2 log L)
+  freeing such a θ costs **+9.75** under the default solver and **+3.37** under
+  `score_sa`, at the same CPU. Both are off by default, bit-identical to before when
+  unset, and restricted to the plain Gaussian residual scope — see the
+  [SAEM docs](docs/estimation/saem.qmd) for the recursion, the scope and the full
+  measurement (#1458).
+
+- **`install_on_engine_pool(f)`** runs population-wide parallel work that is not a `fit()`
+  on the engine's worker pool instead of Rayon's process-global one. This is what makes a
+  declared thread count reach GAM screening and the other standalone parallel entry points;
+  a tool built on ferx-core (the `ferx-tools` GAM screener is the first caller) wraps its
+  `par_iter` in it, and work already running on a worker is left there rather than nesting
+  a second pool ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
@@ -170,6 +188,23 @@ section of the SDLC for the versioning policy).
   both settings.
 
 ### Changed
+
+- **SAEM's `n_mh_steps` default is now `auto`, sized from the dataset instead of a flat
+  20 (#1459).** The block-MH proposal count per subject per iteration is resolved as
+  `2.5 × observations per subject per random effect`, clamped to `[6, 20]`, and the
+  componentwise sweep count is derived from the resolved value exactly as before. A
+  dataset dense enough to reach the cap — the Emax PKPD benchmark the old default was
+  calibrated on has 8 observations per η — keeps the historical 20 and fits unchanged;
+  a sparse population gets 6 or 7. On four real datasets (cefepime 458 subjects,
+  vancomycin 100, busulfan 600, pembrolizumab 303) six seeds could not distinguish the
+  resolved count from 20 on the importance-sampled −2 log L or on final-estimate
+  distance, for **29–41 % less CPU** in the SAEM stage. The rule is a function of the
+  data only, so a fit stays reproducible; `verbose` prints the resolved count and its
+  source. Set an explicit `n_mh_steps = <n>` to override it, and raise it if the
+  acceptance diagnostic reports a chain far from target. `method = bayes` reads the same
+  option but **not** the rule: under `auto` its η block keeps the historical fixed 20,
+  since the rule is calibrated on SAEM quantities and on a kernel that sampler does not
+  run.
 
 - **ferx no longer recommends `[diffusion]` as a remedy for residual autocorrelation.** The IWRES
   Durbin-Watson warning has dropped its "For ODE models, SDE process noise may also help" suffix,
@@ -407,6 +442,40 @@ section of the SDLC for the versioning policy).
   including `RAYON_NUM_THREADS` and caller-configured pools (#1330).
 
 ### Performance
+
+- **`ferx --threads N` now holds `N` worker threads, not `2N`.** The flag sized Rayon's
+  process-global pool *and* the fit then leased a separate `N`-worker pool of its own —
+  the one carrying the 32 MiB stacks wide analytic gradients need — so the global `N`
+  never received any work. Per-thread profiles of a `--threads 2` SAEM fit measured the
+  two fit-pool workers at 85–99% busy and the two global-pool threads at 0.0% for the
+  whole run; measured end to end, a `--threads 2` run drops from 5 live OS threads to 3
+  (main + 2 workers). Nothing about the fit itself changes — same estimates, same
+  `n_threads_used` — but a shared machine or a CPU-quota'd container is no longer charged
+  for twice the threads you asked for, `N × 2 MiB` of worker stack is no longer reserved
+  for nothing, and a whole-process profile of a ferx run stops reporting idle-thread wait
+  as if it were estimator headroom. `configure_global_thread_pool(n)` (the library entry
+  point behind the flag) accordingly no longer builds Rayon's global pool: it declares the
+  worker count ferx's own pools are sized from, it is once-per-process (a second, differing
+  count is an error rather than a silently ignored one), and **parallel work that is not a
+  `fit()` now honours it too** — GAM covariate screening, standalone `run_sir` /
+  `run_covariance`, the NCA initial-estimate pass and `npde`. Those ran on Rayon's global
+  pool, i.e. one worker per logical CPU: on a 15-core host `ferx gam --threads 2` screened
+  15 wide. They now run on the engine's pool at the requested width
+  ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
+
+- **Laplace reuses its exact-anchor sensitivity jet when differentiating the EBE mode.**
+  The same jet already needed for the Hessian derivative now also supplies
+  `dη̂/dx`, eliminating one full sensitivity traversal per subject-gradient
+  evaluation. This removes 9.9% of provider calls and lowers median CPU by 2.2–3.0%
+  across diagonal-Ω, block-Ω, and ODE fixtures without changing the objective or
+  gradient (#1469).
+
+- **One-node Laplace no longer repeats work already completed at the EBE mode.**
+  Fused objective/gradient evaluations avoid capturing an exact terminal Hessian that
+  the analytic gradient must rebuild together with its sensitivity jet, and the sole
+  quadrature node reuses the converged mode NLL. Across diagonal-Ω, block-Ω, and ODE
+  fixtures this removes 9% of full sensitivity-provider calls and improves median wall
+  time by 5.6–11.9%, without changing the objective or gradient (#1463).
 
 - **SAEM: the E-step and M-step stop redoing η-independent work on every MH proposal.**
   Three changes, all of them internal and all of them bit-identical — the same fit, the

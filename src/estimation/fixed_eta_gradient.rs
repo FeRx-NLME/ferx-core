@@ -434,6 +434,105 @@ pub(crate) fn obs_nll_subject_grad(
     n_sigma: usize,
     pk_scratch: &mut EventPkParams,
 ) -> (f64, Vec<f64>) {
+    let (nll, grad, _) = obs_nll_subject_grad_impl(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+        theta_packs_log_mask,
+        lower,
+        upper,
+        n_theta,
+        n_sigma,
+        pk_scratch,
+        false,
+    );
+    (nll, grad)
+}
+
+/// [`obs_nll_subject_grad`] plus the **expected (Fisher) information** of the
+/// same frozen-η objective in the same packed coordinates, row-major `n × n`
+/// (#1458).
+///
+/// For the Gaussian observation model with `y_j ~ N(f_j(x), V_j(x))` at fixed η,
+///
+/// ```text
+/// I_ab = Σ_j [ (∂f_j/∂x_a)(∂f_j/∂x_b) / V_j
+///              + ½ (∂V_j/∂x_a)(∂V_j/∂x_b) / V_j² ]
+/// ```
+///
+/// which is `E[∂²(−log L)/∂x_a∂x_b]` for that subject — positive semi-definite
+/// by construction, unlike the observed Hessian, which is what makes it usable
+/// as the curvature of a Newton step taken on a *stochastically averaged* score
+/// (`mstep_solver = score_sa`; see `estimation::saem`).
+///
+/// `∂f_j/∂x_a` reuses the same forward-FD prediction difference the θ gradient
+/// already pays for, and `∂V_j/∂x_a` is `dV/df · ∂f_j/∂x_a` on the θ block and
+/// the analytic `dvar_dlogsigma` on the σ block, so the information costs no
+/// extra prediction calls over the gradient.
+///
+/// **Returns `None` for the information** — the gradient is still exact —
+/// whenever this subject is outside that closed form:
+///
+/// * an M3, TTE, or dense-residual-covariance model (the whole-NLL FD path,
+///   which never forms per-observation prediction derivatives);
+/// * a `[covariate_nn]` θ assembled by [`NnGradPlan`] (its θ derivatives come
+///   from output-space differences, not per-observation ones);
+/// * a residual **magnitude** (`#484`/`#1029`) or FREM covariate rows, where θ
+///   reaches `V` through a second channel this formula does not carry.
+///
+/// A `None` here is what the caller's scope gate turns into a documented
+/// fallback to the derivative-free M-step rather than a silently wrong step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obs_nll_subject_grad_fisher(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut EventPkParams,
+) -> (f64, Vec<f64>, Option<Vec<f64>>) {
+    obs_nll_subject_grad_impl(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+        theta_packs_log_mask,
+        lower,
+        upper,
+        n_theta,
+        n_sigma,
+        pk_scratch,
+        true,
+    )
+}
+
+/// The one body behind [`obs_nll_subject_grad`] and
+/// [`obs_nll_subject_grad_fisher`]. `want_fisher` only *adds* the information
+/// block; with it `false` the returned `(nll, grad)` is bit-identical to what
+/// this function has always returned.
+#[allow(clippy::too_many_arguments)]
+fn obs_nll_subject_grad_impl(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut EventPkParams,
+    want_fisher: bool,
+) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     let fd_all =
         matches!(model.bloq_method, BloqMethod::M3) || !model.residual_correlations.is_empty();
@@ -519,7 +618,9 @@ pub(crate) fn obs_nll_subject_grad(
                 &mut grad,
             );
         }
-        return (nll_base, grad);
+        // The whole-NLL FD path never forms a per-observation prediction
+        // derivative, so there is nothing to build the information from.
+        return (nll_base, grad, None);
     }
 
     // Non-M3 path.
@@ -554,6 +655,9 @@ pub(crate) fn obs_nll_subject_grad(
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
     let mut obs_var_scale = vec![1.0f64; n_obs];
+    // `dV_j/df_j`, kept per observation only for the expected information
+    // (#1458): the gradient itself folds it into `d_nll_d_f` on the spot.
+    let mut dv_df_obs = vec![0.0f64; if want_fisher { n_obs } else { 0 }];
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
@@ -579,6 +683,9 @@ pub(crate) fn obs_nll_subject_grad(
             (None, None) => model.error_spec.dvar_df(cmt, f, sigma_values) * s,
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+        if want_fisher {
+            dv_df_obs[j] = dv_df;
+        }
     }
 
     let mut grad = vec![0.0f64; n];
@@ -591,6 +698,18 @@ pub(crate) fn obs_nll_subject_grad(
 
     // Theta gradient: forward-FD of predictions, chain rule through obs_nll.
     let h_fd = 1e-5;
+    // Is the expected information (#1458) in scope for this subject? The closed
+    // form needs a per-observation `∂f_j/∂x_a`, and the three cases below either
+    // never form one (`NnGradPlan` differences in output space) or would need a
+    // second `∂V/∂θ` channel this formula does not carry (a residual magnitude,
+    // FREM covariate rows). The *gradient* is exact in all of them — only the
+    // information is withheld, and the caller's gate turns that into a
+    // documented fallback rather than a wrong Newton step.
+    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none() && frem_ov.is_none();
+    // `∂f_j/∂x_a` in PACKED coordinates, per free θ coordinate. Empty for a
+    // pinned coordinate, for every σ coordinate (predictions do not depend on
+    // σ), and for the whole subject when the information is out of scope.
+    let mut df_packed: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
     let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
         let delta = sign * h_fd * (1.0 + theta[i].abs());
         let mut theta_p = theta.to_vec();
@@ -633,6 +752,33 @@ pub(crate) fn obs_nll_subject_grad(
         if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
             continue;
         }
+        if fisher_ok {
+            // Same forward difference, kept per observation instead of
+            // contracted on the spot: the packed `∂f_j/∂x_i` is what both the
+            // gradient and the information are built from, so there is one FD
+            // and one prediction call here as before.
+            let delta = h_fd * (1.0 + theta[i].abs());
+            let mut theta_p = theta.to_vec();
+            theta_p[i] += delta;
+            let preds_p = crate::pk::compute_predictions_with_tv_into(
+                model, subject, &theta_p, eta, pk_scratch,
+            );
+            let pack = if theta_packs_log_mask[i] {
+                theta[i]
+            } else {
+                1.0
+            };
+            let mut dfi = vec![0.0f64; n_obs];
+            let mut g = 0.0f64;
+            for j in 0..n_obs {
+                let d = pack * (preds_p[j] - preds_base[j]) / delta;
+                dfi[j] = d;
+                g += d_nll_d_f[j] * d;
+            }
+            grad[i] = g;
+            df_packed[i] = dfi;
+            continue;
+        }
         let d_obs_nll = signed_theta_deriv(i, 1.0, pk_scratch);
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
@@ -652,6 +798,9 @@ pub(crate) fn obs_nll_subject_grad(
         );
     }
 
+    // `∂V_j/∂(log σ_k)` per free σ coordinate, kept for the information only.
+    let mut dv_dlogsigma: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
+
     // Sigma gradient: analytical.
     // d(obs_nll)/d(log_sigma_k) = Σ_j 0.5 * ratio_jk * (1/V_j - resid_j²/V_j²)
     // where ratio_jk = sigma_k * dV_j/d_sigma_k.
@@ -660,30 +809,93 @@ pub(crate) fn obs_nll_subject_grad(
         if lower[i] == upper[i] {
             continue;
         }
-        let g: f64 = (0..n_obs)
-            .map(|j| {
-                let f = model.floor_prediction(preds_base[j]);
+        // ratio = d(V_j)/d(log sigma_k); zero unless sigma_k enters obs j's
+        // endpoint (so per-CMT each sigma sums only over its own endpoint's
+        // observations). The #484/#1029 magnitude rides slot k's loading,
+        // scaling this derivative by m_k².
+        let ratio_at = |j: usize| -> f64 {
+            let f = model.floor_prediction(preds_base[j]);
+            match ruv_mult.as_ref().map(|m| m[j].as_slice()) {
+                Some(m) => {
+                    model
+                        .error_spec
+                        .dvar_dlogsigma_scaled(err_keys[j], k, f, sigma_values, m)
+                }
+                None => model
+                    .error_spec
+                    .dvar_dlogsigma(err_keys[j], k, f, sigma_values),
+            }
+        };
+        if fisher_ok {
+            let mut dvi = vec![0.0f64; n_obs];
+            let mut g = 0.0f64;
+            for j in 0..n_obs {
                 let v = variances[j];
                 let resid = residuals[j];
-                // ratio = d(V_j)/d(log sigma_k); zero unless sigma_k enters
-                // obs j's endpoint (so per-CMT each sigma sums only over its
-                // own endpoint's observations). The #484/#1029 magnitude rides
-                // slot k's loading, scaling this derivative by m_k².
-                let ratio = match ruv_mult.as_ref().map(|m| m[j].as_slice()) {
-                    Some(m) => {
-                        model
-                            .error_spec
-                            .dvar_dlogsigma_scaled(err_keys[j], k, f, sigma_values, m)
-                    }
-                    None => model
-                        .error_spec
-                        .dvar_dlogsigma(err_keys[j], k, f, sigma_values),
-                } * obs_var_scale[j];
+                let ratio = ratio_at(j) * obs_var_scale[j];
+                dvi[j] = ratio;
+                g += 0.5 * ratio * (1.0 / v - resid * resid / (v * v));
+            }
+            grad[i] = g;
+            dv_dlogsigma[i] = dvi;
+            continue;
+        }
+        let g: f64 = (0..n_obs)
+            .map(|j| {
+                let v = variances[j];
+                let resid = residuals[j];
+                let ratio = ratio_at(j) * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
         grad[i] = g;
     }
 
-    (nll_base, grad)
+    if !fisher_ok {
+        return (nll_base, grad, None);
+    }
+
+    // I_ab = Σ_j [ (∂f_j/∂a)(∂f_j/∂b)/V_j + ½ (∂V_j/∂a)(∂V_j/∂b)/V_j² ], with
+    // ∂V_j/∂θ_a = (dV_j/df_j)·(∂f_j/∂θ_a) and ∂V_j/∂(log σ_k) the analytic
+    // `dvar_dlogsigma` above. Symmetric and PSD by construction; a pinned
+    // coordinate keeps an all-zero row and column, which is what the caller's
+    // linear solve drops.
+    let mut fisher = vec![0.0f64; n * n];
+    // ∂V_j/∂x_a for every coordinate, so the σ and θ blocks assemble alike.
+    let dv: Vec<Vec<f64>> = (0..n)
+        .map(|a| {
+            if a < n_theta {
+                if df_packed[a].is_empty() {
+                    Vec::new()
+                } else {
+                    (0..n_obs).map(|j| dv_df_obs[j] * df_packed[a][j]).collect()
+                }
+            } else {
+                dv_dlogsigma[a].clone()
+            }
+        })
+        .collect();
+    for a in 0..n {
+        let fa = df_packed.get(a).map(|v| v.as_slice()).unwrap_or(&[]);
+        for b in a..n {
+            let fb = df_packed.get(b).map(|v| v.as_slice()).unwrap_or(&[]);
+            let mut acc = 0.0f64;
+            for j in 0..n_obs {
+                let v = variances[j];
+                let mean_term = match (fa.get(j), fb.get(j)) {
+                    (Some(&x), Some(&y)) => x * y / v,
+                    _ => 0.0,
+                };
+                let var_term = match (dv[a].get(j), dv[b].get(j)) {
+                    (Some(&x), Some(&y)) => 0.5 * x * y / (v * v),
+                    _ => 0.0,
+                };
+                acc += mean_term + var_term;
+            }
+            fisher[a * n + b] = acc;
+            fisher[b * n + a] = acc;
+        }
+    }
+
+    (nll_base, grad, Some(fisher))
 }

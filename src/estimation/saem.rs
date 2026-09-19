@@ -620,6 +620,548 @@ fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
     }
 }
 
+/// Is the frozen-η M-step objective of this fit inside the plain Gaussian scope
+/// that the expected information ([`MstepScoreSa`]) and the K-draw objective are
+/// defined on? `None` means yes; `Some(reason)` is a phrase for the warning that
+/// names why the fit keeps the historical single-draw solver (#1458).
+///
+/// The list is deliberately *structural* — a property of the model text, not of
+/// a particular subject — so the decision is made once per run and the answer
+/// cannot change halfway through. The per-subject routine
+/// [`crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher`] has the
+/// matching per-subject gate, and disagreement between the two is what
+/// `MstepScoreSa::out_of_scope` counts.
+///
+/// Why each entry is out of scope:
+///
+/// * **IOV** and **mixture** — the objective is conditioned on a κ draw / a hard
+///   class draw as well as on η, and neither the stored-draw bookkeeping nor the
+///   information block has been derived for them.
+/// * **M3**, a **TTE endpoint**, and a **`block_sigma` residual correlation** —
+///   the per-subject gradient takes the whole-NLL finite-difference path there
+///   and never forms a per-observation prediction derivative.
+/// * **`[covariate_nn]`** — its θ derivatives are assembled in output space.
+/// * a **residual magnitude** (#484/#1029) and **FREM** — θ reaches the residual
+///   variance through a channel the closed form does not carry.
+fn numerical_mstep_scope_gap(
+    model: &CompiledModel,
+    n_kappa: usize,
+    is_mixture: bool,
+) -> Option<&'static str> {
+    if n_kappa > 0 {
+        return Some("the model has IOV");
+    }
+    if is_mixture {
+        return Some("the model is a mixture");
+    }
+    if matches!(model.bloq_method, BloqMethod::M3) {
+        return Some("the model uses M3 censoring");
+    }
+    if !model.residual_correlations.is_empty() {
+        return Some("the model has a correlated residual (`block_sigma`)");
+    }
+    #[cfg(feature = "survival")]
+    if !model.endpoints.is_empty() {
+        return Some("the model has a time-to-event endpoint");
+    }
+    #[cfg(feature = "nn")]
+    if !model.covariate_nns.is_empty() {
+        return Some("the model has a `[covariate_nn]` block");
+    }
+    if model.frem_config.is_some() {
+        return Some("the model is a FREM model");
+    }
+    if model.has_custom_ruv_magnitude() {
+        return Some("the residual error carries a magnitude term");
+    }
+    None
+}
+
+/// Apply the same re-centring a closed-form mu-reference shift makes to
+/// `state.etas` to the stored previous draws of the K-draw M-step objective
+/// (#1458).
+///
+/// The shift keeps `g(P_i) = g(TVP) + eta_i` after `log TVP` moves by `delta`,
+/// so a stored draw that is *not* shifted stops describing the individual
+/// parameters it was drawn for, and the averaged objective would then mix
+/// values of `P_i` from two different parameterisations. `draws` is empty on
+/// every default fit, so this is a no-op there.
+fn recentre_eta_draws(draws: &mut [Vec<Vec<f64>>], eta_idx: usize, delta: f64) {
+    if delta == 0.0 {
+        return;
+    }
+    for d in draws.iter_mut() {
+        for e in d.iter_mut() {
+            if eta_idx < e.len() {
+                e[eta_idx] -= delta;
+            }
+        }
+    }
+}
+
+/// [`recentre_eta_draws`] with a per-subject shift, for the covariate
+/// mu-reference groups of #619 whose mu depends on each subject's covariates.
+fn recentre_eta_draws_per_subject(draws: &mut [Vec<Vec<f64>>], eta_idx: usize, delta: &[f64]) {
+    for d in draws.iter_mut() {
+        for (i, e) in d.iter_mut().enumerate() {
+            match (delta.get(i), e.get_mut(eta_idx)) {
+                (Some(&dv), Some(ev)) if dv.is_finite() => *ev -= dv,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What the `mstep_solver` / `mstep_draws` options resolve to for this fit, and
+/// what to say about it (#1458).
+///
+/// Pure so it can be unit-tested: the alternative is logic that only runs
+/// inside `run_saem`, reachable only by a full fit, which is how the four
+/// warning strings below would otherwise go untested (and uncovered).
+///
+/// Returns `(use_score_sa, mstep_draws, warnings)`.
+fn resolve_mstep_options(
+    solver: SaemMstepSolver,
+    requested_draws: usize,
+    scope_gap: Option<&'static str>,
+) -> (bool, usize, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut use_score_sa = false;
+    if matches!(solver, SaemMstepSolver::ScoreSa) {
+        match scope_gap {
+            Some(reason) => warnings.push(format!(
+                "SAEM: `mstep_solver = score_sa` is not available for this model ({reason}), so \
+                 the numerical theta/sigma M-step keeps the single-draw derivative-free solver \
+                 (#1458)."
+            )),
+            None => use_score_sa = true,
+        }
+    }
+    // `score_sa` already averages over every past draw through its
+    // Robbins-Monro accumulator, so the two never stack.
+    let requested = requested_draws.max(1);
+    let draws = if requested > 1 && use_score_sa {
+        warnings.push(
+            "SAEM: `mstep_draws` is ignored under `mstep_solver = score_sa` — its \
+             Robbins-Monro average over the score and information already spans every past \
+             draw (#1458)."
+                .to_string(),
+        );
+        1
+    } else if requested > 1 {
+        match scope_gap {
+            Some(reason) => {
+                warnings.push(format!(
+                    "SAEM: `mstep_draws` is not available for this model ({reason}), so the \
+                     numerical theta/sigma M-step keeps the single-draw objective (#1458)."
+                ));
+                1
+            }
+            None => requested,
+        }
+    } else {
+        1
+    };
+    (use_score_sa, draws, warnings)
+}
+
+/// The end-of-run report for M-steps that did not move theta/sigma (#1458).
+///
+/// `None` when every M-step moved them. An M-step that silently did nothing is
+/// invisible in the trace — the objective is fine, the parameters simply stop
+/// being estimated — so every failure route is counted by reason and any of
+/// them is reported. Pure, for the same testability reason as
+/// [`resolve_mstep_options`].
+fn score_sa_failure_warning(
+    failures: [u64; MSTEP_SA_FAILURE_KINDS],
+    n_iter: usize,
+) -> Option<String> {
+    let total: u64 = failures.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let by_reason: Vec<String> = failures
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, &c)| format!("{c}x {}", MSTEP_SA_FAILURE_NAMES[i]))
+        .collect();
+    Some(format!(
+        "SAEM: `mstep_solver = score_sa` could not move theta/sigma on {} of {} M-step(s) — \
+         they were held at their previous values on those iterations ({}). Treat the \
+         numerically estimated theta and sigma as unconverged (#1458).",
+        total,
+        n_iter,
+        by_reason.join("; ")
+    ))
+}
+
+/// Levenberg-Marquardt ridge added to the SA-averaged information before it is
+/// inverted, as a fraction of that coordinate's own diagonal (#1458).
+///
+/// The averaged information is positive semi-definite by construction, not
+/// positive *definite*: a coordinate the data does not identify at the current
+/// draw contributes an all-but-zero row, and a Q/V2 ridge contributes a nearly
+/// singular 2x2 block. The ridge is relative rather than absolute so it is
+/// invariant to the packed scale of the coordinate, and small enough that a
+/// well-identified coordinate takes the full Newton step.
+const SCORE_SA_RIDGE: f64 = 1e-3;
+
+/// Absolute floor on a diagonal entry of the ridged information, in packed
+/// units. A coordinate whose information is exactly zero this iteration - every
+/// subject pinned it, or its prediction derivative underflowed - would otherwise
+/// make the solve singular; flooring the diagonal sends its step to (very
+/// nearly) zero instead, which is the right answer for a coordinate the data
+/// says nothing about.
+const SCORE_SA_INFO_FLOOR: f64 = 1e-10;
+
+/// Largest single Newton step in packed units, before the bound clamp.
+///
+/// This is a trust region, not damping: the SA average is what removes the
+/// Jensen bias, and capping the step per iteration would reintroduce the lag
+/// [`SIGMA_SA_MAX_STEP`] documents. It exists for the first few iterations,
+/// where the accumulated information is one draw old and a near-singular
+/// direction can propose a step of tens of log units. `0.5` is roughly a
+/// factor of 1.65 on a log-packed coordinate.
+const SCORE_SA_MAX_STEP: f64 = 0.5;
+
+/// Number of step halvings the finiteness guard may try before giving up on
+/// this iteration's Newton step and leaving theta/sigma where they were.
+const SCORE_SA_MAX_BACKTRACK: u32 = 3;
+
+/// Solve the **score equation** `E[grad Q(x, eta)] = 0` by stochastic
+/// approximation, preconditioned by the SA-averaged expected information
+/// (#1458).
+///
+/// # Why this is not the same estimator as the damped maximiser
+///
+/// [`theta_sigma_mstep_light`] returns the *maximiser* of the conditional
+/// objective at iteration `k`'s single eta draw, and the run then either
+/// assigns it (the default since #1415) or Robbins-Monro averages it
+/// ([`damp_mstep`]). Either way the quantity being averaged is a **nonlinear**
+/// function of the draw, so its average converges to `E[theta*(eta)]` and not
+/// to the theta that maximises `E[Q(theta, eta)]` - a Jensen-type bias that
+/// grows with the dispersion of the draws. Measured on the busulfan benchmark,
+/// improving the E-step's mixing makes it *worse*, which is the signature
+/// (#1458).
+///
+/// The recursion here never forms a maximiser at all. It is Robbins-Monro on the
+/// **score** — the quantity that is linear in the per-draw contribution — with
+/// the averaged expected information as the matrix gain:
+///
+/// ```text
+/// I_k = (1 - g_k)*I_{k-1} + g_k*I(x_k, eta_k)
+/// x_{k+1} = x_k - g_k*(I_k + lambda*diag I_k)^-1 * grad Q(x_k, eta_k)
+/// ```
+///
+/// A fixed point needs `E[grad Q(x*, eta)] = 0`, which is the stationarity
+/// condition of `E[Q]` — the SAEM target — so no Jensen term arises. This is the
+/// standard treatment for a parameter outside the exponential family (Kuhn &
+/// Lavielle 2005); the information is averaged because that is free here and
+/// makes the gain better conditioned, but it is a *preconditioner*, and the
+/// estimator's correctness rests on the `g_k` on the step.
+///
+/// # Why the step is scaled by `g_k` and the score is not accumulated
+///
+/// #1458 proposes the symmetric-looking form — accumulate the score as well,
+/// `s_k = (1 - g_k)*s_{k-1} + g_k*grad_k`, and take a **full** Newton step
+/// `x_{k+1} = x_k - I_k^-1 s_k`. That form has the right fixed point and is
+/// **marginally unstable**, so it does not reach it. Writing the error
+/// recursion for a locally quadratic `Q` with `e_k = x_k - x*` and
+/// `u_k = I^-1 s_k`:
+///
+/// ```text
+/// e_{k+1} = e_k - u_k
+/// u_k     = (1 - g)*u_{k-1} + g*(e_k + noise)
+/// ```
+///
+/// whose matrix `[[1, -1], [g, 1-g]]` has determinant `1 - g + g = 1` exactly,
+/// for every `g`. Its eigenvalues are a complex conjugate pair on the unit
+/// circle: the error rotates and never contracts. Measured on the Tier-1 fixture
+/// in `saem_mstep_sa_tests.rs`, that form settled **8.2e-2** in log units away
+/// from the averaged-objective maximiser it was aiming at — further than the
+/// biased average-of-maximisers it was meant to beat.
+///
+/// Putting the `g_k` on the step instead gives `e_{k+1} = (1 - g)*e_k - g*noise`,
+/// which contracts at `1 - g`. (Doing *both* — averaging the score and scaling
+/// the step — also contracts, at `sqrt(1 - g + g^2)`, about half as fast for
+/// small `g`, and carries an extra vector of state; it is not obviously worth
+/// the second smoothing and is not what ships.)
+///
+/// # What it steps, and what it leaves alone
+///
+/// Exactly the coordinates NLopt would have moved: every free `[theta; sigma]`
+/// coordinate of the packed vector, with `lower == upper` (a `FIX`, or a theta
+/// pinned by the closed-form mu-reference shift) excluded from the solve. A
+/// pinned coordinate keeps an all-zero score and information row - the
+/// per-subject routine skips it - so it also decays out of the accumulator
+/// rather than fighting the pin.
+///
+/// sigma rides the same step, and **[`sigma_mstep_sa_step`]'s extra
+/// Robbins-Monro blend does not apply on top**: that cap (#1445) exists because
+/// the sigma *maximiser* of a minority variance component is boundary-heavy
+/// from a single draw, and there is no maximiser here — sigma is moved by the
+/// same `g_k`-scaled score step every other coordinate is. Applying both would
+/// step sigma at `gamma^2`.
+///
+/// # Why there is no generalised-EM guard
+///
+/// The obvious safeguard - accept the step only if it does not *increase* the
+/// frozen-eta objective, halving it otherwise - is what a Fisher-scoring M-step
+/// taken on the **current draw's** gradient would use, and it is wrong here. The
+/// step is computed from an average over past draws, so it is supposed to
+/// improve the *averaged* objective; the current draw's objective is a different
+/// function and moving against it is not a failure. Measured on the Tier-1
+/// fixture in `saem_mstep_sa_tests.rs`, that guard rejected **36 of 96** steps
+/// and the recursion stalled well short of the point it exists to reach.
+///
+/// What is left is the part that is unconditionally right: the step is clamped
+/// to [`SCORE_SA_MAX_STEP`] per coordinate and then to the bounds, and it is
+/// halved (up to [`SCORE_SA_MAX_BACKTRACK`] times) only while the objective it
+/// lands on is **not finite**. A non-finite objective is not a worse point, it
+/// is no point at all, and accepting one would poison the next iteration's
+/// score.
+pub(crate) struct MstepScoreSa {
+    /// SA-averaged expected information, row-major `n x n`. The matrix gain of
+    /// the score recursion; there is deliberately no score accumulator beside
+    /// it (see the type's docs).
+    info: Vec<f64>,
+    n_theta: usize,
+    n_sigma: usize,
+    /// Has any iteration contributed yet? The first one is an assignment
+    /// (`gamma = 1` in exploration anyway), and this keeps that true even if a
+    /// caller ever starts the solver mid-run.
+    started: bool,
+    /// Why each M-step that failed to move theta/sigma failed, counted by
+    /// reason. Every early return from [`MstepScoreSa::step`] lands in exactly
+    /// one of these — a step that silently did nothing and was not counted is
+    /// the failure mode the end-of-run warning exists to make visible, and it
+    /// is what `every_failure_route_is_counted` pins.
+    failures: [u64; MSTEP_SA_FAILURE_KINDS],
+}
+
+/// Why a [`MstepScoreSa::step`] did not move theta/sigma. The discriminants
+/// index [`MstepScoreSa::failures`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScoreSaFailure {
+    /// A subject's expected information was out of the closed form's scope.
+    /// The run-level gate should make this impossible, so it is a gate bug.
+    OutOfScope = 0,
+    /// The summed score or information was not finite.
+    NonFiniteTerms = 1,
+    /// No free coordinate to move — every one is FIXed or pinned.
+    NoFreeCoordinate = 2,
+    /// The ridged information was not positive definite.
+    NotPositiveDefinite = 3,
+    /// The Newton direction was not finite.
+    NonFiniteDirection = 4,
+    /// Every backtracked step landed on a non-finite (or sentinel) objective.
+    NoFiniteObjective = 5,
+}
+
+/// Number of variants of [`ScoreSaFailure`].
+const MSTEP_SA_FAILURE_KINDS: usize = 6;
+
+/// Human-readable name per [`ScoreSaFailure`] discriminant, for the warning.
+const MSTEP_SA_FAILURE_NAMES: [&str; MSTEP_SA_FAILURE_KINDS] = [
+    "the expected information was out of scope for a subject (this is a gate bug — please report it)",
+    "the summed score or information was not finite",
+    "no free theta or sigma coordinate was left to move",
+    "the ridged information was not positive definite",
+    "the Newton direction was not finite",
+    "no backtracked step reached a finite objective",
+];
+
+impl MstepScoreSa {
+    /// Count this failure and return `false`, so every early return from
+    /// [`MstepScoreSa::step`] is visible to [`MstepScoreSa::failures`].
+    fn fail(&mut self, why: ScoreSaFailure) -> bool {
+        self.failures[why as usize] += 1;
+        false
+    }
+
+    /// How many M-steps failed for each [`ScoreSaFailure`] reason.
+    fn failures(&self) -> [u64; MSTEP_SA_FAILURE_KINDS] {
+        self.failures
+    }
+
+    /// Total M-steps that did not move theta/sigma, for any reason.
+    fn failure_total(&self) -> u64 {
+        self.failures.iter().sum()
+    }
+
+    fn new(n_theta: usize, n_sigma: usize) -> Self {
+        let n = n_theta + n_sigma;
+        Self {
+            info: vec![0.0; n * n],
+            n_theta,
+            n_sigma,
+            started: false,
+            failures: [0; MSTEP_SA_FAILURE_KINDS],
+        }
+    }
+
+    /// One SA update plus one Newton step. Writes the new packed values into
+    /// `log_theta` / `log_sigma` and returns `false` when the step could not be
+    /// taken (information out of scope, or the EM guard rejected every
+    /// halving), in which case both are left exactly as they were.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        model: &CompiledModel,
+        population: &Population,
+        etas: &[Vec<f64>],
+        log_theta: &mut [f64],
+        log_sigma: &mut [f64],
+        theta_lower: &[f64],
+        theta_upper: &[f64],
+        sigma_lower: &[f64],
+        sigma_upper: &[f64],
+        theta_packs_log_mask: &[bool],
+        gamma: f64,
+        schedules: &[Option<crate::pk::event_driven::EventSchedule>],
+    ) -> bool {
+        use rayon::prelude::*;
+        let n_theta = self.n_theta;
+        let n_sigma = self.n_sigma;
+        let n = n_theta + n_sigma;
+
+        let mut lower: Vec<f64> = Vec::with_capacity(n);
+        lower.extend_from_slice(theta_lower);
+        lower.extend_from_slice(sigma_lower);
+        let mut upper: Vec<f64> = Vec::with_capacity(n);
+        upper.extend_from_slice(theta_upper);
+        upper.extend_from_slice(sigma_upper);
+
+        let unpack = |packed: &[f64]| -> Vec<f64> {
+            (0..n_theta)
+                .map(|i| {
+                    if theta_packs_log_mask[i] {
+                        packed[i].exp()
+                    } else {
+                        packed[i]
+                    }
+                })
+                .collect()
+        };
+        let theta_nat = unpack(log_theta);
+        let sigma_nat: Vec<f64> = log_sigma.iter().map(|&v| v.exp()).collect();
+
+        // Per-subject score and information at the current point and draw.
+        // Collected in subject order and folded serially: a parallel `reduce`
+        // would combine partials along thread-count-dependent boundaries and
+        // f64 addition is not associative (#703).
+        let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = population
+            .subjects
+            .par_iter()
+            .zip(etas.par_iter())
+            .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+                crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher(
+                    model,
+                    subject,
+                    &theta_nat,
+                    &sigma_nat,
+                    eta,
+                    theta_packs_log_mask,
+                    &lower,
+                    &upper,
+                    n_theta,
+                    n_sigma,
+                    scratch,
+                )
+            })
+            .collect();
+
+        let mut grad = vec![0.0f64; n];
+        let mut fisher = vec![0.0f64; n * n];
+        for (_, g, f) in &per_subj {
+            let Some(f) = f else {
+                return self.fail(ScoreSaFailure::OutOfScope);
+            };
+            for (a, &gv) in g.iter().enumerate() {
+                grad[a] += gv;
+            }
+            for (a, &fv) in f.iter().enumerate() {
+                fisher[a] += fv;
+            }
+        }
+        if !grad.iter().all(|v| v.is_finite()) || !fisher.iter().all(|v| v.is_finite()) {
+            return self.fail(ScoreSaFailure::NonFiniteTerms);
+        }
+
+        // Robbins-Monro on the information, which is the matrix gain. The
+        // score is NOT accumulated — see the type's docs for the error
+        // recursion that rules that out.
+        let g_eff = gamma.clamp(0.0, 1.0);
+        let g_info = if self.started { g_eff } else { 1.0 };
+        for a in 0..n * n {
+            self.info[a] += g_info * (fisher[a] - self.info[a]);
+        }
+        self.started = true;
+
+        // Free coordinates only - a pinned one is left to its pin.
+        let free: Vec<usize> = (0..n).filter(|&i| lower[i] < upper[i]).collect();
+        if free.is_empty() {
+            return self.fail(ScoreSaFailure::NoFreeCoordinate);
+        }
+        let m = free.len();
+        let mut a_mat = DMatrix::<f64>::zeros(m, m);
+        let mut rhs = DVector::<f64>::zeros(m);
+        for (r, &i) in free.iter().enumerate() {
+            rhs[r] = -grad[i];
+            for (c, &j) in free.iter().enumerate() {
+                a_mat[(r, c)] = self.info[i * n + j];
+            }
+        }
+        for r in 0..m {
+            a_mat[(r, r)] = a_mat[(r, r)] * (1.0 + SCORE_SA_RIDGE) + SCORE_SA_INFO_FLOOR;
+        }
+        let Some(chol) = a_mat.cholesky() else {
+            return self.fail(ScoreSaFailure::NotPositiveDefinite);
+        };
+        let d = chol.solve(&rhs);
+        if d.iter().any(|v| !v.is_finite()) {
+            return self.fail(ScoreSaFailure::NonFiniteDirection);
+        }
+
+        let nll_at = |lt: &[f64], ls: &[f64]| -> f64 {
+            let th = unpack(lt);
+            let sg: Vec<f64> = ls.iter().map(|&v| v.exp()).collect();
+            obs_nll_sum(model, population, &th, &sg, etas, schedules)
+        };
+        let mut scale = 1.0f64;
+        for _ in 0..=SCORE_SA_MAX_BACKTRACK {
+            let mut lt = log_theta.to_vec();
+            let mut ls = log_sigma.to_vec();
+            for (r, &i) in free.iter().enumerate() {
+                // `g_eff` is the Robbins-Monro step size; the trust region
+                // clamps what is actually applied, not the raw direction.
+                let step = (scale * g_eff * d[r]).clamp(-SCORE_SA_MAX_STEP, SCORE_SA_MAX_STEP);
+                let target = (if i < n_theta { lt[i] } else { ls[i - n_theta] }) + step;
+                let clamped = target.clamp(lower[i], upper[i]);
+                if i < n_theta {
+                    lt[i] = clamped;
+                } else {
+                    ls[i - n_theta] = clamped;
+                }
+            }
+            // Finiteness only - see "Why there is no generalised-EM guard".
+            // `1e20` is the sentinel `theta_sigma_mstep_light`'s objective and
+            // `obs_nll_sum`'s callers substitute for a failed solve, and it is a
+            // perfectly finite f64, so `is_finite` alone would accept a point
+            // the model could not be evaluated at.
+            let nll_new = nll_at(&lt, &ls);
+            if nll_new.is_finite() && nll_new < 1e20 {
+                log_theta.copy_from_slice(&lt);
+                log_sigma.copy_from_slice(&ls);
+                return true;
+            }
+            scale *= 0.5;
+        }
+        self.fail(ScoreSaFailure::NoFiniteObjective)
+    }
+}
+
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
 /// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
 /// — they carry the user's declared variance and must not be perturbed.
@@ -1366,6 +1908,13 @@ fn theta_sigma_mstep_light(
     // each one a full prediction per subject, so on the event-driven path this
     // is the same per-call schedule rebuild the E-step kernels stopped paying.
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
+    // Previous iterations' η draws, most recent first (`mstep_draws - 1` of
+    // them, `&[]` for the historical single-draw objective). The objective and
+    // its gradient are averaged over `etas` plus these, so what NLopt maximises
+    // is the *mean* conditional objective rather than one draw's (#1458).
+    // Empty is not merely a special case of the loop: it skips the division, so
+    // a default fit is bit-identical.
+    extra_eta_draws: &[Vec<Vec<f64>>],
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -1411,68 +1960,22 @@ fn theta_sigma_mstep_light(
     //    iterating over all its theta perturbations.
     //  • Pinned dims (lower == upper) are skipped per-subject, saving the
     //    predict calls entirely (same as the old FD guard).
-    let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
-        let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-
-        if let Some(g) = grad {
-            use rayon::prelude::*;
-            // Collect in subject order, then fold serially (#703): a parallel
-            // `reduce` combines partial (nll, grad) pairs along thread-count-
-            // dependent boundaries, and f64 addition is non-associative.
-            let (val, grad_vec) = if let Some(kappas) = kappas_opt {
-                let per_subj: Vec<(f64, Vec<f64>)> = population
-                    .subjects
-                    .par_iter()
-                    .zip(etas.par_iter())
-                    .zip(kappas.par_iter())
-                    .enumerate()
-                    .map_init(
-                        EventPkParams::default,
-                        |scratch, (i, ((subject, eta), kaps))| {
-                            let cls = mix_mstep.map(|m| m.classes[i]);
-                            let _g = cls.map(|c| {
-                                crate::parser::model_parser::MixtureClassGuard::enter(c + 1)
-                            });
-                            let over: &[(usize, f64)] = match (mix_mstep, cls) {
-                                (Some(m), Some(c)) => &m.class_sigma_over[c],
-                                _ => &[],
-                            };
-                            let sub_sg = class_sigma_subst(&sg, over);
-                            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
-                            let (nll, mut grad) = obs_nll_subject_grad_iov(
-                                model,
-                                subject,
-                                &th,
-                                sg_i,
-                                eta,
-                                kaps,
-                                &theta_packs_log_mask,
-                                &lower,
-                                &upper,
-                                n_theta,
-                                n_sigma,
-                                scratch,
-                            );
-                            // A held σ override carries no information about the
-                            // free base σ — zero that subject's contribution.
-                            for &(sidx, _) in over {
-                                if n_theta + sidx < grad.len() {
-                                    grad[n_theta + sidx] = 0.0;
-                                }
-                            }
-                            (nll, grad)
-                        },
-                    )
-                    .collect();
-                fold_nll_grad(per_subj, n)
-            } else {
-                let per_subj: Vec<(f64, Vec<f64>)> = population
-                    .subjects
-                    .par_iter()
-                    .zip(etas.par_iter())
-                    .enumerate()
-                    .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
+    // One draw's `(nll, grad)` over the population, collected in subject order
+    // and folded serially (#703). Factored out of `obj` so the K-draw objective
+    // (#1458) can call it once per stored draw; at `mstep_draws = 1` there is
+    // exactly one call and the arithmetic is unchanged.
+    let one_draw_grad = |th: &[f64], sg: &[f64], etas: &[Vec<f64>]| -> (f64, Vec<f64>) {
+        use rayon::prelude::*;
+        if let Some(kappas) = kappas_opt {
+            let per_subj: Vec<(f64, Vec<f64>)> = population
+                .subjects
+                .par_iter()
+                .zip(etas.par_iter())
+                .zip(kappas.par_iter())
+                .enumerate()
+                .map_init(
+                    EventPkParams::default,
+                    |scratch, (i, ((subject, eta), kaps))| {
                         let cls = mix_mstep.map(|m| m.classes[i]);
                         let _g = cls
                             .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -1480,14 +1983,15 @@ fn theta_sigma_mstep_light(
                             (Some(m), Some(c)) => &m.class_sigma_over[c],
                             _ => &[],
                         };
-                        let sub_sg = class_sigma_subst(&sg, over);
+                        let sub_sg = class_sigma_subst(sg, over);
                         let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
-                        let (nll, mut grad) = obs_nll_subject_grad(
+                        let (nll, mut grad) = obs_nll_subject_grad_iov(
                             model,
                             subject,
-                            &th,
+                            th,
                             sg_i,
                             eta,
+                            kaps,
                             &theta_packs_log_mask,
                             &lower,
                             &upper,
@@ -1495,16 +1999,94 @@ fn theta_sigma_mstep_light(
                             n_sigma,
                             scratch,
                         );
+                        // A held σ override carries no information about the
+                        // free base σ — zero that subject's contribution.
                         for &(sidx, _) in over {
                             if n_theta + sidx < grad.len() {
                                 grad[n_theta + sidx] = 0.0;
                             }
                         }
                         (nll, grad)
-                    })
-                    .collect();
-                fold_nll_grad(per_subj, n)
-            };
+                    },
+                )
+                .collect();
+            fold_nll_grad(per_subj, n)
+        } else {
+            let per_subj: Vec<(f64, Vec<f64>)> = population
+                .subjects
+                .par_iter()
+                .zip(etas.par_iter())
+                .enumerate()
+                .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
+                    let cls = mix_mstep.map(|m| m.classes[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                        (Some(m), Some(c)) => &m.class_sigma_over[c],
+                        _ => &[],
+                    };
+                    let sub_sg = class_sigma_subst(sg, over);
+                    let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                    let (nll, mut grad) = obs_nll_subject_grad(
+                        model,
+                        subject,
+                        th,
+                        sg_i,
+                        eta,
+                        &theta_packs_log_mask,
+                        &lower,
+                        &upper,
+                        n_theta,
+                        n_sigma,
+                        scratch,
+                    );
+                    for &(sidx, _) in over {
+                        if n_theta + sidx < grad.len() {
+                            grad[n_theta + sidx] = 0.0;
+                        }
+                    }
+                    (nll, grad)
+                })
+                .collect();
+            fold_nll_grad(per_subj, n)
+        }
+    };
+    let one_draw_value = |th: &[f64], sg: &[f64], etas: &[Vec<f64>]| -> f64 {
+        match (mix_mstep, kappas_opt) {
+            (Some(mx), Some(kappas)) => {
+                obs_nll_sum_iov_mix(model, population, th, sg, etas, kappas, mx)
+            }
+            (Some(mx), None) => obs_nll_sum_mix(model, population, th, sg, etas, mx, schedules),
+            (None, Some(kappas)) => {
+                obs_nll_sum_iov(model, population, th, sg, etas, kappas, schedules)
+            }
+            (None, None) => obs_nll_sum(model, population, th, sg, etas, schedules),
+        }
+    };
+
+    let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
+        let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
+        let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
+        // The mean over this iteration's draw and the stored previous ones. The
+        // maximiser of an average, rather than the average of maximisers the
+        // caller's Robbins-Monro blend would form (#1458).
+        let k_draws = 1 + extra_eta_draws.len();
+        if let Some(g) = grad {
+            let (mut val, mut grad_vec) = one_draw_grad(&th, &sg, etas);
+            if k_draws > 1 {
+                for d in extra_eta_draws {
+                    let (v2, g2) = one_draw_grad(&th, &sg, d);
+                    val += v2;
+                    for (a, b) in grad_vec.iter_mut().zip(g2.iter()) {
+                        *a += b;
+                    }
+                }
+                let kf = k_draws as f64;
+                val /= kf;
+                for a in grad_vec.iter_mut() {
+                    *a /= kf;
+                }
+            }
             for (gi, &gv) in g.iter_mut().zip(grad_vec.iter()) {
                 *gi = if gv.is_finite() { gv } else { 0.0 };
             }
@@ -1514,18 +2096,13 @@ fn theta_sigma_mstep_light(
                 1e20
             }
         } else {
-            let val = match (mix_mstep, kappas_opt) {
-                (Some(mx), Some(kappas)) => {
-                    obs_nll_sum_iov_mix(model, population, &th, &sg, etas, kappas, mx)
+            let mut val = one_draw_value(&th, &sg, etas);
+            if k_draws > 1 {
+                for d in extra_eta_draws {
+                    val += one_draw_value(&th, &sg, d);
                 }
-                (Some(mx), None) => {
-                    obs_nll_sum_mix(model, population, &th, &sg, etas, mx, schedules)
-                }
-                (None, Some(kappas)) => {
-                    obs_nll_sum_iov(model, population, &th, &sg, etas, kappas, schedules)
-                }
-                (None, None) => obs_nll_sum(model, population, &th, &sg, etas, schedules),
-            };
+                val /= k_draws as f64;
+            }
             if val.is_finite() {
                 val
             } else {
@@ -2647,6 +3224,144 @@ fn saem_state_to_params(
 }
 
 // ---------------------------------------------------------------------------
+// E-step sizing
+// ---------------------------------------------------------------------------
+
+/// Value of [`FitOptions::saem_n_mh_steps`] that selects
+/// [`auto_n_mh_steps`] — the shipped default, written `n_mh_steps = auto` in a
+/// model file.
+pub(crate) const SAEM_N_MH_STEPS_AUTO: usize = 0;
+
+/// Block proposals the automatic rule asks for per observation per random
+/// effect (issue #1459).
+const AUTO_MH_STEPS_PER_OBS_PER_ETA: f64 = 2.5;
+
+/// Floor of the automatic block-proposal count.
+pub(crate) const AUTO_MH_STEPS_MIN: usize = 6;
+
+/// Cap of the automatic block-proposal count — the pre-#1459 fixed default, so
+/// a dataset dense enough to need it keeps exactly the historical E-step.
+pub(crate) const AUTO_MH_STEPS_MAX: usize = 20;
+
+/// Block-kernel proposals per subject per SAEM iteration, chosen from the shape
+/// of the dataset (issue #1459).
+///
+/// ## Why this is not a constant
+///
+/// The step-scale controller holds the block kernel at its 40 % acceptance
+/// target on every sparse benchmark measured (0.39–0.46 realised on cefepime,
+/// vancomycin, busulfan and pembrolizumab, at every count from 2 to 20), so
+/// each proposal there is worth the same fraction of a move, and 20 of them
+/// buy the same E-step as 6 for roughly three times the proposal traffic. The one benchmark where extra
+/// proposals *do* pay is the one where the controller cannot reach its target:
+/// the Emax PKPD model of `docs/estimation/saem.qmd`, 16 observations per
+/// subject against 2 η, realises **0.246**, and its final-estimate distance and
+/// cross-seed stability are 2–3× better at 20 proposals than at 4–8 (measured,
+/// 6 seeds — see the issue). A conditional much narrower than the prior is what
+/// both facts have in common: it drives the adapted scale down, and it is what
+/// makes a warm-started chain slow to follow a moving mode.
+///
+/// Observations per subject per η is the cheapest available proxy for that
+/// narrowing — it is the information the conditional is built from — so the
+/// rule is `2.5 · n_obs / (n_subjects · n_eta)`, clamped to
+/// `[AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX]`. The cap is the historical fixed
+/// default, so nothing changes on a dataset dense enough to earn it; the floor
+/// is where the sparse benchmarks stop being distinguishable from 20.
+///
+/// It is a rule about the *dataset*, not about the run: identical inputs give
+/// an identical count, so a fit stays reproducible. `verbose` prints the
+/// resolved value, and an explicit `n_mh_steps = <n>` overrides it entirely.
+pub(crate) fn auto_n_mh_steps(n_obs: usize, n_subjects: usize, n_eta: usize) -> usize {
+    if n_subjects == 0 || n_eta == 0 {
+        // Nothing to read the density off. Neither shape reaches a kernel —
+        // SAEM rejects `n_eta == 0` up front and an empty population earlier
+        // still — so this is only about not dividing by zero; answer with the
+        // historical default rather than with the cheap end.
+        return AUTO_MH_STEPS_MAX;
+    }
+    let obs_per_eta = n_obs as f64 / (n_subjects as f64 * n_eta as f64);
+    let steps = (AUTO_MH_STEPS_PER_OBS_PER_ETA * obs_per_eta).round();
+    // `steps` is finite and non-negative here (n_obs / positive), so the cast
+    // after the clamp cannot be a saturating surprise.
+    (steps as usize).clamp(AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX)
+}
+
+/// The η-block proposal count for the **Bayes** sampler: the requested value,
+/// or — under [`SAEM_N_MH_STEPS_AUTO`] — the historical fixed count, *not*
+/// [`auto_n_mh_steps`].
+///
+/// [`auto_n_mh_steps`] is calibrated on SAEM quantities (a controller-held
+/// acceptance rate, final-estimate distance against a long-run reference), and
+/// what makes a low count safe there is SAEM's componentwise kernel carrying
+/// the dense case (#1466). The Bayes η block is the block kernel alone and is
+/// judged on posterior mixing, which none of that measured — so `auto` means
+/// "unchanged" here until there is a Bayes benchmark to move it (#1459).
+pub(crate) fn resolve_n_mh_steps_bayes(requested: usize) -> usize {
+    if requested == SAEM_N_MH_STEPS_AUTO {
+        AUTO_MH_STEPS_MAX
+    } else {
+        requested
+    }
+}
+
+/// The `verbose` line describing the resolved E-step kernel sizes. Kept as a
+/// pure function so the wording is unit-testable, like
+/// [`saem_final_ofv_report`].
+fn mh_steps_report(requested: usize, resolved: usize, n_cw_sweeps: usize) -> String {
+    let origin = if requested == SAEM_N_MH_STEPS_AUTO {
+        "auto, from observations per subject per eta"
+    } else {
+        "set in fit options"
+    };
+    format!(
+        "SAEM: {resolved} block MH proposals/subject/iteration ({origin}), \
+         {n_cw_sweeps} componentwise sweeps"
+    )
+}
+
+/// The block-proposal count a run actually uses: the requested value, or
+/// [`auto_n_mh_steps`] when the caller left it at [`SAEM_N_MH_STEPS_AUTO`].
+///
+/// Every consumer of [`FitOptions::saem_n_mh_steps`] goes through here — the
+/// main loop, the conditional-distribution pass and the Bayes η block — so the
+/// sentinel cannot reach a kernel as a literal zero-proposal count.
+pub(crate) fn resolve_n_mh_steps(
+    requested: usize,
+    n_obs: usize,
+    n_subjects: usize,
+    n_eta: usize,
+) -> usize {
+    if requested == SAEM_N_MH_STEPS_AUTO {
+        auto_n_mh_steps(n_obs, n_subjects, n_eta)
+    } else {
+        requested
+    }
+}
+
+/// Componentwise sweeps per E-step iteration (Kuhn–Lavielle kernel 2), given
+/// the block-kernel proposal count.
+///
+/// Each sweep is `n_eta` single-coordinate proposals, so sizing it
+/// `n_mh_steps / n_eta` keeps the kernel's NLL-eval cost roughly on par with
+/// the block kernel, at a floor of 2 sweeps — the kernel is what stops a block
+/// Ω collapsing to a near rank-1 correlation matrix (#191), so it must not
+/// vanish when the block count is small. Skipped entirely for single-η models,
+/// where there is no off-diagonal to decorrelate and the kernel would only
+/// duplicate the block move.
+///
+/// Shared by the main loop and the conditional-distribution pass
+/// ([`saem_conddist`](crate::estimation::saem_conddist)) so the two cannot
+/// drift: both sample the same conditional with the same two kernels, and a
+/// second copy of this arithmetic is a second definition of the E-step.
+pub(crate) fn componentwise_sweeps(n_mh_steps: usize, n_eta: usize) -> usize {
+    if n_eta >= 2 {
+        (n_mh_steps / n_eta).max(2)
+    } else {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main SAEM loop
 // ---------------------------------------------------------------------------
 
@@ -2677,17 +3392,13 @@ pub fn run_saem(
     // estimated. Clamped to the exploration length — burning in past K1 would
     // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
     let omega_burnin = options.saem_omega_burnin.min(k1);
-    let n_mh_steps = options.saem_n_mh_steps;
-    // Componentwise sweeps per iteration (Kuhn-Lavielle kernel 2). Each sweep is
-    // `n_eta` single-coordinate proposals, so sizing it `n_mh_steps / n_eta`
-    // keeps the kernel's NLL-eval cost roughly on par with the block kernel.
-    // Skipped entirely for single-η models, where there is no off-diagonal to
-    // decorrelate and the kernel would duplicate the block move.
-    let n_cw_sweeps = if n_eta >= 2 {
-        (n_mh_steps / n_eta).max(2)
-    } else {
-        0
-    };
+    let n_mh_steps = resolve_n_mh_steps(
+        options.saem_n_mh_steps,
+        population.n_obs(),
+        n_subjects,
+        n_eta,
+    );
+    let n_cw_sweeps = componentwise_sweeps(n_mh_steps, n_eta);
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -2732,6 +3443,13 @@ pub fn run_saem(
         eprintln!(
             "SAEM: {} subjects, {} ETAs, {} total iter ({} explore + {} converge)",
             n_subjects, n_eta, n_iter, k1, k2
+        );
+        // The block count is data-derived unless the caller pinned it, so say
+        // which of the two a run is using — otherwise a reader cannot tell the
+        // resolved count from a coincidence.
+        eprintln!(
+            "{}",
+            mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps)
         );
     }
 
@@ -3491,6 +4209,33 @@ pub fn run_saem(
             "SAEM: `mstep_damping` was set but has no effect — {reason} (#1011)."
         ));
     }
+
+    // ---- #1458: which estimator moves the numerical θ/σ M-step ----
+    //
+    // `mstep_solver = score_sa` and `mstep_draws > 1` are two answers to the
+    // same defect — the M-step blends a *maximiser* of one η draw, a nonlinear
+    // function of that draw, so its running average carries a Jensen-type bias.
+    // Both need the plain Gaussian scope below; a model outside it keeps the
+    // historical solver and is told so by name.
+    let numerical_mstep_scope_gap = numerical_mstep_scope_gap(model, n_kappa, saem_mix.is_some());
+    let (use_score_sa, mstep_draws, mstep_option_warnings) = resolve_mstep_options(
+        options.saem_mstep_solver,
+        options.saem_mstep_draws,
+        numerical_mstep_scope_gap,
+    );
+    warnings.extend(mstep_option_warnings);
+    let mut score_sa: Option<MstepScoreSa> = if use_score_sa {
+        Some(MstepScoreSa::new(n_theta, n_sigma))
+    } else {
+        None
+    };
+    // Previous iterations' η draws, most recent first, at most
+    // `mstep_draws - 1` of them. Held here rather than in `SaemState` because
+    // nothing outside the M-step reads them — but every closed-form
+    // mu-reference shift that re-centres `state.etas` must re-centre these too
+    // (see `recentre_eta_draws`), or a stored draw stops describing the same
+    // individual parameters it was drawn for.
+    let mut extra_eta_draws: Vec<Vec<Vec<f64>>> = Vec::new();
 
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
@@ -4276,7 +5021,13 @@ pub fn run_saem(
 
         // ---- Step 4: M-step theta, sigma (lightweight NLopt, warm-started) ----
         // Only run every few iterations during exploration to save time
-        let run_mstep = k <= 5 || k % 3 == 0 || k > k1;
+        // The exploration throttle exists because a BOBYQA re-maximisation costs
+        // `mstep_maxiter*(n+1)` population passes. `score_sa` costs one gradient
+        // sweep — cheaper than the solve it replaces even at every iteration —
+        // and throttling it would starve the very thing that removes the bias:
+        // the number of Robbins-Monro terms in its averages (#1458; E9 measured
+        // +1450 IS −2 log L for a Newton M-step taken every third iteration).
+        let run_mstep = score_sa.is_some() || k <= 5 || k % 3 == 0 || k > k1;
         let kappas_for_mstep = if n_kappa > 0 {
             Some(state.kappas.as_slice())
         } else {
@@ -4332,6 +5083,7 @@ pub fn run_saem(
                     for e in state.etas.iter_mut() {
                         e[eta_idx] -= delta;
                     }
+                    recentre_eta_draws(&mut extra_eta_draws, eta_idx, delta);
                     // Pin so NLopt leaves the closed-form value unchanged.
                     temp_theta_lower[theta_idx] = log_theta[theta_idx];
                     temp_theta_upper[theta_idx] = log_theta[theta_idx];
@@ -4429,12 +5181,22 @@ pub fn run_saem(
                         }
                         let theta_new = unpack_all(&log_theta);
                         let mu_new = group.mus(&theta_new, population);
+                        let mu_delta: Vec<f64> = mu_new
+                            .iter()
+                            .zip(mu_old.iter())
+                            .map(|(n, o)| n - o)
+                            .collect();
                         for (i, e) in state.etas.iter_mut().enumerate() {
-                            let d = mu_new[i] - mu_old[i];
+                            let d = mu_delta[i];
                             if d.is_finite() && group.eta_idx < e.len() {
                                 e[group.eta_idx] -= d;
                             }
                         }
+                        recentre_eta_draws_per_subject(
+                            &mut extra_eta_draws,
+                            group.eta_idx,
+                            &mu_delta,
+                        );
                     }
                 }
                 // Each pinned mu-ref dim avoids 2 obs_nll_sum calls per NLopt
@@ -4449,29 +5211,52 @@ pub fn run_saem(
                 // channel. The scalar statistic gate has no free numerical θ
                 // or σ dimension left for this solve.
                 if scalar_residual_model.is_none() {
-                    let (theta_new, sigma_new) = theta_sigma_mstep_light(
-                        model,
-                        population,
-                        &state.etas,
-                        kappas_for_mstep,
-                        &log_theta,
-                        &log_sigma,
-                        &temp_theta_lower,
-                        &temp_theta_upper,
-                        &log_sigma_lower,
-                        &log_sigma_upper,
-                        n_theta,
-                        n_sigma,
-                        mstep_maxiter,
-                        options.scale_params,
-                        &theta_packs_log_mask,
-                        // Closed-form branch is never taken for a mixture (disabled
-                        // above), so no class guard is needed here.
-                        None,
-                        &schedules,
-                    );
-                    damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                    damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                    if let Some(sa) = score_sa.as_mut() {
+                        // #1458: one Newton step on the Robbins-Monro averaged
+                        // score and information, in place of blending in the
+                        // maximiser of this one draw. `gamma_mstep` /
+                        // `gamma_sigma` do not apply — the averaging *is* the
+                        // stochastic approximation here.
+                        sa.step(
+                            model,
+                            population,
+                            &state.etas,
+                            &mut log_theta,
+                            &mut log_sigma,
+                            &temp_theta_lower,
+                            &temp_theta_upper,
+                            &log_sigma_lower,
+                            &log_sigma_upper,
+                            &theta_packs_log_mask,
+                            gamma,
+                            &schedules,
+                        );
+                    } else {
+                        let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                            model,
+                            population,
+                            &state.etas,
+                            kappas_for_mstep,
+                            &log_theta,
+                            &log_sigma,
+                            &temp_theta_lower,
+                            &temp_theta_upper,
+                            &log_sigma_lower,
+                            &log_sigma_upper,
+                            n_theta,
+                            n_sigma,
+                            mstep_maxiter,
+                            options.scale_params,
+                            &theta_packs_log_mask,
+                            // Closed-form branch is never taken for a mixture (disabled
+                            // above), so no class guard is needed here.
+                            None,
+                            &schedules,
+                            &extra_eta_draws,
+                        );
+                        damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                    }
                 }
             } else if use_closed_form_mstep {
                 // ---- Closed-form EM M-step under a mixture (#996) ----
@@ -4568,6 +5353,9 @@ pub fn run_saem(
                         class_sigma_over: &mix_sigma_over,
                     }),
                     &schedules,
+                    // A mixture is outside the K-draw scope gate, so this is
+                    // always the historical single-draw objective.
+                    &[],
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                 damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
@@ -4577,30 +5365,51 @@ pub fn run_saem(
                 // + sigma. For a mixture, `mstep_classes` guards each subject so
                 // class-switched thetas are estimated per class (#985).
                 if scalar_residual_model.is_none() {
-                    let (theta_new, sigma_new) = theta_sigma_mstep_light(
-                        model,
-                        population,
-                        &state.etas,
-                        kappas_for_mstep,
-                        &log_theta,
-                        &log_sigma,
-                        &log_theta_lower,
-                        &log_theta_upper,
-                        &log_sigma_lower,
-                        &log_sigma_upper,
-                        n_theta,
-                        n_sigma,
-                        mstep_maxiter,
-                        options.scale_params,
-                        &theta_packs_log_mask,
-                        saem_mix.as_ref().map(|m| MixMstep {
-                            classes: m.classes.as_slice(),
-                            class_sigma_over: &mix_sigma_over,
-                        }),
-                        &schedules,
-                    );
-                    damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                    damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                    if let Some(sa) = score_sa.as_mut() {
+                        // #1458, as in the closed-form branch above: the SA
+                        // average over score and information replaces the blend
+                        // of a single draw's maximiser.
+                        sa.step(
+                            model,
+                            population,
+                            &state.etas,
+                            &mut log_theta,
+                            &mut log_sigma,
+                            &log_theta_lower,
+                            &log_theta_upper,
+                            &log_sigma_lower,
+                            &log_sigma_upper,
+                            &theta_packs_log_mask,
+                            gamma,
+                            &schedules,
+                        );
+                    } else {
+                        let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                            model,
+                            population,
+                            &state.etas,
+                            kappas_for_mstep,
+                            &log_theta,
+                            &log_sigma,
+                            &log_theta_lower,
+                            &log_theta_upper,
+                            &log_sigma_lower,
+                            &log_sigma_upper,
+                            n_theta,
+                            n_sigma,
+                            mstep_maxiter,
+                            options.scale_params,
+                            &theta_packs_log_mask,
+                            saem_mix.as_ref().map(|m| MixMstep {
+                                classes: m.classes.as_slice(),
+                                class_sigma_over: &mix_sigma_over,
+                            }),
+                            &schedules,
+                            &extra_eta_draws,
+                        );
+                        damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                    }
                 }
             }
 
@@ -4673,6 +5482,17 @@ pub fn run_saem(
                     };
                 }
             }
+        }
+
+        // #1458: remember this iteration's draw for the K-draw M-step objective.
+        // Pushed after the M-step, so the next iteration averages over draws
+        // strictly older than its own, and after the mu-reference re-centring
+        // above, so every stored draw is expressed against the θ the fit now
+        // holds. `mstep_draws == 1` keeps the list empty and the objective
+        // bit-identical.
+        if mstep_draws > 1 {
+            extra_eta_draws.insert(0, state.etas.clone());
+            extra_eta_draws.truncate(mstep_draws - 1);
         }
 
         // ---- Update NLL cache (parallelized, needed for MH acceptance ratios) ----
@@ -4968,6 +5788,13 @@ pub fn run_saem(
         options.saem_scale_adaptation,
     ) {
         warnings.push(w);
+    }
+
+    // #1458: see `score_sa_failure_warning` for why every route is reported.
+    if let Some(sa) = score_sa.as_ref() {
+        if let Some(w) = score_sa_failure_warning(sa.failures(), n_iter) {
+            warnings.push(w);
+        }
     }
 
     // #918 review: a #619 group whose solve kept returning `None` never ran.
@@ -6655,6 +7482,7 @@ DV ~ proportional(EPS)
                 &packs_log,
                 None,
                 &[],
+                &[],
             )
         };
         let objective = |lt: &[f64], ls: &[f64]| {
@@ -6737,6 +7565,7 @@ DV ~ proportional(EPS)
                 classes: &classes,
                 class_sigma_over: &class_sigma_over,
             }),
+            &[],
             &[],
         );
         assert!(
@@ -6827,6 +7656,7 @@ DV ~ proportional(EPS)
             false,
             &packs_log,
             None,
+            &[],
             &[],
         );
         let f_b = objective(&theta_b, &sigma_b);
@@ -9655,8 +10485,170 @@ DV ~ additive(EPS)
         );
         assert_ne!(eta[0], eta0[0], "unclamped coordinate should have moved");
     }
+
+    // ── E-step sizing (#1459) ────────────────────────────────────────────────
+
+    /// The automatic count on the shapes it was measured on. Each row is a real
+    /// benchmark from issue #1459, with its observations-per-η and the count
+    /// the rule gives it; a mutation that drops the density term (always the
+    /// floor, or always the cap) reddens a different subset of these rows, so
+    /// no single constant satisfies the table.
+    #[test]
+    fn auto_n_mh_steps_tracks_observations_per_eta() {
+        // The expected counts below are written out rather than spelled with
+        // the clamp constants, so that moving a clamp reddens this test instead
+        // of moving the expectations with it.
+        assert_eq!((AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX), (6, 20));
+
+        // (n_obs, n_subjects, n_eta, expected, what it is)
+        let cases = [
+            // cefepime: 702 obs / 458 subjects / 3 η = 0.51 per η → 1.3 → floor.
+            (702, 458, 3, 6, "cefepime, 0.51 obs/eta"),
+            // vancomycin: 274 / 100 / 3 = 0.91 per η → 2.3 → floor.
+            (274, 100, 3, 6, "vancomycin, 0.91 obs/eta"),
+            // pembrolizumab: 1231 / 303 / 4 = 1.02 per η → 2.5 → floor.
+            (1231, 303, 4, 6, "pembrolizumab, 1.02 obs/eta"),
+            // busulfan: 5259 / 600 / 3 = 2.92 per η → 7.3 → 7, the arm where
+            // the density term actually decides the answer.
+            (5259, 600, 3, 7, "busulfan, 2.92 obs/eta"),
+            // Emax PKPD: 1600 / 100 / 2 = 8.0 per η → 20 → the cap, i.e. the
+            // pre-#1459 default is kept exactly where it was calibrated.
+            (1600, 100, 2, 20, "emax PKPD, 8.0 obs/eta"),
+            // Denser still must not exceed the cap.
+            (100_000, 100, 2, 20, "500 obs/eta"),
+            // A single observation per subject against 6 η cannot go below it.
+            (300, 300, 6, 6, "0.17 obs/eta"),
+            // Just under and just over the knee where the density term takes
+            // over from the floor (2.4 obs/η ⇒ exactly 6).
+            (2400, 1000, 1, 6, "2.4 obs/eta, 1 eta"),
+            (2500, 1000, 1, 6, "2.5 obs/eta, 1 eta — rounds to 6"),
+            (
+                2600,
+                1000,
+                1,
+                7,
+                "2.6 obs/eta, 1 eta — first count above the floor",
+            ),
+        ];
+        for (n_obs, n_subjects, n_eta, want, what) in cases {
+            assert_eq!(
+                auto_n_mh_steps(n_obs, n_subjects, n_eta),
+                want,
+                "{what}: {n_obs} obs / {n_subjects} subjects / {n_eta} eta"
+            );
+        }
+    }
+
+    /// Degenerate inputs must not divide by zero or return a zero count — a
+    /// zero would reach `mh_steps` as "propose nothing".
+    #[test]
+    fn auto_n_mh_steps_is_safe_on_degenerate_shapes() {
+        for (n_obs, n_subjects, n_eta) in [(0, 0, 0), (0, 10, 2), (10, 0, 2), (10, 10, 0)] {
+            let n = auto_n_mh_steps(n_obs, n_subjects, n_eta);
+            assert!(
+                (AUTO_MH_STEPS_MIN..=AUTO_MH_STEPS_MAX).contains(&n),
+                "auto count out of range on ({n_obs}, {n_subjects}, {n_eta}): {n}"
+            );
+        }
+    }
+
+    /// An explicit count is passed through untouched — including one that
+    /// equals neither clamp, and one the rule would never produce.
+    #[test]
+    fn resolve_n_mh_steps_passes_an_explicit_count_through() {
+        // The sparse shape whose auto count is the floor.
+        let (n_obs, n_subj, n_eta) = (274, 100, 3);
+        assert_eq!(
+            resolve_n_mh_steps(SAEM_N_MH_STEPS_AUTO, n_obs, n_subj, n_eta),
+            AUTO_MH_STEPS_MIN,
+            "the sentinel must resolve"
+        );
+        for requested in [1, 3, 40, 200] {
+            assert_eq!(
+                resolve_n_mh_steps(requested, n_obs, n_subj, n_eta),
+                requested,
+                "an explicit count must survive the resolver"
+            );
+        }
+    }
+
+    /// The Bayes η block resolves `auto` to the historical fixed count, *not*
+    /// to the rule — on a shape where the two visibly differ, so the test reads
+    /// "does not consult the rule" rather than "agrees with it here".
+    #[test]
+    fn resolve_n_mh_steps_bayes_keeps_the_historical_count() {
+        // A sparse shape the SAEM rule answers with the floor.
+        let (n_obs, n_subj, n_eta) = (274, 100, 3);
+        assert_eq!(
+            resolve_n_mh_steps(SAEM_N_MH_STEPS_AUTO, n_obs, n_subj, n_eta),
+            AUTO_MH_STEPS_MIN,
+            "precondition: the SAEM rule gives this shape the floor, not the cap"
+        );
+        assert_ne!(
+            AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX,
+            "precondition: the two answers are distinguishable"
+        );
+        assert_eq!(
+            resolve_n_mh_steps_bayes(SAEM_N_MH_STEPS_AUTO),
+            AUTO_MH_STEPS_MAX,
+            "Bayes keeps the historical count under `auto` (see the fn docs)"
+        );
+        for requested in [1, 6, 40] {
+            assert_eq!(
+                resolve_n_mh_steps_bayes(requested),
+                requested,
+                "an explicit count applies to Bayes too"
+            );
+        }
+    }
+
+    /// The componentwise sweep count, including the floor that keeps the
+    /// anti-collapse kernel alive at a small block count (#191) and the
+    /// single-η case where the kernel is skipped entirely.
+    #[test]
+    fn componentwise_sweeps_floor_and_single_eta() {
+        assert_eq!(componentwise_sweeps(20, 3), 6, "20/3 = 6 sweeps");
+        assert_eq!(componentwise_sweeps(20, 2), 10);
+        assert_eq!(
+            componentwise_sweeps(6, 3),
+            2,
+            "6/3 = 2, which is also the floor"
+        );
+        assert_eq!(
+            componentwise_sweeps(6, 4),
+            2,
+            "6/4 = 1 must be lifted to the floor, not left to vanish"
+        );
+        assert_eq!(
+            componentwise_sweeps(0, 4),
+            2,
+            "even a zero block count keeps the anti-collapse kernel"
+        );
+        assert_eq!(
+            componentwise_sweeps(20, 1),
+            0,
+            "single-η models skip the componentwise kernel"
+        );
+    }
+
+    /// The verbose line says which of the two sources the count came from.
+    #[test]
+    fn mh_steps_report_names_its_source() {
+        let auto = mh_steps_report(SAEM_N_MH_STEPS_AUTO, 6, 2);
+        assert!(auto.contains("6 block MH proposals"), "got: {auto}");
+        assert!(auto.contains("auto"), "got: {auto}");
+        assert!(auto.contains("2 componentwise sweeps"), "got: {auto}");
+
+        let explicit = mh_steps_report(20, 20, 6);
+        assert!(explicit.contains("set in fit options"), "got: {explicit}");
+        assert!(!explicit.contains("auto"), "got: {explicit}");
+    }
 }
 
 #[cfg(test)]
 #[path = "saem_hotpath_tests.rs"]
 mod hotpath_tests;
+
+#[cfg(test)]
+#[path = "saem_mstep_sa_tests.rs"]
+mod mstep_sa_tests;

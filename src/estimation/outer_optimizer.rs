@@ -954,6 +954,23 @@ fn run_inner_loop_and_nll(
     (etas, h_matrices, stats, kappas, nll)
 }
 
+fn skip_duplicate_laplace_terminal_capture() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_GRADIENT_CAPTURE_SKIP")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
+fn agq_inner_solve_policy(options: &FitOptions, fused_gradient: bool) -> InnerSolvePolicy {
+    InnerSolvePolicy {
+        seed: InnerHessianSeed::for_options(options),
+        capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture() || !fused_gradient)
+            && matches!(options.hessian_anchor(), HessianAnchor::Exact),
+    }
+}
+
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
@@ -983,16 +1000,12 @@ fn run_inner_loop_and_nll_prepared(
         // The Gauss-Newton anchor never reuses it, and the gradient path recomputes the
         // whole second-order jet for its Laplace derivative sweep anyway, so capturing there
         // would be a full provider pass per subject thrown away.
-        let policy = InnerSolvePolicy {
-            seed: InnerHessianSeed::for_options(options),
-            capture_terminal_hessian: agq_gradient_inputs.is_none()
-                && matches!(options.hessian_anchor(), HessianAnchor::Exact),
-        };
-        let take_terminal_hessian =
+        let policy = agq_inner_solve_policy(options, agq_gradient_inputs.is_some());
+        let take_terminal_work =
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
-                ebe.terminal_hessian.clone()
+                (ebe.terminal_hessian.clone(), ebe.nll)
             };
-        let (etas, h_matrices, stats, kappas, terminal_hessians) = match schedules {
+        let (etas, h_matrices, stats, kappas, terminal_work) = match schedules {
             Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
                 model,
                 population,
@@ -1005,7 +1018,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_restarts,
                 cache,
                 policy,
-                take_terminal_hessian,
+                take_terminal_work,
             ),
             None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
                 model,
@@ -1018,7 +1031,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 policy,
-                take_terminal_hessian,
+                take_terminal_work,
             ),
         };
         let n_nodes = options.agq_nodes().expect("AGQ branch");
@@ -1036,6 +1049,7 @@ fn run_inner_loop_and_nll_prepared(
                 n_nodes,
                 options.hessian_anchor(),
                 cache,
+                &terminal_work,
             ),
             None => crate::estimation::agq::agq_population_evaluate(
                 model,
@@ -1062,7 +1076,7 @@ fn run_inner_loop_and_nll_prepared(
                     n_nodes,
                     options.hessian_anchor(),
                     schedules,
-                    Some(&terminal_hessians),
+                    Some(&terminal_work),
                 )
             },
             |evaluation| evaluation.nll,

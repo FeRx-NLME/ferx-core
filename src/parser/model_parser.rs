@@ -8879,7 +8879,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
         "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
-        "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
+        // `auto` (the default) sizes the block kernel from the dataset — see
+        // `estimation::saem::auto_n_mh_steps` (#1459). It is spelled out here
+        // rather than left as a bare 0 so a model file can say what it means.
+        "n_mh_steps" => {
+            opts.saem_n_mh_steps = if value.eq_ignore_ascii_case("auto") {
+                crate::estimation::saem::SAEM_N_MH_STEPS_AUTO
+            } else {
+                parse_usize("n_mh_steps")?
+            }
+        }
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "scale_adaptation" | "saem_scale_adaptation" => {
@@ -8909,6 +8918,30 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 ));
             }
             opts.saem_mstep_damping = Some(v);
+        }
+        "mstep_solver" | "saem_mstep_solver" => {
+            opts.saem_mstep_solver = match value.to_lowercase().as_str() {
+                "bobyqa" | "maximiser" | "maximizer" | "legacy" => {
+                    crate::types::SaemMstepSolver::Bobyqa
+                }
+                "score_sa" | "score-sa" | "sa" => crate::types::SaemMstepSolver::ScoreSa,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected bobyqa/score_sa"
+                    ));
+                }
+            };
+        }
+        "mstep_draws" | "saem_mstep_draws" => {
+            let v = parse_usize(key)?;
+            if v == 0 {
+                return Err(format!(
+                    "fit option `{key}` must be at least 1 — it is the number of E-step draws \
+                     the SAEM M-step objective is averaged over, and 1 is the historical \
+                     single-draw objective (#1458), got {v}"
+                ));
+            }
+            opts.saem_mstep_draws = v;
         }
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "conddist" | "saem_conddist" => opts.saem_conddist = parse_bool("conddist")?,

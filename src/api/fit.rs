@@ -369,8 +369,12 @@ fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
 ///
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
 /// pool of `n` workers, so this setting is per-call (different fits in the
-/// same process can use different thread counts). When `None`, rayon's
-/// global pool is used (one worker per logical CPU).
+/// same process can use different thread counts). When `None`, the shared
+/// big-stack fit pool is used, sized to available cores minus one and capped
+/// at 8 (#707) unless a front end declared a width with
+/// [`configure_global_thread_pool`](crate::configure_global_thread_pool).
+/// Rayon's own global pool is not used either way, and `--threads N` no longer
+/// sizes it (#1460).
 ///
 /// `[data_selection]` filtering (`options.ignore_exprs` / `accept_exprs` /
 /// `ignore_subjects`) is **not** applied here: it happens at CSV read time in
@@ -1142,7 +1146,8 @@ fn fit_inner(
     }
 
     // Capture thread count before chain runs (current_num_threads() reports
-    // whichever Rayon pool is active — scoped pool when threads=Some, else global).
+    // whichever Rayon pool is active — the scoped pool when threads=Some, else the
+    // shared big-stack default pool this call was installed on).
     let n_threads_used = rayon::current_num_threads();
 
     // Initialise the per-iteration optimizer trace if requested. `finish()`
@@ -1189,7 +1194,8 @@ fn fit_inner(
         let chain_str: Vec<&str> = chain.iter().map(|m| m.label()).collect();
         // rayon::current_num_threads() reports whichever pool par_iter would use
         // from the current call — the scoped pool when options.threads is Some,
-        // otherwise the global pool. So this stays accurate in both paths.
+        // otherwise the shared big-stack default pool. `fit_inner` runs inside
+        // that pool (install_on_fit_pool), so this stays accurate in both paths.
         let n_threads = rayon::current_num_threads();
         let thread_word = if n_threads == 1 { "thread" } else { "threads" };
         if !pre_run_warnings.is_empty() {

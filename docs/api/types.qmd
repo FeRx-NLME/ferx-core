@@ -112,7 +112,7 @@ pub struct FitOptions {
     // SAEM-specific
     pub saem_n_exploration: usize,     // Default: 150
     pub saem_n_convergence: usize,     // Default: 250
-    pub saem_n_mh_steps: usize,        // Default: 3
+    pub saem_n_mh_steps: usize,        // Default: 0 (auto — sized from the data)
     pub saem_adapt_interval: usize,    // Default: 50
     pub saem_seed: Option<u64>,        // Default: None
 }

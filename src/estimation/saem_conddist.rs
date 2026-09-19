@@ -70,7 +70,12 @@ pub fn run_conditional_distribution(
     let nsamp = options.saem_conddist_nsamp.max(1);
     let burnin = options.saem_conddist_burnin;
     let keep = options.saem_conddist_keep_samples;
-    let n_mh_steps = options.saem_n_mh_steps;
+    let n_mh_steps = crate::estimation::saem::resolve_n_mh_steps(
+        options.saem_n_mh_steps,
+        population.n_obs(),
+        n_subjects,
+        n_eta,
+    );
     // Decouple from saem_adapt_interval: scale with burn-in so adaptation
     // fires ~10 times regardless of the user's saem_adapt_interval setting.
     // With the default burnin=20 this gives interval=2; with burnin=500 → 50
@@ -81,13 +86,9 @@ pub fn run_conditional_distribution(
         .unwrap_or(12345)
         .wrapping_add(CONDDIST_SEED_OFFSET);
 
-    // Componentwise sweep count mirrors the main loop: skipped for single-η
-    // models (no off-diagonal to decorrelate).
-    let n_cw_sweeps = if n_eta >= 2 {
-        (n_mh_steps / n_eta).max(2)
-    } else {
-        0
-    };
+    // Componentwise sweep count is the main loop's, by construction — the same
+    // helper, not a copy of its arithmetic.
+    let n_cw_sweeps = crate::estimation::saem::componentwise_sweeps(n_mh_steps, n_eta);
 
     let omega = &params.omega;
     let omega_iov_opt = params.omega_iov.as_ref();

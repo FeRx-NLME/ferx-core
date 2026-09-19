@@ -31,6 +31,7 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::MuTransform;
+use ferx_core::types::SaemMstepSolver;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, FitResult};
 use std::path::Path;
 
@@ -326,4 +327,308 @@ fn imp_recovers_the_additive_renal_gradient() {
     );
     assert_finite_close("TVCL", theta(&result, "TVCL"), NM_ADD_TVCL, 0.3);
     assert_finite_close("TVV", theta(&result, "TVV"), NM_ADD_TVV, 2.0);
+}
+
+/// Tier-3, #1458. The same NONMEM-anchored no-ETA θ, estimated by the two
+/// alternatives to the single-draw maximiser: `mstep_solver = score_sa`
+/// (stochastic approximation on the score and expected information) and
+/// `mstep_draws = 3` (the M-step objective averaged over three E-step draws).
+///
+/// **Why this fixture is the right regression.** `TH_WT` here is the whole
+/// point of #1458: it carries no ETA, defeats covariate mu-reference detection
+/// (asserted below, as in the test above), and therefore moves *only* through
+/// the numerical M-step. NONMEM 7.5.1 `METHOD=SAEM` on the same data and the
+/// same start puts it at 0.921283, which is an external reference rather than
+/// one of ferx's own readouts.
+///
+/// **Measured**, release-equivalent `ci-test`, seed 619, the default 150/250
+/// schedule (`|Δ|` against the NONMEM anchor):
+///
+/// | arm | `TH_WT` | \|Δ\| |
+/// |---|---|---|
+/// | pre-#1415 stall | 0.3322 | 0.589 |
+/// | `bobyqa` (the default, post-#1445) | 0.9026 | 0.019 |
+/// | `score_sa` | see the assertion message | |
+/// | `mstep_draws = 3` | see the assertion message | |
+///
+/// The assertion is **not** "the new arm is closer" — one seed cannot carry
+/// that claim, and the busulfan benchmark in the PR description is where the
+/// six-seed comparison lives. What is pinned here is that each arm lands inside
+/// the same anchored window the default arm has to satisfy, so a change that
+/// breaks one of them (a sign slip in the accumulators, a stored draw that is
+/// never re-centred) cannot land green.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored numerical M-step (#1458): opt in with --features slow-tests"
+)]
+fn the_alternative_mstep_estimators_also_recover_the_allometric_exponent() {
+    let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
+    assert!(
+        model.covariate_mu_refs.is_empty(),
+        "fixture must defeat covariate mu-ref detection: {:?}",
+        model.covariate_mu_refs
+    );
+
+    let arms: [(&str, FitOptions); 2] = [
+        (
+            "score_sa",
+            FitOptions {
+                saem_mstep_solver: SaemMstepSolver::ScoreSa,
+                ..saem_opts()
+            },
+        ),
+        (
+            "mstep_draws=3",
+            FitOptions {
+                saem_mstep_draws: 3,
+                ..saem_opts()
+            },
+        ),
+    ];
+
+    for (name, opts) in arms {
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{name}: SAEM must run: {e}"));
+        // The arm must actually be in force: a model the scope gate refused
+        // would fall back to the default solver and this test would then be a
+        // second copy of the one above.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("#1458") && w.contains("not available")),
+            "{name}: the scope gate refused this fixture, so the arm never ran: {:?}",
+            result.warnings
+        );
+        let th_wt = theta(&result, "TH_WT");
+        assert!(th_wt.is_finite(), "{name}: TH_WT is not finite: {th_wt}");
+        assert!(
+            (th_wt - NM_POW_TH_WT).abs() < 0.12,
+            "{name}: TH_WT {th_wt:.4} against NONMEM SAEM {NM_POW_TH_WT:.4} \
+             (|Δ| {:.4}); the default `bobyqa` arm realises 0.9026 on this fixture",
+            (th_wt - NM_POW_TH_WT).abs()
+        );
+        assert!(
+            (th_wt - BEFORE_TH_WT).abs() > 0.3,
+            "{name}: TH_WT = {th_wt:.4} must be clear of the pre-#1415 stall at \
+             {BEFORE_TH_WT} — an arm that never moves the theta passes the anchor \
+             bound above only because the start is not far from it"
+        );
+        assert_finite_close(
+            &format!("{name}: TVCL"),
+            theta(&result, "TVCL"),
+            NM_POW_TVCL,
+            0.25,
+        );
+        assert_finite_close(
+            &format!("{name}: TVV"),
+            theta(&result, "TVV"),
+            NM_POW_TVV,
+            1.5,
+        );
+        assert_finite_close(
+            &format!("{name}: omega^2(ETA_CL)"),
+            omega(&result, "ETA_CL"),
+            NM_POW_OMEGA_CL,
+            0.03,
+        );
+    }
+}
+
+/// Tier-2, #1458. A model outside the plain-Gaussian scope must say so and keep
+/// the historical solver, rather than stepping on an information matrix whose
+/// closed form does not hold there. Fast: the fit is cut to a handful of
+/// iterations, and what is asserted is the warning, not the estimate.
+///
+/// The out-of-scope shape used here is a **residual magnitude** (`weight = …`),
+/// which is the case closest to in-scope — θ reaches the residual variance
+/// through a second channel the expected-information closed form does not carry
+/// — and which runs on the same data as the in-scope control.
+///
+/// It takes **three** edits, not one: the parser refuses `weight =` on a purely
+/// proportional error ("a common scale factor cancels out of a proportional
+/// (constant-CV) error"), so the variant also needs an additive component for
+/// the weight to act on, and a magnitude expression must declare its covariate
+/// ("an undeclared name silently evaluates to 0 and would make the magnitude a
+/// constant"). `has_custom_ruv_magnitude` is asserted below because
+/// that is the property the scope gate actually reads — without it a fixture
+/// that parsed but carried no magnitude would exercise the in-scope path and
+/// the test would be asserting nothing.
+#[test]
+fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
+    let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
+    let short = |mut o: FitOptions| {
+        o.saem_n_exploration = 2;
+        o.saem_n_convergence = 2;
+        o.saem_n_mh_steps = 2;
+        o
+    };
+    let score_sa = || FitOptions {
+        saem_mstep_solver: SaemMstepSolver::ScoreSa,
+        ..saem_opts()
+    };
+    let k_draws = || FitOptions {
+        saem_mstep_draws: 3,
+        ..saem_opts()
+    };
+
+    // In scope: no fallback warning, so the assertions below are about the gate
+    // and not about every fit emitting the message.
+    let ok = fit(&model, &pop, &model.default_params, &short(score_sa()))
+        .expect("in-scope SAEM must run");
+    assert!(
+        !ok.warnings.iter().any(|w| w.contains("not available")),
+        "an in-scope model must not warn: {:?}",
+        ok.warnings
+    );
+
+    // Out of scope by one line: the same model with a residual magnitude.
+    let src = std::fs::read_to_string(
+        Path::new("nonmem_anchor").join("covmuref_power_numeric_saem_fit.ferx"),
+    )
+    .expect("anchor model file");
+    let magnitude_src = src
+        .replace(
+            "  sigma PROP_ERR ~ 0.02",
+            "  sigma PROP_ERR ~ 0.02\n  sigma ADD_ERR  ~ 0.50 (sd)",
+        )
+        .replace(
+            "DV ~ proportional(PROP_ERR)",
+            "DV ~ combined(PROP_ERR, ADD_ERR) weight = WT
+
+[covariates]
+  WT continuous",
+        );
+    assert_ne!(magnitude_src, src, "the magnitude edit did not apply");
+    assert!(
+        magnitude_src.contains("ADD_ERR") && magnitude_src.contains("weight = WT"),
+        "both halves of the magnitude edit must land: {magnitude_src}"
+    );
+    let mag = parse_full_model(&magnitude_src)
+        .expect("magnitude variant parses")
+        .model;
+    assert!(
+        mag.has_custom_ruv_magnitude(),
+        "the variant must really carry a magnitude, or this tests nothing"
+    );
+
+    let refused = fit(&mag, &pop, &mag.default_params, &short(score_sa()))
+        .expect("out-of-scope SAEM must still run");
+    assert!(
+        refused
+            .warnings
+            .iter()
+            .any(|w| w.contains("score_sa") && w.contains("magnitude")),
+        "a residual magnitude must be refused by name: {:?}",
+        refused.warnings
+    );
+
+    let refused_k = fit(&mag, &pop, &mag.default_params, &short(k_draws()))
+        .expect("out-of-scope SAEM must still run");
+    assert!(
+        refused_k
+            .warnings
+            .iter()
+            .any(|w| w.contains("mstep_draws") && w.contains("magnitude")),
+        "`mstep_draws` must be refused by name too: {:?}",
+        refused_k.warnings
+    );
+}
+
+/// Tier-2, #1458. **Each option must be distinguishable from the default
+/// through `fit()`.**
+///
+/// This is the gate the rest of the #1458 tests were missing. The Tier-1 tests
+/// drive `MstepScoreSa::step` and `theta_sigma_mstep_light` directly, and the
+/// Tier-3 anchor below asserts each arm lands in a window the **default** arm
+/// already satisfies — so deleting the wiring in `run_saem` (returning
+/// `score_sa = None` after the option is read, or forcing `mstep_draws = 1`
+/// before the history push) left every one of them green. Codex review of
+/// PR #1462 found that; this test is the answer.
+///
+/// It runs the production path three times on one model and seed, changing
+/// nothing but the option, and asserts the estimates **differ**. A fit is a
+/// deterministic function of (model, data, options, seed), so two arms of the
+/// same estimator would be bit-identical: any non-zero difference is the option
+/// taking effect, and a mutation that stops it taking effect makes the
+/// difference exactly zero.
+///
+/// Realised worst |Δ log θ| against the `bobyqa` arm on this fixture at
+/// 8/8/3 (printed by the assertion when it fires): `score_sa` **1.03e-1**,
+/// `mstep_draws = 3` **1.43e-2**. The `1e-4` gate is two orders below the
+/// smaller of those — loose enough that the schedule can be retuned without
+/// re-measuring, tight enough that only an exactly-zero difference (the
+/// mutation) fails it.
+///
+/// Deliberately short (8 exploration + 8 convergence, 3 MH steps): what is
+/// asserted is that the option reaches the estimator, not where it converges.
+#[test]
+fn each_mstep_option_changes_the_fit_through_the_public_api() {
+    let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
+
+    let short = |mut o: FitOptions| {
+        o.saem_n_exploration = 8;
+        o.saem_n_convergence = 8;
+        o.saem_n_mh_steps = 3;
+        o
+    };
+    let run = |o: FitOptions| -> Vec<f64> {
+        let r = fit(&model, &pop, &model.default_params, &short(o)).expect("SAEM must run");
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("#1458") && w.contains("not available")),
+            "the scope gate refused this fixture, so no arm ran: {:?}",
+            r.warnings
+        );
+        r.theta.clone()
+    };
+
+    let base = run(saem_opts());
+
+    // The control: the default arm run twice is bit-identical, so any
+    // difference below is the option and not fit-to-fit noise.
+    assert_eq!(
+        base,
+        run(saem_opts()),
+        "two default fits at the same seed are not bit-identical — the \
+         differences below cannot be attributed to the option"
+    );
+
+    let worst = |a: &[f64], b: &[f64]| -> f64 {
+        a.iter().zip(b.iter()).fold(0.0f64, |m, (x, y)| {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "non-finite theta: {x} vs {y}"
+            );
+            m.max((x.ln() - y.ln()).abs())
+        })
+    };
+
+    for (name, opts) in [
+        (
+            "mstep_solver = score_sa",
+            FitOptions {
+                saem_mstep_solver: SaemMstepSolver::ScoreSa,
+                ..saem_opts()
+            },
+        ),
+        (
+            "mstep_draws = 3",
+            FitOptions {
+                saem_mstep_draws: 3,
+                ..saem_opts()
+            },
+        ),
+    ] {
+        let arm = run(opts);
+        let d = worst(&arm, &base);
+        assert!(
+            d > 1e-4,
+            "{name} did not change the fit (worst |Δ log θ| = {d:.4e}) — the option is not \
+             reaching the estimator. Realised when written: score_sa 1.03e-1, \
+             mstep_draws = 3 1.43e-2. base = {base:?}, arm = {arm:?}"
+        );
+    }
 }

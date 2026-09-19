@@ -122,6 +122,27 @@ fn laplace_one_point_fast_enabled() -> bool {
     })
 }
 
+fn laplace_mode_nll_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_MODE_NLL_REUSE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
+/// Benchmark-only A/B switch for reusing the exact anchor's base sensitivity jet in
+/// `deta_hat/dx`. Both routes call the same response assembly; the disabled route merely
+/// rebuilds the identical jet first.
+fn laplace_eta_dx_base_jet_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_ETA_DX_BASE_JET_REUSE")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
 /// Hard cap on the tensor-grid size `n_agq^n_eta`, enforced at model-check time by
 /// [`crate::api::check_model_options`]. The tensor rule costs one full likelihood
 /// evaluation per node per subject per outer iteration, so the grid — not the node count —
@@ -132,6 +153,10 @@ pub const MAX_AGQ_GRID: usize = 100_000;
 /// The sentinel a non-finite likelihood collapses to, matching `individual_nll`'s own
 /// convention so a diverged node sorts as "impossible" rather than poisoning the sum.
 const NLL_SENTINEL: f64 = 1e20;
+
+/// Work already produced by the immediately preceding inner solve at the same
+/// population parameters and mode: optional exact curvature plus the mode NLL.
+pub(crate) type TerminalLaplaceWork = (Option<DMatrix<f64>>, f64);
 
 /// Relative step for central-differencing the grid-response term (and the mixed
 /// `∂²nll/∂η∂x` in [`eta_dx`]).
@@ -733,6 +758,7 @@ pub(crate) fn agq_subject_nll(
         false,
         schedule,
         None,
+        None,
     )
     .0
 }
@@ -758,6 +784,7 @@ fn agq_subject_evaluate(
     retain_gradient_work: bool,
     schedule: Option<&pk::event_driven::EventSchedule>,
     terminal_hessian: Option<&DMatrix<f64>>,
+    terminal_mode_nll: Option<f64>,
 ) -> (f64, Option<PreparedGrid>) {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
@@ -829,17 +856,27 @@ fn agq_subject_evaluate(
     };
 
     // One-point AGQ is Laplace exactly.  Avoid constructing the one-element tensor
-    // grid and its coordinate/work vectors on objective-only evaluations: at z=0
-    // the transformed node is b_hat, while the sqrt(PI) rule weight cancels the
-    // d/2*log(PI) normalization term algebraically.
-    if nodes.len() == 1 && !retain_gradient_work && laplace_one_point_fast_enabled() {
-        let mode_nll = stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule);
+    // grid and, when the inner solve handed it to us, avoid re-evaluating the
+    // conditional NLL at the very same mode. At z=0 the transformed node is
+    // b_hat, while the sqrt(PI) rule weight cancels the d/2*log(PI)
+    // normalization term algebraically.
+    if nodes.len() == 1 && laplace_one_point_fast_enabled() {
+        let reusable_nll = terminal_mode_nll.filter(|_| laplace_mode_nll_reuse_enabled());
+        let mode_nll = reusable_nll.map_or_else(
+            || stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule),
+            |nll| nll,
+        );
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
-        return if nll.is_finite() {
-            (nll, None)
-        } else {
-            (NLL_SENTINEL, None)
-        };
+        if !nll.is_finite() {
+            return (NLL_SENTINEL, None);
+        }
+        let prepared = retain_gradient_work.then(|| PreparedGrid {
+            h,
+            bs: b_hat.to_vec(),
+            softmax: vec![1.0],
+            base_jet,
+        });
+        return (nll, prepared);
     }
 
     let (bs, terms) = agq_nodes_and_terms(
@@ -1116,7 +1153,7 @@ pub(crate) fn agq_population_nll_prepared(
     n_nodes: usize,
     anchor: HessianAnchor,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
-    terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
+    terminal_work: Option<&[TerminalLaplaceWork]>,
 ) -> f64 {
     agq_population_nll_impl(
         model,
@@ -1127,7 +1164,7 @@ pub(crate) fn agq_population_nll_prepared(
         n_nodes,
         anchor,
         schedules,
-        terminal_hessians,
+        terminal_work,
     )
 }
 
@@ -1141,7 +1178,7 @@ fn agq_population_nll_impl(
     n_nodes: usize,
     anchor: HessianAnchor,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
-    terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
+    terminal_work: Option<&[TerminalLaplaceWork]>,
 ) -> f64 {
     let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
     let uncached_log_weights;
@@ -1171,7 +1208,8 @@ fn agq_population_nll_impl(
                 anchor,
                 false,
                 schedule,
-                terminal_hessians.and_then(|all| all[i].as_ref()),
+                terminal_work.and_then(|all| all[i].0.as_ref()),
+                terminal_work.map(|all| all[i].1),
             )
             .0
         })
@@ -1198,7 +1236,7 @@ pub(crate) fn agq_population_evaluate(
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model, population, params, template, x, eta_hats, kappas, bounds, options, n_nodes, anchor,
-        None,
+        None, None,
     )
 }
 
@@ -1219,6 +1257,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
     n_nodes: usize,
     anchor: HessianAnchor,
     schedules: &[Option<pk::event_driven::EventSchedule>],
+    terminal_work: &[TerminalLaplaceWork],
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -1233,6 +1272,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
         n_nodes,
         anchor,
         Some(schedules),
+        Some(terminal_work),
     )
 }
 
@@ -1250,6 +1290,7 @@ fn agq_population_evaluate_impl(
     n_nodes: usize,
     anchor: HessianAnchor,
     schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    terminal_work: Option<&[TerminalLaplaceWork]>,
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
@@ -1283,6 +1324,7 @@ fn agq_population_evaluate_impl(
                 true,
                 schedule,
                 None,
+                terminal_work.map(|all| all[i].1),
             );
             let prepared = grid.map(|grid| PreparedSubject::Grid { stack, b_hat, grid });
             let score = context.score_with_prepared(
@@ -1847,7 +1889,18 @@ fn grid_response_correction(
     // sensitivity provider already supplies and the EBE predictor already relies on). No
     // inner re-solve is needed.
     let db_dx = eta_dx(
-        model, subject, params, template, stack, x, b_hat, scratch, schedule,
+        model,
+        subject,
+        params,
+        template,
+        stack,
+        x,
+        b_hat,
+        base_jet
+            .as_ref()
+            .filter(|_| laplace_eta_dx_base_jet_reuse_enabled()),
+        scratch,
+        schedule,
     )?;
 
     // `∂nll/∂b` at every base node — the node-response factor. Independent of `k`, so this is
@@ -2437,6 +2490,7 @@ fn eta_dx(
     stack: &Stack,
     x: &[f64],
     b_hat: &[f64],
+    base_jet: Option<&crate::sens::provider::SubjectSens>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Option<Vec<nalgebra::DVector<f64>>> {
@@ -2453,9 +2507,14 @@ fn eta_dx(
                 model, subject, template, x, b_hat,
             )
         } else {
-            crate::estimation::sens_outer_gradient::subject_eta_dx(
-                model, subject, template, x, b_hat,
-            )
+            match base_jet {
+                Some(sens) => crate::estimation::sens_outer_gradient::subject_eta_dx_from_sens(
+                    model, subject, params, template, x, b_hat, sens,
+                ),
+                None => crate::estimation::sens_outer_gradient::subject_eta_dx(
+                    model, subject, template, x, b_hat,
+                ),
+            }
         };
         if let Some(v) = exact {
             return Some(v);
@@ -3158,6 +3217,7 @@ mod tests {
             &stack,
             &x,
             ebe.eta.as_slice(),
+            None,
             &mut scratch2,
             schedule.as_ref(),
         )
@@ -3649,6 +3709,7 @@ mod tests {
                     &stack,
                     &x,
                     b_hat,
+                    None,
                     &mut scratch,
                     schedule.as_ref(),
                 )
@@ -4632,8 +4693,40 @@ mod tests {
                 cached_nll.to_bits(),
                 "{anchor:?}: cached population NLL diverged from the uncached rebuild"
             );
+            let terminal_work: Vec<_> = population
+                .subjects
+                .iter()
+                .enumerate()
+                .map(|(i, subject)| {
+                    let stack = Stack::new(&model, &params, 0);
+                    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+                    let hessian = matches!(anchor, HessianAnchor::Exact)
+                        .then(|| {
+                            anchor_hessian(
+                                anchor,
+                                &model,
+                                subject,
+                                &params,
+                                &stack,
+                                eta_hats[i].as_slice(),
+                                &mut scratch,
+                                schedules[i].as_ref(),
+                            )
+                        })
+                        .flatten();
+                    let mode_nll = stack.nll_at(
+                        &model,
+                        subject,
+                        &params,
+                        eta_hats[i].as_slice(),
+                        &mut scratch,
+                        schedules[i].as_ref(),
+                    );
+                    (hessian, mode_nll)
+                })
+                .collect();
             if matches!(anchor, HessianAnchor::Exact) {
-                let terminal_hessians: Vec<_> = population
+                let retained_terminal_work: Vec<_> = population
                     .subjects
                     .iter()
                     .enumerate()
@@ -4665,7 +4758,7 @@ mod tests {
                             retained, anchored,
                             "subject {i}: retained terminal Hessian is not the exact anchor"
                         );
-                        Some(retained)
+                        (Some(retained), terminal_work[i].1)
                     })
                     .collect();
                 let reused = agq_population_nll_prepared(
@@ -4677,12 +4770,40 @@ mod tests {
                     3,
                     anchor,
                     Some(&schedules),
-                    Some(&terminal_hessians),
+                    Some(&retained_terminal_work),
                 );
                 assert_eq!(
                     cached_nll.to_bits(),
                     reused.to_bits(),
                     "terminal Hessian reuse changed the exact-anchor objective"
+                );
+
+                let fresh_one = agq_population_nll_impl(
+                    &model,
+                    &population,
+                    &params,
+                    &eta_hats,
+                    &kappas,
+                    1,
+                    anchor,
+                    Some(&schedules),
+                    None,
+                );
+                let reused_one = agq_population_nll_impl(
+                    &model,
+                    &population,
+                    &params,
+                    &eta_hats,
+                    &kappas,
+                    1,
+                    anchor,
+                    Some(&schedules),
+                    Some(&terminal_work),
+                );
+                assert_eq!(
+                    fresh_one.to_bits(),
+                    reused_one.to_bits(),
+                    "terminal mode NLL reuse changed the one-node Laplace objective"
                 );
             }
 
@@ -4712,6 +4833,7 @@ mod tests {
                 3,
                 anchor,
                 &schedules,
+                &terminal_work,
             );
             assert_eq!(uncached_eval.nll.to_bits(), cached_eval.nll.to_bits());
             let (uncached_grad, cached_grad) = (
@@ -4725,6 +4847,48 @@ mod tests {
                     c.to_bits(),
                     "{anchor:?} gradient coordinate {i}: uncached={u:e}, cached={c:e}"
                 );
+            }
+
+            if matches!(anchor, HessianAnchor::Exact) {
+                let fresh_one = agq_population_evaluate_impl(
+                    &model,
+                    &population,
+                    &params,
+                    template,
+                    &x,
+                    &eta_hats,
+                    &kappas,
+                    &bounds,
+                    &options,
+                    1,
+                    anchor,
+                    Some(&schedules),
+                    None,
+                );
+                let reused_one = agq_population_evaluate_impl(
+                    &model,
+                    &population,
+                    &params,
+                    template,
+                    &x,
+                    &eta_hats,
+                    &kappas,
+                    &bounds,
+                    &options,
+                    1,
+                    anchor,
+                    Some(&schedules),
+                    Some(&terminal_work),
+                );
+                assert_eq!(fresh_one.nll.to_bits(), reused_one.nll.to_bits());
+                for (fresh, reused) in fresh_one
+                    .gradient
+                    .expect("fresh one-node gradient")
+                    .iter()
+                    .zip(reused_one.gradient.expect("reused one-node gradient"))
+                {
+                    assert_eq!(fresh.to_bits(), reused.to_bits());
+                }
             }
         }
     }
