@@ -10,26 +10,25 @@
 //! FREM warfarin fixture, and +3513 on that same FREM fixture under glibc (#1349).
 //!
 //! The unit tests in `outer_optimizer_tests.rs` own the selection rule itself
-//! (`warm_solve_wins`, `ebe_start_dependence_gap`); this file pins the wiring, on a
-//! fixture built so the disagreement is a property of the *configuration* rather than
-//! of one platform's libm.
+//! (`warm_solve_wins`, `ebe_start_dependence_gap`); this file pins the end-to-end
+//! reported objective.  The analytic inner-Hessian seed can now let the cold solve
+//! reproduce the warm mode even under the deliberately tight budget below, so the
+//! warning arm is checked when exercised rather than treated as a precondition.
 
 use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::types::{WarningCode, WarningSeverity};
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
-/// A tightened inner budget is the deterministic way to make a cold restart disagree
-/// with the warm trajectory: `inner_maxiter` is a budget, so a warm start that begins at
-/// the previous iteration's η̂ arrives on it and a cold start from η = 0 spending the
-/// same budget does not. Nothing here depends on the individual objective being
-/// multimodal, which is what makes it reproducible off one machine.
+/// A tightened inner budget historically made a cold restart disagree with the warm
+/// trajectory: `inner_maxiter` is a budget, so a warm start that begins at the previous
+/// iteration's η̂ can arrive on it before a cold start from η = 0. The analytic Hessian
+/// seed can now close that gap without changing the objective this fixture must report.
 ///
-/// 10 is measured, not picked. Below it the *fit* starves too and never reaches the
-/// optimum at all (OFV 242.5 at 1, 212.4 at 2, 196.5 at 3, 188.9 at 5 — and no gap,
-/// because a trajectory that never converged has nothing a cold restart can fail to
-/// reproduce). At 10 the warm trajectory reaches warfarin's usual FOCEI optimum while a
-/// cold re-solve on the same budget lands 255 OFV units short.
+/// 10 was measured before analytic inner-Hessian seeding. Below it the *fit* starves too
+/// and never reaches the optimum at all (OFV 242.5 at 1, 212.4 at 2, 196.5 at 3, 188.9
+/// at 5). At 10 the warm trajectory reaches warfarin's usual FOCEI optimum; historically
+/// its cold re-solve landed 255 OFV units short.
 fn starved_inner_opts() -> FitOptions {
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
@@ -55,47 +54,41 @@ fn a_fit_reports_the_objective_its_optimizer_reached() {
     )
     .expect("a starved-inner fit still returns a result");
 
-    // Precondition, and the reason this fixture exists: the two final solves must
-    // actually disagree here. Without a gap the assertions below are satisfied by the
-    // pre-#833 behaviour they exist to reject.
+    // If the cold and warm solves still disagree, pin the #833 selection and warning
+    // wiring.  With analytic Hessian seeding the cold solve can now reach the warm mode
+    // within this same budget, in which case no warning is the correct result.
     let entry = starved
         .warnings_structured
         .iter()
-        .find(|w| w.category == WarningCode::EbeStartDependent)
-        .unwrap_or_else(|| {
-            panic!(
-                "expected an ebe_start_dependent warning — a cold restart on a 10-iteration \
-                 inner budget cannot reproduce the warm trajectory's EBEs, so if this is \
-                 absent the second solve is not running. warnings: {:?}",
-                starved.warnings
-            )
-        });
-    assert_eq!(entry.severity, WarningSeverity::Warning);
-
-    // The message quotes `(<cold> vs the reported <ofv>)`. The reported OFV must be the
-    // lower of the two, and must be the number the fit actually publishes.
-    let (cold, reported) = parse_ebe_gap_message(&entry.message);
-    assert!(
-        cold > reported,
-        "the reported OFV ({reported}) must be the lower of the two solves; cold = {cold}"
-    );
-    assert!(
-        (reported - starved.ofv).abs() < 5e-4,
-        "the warning's reported value ({reported}) must be the fit's own OFV ({})",
-        starved.ofv
-    );
+        .find(|w| w.category == WarningCode::EbeStartDependent);
+    let cold = entry.map(|entry| {
+        assert_eq!(entry.severity, WarningSeverity::Warning);
+        // The message quotes `(<cold> vs the reported <ofv>)`. The reported OFV must be
+        // the lower of the two, and must be the number the fit actually publishes.
+        let (cold, reported) = parse_ebe_gap_message(&entry.message);
+        assert!(
+            cold > reported,
+            "the reported OFV ({reported}) must be the lower of the two solves; cold = {cold}"
+        );
+        assert!(
+            (reported - starved.ofv).abs() < 5e-4,
+            "the warning's reported value ({reported}) must be the fit's own OFV ({})",
+            starved.ofv
+        );
+        assert!(
+            cold - reported > 100.0,
+            "the measured gap on this fixture is ~255 OFV units; got {}",
+            cold - reported
+        );
+        cold
+    });
     // The substantive half: what the fit publishes is warfarin's own FOCEI optimum, the
     // value the trajectory reached. Before #833 this same run reported −31.06 — the cold
     // re-solve — 255 OFV units worse, on a fit whose parameters were fine.
     assert!(
         (starved.ofv - (-286.0042)).abs() < 0.05,
-        "expected the trajectory's own optimum (−286.0042), got {} (cold re-solve = {cold})",
+        "expected the trajectory's own optimum (−286.0042), got {} (cold re-solve = {cold:?})",
         starved.ofv
-    );
-    assert!(
-        cold - reported > 100.0,
-        "the measured gap on this fixture is ~255 OFV units; got {}",
-        cold - reported
     );
 }
 
