@@ -417,16 +417,30 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
 /// `public-api` is the one group not exercised: its command is `tools/update-public-api.sh
 /// --check`, invoked by path rather than through `PATH`, and shimming it would mean
 /// letting the real script hunt for a pinned toolchain. It runs through the same `run`
-/// helper as all eight positions below, which is what is under test.
+/// helper as every position below, which is what is under test.
 #[test]
 fn a_failing_gate_fails_the_script_from_every_position() {
     let root = repo_root();
     let (counter, path) = fake_cargo_on_path("failure-path");
 
     // Every group whose commands are `cargo` invocations, so the fake below intercepts
-    // them. `public-api` shells out to `tools/update-public-api.sh` instead and is covered
-    // by `the_failure_diagnostic_names_the_group_that_actually_failed`.
-    for group in ["fmt", "check", "clippy", "rustdoc", "debug-assertions"] {
+    // them — `env VAR=1 cargo ...` included, since `env` resolves `cargo` through `PATH`.
+    // `public-api` shells out to `tools/update-public-api.sh` instead and is covered by
+    // `the_failure_diagnostic_names_the_group_that_actually_failed`.
+    //
+    // `docs` and `release-semantics` were missing from this list while the comment above
+    // already claimed every cargo-driven group, so neither had its failure PROPAGATION
+    // tested — and #1470 makes the `docs` group's `cargo clippy -p docs-lint` line the
+    // only thing linting that crate, which is a gate whose exit code now matters.
+    for group in [
+        "fmt",
+        "check",
+        "clippy",
+        "rustdoc",
+        "docs",
+        "debug-assertions",
+        "release-semantics",
+    ] {
         let listed = listed_commands(group);
         assert!(
             !listed.is_empty(),
@@ -639,6 +653,10 @@ exit 0
 ///    `tests/` — unlinted. That gap hid 6 `approx_constant` ERRORS (#1023).
 ///  * dropping `--all` from `cargo fmt` formats only the root package, silently skipping
 ///    `crates/ferx-tools` and `crates/ferx-cli` (#1114).
+///  * dropping `-Dunused` from a clippy line leaves it linting and exiting 0 over every
+///    finding it prints, because only clippy's `correctness` group is deny-by-default
+///    (#1470). Measured: `origin/main` at bd6785b printed an `unused import` from
+///    `src/estimation/saem.rs` and then `preflight OK`.
 ///  * narrowing a `--features` set drops a whole cfg-gated surface out of the compile.
 ///    `ci,nn,slow-tests` becoming `ci` is exactly #1133 with the gate still present.
 ///
@@ -688,6 +706,81 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
          every sibling `*_tests.rs` and all of `tests/` go unlinted — the gap that hid 6 \
          `approx_constant` errors in #1023.\n  {}",
         clippy.join("\n  ")
+    );
+
+    // `cargo clippy` EXITS 0 on warn-level findings. Only clippy's `correctness` group is
+    // deny-by-default, which is why #1023's 6 `approx_constant` findings were caught — they
+    // were errors. Everything else is printed and waved through, rustc's own lints
+    // included, so `-Dunused` is the entire difference between this group gating the
+    // leftovers a refactor drops and merely listing them. Measured on `origin/main` at
+    // bd6785b: the group printed `warning: unused import: `individual_nll_into``
+    // (src/estimation/saem.rs:18, orphaned by #1452) and then `preflight OK`, exit 0. The
+    // local gate and the CI job agreed across the six commits that followed — on green,
+    // over a dead import (#1470).
+    //
+    // Same neutered-gate shape as the `RUSTDOCFLAGS=-Dwarnings` block above, and the same
+    // reason it is asserted rather than assumed: delete the flag and the command stays in
+    // the list, still lints, still costs the same, and still passes. The count tripwire in
+    // `preflight_is_executable_and_lists_every_group` owns "a clippy command was deleted";
+    // this owns "a clippy command that is listed actually fails on what it finds".
+    //
+    // Deliberately NOT `-Dwarnings`: measured at the same commit, the ferx-core command
+    // alone PRINTS 819 warn-level clippy findings — 272 `field_reassign_with_default`, 74
+    // `too_many_arguments`, 67 `type_complexity`, … — and CI installs a fresh nightly every
+    // run, so denying the whole moving surface would redden PRs on lints that did not exist
+    // when they were opened. (Count printed diagnostics, not cargo's per-unit counters:
+    // those read 356 for `lib` and 579 for `lib test`, and 354 of the second is the first
+    // counted again, so adding them overstates the total by a third.)
+    //
+    // `unused` is smaller on that count and SLOWER, not still. Measured with
+    // `rustc -W help`: the group holds 23 lints on `stable` and on `nightly-2026-05-29`,
+    // and 25 on the `nightly` of 2026-08-29 (`repeated_reprs`,
+    // `unreachable_cfg_select_predicates` joined inside three months of one channel). The
+    // argument for it over `-Dwarnings` is blast radius and recovery — a couple of lints a
+    // quarter, each stating that one item is unused, where the fix is deleting the item —
+    // not stasis. It is also strictly more than the warn-level unused lints: denying a
+    // GROUP promotes its allow-by-default members (`unused_extern_crates`,
+    // `unused_macro_rules`) to deny as well.
+    //
+    // A blanket over EVERY group, not one loop for `clippy` and one for `docs`. Those two
+    // rejected exactly the same inputs a single loop does — the two-gates-covering-for-
+    // each-other shape CLAUDE.md calls a test hole, since deleting either left the suite
+    // green — and being group-scoped they left a `cargo clippy` landing in `check`, `fmt`
+    // or `public-api` asserting nothing (`rustdoc` and `docs` have their own blanket loops,
+    // `debug-assertions` and `release-semantics` demand `cargo test `). Measured: a clippy
+    // command planted in a group with no blanket passed every assertion in this file.
+    for group in all_groups() {
+        for cmd in listed_commands(&group) {
+            if !cmd.contains("cargo clippy") {
+                continue;
+            }
+            assert!(
+                cmd.contains("-- -Dunused"),
+                "a `cargo clippy` command in group `{group}` does not deny the `unused` \
+                 lint group, so clippy exits 0 on every `unused import` / `dead_code` / \
+                 `unused_variables` finding it prints and the job goes green over them \
+                 (#1470):\n  {cmd}"
+            );
+        }
+    }
+
+    // `docs-lint` is linted ONLY by the `cargo clippy -p docs-lint` line in `group_docs` —
+    // the `clippy` group is scoped to `ferx-core` and its two members. The blanket above
+    // gates every clippy line that IS listed; this one gates that `docs` still lists one.
+    // The count tripwire in `preflight_is_executable_and_lists_every_group` sees the
+    // command deleted (2 → 1) but not the command REPLACED: a `docs` group of two
+    // `cargo test -p docs-lint` lines counts 2, leaves the crate unlinted, and makes the
+    // blanket vacuous for `docs`. Measured — that mutation leaves all eight group counts at
+    // their expected values, and this assertion is the only one in the file that fires.
+    let docs_lint: Vec<String> = listed_commands("docs")
+        .into_iter()
+        .filter(|c| c.contains("cargo clippy"))
+        .collect();
+    assert!(
+        !docs_lint.is_empty(),
+        "the `docs` group runs no `cargo clippy`, so `crates/docs-lint` is linted by \
+         nothing — the `clippy` group's package list does not include it (#1163).\n  {}",
+        listed_commands("docs").join("\n  ")
     );
 
     let fmt = listed_commands("fmt");

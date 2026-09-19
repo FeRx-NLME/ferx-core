@@ -15,9 +15,8 @@ use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov,
-    individual_nll_iov_with_scratch_and_schedule, individual_nll_prepared, iov_occasion_groups,
-    IndividualNllPrep, IndividualNllScratch,
+    individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
+    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -987,6 +986,14 @@ impl MstepScoreSa {
     }
 
     /// Total M-steps that did not move theta/sigma, for any reason.
+    ///
+    /// **Test-only**, unlike [`MstepScoreSa::failures`] above, which
+    /// `score_sa_failure_warning` reports per reason on the fit path. Nothing in
+    /// production wants the bare sum — the point of #1458's six routes is *which* one
+    /// fired — so the total exists for the assertions in `saem_mstep_sa_tests.rs` that
+    /// pin "exactly one route fired" and "the counter accumulates". `#[cfg(test)]`
+    /// rather than deleted so those keep reading one definition.
+    #[cfg(test)]
     fn failure_total(&self) -> u64 {
         self.failures.iter().sum()
     }

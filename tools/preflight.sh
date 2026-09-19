@@ -301,6 +301,62 @@ group_check() {
 group_clippy() {
   CI_JOB="Clippy"
 
+  # `-Dunused` is what makes this a GATE rather than a log, and it is the whole of
+  # #1470.
+  # `cargo clippy` exits 0 on every warn-level diagnostic: only clippy's
+  # `correctness` group is deny-by-default, which is why #1023 caught 6
+  # `approx_constant` findings — those were ERRORS. Everything else is printed and
+  # waved through, rustc's own lints included. Measured on `origin/main` at bd6785b:
+  # this group printed `warning: unused import: `individual_nll_into``
+  # (src/estimation/saem.rs:18, left behind by #1452 when it moved the SAEM E-step onto
+  # `individual_nll_prepared`), then printed `preflight OK` and exited 0. The gate saw
+  # the defect and reported green — so the local run and the CI job agreed, on the
+  # wrong answer, across the six commits that landed on `main` after it.
+  #
+  # Why the `unused` GROUP and not `-Dwarnings`. `-Dwarnings` is not reachable from
+  # here: the ferx-core command alone PRINTS 819 warn-level clippy findings today —
+  # 272 `field_reassign_with_default`, 74 `too_many_arguments`, 67 `type_complexity`,
+  # 55 `doc_lazy_continuation`, 51 `neg_cmp_op_on_partial_ord`, … — so denying
+  # everything would be an 800-finding cleanup wearing a CI change as a hat. (Count
+  # the printed diagnostics, not cargo's per-unit counters: those read 356 for `lib`
+  # and 579 for `lib test`, and 354 of the second number is the first counted again,
+  # so adding them overstates the total by a third. Measured that way once here, and
+  # the corrected figures are the ones above.) It would also put a MOVING surface in
+  # the gate: CI installs a fresh
+  # nightly every run (see the note below), and clippy's warn-level lint set grows
+  # with it, so an unrelated PR would go red on a lint that did not exist when it was
+  # opened. `unused` is smaller on the first count and SLOWER, not still, on the second.
+  # Measured with `rustc -W help` on the three toolchains installed here: the group holds
+  # 23 lints on `stable` and on `nightly-2026-05-29`, and 25 on the `nightly` of
+  # 2026-08-29 — `repeated_reprs` and `unreachable_cfg_select_predicates` joined it
+  # inside three months of one channel. So the argument is blast radius and recovery, not
+  # stasis: a couple of lints a quarter, each stating that one item is unused, where the
+  # fix is deleting the item rather than an 800-finding cleanup. Do not write this down as
+  # "long-stable" again — one `rustc -W help` is the measurement.
+  #
+  # Two consequences worth knowing before you hit one. Denying a GROUP also promotes its
+  # allow-by-default members: `unused_extern_crates` and `unused_macro_rules` are `allow`
+  # in `rustc -W help` but in `unused`, so a `macro_rules!` arm nothing invokes is an
+  # error here even though a plain nightly build never mentions it. And `dead_code` never
+  # fires on a `pub` item and counts a test-only reader as a use under `--all-targets` —
+  # which is exactly what the two `#[cfg(test)]`s in #1470 rely on, and the reason a green
+  # run means "nothing unused among non-`pub` items", not "no dead code". The tree is
+  # clean under all of that: the findings it had were the saem.rs import above, a
+  # `JointPkTteSolve` field only a test reads (`src/stats/likelihood.rs`) and
+  # `MstepScoreSa::failure_total`, all three resolved in #1470.
+  #
+  # It rides in the argument vector, after `--`, for two reasons. `run` echoes `$*`, so
+  # `--list` shows what will actually run (the same argument `group_rustdoc` makes for
+  # its `env RUSTDOCFLAGS=` form). And cargo applies `--` args only to the packages it
+  # is building, never to registry dependencies, so unlike `RUSTFLAGS=-Dunused` this
+  # changes no dependency fingerprint and forces no second dependency build. Measured:
+  # adding the flag re-checked `ferx-core`, `ferx-tools` and `ferx-cli` and not one of
+  # the ~80 registry crates.
+  #
+  # What it does NOT cover: `slow-tests` is off here, so an unused item inside a
+  # `slow-tests`-gated body is still invisible. Denying it would also be wrong — the
+  # nightly job that compiles that code is where it is used.
+  #
   # `markov` and `nn` so the CTMM module and the covariate-NN / DCM stack are linted
   # too (both compiled out of the base `ci` build). `markov = ["survival"]`, so this
   # covers the whole non-Gaussian endpoint surface as well.
@@ -315,14 +371,20 @@ group_clippy() {
   # local toolchain unless you have updated recently — one of those 6
   # (`EULER_GAMMA`, `src/stats/special.rs`) is invisible to an old clippy. Run
   # `rustup update nightly` before trusting a green result here.
-  run cargo clippy --no-default-features --features ci,markov,nn --all-targets
+  run cargo clippy --no-default-features --features ci,markov,nn --all-targets -- -Dunused
 
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
   # ferx-core line) because the members' test code is a meaningful share of their
   # line count while they are still small.
+  #
+  # The `--` args reach BOTH `-p` packages, not just the last one — worth stating
+  # because the opposite would make half this line decoration, and it is not obvious
+  # from cargo's docs. Verified by injecting an unused import into each crate on its
+  # own: ferx-tools alone and ferx-cli alone each give `error: unused import` and
+  # exit 101 from this exact command.
   run cargo clippy -p ferx-tools -p ferx-cli --tests --no-default-features \
-    --features ferx-core/ci,ferx-core/markov,ferx-core/nn
+    --features ferx-core/ci,ferx-core/markov,ferx-core/nn -- -Dunused
 }
 
 group_docs() {
@@ -339,7 +401,12 @@ group_docs() {
   # `docs-lint` is outside the `Clippy` group's package list (which is scoped to
   # `ferx-core` and its two members), so without this line the crate would be
   # linted by nothing. Cheap: the compile above already warmed it.
-  run cargo clippy -p docs-lint --all-targets
+  #
+  # `-Dunused` for the same reason as `group_clippy`, and it has to be repeated here
+  # rather than inherited: this is a separate `cargo clippy` invocation, so a crate
+  # whose lint coverage exists only because of this line would otherwise keep exactly
+  # the exit-0 hole #1470 closed everywhere else.
+  run cargo clippy -p docs-lint --all-targets -- -Dunused
 }
 
 group_rustdoc() {
