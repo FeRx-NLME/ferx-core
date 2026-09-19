@@ -1569,6 +1569,82 @@ fn light_seed_gradient_applies_cens_only_under_m3() {
     );
 }
 
+/// `gradient = fd` (like `FERX_NO_ANALYTIC_INNER`) promises the historical FD inner solve.
+/// The seed is a provider product too, so it must decline under that hatch: without the gate
+/// the fused gradient was correctly dropped (`use_analytic` false) but the provider's `H̃` was
+/// still accepted as the BFGS metric whenever it was SPD, and the FD solve no longer
+/// reproduced the unseeded path. Asserted on the seed helper (both the light and the exact
+/// arm) and end to end: under `fd` a seeded policy must be bit-identical to the unseeded one,
+/// while under the default `analytic` routing the two solves genuinely differ.
+#[test]
+fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
+    let (mut model, subject) = wellidentified_oral_fixture();
+    let params = model.default_params.clone();
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let eta = vec![0.05, -0.02, 0.1];
+    let seed = |model: &CompiledModel, exact: bool| {
+        analytic_inner_seed_hessian(
+            model,
+            &subject,
+            &params,
+            &eta,
+            None,
+            None,
+            &err_keys,
+            &mut Vec::new(),
+            exact,
+        )
+    };
+    assert!(
+        seed(&model, false).is_some(),
+        "premise: light seed in scope"
+    );
+    assert!(seed(&model, true).is_some(), "premise: exact seed in scope");
+
+    let solve = |model: &CompiledModel, seed: InnerHessianSeed| {
+        let r = find_ebe_cached(
+            model,
+            &subject,
+            &params,
+            100,
+            1e-8,
+            None,
+            None,
+            0,
+            None,
+            InnerSolvePolicy {
+                seed,
+                capture_terminal_hessian: false,
+            },
+        );
+        (r.eta, r.h_matrix, r.grad_norm, r.nll)
+    };
+    let analytic_off = solve(&model, InnerHessianSeed::None);
+    let analytic_on = solve(&model, InnerHessianSeed::GaussNewton);
+    assert_ne!(
+        analytic_off, analytic_on,
+        "premise: the seed must change the analytic solve, or the fd identity is vacuous"
+    );
+
+    model.gradient_method = crate::types::GradientMethod::Fd;
+    assert!(
+        seed(&model, false).is_none(),
+        "light seed ignored `gradient = fd`"
+    );
+    assert!(
+        seed(&model, true).is_none(),
+        "exact seed ignored `gradient = fd`"
+    );
+    let fd_off = solve(&model, InnerHessianSeed::None);
+    for kind in [InnerHessianSeed::GaussNewton, InnerHessianSeed::Exact] {
+        let fd_on = solve(&model, kind);
+        assert_eq!(
+            fd_on, fd_off,
+            "{kind:?} seed changed the `gradient = fd` inner solve"
+        );
+    }
+}
+
 /// `analytic_terminal_work`'s Hessian is trusted verbatim by the objective-only Laplace path in
 /// place of `agq::anchor_hessian(Exact)`, so it must decline exactly where that arm would not
 /// take the provider: outside `analytic_score_supported` — `gradient = fd`, and any

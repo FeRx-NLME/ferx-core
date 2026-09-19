@@ -1713,8 +1713,12 @@ fn fit_inner(
                 &stage_params.theta,
                 stage_opts.mu_referencing,
             );
+            // Seeded like the estimator stages and `run_covariance` (#1389): at a loose
+            // `inner_tol` the seeded and unseeded solves stop at η̂ that differ at the
+            // ~1e-11 level, and this stage's OFV should agree with the one a preceding
+            // Laplace/AGQ stage reported at the same parameters.
             let (eta_hats, h_matrices, _stats, kappas) =
-                crate::estimation::inner_optimizer::run_inner_loop_warm(
+                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
                     model,
                     population,
                     &stage_params,
@@ -1724,6 +1728,7 @@ fn fit_inner(
                     Some(&mu_k),
                     stage_opts.min_obs_for_convergence_check as usize,
                     stage_opts.inner_restarts,
+                    crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,

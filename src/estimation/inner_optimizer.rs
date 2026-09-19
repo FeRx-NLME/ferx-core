@@ -497,6 +497,13 @@ fn analytic_inner_seed_hessian(
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
         return None;
     }
+    // The seed is a provider product like the fused gradient, so it honours the same escape
+    // hatches (`gradient = fd`, `FERX_NO_ANALYTIC_INNER`): a user who routes the inner loop
+    // to FD because the analytic provider misbehaves on their model must get the historical
+    // unseeded solve back, not FD gradients against a provider-built metric.
+    if analytic_inner_common_bail(model) {
+        return None;
+    }
     // The light path fuses the first BFGS gradient, so it must assemble exactly the
     // terms `analytic_eta_nll_gradient_with_schedule` does. Everything that routine
     // routes elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only
