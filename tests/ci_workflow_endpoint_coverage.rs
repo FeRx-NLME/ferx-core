@@ -39,17 +39,46 @@ fn repo_root() -> PathBuf {
 /// though `markov = ["survival"]` implies it, because test files gate on either name.)
 const GATED_FEATURES: [&str; 3] = ["survival", "markov", "nn"];
 
-/// Every `tests/*.rs` whose source mentions one of [`GATED_FEATURES`] as a feature cfg.
+/// Does this source **compile** code gated on one of [`GATED_FEATURES`]?
 ///
 /// Matching on the raw `feature = "…"` string is what makes the set self-maintaining:
 /// any file that compiles feature-gated code *must* gate it (it would not build in the
 /// base `ci` job otherwise), and gating means writing that string.
+///
+/// Line comments are stripped first, because a file that *describes* a cfg does not
+/// compile one. That distinction is not hypothetical and was not free: the version of
+/// this detector that scanned raw text classified
+/// `tests/preflight_owns_the_fast_gates.rs` as endpoint-gated the moment it quoted
+/// `#![cfg(all(feature = "survival", feature = "slow-tests"))]` in a doc comment
+/// explaining which files are double-gated (PR #1450). The failure told the author to
+/// add a `--test` entry for a binary that compiles no gated code at all — i.e. the
+/// error's suggested remedy would have padded the endpoint job for nothing.
+///
+/// Stripping cannot produce a false NEGATIVE, which is the direction that would matter:
+/// a real `#[cfg(feature = "…")]` attribute is never inside a `//` line, and one that is
+/// has been commented out and is not compiled either. Verified against the current tree —
+/// of 120-odd `tests/*.rs`, exactly two change classification under this rule, and both
+/// are CI guard tests that compile nothing gated (this file and the one above).
+fn uses_gated_feature_cfg(src: &str) -> bool {
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    GATED_FEATURES
+        .iter()
+        .any(|f| code.contains(&format!(r#"feature = "{f}""#)))
+}
+
+/// Every `tests/*.rs` that [`uses_gated_feature_cfg`].
 fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
-    // Skip self. The matcher below builds its needles with `format!`, so this file does
-    // not currently quote any of them literally — but it used to, and a future edit that
-    // inlines a cfg string here (in a doc comment, say) would make the file match itself
-    // and demand a `--test` entry for a test that compiles no gated code. `file!()`
-    // rather than a hard-coded name so a rename cannot silently re-introduce that.
+    // Skip self. `uses_gated_feature_cfg` now handles the doc-comment case this guard was
+    // originally written for, but it is kept — and is still load-bearing — for a literal
+    // in CODE: the unit tests below feed the detector synthetic sources containing exactly
+    // the needles it looks for, in ordinary (non-comment) string literals. Without this
+    // skip this file would match itself and demand a `--test` entry for a binary that
+    // compiles nothing gated. `file!()` rather than a hard-coded name so a rename cannot
+    // silently re-introduce that.
     let self_stem = Path::new(file!())
         .file_stem()
         .and_then(|s| s.to_str())
@@ -65,10 +94,7 @@ fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("test file is valid UTF-8");
-        if GATED_FEATURES
-            .iter()
-            .any(|f| src.contains(&format!(r#"feature = "{f}""#)))
-        {
+        if uses_gated_feature_cfg(&src) {
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -141,4 +167,62 @@ fn endpoint_coverage_job_lists_every_feature_gated_test_file() {
          and measured by `Tests + coverage (core)`, so drop their `--test` flags rather than \
          pay a second instrumented compile."
     );
+}
+
+/// The detector must see a real gate. This is the direction that costs money if it
+/// breaks: a missed gate means the file's lines read as uncovered in the merged report
+/// and the PR that added them fails its own ≥90% patch gate with nothing pointing at the
+/// cause. Each spelling below appears in `tests/` today — a whole-file inner attribute, a
+/// per-item outer one, and a `cfg(all(..))` conjunction.
+#[test]
+fn a_real_cfg_attribute_is_detected_in_every_spelling_used_in_the_tree() {
+    for src in [
+        "#![cfg(feature = \"survival\")]\nfn a() {}",
+        "#[cfg(feature = \"nn\")]\n#[test]\nfn b() {}",
+        "#![cfg(all(feature = \"survival\", feature = \"slow-tests\"))]",
+        "#[cfg(feature = \"markov\")]\nmod m {}",
+        // Indented, because an attribute inside a module is not at column 0.
+        "mod m {\n    #[cfg(feature = \"nn\")]\n    fn c() {}\n}",
+    ] {
+        assert!(
+            uses_gated_feature_cfg(src),
+            "a real gate went undetected, so its file would drop out of the endpoint \
+             job's `--test` list and read as uncovered:\n{src}"
+        );
+    }
+}
+
+/// The false-positive direction, and the regression PR #1450 exists to pin: a file that
+/// only *describes* a cfg compiles nothing gated, so demanding a `--test` entry for it
+/// pays an instrumented compile to measure zero lines.
+///
+/// Mutation: delete the `filter` in `uses_gated_feature_cfg` and every case here fails.
+/// The last two are the shapes that actually occurred — the doc comment is
+/// `tests/preflight_owns_the_fast_gates.rs`'s, and the `//!` line is this file's own
+/// module header, which is why the self-skip above existed before this rule did.
+#[test]
+fn a_cfg_named_only_in_a_comment_is_not_a_gate() {
+    for src in [
+        "// #[cfg(feature = \"survival\")]\nfn a() {}",
+        "/// Gated on `#[cfg(feature = \"nn\")]` elsewhere.\nfn b() {}",
+        "///  * `#![cfg(all(feature = \"survival\", feature = \"slow-tests\"))]`\nfn c() {}",
+        "//! add `tests/foo.rs` using `#[cfg(feature = \"survival\")]`, forget the workflow",
+        "    // indented comment naming feature = \"markov\"\nfn d() {}",
+    ] {
+        assert!(
+            !uses_gated_feature_cfg(src),
+            "a cfg mentioned only in a comment was read as a gate; the endpoint job would \
+             be told to build a binary that compiles nothing gated:\n{src}"
+        );
+    }
+}
+
+/// The stripping must not swallow the line it is on. A comment trailing real code leaves
+/// the code, so a gate with an explanatory comment after it is still a gate — the naive
+/// "drop any line containing `//`" rule would lose it, and that is a false negative.
+#[test]
+fn a_trailing_comment_does_not_hide_the_gate_on_its_own_line() {
+    assert!(uses_gated_feature_cfg(
+        "#[cfg(feature = \"survival\")] // TTE only\nfn a() {}"
+    ));
 }
