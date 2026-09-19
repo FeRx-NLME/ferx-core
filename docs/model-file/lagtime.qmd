@@ -169,6 +169,22 @@ harmless and still accepted. The same rule applies to the other two alias pairs,
 `v=`/`v1=` (central volume) and `q=`/`q2=` (inter-compartmental clearance).
 Prefer using only one of the two names per model.
 
+The mirror image — one variable under two **different** roles, `f=X, lagtime=X`
+— is rejected too ([#1359](https://github.com/FeRx-NLME/ferx-core/issues/1359));
+the rule covers every pair of roles, see [Structural model](structural-model.qmd):
+
+```
+[structural_model]: `f=X` and `lagtime=X` bind one parameter to two different
+PK roles (the bioavailability and the absorption lag time). Each role needs its
+own [individual_parameters] variable — e.g. `lagtime=X_LAGTIME` with
+`X_LAGTIME = X` declared in the block.
+```
+
+A `LAGTIME` declared in `[individual_parameters]` but **not** mapped with
+`lagtime=` on an analytical `pk(...)` line is not a lag: the value never reaches
+the dose, the parser warns that it is computed but never used, and the model
+stays on the lag-free fast paths.
+
 ## Notes and caveats
 
 - `lagtime` may carry a random effect like any other PK parameter

@@ -5199,6 +5199,90 @@ const TWOCPT_ORAL_LAG: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
+/// A **literal** lag on the `pk(...)` line — `lagtime=0.75` / `alag=0.5`, no
+/// `[individual_parameters]` variable behind it. Found in the review of #1441:
+/// `has_lagtime()` answered from `pk_indices` alone, which cannot record a slot
+/// with no variable, so it was `false`; `analytical_supported` was `true`; and
+/// the provider ran the lag-free walk (`dose_lagtime_values` → all zero) against
+/// a production predictor that applied the lag. Measured before the fix, oral
+/// at t = 1: provider 9.2848 vs production 4.2088 (120 %); IV bolus at t = 1.5:
+/// 1.4838 vs 1.6666 (11 %) — a wrong gradient on the default estimator, for a
+/// model whose OFV was right. The parser now lists literal-bound slots in
+/// `indiv_param_partials` and `has_lagtime()` reads them (route 3), so the
+/// lag-aware walk runs with a zero-derivative lag; value to 1e-9 and every
+/// derivative block to FD, as for the variable-lag models above.
+///
+/// Mutation: dropping `const_pk_slots` from `routes_lag_slot` reproduces the
+/// 120 % value gap on the first assertion of `check_full_provider_vs_fd`.
+#[test]
+fn provider_literal_lagtime_matches_production() {
+    // Oral: the variable-lag fixture with the lag pinned to its typical value.
+    let oral = ONECPT_ORAL_LAG
+        .replace("  theta TVLAG(0.75, 0.01, 5.0)\n", "")
+        .replace("  omega ETA_LAG ~ 0.05\n", "")
+        .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "")
+        .replace("lagtime=LAGTIME", "lagtime=0.75");
+    let m = parse_model_string(&oral).expect("parse literal oral lag");
+    assert!(
+        !m.pk_indices.contains(&PK_IDX_LAGTIME),
+        "premise: no variable carries the lag, {:?}",
+        m.pk_indices
+    );
+    assert!(
+        m.has_lagtime(),
+        "a literal lag must route through the lag-aware paths"
+    );
+    assert!(m.has_lagtime_on_cmt(1));
+    assert!(analytical_supported(&m));
+    let s = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+    check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+
+    // IV bolus under the `alag=` spelling — a different kernel, same defect shape.
+    let iv = ONECPT_IV_LAG
+        .replace("  theta TVLAG(1.0, 0.01, 5.0)\n", "")
+        .replace("  omega ETA_LAG ~ 0.05\n", "")
+        .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "")
+        .replace("alag=LAGTIME", "alag=0.5");
+    let m = parse_model_string(&iv).expect("parse literal iv lag");
+    assert!(m.has_lagtime() && !m.pk_indices.contains(&PK_IDX_LAGTIME));
+    let s = subject_with_dose(
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        &[1.5, 3.0, 6.0, 12.0],
+    );
+    check_full_provider_vs_fd(&m, &s, &[10.0, 50.0], &[0.1, -0.05]);
+}
+
+/// The bioavailability twin of the test above, pinning the asymmetry on purpose:
+/// a literal `f=0.5` is read off `PK_IDX_F` by both the production predictor and
+/// the provider (equal to 1e-9, measured in the same review), and
+/// `has_bioavailability()` stays `false` — its one consumer asks whether `F` can
+/// change across the inner search, which a literal cannot — so the cached
+/// event schedule is kept. If a future consumer needs "F is applied" rather
+/// than "F can move", this is the test to revisit.
+#[test]
+fn provider_literal_bioavailability_matches_production() {
+    let src = ONECPT_ORAL_LAG
+        .replace("  theta TVLAG(0.75, 0.01, 5.0)\n", "")
+        .replace("  omega ETA_LAG ~ 0.05\n", "")
+        .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "")
+        .replace("lagtime=LAGTIME", "f=0.5");
+    let m = parse_model_string(&src).expect("parse literal f");
+    assert!(!m.has_bioavailability());
+    assert!(!m.has_lagtime());
+    let s = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+    let theta = [0.2, 10.0, 1.5];
+    let eta = [0.15, -0.10, 0.25];
+    let prod = compute_predictions_with_tv(&m, &s, &theta, &eta);
+    // The literal halves the dose: pin against the unscaled model's value so the
+    // fixture cannot pass with F silently ignored on *both* sides.
+    let unscaled = parse_model_string(&src.replace(", f=0.5", "")).unwrap();
+    let full = compute_predictions_with_tv(&unscaled, &s, &theta, &eta);
+    for (p, f) in prod.iter().zip(&full) {
+        approx::assert_relative_eq!(*p, 0.5 * f, max_relative = 1e-12);
+    }
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+}
+
 /// Dose lagtime is now a differentiated PK slot: it enters every dose through
 /// the elapsed-time argument (`∂elapsed/∂lagtime = −1`), seeded as its own dual
 /// axis. The provider's exact value/∂η/∂²η/∂θ/∂η∂θ must match FD of the
