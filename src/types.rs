@@ -1362,10 +1362,9 @@ pub struct ExclusionSummary {
     /// **Not the same set as `Subject::obs_cmts`**, and the difference is not an
     /// oversight. Classification happens where the filter runs, before the reader has
     /// decided whether a row becomes a scored observation: an `EVID=0, MDV=0` row whose
-    /// `DV` is `.` is counted here and then dropped by
-    /// [`MissingDvPolicy::Skip`](crate::io::datareader::MissingDvPolicy), and a row on a
-    /// declared TTE / discrete-state / count endpoint is routed to `Subject::obs_records`
-    /// instead. Re-deciding that here would be a second copy of a predicate the reader
+    /// `DV` is `.` is counted here and then dropped by the reader's default
+    /// `MissingDvPolicy::Skip`, and a row on a declared TTE / discrete-state / count
+    /// endpoint is routed to `Subject::obs_records` instead. Re-deciding that here would be a second copy of a predicate the reader
     /// owns, so this field reports what it can see and its consumers claim no more than
     /// that (#1456 review r2).
     pub obs_cmts_excluded: Vec<usize>,
