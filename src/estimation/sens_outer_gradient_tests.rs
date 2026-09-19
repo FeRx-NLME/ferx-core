@@ -1545,6 +1545,28 @@ fn eta_dx_matches_fd() {
     }
 }
 
+#[test]
+fn eta_dx_reused_base_jet_matches_wrapper_bit_exactly() {
+    let model = parse_model_string(WARFARIN).expect("parse");
+    let theta = vec![0.22, 11.0, 1.4];
+    let subject = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+    let mut template = model.default_params.clone();
+    template.theta = theta;
+    let x = pack_params(&template);
+    let params = unpack_params(&x, &template);
+    let eta_hat = precise_ebe(&model, &subject, &params);
+    let sens = subject_sensitivities(&model, &subject, &params.theta, &eta_hat)
+        .expect("base sensitivity jet");
+
+    let rebuilt =
+        subject_eta_dx(&model, &subject, &template, &x, &eta_hat).expect("rebuilt response");
+    let reused =
+        subject_eta_dx_from_sens(&model, &subject, &params, &template, &x, &eta_hat, &sens)
+            .expect("reused response");
+
+    assert_eq!(reused, rebuilt);
+}
+
 /// #474 regression: `subject_eta_dx` for an `iiv_on_ruv` model. The σ columns
 /// of `dη̂/dx` must carry the `exp(2·η_ruv)` scale and the residual-eta row of
 /// `M_σ`, matching FD of the (scaled) EBE — this guards the parity with

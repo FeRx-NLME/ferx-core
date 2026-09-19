@@ -3044,9 +3044,30 @@ pub fn subject_eta_dx(
     }
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    subject_eta_dx_from_sens(model, subject, &params, template, x, eta_hat, &sens)
+}
+
+/// [`subject_eta_dx`] from an already-computed sensitivity jet at the same
+/// `(theta, eta_hat)` point.
+///
+/// Laplace's exact-Hessian anchor produces this jet as part of the same
+/// [`prepare`] input it needs for `H`. Reusing it here keeps the EBE-response
+/// formula single-sourced while avoiding an identical provider traversal.
+pub(crate) fn subject_eta_dx_from_sens(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+    sens: &SubjectSens,
+) -> Option<Vec<DVector<f64>>> {
+    if subject.observations.is_empty() {
+        return Some(vec![DVector::zeros(model.n_eta); x.len()]);
+    }
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
-    let prep = prepare(model, subject, &params, &sens, eta_hat)?;
+    let prep = prepare(model, subject, params, sens, eta_hat)?;
     let n_eta = prep.n_eta;
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
