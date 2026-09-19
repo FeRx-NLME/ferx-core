@@ -2675,8 +2675,8 @@ pub(crate) const AUTO_MH_STEPS_MAX: usize = 20;
 /// The step-scale controller holds the block kernel at its 40 % acceptance
 /// target on every sparse benchmark measured (0.39–0.46 realised on cefepime,
 /// vancomycin, busulfan and pembrolizumab, at every count from 2 to 20), so
-/// each proposal there is worth the same fraction of a move and 20 of them buy
-/// 20 × the cost of 6 for the same E-step. The one benchmark where extra
+/// each proposal there is worth the same fraction of a move, and 20 of them
+/// buy the same E-step as 6 for roughly three times the proposal traffic. The one benchmark where extra
 /// proposals *do* pay is the one where the controller cannot reach its target:
 /// the Emax PKPD model of `docs/estimation/saem.qmd`, 16 observations per
 /// subject against 2 η, realises **0.246**, and its final-estimate distance and
@@ -2697,6 +2697,10 @@ pub(crate) const AUTO_MH_STEPS_MAX: usize = 20;
 /// resolved value, and an explicit `n_mh_steps = <n>` overrides it entirely.
 pub(crate) fn auto_n_mh_steps(n_obs: usize, n_subjects: usize, n_eta: usize) -> usize {
     if n_subjects == 0 || n_eta == 0 {
+        // Nothing to read the density off. Neither shape reaches a kernel —
+        // SAEM rejects `n_eta == 0` up front and an empty population earlier
+        // still — so this is only about not dividing by zero; answer with the
+        // historical default rather than with the cheap end.
         return AUTO_MH_STEPS_MAX;
     }
     let obs_per_eta = n_obs as f64 / (n_subjects as f64 * n_eta as f64);

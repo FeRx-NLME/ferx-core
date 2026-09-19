@@ -92,7 +92,8 @@ sweeps that 6 implies, 6 seeds each) puts the *sweeps* arm on 20's numbers —
 and the *block* arm on 6's — 0.102 / 0.138 against 0.091 / 0.132. Raising
 `n_mh_steps` is how a model asks for more sweeps today, and at equal quality the
 two spellings cost the same wall here (28.4 s vs 29.0 s), so the rule sizes the
-block count and lets the sweep count follow.
+block count and lets the sweep count follow ([#1466](https://github.com/FeRx-NLME/ferx-core/issues/1466)
+tracks separating them).
 
 Measured on ferx `e7343462`, 6 seeds, 150 + 250 iterations, IS −2 log L from the
 `imp` readout and `d_final` against a 300/700/40 long run of the same build:
