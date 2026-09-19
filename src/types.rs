@@ -7535,17 +7535,34 @@ pub struct FitOptions {
     pub saem_n_exploration: usize,
     pub saem_n_convergence: usize,
     /// Number of block-kernel MH proposals per subject per SAEM outer
-    /// iteration. The default 20 mixes well on hard cold-start surfaces
-    /// (e.g. Emax PKPD with stressful initial values, where chains at 3
-    /// proposals can lock the M-step into a degenerate basin with the
-    /// PD-curve thetas at boundary values) and, together with the
-    /// componentwise kernel (run automatically for multi-η models), keeps a
-    /// block Ω from collapsing to a near rank-1 correlation matrix. The
-    /// componentwise sweep count `max(2, n_mh_steps / n_eta)` is derived from
-    /// this value (the kernel is skipped entirely for single-η models).
-    /// Reduce to 3-10 for the older/faster behaviour on simpler
-    /// well-identified models; raise (30-50) only when the diagnostic shows
-    /// the M-step is still tracking correlated samples.
+    /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
+    /// file — to size it from the dataset.
+    ///
+    /// The automatic rule is `estimation::saem::auto_n_mh_steps`: `2.5`
+    /// proposals per observation per subject per η, clamped to `[6, 20]`.
+    /// A dataset dense enough to reach the cap keeps exactly the pre-#1459
+    /// fixed default of 20; a sparse one — where the step-scale controller
+    /// holds the kernel at its acceptance target and every extra proposal is
+    /// linear cost for no extra mixing — gets 6 or 7, for 29–41 % less CPU at
+    /// indistinguishable estimates on four real datasets (#1459).
+    ///
+    /// The componentwise sweep count `max(2, n_mh_steps / n_eta)`
+    /// (`estimation::saem::componentwise_sweeps`)
+    /// is derived from the *resolved* value (the kernel is skipped entirely for
+    /// single-η models); together the two keep a block Ω from collapsing to a
+    /// near rank-1 correlation matrix (#191).
+    ///
+    /// Set an explicit count to override the rule: raise it (30–50) when the
+    /// acceptance diagnostic shows the chain far from target or the M-step
+    /// still tracking correlated samples, lower it for the older/faster
+    /// behaviour on a simple well-identified model.
+    ///
+    /// **`method = bayes` reads this option but not the rule**: under `auto` its
+    /// η block keeps the historical fixed count of 20. The rule is calibrated on
+    /// SAEM quantities, and what makes a low count safe there is SAEM's
+    /// componentwise kernel, which that sampler does not run — see
+    /// `estimation::saem::resolve_n_mh_steps_bayes`. An explicit count applies
+    /// to both.
     pub saem_n_mh_steps: usize,
     /// Iterations between step-scale adaptations under
     /// [`ScaleAdaptation::Interval`]. Also governs the κ (IOV) scales under
@@ -8218,7 +8235,9 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: 150,
             saem_n_convergence: 250,
-            saem_n_mh_steps: 20,
+            // 0 = `auto`: resolved from the dataset by
+            // `estimation::saem::auto_n_mh_steps` (#1459).
+            saem_n_mh_steps: 0,
             saem_adapt_interval: 50,
             saem_scale_adaptation: ScaleAdaptation::Interval,
             saem_mstep_damping: None,

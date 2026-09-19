@@ -3799,6 +3799,51 @@ fn test_apply_fit_option_known_applies() {
     assert_eq!(opts.saem_omega_burnin, 30);
 }
 
+/// `n_mh_steps` takes a count or the word `auto` (#1459), which is the default
+/// and is stored as the `SAEM_N_MH_STEPS_AUTO` sentinel for
+/// `estimation::saem::resolve_n_mh_steps` to expand against the dataset.
+///
+/// The spelling matters beyond this crate: `apply_fit_option` is what the R
+/// wrapper's `settings` argument goes through, so `settings = list(n_mh_steps
+/// = "auto")` has to reach the same place a model file's `n_mh_steps = auto`
+/// does.
+#[test]
+fn test_n_mh_steps_accepts_auto_and_a_count() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_n_mh_steps,
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        "the default is the sentinel"
+    );
+
+    assert_eq!(apply_fit_option(&mut opts, "n_mh_steps", "12"), Ok(true));
+    assert_eq!(
+        opts.saem_n_mh_steps, 12,
+        "an explicit count is stored as-is"
+    );
+
+    for spelling in ["auto", "AUTO", "Auto"] {
+        assert_eq!(
+            apply_fit_option(&mut opts, "n_mh_steps", spelling),
+            Ok(true)
+        );
+        assert_eq!(
+            opts.saem_n_mh_steps,
+            crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+            "`{spelling}` must reach the sentinel"
+        );
+        // Put it back to a count so the next spelling has to move it again —
+        // otherwise every iteration after the first would pass on the value
+        // the previous one left behind.
+        opts.saem_n_mh_steps = 12;
+    }
+
+    assert!(
+        apply_fit_option(&mut opts, "n_mh_steps", "sometimes").is_err(),
+        "a word that is not `auto` is still a parse error, not a silent 0"
+    );
+}
+
 /// `mstep_damping` (#1011) round-trips under both spellings, defaults to `None`
 /// so the calibrated constant applies, and rejects anything outside `(0, 1]` —
 /// `1.0` is the documented "off" value and must stay accepted.
