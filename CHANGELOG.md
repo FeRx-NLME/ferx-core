@@ -180,11 +180,13 @@ section of the SDLC for the versioning policy).
   a sparse population gets 6 or 7. On four real datasets (cefepime 458 subjects,
   vancomycin 100, busulfan 600, pembrolizumab 303) six seeds could not distinguish the
   resolved count from 20 on the importance-sampled −2 log L or on final-estimate
-  distance, for **27–41 % less CPU** in the SAEM stage. The rule is a function of the
+  distance, for **29–41 % less CPU** in the SAEM stage. The rule is a function of the
   data only, so a fit stays reproducible; `verbose` prints the resolved count and its
   source. Set an explicit `n_mh_steps = <n>` to override it, and raise it if the
-  acceptance diagnostic reports a chain far from target. `method = bayes` resolves the
-  same option the same way for its η block.
+  acceptance diagnostic reports a chain far from target. `method = bayes` reads the same
+  option but **not** the rule: under `auto` its η block keeps the historical fixed 20,
+  since the rule is calibrated on SAEM quantities and on a kernel that sampler does not
+  run.
 
 - **ferx no longer recommends `[diffusion]` as a remedy for residual autocorrelation.** The IWRES
   Durbin-Watson warning has dropped its "For ODE models, SDE process noise may also help" suffix,

@@ -7527,7 +7527,7 @@ pub struct FitOptions {
     /// A dataset dense enough to reach the cap keeps exactly the pre-#1459
     /// fixed default of 20; a sparse one — where the step-scale controller
     /// holds the kernel at its acceptance target and every extra proposal is
-    /// linear cost for no extra mixing — gets 6 or 7, for 27–45 % less CPU at
+    /// linear cost for no extra mixing — gets 6 or 7, for 29–41 % less CPU at
     /// indistinguishable estimates on four real datasets (#1459).
     ///
     /// The componentwise sweep count `max(2, n_mh_steps / n_eta)`
@@ -7539,8 +7539,14 @@ pub struct FitOptions {
     /// Set an explicit count to override the rule: raise it (30–50) when the
     /// acceptance diagnostic shows the chain far from target or the M-step
     /// still tracking correlated samples, lower it for the older/faster
-    /// behaviour on a simple well-identified model. `method = bayes` uses the
-    /// same resolved count for its η block.
+    /// behaviour on a simple well-identified model.
+    ///
+    /// **`method = bayes` reads this option but not the rule**: under `auto` its
+    /// η block keeps the historical fixed count of 20. The rule is calibrated on
+    /// SAEM quantities, and what makes a low count safe there is SAEM's
+    /// componentwise kernel, which that sampler does not run — see
+    /// `estimation::saem::resolve_n_mh_steps_bayes`. An explicit count applies
+    /// to both.
     pub saem_n_mh_steps: usize,
     /// Iterations between step-scale adaptations under
     /// [`ScaleAdaptation::Interval`]. Also governs the κ (IOV) scales under

@@ -72,6 +72,15 @@ i.e. from the observations each random effect has to be informed by. The
 resolved count and where it came from are printed under `verbose = true`, and an
 explicit `n_mh_steps = <n>` overrides the rule entirely.
 
+Two scope notes. With `n_leapfrog > 0` the count is **not** ignored: HMC replaces
+the block kernel for the subjects it can serve, but `n_mh_steps` still governs
+the MH-fallback subjects *and* still sizes the componentwise sweep, which runs
+after an HMC proposal as well. And `method = bayes` reads the option but not the
+rule — under `auto` its η block keeps the historical fixed 20, because the rule
+is calibrated on SAEM quantities and, per the kernel split below, what makes a
+low count safe on dense data is SAEM's componentwise sweep, which that sampler
+does not run. An explicit count applies to both.
+
 The reason it is not a constant is the step-scale controller. On a sparse
 population it reaches its 40 % acceptance target at *any* proposal count —
 measured at 0.39–0.46 on cefepime, vancomycin, busulfan and pembrolizumab for
@@ -103,8 +112,13 @@ Measured on ferx `e7343462`, 6 seeds, 150 + 250 iterations, IS −2 log L from t
 | cefepime (458 subj, 3 η) | 0.51 | 6 | 4296.3 vs 4294.9 (seed sd 1–2) | 0.078 vs 0.075 | −35 % |
 | vancomycin (100 subj, 3 η) | 0.91 | 6 | 1135.3 vs 1135.0 (sd 0.4–0.9) | 0.037 vs 0.033 | −41 % |
 | pembrolizumab (303 subj, 4 η) | 1.02 | 6 | 5983.8 vs 5981.2 (sd 4–10) | 0.179 vs 0.115 | −29 % |
-| busulfan (600 subj, 3 η) | 2.92 | 7 | 60044 vs 60045 (sd 3) | 0.050 vs 0.041 | −35 % |
+| busulfan (600 subj, 3 η) | 2.92 | 7 | 60044 vs 60045 (sd 3) | 0.040 vs 0.041 | −38…−40 % |
 | Emax PKPD (100 subj, 2 η) | 8.0 | 20 | unchanged — the rule returns the old default | | 0 % |
+
+CPU is the SAEM stage's user+sys, 3 seeds on an uncontended lane at `--threads 2`.
+Busulfan's 7 is quoted as a bracket because the count it resolves to sits between
+two measured cells (6 → 4.40 s and 8 → 4.23 s, against 7.10 s at 20) whose costs
+differ by less than the run-to-run spread.
 
 #### HMC (Hamiltonian Monte Carlo, `n_leapfrog > 0`)
 
@@ -708,7 +722,7 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
   method        = saem
   n_exploration = 150      # Phase 1 iterations
   n_convergence = 250      # Phase 2 iterations
-  n_mh_steps    = auto     # block-MH steps/subject/iteration, or `auto` (see above; ignored when n_leapfrog > 0)
+  n_mh_steps    = auto     # block-MH steps/subject/iteration, or `auto` (see above)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency (interval rule)
   scale_adaptation = interval  # or robbins_monro

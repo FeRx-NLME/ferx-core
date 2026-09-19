@@ -2710,6 +2710,24 @@ pub(crate) fn auto_n_mh_steps(n_obs: usize, n_subjects: usize, n_eta: usize) -> 
     (steps as usize).clamp(AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX)
 }
 
+/// The η-block proposal count for the **Bayes** sampler: the requested value,
+/// or — under [`SAEM_N_MH_STEPS_AUTO`] — the historical fixed count, *not*
+/// [`auto_n_mh_steps`].
+///
+/// [`auto_n_mh_steps`] is calibrated on SAEM quantities (a controller-held
+/// acceptance rate, final-estimate distance against a long-run reference), and
+/// what makes a low count safe there is SAEM's componentwise kernel carrying
+/// the dense case (#1466). The Bayes η block is the block kernel alone and is
+/// judged on posterior mixing, which none of that measured — so `auto` means
+/// "unchanged" here until there is a Bayes benchmark to move it (#1459).
+pub(crate) fn resolve_n_mh_steps_bayes(requested: usize) -> usize {
+    if requested == SAEM_N_MH_STEPS_AUTO {
+        AUTO_MH_STEPS_MAX
+    } else {
+        requested
+    }
+}
+
 /// The `verbose` line describing the resolved E-step kernel sizes. Kept as a
 /// pure function so the wording is unit-testable, like
 /// [`saem_final_ofv_report`].
@@ -9862,6 +9880,36 @@ DV ~ additive(EPS)
                 resolve_n_mh_steps(requested, n_obs, n_subj, n_eta),
                 requested,
                 "an explicit count must survive the resolver"
+            );
+        }
+    }
+
+    /// The Bayes η block resolves `auto` to the historical fixed count, *not*
+    /// to the rule — on a shape where the two visibly differ, so the test reads
+    /// "does not consult the rule" rather than "agrees with it here".
+    #[test]
+    fn resolve_n_mh_steps_bayes_keeps_the_historical_count() {
+        // A sparse shape the SAEM rule answers with the floor.
+        let (n_obs, n_subj, n_eta) = (274, 100, 3);
+        assert_eq!(
+            resolve_n_mh_steps(SAEM_N_MH_STEPS_AUTO, n_obs, n_subj, n_eta),
+            AUTO_MH_STEPS_MIN,
+            "precondition: the SAEM rule gives this shape the floor, not the cap"
+        );
+        assert_ne!(
+            AUTO_MH_STEPS_MIN, AUTO_MH_STEPS_MAX,
+            "precondition: the two answers are distinguishable"
+        );
+        assert_eq!(
+            resolve_n_mh_steps_bayes(SAEM_N_MH_STEPS_AUTO),
+            AUTO_MH_STEPS_MAX,
+            "Bayes keeps the historical count under `auto` (see the fn docs)"
+        );
+        for requested in [1, 6, 40] {
+            assert_eq!(
+                resolve_n_mh_steps_bayes(requested),
+                requested,
+                "an explicit count applies to Bayes too"
             );
         }
     }
