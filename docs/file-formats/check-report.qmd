@@ -189,12 +189,13 @@ Bioavailability `F`, lag time `ALAG`/`LAGTIME`, and the modeled infusion duratio
 
 ### Scaling, output and derived columns {#codes-scaling-output-and-derived}
 
-An observed compartment is missing a scaling or error-model entry, or an `[output]` / `[derived]` name does not resolve.
+An observed compartment is missing a scaling or error-model entry, a declared per-CMT entry matches no observation, or an `[output]` / `[derived]` name does not resolve.
 
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_PER_CMT_SCALING` | error | An observed compartment lacks a per-CMT scaling entry. |
 | `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
+| `W_PER_CMT_UNMATCHED` | warning | The other direction of the two above: a compartment the model **declares** an entry for, that no observation is recorded on. One code for all three per-CMT channels — `[scaling] obs_scale[CMT=N]`, `[error_model] CMT=N:`, and a `y[CMT=N]` readout on either engine — with the channel and the dead compartments named in the message. A warning rather than an error because the entry is inert rather than wrong: nothing goes `NaN`, and a scaling block shared across studies may legitimately declare more compartments than one dataset exercises. The usual cause is on the data side, a missing or mis-mapped `CMT` column keying every observation to compartment 1; on a column-less dataset `W_CMT_DEFAULTED` **also** fires, for the defaulting itself, while this code names the entries the defaulting left dead. That reading is offered only when the observed set is consistent with it (every observation on compartment 1), so a model observed on compartment 2 is not sent to audit a column that is present and correct. `[data_selection]` is named as a candidate cause — rather than suppressing the finding, since a filter on any column can remove exactly the rows an entry needed — but only for the dead compartments the clause actually emptied, which `ExclusionSummary::obs_cmts_excluded` records; a clause that removed rows on some other compartment is not blamed. Silent on an observation-free population, so `ferx check` without `--data` does not report every declared entry as dead ([#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)). |
 | `E_DERIVED_NAME_CONFLICT` | error | A `[derived]` name clashes with a built-in sdtab column, theta, eta, or individual-parameter name. |
 | `W_DERIVED_COVARIATE_SHADOW` | warning | A `[derived]` name shadows a covariate (allowed but may be confusing). |
 | `W_DERIVED_STEP_IGNORED` | warning | `step=` given for a DV-based integral (ignored; DV integrals always use observation times). |

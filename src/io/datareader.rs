@@ -174,6 +174,11 @@ impl Excluder<'_> {
 /// Per-subject exclusion counts returned by `parse_subject` when a filter is active.
 pub(crate) struct SubjectExclusion {
     pub n_obs_excluded: usize,
+    /// The **resolved** compartments those excluded observation rows were on — the
+    /// same value `Subject::obs_cmts` would have carried had the row survived, so the
+    /// two sets are comparable (`resolve_row_cmt` feeds the filter's `RowContext` the
+    /// defaulted value, see its doc). Empty when no scored observation was removed.
+    pub obs_cmts: std::collections::BTreeSet<usize>,
     pub n_dose_excluded: usize,
     /// Records excluded that are neither scored obs nor doses (EVID 2/3, or
     /// missing-DV obs).
@@ -1024,6 +1029,10 @@ fn read_nonmem_csv_impl(
         n_records_total,
         ..Default::default()
     };
+    // Union across subjects, sorted and deduplicated by the set; assigned once after
+    // the loop rather than pushed into the summary's `Vec` per subject.
+    let mut excl_obs_cmts_all: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
     for (id, rows) in &rows_by_id {
         let (
             subject,
@@ -1066,6 +1075,7 @@ fn read_nonmem_csv_impl(
 
         // Accumulate filter statistics.
         excl_summary.n_obs_excluded += subj_excl.n_obs_excluded;
+        excl_obs_cmts_all.extend(subj_excl.obs_cmts.iter().copied());
         excl_summary.n_dose_excluded += subj_excl.n_dose_excluded;
         excl_summary.n_other_excluded += subj_excl.n_other_excluded;
         for src in subj_excl.fired {
@@ -1303,6 +1313,7 @@ fn read_nonmem_csv_impl(
         }
     }
 
+    excl_summary.obs_cmts_excluded = excl_obs_cmts_all.into_iter().collect();
     let exclusions = if filter.is_some() {
         Some(excl_summary)
     } else {
@@ -1991,6 +2002,7 @@ fn parse_subject(
     // reader chose (#1009).
     let mut cmt_defaults = CmtDefaults::default();
     let mut excl_n_obs: usize = 0;
+    let mut excl_obs_cmts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut excl_n_dose: usize = 0;
     let mut excl_n_other: usize = 0;
     let mut excl_fired: Vec<String> = Vec::new();
@@ -2243,6 +2255,13 @@ fn parse_subject(
                     excl_n_dose += 1;
                 } else if evid == 0 && mdv == 0 {
                     excl_n_obs += 1;
+                    // Which compartment, not just how many. A count alone cannot say
+                    // whether a `[data_selection]` clause is why some declared per-CMT
+                    // entry looks unmatched — `ignore = CMT == 3` removing CMT-3 rows
+                    // is no explanation at all for a dead `[CMT=2]` entry (#1456
+                    // review r1) — and the row is about to vanish, so this is the last
+                    // point at which the compartment is known.
+                    excl_obs_cmts.insert(cmt_for_ctx);
                 } else {
                     excl_n_other += 1;
                 }
@@ -2810,6 +2829,7 @@ fn parse_subject(
         missing_dv_rows,
         SubjectExclusion {
             n_obs_excluded: excl_n_obs,
+            obs_cmts: excl_obs_cmts,
             n_dose_excluded: excl_n_dose,
             n_other_excluded: excl_n_other,
             fired: excl_fired,

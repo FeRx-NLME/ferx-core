@@ -1349,6 +1349,17 @@ pub struct ExclusionSummary {
     pub excluded_subject_ids: Vec<String>,
     /// Number of observation records (EVID==0, MDV==0) excluded.
     pub n_obs_excluded: usize,
+    /// The distinct **resolved** compartments those excluded observation records were
+    /// on, ascending — the same values `Subject::obs_cmts` carries for the rows that
+    /// survived, so the two are directly comparable. Empty when the clauses removed no
+    /// scored observation.
+    ///
+    /// The count alone cannot say *what* a filter took away, and that is the question
+    /// a per-CMT diagnostic has to answer: `W_PER_CMT_UNMATCHED` names
+    /// `[data_selection]` as a possible cause only when a compartment it removed is one
+    /// of the unmatched entries, so `ignore = CMT == 3` is not offered as the reason a
+    /// `[CMT=2]` entry is dead (#1405).
+    pub obs_cmts_excluded: Vec<usize>,
     /// Number of dose records (EVID 1/4) excluded.
     pub n_dose_excluded: usize,
     /// Number of other records excluded that are neither a scored observation
@@ -6462,6 +6473,22 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // prose arm below claims. Same `(Critical, Convergence)` verdict the
         // prose arm gives, reached deterministically.
         (WarningSeverity::Critical, WarningCode::Convergence)
+    } else if lower.contains("w_per_cmt_unmatched") {
+        // #1405: a declared per-CMT `[scaling]` / `[error_model]` / `y[CMT=N]` entry
+        // that no observation matched. Matched on its `W_` token and placed with the
+        // other token arms, ahead of every prose one. Measured on the chain as it
+        // stands: no arm claims "scaling" or "error model", so the *current* prose
+        // cannot collide — but the message names compartments and offers causes, and
+        // the broad `parameters` arm near the end of the chain would claim it the
+        // moment anyone reworded it. A token arm makes the position irrelevant.
+        //
+        // `DataQuality` and not a code of its own, deliberately: the finding is that
+        // the *dataset* does not exercise what the model declares, which is the same
+        // advice the reader's own `W_CMT_DEFAULTED` / `W_MISSING_DV` family carries,
+        // and `ferx-r`'s `ferx_get_warnings()` already has remediation guidance keyed
+        // on `data_quality`. That arm serves several unrelated inputs, so a test
+        // asserting only the category asserts almost nothing — assert the token.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")

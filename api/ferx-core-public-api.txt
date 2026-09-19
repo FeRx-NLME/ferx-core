@@ -2820,6 +2820,7 @@ pub ferx_core::types::ExclusionSummary::n_dose_excluded: usize
 pub ferx_core::types::ExclusionSummary::n_obs_excluded: usize
 pub ferx_core::types::ExclusionSummary::n_other_excluded: usize
 pub ferx_core::types::ExclusionSummary::n_records_total: usize
+pub ferx_core::types::ExclusionSummary::obs_cmts_excluded: alloc::vec::Vec<usize>
 pub struct ferx_core::types::FitOptions
 pub ferx_core::types::FitOptions::accept_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::agq_eval_only: bool
@@ -4265,6 +4266,7 @@ pub ferx_core::ExclusionSummary::n_dose_excluded: usize
 pub ferx_core::ExclusionSummary::n_obs_excluded: usize
 pub ferx_core::ExclusionSummary::n_other_excluded: usize
 pub ferx_core::ExclusionSummary::n_records_total: usize
+pub ferx_core::ExclusionSummary::obs_cmts_excluded: alloc::vec::Vec<usize>
 pub struct ferx_core::FitOptions
 pub ferx_core::FitOptions::accept_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::agq_eval_only: bool
