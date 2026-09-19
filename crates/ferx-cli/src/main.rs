@@ -317,15 +317,15 @@ fn main() {
             }
         }
     }
-    // Honor --threads by sizing rayon's global pool (build_global() is once-per-process,
-    // correct for a CLI binary) so fit()'s default pool — sized to current_num_threads()
-    // — inherits the count. The 32 MiB worker stack that wide ODE+IOV analytic gradients
-    // need is applied by fit()'s own fit-scoped pool (api::default_fit_pool), so the
-    // global pool keeps the platform-default stack here rather than reserving a second
-    // 32 MiB × N. Without --threads, fit() applies its own default (available cores - 1,
-    // floored at 1, capped at 8 — #707). `Some(0)` (`--threads 0` / `auto`) names the
-    // default rather than a width, so it sizes nothing here — but it is still carried in
-    // `RunOverrides` below, where it overrides a model file's `[fit_options] threads`.
+    // Honor --threads by declaring the process-wide worker count, which is what fit()
+    // sizes its pool from when nothing pins `[fit_options] threads`. It builds no pool of
+    // its own (#1460): the fit runs on a pool fit() leases with the 32 MiB worker stack
+    // that wide ODE+IOV analytic gradients need, and sizing rayon's global pool here as
+    // well used to leave N threads idle beside it for the whole run. Without --threads,
+    // fit() applies its own default (available cores - 1, floored at 1, capped at 8 —
+    // #707). `Some(0)` (`--threads 0` / `auto`) names the default rather than a width, so
+    // it declares nothing here — but it is still carried in `RunOverrides` below, where it
+    // overrides a model file's `[fit_options] threads`.
     if let Some(n) = threads.filter(|&n| n > 0) {
         if let Err(e) = ferx_core::configure_global_thread_pool(n) {
             eprintln!("Warning: {e}");
@@ -729,8 +729,8 @@ fn parse_output_format(args: &[String]) -> EstimatesFormat {
 /// The `None` / `Some(0)` distinction is load-bearing (#1416): it is what lets
 /// `--threads auto` override a model file's `[fit_options] threads = 8` while an
 /// unmentioned flag leaves the file in charge. `Some(0)` is *not* a request to
-/// size the global pool — `configure_global_thread_pool` rejects `0` — it is a
-/// request that the model file not pin one either.
+/// pin a process-wide width — `configure_global_thread_pool` rejects `0` — it is
+/// a request that the model file not pin one either.
 fn parse_threads_flag(args: &[String]) -> Option<usize> {
     let idx = args.iter().position(|a| a == "--threads")?;
     let value = args.get(idx + 1).unwrap_or_else(|| {

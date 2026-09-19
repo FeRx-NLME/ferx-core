@@ -1185,3 +1185,117 @@ fn an_explicitly_requested_default_also_beats_the_model_files_thread_count() {
         );
     }
 }
+
+// ── #1460: `--threads N` sizes one pool, and only one ────────────────────────
+
+/// Live OS-thread count of `pid`, or `None` on a platform this test cannot read
+/// (the assertions are then skipped, see the test's own guard).
+///
+/// Linux exposes one directory per thread under `/proc/<pid>/task`; macOS has no
+/// such interface, so `ps -M <pid>` — one line per thread after the header — is
+/// the reading available without pulling `libc`/`mach` into a test.
+fn live_thread_count(pid: u32) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let n = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .ok()?
+            .filter(|e| e.is_ok())
+            .count();
+        (n > 0).then_some(n)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("ps")
+            .args(["-M", &pid.to_string()])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let n = text
+            .lines()
+            .skip(1) // header
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        (n > 0).then_some(n)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `--threads N` must size exactly one pool: the one the fit runs on.
+///
+/// The defect (#1460, split out of #1447): the CLI sized Rayon's *global* pool to
+/// `N`, and `fit()` then leased a *separate* `N`-worker pool of its own — the one
+/// carrying the 32 MiB worker stack wide `Dual2` gradients need — so the global
+/// `N` never received work. Per-thread `samply` profiles of a `--threads 2` SAEM
+/// fit put the two fit-pool workers at 85–99 % busy and the two global-pool
+/// threads at 0.0 % for the whole run.
+///
+/// Measured on this fixture (`ps -M`, macOS, debug): **5** live threads before the
+/// fix — main + 2 idle + 2 busy — and **3** after, i.e. main + `N` workers. Hence
+/// the bounds: at least `N + 1`, so a "fix" that quietly serialised the fit, or a
+/// sampler that only ever caught the process starting up, reddens too; and at most
+/// `N + 2`, one thread of slack for a platform helper while the pre-fix 5 still
+/// exceeds the 4 that admits. `N = 2` rather than 1 for exactly that reason: at
+/// `N = 1` the old double pool is 3 threads, inside any bound the single-pool
+/// count of 2 satisfies with slack.
+#[test]
+fn a_threads_flag_sizes_one_pool_and_no_idle_set_beside_it() {
+    const THREADS: usize = 2;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model = repo_root().join("examples/one_cpt_iv.ferx");
+    let data = repo_root().join("data/one_cpt_iv.csv");
+
+    // Output is discarded rather than piped: nothing reads these pipes until the
+    // child has exited, and a full pipe buffer would deadlock the poll loop.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg(&model)
+        .arg("--data")
+        .arg(&data)
+        .args(["--threads", &THREADS.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ferx fit");
+
+    let pid = child.id();
+    let mut peak = 0usize;
+    let mut samples = 0usize;
+    let status = loop {
+        if let Some(n) = live_thread_count(pid) {
+            peak = peak.max(n);
+            samples += 1;
+        }
+        match child.try_wait().expect("poll ferx fit") {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    };
+    assert!(status.success(), "the fit itself must succeed");
+
+    if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+        return; // no thread-count interface here; nothing was asserted
+    }
+    assert!(
+        samples > 0,
+        "the sampler never read a thread count on a platform that has one — \
+         the assertions below would be vacuous"
+    );
+    assert!(
+        peak >= THREADS + 1,
+        "expected the main thread plus {THREADS} fit workers alive at once, saw \
+         {peak} over {samples} samples: the fit is not using the worker count it \
+         was given"
+    );
+    assert!(
+        peak <= THREADS + 2,
+        "`--threads {THREADS}` spawned {peak} threads over {samples} samples; at \
+         most {} is one pool plus slack, and {} is the #1460 shape — a second idle \
+         N-worker pool beside the fit pool",
+        THREADS + 2,
+        2 * THREADS + 1
+    );
+}

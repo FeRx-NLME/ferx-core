@@ -70,32 +70,43 @@ pub(crate) fn default_thread_count() -> usize {
     cap_default_threads(available)
 }
 
-/// Set when a caller has explicitly sized the process-wide Rayon pool (currently: the CLI's
-/// `--threads N` via [`configure_global_thread_pool`]), so [`default_fit_pool`] knows to
-/// honor that explicit choice rather than applying the [`default_thread_count`] cap (#707).
-static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The process-wide worker count a caller explicitly asked for (currently: the CLI's
+/// `--threads N` via [`configure_global_thread_pool`]), or `0` when nothing has — so
+/// [`effective_default_threads`] honors that explicit choice rather than applying the
+/// [`default_thread_count`] cap (#707).
+///
+/// A count rather than a flag because the width is now *recorded* here instead of being
+/// read back off Rayon's global pool: that pool is never built, so there is nothing to
+/// read (#1460).
+static EXPLICIT_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Explicitly size the process-wide Rayon pool and mark it as user-chosen. Intended for a
-/// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
-/// library callers that want a pinned thread count for a single fit should use
-/// `FitOptions::threads` instead, which exclusively leases a pool for that call.
+/// Declare the worker count this process should fit with, overriding the automatic default
+/// (available cores minus one, capped at 8). Intended for a CLI binary applying its
+/// `--threads N` before the first fit; library callers that want a pinned thread count for
+/// a single fit should use `FitOptions::threads` instead, which exclusively leases a pool
+/// for that call.
+///
+/// **This does not build Rayon's global pool** (#1460), despite the name it has carried
+/// since #707. It used to: `--threads N` called `build_global` with `N`, and then every
+/// fit ran on a *separate* N-worker pool — `fit()` leases one of its own, with the 32 MiB
+/// worker stack that wide `Dual2` ODE+IOV gradients need, which Rayon's global pool does
+/// not have. Per-thread `samply` profiles of a `--threads 2` SAEM fit measured the two
+/// fit-pool workers at 85–99 % busy and the two global-pool threads at 0.0 % for the whole
+/// run: `--threads N` was spending `2N` OS threads to do `N` threads of work. Recording
+/// the count instead leaves one pool — the one the fit actually runs on — sized to `N`.
 ///
 /// `n_threads` must be positive — a caller wanting the engine's own default should simply
-/// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
-/// as "pick automatically", masking the caller's intent). The explicit-override flag is
-/// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
-/// was already initialized elsewhere) leaves `default_fit_pool` applying the #707 cap
-/// rather than incorrectly deferring to whatever the ambient pool happens to be.
+/// not call this at all, rather than pass `0` (which would otherwise read as "pick
+/// automatically", masking the caller's intent).
+///
+/// Takes effect for every fit that starts afterwards. The shared default pool an unpinned
+/// fit runs on is sized once, on first use, so call this before the first fit — a later
+/// change cannot resize a pool whose workers already exist.
 pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
     if n_threads == 0 {
         return Err("thread count must be positive".to_string());
     }
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(n_threads)
-        .build_global()
-        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))?;
-    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
+    EXPLICIT_THREADS.store(n_threads, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -107,9 +118,10 @@ pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
 ///
 /// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
 /// fits gain little from spreading across every core, and not all cores are equal on
-/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that explicitly sized the
-/// global pool via [`configure_global_thread_pool`] (the CLI's `--threads N`) is honored
-/// instead — that call marks [`GLOBAL_THREADS_EXPLICIT`] before this pool is built.
+/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that declared an explicit
+/// process-wide width via [`configure_global_thread_pool`] (the CLI's `--threads N`) is
+/// honored instead — that call records [`EXPLICIT_THREADS`] before this pool is built, and
+/// this is then the only pool `N` sizes (#1460).
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
@@ -229,8 +241,19 @@ pub(crate) fn install_on_fit_pool<R: Send>(
 /// `total_threads = 0` budget with it — the two must agree, or a `from_budget(0, …)` plan
 /// would silently disagree with the pool an unpinned fit uses (#1115).
 pub(crate) fn effective_default_threads() -> usize {
-    if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
-        rayon::current_num_threads()
+    resolve_default_threads(EXPLICIT_THREADS.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// [`effective_default_threads`] without the process-global read, so the precedence is
+/// testable (`explicit` wins, `0` means "nothing was declared").
+///
+/// Deliberately *not* `rayon::current_num_threads()` on the explicit branch: that reads the
+/// ambient pool, and reading it is what made `--threads N` build a global pool nobody ran on
+/// (#1460). It also silently builds Rayon's global pool when called off-worker, so an
+/// engine that never wants one must not ask.
+pub(crate) fn resolve_default_threads(explicit: usize) -> usize {
+    if explicit > 0 {
+        explicit
     } else {
         default_thread_count()
     }

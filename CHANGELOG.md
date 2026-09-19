@@ -404,6 +404,20 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **`ferx --threads N` now holds `N` worker threads, not `2N`.** The flag sized Rayon's
+  process-global pool *and* the fit then leased a separate `N`-worker pool of its own —
+  the one carrying the 32 MiB stacks wide analytic gradients need — so the global `N`
+  never received any work. Per-thread profiles of a `--threads 2` SAEM fit measured the
+  two fit-pool workers at 85–99% busy and the two global-pool threads at 0.0% for the
+  whole run; measured end to end, a `--threads 2` run drops from 5 live OS threads to 3
+  (main + 2 workers). Nothing about the fit itself changes — same estimates, same
+  `n_threads_used` — but a shared machine or a CPU-quota'd container is no longer charged
+  for twice the threads you asked for, `N × 2 MiB` of worker stack is no longer reserved
+  for nothing, and a whole-process profile of a ferx run stops reporting idle-thread wait
+  as if it were estimator headroom. `configure_global_thread_pool(n)` (the library entry
+  point behind the flag) accordingly no longer builds Rayon's global pool: it declares the
+  worker count ferx's own pools are sized from
+  ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 - **SAEM: the E-step and M-step stop redoing η-independent work on every MH proposal.**
   Three changes, all of them internal and all of them bit-identical — the same fit, the
   same seed, the same estimates, objective and per-subject EBEs down to the last bit — so

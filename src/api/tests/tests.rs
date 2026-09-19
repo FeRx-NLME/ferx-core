@@ -27,11 +27,30 @@ fn cap_default_threads_never_zero() {
 
 #[test]
 fn configure_global_thread_pool_rejects_zero() {
-    // `0` must be rejected rather than silently forwarded to Rayon, which would
-    // otherwise interpret it as "pick automatically" and mask the caller's intent
-    // (and would incorrectly mark GLOBAL_THREADS_EXPLICIT). Returns before touching
-    // the process-wide pool, so this is safe to run alongside other tests.
+    // `0` must be rejected rather than silently recorded, which would otherwise read
+    // as "pick automatically" and mask the caller's intent (and would incorrectly
+    // mark the width explicit). Returns before touching the process-wide width, so
+    // this is safe to run alongside other tests.
     assert!(configure_global_thread_pool(0).is_err());
+}
+
+#[test]
+fn an_explicit_thread_count_beats_the_default_cap() {
+    // The precedence `effective_default_threads` applies, without the process-global
+    // read — the statics are shared with every other test in this binary, so the
+    // resolution is tested here and the end-to-end path in `ferx-cli`'s
+    // `a_threads_flag_sizes_one_pool_and_no_idle_set_beside_it` (#1460).
+    assert_eq!(resolve_default_threads(3), 3);
+    // An explicit count is a user's choice, not a suggestion: it is not re-capped at
+    // DEFAULT_THREADS_CAP the way the automatic count is.
+    assert_eq!(resolve_default_threads(64), 64);
+}
+
+#[test]
+fn no_explicit_thread_count_falls_back_to_the_capped_default() {
+    // `0` is "nothing was declared", which is why `configure_global_thread_pool`
+    // refuses to store it.
+    assert_eq!(resolve_default_threads(0), default_thread_count());
 }
 
 #[test]
