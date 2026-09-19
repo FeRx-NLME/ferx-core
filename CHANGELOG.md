@@ -153,6 +153,20 @@ section of the SDLC for the versioning policy).
   `CL = TVCL * exp(ETA_CL)`) and NONMEM-style explicit mu syntax
   (`MU_1 = log(TVCL)` then `CL = exp(MU_1 + ETA_CL)`) are now detected, provided the
   intermediate is assigned exactly once and carries no ETA.
+- **SAEM: `[fit_options] scale_adaptation` picks how the MH step scales are adapted**
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)). `interval` (the
+  **default**, and the pre-existing rule) multiplies the per-subject step scale by
+  1.1 / 0.9 every `adapt_interval` iterations; `robbins_monro` steps
+  `log δ += c·k^-0.6·(accept − target)` every iteration. The interval rule's reach is
+  bounded by how often it fires — 8 times on a default 400-iteration run, so at most
+  ≈2.1× up or ≈0.43× down no matter how far off the chain is — and a model whose
+  optimal step is an order of magnitude from the 0.3 start never gets there. On the
+  shipped `examples/warfarin_saem.ferx` that leaves the E-step accepting 4.6% of its
+  proposals against a 40% target for the whole run; `robbins_monro` reaches 41.6% on
+  the same model and seed. It is **opt-in**: on a model whose acceptance was already
+  above target, driving it to target was measured to worsen the final estimate, so
+  existing fits keep their current estimates unchanged. The κ (IOV) scales stay on
+  the interval rule under both settings.
 
 ### Changed
 
@@ -231,6 +245,25 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **SAEM now reports an acceptance rate that never reached its target**
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)). The existing mixing
+  warning only fired below 1% cumulative acceptance, so a chain parked at 2–4% for an
+  entire run — which costs real estimate quality — passed in silence; that is exactly
+  what the shipped `examples/warfarin_saem.ferx` does. A combined block + componentwise
+  acceptance outside 10–80% over the **last 100** post-burn-in iterations is now added
+  to `FitResult.warnings`, carrying the realised tail rate, the target, the window
+  length and the cumulative rate, so the run does not have to be repeated with
+  `optimizer_trace` to see how far off it was. The tail rather than the whole-run
+  average is reported, because a run that mixes badly early and recovers averages to a
+  number describing neither half. Runs with fewer than 25 post-burn-in iterations stay
+  quiet, where the realised rate still describes the starting scale.
+- **Two fits in the same second no longer share an optimizer-trace file.** With
+  `optimizer_trace = true` the path was `/tmp/ferx_trace_{pid}_{unix_seconds}.csv`, so a
+  script (or a test) fitting two models back to back in one process silently wrote both
+  runs to the same file — the second truncating the first — and `FitResult::trace_path`
+  then pointed at the wrong run's rows. The filename now carries nanoseconds and a
+  per-process counter, so every fit gets its own trace
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)).
 - **A fit restarted mid-descent now runs on the remaining `maxiter` budget and says so.** The [#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277) restart gave its second leg a fresh evaluation budget — measured as 56 evaluations on a `maxiter = 1` (44-evaluation) fit — while documenting that it could not; it now continues on what the stalled leg left, a stall with the budget already spent is reported (with its own "increase maxiter" warning) rather than restarted, and an adopted restart is named in `FitResult.warnings` as an `optimizer_health` entry (it was visible only under `verbose`). Fits that are not restarted are bit-identical ([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)).
 - **A diagonally declared `omega` at the rail is no longer given the `block_omega` message because some *other* eta is in a block.** `E_OMEGA_INIT_AT_RAIL` chose its wording from whether the whole Ω matrix packs as a block, and one `block_omega` anywhere makes that true for every coordinate — so on `examples/warfarin_block_omega.ferx` a plain `omega ETA_KA ~ 0.0` was told "the block is near-singular in ETA_KA: lower the covariances involving it, or `FIX` the block". ETA_KA is in no block and has no covariances, and `FIX`-ing the block would have fixed ETA_CL and ETA_V instead of the eta on the rail. Worse, that wording *replaced* the `write ... FIX` repair the check exists to hand out ([#1229](https://github.com/FeRx-NLME/ferx-core/issues/1229)). The message is now chosen per **eta** — block wording only for an eta with a structurally free off-diagonal, i.e. one actually declared in a `block_omega` / `block_kappa` — so a model mixing the two spellings reports each eta in the shape it was written in. Same for Ω_IOV. A **one-eta** `block_omega (ETA_CL) = [0.0]` is the one case where the two questions come apart — it is spelled as a block but is correlated with nothing — and it now gets the declared-zero explanation in its own spelling, `` write `block_omega (ETA_CL) = [0.0] FIX` ``, instead of being told to reduce covariances it does not have (which is what it was told before this change too). A block of two or more etas, and a pure-diagonal model, are unchanged ([#1394](https://github.com/FeRx-NLME/ferx-core/issues/1394)).
 - **`model = NAME` names the model.** Only the bare `model NAME` spelling was read; the `KEY = value` form every other setting uses was dropped in silence and the fit (`model_name`, the `ferx run` summary line, `-fit.json`) and ferx-r fell back to the file stem. Both spellings now name the model, a `model` line the parser cannot read (or a second one) is an error naming the accepted forms, only the preamble before the first `[block]` header is read, and `ferx check --json` reports the same name the fit will carry instead of always the stem. **Widening reject:** a `model NAME` / `model = NAME` declaration placed *inside* a block used to be skipped silently (the model kept the stem); it is now an error naming the block and the preamble form, so the misplaced line cannot fall through a block that ignores unrecognised text (`[data]`) or is never read (`[odes]` on a `pk` model). Output filenames (`{stem}-fit.yaml`, `{stem}-sdtab.csv`) are unchanged: they are always the file stem ([#1395](https://github.com/FeRx-NLME/ferx-core/issues/1395)).

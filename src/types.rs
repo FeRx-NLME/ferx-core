@@ -7520,7 +7520,26 @@ pub struct FitOptions {
     /// well-identified models; raise (30-50) only when the diagnostic shows
     /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
+    /// Iterations between step-scale adaptations under
+    /// [`ScaleAdaptation::Interval`]. Also governs the κ (IOV) scales under
+    /// either rule — see [`FitOptions::saem_scale_adaptation`].
     pub saem_adapt_interval: usize,
+    /// How the primary-block and componentwise MH step scales are adapted.
+    ///
+    /// Defaults to [`ScaleAdaptation::Interval`], the historical rule, so an
+    /// existing fit's estimates do not change. [`ScaleAdaptation::RobbinsMonro`]
+    /// is opt-in via `[fit_options] scale_adaptation = robbins_monro`; it
+    /// reaches a target rate the interval rule cannot, but it is not a free
+    /// win on every model — see the SAEM docs page.
+    ///
+    /// The **κ (IOV) scales stay on the interval rule under both settings**,
+    /// which is a scope limit rather than a claim: the per-occasion kernel
+    /// makes one proposal per occasion per iteration, so a single iteration's
+    /// rate for one subject is a ratio of small integers, and the
+    /// Robbins-Monro arm has not been measured there. The block and
+    /// componentwise kernels have `n_mh_steps` and `n_cw_sweeps` proposals per
+    /// iteration to average over.
+    pub saem_scale_adaptation: ScaleAdaptation,
     /// Optional exploration-phase cap on the stochastic-approximation step for
     /// the **numerical θ/σ M-step** (issue #1011); `None` uses the model-keyed
     /// default of `estimation::saem::default_mstep_damping`: `1.0` — **off** —
@@ -8174,6 +8193,7 @@ impl Default for FitOptions {
             saem_n_convergence: 250,
             saem_n_mh_steps: 20,
             saem_adapt_interval: 50,
+            saem_scale_adaptation: ScaleAdaptation::Interval,
             saem_mstep_damping: None,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -8333,6 +8353,40 @@ pub enum Optimizer {
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
+}
+
+/// How SAEM adapts its per-subject MH step scales, set via
+/// `[fit_options] scale_adaptation`.
+///
+/// The E-step's proposals are `δ_i · chol(Ω) · z` (primary block kernel) and
+/// `δ_i,j · √Ω_jj · z` (componentwise kernel). Those `δ` are the only thing
+/// standing between the sampler and an acceptance rate far from its target, and
+/// how they are adapted turns out to matter: on `examples/warfarin_saem.ferx`
+/// the interval rule leaves the chain at 2-4% acceptance against a 40% target
+/// for an entire 400-iteration run (issue #1444).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScaleAdaptation {
+    /// The historical rule, and **the default**: every `adapt_interval`
+    /// iterations, multiply `δ` by 1.1 if the window's acceptance is above
+    /// target and by 0.9 otherwise.
+    ///
+    /// Note its reach. Over a 400-iteration run at the default
+    /// `adapt_interval = 50` it fires **8** times, each by a fixed factor, so
+    /// `δ` can move by at most `1.1^8 ≈ 2.1×` up or `0.9^8 ≈ 0.43×` down no
+    /// matter how far from target the chain is.
+    #[default]
+    Interval,
+    /// Robbins-Monro, every iteration: `log δ += c·k^-0.6·(accept_k − target)`,
+    /// where `accept_k` is *that* iteration's rate for the kernel being
+    /// adapted. The step is proportional to how far off the rate is and decays
+    /// as `k^-0.6`, which both reaches the target quickly and satisfies the
+    /// diminishing-adaptation condition (Roberts & Rosenthal 2007).
+    ///
+    /// Opt-in. It is a large win when the chain cannot otherwise reach its
+    /// target and roughly neutral when it already can, but it has been measured
+    /// to *regress* the final estimate on a model whose acceptance was already
+    /// above target, so it is not the default.
+    RobbinsMonro,
 }
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
@@ -9331,6 +9385,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_leapfrog",
             "saem_n_leapfrog",
             "adapt_interval",
+            "scale_adaptation",
+            "saem_scale_adaptation",
             "mstep_damping",
             "saem_mstep_damping",
             "omega_burnin",

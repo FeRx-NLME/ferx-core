@@ -370,14 +370,77 @@ When `n_leapfrog > 0`, `FitResult::saem_n_subjects_hmc` records how many subject
 
 ### 5. Adaptive Step Sizes
 
-Every `adapt_interval` iterations, the per-subject step sizes $\delta_i$ (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:
+The per-subject step scales $\delta_i$ (MH) and leapfrog step sizes (HMC) are
+adapted toward a target acceptance rate. Which rule does the adapting is set by
+`[fit_options] scale_adaptation`.
 
-- If acceptance rate exceeds the target: increase $\delta_i$ by 10% (up to 5.0)
-- If acceptance rate falls below the target: decrease $\delta_i$ by 10% (down to 0.01)
+Target acceptance rates: 40% for the primary block kernel (MH or HMC's own 65%
+when `n_leapfrog > 0`), 44% for the componentwise kernel. The block kernel and
+the componentwise kernel carry independent per-subject scales, and each η's
+componentwise scale is adapted separately.
 
-The block kernel and the componentwise kernel carry independent per-subject scales (the componentwise scale is adapted toward the higher 1-D optimum), and the kappa MH (IOV) scale is adapted the same way.
+#### `scale_adaptation = interval` (default)
 
-Target acceptance rates: 40% for the block MH kernel, 44% for the componentwise kernel, 65% for HMC.
+Every `adapt_interval` iterations, from that window's acceptance rate:
+
+- above target: increase $\delta_i$ by 10% (up to 5.0)
+- at or below target: decrease $\delta_i$ by 10% (down to 0.01, or 1e-6 for a
+  componentwise scale)
+
+**Know its reach.** The factor is fixed, so the total movement available is
+`1.1^n` up or `0.9^n` down over the `n` times the rule fires — and on the
+default 150 + 250 = 400 iterations at `adapt_interval = 50` that is **8** times,
+i.e. at most ≈2.1× up or ≈0.43× down *however far from target the chain is*. A
+model whose optimal step is an order of magnitude below the 0.3 starting value
+never reaches it. `examples/warfarin_saem.ferx` is such a model: on the default
+settings its combined acceptance collapses to 1.6% by iteration 26 and sits at
+2–4% for the remaining ~375 iterations against the 40% target (issue #1444).
+
+#### `scale_adaptation = robbins_monro`
+
+A Robbins–Monro step taken **every** iteration, from that iteration's own rate:
+
+$$\log \delta_i \leftarrow \log \delta_i + c \, k^{-0.6} \, (\hat{a}_k - a^\ast)$$
+
+with $c = 1$, $k$ the 1-based iteration, $\hat{a}_k$ the realised rate and
+$a^\ast$ the target. The correction is proportional to the discrepancy, so the
+reach is unlimited, and the $k^{-0.6}$ decay is the diminishing-adaptation
+condition that keeps an adapting chain valid (Roberts & Rosenthal 2007). The
+clamps are the same as the interval rule's.
+
+**It is opt-in, and not a free win.** On the warfarin example it moves the
+chain from 2–4% to ≈42% acceptance and cuts the final-estimate error by ~60%,
+and with the scale at target 8 proposals per subject per iteration beat the
+default 20. On models whose baseline scale is already near target it changes
+little. But on a validation model whose acceptance was already *above* target
+(0.45 against 0.40), driving it to target measurably **worsened** the fit —
+final-estimate error up 24% and seed-to-seed spread up 68%, with the marginal
+likelihood agreeing, so it is not an artifact of the reference. The default is
+therefore `interval`, which leaves every existing fit's estimates unchanged.
+
+The κ (IOV) scales stay on the interval rule under both settings: the
+per-occasion kernel makes one proposal per occasion per iteration, so a single
+iteration's rate for one subject is a ratio of small integers, and the
+Robbins–Monro arm has not been measured there.
+
+#### Acceptance-rate diagnostics
+
+Two warnings land in `FitResult.warnings` (never on stderr), most severe first:
+
+- **Not mixing** — the cumulative post-burn-in acceptance is below 1%. The
+  sampled ETAs barely moved, so the M-step ran on degenerate sufficient
+  statistics and Ω/σ are unreliable.
+- **Persistently far from target** — the acceptance over the **last 100**
+  post-burn-in iterations is outside 10–80%. The band is deliberately wide: a
+  fit at 0.25 or 0.60 is unremarkable, and this is not a range of "good" rates
+  but the range outside which the step scales have demonstrably failed to find
+  their target. The message carries the realised tail rate, the target, the
+  window length and the cumulative rate, so you do not have to re-run with
+  `optimizer_trace` to see how far off it was. It is the *tail* rather than the
+  whole-run average that is reported, because a run that mixes badly early and
+  recovers averages to a number describing neither half; and it stays quiet for
+  runs with fewer than 25 post-burn-in iterations, where the realised rate
+  describes the starting scale rather than a failure to reach target.
 
 ## Post-SAEM Finalization
 
@@ -583,7 +646,8 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
   n_convergence = 250      # Phase 2 iterations
   n_mh_steps    = 20       # block-MH steps per subject per iteration (ignored when n_leapfrog > 0)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
-  adapt_interval = 50      # Step-size adaptation frequency
+  adapt_interval = 50      # Step-size adaptation frequency (interval rule)
+  scale_adaptation = interval  # or robbins_monro
   omega_burnin  = 20       # Iterations to hold Ω fixed while the chain warms up
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors
@@ -658,7 +722,9 @@ The reference "scale" is the *larger* of the starting value and the data-informe
 ### Slow Convergence
 
 - Decrease `n_exploration` and `n_convergence` if parameters stabilize early
-- Use `adapt_interval = 25` for faster step-size adaptation
+- Use `adapt_interval = 25` for faster step-size adaptation, or
+  `scale_adaptation = robbins_monro` when the acceptance-rate warning says the
+  scales never reached their target
 
 ### Reproducibility
 

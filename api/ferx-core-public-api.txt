@@ -2431,6 +2431,9 @@ pub ferx_core::types::RateMode::ModeledRate
 pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
+pub enum ferx_core::types::ScaleAdaptation
+pub ferx_core::types::ScaleAdaptation::Interval
+pub ferx_core::types::ScaleAdaptation::RobbinsMonro
 pub enum ferx_core::types::ScalingSpec
 pub ferx_core::types::ScalingSpec::ExpressionScale
 pub ferx_core::types::ScalingSpec::ExpressionScale::deriv: core::option::Option<ferx_core::parser::model_parser::ScaleDerivProgram>
@@ -2916,6 +2919,7 @@ pub ferx_core::types::FitOptions::saem_n_exploration: usize
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
+pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::scale_params: bool
 pub ferx_core::types::FitOptions::sir: bool
@@ -3747,6 +3751,9 @@ pub ferx_core::RateMode::ModeledRate
 pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
+pub enum ferx_core::ScaleAdaptation
+pub ferx_core::ScaleAdaptation::Interval
+pub ferx_core::ScaleAdaptation::RobbinsMonro
 pub enum ferx_core::ScalingSpec
 pub ferx_core::ScalingSpec::ExpressionScale
 pub ferx_core::ScalingSpec::ExpressionScale::deriv: core::option::Option<ferx_core::parser::model_parser::ScaleDerivProgram>
@@ -4356,6 +4363,7 @@ pub ferx_core::FitOptions::saem_n_exploration: usize
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
+pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::scale_params: bool
 pub ferx_core::FitOptions::sir: bool

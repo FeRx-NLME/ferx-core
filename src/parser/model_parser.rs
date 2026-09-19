@@ -8841,6 +8841,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
+        "scale_adaptation" | "saem_scale_adaptation" => {
+            opts.saem_scale_adaptation = match value.to_lowercase().as_str() {
+                "robbins_monro" | "robbins-monro" | "rm" => {
+                    crate::types::ScaleAdaptation::RobbinsMonro
+                }
+                "interval" | "legacy" => crate::types::ScaleAdaptation::Interval,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected \
+                         robbins_monro/interval"
+                    ));
+                }
+            };
+        }
         "mstep_damping" | "saem_mstep_damping" => {
             let v = parse_f64(key)?;
             // `1.0` is the documented "off" value (the pre-#1011 assignment), so

@@ -35,6 +35,28 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+/// Where a run's optimizer trace is written when `FitOptions::optimizer_trace`
+/// is set.
+///
+/// Unique per call, not merely per process-second. The path used to be
+/// `/tmp/ferx_trace_{pid}_{unix_seconds}.csv`, which two `fit()` calls in the
+/// same process and the same wall-clock second share — and the second one
+/// truncates the first, so a caller fitting several models (or a test running
+/// two fits back to back) silently lost a trace and read the wrong run's rows.
+/// The nanosecond field plus a monotonic counter make each call's path its own,
+/// and the counter is what covers a clock with coarse sub-second resolution.
+fn trace_file_path() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let (secs, nanos) = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("/tmp/ferx_trace_{pid}_{secs}_{nanos:09}_{seq}.csv")
+}
+
 /// Build the `FitResult.neural_networks` summary from the compiled model's
 /// `[covariate_nn]` blocks. Empty when no NN blocks are present, so output
 /// writers can always iterate `result.neural_networks` without branching.
@@ -1125,12 +1147,7 @@ fn fit_inner(
 
     // Initialise the per-iteration optimizer trace if requested.
     if options.optimizer_trace {
-        let pid = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path = format!("/tmp/ferx_trace_{}_{}.csv", pid, ts);
+        let path = trace_file_path();
         // Header carries one `val:<name>`/`grad:<name>` column per optimized
         // coordinate. The coordinate structure (and hence the names) is fixed
         // across a method chain, so the template's names serve every stage.
@@ -2978,6 +2995,36 @@ mod bobyqa_scale_warning_tests {
                 bobyqa_scale_warning(opt, BOBYQA_MAX_DIM * 10).is_none(),
                 "{opt:?} must not warn"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod trace_file_path_tests {
+    use super::trace_file_path;
+
+    #[test]
+    fn two_calls_never_share_a_path() {
+        // The regression: the path was `{pid}_{unix_seconds}`, so two fits in
+        // the same second wrote to the same file and the second truncated the
+        // first. A fit takes well under a second on a small model, so this was
+        // reachable from an ordinary two-model script, not only from a test.
+        let a = trace_file_path();
+        let b = trace_file_path();
+        assert_ne!(a, b, "two traces must not share a file");
+        // Still recognisable, and still under /tmp.
+        for p in [&a, &b] {
+            assert!(
+                p.starts_with("/tmp/ferx_trace_") && p.ends_with(".csv"),
+                "unexpected trace path {p}"
+            );
+        }
+        // A thousand calls inside one process-second must all be distinct —
+        // the counter, not the clock, is what guarantees that, so pin it with
+        // more calls than a coarse clock could separate.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(seen.insert(trace_file_path()), "duplicate trace path");
         }
     }
 }
