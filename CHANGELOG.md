@@ -20,6 +20,25 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **SAEM: two opt-in estimators for the numerical θ/σ M-step that do not carry its
+  Jensen bias (`mstep_solver = score_sa`, `mstep_draws = K`).** A θ with no ETA — a
+  covariate effect, or a structural parameter deliberately left without IIV — is moved
+  only by the η-frozen numerical M-step, which re-maximises against each iteration's
+  **single** η draw and adopts the maximiser. A maximiser is a nonlinear function of the
+  draw, so that recursion converges to `E[θ*(η)]` rather than to the θ that maximises
+  `E[Q(θ, η)]`, and the gap grows when the E-step mixes *better*. `mstep_solver =
+  score_sa` solves the score equation `E[∇Q] = 0` by stochastic approximation instead,
+  preconditioned by the SA-averaged expected information; `mstep_draws = K` averages the
+  existing derivative-free objective over the last K draws, which shrinks the bias by
+  roughly `1/K` without removing it. Measured on the busulfan benchmark (600 subjects, `TVQ` with no ETA, 6 seeds, importance-sampled
+  −2 log L): freeing that theta costs **+9.75** under the default solver and **+3.37** under
+  `score_sa`, at the same CPU; `mstep_draws` does not move it under the default random-walk
+  E-step and costs 53–89 % more. Both are **off by default** and a fit
+  that sets neither is bit-identical to before; both are restricted to the plain
+  Gaussian residual scope the expected information has a closed form on (no IOV,
+  mixture, M3, TTE endpoint, `block_sigma`, `[covariate_nn]` θ, residual magnitude or
+  FREM) and say so by name when they decline (#1458).
+
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
