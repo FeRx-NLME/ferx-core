@@ -604,6 +604,16 @@ Rules and restrictions:
 - **Coverage is checked at fit time.** Every observed `CMT` in the dataset must
   have a matching `CMT=N:` entry, or `fit()` errors and names the missing
   compartments. Duplicate `CMT=N` entries are rejected at parse time.
+- **A `CMT=N:` line no observation matches is a warning**, not an error (since
+  [#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)). It is inert —
+  nothing dispatches to it — so `fit()` and `ferx check --data` report
+  `W_PER_CMT_UNMATCHED` naming the dead compartments rather than refusing the
+  model. Measured on a one-state `[odes]` model declaring both `CMT=1:
+  proportional` and `CMT=2: additive`, with the observations on compartment 2
+  and nothing else changed: OFV **13.3243** with the `CMT` column present
+  against **7.7329** with it dropped, because every row then takes the `CMT=1:`
+  error model instead. See [the check-report page](../file-formats/check-report.qmd#codes-scaling-output-and-derived)
+  for what the warning covers and when it stays silent.
 - **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
   optimizers, and SAEM (optionally followed by `imp`).
 
