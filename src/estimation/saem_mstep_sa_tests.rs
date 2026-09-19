@@ -365,15 +365,17 @@ fn score_sa_converges_to_the_maximiser_of_the_averaged_objective() {
     let (_, biased_gap) = worst_theta_gap(&biased, &target);
 
     let (sa, lt, _) = run_score_sa(&model, &population, &p, &draws, 12);
-    let (rejected, out_of_scope) = sa.counters();
-    assert_eq!(out_of_scope, 0, "the fixture is inside the Gaussian scope");
-    // Nothing here should land on a non-finite objective; a non-zero count means
-    // the trust region is letting the step leave the model's domain.
+    // Every step must have moved theta/sigma: this fixture is inside the
+    // Gaussian scope, its information is well conditioned, and nothing should
+    // land on a non-finite objective. A non-zero count in ANY slot would mean
+    // the recursion below ran on fewer steps than it claims.
     assert_eq!(
-        rejected,
+        sa.failure_total(),
         0,
-        "{rejected} of {} steps never found a finite objective",
-        12 * draws.len()
+        "{} of {} steps did not move theta/sigma: {:?}",
+        sa.failure_total(),
+        12 * draws.len(),
+        sa.failures()
     );
 
     let (coord, sa_gap) = worst_theta_gap(&lt, &target);
@@ -669,4 +671,267 @@ fn stored_draws_follow_a_per_subject_mu_reference_shift() {
     // A non-finite shift is skipped rather than poisoning the stored draw —
     // the same rule the live η re-centring uses.
     assert_eq!(draws[0][2][0], 0.40);
+}
+
+/// Every early return from `MstepScoreSa::step` must be **counted**, or a run
+/// can lose its numerical M-step on every iteration and report nothing — the
+/// objective is fine and the parameters simply stop being estimated, which is
+/// invisible in the trace.
+///
+/// The callers ignore `step`'s return value on purpose (a held θ/σ is not a
+/// fatal condition), so the counter *is* the only channel, and this test is
+/// what stops a new early return being added without one. It drives three of
+/// the six routes directly; the gate-bug route (`OutOfScope`) is unreachable
+/// from an in-scope fixture by construction, and `NonFiniteTerms` /
+/// `NonFiniteDirection` are asserted to be reachable-but-unfired here.
+#[test]
+fn every_failure_route_is_counted() {
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let draws = eta_draws();
+
+    // Route: no free coordinate. Pin every theta AND the sigma, so the free
+    // set is empty and there is nothing to solve for.
+    let mut p = packed_start();
+    for i in 0..4 {
+        p.theta_lower[i] = p.log_theta[i];
+        p.theta_upper[i] = p.log_theta[i];
+    }
+    p.sigma_lower[0] = p.log_sigma[0];
+    p.sigma_upper[0] = p.log_sigma[0];
+
+    let mut sa = MstepScoreSa::new(4, 1);
+    let mut lt = p.log_theta.clone();
+    let mut ls = p.log_sigma.clone();
+    let moved = sa.step(
+        &model,
+        &population,
+        &draws[0],
+        &mut lt,
+        &mut ls,
+        &p.theta_lower,
+        &p.theta_upper,
+        &p.sigma_lower,
+        &p.sigma_upper,
+        &p.mask,
+        1.0,
+        &[],
+    );
+    assert!(
+        !moved,
+        "a fully pinned step must report that it did not move"
+    );
+    assert_eq!(
+        sa.failures()[ScoreSaFailure::NoFreeCoordinate as usize],
+        1,
+        "the fully-pinned route was not counted: {:?}",
+        sa.failures()
+    );
+    assert_eq!(sa.failure_total(), 1, "exactly one route should have fired");
+    assert_eq!(lt, p.log_theta, "a failed step must leave theta untouched");
+    assert_eq!(ls, p.log_sigma, "a failed step must leave sigma untouched");
+
+    // …and the same accumulator keeps counting rather than latching.
+    let mut lt2 = p.log_theta.clone();
+    let mut ls2 = p.log_sigma.clone();
+    sa.step(
+        &model,
+        &population,
+        &draws[1],
+        &mut lt2,
+        &mut ls2,
+        &p.theta_lower,
+        &p.theta_upper,
+        &p.sigma_lower,
+        &p.sigma_upper,
+        &p.mask,
+        1.0,
+        &[],
+    );
+    assert_eq!(sa.failure_total(), 2, "the counter must accumulate");
+
+    // Control: the SAME model with the coordinates free must succeed and count
+    // nothing, so the assertions above are about the pin and not about the
+    // fixture being broken.
+    let q = packed_start();
+    let mut sa_ok = MstepScoreSa::new(4, 1);
+    let mut lt3 = q.log_theta.clone();
+    let mut ls3 = q.log_sigma.clone();
+    let moved_ok = sa_ok.step(
+        &model,
+        &population,
+        &draws[0],
+        &mut lt3,
+        &mut ls3,
+        &q.theta_lower,
+        &q.theta_upper,
+        &q.sigma_lower,
+        &q.sigma_upper,
+        &q.mask,
+        1.0,
+        &[],
+    );
+    assert!(moved_ok, "the free fixture must take a step");
+    assert_eq!(
+        sa_ok.failure_total(),
+        0,
+        "the free fixture counted a failure: {:?}",
+        sa_ok.failures()
+    );
+    assert_ne!(lt3, q.log_theta, "the free fixture did not move theta");
+}
+
+/// The failure names are indexed by the enum discriminant, so a new variant
+/// added without a name would print the wrong reason — or panic.
+#[test]
+fn every_failure_reason_has_a_name() {
+    for (i, name) in MSTEP_SA_FAILURE_NAMES.iter().enumerate() {
+        assert!(!name.is_empty(), "reason {i} has no name");
+    }
+    assert_eq!(MSTEP_SA_FAILURE_NAMES.len(), MSTEP_SA_FAILURE_KINDS);
+    // Discriminants must be dense and in order, since they index the array.
+    assert_eq!(ScoreSaFailure::OutOfScope as usize, 0);
+    assert_eq!(ScoreSaFailure::NonFiniteTerms as usize, 1);
+    assert_eq!(ScoreSaFailure::NoFreeCoordinate as usize, 2);
+    assert_eq!(ScoreSaFailure::NotPositiveDefinite as usize, 3);
+    assert_eq!(ScoreSaFailure::NonFiniteDirection as usize, 4);
+    assert_eq!(
+        ScoreSaFailure::NoFiniteObjective as usize,
+        MSTEP_SA_FAILURE_KINDS - 1
+    );
+}
+
+// ── option resolution and the end-of-run report ────────────────────────────
+//
+// Both are pure functions precisely so they can be tested here: the logic
+// otherwise lives inside `run_saem` and is reachable only by a full fit, which
+// means the four warning strings would be exercised by nothing that runs on a
+// PR (slow-gated tests contribute no patch coverage).
+
+/// In scope, `score_sa` is adopted silently and `mstep_draws` passes through.
+#[test]
+fn resolve_mstep_options_adopts_both_in_scope() {
+    let (sa, k, w) = resolve_mstep_options(SaemMstepSolver::ScoreSa, 1, None);
+    assert!(sa, "score_sa must be adopted in scope");
+    assert_eq!(k, 1);
+    assert!(w.is_empty(), "no warning expected in scope: {w:?}");
+
+    let (sa, k, w) = resolve_mstep_options(SaemMstepSolver::Bobyqa, 3, None);
+    assert!(!sa);
+    assert_eq!(k, 3, "mstep_draws must pass through in scope");
+    assert!(w.is_empty(), "{w:?}");
+}
+
+/// The default is the historical solver with one draw, and says nothing.
+#[test]
+fn resolve_mstep_options_default_is_silent_and_historical() {
+    let (sa, k, w) = resolve_mstep_options(SaemMstepSolver::Bobyqa, 1, None);
+    assert!(!sa);
+    assert_eq!(k, 1);
+    assert!(w.is_empty(), "the default must not warn: {w:?}");
+    // …and a scope gap changes nothing when neither option was asked for.
+    let (sa, k, w) = resolve_mstep_options(SaemMstepSolver::Bobyqa, 1, Some("the model has IOV"));
+    assert!(!sa);
+    assert_eq!(k, 1);
+    assert!(w.is_empty(), "an unused option must not warn: {w:?}");
+}
+
+/// Out of scope, each option is declined **by name**, and the reason is
+/// repeated so the user can act on it.
+#[test]
+fn resolve_mstep_options_declines_out_of_scope_by_name() {
+    let reason = "the model has IOV";
+    let (sa, _, w) = resolve_mstep_options(SaemMstepSolver::ScoreSa, 1, Some(reason));
+    assert!(!sa, "score_sa must not be adopted out of scope");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("score_sa") && w[0].contains(reason),
+        "{}",
+        w[0]
+    );
+
+    let (_, k, w) = resolve_mstep_options(SaemMstepSolver::Bobyqa, 3, Some(reason));
+    assert_eq!(k, 1, "mstep_draws must fall back to one draw");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("mstep_draws") && w[0].contains(reason),
+        "{}",
+        w[0]
+    );
+}
+
+/// The two never stack: `mstep_draws` is ignored under `score_sa`, and said so.
+#[test]
+fn resolve_mstep_options_does_not_stack_the_two() {
+    let (sa, k, w) = resolve_mstep_options(SaemMstepSolver::ScoreSa, 4, None);
+    assert!(sa);
+    assert_eq!(k, 1, "mstep_draws must be neutralised under score_sa");
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("ignored") && w[0].contains("mstep_draws"),
+        "{}",
+        w[0]
+    );
+}
+
+/// `mstep_draws = 0` is a `FitOptions` a Rust caller can build directly (the
+/// parser rejects it, `FitOptions` is public), and must not produce a zero-draw
+/// objective.
+#[test]
+fn resolve_mstep_options_floors_zero_draws_at_one() {
+    let (_, k, w) = resolve_mstep_options(SaemMstepSolver::Bobyqa, 0, None);
+    assert_eq!(k, 1, "zero draws must floor at one");
+    assert!(w.is_empty(), "flooring is silent: {w:?}");
+}
+
+/// No failures, no warning — otherwise every clean `score_sa` fit would carry
+/// a spurious one.
+#[test]
+fn score_sa_failure_warning_is_silent_when_every_step_moved() {
+    assert!(score_sa_failure_warning([0; MSTEP_SA_FAILURE_KINDS], 400).is_none());
+}
+
+/// Every route that fired is named with its count; routes that did not fire are
+/// left out. This is the assertion that stops a new `ScoreSaFailure` variant
+/// being added without a reason string, and stops the report collapsing to a
+/// bare total.
+#[test]
+fn score_sa_failure_warning_names_each_route_that_fired() {
+    let mut f = [0u64; MSTEP_SA_FAILURE_KINDS];
+    f[ScoreSaFailure::NotPositiveDefinite as usize] = 7;
+    f[ScoreSaFailure::NoFiniteObjective as usize] = 2;
+    let w = score_sa_failure_warning(f, 400).expect("a failure must be reported");
+
+    assert!(w.contains("9 of 400"), "the total must be the sum: {w}");
+    assert!(
+        w.contains("7x")
+            && w.contains(MSTEP_SA_FAILURE_NAMES[ScoreSaFailure::NotPositiveDefinite as usize]),
+        "{w}"
+    );
+    assert!(
+        w.contains("2x")
+            && w.contains(MSTEP_SA_FAILURE_NAMES[ScoreSaFailure::NoFiniteObjective as usize]),
+        "{w}"
+    );
+    // A route that did not fire must not be mentioned — a report that names
+    // every reason every time tells the user nothing.
+    assert!(
+        !w.contains(MSTEP_SA_FAILURE_NAMES[ScoreSaFailure::OutOfScope as usize]),
+        "a route that did not fire was named: {w}"
+    );
+    assert!(w.contains("score_sa") && w.contains("#1458"), "{w}");
+}
+
+/// The gate-bug route is reportable too — it is the one that should never fire,
+/// so it is the one most worth naming if it does.
+#[test]
+fn score_sa_failure_warning_reports_the_gate_bug_route() {
+    let mut f = [0u64; MSTEP_SA_FAILURE_KINDS];
+    f[ScoreSaFailure::OutOfScope as usize] = 1;
+    let w = score_sa_failure_warning(f, 10).expect("reported");
+    assert!(w.contains("1 of 10"), "{w}");
+    assert!(
+        w.contains("report it"),
+        "the gate-bug route must ask for a report: {w}"
+    );
 }

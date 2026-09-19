@@ -713,6 +713,90 @@ fn recentre_eta_draws_per_subject(draws: &mut [Vec<Vec<f64>>], eta_idx: usize, d
     }
 }
 
+/// What the `mstep_solver` / `mstep_draws` options resolve to for this fit, and
+/// what to say about it (#1458).
+///
+/// Pure so it can be unit-tested: the alternative is logic that only runs
+/// inside `run_saem`, reachable only by a full fit, which is how the four
+/// warning strings below would otherwise go untested (and uncovered).
+///
+/// Returns `(use_score_sa, mstep_draws, warnings)`.
+fn resolve_mstep_options(
+    solver: SaemMstepSolver,
+    requested_draws: usize,
+    scope_gap: Option<&'static str>,
+) -> (bool, usize, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut use_score_sa = false;
+    if matches!(solver, SaemMstepSolver::ScoreSa) {
+        match scope_gap {
+            Some(reason) => warnings.push(format!(
+                "SAEM: `mstep_solver = score_sa` is not available for this model ({reason}), so \
+                 the numerical theta/sigma M-step keeps the single-draw derivative-free solver \
+                 (#1458)."
+            )),
+            None => use_score_sa = true,
+        }
+    }
+    // `score_sa` already averages over every past draw through its
+    // Robbins-Monro accumulator, so the two never stack.
+    let requested = requested_draws.max(1);
+    let draws = if requested > 1 && use_score_sa {
+        warnings.push(
+            "SAEM: `mstep_draws` is ignored under `mstep_solver = score_sa` — its \
+             Robbins-Monro average over the score and information already spans every past \
+             draw (#1458)."
+                .to_string(),
+        );
+        1
+    } else if requested > 1 {
+        match scope_gap {
+            Some(reason) => {
+                warnings.push(format!(
+                    "SAEM: `mstep_draws` is not available for this model ({reason}), so the \
+                     numerical theta/sigma M-step keeps the single-draw objective (#1458)."
+                ));
+                1
+            }
+            None => requested,
+        }
+    } else {
+        1
+    };
+    (use_score_sa, draws, warnings)
+}
+
+/// The end-of-run report for M-steps that did not move theta/sigma (#1458).
+///
+/// `None` when every M-step moved them. An M-step that silently did nothing is
+/// invisible in the trace — the objective is fine, the parameters simply stop
+/// being estimated — so every failure route is counted by reason and any of
+/// them is reported. Pure, for the same testability reason as
+/// [`resolve_mstep_options`].
+fn score_sa_failure_warning(
+    failures: [u64; MSTEP_SA_FAILURE_KINDS],
+    n_iter: usize,
+) -> Option<String> {
+    let total: u64 = failures.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let by_reason: Vec<String> = failures
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, &c)| format!("{c}x {}", MSTEP_SA_FAILURE_NAMES[i]))
+        .collect();
+    Some(format!(
+        "SAEM: `mstep_solver = score_sa` could not move theta/sigma on {} of {} M-step(s) — \
+         they were held at their previous values on those iterations ({}). Treat the \
+         numerically estimated theta and sigma as unconverged (#1458).",
+        total,
+        n_iter,
+        by_reason.join("; ")
+    ))
+}
+
 /// Levenberg-Marquardt ridge added to the SA-averaged information before it is
 /// inverted, as a fraction of that coordinate's own diagonal (#1458).
 ///
@@ -849,19 +933,62 @@ pub(crate) struct MstepScoreSa {
     /// (`gamma = 1` in exploration anyway), and this keeps that true even if a
     /// caller ever starts the solver mid-run.
     started: bool,
-    /// Iterations whose step never landed on a finite objective.
-    rejected: u64,
-    /// Iterations where the per-subject information came back out of scope, so
-    /// the step could not be taken at all. The run-level gate should make this
-    /// impossible; a non-zero count is a gate bug and the caller warns.
-    out_of_scope: u64,
+    /// Why each M-step that failed to move theta/sigma failed, counted by
+    /// reason. Every early return from [`MstepScoreSa::step`] lands in exactly
+    /// one of these — a step that silently did nothing and was not counted is
+    /// the failure mode the end-of-run warning exists to make visible, and it
+    /// is what `every_failure_route_is_counted` pins.
+    failures: [u64; MSTEP_SA_FAILURE_KINDS],
 }
 
+/// Why a [`MstepScoreSa::step`] did not move theta/sigma. The discriminants
+/// index [`MstepScoreSa::failures`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScoreSaFailure {
+    /// A subject's expected information was out of the closed form's scope.
+    /// The run-level gate should make this impossible, so it is a gate bug.
+    OutOfScope = 0,
+    /// The summed score or information was not finite.
+    NonFiniteTerms = 1,
+    /// No free coordinate to move — every one is FIXed or pinned.
+    NoFreeCoordinate = 2,
+    /// The ridged information was not positive definite.
+    NotPositiveDefinite = 3,
+    /// The Newton direction was not finite.
+    NonFiniteDirection = 4,
+    /// Every backtracked step landed on a non-finite (or sentinel) objective.
+    NoFiniteObjective = 5,
+}
+
+/// Number of variants of [`ScoreSaFailure`].
+const MSTEP_SA_FAILURE_KINDS: usize = 6;
+
+/// Human-readable name per [`ScoreSaFailure`] discriminant, for the warning.
+const MSTEP_SA_FAILURE_NAMES: [&str; MSTEP_SA_FAILURE_KINDS] = [
+    "the expected information was out of scope for a subject (this is a gate bug — please report it)",
+    "the summed score or information was not finite",
+    "no free theta or sigma coordinate was left to move",
+    "the ridged information was not positive definite",
+    "the Newton direction was not finite",
+    "no backtracked step reached a finite objective",
+];
+
 impl MstepScoreSa {
-    /// `(rejected, out_of_scope)` — how many M-steps never found a finite
-    /// objective, and how many could not form an information matrix at all.
-    fn counters(&self) -> (u64, u64) {
-        (self.rejected, self.out_of_scope)
+    /// Count this failure and return `false`, so every early return from
+    /// [`MstepScoreSa::step`] is visible to [`MstepScoreSa::failures`].
+    fn fail(&mut self, why: ScoreSaFailure) -> bool {
+        self.failures[why as usize] += 1;
+        false
+    }
+
+    /// How many M-steps failed for each [`ScoreSaFailure`] reason.
+    fn failures(&self) -> [u64; MSTEP_SA_FAILURE_KINDS] {
+        self.failures
+    }
+
+    /// Total M-steps that did not move theta/sigma, for any reason.
+    fn failure_total(&self) -> u64 {
+        self.failures.iter().sum()
     }
 
     fn new(n_theta: usize, n_sigma: usize) -> Self {
@@ -871,8 +998,7 @@ impl MstepScoreSa {
             n_theta,
             n_sigma,
             started: false,
-            rejected: 0,
-            out_of_scope: 0,
+            failures: [0; MSTEP_SA_FAILURE_KINDS],
         }
     }
 
@@ -951,8 +1077,7 @@ impl MstepScoreSa {
         let mut fisher = vec![0.0f64; n * n];
         for (_, g, f) in &per_subj {
             let Some(f) = f else {
-                self.out_of_scope += 1;
-                return false;
+                return self.fail(ScoreSaFailure::OutOfScope);
             };
             for (a, &gv) in g.iter().enumerate() {
                 grad[a] += gv;
@@ -962,7 +1087,7 @@ impl MstepScoreSa {
             }
         }
         if !grad.iter().all(|v| v.is_finite()) || !fisher.iter().all(|v| v.is_finite()) {
-            return false;
+            return self.fail(ScoreSaFailure::NonFiniteTerms);
         }
 
         // Robbins-Monro on the information, which is the matrix gain. The
@@ -978,7 +1103,7 @@ impl MstepScoreSa {
         // Free coordinates only - a pinned one is left to its pin.
         let free: Vec<usize> = (0..n).filter(|&i| lower[i] < upper[i]).collect();
         if free.is_empty() {
-            return false;
+            return self.fail(ScoreSaFailure::NoFreeCoordinate);
         }
         let m = free.len();
         let mut a_mat = DMatrix::<f64>::zeros(m, m);
@@ -993,11 +1118,11 @@ impl MstepScoreSa {
             a_mat[(r, r)] = a_mat[(r, r)] * (1.0 + SCORE_SA_RIDGE) + SCORE_SA_INFO_FLOOR;
         }
         let Some(chol) = a_mat.cholesky() else {
-            return false;
+            return self.fail(ScoreSaFailure::NotPositiveDefinite);
         };
         let d = chol.solve(&rhs);
         if d.iter().any(|v| !v.is_finite()) {
-            return false;
+            return self.fail(ScoreSaFailure::NonFiniteDirection);
         }
 
         let nll_at = |lt: &[f64], ls: &[f64]| -> f64 {
@@ -1034,8 +1159,7 @@ impl MstepScoreSa {
             }
             scale *= 0.5;
         }
-        self.rejected += 1;
-        false
+        self.fail(ScoreSaFailure::NoFiniteObjective)
     }
 }
 
@@ -3954,44 +4078,16 @@ pub fn run_saem(
     // Both need the plain Gaussian scope below; a model outside it keeps the
     // historical solver and is told so by name.
     let numerical_mstep_scope_gap = numerical_mstep_scope_gap(model, n_kappa, saem_mix.is_some());
-    let mut score_sa: Option<MstepScoreSa> = None;
-    if matches!(options.saem_mstep_solver, SaemMstepSolver::ScoreSa) {
-        match numerical_mstep_scope_gap {
-            Some(reason) => warnings.push(format!(
-                "SAEM: `mstep_solver = score_sa` is not available for this model ({reason}), so \
-                 the numerical theta/sigma M-step keeps the single-draw derivative-free solver \
-                 (#1458)."
-            )),
-            None => score_sa = Some(MstepScoreSa::new(n_theta, n_sigma)),
-        }
-    }
-    // Number of η draws the *derivative-free* M-step objective averages over.
-    // `score_sa` already averages over every past draw through its
-    // Robbins-Monro accumulators, so the two never stack.
-    let mstep_draws = {
-        let requested = options.saem_mstep_draws.max(1);
-        if requested > 1 && score_sa.is_some() {
-            warnings.push(
-                "SAEM: `mstep_draws` is ignored under `mstep_solver = score_sa` — its \
-                 Robbins-Monro average over the score and information already spans every \
-                 past draw (#1458)."
-                    .to_string(),
-            );
-            1
-        } else if requested > 1 {
-            match numerical_mstep_scope_gap {
-                Some(reason) => {
-                    warnings.push(format!(
-                        "SAEM: `mstep_draws` is not available for this model ({reason}), so the \
-                         numerical theta/sigma M-step keeps the single-draw objective (#1458)."
-                    ));
-                    1
-                }
-                None => requested,
-            }
-        } else {
-            1
-        }
+    let (use_score_sa, mstep_draws, mstep_option_warnings) = resolve_mstep_options(
+        options.saem_mstep_solver,
+        options.saem_mstep_draws,
+        numerical_mstep_scope_gap,
+    );
+    warnings.extend(mstep_option_warnings);
+    let mut score_sa: Option<MstepScoreSa> = if use_score_sa {
+        Some(MstepScoreSa::new(n_theta, n_sigma))
+    } else {
+        None
     };
     // Previous iterations' η draws, most recent first, at most
     // `mstep_draws - 1` of them. Held here rather than in `SaemState` because
@@ -5554,30 +5650,10 @@ pub fn run_saem(
         warnings.push(w);
     }
 
-    // #1458: say how often the score/information Newton step could not be
-    // taken. A step whose objective never came back finite leaves theta/sigma
-    // where they were, so a run that loses many of them is not estimating them;
-    // an out-of-scope count is a disagreement between the run-level gate
-    // (`numerical_mstep_scope_gap`) and the per-subject one, i.e. a bug.
+    // #1458: see `score_sa_failure_warning` for why every route is reported.
     if let Some(sa) = score_sa.as_ref() {
-        let (rejected, out_of_scope) = sa.counters();
-        if out_of_scope > 0 {
-            warnings.push(format!(
-                "SAEM: `mstep_solver = score_sa` could not form the expected information on {} \
-                 of {} M-step(s) even though the model passed the scope gate — the numerical \
-                 theta/sigma M-step did not move on those iterations. Please report this \
-                 (#1458).",
-                out_of_scope, n_iter
-            ));
-        }
-        if n_iter > 0 && rejected * 10 > n_iter as u64 {
-            warnings.push(format!(
-                "SAEM: `mstep_solver = score_sa` could not find a finite objective for its \
-                 Newton step on {} of {} M-step(s) — theta and sigma were held on those \
-                 iterations. Treat the numerically estimated theta/sigma as unconverged \
-                 (#1458).",
-                rejected, n_iter
-            ));
+        if let Some(w) = score_sa_failure_warning(sa.failures(), n_iter) {
+            warnings.push(w);
         }
     }
 

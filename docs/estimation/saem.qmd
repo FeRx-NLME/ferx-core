@@ -283,7 +283,8 @@ E-step samples better (#1458).
 
 It is invisible in the trace: the objective is fine, and only a comparison
 against a long-run reference or a FOCEI fit shows it. Two opt-in alternatives
-estimate the same coordinates by a recursion that has no Jensen term. Both are
+attack it: one **removes** the Jensen term by never forming a maximiser, the
+other **shrinks** it by averaging more draws into the one it forms. Both are
 **off by default**, and a fit that sets neither is bit-identical to before.
 
 `mstep_solver = score_sa`
