@@ -113,6 +113,20 @@ fn cached_log_weights_enabled() -> bool {
     })
 }
 
+/// Internal same-binary A/B switch for the fused analytic node likelihood + score path.
+fn node_score_fusion_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_AGQ_NODE_SCORE_FUSION")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
+fn node_score_fusion_supported(model: &CompiledModel) -> bool {
+    model.ode_spec.is_none() && analytic_score_supported(model)
+}
+
 fn laplace_one_point_fast_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -342,6 +356,10 @@ struct PreparedGrid {
     /// Row-major quadrature modes (`n_grid × d`) in one allocation.
     bs: Vec<f64>,
     softmax: Vec<f64>,
+    /// Unweighted fixed-node packed scores, row-major (`n_grid × n_packed`).
+    /// When present, the same sensitivity pass supplied both these scores and
+    /// the likelihood terms used to form `softmax`.
+    node_scores: Option<Vec<f64>>,
     base_jet: Option<SubjectSens>,
 }
 
@@ -756,6 +774,7 @@ pub(crate) fn agq_subject_nll(
         log_weights,
         anchor,
         false,
+        None,
         schedule,
         None,
         None,
@@ -782,6 +801,7 @@ fn agq_subject_evaluate(
     log_weights: &[f64],
     anchor: HessianAnchor,
     retain_gradient_work: bool,
+    score_template: Option<&ModelParameters>,
     schedule: Option<&pk::event_driven::EventSchedule>,
     terminal_hessian: Option<&DMatrix<f64>>,
     terminal_mode_nll: Option<f64>,
@@ -874,12 +894,13 @@ fn agq_subject_evaluate(
             h,
             bs: b_hat.to_vec(),
             softmax: vec![1.0],
+            node_scores: None,
             base_jet,
         });
         return (nll, prepared);
     }
 
-    let (bs, terms) = agq_nodes_and_terms(
+    let (bs, terms, node_scores) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -891,6 +912,8 @@ fn agq_subject_evaluate(
         &mut scratch,
         schedule,
         retain_gradient_work,
+        score_template
+            .filter(|_| node_score_fusion_enabled() && node_score_fusion_supported(model)),
     );
 
     let lse = logsumexp(&terms);
@@ -900,6 +923,7 @@ fn agq_subject_evaluate(
             h,
             bs,
             softmax: terms.iter().map(|&t| (t - lse).exp()).collect(),
+            node_scores,
             base_jet,
         });
         (nll, prepared)
@@ -928,7 +952,8 @@ fn agq_nodes_and_terms(
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     retain_nodes: bool,
-) -> (Vec<f64>, Vec<f64>) {
+    score_template: Option<&ModelParameters>,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
@@ -938,6 +963,10 @@ fn agq_nodes_and_terms(
         Vec::new()
     };
     let mut terms = Vec::with_capacity(cap);
+    let score_width = score_template
+        .map(crate::estimation::parameterization::packed_len)
+        .unwrap_or(0);
+    let mut node_scores = score_template.map(|_| Vec::with_capacity(cap * score_width));
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
@@ -966,19 +995,44 @@ fn agq_nodes_and_terms(
             b[k] = b_hat[k] + step[k];
         }
 
-        let nll = stack.nll_at_with_recycle(
-            model,
-            subject,
-            params,
-            &b,
-            scratch,
-            schedule,
-            err_keys.as_deref(),
-            ruv_mult.as_deref(),
-            &mut pred_recycle,
-            &mut eta_work,
-            &mut prior_work,
-        );
+        let fused = match (score_template, node_scores.as_mut()) {
+            (Some(template), Some(scores)) => {
+                let start = scores.len();
+                scores.resize(start + score_width, 0.0);
+                let result = fused_node_nll_and_score(
+                    model,
+                    subject,
+                    params,
+                    template,
+                    stack,
+                    &b,
+                    &mut pred_recycle,
+                    &mut scores[start..],
+                );
+                if result.is_none() {
+                    scores[start..].fill(f64::NAN);
+                }
+                result
+            }
+            _ => None,
+        };
+        let nll = if let Some(nll) = fused {
+            nll
+        } else {
+            stack.nll_at_with_recycle(
+                model,
+                subject,
+                params,
+                &b,
+                scratch,
+                schedule,
+                err_keys.as_deref(),
+                ruv_mult.as_deref(),
+                &mut pred_recycle,
+                &mut eta_work,
+                &mut prior_work,
+            )
+        };
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
@@ -1001,7 +1055,7 @@ fn agq_nodes_and_terms(
             break;
         }
     }
-    (bs, terms)
+    (bs, terms, node_scores)
 }
 
 /// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
@@ -1081,7 +1135,7 @@ pub(crate) fn subject_grid_and_weights(
         schedule.as_ref(),
     )?;
     let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (_bs, terms, _) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -1093,6 +1147,7 @@ pub(crate) fn subject_grid_and_weights(
         &mut scratch,
         schedule.as_ref(),
         false,
+        None,
     );
     let lse = logsumexp(&terms);
     if !lse.is_finite() {
@@ -1207,6 +1262,7 @@ fn agq_population_nll_impl(
                 log_weights,
                 anchor,
                 false,
+                None,
                 schedule,
                 terminal_work.and_then(|all| all[i].0.as_ref()),
                 terminal_work.map(|all| all[i].1),
@@ -1322,6 +1378,7 @@ fn agq_population_evaluate_impl(
                 &log_weights,
                 anchor,
                 true,
+                Some(template),
                 schedule,
                 None,
                 terminal_work.map(|all| all[i].1),
@@ -1584,6 +1641,23 @@ fn accumulate_fixed_eta_packed_gradient(
     weight: f64,
     out: &mut [f64],
 ) -> Option<()> {
+    accumulate_fixed_eta_packed_gradient_with_sens(
+        model, subject, params, template, stack, eta, weight, None, out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_fixed_eta_packed_gradient_with_sens(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    stack: &Stack,
+    eta: &[f64],
+    weight: f64,
+    precomputed_sens: Option<SubjectSens>,
+    out: &mut [f64],
+) -> Option<()> {
     use crate::estimation::parameterization::theta_packs_log;
 
     let b = eta; // the integration variable: η, or the stacked [η, κ₁..κ_K] under IOV
@@ -1693,11 +1767,13 @@ fn accumulate_fixed_eta_packed_gradient(
     // which θ/σ path runs, so falling back for just this subject is exactly the state
     // `accumulate_fixed_b_packed_gradient_fd`'s own docs assume it's called in (#251
     // review #8).
-    let sens = if stack.is_iov() {
-        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
-    } else {
-        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
-    };
+    let sens = precomputed_sens.or_else(|| {
+        if stack.is_iov() {
+            crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
+        } else {
+            crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
+        }
+    });
     let Some(sens) = sens else {
         return accumulate_fixed_b_packed_gradient_fd(
             model,
@@ -1789,6 +1865,89 @@ fn accumulate_fixed_eta_packed_gradient(
     }
 
     Some(())
+}
+
+/// Score one analytic quadrature node from a single full sensitivity jet.
+/// The jet's prediction values score the likelihood, then the same owned jet
+/// supplies the fixed-node packed score. `None` keeps the established two-pass
+/// fallback for model/subject combinations outside the analytic provider.
+fn fused_node_nll_and_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    template: &ModelParameters,
+    stack: &Stack,
+    b: &[f64],
+    preds: &mut Vec<f64>,
+    score: &mut [f64],
+) -> Option<f64> {
+    // On ODE grids the cheap value pass can identify posterior-underflow nodes and the
+    // established score loop then skips their expensive sensitivity integrations. Eager
+    // fusion has to differentiate before it knows that weight, which is a net regression.
+    if !node_score_fusion_supported(model) {
+        return None;
+    }
+    let sens = if stack.is_iov() {
+        crate::sens::provider::subject_sensitivities_iov(model, subject, &params.theta, b)
+    } else {
+        crate::sens::provider::subject_sensitivities(model, subject, &params.theta, b)
+    };
+    let sens = sens?;
+    preds.clear();
+    preds.extend(sens.obs.iter().map(|obs| obs.f));
+    if preds.len() != subject.observations.len() {
+        return None;
+    }
+    let eta = &b[..stack.n_eta];
+    let residual_correlations = if stack.is_iov() {
+        &[][..]
+    } else {
+        params.residual_correlations.as_slice()
+    };
+    let data_nll = crate::stats::likelihood::obs_nll_subject_from_preds(
+        model,
+        subject,
+        preds,
+        &params.theta,
+        &params.sigma.values,
+        residual_correlations,
+        eta,
+    );
+    // Keep node scoring allocation-free outside the sensitivity provider.  The established
+    // likelihood path reuses a `DVector` scratch for this quadratic; constructing a fresh
+    // vector here would erase much of the allocation benefit of fusing the value pass.
+    let prior_quad = b.iter().enumerate().fold(0.0, |sum, (row, &b_row)| {
+        sum + b_row
+            * b.iter()
+                .enumerate()
+                .map(|(col, &b_col)| stack.omega_joint_inv[(row, col)] * b_col)
+                .sum::<f64>()
+    });
+    let mut prior_log_det = params.omega.log_det;
+    if stack.is_iov() {
+        prior_log_det += stack.n_occ as f64 * params.omega_iov.as_ref()?.log_det;
+    }
+    let nll = data_nll + 0.5 * (prior_quad + prior_log_det);
+    if !nll.is_finite() {
+        return None;
+    }
+    debug_assert_eq!(
+        score.len(),
+        crate::estimation::parameterization::packed_len(template)
+    );
+    score.fill(0.0);
+    accumulate_fixed_eta_packed_gradient_with_sens(
+        model,
+        subject,
+        params,
+        template,
+        stack,
+        b,
+        1.0,
+        Some(sens),
+        score,
+    )?;
+    Some(nll)
 }
 
 /// The **grid response**: movement of both the anchor and the mode, omitted by the fixed-node score.
@@ -2584,7 +2743,7 @@ fn phi_grid(
 ) -> Option<f64> {
     let d = stack.d();
     let proposal = build_proposal(h_mat, omega_inv, d)?;
-    let (_bs, terms) = agq_nodes_and_terms(
+    let (_bs, terms, _) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -2596,6 +2755,7 @@ fn phi_grid(
         scratch,
         schedule,
         false,
+        None,
     );
     let lse = logsumexp(&terms);
     lse.is_finite()
@@ -2647,7 +2807,7 @@ fn agq_subject_packed_gradient(
 
     // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
     // and the scores are computed on exactly the same nodes the objective used.
-    let (bs, terms) = agq_nodes_and_terms(
+    let (bs, terms, _) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -2659,6 +2819,7 @@ fn agq_subject_packed_gradient(
         &mut scratch,
         schedule.as_ref(),
         true,
+        None,
     );
     let lse = logsumexp(&terms);
     if !lse.is_finite() {
@@ -2685,6 +2846,7 @@ fn agq_subject_packed_gradient(
         &h,
         &bs,
         &softmax,
+        None,
         &mut scratch,
         schedule.as_ref(),
         base_jet,
@@ -2708,12 +2870,64 @@ fn finish_agq_subject_gradient(
     h: &DMatrix<f64>,
     bs: &[f64],
     softmax: &[f64],
+    node_scores: Option<&[f64]>,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     base_jet: Option<SubjectSens>,
     out: &mut [f64],
 ) -> Option<()> {
-    if parallel_grid {
+    if let Some(scores) = node_scores {
+        let score_width = out.len();
+        debug_assert_eq!(scores.len(), softmax.len() * score_width);
+        if parallel_grid {
+            let d = stack.d();
+            let mut weighted = vec![0.0; scores.len()];
+            weighted
+                .par_chunks_mut(score_width)
+                .zip(scores.par_chunks(score_width))
+                .zip(bs.par_chunks(d))
+                .zip(softmax.par_iter())
+                .try_for_each(|(((dst, score), b_j), &w)| {
+                    if w == 0.0 {
+                        return Some(());
+                    }
+                    if score.iter().all(|v| v.is_finite()) {
+                        for (slot, &value) in dst.iter_mut().zip(score) {
+                            *slot = w * value;
+                        }
+                    } else {
+                        accumulate_fixed_eta_packed_gradient(
+                            model, subject, params, template, stack, b_j, w, dst,
+                        )?;
+                    }
+                    Some(())
+                })?;
+            for score in weighted.chunks_exact(score_width) {
+                for (dst, value) in out.iter_mut().zip(score) {
+                    *dst += *value;
+                }
+            }
+        } else {
+            for ((score, b_j), &w) in scores
+                .chunks_exact(score_width)
+                .zip(bs.chunks_exact(stack.d()))
+                .zip(softmax)
+            {
+                if w == 0.0 {
+                    continue;
+                }
+                if score.iter().all(|v| v.is_finite()) {
+                    for (dst, &value) in out.iter_mut().zip(score) {
+                        *dst += w * value;
+                    }
+                } else {
+                    accumulate_fixed_eta_packed_gradient(
+                        model, subject, params, template, stack, b_j, w, out,
+                    )?;
+                }
+            }
+        }
+    } else if parallel_grid {
         let d = stack.d();
         let score_width = out.len();
         let mut node_scores = vec![0.0; softmax.len() * score_width];
@@ -2899,6 +3113,7 @@ impl<'a> SubjectScoreContext<'a> {
                     &grid.h,
                     &grid.bs,
                     &grid.softmax,
+                    grid.node_scores.as_deref(),
                     &mut scratch,
                     schedule,
                     grid.base_jet,
@@ -3194,7 +3409,7 @@ mod tests {
         )
         .expect("base anchor must be valid — only the perturbed point is invalid");
         let proposal = build_proposal(&h, &stack.omega_joint_inv, stack.d()).expect("proposal");
-        let (bs, terms) = agq_nodes_and_terms(
+        let (bs, terms, _) = agq_nodes_and_terms(
             &model,
             &subject,
             params,
@@ -3206,6 +3421,7 @@ mod tests {
             &mut scratch2,
             schedule.as_ref(),
             true,
+            None,
         );
         let lse = logsumexp(&terms);
         let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
@@ -3477,7 +3693,12 @@ mod tests {
             let terms_only =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
             assert!(evaluation.gradient.is_some());
-            assert_eq!(evaluation.nll.to_bits(), terms_only.to_bits());
+            assert!(
+                (evaluation.nll - terms_only).abs() <= 1e-13 * (1.0 + terms_only.abs()),
+                "{anchor:?} fused objective {} differs from terms-only {}",
+                evaluation.nll,
+                terms_only
+            );
 
             let uncached = population_gradient_mixed(
                 &model,
@@ -3507,13 +3728,64 @@ mod tests {
             .expect("fused gradient");
             assert_eq!(fused.len(), uncached.len());
             for (i, (fused, uncached)) in fused.iter().zip(&uncached).enumerate() {
-                assert_eq!(
-                    fused.to_bits(),
-                    uncached.to_bits(),
+                assert!(
+                    (fused - uncached).abs() <= 1e-13 * (1.0 + uncached.abs()),
                     "{anchor:?} packed gradient coordinate {i}: \
                      fused={fused:e}, uncached={uncached:e}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fused_iov_node_reuses_the_jet_without_changing_value_or_score() {
+        use crate::estimation::parameterization::{pack_params, packed_len};
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+
+        let model = parse_model_file(Path::new("examples/warfarin_iov.ferx")).expect("model");
+        let population =
+            read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC")).expect("data");
+        let subject = &population.subjects[0];
+        let params = &model.default_params;
+        let n_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
+        let stack = Stack::new(&model, params, n_occ);
+        let b = vec![0.03; stack.d()];
+        let mut preds = Vec::new();
+        let mut fused_score = vec![0.0; packed_len(params)];
+        let fused_nll = fused_node_nll_and_score(
+            &model,
+            subject,
+            params,
+            params,
+            &stack,
+            &b,
+            &mut preds,
+            &mut fused_score,
+        )
+        .expect("IOV analytic fusion");
+
+        let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+        let schedule = cacheable_schedule(&model, subject);
+        let established_nll =
+            stack.nll_at(&model, subject, params, &b, &mut scratch, schedule.as_ref());
+        assert!((fused_nll - established_nll).abs() <= 1e-13 * (1.0 + established_nll.abs()));
+
+        let mut established_score = vec![0.0; pack_params(params).len()];
+        accumulate_fixed_eta_packed_gradient(
+            &model,
+            subject,
+            params,
+            params,
+            &stack,
+            &b,
+            1.0,
+            &mut established_score,
+        )
+        .expect("established IOV score");
+        for (fused, established) in fused_score.iter().zip(&established_score) {
+            assert!((fused - established).abs() <= 1e-13 * (1.0 + established.abs()));
         }
     }
 
@@ -3685,7 +3957,7 @@ mod tests {
                 .expect("anchor Hessian");
                 let proposal =
                     build_proposal(&h, &stack.omega_joint_inv, stack.d()).expect("proposal");
-                let (bs, terms) = agq_nodes_and_terms(
+                let (bs, terms, _) = agq_nodes_and_terms(
                     &model,
                     &subject,
                     &params,
@@ -3697,6 +3969,7 @@ mod tests {
                     &mut scratch,
                     schedule.as_ref(),
                     true,
+                    None,
                 );
                 let lse = logsumexp(&terms);
                 let softmax: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
