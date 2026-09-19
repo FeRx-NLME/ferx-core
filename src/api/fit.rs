@@ -1631,29 +1631,6 @@ fn fit_inner(
         let mut stage_opts = options.clone();
         stage_opts.method = method;
         stage_opts.methods = Vec::new();
-        let quadrature_nodes = stage_opts.agq_nodes();
-        crate::estimation::inner_optimizer::set_capture_terminal_hessian(
-            quadrature_nodes.is_some(),
-        );
-        // FOCE and FOCEI intentionally share the positive conditional
-        // Gauss-Newton metric: their EBE objective is identical. Their distinct
-        // interaction/non-interaction Hessians enter the population marginal,
-        // not this inner solve. Multi-node AGQ uses that same robust metric;
-        // one-node Laplace uses its exact conditional Hessian for robustness.
-        // Both pass through the same SPD Cholesky gate and prior-metric fallback.
-        crate::estimation::inner_optimizer::set_exact_hessian_seed_for_fit(
-            quadrature_nodes == Some(1),
-        );
-        crate::estimation::inner_optimizer::set_hessian_seed_for_fit(
-            quadrature_nodes == Some(1)
-                || (matches!(
-                    method,
-                    EstimationMethod::Foce
-                        | EstimationMethod::FoceI
-                        | EstimationMethod::FoceGn
-                        | EstimationMethod::FoceGnHybrid
-                ) && quadrature_nodes != Some(1)),
-        );
         // Per-stage interaction flag: FOCEI=on, FOCE=off, others inherit from user options.
         match method {
             EstimationMethod::FoceI => stage_opts.interaction = true,

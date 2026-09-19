@@ -1,4 +1,5 @@
 use super::*;
+use crate::estimation::inner_optimizer::run_inner_loop_warm;
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
 use crate::estimation::covariance::{

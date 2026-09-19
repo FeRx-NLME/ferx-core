@@ -1095,14 +1095,19 @@ pub fn agq_population_nll(
     )
 }
 
-/// Same objective as [`agq_population_nll`], but with a caller-hoisted
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`] so every subject's
-/// per-eval schedule rebuild is skipped in favor of the one built for the whole fit.
-/// Used only by the FOCEI/Laplace/AGQ outer hot loop (`outer_optimizer.rs`); every other
-/// caller goes through [`agq_population_nll`] and pays the per-call rebuild.
+/// Same objective as [`agq_population_nll`], for the FOCEI/Laplace/AGQ outer hot loop
+/// (`outer_optimizer.rs`): a caller-hoisted
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`] skips every subject's
+/// per-eval schedule rebuild, and `terminal_hessians` — each subject's exact conditional
+/// Hessian retained from its inner solve (`EbeResult::terminal_hessian`) — replaces the
+/// anchor recomputation under [`HessianAnchor::Exact`]. Either may be `None`; every other
+/// caller goes through [`agq_population_nll`] and pays both.
+///
+/// A retained Hessian is trusted verbatim, so the producer must guarantee it is the matrix
+/// `anchor_hessian(Exact)` would compute at `eta_hats[i]` — `analytic_terminal_work` gates
+/// on the same `analytic_score_supported` predicate for exactly that reason.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn agq_population_nll_with_schedules(
+pub(crate) fn agq_population_nll_prepared(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -1110,7 +1115,8 @@ pub(crate) fn agq_population_nll_with_schedules(
     kappas: &[Vec<nalgebra::DVector<f64>>],
     n_nodes: usize,
     anchor: HessianAnchor,
-    schedules: &[Option<pk::event_driven::EventSchedule>],
+    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    terminal_hessians: Option<&[Option<DMatrix<f64>>]>,
 ) -> f64 {
     agq_population_nll_impl(
         model,
@@ -1120,34 +1126,8 @@ pub(crate) fn agq_population_nll_with_schedules(
         kappas,
         n_nodes,
         anchor,
-        Some(schedules),
-        None,
-    )
-}
-
-/// Schedule-cached objective that also reuses exact terminal inner Hessians.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn agq_population_nll_with_schedules_and_hessians(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[nalgebra::DVector<f64>],
-    kappas: &[Vec<nalgebra::DVector<f64>>],
-    n_nodes: usize,
-    anchor: HessianAnchor,
-    schedules: &[Option<pk::event_driven::EventSchedule>],
-    terminal_hessians: &[Option<DMatrix<f64>>],
-) -> f64 {
-    agq_population_nll_impl(
-        model,
-        population,
-        params,
-        eta_hats,
-        kappas,
-        n_nodes,
-        anchor,
-        Some(schedules),
-        Some(terminal_hessians),
+        schedules,
+        terminal_hessians,
     )
 }
 
@@ -1224,7 +1204,7 @@ pub(crate) fn agq_population_evaluate(
 
 /// Same evaluation as [`agq_population_evaluate`], but with a caller-hoisted
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`] — see
-/// [`agq_population_nll_with_schedules`]. Used only by the FOCEI/Laplace/AGQ outer hot loop.
+/// [`agq_population_nll_prepared`]. Used only by the FOCEI/Laplace/AGQ outer hot loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_population_evaluate_with_schedules(
     model: &CompiledModel,
@@ -4569,9 +4549,11 @@ mod tests {
         assert_eq!(grid_size(21, 50), usize::MAX);
     }
 
-    /// `agq_population_nll_with_schedules` / `agq_population_evaluate_with_schedules` must be
+    /// `agq_population_nll_prepared` / `agq_population_evaluate_with_schedules` must be
     /// bit-identical to the uncached `agq_population_nll` / `agq_population_evaluate` they
-    /// wrap. Mixes a subject with an `EVID 3/4` reset (`cacheable_schedule` returns `Some`)
+    /// wrap — with the schedule cache alone, and with the terminal Hessians the inner solve
+    /// actually retains (`analytic_terminal_work`, the production producer; not
+    /// `anchor_hessian` fed back into itself, which would only assert `f(x) == f(x)`). Mixes a subject with an `EVID 3/4` reset (`cacheable_schedule` returns `Some`)
     /// and one with neither a reset nor a time-varying covariate (`None`) in the same
     /// population, since that mix is what would expose the cache's per-subject index ever
     /// drifting out of alignment with `population.subjects`.
@@ -4634,7 +4616,7 @@ mod tests {
             };
             let uncached_nll =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
-            let cached_nll = agq_population_nll_with_schedules(
+            let cached_nll = agq_population_nll_prepared(
                 &model,
                 &population,
                 &params,
@@ -4642,7 +4624,8 @@ mod tests {
                 &kappas,
                 3,
                 anchor,
-                &schedules,
+                Some(&schedules),
+                None,
             );
             assert_eq!(
                 uncached_nll.to_bits(),
@@ -4655,9 +4638,19 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, subject)| {
+                        let retained = crate::estimation::inner_optimizer::analytic_terminal_work(
+                            &model,
+                            subject,
+                            &params,
+                            eta_hats[i].as_slice(),
+                        )
+                        .map(|(_, h)| h)
+                        .expect("in-scope Gaussian subject retains a terminal Hessian");
+                        // The retained matrix must be *the* anchor, not merely close to it:
+                        // the objective trusts it verbatim in place of `anchor_hessian`.
                         let stack = Stack::new(&model, &params, 0);
                         let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-                        anchor_hessian(
+                        let anchored = anchor_hessian(
                             anchor,
                             &model,
                             subject,
@@ -4667,9 +4660,15 @@ mod tests {
                             &mut scratch,
                             schedules[i].as_ref(),
                         )
+                        .expect("exact anchor always yields a matrix");
+                        assert_eq!(
+                            retained, anchored,
+                            "subject {i}: retained terminal Hessian is not the exact anchor"
+                        );
+                        Some(retained)
                     })
                     .collect();
-                let reused = agq_population_nll_with_schedules_and_hessians(
+                let reused = agq_population_nll_prepared(
                     &model,
                     &population,
                     &params,
@@ -4677,8 +4676,8 @@ mod tests {
                     &kappas,
                     3,
                     anchor,
-                    &schedules,
-                    &terminal_hessians,
+                    Some(&schedules),
+                    Some(&terminal_hessians),
                 );
                 assert_eq!(
                     cached_nll.to_bits(),

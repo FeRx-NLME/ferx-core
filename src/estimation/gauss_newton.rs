@@ -13,7 +13,7 @@
 ///
 /// This approach mirrors NONMEM's modified Gauss-Newton algorithm and typically
 /// converges in 10-30 iterations vs 100+ for first-order methods.
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -124,7 +124,7 @@ pub fn run_foce_gn(
     // Initial inner loop
     let params = unpack_params(&x, init_params);
     let init_mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let (mut eta_hats, mut h_matrices, _, mut kappas) = run_inner_loop_warm(
+    let (mut eta_hats, mut h_matrices, _, mut kappas) = run_inner_loop_warm_seeded(
         model,
         population,
         &params,
@@ -134,6 +134,7 @@ pub fn run_foce_gn(
         Some(&init_mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
+        InnerHessianSeed::for_options(options),
     );
 
     let mut ofv_clean = 2.0
@@ -287,7 +288,7 @@ pub fn run_foce_gn(
 
         let params_try = unpack_params(&x_try, init_params);
         let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
-        let (eta_try, h_try, _, kap_try) = run_inner_loop_warm(
+        let (eta_try, h_try, _, kap_try) = run_inner_loop_warm_seeded(
             model,
             population,
             &params_try,
@@ -297,6 +298,7 @@ pub fn run_foce_gn(
             Some(&try_mu_k),
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
+            InnerHessianSeed::for_options(options),
         );
         let ofv_try_clean = 2.0
             * pop_nll(

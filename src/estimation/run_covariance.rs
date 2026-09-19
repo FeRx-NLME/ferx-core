@@ -277,7 +277,7 @@ fn run_covariance_scoped(
     };
     let mu_k = compute_mu_k(model_ref, &params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, kappas) =
-        crate::estimation::inner_optimizer::run_inner_loop_warm(
+        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
             model_ref,
             pop_ref,
             &params,
@@ -289,6 +289,11 @@ fn run_covariance_scoped(
             // Cold reconvergence: match the fit's inner multi-start so the EBEs
             // land in the same basin (else SEs would differ from the inline path).
             options.inner_restarts,
+            // …and the fit's BFGS seed (#1389), for the same reason: the inline final
+            // inner loop runs the stage's seed, and a different metric lands a
+            // different η̂ at a loose `inner_tol` (measured 1.5e-11 on the warfarin
+            // covariance, against the 1e-12 bit-parity bound).
+            crate::estimation::inner_optimizer::InnerHessianSeed::for_options(options),
         );
 
     // --- Run the covariance step (UNGATED: calling `run_covariance` IS the
