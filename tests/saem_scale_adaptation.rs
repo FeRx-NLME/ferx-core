@@ -79,6 +79,10 @@ fn tail_accept_rate(trace_path: &str, n: usize) -> f64 {
 }
 
 fn warfarin_tail_rate(rule: &str) -> f64 {
+    warfarin_tail_rate_seed(rule, 12345)
+}
+
+fn warfarin_tail_rate_seed(rule: &str, seed: u64) -> f64 {
     let model = parse_model_file(std::path::Path::new("examples/warfarin_saem.ferx"))
         .expect("example parses");
     let pop = read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
@@ -91,7 +95,7 @@ fn warfarin_tail_rate(rule: &str) -> f64 {
         // not the example file's `n_mh_steps = 3`.
         saem_n_mh_steps: 20,
         saem_omega_burnin: OMEGA_BURNIN,
-        saem_seed: Some(12345),
+        saem_seed: Some(seed),
         run_covariance_step: false,
         optimizer_trace: true,
         threads: Some(2),
@@ -113,9 +117,24 @@ fn warfarin_tail_rate(rule: &str) -> f64 {
 
 /// The defect of #1444 and its fix, as a straddle over the diagnostic's gate.
 ///
-/// Realised on `origin/main @ 65118bea` + this change, seed 12345, 20 MH steps:
-/// `interval` 0.0390, `robbins_monro` 0.4205 — matching the 0.040 / 0.420 the issue
-/// reported from the research branch.
+/// **The bounds below are measured, not bracketed** (#1451 review). Realised tail
+/// acceptance on this machine, `origin/main @ 65118bea` + this change, 20 MH steps,
+/// over a four-seed sweep:
+///
+/// | seed  | `interval` | `robbins_monro` |
+/// |-------|-----------:|----------------:|
+/// | 1     |     0.0396 |          0.4228 |
+/// | 2     |     0.0408 |          0.4178 |
+/// | 777   |     0.0412 |          0.4170 |
+/// | 12345 |     0.0390 |          0.4205 |
+///
+/// so the worst realised values are `interval` **0.0412** (cross-seed spread
+/// 0.0022) and `|robbins_monro − 0.40|` **0.0228** (spread 0.0058). The bounds are
+/// derived from those with stated headroom: `interval < 0.06` is 1.46x the worst
+/// observed value and still well below the diagnostic's own `MH_RATE_LOW = 0.10`,
+/// and `|rm − 0.40| < 0.08` is 3.5x the worst observed deviation. The seed-12345
+/// pair the test itself runs (0.0390 / 0.4205) reproduces the 0.040 / 0.420 the
+/// issue reported from the research branch.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -128,15 +147,16 @@ fn warfarin_saem_reaches_target_only_under_robbins_monro() {
         interval.is_finite() && rm.is_finite(),
         "non-finite tail rates: interval {interval}, rm {rm}"
     );
-    // The reported defect: the legacy rule never gets near 40%.
+    // The reported defect: the legacy rule never gets near 40%. Bound from the
+    // sweep's worst 0.0412, with 1.46x headroom.
     assert!(
-        interval < 0.08,
+        interval < 0.06,
         "interval arm should still be stuck near a few percent, got {interval:.4}"
     );
-    // The fix: Robbins-Monro arrives. A wide bracket — this is a stochastic
-    // chain, and the claim is "reaches its target", not a pinned number.
+    // The fix: Robbins-Monro arrives. Bound from the sweep's worst deviation
+    // 0.0228, with 3.5x headroom.
     assert!(
-        (0.30..=0.55).contains(&rm),
+        (rm - 0.40_f64).abs() < 0.08,
         "robbins_monro arm should reach the 40% target, got {rm:.4}"
     );
     // Assert the straddle itself. Without this the pair could be retuned into

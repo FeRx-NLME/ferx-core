@@ -161,12 +161,13 @@ section of the SDLC for the versioning policy).
   bounded by how often it fires — 8 times on a default 400-iteration run, so at most
   ≈2.1× up or ≈0.43× down no matter how far off the chain is — and a model whose
   optimal step is an order of magnitude from the 0.3 start never gets there. On the
-  shipped `examples/warfarin_saem.ferx` that leaves the E-step accepting 4.6% of its
-  proposals against a 40% target for the whole run; `robbins_monro` reaches 41.6% on
-  the same model and seed. It is **opt-in**: on a model whose acceptance was already
-  above target, driving it to target was measured to worsen the final estimate, so
-  existing fits keep their current estimates unchanged. The κ (IOV) scales stay on
-  the interval rule under both settings.
+  shipped `examples/warfarin_saem.ferx` that leaves the E-step accepting 3.90% of its
+  proposals against a 40% target for the whole run; `robbins_monro` reaches 42.05% on
+  the same model and seed. It is **opt-in**: the benchmarking in #1444 reports it
+  regressing the final estimate at 3 of 6 seeds on a model whose acceptance was
+  already above target, so the default is unchanged and existing fits keep their
+  current estimates bit-for-bit. The κ (IOV) scales stay on the interval rule under
+  both settings.
 
 ### Changed
 

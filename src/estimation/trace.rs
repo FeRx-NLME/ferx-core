@@ -270,6 +270,24 @@ pub fn is_active() -> bool {
     TRACE.with(|t| t.borrow().writer.is_some())
 }
 
+/// Serialises tests that turn `FitOptions::optimizer_trace` on.
+///
+/// The writer above lives in a **thread-local**, and `fit()` runs `fit_inner`
+/// — including this module's `init` and `finish` — inside a shared Rayon pool
+/// via `install`. Two `fit()` calls made concurrently from two libtest threads
+/// can therefore interleave on one pool worker, where the second `init`
+/// replaces the writer the first `finish` is about to take and
+/// `FitResult::trace_path` comes back `None` (observed under
+/// `--test-threads=2`; the tests pass individually). That is a pre-existing
+/// property of the thread-local design, not of any one test, so every test
+/// that enables the trace takes this lock for its duration rather than each
+/// one working around it.
+///
+/// Poisoning is ignored on purpose: a panicking test has already failed, and
+/// turning that into a cascade of unrelated failures hides it.
+#[cfg(test)]
+pub(crate) static TRACE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Flush and close the trace file.  Returns the path so `fit_inner` can
 /// store it in `FitResult::trace_path`.
 pub fn finish() -> Option<String> {

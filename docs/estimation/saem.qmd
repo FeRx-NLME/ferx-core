@@ -408,15 +408,25 @@ reach is unlimited, and the $k^{-0.6}$ decay is the diminishing-adaptation
 condition that keeps an adapting chain valid (Roberts & Rosenthal 2007). The
 clamps are the same as the interval rule's.
 
-**It is opt-in, and not a free win.** On the warfarin example it moves the
-chain from 2–4% to ≈42% acceptance and cuts the final-estimate error by ~60%,
-and with the scale at target 8 proposals per subject per iteration beat the
-default 20. On models whose baseline scale is already near target it changes
-little. But on a validation model whose acceptance was already *above* target
-(0.45 against 0.40), driving it to target measurably **worsened** the fit —
-final-estimate error up 24% and seed-to-seed spread up 68%, with the marginal
-likelihood agreeing, so it is not an artifact of the reference. The default is
-therefore `interval`, which leaves every existing fit's estimates unchanged.
+**It is opt-in, and not a free win.** What ferx measures directly is the
+acceptance rate, and on `examples/warfarin_saem.ferx` at its shipped settings
+(150 + 250 iterations, `n_mh_steps = 20`, seed 12345) the combined rate over
+the last 100 iterations goes from **3.90%** under `interval` to **42.05%**
+under `robbins_monro`, against the 40% target. That much is reproduced by
+`tests/saem_scale_adaptation.rs`.
+
+Whether a rate at target makes the *estimates* better is a separate question,
+and one this page does not answer from its own runs. The SAEM benchmarking in
+[issue #1444](https://github.com/FeRx-NLME/ferx-core/issues/1444) reports, over
+6 seeds on real datasets, that Robbins–Monro roughly halves warfarin's
+final-estimate error against a long-run reference, changes little on models
+whose baseline scale is already near target, and **regresses** pembrolizumab
+(303 subjects, 4 η) at 3 of 6 seeds — a model whose acceptance was already
+*above* target. Those numbers come from that benchmark suite, not from this
+repository's test suite, and they have no NONMEM counterpart (NONMEM's SAEM
+exposes no comparable step-scale knob). Treat them as the reason the default
+did not change rather than as a performance guarantee: `interval` remains the
+default, so no existing fit's estimates move.
 
 The κ (IOV) scales stay on the interval rule under both settings: the
 per-occasion kernel makes one proposal per occasion per iteration, so a single
