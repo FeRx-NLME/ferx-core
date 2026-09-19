@@ -1349,6 +1349,17 @@ pub struct ExclusionSummary {
     pub excluded_subject_ids: Vec<String>,
     /// Number of observation records (EVID==0, MDV==0) excluded.
     pub n_obs_excluded: usize,
+    /// The distinct **resolved** compartments those excluded observation records were
+    /// on, ascending — the same values `Subject::obs_cmts` carries for the rows that
+    /// survived, so the two are directly comparable. Empty when the clauses removed no
+    /// scored observation.
+    ///
+    /// The count alone cannot say *what* a filter took away, and that is the question
+    /// a per-CMT diagnostic has to answer: `W_PER_CMT_UNMATCHED` names
+    /// `[data_selection]` as a possible cause only when a compartment it removed is one
+    /// of the unmatched entries, so `ignore = CMT == 3` is not offered as the reason a
+    /// `[CMT=2]` entry is dead (#1405).
+    pub obs_cmts_excluded: Vec<usize>,
     /// Number of dose records (EVID 1/4) excluded.
     pub n_dose_excluded: usize,
     /// Number of other records excluded that are neither a scored observation

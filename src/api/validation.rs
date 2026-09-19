@@ -220,6 +220,17 @@ fn check_per_cmt_scaling(model: &CompiledModel, population: &Population) -> Vec<
 /// accessor and says why the other three variants have no declared map.
 fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     use std::collections::BTreeSet;
+    // Declared side first. A model with no per-CMT map anywhere is the common case and
+    // has nothing to report whatever the data holds, so the population walk below never
+    // runs for it. Not a fast path that hides the logic behind it: every fixture in
+    // `per_cmt_unmatched_tests` declares a map and passes straight through this.
+    let declared: Vec<(&'static str, &'static str, BTreeSet<usize>)> = CmtConsumer::iter()
+        .filter_map(|c| c.declared_cmts(model))
+        .collect();
+    if declared.is_empty() {
+        return Vec::new();
+    }
+
     let mut observed: BTreeSet<usize> = BTreeSet::new();
     for subj in &population.subjects {
         observed.extend(subj.obs_cmts.iter().copied());
@@ -232,38 +243,70 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         return Vec::new();
     }
 
-    // Named, not special-cased. `[data_selection]` legitimately removes rows, so a
-    // filter that deleted every CMT-2 record makes a live entry look dead — but
-    // suppressing the warning there re-silences the case this check exists for. The
-    // user disambiguates; ferx does not guess. Read off the population's own exclusion
-    // record rather than off a `CMT`-comparing clause: a clause on any other column
-    // (`ignore = STUDY == 2`) removes the same rows just as effectively.
-    let filtered_obs = population
+    // The advice half depends on the observed set and not on the channel, so it is
+    // built once, outside the loop.
+    //
+    // **Gated, because the missing-column reading is not always true.** `{1}` is
+    // exactly what the reader defaults a column-less dataset to (`W_CMT_DEFAULTED`,
+    // #1009), so it is the one observed set for which "a missing or mis-mapped CMT
+    // column keys every observation to compartment 1" is a live hypothesis. With
+    // observations on compartment 2 the column is present, correct and being read, and
+    // the sentence sent the user to audit the one thing that was right — measured on
+    // the PR's own *after* block, which is that case (#1456 review r1).
+    let advice = if observed.len() == 1 && observed.contains(&1) {
+        "The usual cause is on the data side: a missing or mis-mapped CMT column keys \
+         every observation to compartment 1. Check the CMT column, or delete the unused \
+         entries."
+    } else {
+        "The CMT column is being read — observations are recorded on other \
+         compartment(s) — so check that these entries name the compartments this dataset \
+         actually uses, or delete them."
+    };
+
+    // Which compartments a `[data_selection]` clause took away. Named rather than
+    // special-cased: a filter legitimately removes rows, so a live entry can read as
+    // dead, and suppressing the warning there re-silences the case this check exists
+    // for — the user disambiguates, ferx does not guess. Read off the population's own
+    // exclusion record rather than off a `CMT`-comparing clause, because a clause on
+    // any other column (`ignore = STUDY == 2`) removes the same rows just as
+    // effectively.
+    let filtered_cmts: BTreeSet<usize> = population
         .exclusions
         .as_ref()
-        .map(|e| e.n_obs_excluded)
-        .filter(|n| *n > 0);
+        .map(|e| e.obs_cmts_excluded.iter().copied().collect())
+        .unwrap_or_default();
 
     let mut diags = Vec::new();
-    for consumer in CmtConsumer::iter() {
-        let Some((syntax, declared)) = consumer.declared_cmts(model) else {
-            continue;
-        };
+    for (syntax, block, declared) in declared {
         let unmatched: Vec<usize> = declared.difference(&observed).copied().collect();
         if unmatched.is_empty() {
             continue;
         }
-        let block = match consumer {
-            CmtConsumer::PerCmtErrorModel => "error_model",
-            _ => "scaling",
-        };
-        let filter_note = match filtered_obs {
-            Some(n) => format!(
-                " A `[data_selection]` clause removed {n} observation record(s) from this \
-                 read, so an entry the unfiltered dataset does exercise can read as \
-                 unmatched here.",
-            ),
-            None => String::new(),
+        // Only the compartments that are *both* unmatched here and removed by the
+        // filter, which is why `ExclusionSummary` records the set and not just the
+        // count (#1456 review r1): gating on "some observation was excluded" blamed
+        // `ignore = CMT == 3` for a dead `[CMT=2]` entry, sending the user to edit a
+        // block that cannot be the cause. Per channel, since `unmatched` is.
+        //
+        // The intersection is also what makes the sentence below exactly true rather
+        // than merely plausible: a compartment is unmatched only when *no* scored
+        // observation on it survived, so one the filter also touched is one the filter
+        // emptied.
+        let blamed: Vec<usize> = unmatched
+            .iter()
+            .copied()
+            .filter(|c| filtered_cmts.contains(c))
+            .collect();
+        let filter_note = if blamed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " A `[data_selection]` clause removed every scored observation on \
+                 compartment(s) {} from this read, so {} entry is exercised by the \
+                 unfiltered dataset.",
+                join_cmts(&blamed),
+                if blamed.len() == 1 { "that" } else { "those" },
+            )
         };
         diags.push(
             Diagnostic::warning(
@@ -271,10 +314,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
                 format!(
                     "W_PER_CMT_UNMATCHED: `{syntax}` declares compartment(s) {} that no \
                      observation is recorded on (observed: {}). Those entries are inert — \
-                     nothing dispatches to them. The usual cause is on the data side: a \
-                     missing or mis-mapped CMT column keys every observation to \
-                     compartment 1.{filter_note} Check the CMT column, or delete the unused \
-                     entries.",
+                     nothing dispatches to them.{filter_note} {advice}",
                     join_cmts(&unmatched),
                     join_cmts(&observed.iter().copied().collect::<Vec<_>>()),
                 ),
@@ -312,17 +352,12 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
     if missing.is_empty() {
         return Vec::new();
     }
-    let list = missing
-        .iter()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     vec![Diagnostic::error(
         "E_PER_CMT_ERROR_MODEL",
         format!(
             "[error_model] has no entry for observed compartment(s) {}; \
              add a `CMT=N: DV ~ ...` line for each observed CMT.",
-            list
+            join_cmts(&missing.into_iter().collect::<Vec<_>>())
         ),
     )
     .with_block("error_model")]
@@ -980,7 +1015,8 @@ impl CmtConsumer {
     }
 
     /// The compartments this channel's **declared-side** map names, plus the syntax
-    /// that spells one entry — `None` for a channel that declares no such map (#1405).
+    /// that spells one entry and the `[block]` it is written in — `None` for a channel
+    /// that declares no such map (#1405).
     ///
     /// The mirror of [`Self::is_live`]. That asks whether the channel reads `CMT` at
     /// all; this asks *which* compartments it was told about, so `declared − observed`
@@ -1004,25 +1040,40 @@ impl CmtConsumer {
     pub(crate) fn declared_cmts(
         self,
         model: &CompiledModel,
-    ) -> Option<(&'static str, std::collections::BTreeSet<usize>)> {
+    ) -> Option<(
+        &'static str,
+        &'static str,
+        std::collections::BTreeSet<usize>,
+    )> {
         use std::collections::BTreeSet;
-        let keys =
-            |set: BTreeSet<usize>, syntax: &'static str| (!set.is_empty()).then_some((syntax, set));
+        // The `[block]` the entry is written in travels with the syntax rather than
+        // being re-derived by the caller. `check_per_cmt_unmatched` first picked it
+        // with a `match consumer { PerCmtErrorModel => .., _ => "scaling" }`, and that
+        // `_` is the hand-written list this accessor exists to delete: a new
+        // `cmt_consumers!` variant would have inherited `"scaling"` in silence instead
+        // of failing to compile here (#1456 review r1).
+        let keys = |set: BTreeSet<usize>, syntax: &'static str, block: &'static str| {
+            (!set.is_empty()).then_some((syntax, block, set))
+        };
         match self {
             // A dose row names its own compartment in the data; the model declares no
             // list of dose targets that could go unmatched. The opposite direction — a
             // dose to a compartment the model does not have — is `check_dose_compartments`.
             CmtConsumer::DoseCompartment => None,
             CmtConsumer::PerCmtScaling => match &model.scaling {
-                ScalingSpec::PerCmt(map) => {
-                    keys(map.keys().copied().collect(), "[scaling] obs_scale[CMT=N]")
-                }
+                ScalingSpec::PerCmt(map) => keys(
+                    map.keys().copied().collect(),
+                    "[scaling] obs_scale[CMT=N]",
+                    "scaling",
+                ),
                 _ => None,
             },
             CmtConsumer::PerCmtErrorModel => match &model.error_spec {
-                ErrorSpec::PerCmt(map) => {
-                    keys(map.keys().copied().collect(), "[error_model] CMT=N:")
-                }
+                ErrorSpec::PerCmt(map) => keys(
+                    map.keys().copied().collect(),
+                    "[error_model] CMT=N:",
+                    "error_model",
+                ),
                 _ => None,
             },
             // Both readout structs, unioned — `OdeReadout::PerCmt` is dispatched from
@@ -1042,7 +1093,7 @@ impl CmtConsumer {
                 if let Some(ar) = model.analytic_readout.as_ref() {
                     set.extend(per_cmt(&ar.readout));
                 }
-                keys(set, "[scaling] y[CMT=N]")
+                keys(set, "[scaling] y[CMT=N]", "scaling")
             }
             // Already an *error*, not a warning: `E_ENDPOINT_NO_RECORDS` reports a
             // declared endpoint with no row routed to it, so reporting it here would
