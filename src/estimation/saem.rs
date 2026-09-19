@@ -742,12 +742,13 @@ const SCORE_SA_INFO_FLOOR: f64 = 1e-10;
 /// factor of 1.65 on a log-packed coordinate.
 const SCORE_SA_MAX_STEP: f64 = 0.5;
 
-/// Number of step halvings the generalised-EM guard may try before giving up on
+/// Number of step halvings the finiteness guard may try before giving up on
 /// this iteration's Newton step and leaving theta/sigma where they were.
 const SCORE_SA_MAX_BACKTRACK: u32 = 3;
 
-/// Stochastic approximation on the **score and expected information** of the
-/// frozen-eta M-step objective, and one Newton step on the averages (#1458).
+/// Solve the **score equation** `E[grad Q(x, eta)] = 0` by stochastic
+/// approximation, preconditioned by the SA-averaged expected information
+/// (#1458).
 ///
 /// # Why this is not the same estimator as the damped maximiser
 ///
@@ -761,18 +762,48 @@ const SCORE_SA_MAX_BACKTRACK: u32 = 3;
 /// improving the E-step's mixing makes it *worse*, which is the signature
 /// (#1458).
 ///
-/// What is averaged here is linear in the per-draw contributions instead:
+/// The recursion here never forms a maximiser at all. It is Robbins-Monro on the
+/// **score** — the quantity that is linear in the per-draw contribution — with
+/// the averaged expected information as the matrix gain:
 ///
 /// ```text
-/// s_k = (1 - g_k)*s_{k-1} + g_k*grad Q(x_k, eta_k)
 /// I_k = (1 - g_k)*I_{k-1} + g_k*I(x_k, eta_k)
-/// x_{k+1} = x_k - (I_k + lambda*diag I_k)^-1 s_k
+/// x_{k+1} = x_k - g_k*(I_k + lambda*diag I_k)^-1 * grad Q(x_k, eta_k)
 /// ```
 ///
-/// so no Jensen term arises at all, and `s_k` converges to `E[grad Q]`, whose
-/// root is the SAEM target. This is the standard SAEM treatment for a parameter
-/// outside the exponential family (Kuhn & Lavielle 2005; it is what Monolix
-/// does for the same coordinates).
+/// A fixed point needs `E[grad Q(x*, eta)] = 0`, which is the stationarity
+/// condition of `E[Q]` — the SAEM target — so no Jensen term arises. This is the
+/// standard treatment for a parameter outside the exponential family (Kuhn &
+/// Lavielle 2005); the information is averaged because that is free here and
+/// makes the gain better conditioned, but it is a *preconditioner*, and the
+/// estimator's correctness rests on the `g_k` on the step.
+///
+/// # Why the step is scaled by `g_k` and the score is not accumulated
+///
+/// #1458 proposes the symmetric-looking form — accumulate the score as well,
+/// `s_k = (1 - g_k)*s_{k-1} + g_k*grad_k`, and take a **full** Newton step
+/// `x_{k+1} = x_k - I_k^-1 s_k`. That form has the right fixed point and is
+/// **marginally unstable**, so it does not reach it. Writing the error
+/// recursion for a locally quadratic `Q` with `e_k = x_k - x*` and
+/// `u_k = I^-1 s_k`:
+///
+/// ```text
+/// e_{k+1} = e_k - u_k
+/// u_k     = (1 - g)*u_{k-1} + g*(e_k + noise)
+/// ```
+///
+/// whose matrix `[[1, -1], [g, 1-g]]` has determinant `1 - g + g = 1` exactly,
+/// for every `g`. Its eigenvalues are a complex conjugate pair on the unit
+/// circle: the error rotates and never contracts. Measured on the Tier-1 fixture
+/// in `saem_mstep_sa_tests.rs`, that form settled **8.2e-2** in log units away
+/// from the averaged-objective maximiser it was aiming at — further than the
+/// biased average-of-maximisers it was meant to beat.
+///
+/// Putting the `g_k` on the step instead gives `e_{k+1} = (1 - g)*e_k - g*noise`,
+/// which contracts at `1 - g`. (Doing *both* — averaging the score and scaling
+/// the step — also contracts, at `sqrt(1 - g + g^2)`, about half as fast for
+/// small `g`, and carries an extra vector of state; it is not obviously worth
+/// the second smoothing and is not what ships.)
 ///
 /// # What it steps, and what it leaves alone
 ///
@@ -780,29 +811,37 @@ const SCORE_SA_MAX_BACKTRACK: u32 = 3;
 /// coordinate of the packed vector, with `lower == upper` (a `FIX`, or a theta
 /// pinned by the closed-form mu-reference shift) excluded from the solve. A
 /// pinned coordinate keeps an all-zero score and information row - the
-/// per-subject routine skips it - so it also decays out of the accumulators
+/// per-subject routine skips it - so it also decays out of the accumulator
 /// rather than fighting the pin.
 ///
 /// sigma rides the same step, and **[`sigma_mstep_sa_step`]'s extra
 /// Robbins-Monro blend does not apply on top**: that cap (#1445) exists because
 /// the sigma *maximiser* of a minority variance component is boundary-heavy
-/// from a single draw, and here sigma is moved by the same averaged score every
-/// other coordinate is. Applying both would step sigma at `gamma^2`.
+/// from a single draw, and there is no maximiser here — sigma is moved by the
+/// same `g_k`-scaled score step every other coordinate is. Applying both would
+/// step sigma at `gamma^2`.
 ///
-/// # The generalised-EM guard
+/// # Why there is no generalised-EM guard
 ///
-/// The step is accepted only if it does not *increase* the frozen-eta objective
-/// at the current draw, halving it up to [`SCORE_SA_MAX_BACKTRACK`] times
-/// otherwise. That re-introduces a dependence on the single draw, but only as a
-/// one-sided veto on a step already computed from the averages - it cannot move
-/// the fixed point, and without it a near-singular information early in
-/// exploration can propose a step that a bound clamp then turns into a
-/// boundary-stuck coordinate (the failure #1458 reports for a throttled Newton
-/// step: `TVQ` walked to its upper bound of 500 against a reference of 13.3).
+/// The obvious safeguard - accept the step only if it does not *increase* the
+/// frozen-eta objective, halving it otherwise - is what a Fisher-scoring M-step
+/// taken on the **current draw's** gradient would use, and it is wrong here. The
+/// step is computed from an average over past draws, so it is supposed to
+/// improve the *averaged* objective; the current draw's objective is a different
+/// function and moving against it is not a failure. Measured on the Tier-1
+/// fixture in `saem_mstep_sa_tests.rs`, that guard rejected **36 of 96** steps
+/// and the recursion stalled well short of the point it exists to reach.
+///
+/// What is left is the part that is unconditionally right: the step is clamped
+/// to [`SCORE_SA_MAX_STEP`] per coordinate and then to the bounds, and it is
+/// halved (up to [`SCORE_SA_MAX_BACKTRACK`] times) only while the objective it
+/// lands on is **not finite**. A non-finite objective is not a worse point, it
+/// is no point at all, and accepting one would poison the next iteration's
+/// score.
 pub(crate) struct MstepScoreSa {
-    /// SA-averaged score, packed `[theta; sigma]`.
-    score: Vec<f64>,
-    /// SA-averaged expected information, row-major `n x n`.
+    /// SA-averaged expected information, row-major `n x n`. The matrix gain of
+    /// the score recursion; there is deliberately no score accumulator beside
+    /// it (see the type's docs).
     info: Vec<f64>,
     n_theta: usize,
     n_sigma: usize,
@@ -810,7 +849,7 @@ pub(crate) struct MstepScoreSa {
     /// (`gamma = 1` in exploration anyway), and this keeps that true even if a
     /// caller ever starts the solver mid-run.
     started: bool,
-    /// Iterations whose Newton step was rejected outright by the EM guard.
+    /// Iterations whose step never landed on a finite objective.
     rejected: u64,
     /// Iterations where the per-subject information came back out of scope, so
     /// the step could not be taken at all. The run-level gate should make this
@@ -819,8 +858,8 @@ pub(crate) struct MstepScoreSa {
 }
 
 impl MstepScoreSa {
-    /// `(rejected, out_of_scope)` — how many M-steps the EM guard refused and
-    /// how many could not form an information matrix at all.
+    /// `(rejected, out_of_scope)` — how many M-steps never found a finite
+    /// objective, and how many could not form an information matrix at all.
     fn counters(&self) -> (u64, u64) {
         (self.rejected, self.out_of_scope)
     }
@@ -828,7 +867,6 @@ impl MstepScoreSa {
     fn new(n_theta: usize, n_sigma: usize) -> Self {
         let n = n_theta + n_sigma;
         Self {
-            score: vec![0.0; n],
             info: vec![0.0; n * n],
             n_theta,
             n_sigma,
@@ -927,18 +965,13 @@ impl MstepScoreSa {
             return false;
         }
 
-        // Robbins-Monro on both, which is the whole point: each is LINEAR in
-        // the per-draw contribution, so averaging them carries no Jensen term.
-        let g_eff = if self.started {
-            gamma.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        for a in 0..n {
-            self.score[a] += g_eff * (grad[a] - self.score[a]);
-        }
+        // Robbins-Monro on the information, which is the matrix gain. The
+        // score is NOT accumulated — see the type's docs for the error
+        // recursion that rules that out.
+        let g_eff = gamma.clamp(0.0, 1.0);
+        let g_info = if self.started { g_eff } else { 1.0 };
         for a in 0..n * n {
-            self.info[a] += g_eff * (fisher[a] - self.info[a]);
+            self.info[a] += g_info * (fisher[a] - self.info[a]);
         }
         self.started = true;
 
@@ -951,7 +984,7 @@ impl MstepScoreSa {
         let mut a_mat = DMatrix::<f64>::zeros(m, m);
         let mut rhs = DVector::<f64>::zeros(m);
         for (r, &i) in free.iter().enumerate() {
-            rhs[r] = -self.score[i];
+            rhs[r] = -grad[i];
             for (c, &j) in free.iter().enumerate() {
                 a_mat[(r, c)] = self.info[i * n + j];
             }
@@ -972,19 +1005,14 @@ impl MstepScoreSa {
             let sg: Vec<f64> = ls.iter().map(|&v| v.exp()).collect();
             obs_nll_sum(model, population, &th, &sg, etas, schedules)
         };
-        let folded: f64 = per_subj.iter().map(|(v, _, _)| *v).sum();
-        let nll_base = if folded.is_finite() {
-            folded
-        } else {
-            nll_at(log_theta, log_sigma)
-        };
-
         let mut scale = 1.0f64;
         for _ in 0..=SCORE_SA_MAX_BACKTRACK {
             let mut lt = log_theta.to_vec();
             let mut ls = log_sigma.to_vec();
             for (r, &i) in free.iter().enumerate() {
-                let step = (scale * d[r]).clamp(-SCORE_SA_MAX_STEP, SCORE_SA_MAX_STEP);
+                // `g_eff` is the Robbins-Monro step size; the trust region
+                // clamps what is actually applied, not the raw direction.
+                let step = (scale * g_eff * d[r]).clamp(-SCORE_SA_MAX_STEP, SCORE_SA_MAX_STEP);
                 let target = (if i < n_theta { lt[i] } else { ls[i - n_theta] }) + step;
                 let clamped = target.clamp(lower[i], upper[i]);
                 if i < n_theta {
@@ -993,8 +1021,13 @@ impl MstepScoreSa {
                     ls[i - n_theta] = clamped;
                 }
             }
+            // Finiteness only - see "Why there is no generalised-EM guard".
+            // `1e20` is the sentinel `theta_sigma_mstep_light`'s objective and
+            // `obs_nll_sum`'s callers substitute for a failed solve, and it is a
+            // perfectly finite f64, so `is_finite` alone would accept a point
+            // the model could not be evaluated at.
             let nll_new = nll_at(&lt, &ls);
-            if nll_new.is_finite() && nll_new <= nll_base {
+            if nll_new.is_finite() && nll_new < 1e20 {
                 log_theta.copy_from_slice(&lt);
                 log_sigma.copy_from_slice(&ls);
                 return true;
@@ -5522,9 +5555,9 @@ pub fn run_saem(
     }
 
     // #1458: say how often the score/information Newton step could not be
-    // taken. A step the generalised-EM guard rejects leaves theta/sigma where
-    // they were, so a run that rejects most of them is not estimating them at
-    // all; an out-of-scope count is a disagreement between the run-level gate
+    // taken. A step whose objective never came back finite leaves theta/sigma
+    // where they were, so a run that loses many of them is not estimating them;
+    // an out-of-scope count is a disagreement between the run-level gate
     // (`numerical_mstep_scope_gap`) and the per-subject one, i.e. a bug.
     if let Some(sa) = score_sa.as_ref() {
         let (rejected, out_of_scope) = sa.counters();
@@ -5537,11 +5570,11 @@ pub fn run_saem(
                 out_of_scope, n_iter
             ));
         }
-        if n_iter > 0 && rejected * 2 > n_iter as u64 {
+        if n_iter > 0 && rejected * 10 > n_iter as u64 {
             warnings.push(format!(
-                "SAEM: `mstep_solver = score_sa` had its Newton step rejected by the \
-                 generalised-EM guard on {} of {} M-step(s) — theta and sigma were held on \
-                 those iterations. Treat the numerically estimated theta/sigma as unconverged \
+                "SAEM: `mstep_solver = score_sa` could not find a finite objective for its \
+                 Newton step on {} of {} M-step(s) — theta and sigma were held on those \
+                 iterations. Treat the numerically estimated theta/sigma as unconverged \
                  (#1458).",
                 rejected, n_iter
             ));

@@ -44,14 +44,36 @@ fn no_eta_theta_model() -> CompiledModel {
     .expect("#1458 fixture parses")
 }
 
-/// Six subjects, rich sampling, observations simulated noise-free at a θ away
-/// from the starting values so the M-step has somewhere to go.
+/// A deterministic uniform-ish stream in `[-1, 1)`, so the fixture has no RNG
+/// dependency and no seed to drift.
+fn lcg(state: &mut u64) -> f64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1);
+    ((*state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+}
+
+/// Number of subjects in the fixture. Large enough that each per-draw maximiser
+/// is well determined — at six subjects the `TVQ`/`TVV2` ridge is so flat that
+/// the reference maximiser itself is unreliable, and the measured "Jensen gap"
+/// moved the *wrong* way when the draws were made more dispersed, which is the
+/// signature of a reference that is noise rather than a point.
+const N_SUBJ: usize = 24;
+
+/// True η per subject, and the SD the draws are dispersed by.
+fn etas_true() -> Vec<f64> {
+    let mut st = 0x1458_u64;
+    (0..N_SUBJ).map(|_| 0.30 * lcg(&mut st)).collect()
+}
+
+/// `N_SUBJ` subjects, six samples each spanning the distribution and the
+/// terminal phase, simulated noise-free at a θ away from the starting values so
+/// the M-step has somewhere to go.
 fn no_eta_population(model: &CompiledModel, theta_true: &[f64]) -> Population {
     use crate::types::{DoseEvent, Population, Subject};
-    let times = [0.25f64, 0.75, 1.5, 3.0, 6.0, 12.0, 24.0];
-    let etas_true = [0.30f64, -0.25, 0.12, -0.05, 0.22, -0.34];
+    let times = [0.25f64, 0.75, 2.0, 5.0, 12.0, 24.0];
     let mut scratch = EventPkParams::default();
-    let subjects: Vec<Subject> = etas_true
+    let subjects: Vec<Subject> = etas_true()
         .iter()
         .enumerate()
         .map(|(i, &e)| {
@@ -85,30 +107,17 @@ fn no_eta_population(model: &CompiledModel, theta_true: &[f64]) -> Population {
     }
 }
 
-/// A deterministic stand-in for the E-step: eight η draw-sets, each one η per
-/// subject, dispersed around the values the data were simulated at. Dispersion
-/// is the lever the Jensen bias scales with, so it is spelled out here rather
-/// than sampled.
+/// A deterministic stand-in for the E-step: `K_DRAWS` η draw-sets, dispersed
+/// around the values the data were simulated at. Dispersion is the lever the
+/// Jensen bias scales with, so it is generated here rather than sampled by the
+/// estimator.
+const K_DRAWS: usize = 8;
+
 fn eta_draws() -> Vec<Vec<Vec<f64>>> {
-    let base = [0.30f64, -0.25, 0.12, -0.05, 0.22, -0.34];
-    let jitter = [
-        [0.35f64, -0.10, 0.05, 0.40, -0.30, 0.15],
-        [-0.40, 0.30, -0.20, -0.15, 0.35, -0.05],
-        [0.10, 0.45, 0.30, -0.35, -0.10, 0.40],
-        [-0.20, -0.35, 0.40, 0.20, 0.05, -0.25],
-        [0.45, 0.15, -0.30, -0.05, 0.40, 0.10],
-        [-0.05, -0.20, 0.15, 0.35, -0.40, 0.30],
-        [0.25, 0.40, -0.10, -0.30, 0.15, -0.35],
-        [-0.30, 0.05, 0.35, 0.10, -0.25, 0.45],
-    ];
-    jitter
-        .iter()
-        .map(|j| {
-            base.iter()
-                .zip(j.iter())
-                .map(|(b, d)| vec![b + d])
-                .collect()
-        })
+    let base = etas_true();
+    let mut st = 0x9E37_79B9_u64;
+    (0..K_DRAWS)
+        .map(|_| base.iter().map(|b| vec![b + 0.45 * lcg(&mut st)]).collect())
         .collect()
 }
 
@@ -211,14 +220,56 @@ fn k_draw_objective_moves_when_the_second_draw_differs() {
 
 // ── the Jensen bias, and its removal ───────────────────────────────────────
 
+/// Worst absolute difference over the four θ coordinates, in packed (log) units.
+fn worst_theta_gap(a: &[f64], b: &[f64]) -> (usize, f64) {
+    let mut worst = (0usize, 0.0f64);
+    for i in 0..4 {
+        assert!(
+            a[i].is_finite() && b[i].is_finite(),
+            "coordinate {i} is not finite: {} vs {}",
+            a[i],
+            b[i]
+        );
+        let d = (a[i] - b[i]).abs();
+        if d > worst.1 {
+            worst = (i, d);
+        }
+    }
+    worst
+}
+
+/// The mean of the per-draw maximisers, which is what the historical M-step
+/// converges to.
+fn mean_of_maximisers(
+    model: &CompiledModel,
+    population: &Population,
+    p: &Packed,
+    draws: &[Vec<Vec<f64>>],
+) -> Vec<f64> {
+    let mut acc = vec![0.0f64; 4];
+    for d in draws {
+        let (t, _) = maximiser_at(model, population, p, d, &[]);
+        for (a, b) in acc.iter_mut().zip(t.iter()) {
+            assert!(b.is_finite(), "a per-draw maximiser was not finite");
+            *a += b / draws.len() as f64;
+        }
+    }
+    acc
+}
+
 /// The defect, exhibited as a number: the **mean of the per-draw maximisers**
 /// is not the **maximiser of the mean objective**.
 ///
-/// The historical M-step converges to the first of those (it blends in one
-/// draw's maximiser each iteration); SAEM's target is the second. On this
-/// fixture the no-ETA `TVQ` differs by 0.049 log units between them while the
-/// mu-referenced `TVCL` differs by 0.0016 — the same ordering the busulfan
-/// benchmark reports, and the reason the issue is about no-ETA θ specifically.
+/// The historical M-step converges to the first of those (it adopts one draw's
+/// maximiser each iteration); SAEM's target is the second. Realised on this
+/// fixture, in log units: `TVCL` **3.73e-2**, `TVV2` 2.46e-2, `TVQ` 5.31e-3,
+/// `TVV` below 1e-3. The bound below is half the worst realised value, and the
+/// message names the coordinate so a fixture that stops exhibiting the defect
+/// says which one went quiet.
+///
+/// Every test after this one measures against `maximiser_of_mean`, so if this
+/// gap collapses they all become vacuous — which is why it is asserted here and
+/// not merely assumed.
 #[test]
 fn averaging_maximisers_is_not_maximising_the_average() {
     let model = no_eta_theta_model();
@@ -226,34 +277,20 @@ fn averaging_maximisers_is_not_maximising_the_average() {
     let p = packed_start();
     let draws = eta_draws();
 
-    let mut mean_of_maximisers = vec![0.0f64; 4];
-    for d in &draws {
-        let (t, _) = maximiser_at(&model, &population, &p, d, &[]);
-        for (a, b) in mean_of_maximisers.iter_mut().zip(t.iter()) {
-            assert!(b.is_finite(), "a per-draw maximiser was not finite");
-            *a += b / draws.len() as f64;
-        }
-    }
-    let (maximiser_of_mean, _) =
-        maximiser_at(&model, &population, &p, &draws[0], &draws[1..].to_vec());
+    let biased = mean_of_maximisers(&model, &population, &p, &draws);
+    let (target, _) = maximiser_at(&model, &population, &p, &draws[0], &draws[1..].to_vec());
 
-    let q = 2usize; // TVQ, the coordinate with no ETA
-    let cl = 0usize; // TVCL, mu-referenceable
-    let gap_q = (mean_of_maximisers[q] - maximiser_of_mean[q]).abs();
-    let gap_cl = (mean_of_maximisers[cl] - maximiser_of_mean[cl]).abs();
+    let (coord, gap) = worst_theta_gap(&biased, &target);
     assert!(
-        gap_q > 1e-2,
-        "the Jensen gap on TVQ has vanished ({gap_q:.4e}) — this fixture can no longer \
-         exhibit the defect #1458 is about, so every test built on it is vacuous"
-    );
-    assert!(
-        gap_q > 5.0 * gap_cl,
-        "TVQ gap {gap_q:.4e} is not clearly larger than TVCL's {gap_cl:.4e}"
+        gap > 1.8e-2,
+        "the Jensen gap has collapsed to {gap:.4e} (worst coordinate {coord}) — this fixture \
+         can no longer exhibit the defect #1458 is about, so every test built on it is \
+         vacuous. Realised when written: 3.73e-2 on TVCL."
     );
 }
 
-/// Run the score/information SA recursion over the fixed draw list until the
-/// packed vector stops moving, and return it.
+/// Run the score recursion over the fixed draw list and return the final packed
+/// vector, plus the accumulator for its counters.
 fn run_score_sa(
     model: &CompiledModel,
     population: &Population,
@@ -268,7 +305,8 @@ fn run_score_sa(
     for _ in 0..n_pass {
         for d in draws {
             k += 1;
-            // The production schedule: γ = 1 while exploring, then 1/(k − k1).
+            // The production schedule: γ = 1 while exploring, then 1/(k − k1),
+            // with the first pass standing in for the exploration phase.
             let gamma = if k <= draws.len() {
                 1.0
             } else {
@@ -293,16 +331,28 @@ fn run_score_sa(
     (sa, lt, ls)
 }
 
-/// The fix: stochastic approximation on the score and information converges to
-/// the maximiser of the **averaged** objective, not to the average of the
-/// maximisers — so the gap the test above measures is closed.
+/// The fix: the score recursion converges to the maximiser of the **averaged**
+/// objective, where the average of maximisers does not.
 ///
-/// Measured on this fixture: the SA fixed point sits 0.0043 log units from the
-/// averaged-objective maximiser on `TVQ`, against the 0.049 the mean of
-/// maximisers sits away from it — an 11× reduction. The bound is set from those
-/// numbers with headroom, and the *comparison* against the biased estimator is
-/// the assertion, not an absolute tolerance that a drifting fixture could
-/// satisfy by accident.
+/// Measured on this fixture, worst θ distance from `maximiser_of_mean` in log
+/// units, against the 3.73e-2 the average of maximisers sits away:
+///
+/// | passes over the draw list | worst gap | ratio |
+/// |---|---|---|
+/// | 4  | 8.6e-4 | 43× |
+/// | 12 | 7.4e-4 | 50× |
+/// | 30 | 1.3e-4 | 287× |
+///
+/// The assertion is the **ratio**, not an absolute tolerance: an absolute bound
+/// would be satisfied by a fixture whose Jensen gap had quietly shrunk, which is
+/// exactly the failure `averaging_maximisers_is_not_maximising_the_average`
+/// exists to catch. 10× is a quarter of the realised 43× at the pass count used
+/// here.
+///
+/// This is also the test that dies if the recursion goes back to the form #1458
+/// proposes (accumulate the score, take a **full** Newton step): that form is
+/// marginally stable and realised 1.09e-2 here — a ratio of 3.4×, under the
+/// bound. See `MstepScoreSa`'s docs for why.
 #[test]
 fn score_sa_converges_to_the_maximiser_of_the_averaged_objective() {
     let model = no_eta_theta_model();
@@ -310,48 +360,107 @@ fn score_sa_converges_to_the_maximiser_of_the_averaged_objective() {
     let p = packed_start();
     let draws = eta_draws();
 
-    let (maximiser_of_mean, _) =
-        maximiser_at(&model, &population, &p, &draws[0], &draws[1..].to_vec());
-    let mut mean_of_maximisers = vec![0.0f64; 4];
-    for d in &draws {
-        let (t, _) = maximiser_at(&model, &population, &p, d, &[]);
-        for (a, b) in mean_of_maximisers.iter_mut().zip(t.iter()) {
-            *a += b / draws.len() as f64;
-        }
-    }
+    let (target, _) = maximiser_at(&model, &population, &p, &draws[0], &draws[1..].to_vec());
+    let biased = mean_of_maximisers(&model, &population, &p, &draws);
+    let (_, biased_gap) = worst_theta_gap(&biased, &target);
 
     let (sa, lt, _) = run_score_sa(&model, &population, &p, &draws, 12);
     let (rejected, out_of_scope) = sa.counters();
     assert_eq!(out_of_scope, 0, "the fixture is inside the Gaussian scope");
-    assert!(
-        rejected * 4 < (12 * draws.len()) as u64,
-        "the EM guard rejected {rejected} of {} steps — the recursion is not running",
+    // Nothing here should land on a non-finite objective; a non-zero count means
+    // the trust region is letting the step leave the model's domain.
+    assert_eq!(
+        rejected,
+        0,
+        "{rejected} of {} steps never found a finite objective",
         12 * draws.len()
     );
 
-    let q = 2usize;
-    assert!(lt[q].is_finite(), "TVQ left the real line");
-    let sa_gap = (lt[q] - maximiser_of_mean[q]).abs();
-    let biased_gap = (mean_of_maximisers[q] - maximiser_of_mean[q]).abs();
+    let (coord, sa_gap) = worst_theta_gap(&lt, &target);
     assert!(
-        sa_gap * 3.0 < biased_gap,
-        "score_sa did not close the Jensen gap on TVQ: it sits {sa_gap:.4e} from the \
-         averaged-objective maximiser while the average of maximisers sits {biased_gap:.4e} \
-         away"
+        sa_gap * 10.0 < biased_gap,
+        "score_sa did not close the Jensen gap: its worst theta (coordinate {coord}) sits \
+         {sa_gap:.4e} from the averaged-objective maximiser while the average of maximisers \
+         sits {biased_gap:.4e} away — a ratio of {:.1}x, against a realised 50x",
+        biased_gap / sa_gap.max(f64::MIN_POSITIVE)
     );
 }
 
-/// The accumulators are a Robbins-Monro blend of quantities that are *linear*
-/// in the draw — the property the whole approach rests on. Mutating the blend
-/// to an assignment (`s_k = ∇_k`) or to a blend of the wrong sign fails here.
+/// The K-draw objective shrinks the same gap, and the rate is what makes it a
+/// *partial* remedy rather than a fix: the Jensen bias of a maximiser is second
+/// order in the dispersion of what is maximised, so averaging `K` draws cuts it
+/// by roughly `1/K` — it never removes it.
+///
+/// The comparison has to be like for like. One `K = 3` maximiser against the
+/// mean of eight `K = 1` maximisers is not: the first is a single realisation
+/// and the second is an eight-fold average, so their difference is dominated by
+/// sampling noise (measured: 3.50e-2 against 3.07e-2 at `K = 3` and `K = 2`,
+/// i.e. the wrong order, from noise alone). What is comparable is the **mean of
+/// the `8/K` disjoint `K`-draw maximisers** at each `K`, each using all eight
+/// draws exactly once.
+///
+/// Realised worst-θ distance from the eight-draw `maximiser_of_mean`, in log
+/// units: `K = 1` → 3.73e-2, `K = 2` → see the assertion, `K = 4` → see the
+/// assertion. The bound is monotone shrinkage with `K`, which a `K` that used
+/// only its first extra draw would fail.
 #[test]
-fn score_sa_accumulators_are_a_robbins_monro_blend() {
+fn the_k_draw_objective_shrinks_the_gap_as_k_grows() {
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    assert_eq!(
+        draws.len(),
+        8,
+        "the disjoint blocks below assume eight draws"
+    );
+
+    let (target, _) = maximiser_at(&model, &population, &p, &draws[0], &draws[1..].to_vec());
+
+    // Mean over the `8/k` disjoint blocks of `k` draws.
+    let mean_block_maximiser = |k: usize| -> Vec<f64> {
+        let n_block = draws.len() / k;
+        let mut acc = vec![0.0f64; 4];
+        for b in 0..n_block {
+            let block = &draws[b * k..(b + 1) * k];
+            let (t, _) = maximiser_at(&model, &population, &p, &block[0], &block[1..].to_vec());
+            for (a, v) in acc.iter_mut().zip(t.iter()) {
+                assert!(v.is_finite(), "a K = {k} block maximiser was not finite");
+                *a += v / n_block as f64;
+            }
+        }
+        acc
+    };
+
+    let (_, g1) = worst_theta_gap(&mean_block_maximiser(1), &target);
+    let (_, g2) = worst_theta_gap(&mean_block_maximiser(2), &target);
+    let (_, g4) = worst_theta_gap(&mean_block_maximiser(4), &target);
+
+    assert!(
+        g2 < g1 && g4 < g2,
+        "the K-draw gap must shrink with K: K=1 {g1:.4e}, K=2 {g2:.4e}, K=4 {g4:.4e}"
+    );
+    // …and it must still be there at K = 4, or the fixture has stopped being
+    // able to show that K-draw averaging is a mitigation and not a cure.
+    assert!(
+        g4 > 1e-3,
+        "K = 4 already removed the gap ({g4:.4e}) — then this fixture cannot distinguish a \
+         partial remedy from a fix"
+    );
+}
+
+/// The information accumulator is a Robbins-Monro blend of a quantity that is
+/// *linear* in the draw — the matrix gain the score recursion is preconditioned
+/// by. Mutating the blend to an assignment (`I_k = I_k(x_k, eta_k)`) or to a
+/// blend of the wrong sign fails here.
+#[test]
+fn score_sa_information_is_a_robbins_monro_blend() {
     let model = no_eta_theta_model();
     let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
     let p = packed_start();
     let draws = eta_draws();
 
-    // One step at γ = 1 fixes `s_1 = ∇_1`, `I_1 = I_1`.
+    // One step at γ = 1 fixes `I_1 = I(x_1, η_1)`.
     let mut sa = MstepScoreSa::new(4, 1);
     let mut lt = p.log_theta.clone();
     let mut ls = p.log_sigma.clone();
@@ -369,15 +478,14 @@ fn score_sa_accumulators_are_a_robbins_monro_blend() {
         1.0,
         &[],
     );
-    let s1 = sa.score.clone();
     let i1 = sa.info.clone();
     assert!(
-        s1.iter().any(|v| v.abs() > 1e-6),
-        "the first step left an all-zero score — nothing below can fail"
+        i1.iter().any(|v| v.abs() > 1e-6),
+        "the first step left an all-zero information — nothing below can fail"
     );
 
     // A second step at γ = 0.5, from the SAME packed point, so the fresh
-    // contribution is computable independently.
+    // contribution is computable independently by a fresh accumulator at γ = 1.
     let mut sa_b = MstepScoreSa::new(4, 1);
     let mut lt_b = lt.clone();
     let mut ls_b = ls.clone();
@@ -395,8 +503,7 @@ fn score_sa_accumulators_are_a_robbins_monro_blend() {
         1.0,
         &[],
     );
-    let fresh_score = sa_b.score.clone();
-    let fresh_info = sa_b.info.clone();
+    let fresh = sa_b.info.clone();
 
     let mut lt_c = lt.clone();
     let mut ls_c = ls.clone();
@@ -415,22 +522,22 @@ fn score_sa_accumulators_are_a_robbins_monro_blend() {
         &[],
     );
 
-    for a in 0..s1.len() {
-        let want = s1[a] + 0.5 * (fresh_score[a] - s1[a]);
-        assert!(
-            (sa.score[a] - want).abs() <= 1e-9 * want.abs().max(1.0),
-            "score[{a}] is not the Robbins-Monro blend: {} vs {want}",
-            sa.score[a]
-        );
-    }
+    let mut moved = 0.0f64;
     for a in 0..i1.len() {
-        let want = i1[a] + 0.5 * (fresh_info[a] - i1[a]);
+        let want = i1[a] + 0.5 * (fresh[a] - i1[a]);
         assert!(
             (sa.info[a] - want).abs() <= 1e-9 * want.abs().max(1.0),
             "info[{a}] is not the Robbins-Monro blend: {} vs {want}",
             sa.info[a]
         );
+        moved = moved.max((fresh[a] - i1[a]).abs());
     }
+    // If the two draws produced the same information, the blend is the identity
+    // and the assertion above cannot tell a blend from an assignment.
+    assert!(
+        moved > 1e-6,
+        "the two draws gave the same information ({moved:.3e}) — the blend is untested"
+    );
 }
 
 /// A pinned coordinate — a `FIX`, or a θ the closed-form mu-reference shift has

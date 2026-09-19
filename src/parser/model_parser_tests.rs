@@ -3738,16 +3738,15 @@ fn test_mstep_solver_and_draws_under_focei_warn() {
         "mstep_solver = score_sa".to_string(),
         "mstep_draws = 2".to_string(),
     ])
-    .expect("parses");
+    .unwrap();
+    let warnings = opts.unsupported_keys_warnings();
     assert!(
-        opts.warnings.iter().any(|w| w.contains("mstep_solver")),
-        "mstep_solver under FOCEI must warn: {:?}",
-        opts.warnings
+        warnings.iter().any(|w| w.contains("mstep_solver")),
+        "mstep_solver under FOCEI must warn: {warnings:?}"
     );
     assert!(
-        opts.warnings.iter().any(|w| w.contains("mstep_draws")),
-        "mstep_draws under FOCEI must warn: {:?}",
-        opts.warnings
+        warnings.iter().any(|w| w.contains("mstep_draws")),
+        "mstep_draws under FOCEI must warn: {warnings:?}"
     );
 }
 
