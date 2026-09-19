@@ -98,13 +98,6 @@ fn run_quiet_fit() {
     .quiet();
     assert!(!opts.verbose);
 
-    // This fit enables `optimizer_trace`, so it shares the serialisation every
-    // other trace-enabling test takes — see `trace::TRACE_TEST_LOCK`. Without
-    // it this test cannot fail, but its `init` can steal the thread-local
-    // writer from a concurrent trace-reading test and fail *that* one.
-    let _trace_guard = crate::estimation::trace::TRACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
     // `warnings` is the channel a quiet caller reads instead of the console; it
     // must remain populated (not merely silent) — the SS/boundary/shrinkage

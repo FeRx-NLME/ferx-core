@@ -258,6 +258,18 @@ section of the SDLC for the versioning policy).
   average is reported, because a run that mixes badly early and recovers averages to a
   number describing neither half. Runs with fewer than 25 post-burn-in iterations stay
   quiet, where the realised rate still describes the starting scale.
+- **`FitResult::saem_mh_accept_tail` reports the E-step's realised acceptance.** The
+  combined block + componentwise Metropolis-Hastings rate over the trailing post-burn-in
+  iterations — the exact number the acceptance diagnostic warns on — is now a field, so a
+  caller can check SAEM mixing programmatically instead of parsing a warning string. `None`
+  for non-SAEM methods and for a run that made no post-burn-in proposal
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)).
+- **A concurrent fit no longer voids another fit's optimizer trace.** `fit()` closed the
+  trace unconditionally, but the trace writer is a thread-local and `fit_inner` runs inside a
+  shared Rayon pool — so a fit that never asked for a trace, work-stolen onto a tracing fit's
+  thread, took that fit's writer out from under it and left its `FitResult::trace_path` as
+  `None`. A fit now closes only a trace it opened
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)).
 - **Two fits in the same second no longer share an optimizer-trace file.** With
   `optimizer_trace = true` the path was `/tmp/ferx_trace_{pid}_{unix_seconds}.csv`, so a
   script (or a test) fitting two models back to back in one process silently wrote both

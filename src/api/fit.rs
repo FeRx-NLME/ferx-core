@@ -1145,7 +1145,16 @@ fn fit_inner(
     // whichever Rayon pool is active — scoped pool when threads=Some, else global).
     let n_threads_used = rayon::current_num_threads();
 
-    // Initialise the per-iteration optimizer trace if requested.
+    // Initialise the per-iteration optimizer trace if requested. `finish()`
+    // below is called **only** when this call actually installed a writer: the
+    // trace state is a thread-local and `fit_inner` runs inside a shared Rayon
+    // pool, so a `fit()` that blocks in `install` can have another fit's job
+    // stolen onto its thread. An unconditional `finish()` there takes the
+    // *other* fit's writer out from under it, and that fit's
+    // `FitResult::trace_path` comes back `None` (observed in CI, where enough
+    // fits run concurrently to make it near-certain). A fit that never asked
+    // for a trace now leaves the thread-local alone.
+    let mut trace_installed = false;
     if options.optimizer_trace {
         let path = trace_file_path();
         // Header carries one `val:<name>`/`grad:<name>` column per optimized
@@ -1163,6 +1172,7 @@ fn fit_inner(
         if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
             pre_run_warnings.push(format!("could not open trace file {}: {}", path, e));
         } else {
+            trace_installed = true;
             pre_run_warnings.push(format!("optimizer trace written to {}", path));
         }
     }
@@ -1756,6 +1766,7 @@ fn fit_inner(
                         warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
                         saem_n_subjects_hmc: None,
+                        saem_mh_accept_tail: None,
                         ebe_convergence_warnings: 0,
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
@@ -1845,6 +1856,7 @@ fn fit_inner(
                     warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
                     saem_n_subjects_hmc: None,
+                    saem_mh_accept_tail: None,
                     ebe_convergence_warnings: 0,
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
@@ -2496,8 +2508,13 @@ fn fit_inner(
         model,
     );
 
-    // Flush and close the trace file; capture path for FitResult.
-    let trace_path = crate::estimation::trace::finish();
+    // Flush and close the trace file; capture path for FitResult. Guarded on
+    // having installed one — see the `trace_installed` comment above.
+    let trace_path = if trace_installed {
+        crate::estimation::trace::finish()
+    } else {
+        None
+    };
 
     // Estimation completed: delete the resume checkpoint (nothing left to
     // resume). Any post-estimation error below still returns Err, but a fresh
@@ -2799,6 +2816,7 @@ fn fit_inner(
         ebe_kappas: result.kappas.clone(),
         saem_mu_ref_m_step_evals_saved: result.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
+        saem_mh_accept_tail: result.saem_mh_accept_tail,
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),
         uses_ode_solver: model.is_ode_based(),

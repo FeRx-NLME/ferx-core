@@ -136,6 +136,10 @@ struct FitWire {
     saem_mu_ref_m_step_evals_saved: Option<u64>,
     #[serde(default)]
     saem_n_subjects_hmc: Option<usize>,
+    /// Post-burn-in tail MH acceptance (#1444). `default` so a fit written
+    /// before this field existed still reads back.
+    #[serde(default)]
+    saem_mh_accept_tail: Option<f64>,
 
     theta: ThetaWire,
     omega: OmegaWire,
@@ -629,6 +633,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         warnings: r.warnings.clone(),
         saem_mu_ref_m_step_evals_saved: r.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: r.saem_n_subjects_hmc,
+        saem_mh_accept_tail: r.saem_mh_accept_tail,
         theta: ThetaWire {
             names: r.theta_names.clone(),
             estimates: r.theta.clone(),
@@ -1974,6 +1979,7 @@ fn wire_to_fit_result(
         ebe_kappas,
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
+        saem_mh_accept_tail: w.saem_mh_accept_tail,
         gradient_method_inner: w.gradient_method_inner,
         gradient_method_outer: w.gradient_method_outer,
         uses_ode_solver: w.uses_ode_solver,

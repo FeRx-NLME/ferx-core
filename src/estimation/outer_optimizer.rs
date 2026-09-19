@@ -63,6 +63,10 @@ pub struct OuterResult {
     /// Number of subjects that used HMC at least once during the SAEM E-step.
     /// `None` when `n_leapfrog = 0` (MH-only run) or for non-SAEM methods.
     pub saem_n_subjects_hmc: Option<usize>,
+    /// Combined (primary + componentwise) MH acceptance over the trailing
+    /// post-burn-in iterations the acceptance diagnostic reads. `None` for
+    /// non-SAEM methods and when no post-burn-in proposal was made.
+    pub saem_mh_accept_tail: Option<f64>,
     pub ebe_convergence_warnings: u32,
     pub max_unconverged_subjects: u32,
     pub total_ebe_fallbacks: u32,
@@ -613,6 +617,7 @@ fn evaluate_at_initial_params(
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
+        saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -3532,6 +3537,7 @@ fn optimize_nlopt_once(
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
+        saem_mh_accept_tail: None,
         ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
@@ -4067,6 +4073,7 @@ fn optimize_bfgs(
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
+        saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,

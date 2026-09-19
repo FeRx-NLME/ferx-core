@@ -26,10 +26,10 @@
 //! itself is asserted, so the pair cannot quietly become a tautology if the
 //! model or the iteration counts are ever retuned.
 //!
-//! The observable is the per-iteration `mh_accept_rate` column of the optimizer
-//! trace (`FitOptions::optimizer_trace`), which is the same combined block +
-//! componentwise rate the end-of-run diagnostic folds — so this test measures
-//! the quantity the warning reports, not a proxy for it.
+//! The observable is `FitResult::saem_mh_accept_tail`, the combined block +
+//! componentwise acceptance over the trailing post-burn-in iterations — the
+//! same number the end-of-run diagnostic reports on, so this test measures the
+//! quantity the warning states rather than a proxy for it.
 
 use ferx_core::{fit, parse_model_file, read_nonmem_csv, EstimationMethod, FitOptions};
 
@@ -40,43 +40,6 @@ const N_CONVERGE: usize = 250;
 const OMEGA_BURNIN: usize = 20;
 /// The diagnostic's own lower band edge (`saem::MH_RATE_LOW`, `pub(crate)`).
 const MH_RATE_LOW: f64 = 0.10;
-
-/// Mean of the last `n` finite `mh_accept_rate` entries in a trace CSV.
-///
-/// Every row is checked with `is_finite()` before it is folded: a `NaN` from a
-/// diverged solve would otherwise be swallowed by the accumulator and the mean
-/// would describe only the rows that worked (CLAUDE.md's fold trap).
-fn tail_accept_rate(trace_path: &str, n: usize) -> f64 {
-    let txt = std::fs::read_to_string(trace_path)
-        .unwrap_or_else(|e| panic!("cannot read trace {trace_path}: {e}"));
-    let mut lines = txt.lines();
-    let col = lines
-        .next()
-        .expect("trace has a header")
-        .split(',')
-        .position(|c| c == "mh_accept_rate")
-        .expect("trace header has mh_accept_rate");
-    let rates: Vec<f64> = lines
-        .map(|l| {
-            let f = l.split(',').nth(col).expect("row has the column");
-            f.parse::<f64>()
-                .unwrap_or_else(|e| panic!("unparseable mh_accept_rate {f:?}: {e}"))
-        })
-        .collect();
-    assert!(
-        rates.len() >= N_EXPLORE + N_CONVERGE,
-        "expected {} SAEM rows, got {}",
-        N_EXPLORE + N_CONVERGE,
-        rates.len()
-    );
-    let tail = &rates[rates.len() - n..];
-    let mut sum = 0.0;
-    for &r in tail {
-        assert!(r.is_finite(), "non-finite mh_accept_rate in {trace_path}");
-        sum += r;
-    }
-    sum / tail.len() as f64
-}
 
 fn warfarin_tail_rate(rule: &str) -> f64 {
     warfarin_tail_rate_seed(rule, 12345)
@@ -97,7 +60,6 @@ fn warfarin_tail_rate_seed(rule: &str, seed: u64) -> f64 {
         saem_omega_burnin: OMEGA_BURNIN,
         saem_seed: Some(seed),
         run_covariance_step: false,
-        optimizer_trace: true,
         threads: Some(2),
         ..FitOptions::default()
     };
@@ -105,12 +67,14 @@ fn warfarin_tail_rate_seed(rule: &str, seed: u64) -> f64 {
     ferx_core::parser::model_parser::apply_fit_option(&mut opts, "scale_adaptation", rule)
         .expect("scale_adaptation parses");
     let res = fit(&model, &pop, &model.default_params, &opts).expect("warfarin SAEM Ok");
-    let path = res
-        .trace_path
-        .clone()
-        .expect("optimizer_trace = true must produce a trace");
-    let rate = tail_accept_rate(&path, 100);
-    let _ = std::fs::remove_file(&path);
+    let rate = res
+        .saem_mh_accept_tail
+        .expect("a 400-iteration SAEM fit must report a tail acceptance");
+    // A `NaN` from a diverged solve would sail through every comparison below
+    // (any comparison against NaN is false, so a `<` bound would simply fail,
+    // but a range `contains` would too) — assert finiteness explicitly so the
+    // failure names the real problem.
+    assert!(rate.is_finite(), "non-finite tail acceptance: {rate}");
     println!("scale_adaptation = {rule}: tail acceptance {rate:.4}");
     rate
 }

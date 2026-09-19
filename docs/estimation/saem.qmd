@@ -440,6 +440,9 @@ Two warnings land in `FitResult.warnings` (never on stderr), most severe first:
 - **Not mixing** — the cumulative post-burn-in acceptance is below 1%. The
   sampled ETAs barely moved, so the M-step ran on degenerate sufficient
   statistics and Ω/σ are unreliable.
+The realised tail rate is also available as `FitResult::saem_mh_accept_tail`,
+so a script can check mixing without matching on the warning text.
+
 - **Persistently far from target** — the acceptance over the **last 100**
   post-burn-in iterations is outside 10–80%. The band is deliberately wide: a
   fit at 0.25 or 0.60 is unremarkable, and this is not a range of "good" rates

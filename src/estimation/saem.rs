@@ -1886,6 +1886,20 @@ struct MhRateWindow<'a> {
 }
 
 impl MhRateWindow<'_> {
+    /// Combined acceptance over the window, or `None` when it made no
+    /// proposal. This is the single definition of "the tail rate": the
+    /// diagnostic below and `FitResult::saem_mh_accept_tail` both read it, so
+    /// the number a user sees in the message and the number they can assert on
+    /// cannot drift apart.
+    fn tail_rate(&self) -> Option<f64> {
+        let prop: u64 = self.samples.iter().map(|s| s.proposed).sum();
+        if prop == 0 {
+            return None;
+        }
+        let acc: u64 = self.samples.iter().map(|s| s.accepted).sum();
+        Some(acc as f64 / prop as f64)
+    }
+
     /// Whether the controller had acted before every sample in the window.
     fn adapted_throughout(&self) -> bool {
         match (self.first_adapt, self.samples.first()) {
@@ -1954,12 +1968,8 @@ fn saem_mixing_warning(
     if samples.len() < MH_RATE_MIN_WINDOW || !window.adapted_throughout() {
         return None;
     }
-    let w_acc: u64 = samples.iter().map(|s| s.accepted).sum();
     let w_prop: u64 = samples.iter().map(|s| s.proposed).sum();
-    if w_prop == 0 {
-        return None;
-    }
-    let w_rate = w_acc as f64 / w_prop as f64;
+    let w_rate = window.tail_rate()?;
     if !(MH_RATE_LOW..=MH_RATE_HIGH).contains(&w_rate) {
         // Proposal-weighted across the kernels that actually ran, so a run
         // whose proposals are mostly componentwise is judged against 0.44 and
@@ -4802,13 +4812,18 @@ pub fn run_saem(
     // from their starting values, so the M-step ran on degenerate sufficient
     // statistics and the Ω/σ estimates are unreliable (the classic FREM-scale
     // "0% acceptance" failure).
+    let mh_window = MhRateWindow {
+        samples: mh_rate_window.make_contiguous(),
+        first_adapt: first_scale_adapt,
+    };
+    // The number the diagnostic below reports on, exposed on `FitResult` so a
+    // caller (and a test) can read it without parsing the message or the
+    // optimizer trace (#1444).
+    let saem_mh_accept_tail = mh_window.tail_rate();
     if let Some(w) = saem_mixing_warning(
         cum_mh_acc,
         cum_mh_prop,
-        &MhRateWindow {
-            samples: mh_rate_window.make_contiguous(),
-            first_adapt: first_scale_adapt,
-        },
+        &mh_window,
         options.saem_scale_adaptation,
     ) {
         warnings.push(w);
@@ -5048,6 +5063,7 @@ pub fn run_saem(
         warnings,
         saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc,
+        saem_mh_accept_tail,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -8862,22 +8878,25 @@ DV ~ additive(EPS)
         crate::parser::model_parser::parse_model_string(&src).expect("model parses")
     }
 
-    /// Post-burn-in iterations excluded from both the diagnostic's window and
-    /// the tail this helper measures — the two must agree or the test is
-    /// checking a different number from the warning.
+    /// `omega_burnin` for the fixture below: the iterations excluded from the
+    /// diagnostic's window, and hence from the tail rate it reports.
     const SCALE1444_BURNIN: usize = 30;
 
     /// 60 SAEM iterations — 30 post-burn-in, past `MH_RATE_MIN_WINDOW` — with
     /// two firings of the interval rule before the window opens, so both arms
     /// are exercised and the tail tier's "the controller has run" gate is met.
     ///
-    /// Returns the fit **and** the mean combined MH acceptance over its
-    /// post-burn-in iterations, read from the optimizer trace's
-    /// `mh_accept_rate` column — the same quantity the end-of-run diagnostic
-    /// folds, so the tests measure what the warning reports rather than a
-    /// proxy. The trace is read and deleted before returning: its filename
-    /// embeds only the pid and a whole-second timestamp, and these fits take
-    /// well under a second, so a second fit in the same test truncates it.
+    /// Returns the fit **and** its realised combined MH acceptance over those
+    /// post-burn-in iterations, read from `FitResult::saem_mh_accept_tail` —
+    /// the same number the diagnostic reports, so the tests measure what the
+    /// warning says rather than a proxy.
+    ///
+    /// This used to read the optimizer trace instead, which was wrong for a
+    /// reason worth recording: the trace writer is a thread-local and
+    /// `fit_inner` runs inside a shared Rayon pool, so any *other* concurrent
+    /// fit whose job is stolen onto this one's thread perturbs it. Under CI's
+    /// parallelism that made these tests fail on `trace_path` being `None`.
+    /// A field on the result has no such coupling.
     fn scale1444_fit(
         omega_cl: f64,
         omega_v: f64,
@@ -8898,49 +8917,14 @@ DV ~ additive(EPS)
             saem_scale_adaptation: rule,
             saem_seed: Some(1444),
             run_covariance_step: false,
-            optimizer_trace: true,
             ..FitOptions::default()
         };
-        // Every `optimizer_trace` fit in this binary serialises on this lock —
-        // see `trace::TRACE_TEST_LOCK` for the thread-local race it avoids.
-        let _trace_guard = crate::estimation::trace::TRACE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
-        let path = res
-            .trace_path
-            .clone()
-            .expect("optimizer_trace = true must produce a trace");
-        let txt = std::fs::read_to_string(&path).expect("trace is readable");
-        let _ = std::fs::remove_file(&path);
-        let col = txt
-            .lines()
-            .next()
-            .expect("trace has a header")
-            .split(',')
-            .position(|c| c == "mh_accept_rate")
-            .expect("trace header has mh_accept_rate");
-        let rates: Vec<f64> = txt
-            .lines()
-            .skip(1)
-            .map(|l| {
-                let f = l.split(',').nth(col).expect("row has the column");
-                f.parse::<f64>()
-                    .unwrap_or_else(|e| panic!("unparseable mh_accept_rate {f:?}: {e}"))
-            })
-            .collect();
-        assert_eq!(rates.len(), 60, "expected one trace row per SAEM iteration");
-        // `omega_burnin` (default 20) iterations are excluded, matching what
-        // the diagnostic accumulates. Every row is checked before it is folded:
-        // `f64::max` and a running sum both swallow a `NaN` from a diverged
-        // solve, and the mean would then describe only the rows that worked.
-        let tail = &rates[SCALE1444_BURNIN..];
-        let mut sum = 0.0;
-        for &r in tail {
-            assert!(r.is_finite(), "non-finite mh_accept_rate in the trace");
-            sum += r;
-        }
-        (res, sum / tail.len() as f64)
+        let tail = res
+            .saem_mh_accept_tail
+            .expect("a SAEM fit with post-burn-in iterations must report a tail rate");
+        assert!(tail.is_finite(), "non-finite tail acceptance: {tail}");
+        (res, tail)
     }
 
     #[test]

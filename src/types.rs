@@ -6814,6 +6814,17 @@ pub struct FitResult {
     /// Number of subjects that used HMC at least once during the SAEM E-step.
     /// `None` when `n_leapfrog = 0` (MH-only) or for non-SAEM methods.
     pub saem_n_subjects_hmc: Option<usize>,
+    /// Combined (primary block + componentwise) Metropolis-Hastings acceptance
+    /// over the trailing post-burn-in SAEM iterations — the exact quantity the
+    /// acceptance diagnostic in `FitResult::warnings` reports on, exposed so a
+    /// caller can check E-step mixing without parsing a message. `None` for
+    /// non-SAEM methods and for a run that made no post-burn-in proposal.
+    ///
+    /// Compare it against the target the same warning quotes: roughly 0.40 for
+    /// the block kernel and 0.44 for the componentwise sweep, proposal-weighted
+    /// across whichever ran (issue #1444).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_mh_accept_tail: Option<f64>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.
     pub gradient_method_inner: String,
     /// Gradient method used in the outer (population parameter) optimizer.
