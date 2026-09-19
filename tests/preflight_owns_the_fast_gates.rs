@@ -639,6 +639,10 @@ exit 0
 ///    `tests/` — unlinted. That gap hid 6 `approx_constant` ERRORS (#1023).
 ///  * dropping `--all` from `cargo fmt` formats only the root package, silently skipping
 ///    `crates/ferx-tools` and `crates/ferx-cli` (#1114).
+///  * dropping `-Dunused` from a clippy line leaves it linting and exiting 0 over every
+///    finding it prints, because only clippy's `correctness` group is deny-by-default.
+///    Measured: `origin/main` at bd6785b printed an `unused import` from
+///    `src/estimation/saem.rs` and then `preflight OK`.
 ///  * narrowing a `--features` set drops a whole cfg-gated surface out of the compile.
 ///    `ci,nn,slow-tests` becoming `ci` is exactly #1133 with the gate still present.
 ///
@@ -689,6 +693,60 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
          `approx_constant` errors in #1023.\n  {}",
         clippy.join("\n  ")
     );
+
+    // `cargo clippy` EXITS 0 on warn-level findings. Only clippy's `correctness` group is
+    // deny-by-default, which is why #1023's 6 `approx_constant` findings were caught — they
+    // were errors. Everything else is printed and waved through, rustc's own lints
+    // included, so `-Dunused` is the entire difference between this group gating the
+    // leftovers a refactor drops and merely listing them. Measured on `origin/main` at
+    // bd6785b: the group printed `warning: unused import: `individual_nll_into``
+    // (src/estimation/saem.rs:18, orphaned by #1452) and then `preflight OK`, exit 0. The
+    // local gate and the CI job agreed across the six commits that followed — on green,
+    // over a dead import.
+    //
+    // Same neutered-gate shape as the `RUSTDOCFLAGS=-Dwarnings` block above, and the same
+    // reason it is asserted rather than assumed: delete the flag and the command stays in
+    // the list, still lints, still costs the same, and still passes. The count tripwire in
+    // `preflight_is_executable_and_lists_every_group` owns "a clippy command was deleted";
+    // this owns "a clippy command that is listed actually fails on what it finds".
+    //
+    // Deliberately NOT `-Dwarnings`: measured at the same commit, this group emits ~1,000
+    // warn-level clippy findings (356 `ferx-core` lib, 579 lib test, the rest across the
+    // test binaries), and CI installs a fresh nightly every run, so denying the whole
+    // moving surface would redden PRs on lints that did not exist when they were opened.
+    // `unused` is one long-stable rustc group stating a fact rather than a preference.
+    for cmd in &clippy {
+        assert!(
+            cmd.contains("-- -Dunused"),
+            "a clippy command does not deny the `unused` lint group, so `cargo clippy` \
+             exits 0 on every `unused import` / `dead_code` / `unused_variables` finding \
+             it prints and the `Clippy` job goes green over them:\n  {cmd}"
+        );
+    }
+
+    // `docs-lint` is linted ONLY by the `cargo clippy -p docs-lint` line in `group_docs` —
+    // the `clippy` group is scoped to `ferx-core` and its two members. So the deny has to
+    // reach that line too, and the line has to still BE a clippy line: the count tripwire
+    // in `preflight_is_executable_and_lists_every_group` sees the command deleted (2 → 1)
+    // but not the command REPLACED, and a `docs` group of two `cargo test -p docs-lint`
+    // lines counts 2, leaves the crate unlinted, and makes the loop below vacuous.
+    let docs_lint: Vec<String> = listed_commands("docs")
+        .into_iter()
+        .filter(|c| c.contains("cargo clippy"))
+        .collect();
+    assert!(
+        !docs_lint.is_empty(),
+        "the `docs` group runs no `cargo clippy`, so `crates/docs-lint` is linted by \
+         nothing — the `clippy` group's package list does not include it (#1163).\n  {}",
+        listed_commands("docs").join("\n  ")
+    );
+    for cmd in &docs_lint {
+        assert!(
+            cmd.contains("-- -Dunused"),
+            "the docs-lint clippy command does not deny `unused`, so `crates/docs-lint` \
+             keeps the exit-0 hole the other clippy lines no longer have:\n  {cmd}"
+        );
+    }
 
     let fmt = listed_commands("fmt");
     assert!(

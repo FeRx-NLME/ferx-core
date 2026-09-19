@@ -197,7 +197,18 @@ pub(crate) struct JointPkTteSolve {
     /// Full ODE state at each `times[i]` — the seeded initial state for a time before the
     /// integration start (#1223), NaN only where the solve diverged.
     chz_states: Vec<Vec<f64>>,
-    /// PK-parameter snapshot used for the solve — reused to evaluate `h = dCHZ/dt`.
+    /// PK-parameter snapshot used for the solve.
+    ///
+    /// **Test-only.** The fit path evaluates `h = dCHZ/dt` through `rhs_params` below,
+    /// which since #1261 carries this same snapshot *extended* with the per-time dose
+    /// anchors the RHS reads — so nothing in production needs the bare vector, and
+    /// `cargo clippy -- -Dunused` says so. The #1223 parity test does need it: it asserts
+    /// the pre-start state is bit-identical to `ode.initial_state(..)`, which is a claim
+    /// about the SEEDING, so the seed has to be built from the snapshot this solve
+    /// actually used. Recomputing one in the test would fold in a second claim — that the
+    /// share derives the snapshot the test thinks it does — and a failure would no longer
+    /// say which of the two broke.
+    #[cfg(test)]
     pk_values: Vec<f64>,
     /// Extended parameter snapshots aligned to `times`, including the dose-time anchors
     /// the RHS reads when evaluating `h = dCHZ/dt` (#1261).
@@ -323,6 +334,7 @@ fn try_joint_pktte_shared_solve(
         preds,
         times,
         chz_states,
+        #[cfg(test)]
         pk_values: pk.values.to_vec(),
         rhs_params,
     })

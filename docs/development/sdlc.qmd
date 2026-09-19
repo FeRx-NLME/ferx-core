@@ -371,7 +371,17 @@ See [§10](#cross-repo-synchronization).
 | **CodeFactor** | code quality / smells | **A+** |
 
 `rustfmt` is enforced by the shared pre-commit hook (`git config core.hooksPath
-.githooks`) and by the `fmt` CI job; `clippy` must be clean.
+.githooks`) and by the `fmt` CI job.
+
+What the `Clippy` job actually fails on is narrower than "clippy is clean", and
+worth knowing before you rely on it. `cargo clippy` exits 0 on warn-level
+findings, so only two things redden the job: clippy's deny-by-default
+`correctness` group, and rustc's `unused` group, which `tools/preflight.sh`
+denies explicitly (`-Dunused`). That covers the leftovers a refactor drops — an
+orphaned `use`, a field nothing reads, a variable nothing consumes. The rest of
+clippy's warn-level surface (style, complexity, pedantic-adjacent perf lints) is
+advisory: it is printed, it does not fail, and a green `Clippy` job is therefore
+not a warning-free tree.
 
 ### 8.5 Documentation workflow
 

@@ -15,9 +15,8 @@ use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov,
-    individual_nll_iov_with_scratch_and_schedule, individual_nll_prepared, iov_occasion_groups,
-    IndividualNllPrep, IndividualNllScratch,
+    individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
+    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
