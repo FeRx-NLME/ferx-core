@@ -2078,6 +2078,11 @@ fn fit_inner(
         }
     }
 
+    // Curvature retention is a stage-local Laplace handoff. Post-fit EBE work
+    // has no quadrature consumer and must not pay for an otherwise-unused full
+    // sensitivity jet (one extra provider call per subject).
+    crate::estimation::inner_optimizer::set_capture_terminal_hessian(false);
+
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());
     }
