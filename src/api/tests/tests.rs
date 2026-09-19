@@ -54,6 +54,17 @@ fn no_explicit_thread_count_falls_back_to_the_capped_default() {
 }
 
 #[test]
+fn reconfiguring_the_same_thread_count_is_accepted_and_a_different_one_is_not() {
+    // `configure_global_thread_pool` is once-per-process, as the `build_global` it
+    // replaced was: pools sized from the first value already exist, so a second,
+    // differing count would be reported as in force while nothing used it — and
+    // `PoolPlan::from_budget(0, …)` would then read a width no pool has (#1115/#1460).
+    assert!(reconfiguration_result(2, 2).is_ok());
+    let err = reconfiguration_result(2, 4).expect_err("4 after 2 must not be accepted");
+    assert!(err.contains('2') && err.contains('4'), "{err}");
+}
+
+#[test]
 fn default_thread_count_matches_cap_of_available_parallelism() {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())

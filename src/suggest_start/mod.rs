@@ -398,23 +398,27 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         return (empty_pop_nca(), warnings);
     }
 
-    let per_subject: Vec<SubjectNca> = match model.pk_model {
-        PkModel::OneCptOral
-        | PkModel::OneCptTransit
-        | PkModel::OneCptIg
-        | PkModel::TwoCptOral
-        | PkModel::TwoCptTransit
-        | PkModel::TwoCptIg
-        | PkModel::ThreeCptOral => population
-            .subjects
-            .par_iter()
-            .map(nca_one_cpt_oral)
-            .collect(),
+    // NCA runs from `prepare_run`, before any fit has installed a pool, so this
+    // `par_iter` would otherwise land on Rayon's global pool at one worker per logical
+    // CPU regardless of the requested thread count (#1460).
+    let per_subject: Vec<SubjectNca> =
+        crate::api::install_on_engine_pool(|| match model.pk_model {
+            PkModel::OneCptOral
+            | PkModel::OneCptTransit
+            | PkModel::OneCptIg
+            | PkModel::TwoCptOral
+            | PkModel::TwoCptTransit
+            | PkModel::TwoCptIg
+            | PkModel::ThreeCptOral => population
+                .subjects
+                .par_iter()
+                .map(nca_one_cpt_oral)
+                .collect(),
 
-        PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv => {
-            population.subjects.par_iter().map(nca_one_cpt_iv).collect()
-        }
-    };
+            PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv => {
+                population.subjects.par_iter().map(nca_one_cpt_iv).collect()
+            }
+        });
 
     // Count how many subjects had valid CL estimates.
     let n_valid = per_subject.iter().filter(|s| s.cl_f.is_some()).count();

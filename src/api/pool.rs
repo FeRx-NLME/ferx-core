@@ -99,15 +99,41 @@ static EXPLICIT_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// not call this at all, rather than pass `0` (which would otherwise read as "pick
 /// automatically", masking the caller's intent).
 ///
-/// Takes effect for every fit that starts afterwards. The shared default pool an unpinned
-/// fit runs on is sized once, on first use, so call this before the first fit — a later
-/// change cannot resize a pool whose workers already exist.
+/// **Once per process**, like the `build_global` it replaces. The shared default pool an
+/// unpinned fit runs on is sized from this on first use and cannot be resized afterwards,
+/// so a second, *differing* count would be reported as configured while the pool kept the
+/// first one — and `PoolPlan::from_budget(0, …)` would then disagree with the pool an
+/// unpinned fit actually runs on, which is exactly the agreement #1115 requires. A repeat
+/// call with the same count is accepted (nothing changes); a differing one is an `Err`
+/// naming both, as the second `build_global` used to be.
 pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
     if n_threads == 0 {
         return Err("thread count must be positive".to_string());
     }
-    EXPLICIT_THREADS.store(n_threads, std::sync::atomic::Ordering::Release);
-    Ok(())
+    match EXPLICIT_THREADS.compare_exchange(
+        0,
+        n_threads,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(already) => reconfiguration_result(already, n_threads),
+    }
+}
+
+/// Outcome of a second [`configure_global_thread_pool`] call: idempotent when it names the
+/// count already in force, an error naming both when it does not.
+///
+/// Split out so the message is unit-testable without writing the process-global static
+/// every other test in the binary shares.
+pub(crate) fn reconfiguration_result(already: usize, requested: usize) -> Result<(), String> {
+    if already == requested {
+        return Ok(());
+    }
+    Err(format!(
+        "thread count is already configured to {already} and cannot be changed to \
+         {requested}: pools sized from the first value may already exist"
+    ))
 }
 
 /// The process-wide fit pool, built once with the ferx worker stack (32 MiB) so wide
@@ -190,15 +216,61 @@ pub(crate) fn with_fit_ode_scope<R: Send>(
         .threads
         .filter(|&n| n > 0)
         .unwrap_or_else(effective_default_threads);
-    let already_scoped = crate::ode::solver::worker_carries_ode_override(ov)
+    // `current_num_threads()` is only meaningful — and only safe to call — on a worker:
+    // off one it reports (and *initializes*) Rayon's global pool, at one worker per logical
+    // CPU, which is the pool this engine never wants to own (#1460).
+    let on_worker = rayon::current_thread_index().is_some();
+    let already_scoped = on_worker
+        && crate::ode::solver::worker_carries_ode_override(ov)
         && rayon::current_num_threads() == requested_threads;
     let _armed = crate::ode::solver::arm_ode_solver_override(ov);
-    if ov.is_empty() || already_scoped {
+    if already_scoped {
         return Ok(f());
+    }
+    if ov.is_empty() {
+        // No override for workers to carry, but `f` still `par_iter`s (SIR weighting, the
+        // covariance step's per-subject passes). Off a worker that would be the global
+        // pool, so put it on a ferx pool of the width the caller asked for.
+        return Ok(install_on_pool_sized(requested_threads, f));
     }
     match options.threads.filter(|&n| n > 0) {
         Some(n) => Ok(ode_override_pool(ov, n)?.install(f)),
         None => Ok(shared_ode_override_pool(ov, requested_threads)?.install(f)),
+    }
+}
+
+/// Run population-wide parallel work that is **not** a `fit()` on the engine's worker pool.
+///
+/// For the parallel entry points a caller can reach directly — GAM covariate screening,
+/// standalone `run_sir` / `run_covariance`, the NCA initial-estimate pass, `npde`. A bare
+/// `par_iter` in those places runs on whatever pool the calling thread belongs to, and off
+/// a Rayon worker that is Rayon's *global* pool: one thread per logical CPU, sized by
+/// Rayon, ignoring the count the caller declared. Measured on a 15-core host after
+/// `configure_global_thread_pool(2)`: 15 workers, not 2 (#1460).
+///
+/// Already on a worker → runs inline, so work reached from inside a fit (or from inside a
+/// tool's replicate pool) keeps that budget instead of nesting a second pool underneath it.
+pub fn install_on_engine_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    install_on_pool_sized(effective_default_threads(), f)
+}
+
+/// [`install_on_engine_pool`] at an explicit width, for a caller that pinned one.
+///
+/// Prefers the shared default pool when it is already that wide — the common case, where
+/// this adds no threads at all — and otherwise leases from the same cache `fit()` uses, so
+/// a pool just released by a fit is reused rather than doubled. Falls back to running
+/// inline if no pool can be built: ambient parallelism is worse than the declared width,
+/// but it is not worth failing the caller's work over.
+pub(crate) fn install_on_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_some() {
+        return f();
+    }
+    match default_fit_pool() {
+        Some(pool) if pool.current_num_threads() == n_threads => pool.install(f),
+        _ => match fit_pool_cache().acquire(n_threads, Default::default()) {
+            Ok(lease) => lease.install(f),
+            Err(_) => f(),
+        },
     }
 }
 
