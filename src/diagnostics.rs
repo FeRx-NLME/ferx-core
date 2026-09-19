@@ -62,6 +62,7 @@
 //! | `E_OUTPUT_UNKNOWN_COLUMN` | a name in `[output]` is not recognised as any known quantity |
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
 //! | `W_ADDL_MISSING_II`       | ADDL > 0 on a dose row but II is zero or missing; additional doses not expanded |
+//! | `W_COMPARTMENT_FREE_DOSES` | dose records in the dataset of a compartment-free (`$PRED`-equivalent) model, which applies no dose — reported once with counts; a coded `RATE` on such a model lands here, not on `E_MODELED_*_NO_PARAM` (#1443) |
 //! | `W_MISSING_DV`            | EVID=0 observation row with a missing DV and no MDV=1; skipped rather than scored as DV=0 |
 //! | `W_CMT_DEFAULTED`         | dose / observation rows assigned compartment 1 because the dataset has no `CMT` column, or the cell is missing or unparseable; reported when `CMT` selects something — more than one compartment a dose can reach (multi-state `[odes]`, or an analytical model whose `CMT=2` is a real target), a per-CMT scaling / error model / readout on either engine, an endpoint the row routes to, or a `[data_selection]` clause comparing `CMT` (the scope is the `CmtConsumer` enumeration in `api::validation`) |
 //! | `E_COVSTAT_UNRESOLVED`    | a `[covariate_model]` relation still needs data-derived statistics (`center = median`, `levels = auto`, or a form whose default bounds come from the data) |

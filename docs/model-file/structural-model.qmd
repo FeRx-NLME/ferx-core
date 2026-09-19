@@ -195,20 +195,27 @@ on (dose, arm size, a study-level flag), and the column then becomes required.
 ### What a compartment-free model does not have
 
 There are no compartments, so there is nothing to dose and nothing to integrate.
-The dataset needs no `AMT` column and normally has no dose records at all. The
-following are rejected by name rather than silently ignored:
+The dataset needs no `AMT` column and normally has no dose records at all; if it
+carries some anyway (a `$PRED` dataset that kept its `EVID=1` rows, say), they are
+not applied, and the model/data check says so once, with counts
+(`W_COMPARTMENT_FREE_DOSES`). The following are rejected by name rather than
+silently ignored:
 
 | | Why |
 |---|---|
 | `[odes]` | declares derivatives of compartment states |
 | `[initial_conditions]` | seeds compartment amounts |
 | `[diffusion]` | adds SDE diffusion to compartment states |
+| `[adaptive_dosing]` | emits doses into compartments |
 | `[scaling]` | this block already declares the prediction — fold any conversion into `y` |
 | `obs_scale = ...` | there is no built-in prediction to divide |
 | `central` / `depot` / `peripheral` in the equation | no compartment exists to read |
 
 `[error_model]`, `[fit_options]`, `[covariates]`, `[derived]` and `[output]` all
-work unchanged.
+work unchanged. The `[error_model]` is a single `DV ~ ...`: there is one prediction
+and no compartment to key a `CMT=N:` error model on. A parameter declared in
+`[individual_parameters]` that the equations never read draws the same
+"computed but never used" warning every other model class gets.
 
 Because nothing is dosed, the compartment-indexed dose-attribute names a
 `pk(...)` or `[odes]` model reserves — `F1`, `ALAG1`, `D2`, `R1` — carry no

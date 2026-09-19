@@ -22408,6 +22408,16 @@ fn algebraic_structural_model_rejects_compartment_only_blocks() {
         ("odes", "  d/dt(central) = -0.1 * central\n"),
         ("initial_conditions", "  init(central) = 1.0\n"),
         ("diffusion", "  central ~ 0.1\n"),
+        // #1443: the controller emits doses; the observe check's analytical arm
+        // would otherwise read a parameter named `F1` as a dose attribute of the
+        // placeholder `pk_model` and demand an `f=F1` mapping on a `pk(...)` call
+        // the user never wrote.
+        (
+            "adaptive_dosing",
+            "  observe = E0\n  at = every 24 from 0 to 48\n  start_dose = 100\n  \
+             route = bolus(cmt=1)\n  dose_bounds = [0, 400]\n  \
+             when signal < 10 : increase 25%\n",
+        ),
     ] {
         let src = format!(
             "{}\n[{block}]\n{body}",
@@ -22672,6 +22682,90 @@ fn algebraic_structural_model_accepts_dose_attribute_shaped_parameter_names() {
             model.pk_indices[i]
         );
     }
+}
+
+/// #1443: the "computed but never used" census used to skip compartment-free
+/// models outright (its gate was `!pk_param_map.is_empty() || is_ode`, and a
+/// compartment-free model is neither), so an unread parameter drew no warning.
+/// It now runs with its own wording — the equations live in `[structural_model]`,
+/// not `[odes]` or a `pk(...)` mapping — and with no dose-attribute carve-out,
+/// since nothing is dosed. `EMAX` is declared and never read; `E0` is read.
+#[test]
+fn algebraic_structural_model_warns_on_an_unused_parameter() {
+    let model = parse_model_string(&algebraic_model_str("  y = E0 * ET50\n"))
+        .expect("an unused parameter is a warning, not an error");
+    assert!(model.is_algebraic());
+    let w = model
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("computed but never used"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a dead-parameter warning, got {:?}",
+                model.parse_warnings
+            )
+        });
+    assert!(
+        w.contains("`EMAX`") && !w.contains("`E0`") && !w.contains("`ET50`"),
+        "names the dead parameter only: {w}"
+    );
+    assert!(
+        w.contains("[structural_model]") && !w.contains("[odes]") && !w.contains("pk("),
+        "compartment-free wording, not the ODE or analytical one: {w}"
+    );
+}
+
+/// The census must not exempt a dose-attribute-shaped name on a compartment-free
+/// model: with no doses, an unread `F1` is exactly as dead as an unread `EMAX`.
+/// (An ODE model exempts `F1`, an analytical model exempts `D1`/`R1`; here nothing
+/// is load-bearing without a textual reference.)
+#[test]
+fn algebraic_structural_model_census_has_no_dose_attribute_exemption() {
+    for name in ["F1", "ALAG1", "D1", "R1"] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 theta TVX(1.0, 0.01, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 E0 = TVE0\n\
+            \x20 {name} = TVX\n\n\
+            [structural_model]\n\
+            \x20 y = E0 * TIME\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| panic!("`{name}`: {e}"));
+        assert!(
+            model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used") && w.contains(&format!("`{name}`"))),
+            "`{name}` unread on a compartment-free model must be reported dead, got {:?}",
+            model.parse_warnings
+        );
+    }
+}
+
+/// #1443: a per-CMT `[error_model]` on a compartment-free model is still rejected
+/// (one prediction, no compartments), but the reason names *this* model class
+/// rather than "analytical PK models", which the user never wrote.
+#[test]
+fn algebraic_structural_model_per_cmt_error_model_reject_names_the_model_class() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0\n\n\
+        [structural_model]\n\
+        \x20 y = E0 * TIME\n\n\
+        [error_model]\n\
+        \x20 CMT=1: DV ~ proportional(PROP)\n";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("compartment-free") && !err.contains("analytical PK models"),
+        "got: {err}"
+    );
 }
 
 // ── #1064: θ level blocks ────────────────────────────────────────

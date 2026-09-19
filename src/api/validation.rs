@@ -1599,6 +1599,14 @@ pub(crate) fn check_modeled_dose_rates(
 ) -> Vec<Diagnostic> {
     use crate::types::{DoseAttr, RateMode};
     let mut diags = Vec::new();
+    // A compartment-free model (#811) applies no dose at all, so a coded `RATE`
+    // has no slot to resolve against on any engine and the "add a `D{cmt}` /
+    // `R{cmt}` parameter" advice below would ask for a parameter the model cannot
+    // consume (#1443). The dose records themselves are reported once, model-wide,
+    // by `W_COMPARTMENT_FREE_DOSES` in `check_model_data_warnings`.
+    if model.is_algebraic() {
+        return diags;
+    }
     // De-dup by (attribute, compartment) so N identical coded-RATE rows give one
     // error, not N — and a `D{cmt}` and an `R{cmt}` dose into the same compartment
     // are reported independently rather than masking each other.
@@ -5398,6 +5406,35 @@ pub fn check_model_data_warnings(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+
+    // A compartment-free model (#811) has nothing for a dose to land in, so every
+    // dose record the reader parsed is silently dropped from the prediction —
+    // the reader is model-blind and cannot know. Say so once, with the count,
+    // rather than let a `$PRED`-style dataset that still carries `EVID=1` rows
+    // (or a `RATE=-2` row whose `D1` the model cannot consume, #1443) look as if
+    // it were being dosed. A dose-free dataset is this model class's normal
+    // shape; that is why `W_NO_DOSES` is suppressed for it
+    // (`reader_warning_suppressed`), and this is the other half of the same fact.
+    if model.is_algebraic() {
+        let (n_doses, n_subjects) = population
+            .subjects
+            .iter()
+            .map(|s| s.doses.len())
+            .filter(|&n| n > 0)
+            .fold((0usize, 0usize), |(d, s), n| (d + n, s + 1));
+        if n_doses > 0 {
+            diags.push(Diagnostic::warning(
+                "W_COMPARTMENT_FREE_DOSES",
+                format!(
+                    "{n_doses} dose record(s) across {n_subjects} subject(s) are ignored: the \
+                     [structural_model] is compartment-free ($PRED-equivalent), so no dose is \
+                     applied and `AMT` / `RATE` / `SS` on those rows have no effect on the \
+                     prediction. Drop the dose rows, or declare a compartment model \
+                     (`pk NAME(...)` / `ode(states=[...])`) if the doses are meant to act."
+                ),
+            ));
+        }
+    }
 
     // SS=1 with II ≤ 0 — the SS branch is gated on `dose.ii > 0`, so the dose
     // is silently treated as a single (non-SS) dose.

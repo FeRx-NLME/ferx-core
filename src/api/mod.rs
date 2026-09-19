@@ -204,6 +204,10 @@ mod dose_compartment_tests;
 mod reader_warning_suppression_tests;
 
 #[cfg(test)]
+#[path = "tests/compartment_free_doses_tests.rs"]
+mod compartment_free_doses_tests;
+
+#[cfg(test)]
 #[path = "tests/scaling_undefined_tests.rs"]
 mod scaling_undefined_tests;
 

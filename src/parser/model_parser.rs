@@ -3449,7 +3449,8 @@ pub fn parse_full_model_with(
         ParsedErrorModel::Selected { covariates, .. } => covariates.clone(),
         _ => Vec::new(),
     };
-    let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
+    let (error_model, error_spec) =
+        build_error_spec(parsed_error_model, &sigma_names, is_ode, is_algebraic)?;
     let (residual_correlations, residual_correlation_fixed) =
         build_residual_correlations(&block_sigmas, &sigma_names)?;
     validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
@@ -5058,9 +5059,14 @@ pub fn parse_full_model_with(
     // `alag`) are applied to the dose by the engine without ever appearing in the
     // RHS, so their textual absence does not make them dead (#315). Analytical
     // models bind F/lagtime only via an explicit `pk(...)` mapping, which the
-    // census counts, so they need no carve-out there. Pure-TTE models (no `pk(...)`,
-    // no `[odes]`) are skipped: their params live in named `[event_model LABEL]`
-    // blocks, which the census deliberately does not tokenize (see below).
+    // census counts, so they need no carve-out there. Compartment-free models
+    // (#811) run it too (#1443): their equations were moved into the unnamed
+    // `scaling` block by `apply_algebraic_structural`, so a parameter the readout
+    // reads is counted there, and with no doses there is no dose-attribute
+    // carve-out at all. Endpoint-only models (no `pk(...)`, no `[odes]`, no
+    // compartment-free block) are skipped: they carry no `[individual_parameters]`
+    // block, and their params live in named `[event_model LABEL]` blocks, which the
+    // census deliberately does not tokenize (see below).
     //
     // A raw-text census (rather than resolving against the parsed ASTs) is the
     // deliberate choice: it covers *every* block uniformly — including ones whose
@@ -5070,7 +5076,7 @@ pub fn parse_full_model_with(
     // because individual-parameter names are confined to unnamed blocks (named
     // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
     // covariates, never indiv params — so a param can't be "used" solely there).
-    if !pk_param_map.is_empty() || is_ode {
+    if !pk_param_map.is_empty() || is_ode || is_algebraic {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for lines in blocks.values() {
@@ -5110,9 +5116,13 @@ pub fn parse_full_model_with(
             //    NOT exempt here: the analytical engine binds F/lag only via an
             //    explicit `pk(...)` mapping (which the census counts), so an
             //    unmapped `F1` really is dead.
+            //  * compartment-free models: nothing — no dose is ever applied, so no
+            //    name is load-bearing without a textual reference (#1443).
             .filter(|(i, name)| {
                 use crate::types::DoseAttr;
-                let exempt = if is_ode {
+                let exempt = if is_algebraic {
+                    false
+                } else if is_ode {
                     ode_slot_map
                         .get(*i)
                         .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
@@ -5140,8 +5150,15 @@ pub fn parse_full_model_with(
                 ("are", "they", "them", "have")
             };
             // Shared scaffold; only the cause clause and the remediation hint
-            // differ between analytical (`pk(...)`) and ODE models.
-            let (cause, fix) = if is_ode {
+            // differ between analytical (`pk(...)`), ODE and compartment-free models.
+            let (cause, fix) = if is_algebraic {
+                (
+                    "not referenced in the [structural_model] equations or any other block",
+                    format!(
+                        "Reference {obj} in [structural_model] (or [derived]/[output]) or remove {obj}."
+                    ),
+                )
+            } else if is_ode {
                 (
                     "not referenced in the [odes] RHS or any other block",
                     format!(
@@ -15923,6 +15940,13 @@ fn apply_algebraic_structural(extracted: &mut ExtractedBlocks) -> Result<(), Str
             "diffusion",
             "adds SDE diffusion to compartment states, and this model has none",
         ),
+        // #1443: the controller emits doses into compartments; with none there is
+        // nothing for a dose to land in. Rejected by name so the `observe` check
+        // never runs its analytical dose-attribute arm on a placeholder `pk_model`.
+        (
+            "adaptive_dosing",
+            "emits doses into compartments, and this model has none",
+        ),
     ] {
         if extracted.unnamed.contains_key(block) {
             return Err(format!(
@@ -17162,6 +17186,10 @@ fn build_error_spec(
     parsed: ParsedErrorModel,
     sigma_names: &[String],
     is_ode: bool,
+    // Only read to word the per-CMT reject: a compartment-free model (#811) has
+    // one prediction and no compartments, which is a different reason for the
+    // same reject than "the analytical closed form has a single output" (#1443).
+    is_algebraic: bool,
 ) -> Result<(ErrorModel, ErrorSpec), String> {
     match parsed {
         ParsedErrorModel::Single(model, args, _exponent) => {
@@ -17265,12 +17293,18 @@ fn build_error_spec(
             // An empty PerCmt arises for TTE-only models (no [error_model] block) —
             // allow it regardless of is_ode.  Non-empty PerCmt still requires ODE.
             if !entries.is_empty() && !is_ode {
-                return Err(
+                return Err(if is_algebraic {
+                    "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
+                     [structural_model]; a compartment-free ($PRED-equivalent) model has \
+                     one prediction and no compartments to key an error model on, so it \
+                     takes a single error model (`DV ~ ...`)."
+                        .to_string()
+                } else {
                     "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
                      [structural_model]; analytical PK models support a single error \
                      model only."
-                        .to_string(),
-                );
+                        .to_string()
+                });
             }
             let mut map = HashMap::new();
             let mut representative = None;
