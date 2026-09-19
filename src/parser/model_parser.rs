@@ -8838,7 +8838,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
         "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
-        "n_mh_steps" => opts.saem_n_mh_steps = parse_usize("n_mh_steps")?,
+        // `auto` (the default) sizes the block kernel from the dataset — see
+        // `estimation::saem::auto_n_mh_steps` (#1459). It is spelled out here
+        // rather than left as a bare 0 so a model file can say what it means.
+        "n_mh_steps" => {
+            opts.saem_n_mh_steps = if value.eq_ignore_ascii_case("auto") {
+                crate::estimation::saem::SAEM_N_MH_STEPS_AUTO
+            } else {
+                parse_usize("n_mh_steps")?
+            }
+        }
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "scale_adaptation" | "saem_scale_adaptation" => {

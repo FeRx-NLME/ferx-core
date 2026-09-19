@@ -475,7 +475,16 @@ pub fn run_bayes(
     let n_sample = options.bayes_iters;
     let thin = options.bayes_thin.max(1);
     let n_chains = options.bayes_chains.max(1);
-    let n_eta_mh = options.saem_n_mh_steps.max(1);
+    // Shares `saem_n_mh_steps` with the SAEM E-step, including its `auto`
+    // sentinel — the sampler's η block is the same random-walk kernel against
+    // the same conditional, so the count that mixes it is chosen the same way.
+    let n_eta_mh = crate::estimation::saem::resolve_n_mh_steps(
+        options.saem_n_mh_steps,
+        population.n_obs(),
+        n_subjects,
+        n_eta,
+    )
+    .max(1);
     let master_seed = options.bayes_seed.unwrap_or(0x6E_61_6D_63_62_61_79_65); // "bayesnam"
     let verbose = options.verbose;
 

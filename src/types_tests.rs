@@ -2034,30 +2034,43 @@ fn test_lagtime_from_hashmap_primary_and_alias() {
     assert_eq!(p_alias.lagtime(), 2.0);
 }
 
-/// Guard the SAEM MH-step default. An early value (3) was too low for hard
-/// cold-start surfaces — the chain didn't decorrelate between SAEM outer
-/// iterations, so the single-draw stochastic M-step received sticky
-/// correlated ETAs and locked the population-θ M-step into a degenerate
-/// basin (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150
-/// OFV units worse than the correct basin). The default was raised to 10,
-/// then to 20 alongside the componentwise eta kernel and the damped Ω
-/// stochastic-approximation step — both added to stop a block (correlated)
-/// Ω collapsing to a near rank-1 correlation matrix (UVM 2-cpt: every
-/// off-diagonal correlation → ~0.99, one variance → 0). The larger default
-/// also sizes the componentwise sweep count (`max(2, n_mh_steps / n_eta)`).
+/// Guard the SAEM MH-step default, which is the `auto` sentinel (#1459).
 ///
-/// If a future change drops the default below ~5, re-run both the Emax PKPD
-/// basin regression and the UVM block-Ω collapse regression in the
-/// experiment repo before merging — both fail silently (OFV looks fine;
-/// parameters wrong).
+/// History, because the value is not free to move: an early fixed 3 was too low
+/// for hard cold-start surfaces — the chain didn't decorrelate between SAEM
+/// outer iterations, so the single-draw stochastic M-step received sticky
+/// correlated ETAs and locked the population-θ M-step into a degenerate basin
+/// (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150 OFV units
+/// worse than the correct basin). It was raised to 10, then to 20 alongside the
+/// componentwise eta kernel and the damped Ω stochastic-approximation step —
+/// both added to stop a block (correlated) Ω collapsing to a near rank-1
+/// correlation matrix (UVM 2-cpt: every off-diagonal correlation → ~0.99, one
+/// variance → 0). The count also sizes the componentwise sweep
+/// (`max(2, n_mh_steps / n_eta)`).
+///
+/// #1459 replaced the fixed 20 with
+/// [`auto_n_mh_steps`](crate::estimation::saem::auto_n_mh_steps), which returns
+/// **20 on the Emax PKPD shape that calibrated it** (8 observations per η, the
+/// cap) and 6–7 on sparse PK data, where six real-dataset benchmarks could not
+/// distinguish 6 from 20 at 27–45 % of the CPU.
+///
+/// A future change that makes this a small fixed number again drops the Emax
+/// case to that number too: re-run the Emax PKPD basin regression and the UVM
+/// block-Ω collapse regression (`tests/saem_block_omega_collapse.rs`) first —
+/// both fail silently (OFV looks fine; parameters wrong).
 #[test]
-fn saem_n_mh_steps_default_is_20() {
+fn saem_n_mh_steps_default_is_auto() {
     let opts = FitOptions::default();
     assert_eq!(
-        opts.saem_n_mh_steps, 20,
-        "saem_n_mh_steps default changed — see comment above this test \
-             for the basin-trap and block-Ω-collapse regression rationale \
-             before adjusting."
+        opts.saem_n_mh_steps,
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        "saem_n_mh_steps default changed — see comment above this test for the \
+             basin-trap and block-Ω-collapse regression rationale before adjusting."
+    );
+    assert_eq!(
+        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        0,
+        "the sentinel is 0 — a model file writes it as `n_mh_steps = auto`"
     );
 }
 
