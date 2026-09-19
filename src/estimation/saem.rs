@@ -160,6 +160,71 @@ const SAEM_RUV_OMEGA_LN_GROWTH: f64 = 3.0;
 /// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
 const OMEGA_SA_MAX_STEP: f64 = 0.1;
 
+/// Maximum per-iteration stochastic-approximation step for the **residual σ**
+/// half of the numerical θ/σ M-step, in *both* phases (#1445).
+///
+/// Ω has [`OMEGA_SA_MAX_STEP`], and a single free additive or proportional σ has
+/// the averaged sufficient statistic of [`update_scalar_residual_sse`]. Every
+/// other residual channel — `combined()`, per-endpoint, `block_sigma`,
+/// magnitude-scaled, and any single σ in a model with a free numerical θ — rides
+/// [`theta_sigma_mstep_light`], whose result was *assigned* outright in both
+/// phases once [`MSTEP_SA_MAX_STEP`] defaulted to off (#1415). That left it as
+/// the one SAEM statistic with no stochastic approximation at all, and the
+/// reported σ was one draw of the M-step maximiser's sampling distribution
+/// rather than its average.
+///
+/// For a well-identified σ that hardly matters — the maximiser barely moves. For
+/// a **minority variance component** it decides the answer: on the #1445 repro
+/// (300 subjects, median 1 observation each, block Ω(3), `combined(0.13, 1.8)`)
+/// the per-M-step σ_add maximiser swings between 0.0087 and 2.34 with median
+/// 0.035 against a truth of 1.8, because a weakly identified variance component
+/// has a boundary-heavy sampling distribution. Whatever the last iteration drew
+/// is what the fit reports: three seeds returned 0.011, 0.0025 and 0.011.
+///
+/// Capping γ at this value **in both phases** is what makes the estimate an
+/// average rather than a draw:
+///
+/// * Exploration (`γ = 1`) would otherwise be pure assignment, and σ feeds
+///   straight back into the next E-step's posterior — the same feedback the Ω
+///   cap exists to break, here on the residual side.
+/// * The first convergence iteration (`γ = 1/(k−k1) = 1` at `k = k1+1`) would
+///   otherwise overwrite the whole exploration average with a single draw. Ω
+///   accepts that hand-off deliberately, because `(1/N)Σηηᵀ` over N subjects is
+///   a well-determined statistic; the σ maximiser of a minority component is
+///   not, so σ does not get the same treatment. The cap only binds for the first
+///   five convergence iterations — beyond `k − k1 = 5`, `1/(k−k1) < 0.2` and the
+///   full decaying Robbins-Monro schedule takes over unchanged, which is what
+///   the SA estimate needs to settle.
+///
+/// **The value is measured, not inherited from [`OMEGA_SA_MAX_STEP`].** A cap is
+/// a trade: it is what makes the estimate an average, and it is also what makes
+/// σ *lag*, since a σ that has to travel from its initial estimate now does so
+/// at a bounded rate and is then averaged over a trajectory that was still
+/// moving. Swept at 0.1 / 0.15 / 0.2 / 0.3 over 8 seeds each (release-equivalent
+/// `ci-test`), against the three anchors this change has to satisfy at once:
+///
+/// | cap | #1445 fixture σ_add, truth 1.8 | cefepime σ_add / Laplace OFV, FOCEI 1.837 / 4311.7 | `covmuref_power` numeric `TH_WT`, NONMEM 0.9213 |
+/// |---|---|---|---|
+/// | off (pre-#1445) | 0.0025 – 0.011 (the floor) | ~1e-3 / 4337.0 | 0.9612 |
+/// | 0.1  | 1.52 [1.03, 1.72] | 1.22 [1.14, 1.32] / 4348.1 | 0.8299 |
+/// | 0.15 | 1.46 [1.17, 1.72] | 1.16 [0.94, 1.30] / 4337.0 | 0.9499 |
+/// | 0.2  | 1.42 [1.11, 1.75] | 1.16 [0.97, 1.34] / **4331.7** | 0.9026 |
+/// | 0.3  | 1.42 [1.23, 1.62] | 1.14 [**0.47**, 1.44] / 4332.0 | 0.8821 |
+///
+/// 0.3 is rejected on the left tail: one cefepime seed comes back at 0.47, a
+/// partial collapse, which is the failure this change exists to remove. 0.1 is
+/// rejected on the lag: it is the only cap whose cefepime objective is *worse*
+/// than the un-averaged baseline (4348.1 against 4337.0, with σ_prop stuck at
+/// 0.172 against FOCEI's 0.137), and it is the worst of the four on the #1415
+/// NONMEM anchor. 0.2 is the one value that improves every anchor at once —
+/// including both of the ones that were *not* broken: the cefepime objective
+/// (4331.7, 5.3 better than the baseline) and `TH_WT` (0.9026, |Δ| 0.019 against
+/// NONMEM where the undamped channel realises 0.040).
+///
+/// It is deliberately not a fit option, because it restores the Robbins-Monro
+/// averaging every other SAEM statistic already has rather than adding a knob.
+const SIGMA_SA_MAX_STEP: f64 = 0.2;
+
 /// Default exploration-phase cap on the stochastic-approximation step for the
 /// **numerical θ/σ M-step** — the `mstep_damping` fit option — and, since
 /// #1415, **off** (`1.0`): the numerical maximiser is assigned outright in both
@@ -291,17 +356,16 @@ fn damps_numerical_mstep(
     })
 }
 
-/// SA step size for the numerical θ/σ M-step (#1011).
+/// SA step size for the **θ half** of the numerical θ/σ M-step (#1011).
 ///
-/// One γ for both components, because [`theta_sigma_mstep_light`] is a *single*
-/// NLopt problem over the concatenated `[θ; σ]` vector: `theta_new` and
-/// `sigma_new` are one joint maximiser of the same frozen-η conditional
-/// likelihood. Blending θ at γ and σ at 1.0 would take an inconsistent partial
-/// step — σ would jump to the value that is optimal for the θ the M-step
-/// wanted, while θ is held near the θ it had, so σ absorbs the misfit the
-/// damping just stopped θ from fixing. So the gate below reads as a θ property
-/// only because θ is what makes the *channel* biased; what it gates is the
-/// blend of the joint result, σ included.
+/// [`theta_sigma_mstep_light`] is a *single* NLopt problem over the concatenated
+/// `[θ; σ]` vector, so `theta_new` and `sigma_new` are one joint maximiser of the
+/// same frozen-η conditional likelihood, and this γ used to blend both. Since
+/// #1445 the σ half has its own, always-on step ([`sigma_mstep_sa_step`]), which
+/// is never larger than this one — the case the original argument here warned
+/// about (σ assigned at 1.0 while θ is held back, so σ absorbs the misfit the θ
+/// damping refused to let θ fix) is exactly what that `min` rules out. The gate
+/// below still reads as a θ property, and now gates only the θ half.
 ///
 /// * No θ for the damping to act on (see [`damps_numerical_mstep`]) → `1.0`,
 ///   the undamped pre-#1011 assignment, so those fits are byte-identical.
@@ -339,6 +403,28 @@ fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64,
     } else {
         gamma
     }
+}
+
+/// SA step for the **σ half** of the same numerical M-step result (#1445).
+///
+/// `min(γ_k, SIGMA_SA_MAX_STEP, γ_mstep)` — see [`SIGMA_SA_MAX_STEP`] for why the
+/// cap applies in both phases. The third term keeps the σ side from ever taking
+/// a *larger* step than the θ side: with `mstep_damping` set (the `iiv_on_ruv`
+/// default, and the #1011 shape) the two stay locked together as before, so that
+/// configuration is unchanged except for the first five convergence iterations.
+///
+/// **On [`mstep_sa_step`]'s "one γ for both components" argument.** That doc is
+/// right that `theta_sigma_mstep_light` returns a *joint* maximiser, and that
+/// blending θ at γ while assigning σ at 1.0 would let σ absorb the misfit the θ
+/// damping just refused to let θ fix. The direction here is the opposite one:
+/// with the default `mstep_damping` off, θ is *accepted in full*, so σ takes a
+/// partial step toward the maximiser at the θ the fit actually adopted — a
+/// Robbins-Monro average of the σ maximiser given the new θ, not a half-applied
+/// joint step. When damping is on, `min` restores the locked pair. The asymmetry
+/// is the same one Ω already has against θ, and for the same reason: which
+/// statistic can be trusted from a single draw.
+fn sigma_mstep_sa_step(gamma: f64, gamma_mstep: f64) -> f64 {
+    gamma.min(SIGMA_SA_MAX_STEP).min(gamma_mstep)
 }
 
 /// Sanitise the `mstep_damping` fit option at its point of use.
@@ -385,6 +471,48 @@ fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
     }
     for (c, &n) in cur.iter_mut().zip(new.iter()) {
         *c += gamma * (n - *c);
+    }
+}
+
+/// Robbins-Monro blend of the σ half of the numerical M-step result, taken on
+/// the **variance** scale: `σ² += γ·(σ_new² − σ²)`, written back as `log σ`
+/// (#1445).
+///
+/// `cur` and `new` are `log σ` (σ is the residual *SD*; the residual
+/// correlations of a `block_sigma` are a separate vector and never enter this
+/// one), so the blend is `log σ = ½·log((1−γ)·e^{2 log σ} + γ·e^{2 log σ_new})`.
+///
+/// **Why the variance scale and not the packed one.** The statistic SAEM is
+/// approximating is a residual sum of squares — that is literally what
+/// [`update_scalar_residual_sse`] averages on the one σ channel that already had
+/// an SA step, and `σ = √(S_r/n)` is read off it. Averaging `log σ` instead is a
+/// geometric mean, and on exactly the sequence this fix exists to tame it is not
+/// a cosmetic difference: the #1445 repro's σ_add M-step maximisers over a
+/// 250-iteration convergence phase (min 0.0087, max 2.34, median 0.035, truth
+/// 1.8) Robbins-Monro to **0.097** in log space against **0.816** on the
+/// variance scale. A boundary-heavy sampling distribution is what a weakly
+/// identified minority variance component has, and a geometric mean of it is
+/// dominated by the draws that came back near zero.
+///
+/// A FIXed σ is returned unchanged by NLopt (`lower == upper`), so `new == cur`
+/// and the blend is a no-op for it at any γ — the same property that lets
+/// [`damp_mstep`] be applied blanket-wise on the θ side. `γ >= 1.0` copies, so
+/// the undamped assignment is reproduced bit-for-bit. A non-finite `new`
+/// (NLopt returned garbage for a coordinate) leaves that coordinate alone
+/// rather than poisoning the running average.
+fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
+    if gamma >= 1.0 {
+        cur.copy_from_slice(new);
+        return;
+    }
+    for (c, &n) in cur.iter_mut().zip(new.iter()) {
+        if !n.is_finite() {
+            continue;
+        }
+        let blended = (1.0 - gamma) * (2.0 * *c).exp() + gamma * (2.0 * n).exp();
+        if blended > 0.0 && blended.is_finite() {
+            *c = 0.5 * blended.ln();
+        }
     }
 }
 
@@ -2967,6 +3095,9 @@ pub fn run_saem(
             gamma,
             mstep_damping_cap,
         );
+        // #1445: the σ half of that same joint maximiser takes its own,
+        // always-on Robbins-Monro step. See `sigma_mstep_sa_step`.
+        let gamma_sigma = sigma_mstep_sa_step(gamma, gamma_mstep);
         let gamma_omega = if k <= k1 {
             gamma.min(OMEGA_SA_MAX_STEP)
         } else {
@@ -3760,7 +3891,7 @@ pub fn run_saem(
                         None,
                     );
                     damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                    damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                    damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
                 }
             } else if use_closed_form_mstep {
                 // ---- Closed-form EM M-step under a mixture (#996) ----
@@ -3858,7 +3989,7 @@ pub fn run_saem(
                     }),
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
             } else {
                 // mu_referencing = false (or a mixture whose class thetas could not
                 // be class-aware mu-referenced): full NLopt M-step for all thetas
@@ -3887,7 +4018,7 @@ pub fn run_saem(
                         }),
                     );
                     damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                    damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+                    damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
                 }
             }
 
@@ -4750,6 +4881,189 @@ mod tests {
         assert_eq!(MSTEP_SA_MAX_STEP, 1.0);
         assert_eq!(mstep_sa_step(true, true, 1.0, MSTEP_SA_MAX_STEP), 1.0);
         assert_eq!(mstep_sa_step(true, false, 0.004, MSTEP_SA_MAX_STEP), 1.0);
+    }
+
+    /// The σ schedule (#1445): `min(γ, 0.1, γ_mstep)`, capped in **both**
+    /// phases. The two properties that matter are the ones the collapse turned
+    /// on — exploration must not assign, and the first convergence iteration
+    /// (where `γ = 1/(k−k1) = 1`) must not assign either — plus the decay
+    /// surviving intact past `k − k1 = 10`, without which the SA estimate never
+    /// settles.
+    ///
+    /// Regression this exists to catch: dropping either cap puts σ back on a
+    /// single draw of the M-step maximiser, which is #1445. Mutation check —
+    /// returning `gamma_mstep` (the pre-#1445 expression) fails the first two
+    /// assertions; returning a bare `SIGMA_SA_MAX_STEP` fails the decay ones.
+    #[test]
+    fn sigma_mstep_sa_step_never_assigns_and_keeps_the_decay() {
+        // Exploration: γ = 1 with the damping off must NOT come back as an
+        // assignment. This is the pre-#1445 behaviour, and the whole bug.
+        assert_eq!(sigma_mstep_sa_step(1.0, 1.0), SIGMA_SA_MAX_STEP);
+        // First convergence iteration: γ = 1/(k−k1) = 1 at k = k1+1. Ω takes
+        // that hand-off assignment deliberately; σ must not.
+        assert_eq!(sigma_mstep_sa_step(1.0, 1.0), SIGMA_SA_MAX_STEP);
+        assert!(sigma_mstep_sa_step(1.0, 1.0) < 1.0);
+
+        // The cap binds for the first five convergence iterations only...
+        assert_eq!(sigma_mstep_sa_step(1.0 / 3.0, 1.0), SIGMA_SA_MAX_STEP);
+        assert_eq!(sigma_mstep_sa_step(1.0 / 5.0, 1.0), SIGMA_SA_MAX_STEP);
+        // ...and past that the full decaying Robbins-Monro schedule is intact.
+        assert_eq!(sigma_mstep_sa_step(1.0 / 6.0, 1.0), 1.0 / 6.0);
+        assert_eq!(sigma_mstep_sa_step(1.0 / 250.0, 1.0), 1.0 / 250.0);
+
+        // σ never takes a larger step than θ: with `mstep_damping` set (the
+        // `iiv_on_ruv` default) the pair stays locked, so that shape is
+        // unchanged wherever γ_mstep is the binding term.
+        assert_eq!(
+            sigma_mstep_sa_step(1.0, MSTEP_SA_MAX_STEP_IIV_ON_RUV),
+            MSTEP_SA_MAX_STEP_IIV_ON_RUV
+        );
+        assert_eq!(sigma_mstep_sa_step(0.5, 0.004), 0.004);
+        // The cap is a measured value, not Ω's (see `SIGMA_SA_MAX_STEP` for the
+        // sweep). Pinned so a future edit has to revisit that table: a *smaller*
+        // cap makes σ lag (0.1 is the only swept value whose cefepime objective
+        // is worse than the un-averaged baseline), a larger one lets a seed
+        // partially collapse again (0.3 realises σ_add = 0.47 on cefepime).
+        assert_eq!(SIGMA_SA_MAX_STEP, 0.2);
+    }
+
+    /// The σ half of every `theta_sigma_mstep_light` result goes through
+    /// [`damp_mstep_sigma_variance`] at [`sigma_mstep_sa_step`]'s γ — a source
+    /// check, because the behaviour it pins has no cheaper test.
+    ///
+    /// The two tests above cover the schedule and the blend as *functions*;
+    /// neither can see the smallest edit that removes #1445, which is to leave
+    /// both functions alone and restore the pre-#1445 call —
+    /// `damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep)` — at the three
+    /// sites. Mutation-checked: that revert leaves every unit test in this file
+    /// green and is caught only by
+    /// `tests/saem_combined_error.rs::saem_sparse_combined_additive_sigma_is_not_a_single_draw`,
+    /// which is `slow-tests`-gated and therefore never runs on a PR. This test
+    /// closes that window on the PR job.
+    ///
+    /// Whitespace is stripped before matching, so rustfmt may re-wrap the calls
+    /// freely; renaming a local (`log_sigma`, `sigma_new`) is what would need
+    /// this test updated, and that is the point — the rename should have to look
+    /// here.
+    #[test]
+    fn the_sigma_mstep_result_is_blended_not_assigned() {
+        // Comment lines are dropped first (this test's doc comment quotes the
+        // forbidden call, and so does `sigma_mstep_sa_step`'s), and every needle
+        // is assembled from fragments at runtime so the assertions below do not
+        // match themselves.
+        let src: String = include_str!("saem.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let sigma_arg = format!("(&mut{}_sigma", "log");
+
+        let forbidden = format!("{}{sigma_arg}", "damp_mstep");
+        assert!(
+            !src.contains(&forbidden),
+            "σ must not ride the θ blend (`{forbidden}`, ..) — that is the pre-#1445 assignment"
+        );
+
+        let wanted = format!(
+            "{}{sigma_arg},&sigma_new,gamma_sigma)",
+            "damp_mstep_sigma_variance"
+        );
+        let calls = src.matches(&wanted).count();
+        assert_eq!(
+            calls, 3,
+            "expected the three θ/σ M-step arms (mu-ref, mixture, mu_referencing = false) to \
+             blend σ at γ_σ; found {calls} of `{wanted}`"
+        );
+
+        // ...and that the γ they are handed is the σ schedule, not θ's.
+        let schedule = format!(
+            "letgamma_sigma={}(gamma,gamma_mstep)",
+            "sigma_mstep_sa_step"
+        );
+        assert!(
+            src.contains(&schedule),
+            "γ_σ must come from the σ schedule: `{schedule}` not found"
+        );
+    }
+
+    /// The σ blend is on the **variance** scale, not the packed one (#1445).
+    ///
+    /// Regression this exists to catch: re-spelling the blend as
+    /// `damp_mstep(&mut log_sigma, …)` — the pre-#1445 call, and the obvious
+    /// "simplification" — which is a geometric mean of the maximiser sequence.
+    /// The last assertion is the discriminator: on a two-point sequence with the
+    /// boundary-heavy shape a minority variance component actually produces, the
+    /// two spellings differ by a factor of ~3, and log space is the collapsed
+    /// one. A test that only checked the γ ≥ 1 and pinned cases would pass under
+    /// either spelling.
+    #[test]
+    fn damp_mstep_sigma_variance_blends_on_the_variance_scale() {
+        // γ ≥ 1 assigns, bit-for-bit — the undamped path stays reproducible.
+        for g in [1.0_f64, 2.0] {
+            let mut cur = [0.5_f64, -1.0];
+            let new = [(0.2_f64).ln(), (3.0_f64).ln()];
+            damp_mstep_sigma_variance(&mut cur, &new, g);
+            assert_eq!(cur, new, "γ = {g} must assign outright");
+        }
+
+        // A FIXed / pinned σ (NLopt returns it unchanged) is a no-op at any γ.
+        for g in [0.0_f64, 0.1, 0.5, 1.0] {
+            let mut cur = [(1.7_f64).ln(); 2];
+            damp_mstep_sigma_variance(&mut cur, &[(1.7_f64).ln(); 2], g);
+            for c in cur {
+                assert!(
+                    (c - (1.7_f64).ln()).abs() < 1e-15,
+                    "pinned σ moved at γ = {g}"
+                );
+            }
+        }
+
+        // The blend itself: σ² += γ·(σ_new² − σ²).
+        let mut cur = [(2.0_f64).ln()];
+        damp_mstep_sigma_variance(&mut cur, &[(4.0_f64).ln()], 0.25);
+        let want = (0.75 * 4.0 + 0.25 * 16.0_f64).sqrt(); // = 2.6457…
+        assert!(
+            (cur[0].exp() - want).abs() < 1e-12,
+            "variance blend: got {}, want {want}",
+            cur[0].exp()
+        );
+        // ...which is NOT the packed-scale blend, whose answer here is
+        // exp(0.75·ln2 + 0.25·ln4) = 2.3784.
+        let log_space = (0.75 * (2.0_f64).ln() + 0.25 * (4.0_f64).ln()).exp();
+        assert!((cur[0].exp() - log_space).abs() > 0.25);
+
+        // A non-finite maximiser leaves that coordinate alone rather than
+        // poisoning the running average with NaN.
+        let mut cur = [(1.5_f64).ln(), (2.5_f64).ln()];
+        let before = cur;
+        damp_mstep_sigma_variance(&mut cur, &[f64::NAN, f64::INFINITY], 0.1);
+        assert_eq!(cur, before);
+
+        // The discriminator. A boundary-heavy sequence — half the M-step
+        // maximisers near the σ floor, half at a healthy value — averages to
+        // something usable on the variance scale and collapses in log space.
+        // The numbers are the shape measured on the #1445 repro (floor-adjacent
+        // draws of 0.01 against healthy draws of 2.0).
+        let seq = [0.01_f64, 2.0, 0.01, 2.0, 0.01, 2.0, 0.01, 2.0];
+        let mut var_scale = [(1.0_f64).ln()];
+        let mut log_scale = [(1.0_f64).ln()];
+        for (i, &s) in seq.iter().enumerate() {
+            let g = 1.0 / (i + 1) as f64;
+            damp_mstep_sigma_variance(&mut var_scale, &[s.ln()], g);
+            damp_mstep(&mut log_scale, &[s.ln()], g);
+        }
+        assert!(
+            var_scale[0].exp() > 1.0,
+            "variance-scale average collapsed: {}",
+            var_scale[0].exp()
+        );
+        assert!(
+            log_scale[0].exp() < 0.5,
+            "log-scale average was expected to collapse: {}",
+            log_scale[0].exp()
+        );
+        assert!(var_scale[0].exp() / log_scale[0].exp() > 3.0);
     }
 
     /// The default cap is keyed to the one shape it was measured to help
