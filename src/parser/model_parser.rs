@@ -18220,10 +18220,17 @@ fn build_pk_param_fn(
                         let hit = entry.occupied
                             && entry.model_id == ip_model_id
                             && entry.key.len() == ip_key.len()
-                            // Bit equality, not `==`: a key that differs only in
-                            // the sign of a zero, or that carries a NaN
-                            // covariate (#1111's missing-value encoding), must
-                            // not be treated as the same input.
+                            // Bit equality, not `==`, and the two cases pull in
+                            // opposite directions. `-0.0 == 0.0` is true but the
+                            // two are different inputs to the prefix (`1/x`
+                            // alone separates them), so `==` would serve a false
+                            // hit; bits give the miss. `NaN == NaN` is false —
+                            // and a `NaN` covariate is #1111's missing-value
+                            // encoding, so it is a real input, not an error —
+                            // so `==` would miss forever on such a subject;
+                            // bits give the hit, which is correct because the
+                            // prefix is deterministic: same bits in, same values
+                            // out.
                             && entry
                                 .key
                                 .iter()
