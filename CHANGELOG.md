@@ -38,6 +38,25 @@ section of the SDLC for the versioning policy).
   a tool built on ferx-core (the `ferx-tools` GAM screener is the first caller) wraps its
   `par_iter` in it, and work already running on a worker is left there rather than nesting
   a second pool ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
+
+- **A declared per-CMT entry that no observation matches is now reported** as
+  `W_PER_CMT_UNMATCHED` by `fit()` and `ferx check --data` (#1405). The per-CMT coverage
+  checks only ever looked one way — every *observed* compartment needs an entry — so
+  `obs_scale[CMT=2]`, `y[CMT=2]` or a `CMT=2: DV ~ ...` line on a dataset with no CMT-2
+  row validated clean and silently did nothing, usually because the `CMT` column was
+  missing or mis-mapped. The warning names the channel and the dead compartments, and
+  stays silent on `ferx check` without `--data`. It suggests the missing-`CMT`-column
+  reading only when the reader actually reported one (`W_CMT_DEFAULTED`), so a dataset
+  with a present, correct column is never sent to audit it, and names `[data_selection]`
+  as a cause only for the dead compartments a clause actually emptied. It is also reported by `predict()` and `simulate()`, which dispatch
+  through the same per-CMT map.
+- **`ExclusionSummary` gained `obs_cmts_excluded`** — the distinct compartments of the
+  excluded records `n_obs_excluded` counts, ascending (#1405). The count says how many
+  rows went but not what they were, which is the question a per-CMT diagnostic has to
+  answer. Note it is not the same set as `Subject::obs_cmts`: classification happens
+  where the filter runs, before the reader decides whether a row becomes a scored
+  observation. **Breaking for struct-literal construction** of `ExclusionSummary`;
+  reading it is unchanged.
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and

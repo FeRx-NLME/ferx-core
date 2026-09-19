@@ -68,7 +68,13 @@ Carried, in this order:
    the same suppression filter `fit()` and `ferx check` use, so all three
    suppress exactly the same ones.
 3. **Model/data warnings** — `W_STEADY_STATE_*`, `W_SDE_*`,
-   `W_NEGATIVE_LAGTIME`, `W_MODELED_*`, `W_ADDITIVE_INIT_SCALE`, …
+   `W_NEGATIVE_LAGTIME`, `W_MODELED_*`, `W_ADDITIVE_INIT_SCALE`,
+   `W_COMPARTMENT_FREE_DOSES`, `W_PER_CMT_UNMATCHED`, …
+   The last is the one whose membership was argued rather than inherited: a
+   declared per-CMT entry that no observation matched is a statement about the
+   model and the data the caller handed in, and `predict()` dispatches through
+   the same per-CMT map, so the entry is exactly as inert there as in a fit
+   ([#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)).
 4. **Experimental-feature notices** — a feature is experimental whichever door
    you use it through.
 5. **The ODE-solver diagnostics** of the pass that just ran.

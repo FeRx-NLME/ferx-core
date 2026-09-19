@@ -556,6 +556,8 @@ Form C (ODE) per-CMT:
   y[CMT=2] = metab  / V_metab
 ```
 
+### Coverage: both directions
+
 **Coverage rule** — every CMT that has at least one observation in the
 data must have a matching `[CMT=N]` entry. The parser only checks
 syntax; the fit-time validation (run automatically at the top of
@@ -566,10 +568,35 @@ syntax; the fit-time validation (run automatically at the top of
 Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry.
 ```
 
+**The other direction is a warning** (since [#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)) — a
+`[CMT=N]` entry that *no* observation is recorded on is inert rather than
+wrong, so `fit()` and `ferx check --data` report `W_PER_CMT_UNMATCHED`
+naming the dead compartments instead of refusing the model. It fires on
+all three per-CMT channels, `obs_scale[CMT=N]`, `y[CMT=N]` and
+`[error_model] CMT=N:`. The usual cause is a `CMT` column that never
+carries the declared value — a typo, an endpoint removed by
+`[data_selection]`, or a block carried over from another model. On a
+dataset with *no* `CMT` column every observation is keyed to compartment
+1 and **both** codes fire: `W_CMT_DEFAULTED` for the defaulting itself,
+this one for the entries the defaulting left dead. The message offers
+that reading only when the data is consistent with it — every
+observation on compartment 1 — so a model whose observations sit on
+compartment 2 is told its entries are inert without being sent to audit
+a `CMT` column that is present and correct. When a `[data_selection]`
+clause emptied one of the dead compartments the message says so and
+names it; a clause that removed rows on some *other* compartment is not
+offered as the cause. Validating a model without `--data` reports
+nothing here: an empty population is no evidence about which entries are
+exercised.
+
+### Mixing rule
+
 **Mixing rule** — the uniform form (`obs_scale = K`) and the per-CMT
 form (`obs_scale[CMT=N] = K`) are mutually exclusive within the same
 group. The parser rejects mixing them so the user is explicit about
 intent. The same rule applies to `y` and `y[CMT=N]`.
+
+### Gradients
 
 **Gradients** — per-CMT `obs_scale[CMT=N]` works with both
 `gradient = auto` and `gradient = fd`. The analytic route materialises a
@@ -599,6 +626,8 @@ evaluates one scale jet per occasion group, so an IOV model with time-varying
 covariates in the dynamics and `obs_scale = V` stays on the analytic route since
 #590. Combined with **LTBS**, an ODE expression `obs_scale` still falls back to FD
 because the walk applies LTBS before the η/θ chain.
+
+### Numerical validation
 
 **Numerical validation.** The per-CMT analytic gradient inherits the NONMEM
 validation of the user-ODE sensitivity engine (#410): the gradient machinery —

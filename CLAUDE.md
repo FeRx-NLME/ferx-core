@@ -375,7 +375,7 @@ found on #1166 in tests that had been written, run green and believed:
 
 For each new assertion, name the regression it exists to catch and check that regression can
 actually reach it. For a regression test that means mutation; for an anchor, feeding it the
-failure it exists to catch. Two things that "I mutation-tested it" does **not** cover:
+failure it exists to catch. Three things that "I mutation-tested it" does **not** cover:
 
 - **Mutating your own fix is not enough — ask what the *smallest* edit that removes it is, and
   which test dies.** On #1171 / PR #1174 sixteen tests across three tiers each died correctly
@@ -393,6 +393,24 @@ failure it exists to catch. Two things that "I mutation-tested it" does **not** 
   by an unexercised path is an assertion against a constant. Require each mutation to name its
   own side in the failure message; if one side stays green, find the fast path supplying the
   answer and change the fixture until it does not.
+- **A user-facing message is code, and every sentence of it is a mutation target.** #1405 / PR
+  #1456 shipped 15 tests and a 16-mutation sweep reported as fully killed, while the warning's
+  advice half — "a missing or mis-mapped CMT column keys every observation to compartment 1" —
+  was **false on every dataset whose observations are not on compartment 1**, which included
+  the PR's own worked example in the body. Review measured it: deleting the entire advice half
+  killed **0 of 15** tests. Every one of the 16 mutations had been on control flow — an arm
+  returning `None`, a guard deleted, one leg of a union dropped — so the sweep mutated the code
+  the author wrote and never the text the reader sees, and was structurally incapable of seeing
+  it. Two more cells of the same input space were then found one per review round. The sentence
+  is the deliverable of a diagnostic; a sentence no test can kill is a claim nobody has checked.
+  So: **delete each sentence of the message in turn and name the test that dies**; **enumerate
+  the message's input space before writing its prose**, the way a predicate's domain is
+  enumerated (here it was observed-CMT-set × `[data_selection]` state — six cells, two wrong,
+  discovered one per round, which is the most expensive way to enumerate anything); and where
+  a claim is conditional, **assert both sides of its gate in one test**, so forcing either
+  branch reddens it — split across two tests, a gate stuck on one branch still passes half.
+  This is the whole of `check-report.qmd`'s value and none of it is numeric, which is why the
+  rules above do not reach it.
 
 **Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the dual path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
 

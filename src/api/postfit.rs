@@ -2154,7 +2154,13 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 ///    `[data_selection]` clause comparing `CMT` — and these entry points have none, so it is
 ///    passed a default. See the call site.
 /// 3. [`crate::api::check_model_data_warnings`] — the `W_STEADY_STATE_*` / `W_SDE_*` /
-///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` bundle.
+///    `W_NEGATIVE_LAGTIME` / `W_MODELED_*` / `W_COMPARTMENT_FREE_DOSES` /
+///    `W_PER_CMT_UNMATCHED` bundle. The last of those is the one whose membership was
+///    argued rather than inherited (#1405 review): a declared per-CMT entry that no
+///    observation matched is a statement about the model and the data the caller handed
+///    in, and `predict()` dispatches through the same map, so the entry is exactly as
+///    inert there as in a fit. `predict_and_simulate_report_it_too` pins it on both
+///    paths.
 /// 4. [`crate::api::check_experimental_features`] — data-independent; a feature is
 ///    experimental whichever door you use it through.
 /// 5. The ODE-solver diagnostics of the pass that just ran.
