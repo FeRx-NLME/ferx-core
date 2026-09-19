@@ -148,6 +148,87 @@ fn profile_has_guards_on(name: &str) -> bool {
     panic!("`inherits` chain from profile `{name}` did not terminate");
 }
 
+/// Transitively close a `--features` list over Cargo.toml's `[features]` table.
+///
+/// `markov = ["survival"]`, so `--features ci,markov,slow-tests` compiles every
+/// `#![cfg(all(feature = "survival", feature = "slow-tests"))]` file just as
+/// `ci,survival,slow-tests` does. A guard that matched the literal token would red a
+/// perfectly valid merge of those two check lines — a false positive on exactly the
+/// "splitting or merging feature sets stays a free refactor" property the feature
+/// assertions are supposed to preserve. Read from the manifest rather than hard-coded
+/// so the implication graph has one owner: add `foo = ["survival"]` to Cargo.toml and
+/// this follows it without a second edit here.
+fn expand_features(listed: &[String]) -> Vec<String> {
+    let src = std::fs::read_to_string(repo_root().join("Cargo.toml")).expect("read Cargo.toml");
+    let table = src
+        .find("\n[features]\n")
+        .map(|start| {
+            let rest = &src[start + "\n[features]\n".len()..];
+            &rest[..rest.find("\n[").unwrap_or(rest.len())]
+        })
+        .expect("Cargo.toml has a [features] table");
+
+    let deps = |feature: &str| -> Vec<String> {
+        table
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .find(|(k, _)| k.trim() == feature)
+            .map(|(_, v)| {
+                v.trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|d| d.trim().trim_matches('"').to_string())
+                    .filter(|d| !d.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut out: Vec<String> = listed.to_vec();
+    // Bounded: a cycle is a Cargo error, but this test must not hang on a bad manifest.
+    for _ in 0..16 {
+        let grown: Vec<String> = out
+            .iter()
+            .flat_map(|f| deps(f))
+            .filter(|d| !out.contains(d))
+            .collect();
+        if grown.is_empty() {
+            return out;
+        }
+        out.extend(grown);
+    }
+    panic!("feature implication graph in Cargo.toml did not terminate: {listed:?}");
+}
+
+/// Does this command compile **ferx-core's** targets, as opposed to only a member's?
+///
+/// The members line takes its features package-qualified (`ferx-core/ci`), and the
+/// feature parse strips that prefix — so a hypothetical
+/// `cargo check -p ferx-tools --tests --features ferx-core/nn,ferx-core/slow-tests`
+/// would present an `nn` + `slow-tests` feature set while compiling none of ferx-core's
+/// own test targets. #1450 review raised that; it is the PACKAGE dimension only.
+///
+/// Deliberately says nothing about `--tests`: that dimension is owned, for every command
+/// in the group, by the blanket assertion in
+/// `load_bearing_flags_and_feature_coverage_survive_in_the_command_list`. Checking it
+/// here too would be a second gate rejecting exactly the inputs the first one rejects,
+/// so neither could be mutation-tested — the hole this whole test exists to avoid.
+///
+/// No `-p` at all means the workspace root package, which IS ferx-core.
+fn selects_ferx_core(cmd: &str) -> bool {
+    let mut parts = cmd.split_whitespace();
+    let mut packages = Vec::new();
+    while let Some(p) = parts.next() {
+        if p == "-p" || p == "--package" {
+            if let Some(name) = parts.next() {
+                packages.push(name);
+            }
+        }
+    }
+    packages.is_empty() || packages.contains(&"ferx-core")
+}
+
 fn ci_yml() -> String {
     let p = repo_root().join(".github").join("workflows").join("ci.yml");
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
@@ -561,9 +642,43 @@ exit 0
 ///  * narrowing a `--features` set drops a whole cfg-gated surface out of the compile.
 ///    `ci,nn,slow-tests` becoming `ci` is exactly #1133 with the gate still present.
 ///
-/// The feature check is deliberately a **union over the whole group**, not a per-line
-/// assertion: it pins that the matrix still compiles each gated surface without caring how
-/// the lines are arranged, so splitting or merging feature sets stays a free refactor.
+/// The feature check is a **union over the whole group** where one feature alone is what
+/// opens a surface (`ci`, `markov`), so splitting or merging those lines stays a free
+/// refactor. It is a **per-command** check where the surface is opened only by a
+/// *conjunction*, because a union cannot see a conjunction being broken up: with
+/// `ci,survival,slow-tests` still in the list, narrowing `ci,nn,slow-tests` to `ci,nn`
+/// leaves every one of `ci`, `survival`, `slow-tests`, `markov`, `nn` present in the union
+/// and the command count unchanged, so a pure-union assertion stays green (measured on
+/// #1446 — the whole 10-test file passed under exactly that edit). What it silently stops
+/// compiling is the three `#[cfg(feature = "slow-tests")]` bodies inside `src/nn`'s
+/// `nn`-gated test module, whose own doc comment names this command as the thing that
+/// catches their bit-rot. Same shape on the survival side:
+/// `tests/tte_convergence.rs` and `tests/categorical_convergence.rs` are
+/// `#![cfg(all(feature = "survival", feature = "slow-tests"))]`.
+///
+/// The two halves are disjoint on purpose: `slow-tests`, `nn` and `survival` are checked
+/// ONLY by the pairings and `ci`/`markov` ONLY by the union. Asserting both ways for the
+/// same feature would be two gates rejecting the same edits, which is how a hole hides —
+/// delete either and the suite stays green, so neither can be mutation-tested.
+///
+/// Features are compared **after** transitive expansion over Cargo.toml's `[features]`
+/// table (`expand_features`), so `ci,markov,slow-tests` satisfies the `survival` pairing:
+/// `markov = ["survival"]`, and that set compiles the double-gated survival files exactly
+/// as `ci,survival,slow-tests` does. Matching the literal token would red a valid merge of
+/// those two lines — a false positive on the free-refactor property above (#1450 review).
+///
+/// A feature set is only half the question, and the other half is a SEPARATE dimension
+/// with its own owner, because a feature says what gets compiled and a target selector
+/// says whether any test code gets compiled at all:
+///
+///  * `--tests` / `--all-targets`, asserted as a blanket over EVERY command in the group.
+///    Deleting `--tests` from the `ci,nn,slow-tests` line leaves the feature sets and the
+///    command count untouched, and — measured on #1450 — compiles #1446's own
+///    `error[E0425]: cannot find function `compute_bounds`` clean. The gate stayed in the
+///    list and checked nothing.
+///  * the package selection, asserted only where a pairing lands (`selects_ferx_core`),
+///    since a member-only `-p ferx-tools` line can carry `ferx-core/nn,ferx-core/slow-tests`
+///    and compile no ferx-core test target at all.
 #[test]
 fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     let clippy = listed_commands("clippy");
@@ -742,30 +857,90 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         );
     }
 
-    // Union of every `--features` value in the check group.
+    // The `--features` value of each command in the check group, kept PER COMMAND so a
+    // conjunction can be asserted. A command with no `--features` contributes an empty set
+    // rather than being dropped, so the two views below stay derived from one parse.
     let check = listed_commands("check");
-    let mut features: Vec<String> = Vec::new();
-    for cmd in &check {
-        let mut parts = cmd.split_whitespace();
-        while let Some(p) = parts.next() {
-            if p == "--features" {
-                if let Some(list) = parts.next() {
-                    for f in list.split(',') {
-                        // Members take their features package-qualified (`ferx-core/ci`).
-                        let f = f.rsplit('/').next().unwrap_or(f);
-                        features.push(f.to_string());
+    let per_command: Vec<Vec<String>> = check
+        .iter()
+        .map(|cmd| {
+            let mut set = Vec::new();
+            let mut parts = cmd.split_whitespace();
+            while let Some(p) = parts.next() {
+                if p == "--features" {
+                    if let Some(list) = parts.next() {
+                        for f in list.split(',') {
+                            // Members take their features package-qualified (`ferx-core/ci`).
+                            set.push(f.rsplit('/').next().unwrap_or(f).to_string());
+                        }
                     }
                 }
             }
-        }
-    }
-    for want in ["ci", "survival", "slow-tests", "markov", "nn"] {
+            // `markov` implies `survival`; see `expand_features`.
+            expand_features(&set)
+        })
+        .collect();
+    let features: Vec<&String> = per_command.iter().flatten().collect();
+
+    // A feature set says WHAT gets compiled; `--tests` says WHETHER the test targets get
+    // compiled at all. Independent dimensions, so this is its own assertion rather than a
+    // clause bolted onto the feature checks below — and it is a blanket over ALL five
+    // commands, because every one of them exists to compile-gate test code. Without it the
+    // feature assertions gate nothing: `cargo check --features ci,nn,slow-tests` with
+    // `--tests` deleted keeps every feature token, keeps the command count at 5, and
+    // compiles #1446's `error[E0425]` clean (measured on PR #1450's review).
+    for cmd in &check {
         assert!(
-            features.iter().any(|f| f == want),
+            cmd.contains("--tests") || cmd.contains("--all-targets"),
+            "a `check` command selects no test targets, so it compiles the library only — \
+             every `#[cfg(test)]` module, every sibling `*_tests.rs` and all of `tests/` \
+             go uncompiled and the feature set on it gates nothing:\n  {cmd}"
+        );
+    }
+
+    // Features whose surface a single flag opens: a union over the group is the right
+    // question, and the only one, for these.
+    for want in ["ci", "markov"] {
+        assert!(
+            features.iter().any(|f| *f == want),
             "the `check` group compiles nothing under `{want}`, so every source and test \
              file behind that cfg is unchecked on this PR. #1133 is what that looks like: \
              one struct literal in an `nn`-gated file turned three CI jobs red after a \
              local run of 4634 tests reported clean.\nfeature sets seen: {features:?}\n  {}",
+            check.join("\n  ")
+        );
+    }
+
+    // Features whose surface is opened only by a CONJUNCTION. Asserted on a single
+    // command, because the union above is blind to the pair being split across two
+    // commands that each carry one half — see this test's doc comment.
+    for (a, b, what) in [
+        (
+            "nn",
+            "slow-tests",
+            "the three `#[cfg(feature = \"slow-tests\")]` bodies in `src/nn`'s test module \
+             (`l2_shrinks_weights_and_modulator_variation` and its two helpers), which are \
+             `#[cfg]`ed out rather than `#[ignore]`d so they do not read as missed patch \
+             lines (#293)",
+        ),
+        (
+            "survival",
+            "slow-tests",
+            "`tests/tte_convergence.rs` and `tests/categorical_convergence.rs`, both \
+             `#![cfg(all(feature = \"survival\", feature = \"slow-tests\"))]`",
+        ),
+    ] {
+        assert!(
+            check.iter().zip(&per_command).any(|(cmd, set)| {
+                set.iter().any(|f| f == a) && set.iter().any(|f| f == b) && selects_ferx_core(cmd)
+            }),
+            "no single `check` command enables `{a}` AND `{b}` together on ferx-core's own \
+             test targets, so {what} compile in no per-PR job at all. Both features \
+             appearing somewhere in the group is not enough — that is the state #1446 \
+             measured, where narrowing one line to `ci,{a}` left this whole file green. \
+             Nor is a member-only `-p ferx-tools` line carrying them as `ferx-core/{a}`: \
+             it selects no ferx-core test target.\nper-command feature sets: \
+             {per_command:?}\n  {}",
             check.join("\n  ")
         );
     }

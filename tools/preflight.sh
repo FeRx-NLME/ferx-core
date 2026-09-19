@@ -274,11 +274,18 @@ group_check() {
   run cargo check --tests --no-default-features --features ci,markov
 
   # Same rationale for `nn`, with `slow-tests` folded in for the same reason as the
-  # survival line: `tests/nn_fit_smoke.rs` and `tests/nn_fit_convergence.rs` are
-  # gated on BOTH `nn` and `slow-tests`, so their bodies compile in no other per-PR
-  # job. One cheap check covers the whole `nn` surface — `src/nn`, the
-  # `[covariate_nn]` parser, the θ-gradient module, and every nn-gated test file.
-  # This is the exact line that would have caught #1133's E0063 before the push.
+  # survival line — but the double-gated bodies are in `src/`, not `tests/`.
+  # `src/nn/mod.rs`'s test module carries three `#[cfg(feature = "slow-tests")]`
+  # items (`l2_shrinks_weights_and_modulator_variation` and its two helpers),
+  # `#[cfg]`ed out rather than `#[ignore]`d because codecov measures `src/` and an
+  # ignored body would read as missed patch lines (#293). Their own doc comment
+  # names THIS command as what catches their bit-rot, and no other per-PR job
+  # enables `nn` and `slow-tests` together. (The comment here used to cite
+  # `tests/nn_fit_smoke.rs` / `tests/nn_fit_convergence.rs`; both dropped their
+  # `#![cfg(feature = "slow-tests")]` in 7796919d and are now `nn`-only — #1446.)
+  # One cheap check covers the whole `nn` surface — `src/nn`, the `[covariate_nn]`
+  # parser, the θ-gradient module, and every nn-gated test file. This is the exact
+  # line that would have caught #1133's E0063, and #1446's E0425, before the push.
   run cargo check --tests --no-default-features --features ci,nn,slow-tests
 
   # The workspace members (#1114). `-p` rather than `--workspace` so the `ferx-core`
