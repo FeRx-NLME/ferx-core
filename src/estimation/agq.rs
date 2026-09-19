@@ -1899,19 +1899,15 @@ fn fused_node_nll_and_score(
         return None;
     }
     let eta = &b[..stack.n_eta];
-    let residual_correlations = if stack.is_iov() {
-        &[][..]
-    } else {
-        params.residual_correlations.as_slice()
-    };
-    let data_nll = crate::stats::likelihood::obs_nll_subject_from_preds(
+    let data_nll = crate::stats::likelihood::conditional_obs_nll_from_preds(
         model,
         subject,
         preds,
         &params.theta,
         &params.sigma.values,
-        residual_correlations,
+        &params.residual_correlations,
         eta,
+        stack.is_iov(),
     );
     // Keep node scoring allocation-free outside the sensitivity provider.  The established
     // likelihood path reuses a `DVector` scratch for this quadratic; constructing a fresh
@@ -3787,6 +3783,48 @@ mod tests {
         for (fused, established) in fused_score.iter().zip(&established_score) {
             assert!((fused - established).abs() <= 1e-13 * (1.0 + established.abs()));
         }
+    }
+
+    #[test]
+    fn fused_node_preserves_raw_negative_prediction_likelihood() {
+        use crate::estimation::parameterization::packed_len;
+
+        let model = parse_model_string(
+            r#"
+[parameters]
+  theta BASE(1.0, 0.01, 10.0)
+  omega ETA_BASE ~ 0.1
+  sigma ADD ~ 1.0 (variance)
+[individual_parameters]
+  E0 = BASE + ETA_BASE
+[structural_model]
+  y = E0 - 10
+[error_model]
+  DV ~ additive(ADD)
+"#,
+        )
+        .unwrap();
+        let params = &model.default_params;
+        let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0]);
+        let stack = Stack::new(&model, params, 0);
+        let b = vec![0.03];
+        let mut preds = Vec::new();
+        let mut score = vec![0.0; packed_len(params)];
+        let fused = fused_node_nll_and_score(
+            &model, &subject, params, params, &stack, &b, &mut preds, &mut score,
+        )
+        .expect("analytic fusion");
+        assert!(
+            preds.iter().all(|&f| f < 0.0),
+            "fixture must exercise raw negatives: {preds:?}"
+        );
+
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let established = stack.nll_at(&model, &subject, params, &b, &mut scratch, None);
+        assert!(
+            (fused - established).abs() <= 1e-13 * (1.0 + established.abs()),
+            "fused={fused:e}, established={established:e}"
+        );
     }
 
     #[test]
