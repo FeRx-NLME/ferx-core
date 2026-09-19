@@ -377,7 +377,7 @@ What the `Clippy` job actually fails on is narrower than "clippy is clean", and
 worth knowing before you rely on it. `cargo clippy` exits 0 on warn-level
 findings, so only two things redden the job: clippy's deny-by-default
 `correctness` group, and rustc's `unused` group, which `tools/preflight.sh`
-denies explicitly (`-Dunused`). That covers the leftovers a refactor drops — an
+denies explicitly (`-Dunused`, #1470). That covers the leftovers a refactor drops — an
 orphaned `use`, a field nothing reads, a variable nothing consumes. The rest of
 clippy's warn-level surface (style, complexity, pedantic-adjacent perf lints) is
 advisory: it is printed, it does not fail, and a green `Clippy` job is therefore

@@ -640,8 +640,8 @@ exit 0
 ///  * dropping `--all` from `cargo fmt` formats only the root package, silently skipping
 ///    `crates/ferx-tools` and `crates/ferx-cli` (#1114).
 ///  * dropping `-Dunused` from a clippy line leaves it linting and exiting 0 over every
-///    finding it prints, because only clippy's `correctness` group is deny-by-default.
-///    Measured: `origin/main` at bd6785b printed an `unused import` from
+///    finding it prints, because only clippy's `correctness` group is deny-by-default
+///    (#1470). Measured: `origin/main` at bd6785b printed an `unused import` from
 ///    `src/estimation/saem.rs` and then `preflight OK`.
 ///  * narrowing a `--features` set drops a whole cfg-gated surface out of the compile.
 ///    `ci,nn,slow-tests` becoming `ci` is exactly #1133 with the gate still present.
@@ -702,7 +702,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     // bd6785b: the group printed `warning: unused import: `individual_nll_into``
     // (src/estimation/saem.rs:18, orphaned by #1452) and then `preflight OK`, exit 0. The
     // local gate and the CI job agreed across the six commits that followed — on green,
-    // over a dead import.
+    // over a dead import (#1470).
     //
     // Same neutered-gate shape as the `RUSTDOCFLAGS=-Dwarnings` block above, and the same
     // reason it is asserted rather than assumed: delete the flag and the command stays in
@@ -720,7 +720,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
             cmd.contains("-- -Dunused"),
             "a clippy command does not deny the `unused` lint group, so `cargo clippy` \
              exits 0 on every `unused import` / `dead_code` / `unused_variables` finding \
-             it prints and the `Clippy` job goes green over them:\n  {cmd}"
+             it prints and the `Clippy` job goes green over them (#1470):\n  {cmd}"
         );
     }
 
@@ -744,7 +744,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         assert!(
             cmd.contains("-- -Dunused"),
             "the docs-lint clippy command does not deny `unused`, so `crates/docs-lint` \
-             keeps the exit-0 hole the other clippy lines no longer have:\n  {cmd}"
+             keeps the exit-0 hole the other clippy lines no longer have (#1470):\n  {cmd}"
         );
     }
 

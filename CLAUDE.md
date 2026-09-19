@@ -149,7 +149,7 @@ workspace members need **package-qualified** features (`ferx-core/ci`, not `ci`,
 which fails outright — #1114); and every clippy line ends in `-- -Dunused`,
 because **`cargo clippy` exits 0 on warn-level findings**. Only its `correctness`
 group is deny-by-default — that is why #1023's `approx_constant` findings were
-caught, they were *errors* — so before this gate landed the group printed
+caught, they were *errors* — so before #1470 the group printed
 `warning: unused import: individual_nll_into` and then `preflight OK`, exit 0, across
 the six commits that landed on `main` after the import was orphaned. `-Dunused` is
 rustc's long-stable group (`unused_imports`, `dead_code`, `unused_variables`,
