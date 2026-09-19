@@ -3345,29 +3345,19 @@ mod regularizer_fit_tests {
     /// remaining budget; −271.34 in 56 evals with #1414's fresh-budget restart).
     ///
     /// `maxiter = 1` is a 44-eval budget (`outer_maxiter × (n + 1)`, n = 43):
-    /// enough to abort at eval 12, restart once, and descend well past the
-    /// abort point. Nothing else in the `--lib` suite drives a real fit through
-    /// the restart wiring: with `mid_descent_stall` forced `false` the full
-    /// `ci,markov,nn` suite is 5166 passed / 1 failed — this one (reported
-    /// 3209.805 on macOS, 7901.994 on Linux, no warning). It also pins the
-    /// budget: `n_iterations` must not exceed the 44 the user asked for — with
-    /// `spent_evals` mutated to `0` the fit spends 56 and this dies on that
-    /// bound alone.
+    /// enough to recover and descend well past the old abort point. The Hessian-seeded
+    /// inner solve may now avoid that exact outer line-search abort altogether, so the
+    /// invariant is the outcome rather than the historical warning: the fit gets below
+    /// zero and stays within the requested budget. Dedicated
+    /// `resolve_mid_descent_restart` unit tests pin the restart dispatch itself.
     #[test]
-    fn first_line_search_abort_is_resumed_not_reported() {
+    fn first_line_search_abort_is_avoided_or_resumed_not_reported() {
         let (model, options, population) = load();
         let mut o = options.clone();
         o.nn_l2_lambda = 0.0;
         o.outer_maxiter = 1;
         let fit = crate::fit(&model, &population, &model.default_params, &o)
             .unwrap_or_else(|e| panic!("fit failed: {e}"));
-        assert!(
-            fit.warnings
-                .iter()
-                .any(|w| w.contains("was resumed from the best point seen")),
-            "the eval-12 abort must be restarted, not reported; warnings: {:?}",
-            fit.warnings
-        );
         // Abort point measured at 7974.86 (best-seen) / 7901.99 (reported) on
         // Linux; zero sits hundreds below the restarted measurement and
         // thousands below the failure it exists to catch, on both platforms.
