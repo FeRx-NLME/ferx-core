@@ -963,6 +963,14 @@ fn skip_duplicate_laplace_terminal_capture() -> bool {
     })
 }
 
+fn agq_inner_solve_policy(options: &FitOptions, fused_gradient: bool) -> InnerSolvePolicy {
+    InnerSolvePolicy {
+        seed: InnerHessianSeed::for_options(options),
+        capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture() || !fused_gradient)
+            && matches!(options.hessian_anchor(), HessianAnchor::Exact),
+    }
+}
+
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
@@ -992,12 +1000,7 @@ fn run_inner_loop_and_nll_prepared(
         // The Gauss-Newton anchor never reuses it, and the gradient path recomputes the
         // whole second-order jet for its Laplace derivative sweep anyway, so capturing there
         // would be a full provider pass per subject thrown away.
-        let policy = InnerSolvePolicy {
-            seed: InnerHessianSeed::for_options(options),
-            capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture()
-                || agq_gradient_inputs.is_none())
-                && matches!(options.hessian_anchor(), HessianAnchor::Exact),
-        };
+        let policy = agq_inner_solve_policy(options, agq_gradient_inputs.is_some());
         let take_terminal_work =
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
                 (ebe.terminal_hessian.clone(), ebe.nll)
@@ -3460,7 +3463,6 @@ fn optimize_nlopt_once(
     // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
-    crate::estimation::inner_optimizer::set_capture_terminal_hessian(false);
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x0,
