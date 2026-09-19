@@ -2983,6 +2983,37 @@ fn case_distinct_names_under_two_roles_keep_their_own_slots() {
 }
 
 #[test]
+fn pk_slot_noun_names_every_slot_name_to_index_hands_out() {
+    // The two-roles diagnostic can name any pair of slots, so every slot a role
+    // key can reach must have its own noun — the `_` fallback is for a slot that
+    // does not exist yet, not for one of these. Driven off `name_to_index` so a
+    // new role key added there without a noun fails here.
+    let names = [
+        "cl", "v", "v1", "q", "q2", "v2", "ka", "f", "q3", "v3", "lagtime", "alag", "n", "mtt",
+        "mat", "cv2",
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let slot = crate::types::PkParams::name_to_index(name)
+            .unwrap_or_else(|| panic!("`{name}` must be a role key"));
+        let noun = super::pk_slot_noun(slot);
+        assert_ne!(
+            noun, "the same PK parameter",
+            "slot {slot} (`{name}`) has no noun"
+        );
+        assert!(
+            noun.starts_with("the "),
+            "`{noun}` must read as a noun phrase"
+        );
+        seen.insert(slot);
+    }
+    // Every slot name_to_index can produce was visited (13 distinct slots).
+    assert_eq!(seen.len(), 13, "{seen:?}");
+    // And the fallback still exists for a slot outside the table.
+    assert_eq!(super::pk_slot_noun(usize::MAX), "the same PK parameter");
+}
+
+#[test]
 fn one_variable_under_two_spellings_of_one_role_stays_legal() {
     // The #1359 gate is keyed on the *slot*, so the #1048 redundancy
     // (`lagtime=X, alag=X`: one slot, two spellings) is untouched — `slot_seen`
