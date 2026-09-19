@@ -56,7 +56,9 @@ pub use fit::{fit, fit_from_files};
 pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
-pub use pool::{configure_global_thread_pool, PoolPlan, FIT_RAYON_STACK_SIZE};
+pub use pool::{
+    configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
+};
 pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_ode_scope};
 // Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
 // private to `api`, so a test elsewhere in the crate needs the re-export.
@@ -106,7 +108,10 @@ pub(crate) use fit::{
     saem_non_mu_referenced_individual_params_warning,
 };
 #[cfg(test)]
-pub(crate) use pool::{cap_default_threads, default_thread_count, effective_default_threads};
+pub(crate) use pool::{
+    cap_default_threads, default_thread_count, effective_default_threads, reconfiguration_result,
+    resolve_default_threads,
+};
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,

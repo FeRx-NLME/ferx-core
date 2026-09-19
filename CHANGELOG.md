@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`install_on_engine_pool(f)`** runs population-wide parallel work that is not a `fit()`
+  on the engine's worker pool instead of Rayon's process-global one. This is what makes a
+  declared thread count reach GAM screening and the other standalone parallel entry points;
+  a tool built on ferx-core (the `ferx-tools` GAM screener is the first caller) wraps its
+  `par_iter` in it, and work already running on a worker is left there rather than nesting
+  a second pool ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and
@@ -408,6 +414,25 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **`ferx --threads N` now holds `N` worker threads, not `2N`.** The flag sized Rayon's
+  process-global pool *and* the fit then leased a separate `N`-worker pool of its own —
+  the one carrying the 32 MiB stacks wide analytic gradients need — so the global `N`
+  never received any work. Per-thread profiles of a `--threads 2` SAEM fit measured the
+  two fit-pool workers at 85–99% busy and the two global-pool threads at 0.0% for the
+  whole run; measured end to end, a `--threads 2` run drops from 5 live OS threads to 3
+  (main + 2 workers). Nothing about the fit itself changes — same estimates, same
+  `n_threads_used` — but a shared machine or a CPU-quota'd container is no longer charged
+  for twice the threads you asked for, `N × 2 MiB` of worker stack is no longer reserved
+  for nothing, and a whole-process profile of a ferx run stops reporting idle-thread wait
+  as if it were estimator headroom. `configure_global_thread_pool(n)` (the library entry
+  point behind the flag) accordingly no longer builds Rayon's global pool: it declares the
+  worker count ferx's own pools are sized from, it is once-per-process (a second, differing
+  count is an error rather than a silently ignored one), and **parallel work that is not a
+  `fit()` now honours it too** — GAM covariate screening, standalone `run_sir` /
+  `run_covariance`, the NCA initial-estimate pass and `npde`. Those ran on Rayon's global
+  pool, i.e. one worker per logical CPU: on a 15-core host `ferx gam --threads 2` screened
+  15 wide. They now run on the engine's pool at the requested width
+  ([#1460](https://github.com/FeRx-NLME/ferx-core/issues/1460)).
 - **SAEM: the E-step and M-step stop redoing η-independent work on every MH proposal.**
   Three changes, all of them internal and all of them bit-identical — the same fit, the
   same seed, the same estimates, objective and per-subject EBEs down to the last bit — so

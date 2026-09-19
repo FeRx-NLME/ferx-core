@@ -398,23 +398,27 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         return (empty_pop_nca(), warnings);
     }
 
-    let per_subject: Vec<SubjectNca> = match model.pk_model {
-        PkModel::OneCptOral
-        | PkModel::OneCptTransit
-        | PkModel::OneCptIg
-        | PkModel::TwoCptOral
-        | PkModel::TwoCptTransit
-        | PkModel::TwoCptIg
-        | PkModel::ThreeCptOral => population
-            .subjects
-            .par_iter()
-            .map(nca_one_cpt_oral)
-            .collect(),
+    // NCA runs from `prepare_run`, before any fit has installed a pool, so this
+    // `par_iter` would otherwise land on Rayon's global pool at one worker per logical
+    // CPU regardless of the requested thread count (#1460).
+    let per_subject: Vec<SubjectNca> =
+        crate::api::install_on_engine_pool(|| match model.pk_model {
+            PkModel::OneCptOral
+            | PkModel::OneCptTransit
+            | PkModel::OneCptIg
+            | PkModel::TwoCptOral
+            | PkModel::TwoCptTransit
+            | PkModel::TwoCptIg
+            | PkModel::ThreeCptOral => population
+                .subjects
+                .par_iter()
+                .map(nca_one_cpt_oral)
+                .collect(),
 
-        PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv => {
-            population.subjects.par_iter().map(nca_one_cpt_iv).collect()
-        }
-    };
+            PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv => {
+                population.subjects.par_iter().map(nca_one_cpt_iv).collect()
+            }
+        });
 
     // Count how many subjects had valid CL estimates.
     let n_valid = per_subject.iter().filter(|s| s.cl_f.is_some()).count();
@@ -852,6 +856,39 @@ mod tests {
         assert!(!result.warnings.is_empty());
         // Params should equal model defaults.
         assert_eq!(result.params.theta, model.default_params.theta);
+    }
+
+    #[test]
+    fn test_suggest_start_iv_model_uses_the_iv_nca_route() {
+        // The oral and IV routes are two different `par_iter` arms of `run_nca`, and every
+        // other test here is oral (warfarin), so without this one the IV arm is never
+        // entered — a change to it, or to the pool the pass runs on (#1460), would be
+        // invisible.
+        let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).unwrap();
+        assert!(
+            matches!(
+                model.pk_model,
+                PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv
+            ),
+            "fixture must take the IV arm, got {:?}",
+            model.pk_model
+        );
+        let population = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).unwrap();
+        let result = inits_from_nca(&model, &population, NcaInit::Nca);
+        for (i, &theta) in result.params.theta.iter().enumerate() {
+            let lo = result.params.theta_lower[i];
+            let hi = result.params.theta_upper[i];
+            assert!(
+                theta.is_finite() && theta >= lo && theta <= hi,
+                "theta[{i}] = {theta} outside bounds [{lo}, {hi}]"
+            );
+        }
+        // An IV dataset has concentrations and doses, so NCA has something to work with:
+        // the suggestion must actually move off the model's defaults.
+        assert_ne!(
+            result.params.theta, model.default_params.theta,
+            "NCA returned the model defaults on a dataset it can analyse"
+        );
     }
 
     #[test]

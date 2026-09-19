@@ -70,33 +70,70 @@ pub(crate) fn default_thread_count() -> usize {
     cap_default_threads(available)
 }
 
-/// Set when a caller has explicitly sized the process-wide Rayon pool (currently: the CLI's
-/// `--threads N` via [`configure_global_thread_pool`]), so [`default_fit_pool`] knows to
-/// honor that explicit choice rather than applying the [`default_thread_count`] cap (#707).
-static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The process-wide worker count a caller explicitly asked for (currently: the CLI's
+/// `--threads N` via [`configure_global_thread_pool`]), or `0` when nothing has — so
+/// [`effective_default_threads`] honors that explicit choice rather than applying the
+/// [`default_thread_count`] cap (#707).
+///
+/// A count rather than a flag because the width is now *recorded* here instead of being
+/// read back off Rayon's global pool: that pool is never built, so there is nothing to
+/// read (#1460).
+static EXPLICIT_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Explicitly size the process-wide Rayon pool and mark it as user-chosen. Intended for a
-/// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
-/// library callers that want a pinned thread count for a single fit should use
-/// `FitOptions::threads` instead, which exclusively leases a pool for that call.
+/// Declare the worker count this process should fit with, overriding the automatic default
+/// (available cores minus one, capped at 8). Intended for a CLI binary applying its
+/// `--threads N` before the first fit; library callers that want a pinned thread count for
+/// a single fit should use `FitOptions::threads` instead, which exclusively leases a pool
+/// for that call.
+///
+/// **This does not build Rayon's global pool** (#1460), despite the name it has carried
+/// since #707. It used to: `--threads N` called `build_global` with `N`, and then every
+/// fit ran on a *separate* N-worker pool — `fit()` leases one of its own, with the 32 MiB
+/// worker stack that wide `Dual2` ODE+IOV gradients need, which Rayon's global pool does
+/// not have. Per-thread `samply` profiles of a `--threads 2` SAEM fit measured the two
+/// fit-pool workers at 85–99 % busy and the two global-pool threads at 0.0 % for the whole
+/// run: `--threads N` was spending `2N` OS threads to do `N` threads of work. Recording
+/// the count instead leaves one pool — the one the fit actually runs on — sized to `N`.
 ///
 /// `n_threads` must be positive — a caller wanting the engine's own default should simply
-/// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
-/// as "pick automatically", masking the caller's intent). The explicit-override flag is
-/// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
-/// was already initialized elsewhere) leaves `default_fit_pool` applying the #707 cap
-/// rather than incorrectly deferring to whatever the ambient pool happens to be.
+/// not call this at all, rather than pass `0` (which would otherwise read as "pick
+/// automatically", masking the caller's intent).
+///
+/// **Once per process**, like the `build_global` it replaces. The shared default pool an
+/// unpinned fit runs on is sized from this on first use and cannot be resized afterwards,
+/// so a second, *differing* count would be reported as configured while the pool kept the
+/// first one — and `PoolPlan::from_budget(0, …)` would then disagree with the pool an
+/// unpinned fit actually runs on, which is exactly the agreement #1115 requires. A repeat
+/// call with the same count is accepted (nothing changes); a differing one is an `Err`
+/// naming both, as the second `build_global` used to be.
 pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
     if n_threads == 0 {
         return Err("thread count must be positive".to_string());
     }
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(n_threads)
-        .build_global()
-        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))?;
-    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
+    match EXPLICIT_THREADS.compare_exchange(
+        0,
+        n_threads,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(already) => reconfiguration_result(already, n_threads),
+    }
+}
+
+/// Outcome of a second [`configure_global_thread_pool`] call: idempotent when it names the
+/// count already in force, an error naming both when it does not.
+///
+/// Split out so the message is unit-testable without writing the process-global static
+/// every other test in the binary shares.
+pub(crate) fn reconfiguration_result(already: usize, requested: usize) -> Result<(), String> {
+    if already == requested {
+        return Ok(());
+    }
+    Err(format!(
+        "thread count is already configured to {already} and cannot be changed to \
+         {requested}: pools sized from the first value may already exist"
+    ))
 }
 
 /// The process-wide fit pool, built once with the ferx worker stack (32 MiB) so wide
@@ -107,9 +144,10 @@ pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
 ///
 /// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
 /// fits gain little from spreading across every core, and not all cores are equal on
-/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that explicitly sized the
-/// global pool via [`configure_global_thread_pool`] (the CLI's `--threads N`) is honored
-/// instead — that call marks [`GLOBAL_THREADS_EXPLICIT`] before this pool is built.
+/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that declared an explicit
+/// process-wide width via [`configure_global_thread_pool`] (the CLI's `--threads N`) is
+/// honored instead — that call records [`EXPLICIT_THREADS`] before this pool is built, and
+/// this is then the only pool `N` sizes (#1460).
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
@@ -178,15 +216,61 @@ pub(crate) fn with_fit_ode_scope<R: Send>(
         .threads
         .filter(|&n| n > 0)
         .unwrap_or_else(effective_default_threads);
-    let already_scoped = crate::ode::solver::worker_carries_ode_override(ov)
+    // `current_num_threads()` is only meaningful — and only safe to call — on a worker:
+    // off one it reports (and *initializes*) Rayon's global pool, at one worker per logical
+    // CPU, which is the pool this engine never wants to own (#1460).
+    let on_worker = rayon::current_thread_index().is_some();
+    let already_scoped = on_worker
+        && crate::ode::solver::worker_carries_ode_override(ov)
         && rayon::current_num_threads() == requested_threads;
     let _armed = crate::ode::solver::arm_ode_solver_override(ov);
-    if ov.is_empty() || already_scoped {
+    if already_scoped {
         return Ok(f());
+    }
+    if ov.is_empty() {
+        // No override for workers to carry, but `f` still `par_iter`s (SIR weighting, the
+        // covariance step's per-subject passes). Off a worker that would be the global
+        // pool, so put it on a ferx pool of the width the caller asked for.
+        return Ok(install_on_pool_sized(requested_threads, f));
     }
     match options.threads.filter(|&n| n > 0) {
         Some(n) => Ok(ode_override_pool(ov, n)?.install(f)),
         None => Ok(shared_ode_override_pool(ov, requested_threads)?.install(f)),
+    }
+}
+
+/// Run population-wide parallel work that is **not** a `fit()` on the engine's worker pool.
+///
+/// For the parallel entry points a caller can reach directly — GAM covariate screening,
+/// standalone `run_sir` / `run_covariance`, the NCA initial-estimate pass, `npde`. A bare
+/// `par_iter` in those places runs on whatever pool the calling thread belongs to, and off
+/// a Rayon worker that is Rayon's *global* pool: one thread per logical CPU, sized by
+/// Rayon, ignoring the count the caller declared. Measured on a 15-core host after
+/// `configure_global_thread_pool(2)`: 15 workers, not 2 (#1460).
+///
+/// Already on a worker → runs inline, so work reached from inside a fit (or from inside a
+/// tool's replicate pool) keeps that budget instead of nesting a second pool underneath it.
+pub fn install_on_engine_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    install_on_pool_sized(effective_default_threads(), f)
+}
+
+/// [`install_on_engine_pool`] at an explicit width, for a caller that pinned one.
+///
+/// Prefers the shared default pool when it is already that wide — the common case, where
+/// this adds no threads at all — and otherwise leases from the same cache `fit()` uses, so
+/// a pool just released by a fit is reused rather than doubled. Falls back to running
+/// inline if no pool can be built: ambient parallelism is worse than the declared width,
+/// but it is not worth failing the caller's work over.
+pub(crate) fn install_on_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_some() {
+        return f();
+    }
+    match default_fit_pool() {
+        Some(pool) if pool.current_num_threads() == n_threads => pool.install(f),
+        _ => match fit_pool_cache().acquire(n_threads, Default::default()) {
+            Ok(lease) => lease.install(f),
+            Err(_) => f(),
+        },
     }
 }
 
@@ -229,8 +313,19 @@ pub(crate) fn install_on_fit_pool<R: Send>(
 /// `total_threads = 0` budget with it — the two must agree, or a `from_budget(0, …)` plan
 /// would silently disagree with the pool an unpinned fit uses (#1115).
 pub(crate) fn effective_default_threads() -> usize {
-    if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
-        rayon::current_num_threads()
+    resolve_default_threads(EXPLICIT_THREADS.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// [`effective_default_threads`] without the process-global read, so the precedence is
+/// testable (`explicit` wins, `0` means "nothing was declared").
+///
+/// Deliberately *not* `rayon::current_num_threads()` on the explicit branch: that reads the
+/// ambient pool, and reading it is what made `--threads N` build a global pool nobody ran on
+/// (#1460). It also silently builds Rayon's global pool when called off-worker, so an
+/// engine that never wants one must not ask.
+pub(crate) fn resolve_default_threads(explicit: usize) -> usize {
+    if explicit > 0 {
+        explicit
     } else {
         default_thread_count()
     }

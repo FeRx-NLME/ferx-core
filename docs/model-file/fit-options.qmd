@@ -84,6 +84,20 @@ preserves the per-fit budgets assigned by `PoolPlan`.
 This isolates worker budgets and ODE settings; concurrent fits should still use
 consistent process-wide inner-optimizer and EBE warm-start settings.
 
+Either way, a requested worker count sizes **one** pool: the one the fit runs on.
+The CLI's `--threads N` used to size Rayon's process-global pool as well, so a
+run held `2N` worker threads to do `N` threads of work — the extra `N` measured
+0.0% busy for the whole fit. Since #1460 the flag only declares the width, and
+`ferx --threads N` runs with `N` workers plus the main thread.
+
+The same count applies to parallel work that is not a fit — GAM covariate
+screening, standalone `run_sir` / `run_covariance`, the NCA initial-estimate pass
+and `npde`. Those used to spread over every logical CPU regardless of the flag
+(`ferx gam --threads 2` screened 15 wide on a 15-core host), because they run
+outside any ferx pool and a bare parallel loop there belongs to Rayon's global
+pool. A tool built on ferx-core gets the same behaviour by wrapping its parallel
+loop in `install_on_engine_pool`.
+
 The caches ordinarily retain at most twice the automatic thread budget across
 all settings (at most 16 workers each). Older entries are evicted. When a single
 pool is wider than that budget, it can remain as the sole most-recent entry so a

@@ -88,6 +88,7 @@ pub fn ferx_core::api::check_model_options(model: &ferx_core::CompiledModel, opt
 pub fn ferx_core::api::configure_global_thread_pool(n_threads: usize) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::api::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
+pub fn ferx_core::api::install_on_engine_pool<R: core::marker::Send>(f: impl core::ops::function::FnOnce() -> R + core::marker::Send) -> R
 pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::PredictionResult>
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::EndpointPredictionResult>
 pub fn ferx_core::api::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> ferx_core::PredictionOutput
@@ -4959,6 +4960,7 @@ pub fn ferx_core::fit(model: &ferx_core::CompiledModel, population: &ferx_core::
 pub fn ferx_core::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::framework_keys() -> &'static [&'static str]
 pub fn ferx_core::inits_from_nca(model: &ferx_core::CompiledModel, population: &ferx_core::Population, method: ferx_core::suggest_start::NcaInit) -> ferx_core::suggest_start::SuggestedStart
+pub fn ferx_core::install_on_engine_pool<R: core::marker::Send>(f: impl core::ops::function::FnOnce() -> R + core::marker::Send) -> R
 pub fn ferx_core::known_block_names() -> alloc::vec::Vec<&'static str>
 pub fn ferx_core::max_abs_correlation(result: &ferx_core::FitResult) -> core::option::Option<f64>
 pub fn ferx_core::method_specific_keys(m: ferx_core::EstimationMethod) -> &'static [&'static str]
