@@ -15,8 +15,9 @@ use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov, individual_nll_iov_with_scratch,
-    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
+    individual_nll, individual_nll_into, individual_nll_iov,
+    individual_nll_iov_with_scratch_and_schedule, individual_nll_prepared, iov_occasion_groups,
+    IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -721,6 +722,29 @@ impl MhScratch {
     }
 }
 
+/// `out ← chol(Ω) · z`, into a buffer the caller already owns.
+///
+/// This is the block MH proposal's correlated perturbation. It replaced
+/// `l * DVector::from_column_slice(&z)`, which allocated a fresh `DVector` per
+/// proposal; both reach the same `gemm_uninit` kernel, this one through
+/// `Matrix::gemm` with **`beta = 0`**, which makes it *write* rather than
+/// accumulate and so never reads `out`'s previous contents.
+///
+/// It is a named function rather than one line inlined in `mh_steps` so the
+/// equivalence test can call the production code instead of a copy of it. It
+/// was inlined at first, and the test that "pinned" it reimplemented the same
+/// `gemm` call — so changing `beta` in the real one left the test green
+/// (#1452 review round 2, found by running the mutation rather than reasoning
+/// about it).
+#[inline]
+pub(crate) fn cholesky_perturbation_into(
+    l: &DMatrix<f64>,
+    z: &DVector<f64>,
+    out: &mut DVector<f64>,
+) {
+    out.gemm(1.0, l, z, 0.0);
+}
+
 /// Run `n_steps` symmetric random-walk MH iterations for one subject in-place.
 /// Returns (n_accepted, updated_nll).
 ///
@@ -784,11 +808,7 @@ pub(crate) fn mh_steps(
         for slot in z.iter_mut() {
             *slot = rng.sample(StandardNormal);
         }
-        // `l * z` with the result written into a buffer we already own.
-        // `Mul` would allocate an output and reach the same `gemm_uninit`
-        // kernel; this reaches it through `Matrix::gemm` with `beta = 0`, which
-        // never reads `perturbation`'s previous contents.
-        perturbation.gemm(1.0, l, &*z, 0.0);
+        cholesky_perturbation_into(l, z, perturbation);
 
         for j in 0..n_eta {
             let bs = eta_block_scale.map_or(1.0, |s| s[j]);
@@ -802,7 +822,7 @@ pub(crate) fn mh_steps(
         // profiling takes the scratch rather than allocating an `EventPkParams`
         // per proposal.
         let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
-            individual_nll_iov_with_scratch(
+            individual_nll_iov_with_scratch_and_schedule(
                 model,
                 subject,
                 theta,
@@ -812,6 +832,7 @@ pub(crate) fn mh_steps(
                 Some(omega_iov),
                 sigma_values,
                 &mut nll_scratch.pk,
+                schedule,
             )
         } else {
             individual_nll_prepared(
@@ -904,7 +925,7 @@ pub(crate) fn mh_steps_componentwise(
             eta[j] = old_j + step_scales[j] * cw_sd[j] * z;
 
             let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
-                individual_nll_iov_with_scratch(
+                individual_nll_iov_with_scratch_and_schedule(
                     model,
                     subject,
                     theta,
@@ -914,6 +935,7 @@ pub(crate) fn mh_steps_componentwise(
                     Some(omega_iov),
                     sigma_values,
                     &mut nll_scratch.pk,
+                    schedule,
                 )
             } else {
                 individual_nll_prepared(
@@ -957,6 +979,7 @@ pub(crate) fn mh_steps_componentwise(
 ///
 /// Returns `(n_accepted, n_proposed, updated_nll)`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mh_kappa_steps(
     kappas: &mut [Vec<f64>],
     nll_current: f64,
@@ -969,6 +992,13 @@ pub(crate) fn mh_kappa_steps(
     sigma_values: &[f64],
     step_scale: f64,
     rng: &mut impl Rng,
+    // This subject's cached `EventSchedule`, or `None` where reuse is unsound.
+    // The κ sweep evaluates the full IOV NLL once per occasion per iteration and
+    // rebuilt the schedule inside each one (#1452 review).
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    // Caller-owned per-event PK buffer, for the same reason the η kernels take
+    // one: this is a per-proposal allocation otherwise.
+    pk_scratch: &mut EventPkParams,
 ) -> (usize, usize, f64) {
     let n_kappa = omega_iov.matrix.nrows();
     let l = &omega_iov.chol;
@@ -989,7 +1019,7 @@ pub(crate) fn mh_kappa_steps(
         let old_kap = kappas[k].clone();
         kappas[k] = kap_prop;
 
-        let nll_prop = individual_nll_iov(
+        let nll_prop = individual_nll_iov_with_scratch_and_schedule(
             model,
             subject,
             theta,
@@ -998,6 +1028,8 @@ pub(crate) fn mh_kappa_steps(
             omega_bsv,
             Some(omega_iov),
             sigma_values,
+            pk_scratch,
+            schedule,
         );
 
         let log_u: f64 = rng.random::<f64>().ln();
@@ -1259,7 +1291,9 @@ fn theta_sigma_mstep_light(
                 (Some(mx), None) => {
                     obs_nll_sum_mix(model, population, &th, &sg, etas, mx, schedules)
                 }
-                (None, Some(kappas)) => obs_nll_sum_iov(model, population, &th, &sg, etas, kappas),
+                (None, Some(kappas)) => {
+                    obs_nll_sum_iov(model, population, &th, &sg, etas, kappas, schedules)
+                }
                 (None, None) => obs_nll_sum(model, population, &th, &sg, etas, schedules),
             };
             if val.is_finite() {
@@ -1414,6 +1448,9 @@ fn obs_nll_sum_iov(
     sigma_values: &[f64],
     etas: &[Vec<f64>],
     kappas: &[Vec<Vec<f64>>],
+    // Per-subject cached `EventSchedule`s, parallel to `population.subjects`.
+    // `&[]` means "no cache" and reproduces the per-call rebuild exactly.
+    schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
     use rayon::prelude::*;
     // Deterministic reduction (collect in subject order, fold serially): a
@@ -1424,7 +1461,7 @@ fn obs_nll_sum_iov(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            obs_nll_subject_into_iov(
+            crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov_with_schedule(
                 model,
                 subject,
                 theta,
@@ -1432,6 +1469,7 @@ fn obs_nll_sum_iov(
                 &etas[i],
                 &kappas[i],
                 scratch,
+                schedules.get(i).and_then(|s| s.as_ref()),
             )
         })
         .collect();
@@ -3553,7 +3591,9 @@ pub fn run_saem(
                         // both nll_kappa_ref and nll_prop are evaluated by the same
                         // individual_nll_iov, giving the correct acceptance ratio for
                         // p(κ | η, θ, data).
-                        let nll_kappa_ref = individual_nll_iov(
+                        let mut kappa_pk = EventPkParams::default();
+                        let sched_i = schedules[i].as_ref();
+                        let nll_kappa_ref = individual_nll_iov_with_scratch_and_schedule(
                             model,
                             subject,
                             &st.theta,
@@ -3562,6 +3602,8 @@ pub fn run_saem(
                             omega_i,
                             Some(omega_iov_cur),
                             sigma_i,
+                            &mut kappa_pk,
+                            sched_i,
                         );
                         let (n_acc, n_prop, nll_new) = mh_kappa_steps(
                             &mut kappas_i,
@@ -3575,6 +3617,8 @@ pub fn run_saem(
                             sigma_i,
                             st.kappa_step_scales[i],
                             &mut rng,
+                            sched_i,
+                            &mut kappa_pk,
                         );
                         (kappas_i, nll_new, n_acc, n_prop)
                     })
@@ -3891,6 +3935,7 @@ pub fn run_saem(
                                     match kappas_for_mstep {
                                         Some(kaps) => obs_nll_sum_iov(
                                             model, population, th, &sigma_now, &shifted, kaps,
+                                            &schedules,
                                         ),
                                         None => obs_nll_sum(
                                             model, population, th, &sigma_now, &shifted, &schedules,
@@ -4206,6 +4251,7 @@ pub fn run_saem(
                     iov_ref.free_mask.clone(),
                 )
             });
+            let mut refresh_pk = EventPkParams::default();
             let new_nlls: Vec<f64> = (0..n_subjects)
                 .map(|i| {
                     let cls = mix_classes.as_ref().map(|c| c[i]);
@@ -4215,7 +4261,7 @@ pub fn run_saem(
                         Some(c) => (&mix_omegas[c], &mix_sigmas[c]),
                         None => (&omega_upd, state.sigma_vals.as_slice()),
                     };
-                    individual_nll_iov(
+                    individual_nll_iov_with_scratch_and_schedule(
                         model,
                         &population.subjects[i],
                         &state.theta,
@@ -4224,6 +4270,8 @@ pub fn run_saem(
                         omega_i,
                         omega_iov_upd.as_ref(),
                         sigma_i,
+                        &mut refresh_pk,
+                        schedules[i].as_ref(),
                     )
                 })
                 .collect();
@@ -4250,14 +4298,18 @@ pub fn run_saem(
                         Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
                         None => (&omega_upd, state.sigma_vals.as_slice()),
                     };
-                    individual_nll_into(
+                    crate::stats::likelihood::individual_nll_into_with_schedule(
                         model,
                         &population.subjects[i],
                         &state.theta,
                         eta,
                         omega_i,
                         sigma_i,
+                        // Same ρ `individual_nll_into` passes — SAEM holds
+                        // `block_sigma` at its declaration.
+                        &model.residual_correlations,
                         scratch,
+                        schedules.get(i).and_then(|s| s.as_ref()),
                     )
                 })
                 .collect();
@@ -7356,6 +7408,8 @@ DV ~ additive(EPS)
             &sigma,
             0.0, // step_scale = 0 → proposal == current → always accepted
             &mut rng,
+            None,
+            &mut EventPkParams::default(),
         );
 
         // With step_scale=0 every occasion proposal is accepted (2 occasions).

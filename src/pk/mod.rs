@@ -1254,6 +1254,31 @@ pub(crate) fn predict_iov_with_scratch<K: AsRef<[f64]>>(
     kappas: &[K],
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
+    predict_iov_with_scratch_and_schedule(model, subject, theta, eta_bsv, kappas, scratch, None)
+}
+
+/// [`predict_iov_with_scratch`] with the subject's cached
+/// [`EventSchedule`](event_driven::EventSchedule).
+///
+/// The IOV funnel is a structural peer of
+/// [`compute_predictions_with_tv_recycle_with_schedule`] and had no schedule
+/// parameter at all, so every IOV caller rebuilt the merged event sort and the
+/// per-interval infusion bounds inside each likelihood evaluation even when the
+/// caller held a cache — which made the SAEM E-step's schedule cache silently
+/// inert on IOV models (#1452 review). The reuse condition is the same one the
+/// non-IOV arm applies and is checked at the same place: a cached schedule was
+/// built from the *unresolved* subject, so it is valid only when nothing needed
+/// resolving (`Cow::Borrowed`). `None` is exactly the previous behaviour.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[K],
+    scratch: &mut EventPkParams,
+    schedule: Option<&event_driven::EventSchedule>,
+) -> Vec<f64> {
     use std::collections::HashMap;
     let EventPkParams {
         dose: dose_params,
@@ -1384,13 +1409,27 @@ pub(crate) fn predict_iov_with_scratch<K: AsRef<[f64]>>(
             crate::dosing::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
                 &dose_params[k].values
             });
-        event_driven::event_driven_predictions(
-            model.pk_model,
-            &resolved,
-            dose_params.as_slice(),
-            obs_params.as_slice(),
-            pk_only_params.as_slice(),
-        )
+        // Same cache-validity test as the non-IOV arm: the cached schedule was
+        // built from the unresolved subject (modeled-duration infusions still read
+        // `duration == 0`), so reuse it only when nothing was resolved.
+        if let (std::borrow::Cow::Borrowed(_), Some(sched)) = (&resolved, schedule) {
+            event_driven::event_driven_predictions_with_schedule(
+                model.pk_model,
+                &resolved,
+                sched,
+                dose_params.as_slice(),
+                obs_params.as_slice(),
+                pk_only_params.as_slice(),
+            )
+        } else {
+            event_driven::event_driven_predictions(
+                model.pk_model,
+                &resolved,
+                dose_params.as_slice(),
+                obs_params.as_slice(),
+                pk_only_params.as_slice(),
+            )
+        }
     } else {
         // Unreachable today: every `PkModel` variant has event-driven analytical
         // support and ODE models took the branch above. A new analytical variant

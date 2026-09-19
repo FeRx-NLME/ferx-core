@@ -377,6 +377,18 @@ section of the SDLC for the versioning policy).
   the lookup would cost more than the algebra. Measured at −4% to −25% CPU depending on the
   model ([#1447](https://github.com/FeRx-NLME/ferx-core/issues/1447)).
 
+- **The `EventSchedule` cache now also reaches IOV models and `TIME`-only models.** Two gaps
+  found in review of the change above, both of which left a cache built and then unused.
+  (1) The IOV prediction funnel (`predict_iov`) accepted no schedule at all, so every
+  proposal of an IOV SAEM fit — and every evaluation of its θ/σ M-step objective and its
+  per-occasion κ sweep — rebuilt the merged event sort. (2) The cache's gate admitted a
+  subject only for time-varying covariates or `EVID=3/4` resets, but the predictor also
+  routes a subject onto the event-driven walk when the model reads the `TIME` built-in, so a
+  baseline-covariate subject of a `TIME`-dependent model rebuilt its schedule on every
+  likelihood call. Widening the gate also benefits FOCE/FOCEI, Laplace, AGQ and the Bayes
+  chain, which share it. Results are unchanged in both cases
+  ([#1447](https://github.com/FeRx-NLME/ferx-core/issues/1447)).
+
 - Population fitting and prediction use the available worker budget more efficiently: Bayesian chains and underfilled AGQ grids run concurrently, small FOCE populations avoid fine-grained dispatch overhead, concurrent cold callers share pool construction, AGQ-IOV nodes avoid a heap allocation, and public `predict()` evaluates subjects in parallel ([#1385](https://github.com/FeRx-NLME/ferx-core/pull/1385)).
 
 - **FOCEI, Laplace, and `focei` with `n_agq > 1` now build each subject's `EventSchedule`

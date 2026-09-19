@@ -2697,6 +2697,41 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
     sigma_values: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
+    individual_nll_iov_with_scratch_and_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        kappas,
+        omega,
+        omega_iov,
+        sigma_values,
+        pk_scratch,
+        None,
+    )
+}
+
+/// [`individual_nll_iov_with_scratch`] with the subject's cached
+/// [`EventSchedule`](pk::event_driven::EventSchedule).
+///
+/// Without this the IOV arm of the SAEM E-step held a schedule cache it could
+/// not hand to anything: `predict_iov` took no schedule, so every MH proposal on
+/// an IOV model rebuilt the merged event sort it was built to avoid (#1452
+/// review). `None` reproduces the previous behaviour exactly, and is what a
+/// subject the shared `cacheable_schedule` gate declines still gets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[K],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+) -> f64 {
     if kappas.is_empty() {
         return individual_nll(model, subject, theta, eta, omega, sigma_values);
     }
@@ -2731,7 +2766,9 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
-    let preds = pk::predict_iov_with_scratch(model, subject, theta, eta, kappas, pk_scratch);
+    let preds = pk::predict_iov_with_scratch_and_schedule(
+        model, subject, theta, eta, kappas, pk_scratch, schedule,
+    );
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
     // the PK residual error, so the FREM etas are sampled against the right
     // variance (mirrors the FOCE paths and the non-IOV individual_nll).

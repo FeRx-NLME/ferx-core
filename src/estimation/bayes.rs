@@ -881,6 +881,8 @@ pub fn run_bayes(
                                 &sigma,
                                 kappa_scale,
                                 &mut rng,
+                                schedules[i].as_ref(),
+                                &mut scratch,
                             )
                         };
                         nll[i] = nll_new;

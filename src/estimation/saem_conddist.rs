@@ -244,6 +244,8 @@ pub fn run_conditional_distribution(
                             sigma,
                             step_kappa,
                             &mut rng,
+                            schedule.as_ref(),
+                            mh_scratch.pk(),
                         );
                         nll = nll_k;
                         acc_k += nk;
