@@ -25,6 +25,7 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::StandardNormal;
+use std::collections::VecDeque;
 
 /// NLopt algorithm used for the SAEM M-step (non-mu-ref thetas + sigma).
 ///
@@ -125,11 +126,103 @@ pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
 const CW_TARGET_ACCEPT: f64 = 0.44;
 
+/// Clamp on the per-subject **block** MH step scale `δ_i`, shared by both
+/// adaptation rules so the two cannot drift apart (issue #1444).
+const MH_BLOCK_SCALE_MIN: f64 = 0.01;
+/// Upper end of [`MH_BLOCK_SCALE_MIN`]'s clamp.
+const MH_BLOCK_SCALE_MAX: f64 = 5.0;
+/// Clamp on the per-subject, per-η **componentwise** MH step scale.
+///
+/// The floor is 1e-6 rather than the block kernel's 0.01 to accommodate a
+/// near-deterministic η (e.g. a FREM covariate η) whose posterior SD is orders
+/// of magnitude below `√Ω_jj`.
+const MH_CW_SCALE_MIN: f64 = 1e-6;
+/// Upper end of [`MH_CW_SCALE_MIN`]'s clamp.
+const MH_CW_SCALE_MAX: f64 = 5.0;
+
+/// One step of the legacy [`ScaleAdaptation::Interval`] rule: a fixed ×1.1 if
+/// the window's acceptance is above `target`, ×0.9 otherwise, clamped to
+/// `[lo, hi]`.
+///
+/// Extracted so that the rule has **one** implementation: `run_saem` applies it
+/// to the block and componentwise scales and the tests measure its reach
+/// against the same code, rather than against a re-spelling of it that could
+/// drift (issue #1444).
+fn interval_scale_update(scale: f64, rate: f64, target: f64, lo: f64, hi: f64) -> f64 {
+    if rate > target {
+        (scale * 1.1).min(hi)
+    } else {
+        (scale * 0.9).max(lo)
+    }
+}
+
+/// Robbins-Monro exponent for the step-scale adaptation: `c · k^-RM_SCALE_EXPONENT`.
+///
+/// Must lie in `(0.5, 1]`. That is the standard diminishing-adaptation window:
+/// the steps have to vanish (so the adaptation dies out and the ergodicity
+/// argument of Roberts & Rosenthal (2007) applies) without being so short that
+/// the scale stops correcting before it arrives.
+const RM_SCALE_EXPONENT: f64 = 0.6;
+
+/// Gain on the Robbins-Monro step-scale update.
+///
+/// With `accept − target` in roughly `[-0.44, 0.56]` this moves `log δ` by at
+/// most ~0.56 on iteration 1 and ~0.04 by iteration 100 — fast enough to find
+/// the scale during exploration, small enough not to fight Ω afterwards.
+const RM_SCALE_GAIN: f64 = 1.0;
+
+/// One Robbins-Monro step on a log step-scale, clamped to `[lo, hi]`.
+///
+/// `k` is the 1-based SAEM iteration, so the first step is
+/// `gain · (rate − target)` and the sequence decays as `k^-0.6`. `rate` is the
+/// current iteration's own acceptance rate for the kernel being adapted.
+///
+/// This is the [`ScaleAdaptation::RobbinsMonro`] alternative to a fixed
+/// ×1.1 / ×0.9 applied every `adapt_interval` iterations. The difference that
+/// matters is not the schedule but the *reach*: over a 400-iteration run the
+/// interval rule fires 8 times by a fixed factor, so `δ` can move by at most
+/// ≈2.1× up or ≈0.43× down however far off the chain is. A model needing a 10×
+/// smaller step never gets one (issue #1444).
+fn rm_scale_update(scale: f64, rate: f64, target: f64, k: usize, lo: f64, hi: f64) -> f64 {
+    let step = RM_SCALE_GAIN * (k as f64).powf(-RM_SCALE_EXPONENT) * (rate - target);
+    (scale.ln() + step).exp().clamp(lo, hi)
+}
+
 /// Combined (block + componentwise) post-burn-in MH acceptance rate below which
 /// SAEM appends a "sampler is not mixing" warning to `FitResult.warnings`
 /// (issue #895). A genuinely stuck E-step never updates the ETAs, so the M-step
 /// runs on degenerate sufficient statistics and the estimates are unreliable.
 const SAEM_MH_STUCK_ACCEPT: f64 = 0.01;
+
+/// How many trailing post-burn-in iterations the acceptance-rate diagnostic
+/// looks at. The *tail* is the part a user can act on: the scales adapt over
+/// the run, so a whole-run average of a chain that started badly and recovered
+/// describes neither half.
+const MH_RATE_WINDOW: usize = 100;
+
+/// Fewest post-burn-in iterations the tail diagnostic will speak on.
+///
+/// This is the *statistical* floor: below it the tail is too short for its
+/// mean to describe a settled rate at all. It is **not** what establishes that
+/// the step scales have had a chance to adapt — that is
+/// [`MhRateWindow::adapted_throughout`], and the two are separate gates
+/// answering separate questions (#1451 review). A 45-iteration run at
+/// `omega_burnin = 20` reaches this floor exactly while the interval rule,
+/// which fires once per `adapt_interval = 50`, has not run once.
+const MH_RATE_MIN_WINDOW: usize = 25;
+
+/// Acceptance band, over the last [`MH_RATE_WINDOW`] iterations, outside which
+/// SAEM reports that the E-step never reached its target rate (issue #1444).
+///
+/// Deliberately wide. The optimal-scaling targets are 0.40 (block) and 0.44
+/// (componentwise), and a fit at 0.25 or 0.60 is unremarkable — this is not a
+/// band of "good" rates, it is the range outside which the step scales have
+/// demonstrably failed to find their target and the user should know. The lower
+/// bound sits well above [`SAEM_MH_STUCK_ACCEPT`] because a chain at 2-4% is not
+/// "stuck" by that 1% test yet still wastes most of the evaluations it pays for.
+const MH_RATE_LOW: f64 = 0.10;
+/// Upper end of the band described on [`MH_RATE_LOW`].
+const MH_RATE_HIGH: f64 = 0.80;
 
 /// Maximum growth of a free PK-residual σ during a SAEM run, in natural-log
 /// units, when `iiv_on_ruv` is active (issue #895). The IIV-on-RUV
@@ -1892,30 +1985,172 @@ fn reanchor_ruv_omega_cap(cap: Option<f64>, omega_ruv_var: f64) -> Option<f64> {
     })
 }
 
-/// Decide whether SAEM should warn that its E-step never mixed (issue #895).
+/// One post-burn-in iteration's contribution to the acceptance diagnostic.
 ///
-/// `cum_acc` / `cum_prop` are the run-cumulative combined (block + componentwise)
-/// MH accept / proposal counts over the post-burn-in iterations. Returns the
-/// warning string when the acceptance rate is below `SAEM_MH_STUCK_ACCEPT` (and
-/// at least one proposal was made), else `None`. A near-zero rate means the
-/// sampled ETAs barely moved, so the M-step ran on degenerate sufficient
-/// statistics and Ω/σ are unreliable.
-fn saem_mixing_warning(cum_acc: u64, cum_prop: u64) -> Option<String> {
+/// `target_weight` is `Σ_k n_proposals_k · target_k` over the kernels that ran
+/// this iteration, so a window's **proposal-weighted** target is
+/// `Σ target_weight / Σ proposed`. That matters because `accepted / proposed`
+/// pools the primary block kernel with the componentwise sweep, and the two
+/// have different optimal rates: naming the combined rate after the primary
+/// kernel's target alone is wrong whenever the mix is not dominated by it.
+/// With HMC it is wrong by a wide margin — one HMC proposal at 0.65 against
+/// `n_cw_sweeps · n_eta` componentwise proposals at 0.44 gives a combined
+/// target near 0.45, and a two-η fixture measured 0.4978 realised against the
+/// 0.65 that used to be printed (#1451 review).
+#[derive(Debug, Clone, Copy)]
+struct MhRateSample {
+    /// 1-based SAEM iteration this sample came from.
+    iter: usize,
+    accepted: u64,
+    proposed: u64,
+    target_weight: f64,
+}
+
+/// The trailing post-burn-in samples the diagnostic reads, plus whether the
+/// step scales had already been adapted when each of them was drawn.
+struct MhRateWindow<'a> {
+    samples: &'a [MhRateSample],
+    /// 1-based iteration at which the block/componentwise scales were first
+    /// adapted, or `None` if they never were.
+    ///
+    /// A scale adapted at the end of iteration `k` first affects sampling at
+    /// `k + 1`, so the tail tier speaks only when `first_adapt < samples[0].iter`
+    /// — i.e. **every** iteration whose rate it is about to report was drawn
+    /// with a scale the controller had already touched. Without this the
+    /// diagnostic says a run "never reached" its target on a run where the rule
+    /// never ran: measured on a 45-iteration fit at `omega_burnin = 20`,
+    /// `adapt_interval = 50`, which reported "settled at 8.7%" after **zero**
+    /// adaptations (#1451 review).
+    first_adapt: Option<usize>,
+}
+
+impl MhRateWindow<'_> {
+    /// Combined acceptance over the window, or `None` when it made no
+    /// proposal. This is the single definition of "the tail rate": the
+    /// diagnostic below and `FitResult::saem_mh_accept_tail` both read it, so
+    /// the number a user sees in the message and the number they can assert on
+    /// cannot drift apart.
+    fn tail_rate(&self) -> Option<f64> {
+        let prop: u64 = self.samples.iter().map(|s| s.proposed).sum();
+        if prop == 0 {
+            return None;
+        }
+        let acc: u64 = self.samples.iter().map(|s| s.accepted).sum();
+        Some(acc as f64 / prop as f64)
+    }
+
+    /// Whether the controller had acted before every sample in the window.
+    fn adapted_throughout(&self) -> bool {
+        match (self.first_adapt, self.samples.first()) {
+            (Some(k0), Some(first)) => k0 < first.iter,
+            _ => false,
+        }
+    }
+}
+
+/// Decide whether SAEM should warn about its E-step acceptance rate.
+///
+/// `cum_acc` / `cum_prop` are the run-cumulative combined (block +
+/// componentwise) MH accept / proposal counts over the post-burn-in iterations.
+/// `window` holds the last [`MH_RATE_WINDOW`] post-burn-in samples — the
+/// *converged tail*, which is what a user can act on; a run that mixes badly
+/// early and well later averages to a number describing neither — together
+/// with when the scales were first adapted. The target the message quotes is
+/// **proposal-weighted** across the kernels that ran (see [`MhRateSample`]),
+/// not the primary kernel's alone. `mode` is the active adaptation rule, which
+/// decides what the message can usefully suggest.
+///
+/// Two tiers, most severe first:
+///
+/// 1. **Not mixing** — cumulative rate below [`SAEM_MH_STUCK_ACCEPT`]. The
+///    sampled ETAs barely moved at all, so the M-step ran on degenerate
+///    sufficient statistics and Ω/σ are unreliable. Keeps its historical
+///    wording (issue #895), which `tests/frem_warfarin.rs` asserts the absence
+///    of.
+/// 2. **Persistently far from target** — the tail rate is outside
+///    `[MH_RATE_LOW, MH_RATE_HIGH]`. Not necessarily wrong, but it means the
+///    step scales never found their target and the chain is either crawling
+///    (too-large steps, almost everything rejected) or barely moving per
+///    accepted step (too-small steps, almost everything accepted). This tier
+///    exists because tier 1's 1% threshold is low enough that a chain stuck at
+///    2-4% for an entire run — which `examples/warfarin_saem.ferx` does, and
+///    which costs real estimate quality — passed silently (issue #1444).
+///
+///    It is gated on the controller having *run*, not merely on the window
+///    being long enough: "never reached its target" is a claim about an
+///    adaptation that failed, and it must not be made about one that never
+///    happened. See [`MhRateWindow::first_adapt`].
+///
+/// Both messages carry the numbers, so the reader does not have to re-run with
+/// `optimizer_trace` to find out how far off it was.
+fn saem_mixing_warning(
+    cum_acc: u64,
+    cum_prop: u64,
+    window: &MhRateWindow<'_>,
+    mode: crate::types::ScaleAdaptation,
+) -> Option<String> {
     if cum_prop == 0 {
         return None;
     }
     let rate = cum_acc as f64 / cum_prop as f64;
     if rate < SAEM_MH_STUCK_ACCEPT {
-        Some(format!(
+        return Some(format!(
             "SAEM Metropolis-Hastings acceptance was {:.2}% over the post-burn-in \
              iterations — the E-step is not mixing, so Ω/σ estimates are unreliable. \
              Check for extreme Ω-diagonal scale differences (e.g. FREM covariate ETAs) \
              or a mis-scaled initial Ω.",
             rate * 100.0
-        ))
-    } else {
-        None
+        ));
     }
+
+    let samples = window.samples;
+    if samples.len() < MH_RATE_MIN_WINDOW || !window.adapted_throughout() {
+        return None;
+    }
+    let w_prop: u64 = samples.iter().map(|s| s.proposed).sum();
+    let w_rate = window.tail_rate()?;
+    if !(MH_RATE_LOW..=MH_RATE_HIGH).contains(&w_rate) {
+        // Proposal-weighted across the kernels that actually ran, so a run
+        // whose proposals are mostly componentwise is judged against 0.44 and
+        // not against the primary kernel's 0.40 (or HMC's 0.65).
+        let w_target: f64 = samples.iter().map(|s| s.target_weight).sum::<f64>() / w_prop as f64;
+        let direction = if w_rate < MH_RATE_LOW {
+            "too large a step — most proposals are rejected"
+        } else {
+            "too small a step — almost every proposal is accepted, so each one moves little"
+        };
+        // The remedy has to depend on what is already running: telling a
+        // Robbins-Monro run to switch to Robbins-Monro is a no-op (#1451
+        // review). A chain that is still outside the band under the
+        // per-iteration rule has hit a scale clamp or has an Ω so mis-scaled
+        // that no step size helps, which is a different repair.
+        let remedy = match mode {
+            crate::types::ScaleAdaptation::Interval => {
+                "Consider `[fit_options] scale_adaptation = robbins_monro`, which steps the \
+                 scales every iteration rather than once per `adapt_interval`, or lower \
+                 `adapt_interval` so the existing rule fires more often."
+            }
+            crate::types::ScaleAdaptation::RobbinsMonro => {
+                "`scale_adaptation = robbins_monro` is already active, so the step scale has \
+                 most likely hit a clamp or the chain is too short for it to arrive: check the \
+                 scale of the initial Ω (a Ω-diagonal orders of magnitude from the posterior \
+                 spread cannot be rescued by any step size) and consider more exploration \
+                 iterations."
+            }
+        };
+        return Some(format!(
+            "SAEM Metropolis-Hastings acceptance settled at {:.1}% over the last {} \
+             iterations, against a proposal-weighted target of {:.0}% ({:.1}% over all \
+             post-burn-in iterations). That is {direction}, so the E-step explored less of \
+             each subject's conditional distribution than it paid for and the Ω/σ estimates \
+             carry more Monte-Carlo noise than they need to. {remedy}",
+            w_rate * 100.0,
+            samples.len(),
+            w_target * 100.0,
+            rate * 100.0
+        ));
+    }
+    None
 }
 
 /// Build (theta_idx, eta_idx) pairs eligible for the closed-form EM M-step.
@@ -2455,6 +2690,14 @@ pub fn run_saem(
         0
     };
     let adapt_interval = options.saem_adapt_interval;
+    // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
+    // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
+    // block and the componentwise scales only — κ stays on the interval rule
+    // under both, see `FitOptions::saem_scale_adaptation` for why.
+    let rm_scale_adaptation = matches!(
+        options.saem_scale_adaptation,
+        crate::types::ScaleAdaptation::RobbinsMonro
+    );
     let verbose = options.verbose;
     let n_leapfrog = options.saem_n_leapfrog;
     // HMC is BSV-only (kappa-unaware); disable it for IOV models so eta sampling
@@ -3266,6 +3509,13 @@ pub fn run_saem(
     // step resets every `adapt_interval`.
     let mut cum_mh_acc: u64 = 0;
     let mut cum_mh_prop: u64 = 0;
+    // Per-iteration samples for the last `MH_RATE_WINDOW` post-burn-in
+    // iterations, backing the tail tier of the diagnostic (#1444).
+    let mut mh_rate_window: VecDeque<MhRateSample> = VecDeque::with_capacity(MH_RATE_WINDOW);
+    // 1-based iteration at which the block/componentwise step scales were
+    // first adapted. The tail tier is gated on this: "never reached its
+    // target" must not be said of a controller that never ran (#1451 review).
+    let mut first_scale_adapt: Option<usize> = None;
 
     // Iterations on which each #619 group's solve returned `None` — its
     // typical value was not finite for some subject at the current θ. SAEM
@@ -3305,6 +3555,10 @@ pub fn run_saem(
         // tallies — the honest E-step mixing rate reported to the trace (#895).
         let mut iter_acc: usize = 0;
         let mut iter_prop: usize = 0;
+        // `Σ_k n_proposals_k · target_k` over the kernels that ran this
+        // iteration, so the diagnostic can quote a proposal-weighted target
+        // instead of the primary kernel's alone (#1451 review).
+        let mut iter_target_weight: f64 = 0.0;
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("SAEM: cancelled at iteration {}", k);
@@ -3663,12 +3917,52 @@ pub fn run_saem(
                     state.cw_proposal_counts[i][j] += n_cw_sweeps;
                 }
                 hmc_subjects[i] |= used_hmc;
+                // ---- Robbins-Monro step-scale adaptation (#1444, opt-in) ----
+                // Stepped every iteration from *this* iteration's own rate, so
+                // the correction is proportional to the discrepancy rather than
+                // a fixed factor applied eight times a run. The counters above
+                // are still maintained under this rule: the interval block
+                // below resets them, and the trace reads them.
+                if rm_scale_adaptation {
+                    if n_prop > 0 || (n_cw_sweeps > 0 && !per_eta_acc_cw.is_empty()) {
+                        first_scale_adapt.get_or_insert(k);
+                    }
+                    if n_prop > 0 {
+                        let rate = n_acc as f64 / n_prop as f64;
+                        state.step_scales[i] = rm_scale_update(
+                            state.step_scales[i],
+                            rate,
+                            target_accept_rate,
+                            k,
+                            MH_BLOCK_SCALE_MIN,
+                            MH_BLOCK_SCALE_MAX,
+                        );
+                    }
+                    // Per-η, for the same reason the interval rule adapts each
+                    // coordinate separately: a FREM covariate η and a PK η have
+                    // posterior SDs orders of magnitude apart.
+                    if n_cw_sweeps > 0 {
+                        for j in 0..n_eta.min(per_eta_acc_cw.len()) {
+                            let rate = per_eta_acc_cw[j] as f64 / n_cw_sweeps as f64;
+                            state.cw_step_scales[i][j] = rm_scale_update(
+                                state.cw_step_scales[i][j],
+                                rate,
+                                CW_TARGET_ACCEPT,
+                                k,
+                                MH_CW_SCALE_MIN,
+                                MH_CW_SCALE_MAX,
+                            );
+                        }
+                    }
+                }
                 // Combined (block + componentwise) acceptance for this iteration —
                 // the honest E-step mixing metric (#895). The block kernel alone
                 // reads 0% for FREM-scale Ω even when the componentwise sweep is
                 // mixing fine, so a block-only rate is misleading.
                 iter_acc += n_acc + cw_acc_i;
                 iter_prop += n_prop + n_prop_cw;
+                iter_target_weight +=
+                    n_prop as f64 * target_accept_rate + n_prop_cw as f64 * CW_TARGET_ACCEPT;
             }
 
             // ---- Mixture bookkeeping (#985) ----
@@ -3686,6 +3980,19 @@ pub fn run_saem(
         if k > omega_burnin {
             cum_mh_acc += iter_acc as u64;
             cum_mh_prop += iter_prop as u64;
+            // Keep the per-iteration pair too, so the diagnostic can look at the
+            // *converged* tail rather than the whole post-burn-in average. A run
+            // that mixes badly early and well later — or the reverse — averages
+            // to something that describes neither (#1444).
+            if mh_rate_window.len() == MH_RATE_WINDOW {
+                mh_rate_window.pop_front();
+            }
+            mh_rate_window.push_back(MhRateSample {
+                iter: k,
+                accepted: iter_acc as u64,
+                proposed: iter_prop as u64,
+                target_weight: iter_target_weight,
+            });
         }
 
         // ---- Step 1b: Per-occasion kappa MH (IOV models only) ----
@@ -4495,10 +4802,20 @@ pub fn run_saem(
                 // proposals) are not scaled by the HMC denominator of 1.
                 let total_proposals = state.proposal_counts[i].max(1);
                 let rate = state.accept_counts[i] as f64 / total_proposals as f64;
-                if rate > target_accept_rate {
-                    state.step_scales[i] = (state.step_scales[i] * 1.1).min(5.0);
-                } else {
-                    state.step_scales[i] = (state.step_scales[i] * 0.9).max(0.01);
+                // Under the Robbins-Monro rule this scale is already stepped
+                // every iteration; applying the multiplicative bump on top would
+                // be a second, coarser controller fighting the first. The
+                // counters are still *reset* here under either rule, because the
+                // per-iteration trace reads them.
+                if !rm_scale_adaptation {
+                    first_scale_adapt.get_or_insert(k);
+                    state.step_scales[i] = interval_scale_update(
+                        state.step_scales[i],
+                        rate,
+                        target_accept_rate,
+                        MH_BLOCK_SCALE_MIN,
+                        MH_BLOCK_SCALE_MAX,
+                    );
                 }
                 state.accept_counts[i] = 0;
                 state.proposal_counts[i] = 0;
@@ -4514,12 +4831,15 @@ pub fn run_saem(
                     for j in 0..n_eta {
                         let cw_total = state.cw_proposal_counts[i][j].max(1);
                         let cw_rate = state.cw_accept_counts[i][j] as f64 / cw_total as f64;
-                        if cw_rate > CW_TARGET_ACCEPT {
-                            state.cw_step_scales[i][j] =
-                                (state.cw_step_scales[i][j] * 1.1).min(5.0);
-                        } else {
-                            state.cw_step_scales[i][j] =
-                                (state.cw_step_scales[i][j] * 0.9).max(1e-6);
+                        // Same split as the block scale above.
+                        if !rm_scale_adaptation {
+                            state.cw_step_scales[i][j] = interval_scale_update(
+                                state.cw_step_scales[i][j],
+                                cw_rate,
+                                CW_TARGET_ACCEPT,
+                                MH_CW_SCALE_MIN,
+                                MH_CW_SCALE_MAX,
+                            );
                         }
                         state.cw_accept_counts[i][j] = 0;
                         state.cw_proposal_counts[i][j] = 0;
@@ -4634,7 +4954,20 @@ pub fn run_saem(
     // from their starting values, so the M-step ran on degenerate sufficient
     // statistics and the Ω/σ estimates are unreliable (the classic FREM-scale
     // "0% acceptance" failure).
-    if let Some(w) = saem_mixing_warning(cum_mh_acc, cum_mh_prop) {
+    let mh_window = MhRateWindow {
+        samples: mh_rate_window.make_contiguous(),
+        first_adapt: first_scale_adapt,
+    };
+    // The number the diagnostic below reports on, exposed on `FitResult` so a
+    // caller (and a test) can read it without parsing the message or the
+    // optimizer trace (#1444).
+    let saem_mh_accept_tail = mh_window.tail_rate();
+    if let Some(w) = saem_mixing_warning(
+        cum_mh_acc,
+        cum_mh_prop,
+        &mh_window,
+        options.saem_scale_adaptation,
+    ) {
         warnings.push(w);
     }
 
@@ -4872,6 +5205,7 @@ pub fn run_saem(
         warnings,
         saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc,
+        saem_mh_accept_tail,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -8337,18 +8671,858 @@ DV ~ additive(EPS)
         assert_eq!(reanchor_ruv_omega_cap(cap, 0.0), cap);
     }
 
-    // ---- #895: MH mixing warning ----
+    // ---- #895 / #1444 / #1451: MH acceptance diagnostic ----
+
+    /// First iteration number the synthetic windows below use. Any value works;
+    /// a non-1 start makes the "adapted before the window" gate visible.
+    const WSTART: usize = 301;
+
+    /// `n` samples at a constant acceptance `rate`, 1000 proposals an
+    /// iteration, every proposal carrying `target` as its kernel's target.
+    fn window_at_n_t(rate: f64, n: usize, target: f64) -> Vec<MhRateSample> {
+        let prop = 1_000_u64;
+        (0..n)
+            .map(|j| MhRateSample {
+                iter: WSTART + j,
+                accepted: (rate * prop as f64).round() as u64,
+                proposed: prop,
+                target_weight: prop as f64 * target,
+            })
+            .collect()
+    }
+
+    fn window_at_n(rate: f64, n: usize) -> Vec<MhRateSample> {
+        window_at_n_t(rate, n, 0.40)
+    }
+
+    /// A full-length (`MH_RATE_WINDOW`) tail at a constant acceptance `rate`.
+    fn window_at(rate: f64) -> Vec<MhRateSample> {
+        window_at_n(rate, MH_RATE_WINDOW)
+    }
+
+    /// Wrap samples as a window whose scales were adapted one iteration before
+    /// the first sample — the ordinary case.
+    fn adapted(samples: &[MhRateSample]) -> MhRateWindow<'_> {
+        MhRateWindow {
+            samples,
+            first_adapt: samples.first().map(|s| s.iter - 1),
+        }
+    }
+
+    /// `saem_mixing_warning` on an adapted window, at the default rule.
+    fn warn(cum_acc: u64, cum_prop: u64, samples: &[MhRateSample]) -> Option<String> {
+        saem_mixing_warning(
+            cum_acc,
+            cum_prop,
+            &adapted(samples),
+            crate::types::ScaleAdaptation::Interval,
+        )
+    }
 
     #[test]
     fn saem_mixing_warning_fires_only_when_stuck() {
+        let healthy = window_at(0.40);
         // 0% acceptance over the post-burn-in window → warn.
-        assert!(saem_mixing_warning(0, 100_000).is_some());
+        assert!(warn(0, 100_000, &window_at(0.0)).is_some());
         // Just below the 1% threshold → warn.
-        assert!(saem_mixing_warning(50, 100_000).is_some());
+        assert!(warn(50, 100_000, &window_at(0.0005)).is_some());
         // Healthy acceptance → silent.
-        assert!(saem_mixing_warning(8_000, 100_000).is_none());
+        assert!(warn(8_000, 100_000, &healthy).is_none());
         // No proposals accumulated (e.g. burn-in ≥ n_iter) → silent, no div-by-0.
-        assert!(saem_mixing_warning(0, 0).is_none());
+        assert!(warn(0, 0, &[]).is_none());
+        // Cumulative fine but no window at all → silent, no div-by-0 either.
+        assert!(warn(8_000, 100_000, &[]).is_none());
+        // A window of empty iterations (every proposal count zero) → silent.
+        let empty: Vec<MhRateSample> = (0..MH_RATE_WINDOW)
+            .map(|j| MhRateSample {
+                iter: WSTART + j,
+                accepted: 0,
+                proposed: 0,
+                target_weight: 0.0,
+            })
+            .collect();
+        assert!(warn(8_000, 100_000, &empty).is_none());
+        // The stuck tier keeps its historical wording: `tests/frem_warfarin.rs`
+        // asserts the *absence* of "not mixing", so the tail tier below must
+        // not reuse that phrase.
+        let stuck = warn(0, 100_000, &window_at(0.0)).unwrap();
+        assert!(stuck.contains("not mixing"), "{stuck}");
+    }
+
+    #[test]
+    fn saem_mixing_warning_reports_a_tail_that_never_reached_target() {
+        // The regression this exists to catch: a chain parked at 2-4% for a
+        // whole run. That is 2-4× above the 1% "stuck" threshold, so the
+        // pre-existing tier stayed silent on it — measured on
+        // `examples/warfarin_saem.ferx`, which sat at 1.6-4.5% for 375 of 400
+        // iterations against a 40% target (issue #1444).
+        let w = warn(3_000, 100_000, &window_at(0.03)).expect("a 3% tail must be reported");
+        assert!(!w.contains("not mixing"), "wrong tier: {w}");
+        // The numbers have to be in the message — the point is that the reader
+        // does not have to re-run with a trace to learn how far off it was.
+        assert!(w.contains("3.0%"), "tail rate missing: {w}");
+        assert!(w.contains("40%"), "target missing: {w}");
+        assert!(w.contains("100"), "window length missing: {w}");
+        assert!(w.contains("rejected"), "direction missing: {w}");
+        assert!(w.contains("scale_adaptation"), "remedy missing: {w}");
+
+        // The other end of the band: near-total acceptance means a step so small
+        // each accepted move goes nowhere.
+        let hi = warn(90_000, 100_000, &window_at(0.9)).expect("a 90% tail must be reported");
+        assert!(hi.contains("90.0%") && hi.contains("accepted"), "{hi}");
+
+        // The band must be a band, not a one-sided test: rates inside it are
+        // silent even when they are nowhere near the nominal target.
+        for r in [0.11, 0.25, 0.40, 0.60, 0.79] {
+            assert!(
+                warn(40_000, 100_000, &window_at(r)).is_none(),
+                "rate {r} is inside [{MH_RATE_LOW}, {MH_RATE_HIGH}] and must stay silent"
+            );
+        }
+
+        // The *tail* decides, not the cumulative average. A run that mixed
+        // badly early and recovered must NOT warn, and the reverse MUST — which
+        // is the whole reason the window exists. Both pass the same cumulative
+        // counts, so only the window can distinguish them.
+        assert!(
+            warn(20_000, 100_000, &window_at(0.42)).is_none(),
+            "recovered tail must be silent despite a poor cumulative average"
+        );
+        assert!(
+            warn(20_000, 100_000, &window_at(0.02)).is_some(),
+            "degraded tail must warn despite an acceptable cumulative average"
+        );
+    }
+
+    #[test]
+    fn saem_mixing_warning_says_nothing_before_the_scales_had_a_chance() {
+        // The *statistical* floor, on its own. A tail this short cannot
+        // describe a settled rate whatever the controller did, so the tier
+        // holds its tongue. Regression this catches: dropping the minimum and
+        // firing the diagnostic on every 5-iteration smoke-test fit.
+        assert!(
+            warn(3_000, 100_000, &window_at_n(0.03, MH_RATE_MIN_WINDOW - 1)).is_none(),
+            "a {}-iteration tail is too short to speak on",
+            MH_RATE_MIN_WINDOW - 1
+        );
+        // One more iteration and it does — so the gate is the length, and this
+        // pair cannot pass by the tier being dead.
+        assert!(
+            warn(3_000, 100_000, &window_at_n(0.03, MH_RATE_MIN_WINDOW)).is_some(),
+            "a {MH_RATE_MIN_WINDOW}-iteration tail must be reported"
+        );
+        // The short tail does not mask the more severe tier: a genuinely stuck
+        // run is still reported however short its window.
+        assert!(
+            warn(0, 100_000, &window_at_n(0.0, 2)).is_some(),
+            "tier 1 must not be gated on the window length"
+        );
+    }
+
+    #[test]
+    fn saem_mixing_warning_is_silent_until_the_controller_has_actually_run() {
+        // #1451 review. The length floor above does **not** establish that any
+        // adaptation happened, and the two must not be conflated: a 45-iteration
+        // fit at `omega_burnin = 20`, `adapt_interval = 50` reaches a 25-sample
+        // window while the interval rule has fired **zero** times. Measured on
+        // that fixture before this gate existed, the run reported "acceptance
+        // settled at 8.7% ... against a target of 40%" — a claim about a
+        // controller that never ran.
+        let samples = window_at(0.03);
+        let mode = crate::types::ScaleAdaptation::Interval;
+
+        // Never adapted → silent, however long and however far off the tail is.
+        let never = MhRateWindow {
+            samples: &samples,
+            first_adapt: None,
+        };
+        assert!(
+            saem_mixing_warning(3_000, 100_000, &never, mode).is_none(),
+            "a controller that never ran cannot have failed to reach target"
+        );
+
+        // Adapted for the first time *during* the window → still silent, because
+        // the earlier samples were drawn at the untouched initial scale and the
+        // reported mean is partly about the initial condition.
+        let mid = MhRateWindow {
+            samples: &samples,
+            first_adapt: Some(samples[samples.len() / 2].iter),
+        };
+        assert!(
+            saem_mixing_warning(3_000, 100_000, &mid, mode).is_none(),
+            "a window straddling the first adaptation must not be reported"
+        );
+        // The exact boundary, both sides: adapting *at* the first sample's
+        // iteration is too late (that sample was drawn before the update),
+        // one iteration earlier is in time.
+        let at = MhRateWindow {
+            samples: &samples,
+            first_adapt: Some(samples[0].iter),
+        };
+        assert!(
+            saem_mixing_warning(3_000, 100_000, &at, mode).is_none(),
+            "off-by-one: too late"
+        );
+        let before = MhRateWindow {
+            samples: &samples,
+            first_adapt: Some(samples[0].iter - 1),
+        };
+        assert!(
+            saem_mixing_warning(3_000, 100_000, &before, mode).is_some(),
+            "adapted before the window: the tier must speak"
+        );
+
+        // And the gate is specific to the tail tier: a genuinely stuck chain is
+        // still reported even if nothing was ever adapted.
+        assert!(
+            saem_mixing_warning(0, 100_000, &never, mode).is_some(),
+            "tier 1 must not be gated on adaptation"
+        );
+    }
+
+    #[test]
+    fn saem_mixing_warning_quotes_a_proposal_weighted_target() {
+        // #1451 review. `accepted / proposed` pools the primary kernel with the
+        // componentwise sweep, so naming the combined rate after the primary
+        // kernel's target alone is wrong whenever the mix is not dominated by
+        // it. The HMC case is the extreme: one HMC proposal at 0.65 against 20
+        // componentwise proposals at 0.44 is a combined target of
+        // (1·0.65 + 20·0.44) / 21 = 0.4500, and a two-η HMC fixture measured
+        // 0.4978 realised — which the old message would have called 15 points
+        // *below* a 65% target when it is 5 points above the real one.
+        let hmc: Vec<MhRateSample> = (0..MH_RATE_WINDOW)
+            .map(|j| MhRateSample {
+                iter: WSTART + j,
+                // Drive it below the band so the message is emitted at all.
+                accepted: 1,
+                proposed: 21,
+                target_weight: 1.0 * 0.65 + 20.0 * CW_TARGET_ACCEPT,
+            })
+            .collect();
+        // Cumulative kept above the 1% "stuck" tier so this exercises tier 2.
+        let w = saem_mixing_warning(
+            5_000,
+            100_000,
+            &adapted(&hmc),
+            crate::types::ScaleAdaptation::Interval,
+        )
+        .expect("a 4.8% tail must be reported");
+        let want = (0.65 + 20.0 * CW_TARGET_ACCEPT) / 21.0;
+        assert!(
+            (want - 0.45).abs() < 5e-3,
+            "hand-computed weighted target moved: {want}"
+        );
+        assert!(
+            w.contains("target of 45%"),
+            "must quote the weighted 45%, not the primary kernel's 65%: {w}"
+        );
+        assert!(
+            !w.contains("65%"),
+            "the primary-only target must not appear: {w}"
+        );
+
+        // Control: when every proposal shares one target the weighting is a
+        // no-op, so the single-kernel case still reads exactly as before.
+        let single = warn(3_000, 100_000, &window_at_n_t(0.03, MH_RATE_WINDOW, 0.40))
+            .expect("must be reported");
+        assert!(single.contains("target of 40%"), "{single}");
+    }
+
+    #[test]
+    fn saem_mixing_warning_does_not_prescribe_the_rule_already_running() {
+        // #1451 review: recommending `scale_adaptation = robbins_monro` to a run
+        // that is already using it is a no-op repair.
+        let samples = window_at(0.03);
+        let under_interval = saem_mixing_warning(
+            3_000,
+            100_000,
+            &adapted(&samples),
+            crate::types::ScaleAdaptation::Interval,
+        )
+        .expect("reported");
+        assert!(
+            under_interval.contains("scale_adaptation = robbins_monro")
+                && under_interval.contains("adapt_interval"),
+            "the interval arm must offer the switch: {under_interval}"
+        );
+
+        let under_rm = saem_mixing_warning(
+            3_000,
+            100_000,
+            &adapted(&samples),
+            crate::types::ScaleAdaptation::RobbinsMonro,
+        )
+        .expect("reported");
+        assert!(
+            under_rm.contains("already active"),
+            "the RM arm must say so: {under_rm}"
+        );
+        assert!(
+            !under_rm.contains("Consider `[fit_options] scale_adaptation = robbins_monro`"),
+            "must not prescribe the rule that is already running: {under_rm}"
+        );
+        // Both still carry the numbers; only the remedy differs.
+        for m in [&under_interval, &under_rm] {
+            assert!(m.contains("3.0%") && m.contains("target of 40%"), "{m}");
+        }
+    }
+
+    // ---- #1444: MH step-scale adaptation ----
+
+    #[test]
+    fn interval_scale_update_is_the_legacy_times_1_1_or_0_9() {
+        // The legacy rule, pinned as arithmetic so the extraction into a
+        // function cannot silently have changed it. Regression this catches:
+        // a factor, a comparison direction or a clamp drifting while the
+        // Robbins-Monro arm is edited next door.
+        assert_eq!(interval_scale_update(0.3, 0.9, 0.4, 0.01, 5.0), 0.3 * 1.1);
+        assert_eq!(interval_scale_update(0.3, 0.1, 0.4, 0.01, 5.0), 0.3 * 0.9);
+        // Strictly-above, so an exactly-on-target window shrinks (the historical
+        // `if rate > target` branch, not `>=`).
+        assert_eq!(interval_scale_update(0.3, 0.4, 0.4, 0.01, 5.0), 0.3 * 0.9);
+        // Both clamps bind.
+        assert_eq!(interval_scale_update(4.9, 1.0, 0.4, 0.01, 5.0), 5.0);
+        assert_eq!(interval_scale_update(0.0105, 0.0, 0.4, 0.01, 5.0), 0.01);
+    }
+
+    #[test]
+    fn rm_scale_update_matches_the_hand_computed_formula() {
+        // Exact formula, not just the sign: log δ += c·k^-0.6·(rate − target).
+        let up = rm_scale_update(0.3, 0.9, 0.4, 1, 0.01, 5.0);
+        let down = rm_scale_update(0.3, 0.1, 0.4, 1, 0.01, 5.0);
+        assert!(up > 0.3, "rate above target must raise the scale: {up}");
+        assert!(down < 0.3, "rate below target must lower it: {down}");
+        // Hand-computed: k = 1 → k^-0.6 = 1, so log δ moves by exactly 0.5.
+        let want = (0.3_f64.ln() + 0.5).exp();
+        assert!((up - want).abs() < 1e-12, "got {up}, want {want}");
+        // And at k = 32: 32^-0.6 = 2^(-3) = 0.125 exactly, so log δ moves by
+        // 0.125·(0.9 − 0.4) = 0.0625. A power of two makes this hand-checkable
+        // rather than a number copied out of the implementation.
+        let at32 = rm_scale_update(0.3, 0.9, 0.4, 32, 0.01, 5.0);
+        let want32 = (0.3_f64.ln() + 0.0625).exp();
+        assert!(
+            (at32 - want32).abs() < 1e-12,
+            "k=32: got {at32}, want {want32}"
+        );
+
+        // Diminishing adaptation: the same discrepancy must move log δ strictly
+        // less at a later iteration while still pointing the right way. That is
+        // the condition the ergodicity argument needs, so it is worth pinning
+        // rather than assuming.
+        let early = rm_scale_update(0.3, 0.9, 0.4, 1, 0.01, 5.0).ln() - 0.3_f64.ln();
+        let late = rm_scale_update(0.3, 0.9, 0.4, 400, 0.01, 5.0).ln() - 0.3_f64.ln();
+        assert!(late > 0.0 && late < early * 0.1, "{early} then {late}");
+
+        // Zero discrepancy is a fixed point; both clamps bind.
+        assert!((rm_scale_update(0.3, 0.4, 0.4, 7, 0.01, 5.0) - 0.3).abs() < 1e-12);
+        assert_eq!(rm_scale_update(4.9, 1.0, 0.0, 1, 0.01, 5.0), 5.0);
+        assert_eq!(rm_scale_update(0.011, 0.0, 1.0, 1, 0.01, 5.0), 0.01);
+    }
+
+    /// Synthetic acceptance response for the closed-loop straddle below: a
+    /// random-walk MH kernel accepts less the larger its step, so `A/δ` capped
+    /// at 1 is a monotone, exactly-computable stand-in.
+    ///
+    /// `A = 0.008` puts the 40% target at `δ* = 0.02`, 15× below the 0.3 the
+    /// SAEM state starts at — and it reproduces the reported symptom: at the
+    /// 0.3 start the rate is `0.008/0.3 = 2.7%`, inside the 2-4% measured on
+    /// `examples/warfarin_saem.ferx` (issue #1444).
+    fn synth_accept(delta: f64) -> f64 {
+        (0.008_f64 / delta).min(1.0)
+    }
+
+    #[test]
+    fn rm_reaches_a_target_the_interval_rule_provably_cannot() {
+        // A differential pair, run as two closed loops over the *production*
+        // update functions, that has to straddle the diagnostic's gate: from
+        // the same 0.3 start and the same acceptance response, the interval
+        // rule must still be far below target after 400 iterations and
+        // Robbins-Monro must have arrived.
+        const TARGET: f64 = 0.40;
+        const N_ITER: usize = 400;
+        const ADAPT_INTERVAL: usize = 50;
+
+        // --- interval arm: 8 corrections in 400 iterations ---
+        let mut d_int = 0.3_f64;
+        let mut n_corrections = 0;
+        for k in 1..=N_ITER {
+            if k % ADAPT_INTERVAL == 0 {
+                d_int = interval_scale_update(
+                    d_int,
+                    synth_accept(d_int),
+                    TARGET,
+                    MH_BLOCK_SCALE_MIN,
+                    MH_BLOCK_SCALE_MAX,
+                );
+                n_corrections += 1;
+            }
+        }
+        assert_eq!(n_corrections, 8, "the reach argument assumes 8 corrections");
+        // The reach, as arithmetic rather than as prose: 8 × 0.9, nothing more.
+        let reach_floor = 0.3 * 0.9_f64.powi(8);
+        assert!(
+            (d_int - reach_floor).abs() < 1e-15,
+            "interval arm must land exactly on 0.3·0.9^8 = {reach_floor}, got {d_int}"
+        );
+
+        // --- Robbins-Monro arm: a step every iteration ---
+        let mut d_rm = 0.3_f64;
+        for k in 1..=N_ITER {
+            d_rm = rm_scale_update(
+                d_rm,
+                synth_accept(d_rm),
+                TARGET,
+                k,
+                MH_BLOCK_SCALE_MIN,
+                MH_BLOCK_SCALE_MAX,
+            );
+        }
+
+        let rate_int = synth_accept(d_int);
+        let rate_rm = synth_accept(d_rm);
+        // `f64::max`/`min` swallow NaN and `clamp` would propagate one, so check
+        // before comparing (CLAUDE.md's fold trap).
+        assert!(
+            rate_int.is_finite() && rate_rm.is_finite(),
+            "non-finite realised rates: interval {rate_int}, rm {rate_rm}"
+        );
+        // Realised on this stream: interval 0.0619, RM 0.3998.
+        assert!(
+            (rate_rm - TARGET).abs() < 0.02,
+            "RM must arrive at the target: {rate_rm}"
+        );
+        // Assert the straddle itself, so the pair cannot quietly become a
+        // tautology if the acceptance response or the start is ever retuned:
+        // the two arms must sit on opposite sides of the diagnostic's gate.
+        assert!(
+            rate_int < MH_RATE_LOW && MH_RATE_LOW < rate_rm,
+            "the pair must straddle MH_RATE_LOW = {MH_RATE_LOW}: interval {rate_int}, rm {rate_rm}"
+        );
+
+        // It must be a controller, not a ratchet: fed an acceptance *above*
+        // target from the same start it moves the other way. Without this, a
+        // rule that only ever shrinks δ would pass everything above.
+        let mut up = 0.3_f64;
+        for k in 1..=N_ITER {
+            up = rm_scale_update(up, 0.90, TARGET, k, MH_BLOCK_SCALE_MIN, MH_BLOCK_SCALE_MAX);
+        }
+        assert!(up > 0.3, "RM must also grow the step: {up}");
+    }
+
+    #[test]
+    fn scale_adaptation_parses_every_documented_spelling() {
+        use crate::types::ScaleAdaptation;
+        let parse = |key: &str, v: &str| -> Result<ScaleAdaptation, String> {
+            let mut opts = FitOptions::default();
+            crate::parser::model_parser::apply_fit_option(&mut opts, key, v)
+                .map(|_| opts.saem_scale_adaptation)
+        };
+        assert_eq!(
+            parse("scale_adaptation", "robbins_monro").unwrap(),
+            ScaleAdaptation::RobbinsMonro
+        );
+        assert_eq!(
+            parse("scale_adaptation", "robbins-monro").unwrap(),
+            ScaleAdaptation::RobbinsMonro
+        );
+        assert_eq!(
+            parse("scale_adaptation", "RM").unwrap(),
+            ScaleAdaptation::RobbinsMonro
+        );
+        assert_eq!(
+            parse("scale_adaptation", "interval").unwrap(),
+            ScaleAdaptation::Interval
+        );
+        assert_eq!(
+            parse("saem_scale_adaptation", "legacy").unwrap(),
+            ScaleAdaptation::Interval
+        );
+        let err = parse("scale_adaptation", "adam").unwrap_err();
+        assert!(
+            err.contains("scale_adaptation") && err.contains("adam"),
+            "{err}"
+        );
+
+        // The default stays the legacy rule: shipping Robbins-Monro as the
+        // default would silently move every existing SAEM user's estimates, and
+        // it is measured to regress one benchmark (issue #1444).
+        assert_eq!(
+            FitOptions::default().saem_scale_adaptation,
+            ScaleAdaptation::Interval
+        );
+    }
+
+    #[test]
+    fn scale_adaptation_keys_are_registered_as_saem_options() {
+        // A new SAEM key must be added to `method_specific_keys` as well as to
+        // the parser, and nothing forces that — an option that works while
+        // warning "is not used by method `SAEM` and will be ignored" is the
+        // failure mode.
+        for key in ["scale_adaptation", "saem_scale_adaptation"] {
+            let opts = FitOptions {
+                method: EstimationMethod::Saem,
+                user_set_keys: vec![key.to_string()],
+                ..FitOptions::default()
+            };
+            let w = opts.unsupported_keys_warnings();
+            assert!(w.is_empty(), "`{key}` must not warn under saem: {w:?}");
+        }
+        // Control: a genuinely non-SAEM key still warns, so the emptiness above
+        // is not "this function never warns".
+        let opts = FitOptions {
+            method: EstimationMethod::Saem,
+            user_set_keys: vec!["imp_samples".to_string()],
+            ..FitOptions::default()
+        };
+        assert!(opts
+            .unsupported_keys_warnings()
+            .iter()
+            .any(|m| m.contains("imp_samples")));
+    }
+
+    // ---- #1444: the rules, wired into `run_saem` ----
+    //
+    // These four tests call `fit()`, which CLAUDE.md's Tier 1 says to avoid.
+    // They stay in `--lib` deliberately (#1451 review), on three grounds.
+    // First, cost: all four together run in **0.79 s** single-threaded
+    // (`cargo test --lib -- --test-threads=1`, 11 fits of 60 iterations on 8
+    // subjects), against the tier's "seconds total" budget. Second, precedent:
+    // `origin/main`'s own test module in this file already makes 14 `fit()`
+    // calls with `saem_n_exploration = 4`-style budgets, so a short fixed-budget
+    // fit is this file's established unit-test shape, not a new one. Third, and
+    // decisively, what they cover cannot move: mutation M2 — deleting the
+    // Robbins-Monro block from `run_saem` entirely — is invisible to every pure
+    // update-rule test, and `slow-tests` never runs on a PR, so moving these to
+    // Tier 3 would restore exactly the hole mutation testing found. The genuine
+    // convergence run (400 iterations on warfarin) *is* gated, in
+    // `tests/saem_scale_adaptation.rs`.
+
+    /// 1-cpt IV, two estimated ETAs, `n_per` subjects. `omega_cl`/`omega_v` are
+    /// the (FIXed) ETA variances, which is the knob that sets how far the MH
+    /// proposals overshoot the posterior and hence the acceptance rate.
+    fn scale1444_model(omega_cl: f64, omega_v: f64) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ {omega_cl} FIX
+  omega ETA_V ~ {omega_v} FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("model parses")
+    }
+
+    /// `omega_burnin` for the fixture below: the iterations excluded from the
+    /// diagnostic's window, and hence from the tail rate it reports.
+    const SCALE1444_BURNIN: usize = 30;
+
+    /// 60 SAEM iterations — 30 post-burn-in, past `MH_RATE_MIN_WINDOW` — with
+    /// two firings of the interval rule before the window opens, so both arms
+    /// are exercised and the tail tier's "the controller has run" gate is met.
+    ///
+    /// Returns the fit **and** its realised combined MH acceptance over those
+    /// post-burn-in iterations, read from `FitResult::saem_mh_accept_tail` —
+    /// the same number the diagnostic reports, so the tests measure what the
+    /// warning says rather than a proxy.
+    ///
+    /// This used to read the optimizer trace instead, which was wrong for a
+    /// reason worth recording: the trace writer is a thread-local and
+    /// `fit_inner` runs inside a shared Rayon pool, so any *other* concurrent
+    /// fit whose job is stolen onto this one's thread perturbs it. Under CI's
+    /// parallelism that made these tests fail on `trace_path` being `None`.
+    /// A field on the result has no such coupling.
+    fn scale1444_fit(
+        omega_cl: f64,
+        omega_v: f64,
+        rule: crate::types::ScaleAdaptation,
+    ) -> (crate::types::FitResult, f64) {
+        let model = scale1444_model(omega_cl, omega_v);
+        let pop = mix996_pop(4);
+        let opts = FitOptions {
+            method: EstimationMethod::Saem,
+            saem_n_exploration: 40,
+            saem_n_convergence: 20,
+            saem_adapt_interval: 25,
+            // `omega_burnin = 30` puts the whole reported window (iterations
+            // 31-60) after the interval rule's first firing at k = 25, which
+            // the tail tier now requires (#1451 review). At the default 20 the
+            // window would open at 21 and straddle that first adaptation.
+            saem_omega_burnin: SCALE1444_BURNIN,
+            saem_scale_adaptation: rule,
+            saem_seed: Some(1444),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let tail = res
+            .saem_mh_accept_tail
+            .expect("a SAEM fit with post-burn-in iterations must report a tail rate");
+        assert!(tail.is_finite(), "non-finite tail acceptance: {tail}");
+        (res, tail)
+    }
+
+    #[test]
+    fn interval_is_the_default_and_bit_identical_to_asking_for_it() {
+        use crate::types::ScaleAdaptation;
+        let model = scale1444_model(0.09, 0.04);
+        let pop = mix996_pop(4);
+        let base = FitOptions {
+            method: EstimationMethod::Saem,
+            saem_n_exploration: 40,
+            saem_n_convergence: 20,
+            saem_adapt_interval: 25,
+            saem_seed: Some(1444),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        // Arm 1: the option left alone. Arm 2: `interval` asked for explicitly.
+        let untouched = crate::api::fit(&model, &pop, &model.default_params, &base).expect("Ok");
+        let explicit = crate::api::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                saem_scale_adaptation: ScaleAdaptation::Interval,
+                ..base
+            },
+        )
+        .expect("Ok");
+        // Bit-for-bit, not to a tolerance: the legacy path must still be the
+        // code that ran before #1444, and the default must select it. A single
+        // `f64` differing in its last bit fails this. The regression it catches
+        // is the default flipping to `RobbinsMonro` — which is what the
+        // research branch this came from shipped.
+        assert!(untouched.ofv.is_finite(), "OFV {}", untouched.ofv);
+        assert_eq!(
+            untouched.ofv.to_bits(),
+            explicit.ofv.to_bits(),
+            "default arm OFV {} vs explicit-interval {}",
+            untouched.ofv,
+            explicit.ofv
+        );
+        assert_eq!(untouched.theta.len(), explicit.theta.len());
+        for (a, b) in untouched.theta.iter().zip(&explicit.theta) {
+            assert_eq!(a.to_bits(), b.to_bits(), "theta {a} vs {b}");
+        }
+        for (a, b) in untouched.sigma.iter().zip(&explicit.sigma) {
+            assert_eq!(a.to_bits(), b.to_bits(), "sigma {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn robbins_monro_moves_the_realised_acceptance_toward_target_both_ways() {
+        use crate::types::ScaleAdaptation;
+        // The wiring test, and a differential pair in *both* directions on a
+        // real fit. Asserting only "the two rules give different estimates" is
+        // not enough: switching to Robbins-Monro also switches the interval
+        // bump off, so the runs differ even when the RM update itself is a
+        // no-op — a mutation that deletes the RM block in `run_saem` passes
+        // that weaker test. Measuring the realised acceptance rate is what
+        // distinguishes "adapting differently" from "not adapting".
+        const TARGET: f64 = 0.40;
+
+        // (a) Starting far BELOW target: a grossly over-dispersed Ω (SD 10 on a
+        //     log-scale η) makes the block proposal ≈ 3 log-units, so nearly
+        //     everything is rejected. Realised: interval 0.0844, RM 0.3271.
+        let (_, lo_int) = scale1444_fit(100.0, 100.0, ScaleAdaptation::Interval);
+        let (_, lo_rm) = scale1444_fit(100.0, 100.0, ScaleAdaptation::RobbinsMonro);
+        // (b) Starting ABOVE target, so the rule is shown to be a controller
+        //     and not a ratchet on a real chain too. Realised: interval 0.6114,
+        //     RM 0.4324.
+        let (_, hi_int) = scale1444_fit(0.09, 0.04, ScaleAdaptation::Interval);
+        let (_, hi_rm) = scale1444_fit(0.09, 0.04, ScaleAdaptation::RobbinsMonro);
+        for (name, r) in [
+            ("lo_int", lo_int),
+            ("lo_rm", lo_rm),
+            ("hi_int", hi_int),
+            ("hi_rm", hi_rm),
+        ] {
+            assert!(r.is_finite(), "{name} is not finite: {r}");
+        }
+
+        // Each RM arm must be closer to target than its interval twin. Under a
+        // mutation that unwires the RM block the two arms become *equal*, so
+        // both of these die.
+        assert!(
+            (lo_rm - TARGET).abs() < (lo_int - TARGET).abs() - 0.1,
+            "below target: RM {lo_rm:.4} must be closer to {TARGET} than interval {lo_int:.4}"
+        );
+        assert!(
+            (hi_rm - TARGET).abs() < (hi_int - TARGET).abs() - 0.1,
+            "above target: RM {hi_rm:.4} must be closer to {TARGET} than interval {hi_int:.4}"
+        );
+        // Each RM arm must also land *near* target in absolute terms, not merely
+        // nearer than its twin. This is what separates "the RM block ran" from
+        // "half of it ran": deleting the per-η componentwise update alone leaves
+        // the block update to carry the combined rate, and it gets only part of
+        // the way. Both bounds are measured, not picked (#1451 review) — the
+        // realised |rate − target| is:
+        //
+        //             both halves   componentwise half deleted   bound
+        //   below       0.0729              0.1624               0.12
+        //   above       0.0324              0.0807               0.06
+        //
+        // i.e. each bound sits between the two, with 1.6x / 1.9x headroom over
+        // the passing case, so it is exactly this mutation that both die for.
+        // The block half alone is caught by the `closer than its twin` pair
+        // above.
+        assert!(
+            (lo_rm - TARGET).abs() < 0.12,
+            "below target: RM must land near {TARGET}, got {lo_rm:.4}"
+        );
+        assert!(
+            (hi_rm - TARGET).abs() < 0.06,
+            "above target: RM must land near {TARGET}, got {hi_rm:.4}"
+        );
+        // And the low pair must straddle the diagnostic's own gate, asserted so
+        // the pair cannot quietly become two runs on the same side of it.
+        assert!(
+            lo_int < MH_RATE_LOW && MH_RATE_LOW < lo_rm,
+            "the low pair must straddle MH_RATE_LOW = {MH_RATE_LOW}: \
+             interval {lo_int:.4}, rm {lo_rm:.4}"
+        );
+        // The high pair moves the other way: RM must *reduce* the rate, which a
+        // rule that only ever shrinks the step could not do.
+        assert!(
+            hi_rm < hi_int,
+            "above target RM must lower the rate: {hi_rm:.4} vs {hi_int:.4}"
+        );
+    }
+
+    #[test]
+    fn saem_says_nothing_about_a_target_the_interval_rule_never_tried_to_reach() {
+        use crate::types::ScaleAdaptation;
+        // #1451 review, end to end on the exact fixture it constructed:
+        // `omega_burnin = 20`, `adapt_interval = 50`, 45 iterations. The window
+        // reaches its 25-sample floor at iteration 45, but the interval rule
+        // fires at multiples of 50, so it has run **zero** times. Before the
+        // gate this reported "acceptance settled at 8.7% ... against a target
+        // of 40%" — a verdict on a controller that never ran.
+        //
+        // The Ω is the same grossly over-dispersed one the positive fixture
+        // uses, so the rate really is far outside the band: what changes is
+        // only whether ferx is entitled to call that a failure to adapt.
+        let model = scale1444_model(100.0, 100.0);
+        let pop = mix996_pop(4);
+        let opts = FitOptions {
+            method: EstimationMethod::Saem,
+            saem_n_exploration: 40,
+            saem_n_convergence: 5,
+            saem_adapt_interval: 50,
+            saem_omega_burnin: 20,
+            saem_scale_adaptation: ScaleAdaptation::Interval,
+            saem_seed: Some(1444),
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("acceptance settled at")),
+            "no adaptation has happened yet, so the tail tier must stay quiet: {:?}",
+            res.warnings
+        );
+
+        // The control that stops this from passing for the wrong reason: the
+        // *same* model and Ω, run long enough that the rule does fire before
+        // the window opens, must warn. Without this the assertion above is
+        // satisfied by a diagnostic that never speaks at all.
+        let (loud, _) = scale1444_fit(100.0, 100.0, ScaleAdaptation::Interval);
+        assert!(
+            loud.warnings
+                .iter()
+                .any(|w| w.contains("acceptance settled at")),
+            "the adapted control must still warn: {:?}",
+            loud.warnings
+        );
+    }
+
+    #[test]
+    fn saem_reports_a_tail_acceptance_far_from_target_end_to_end() {
+        use crate::types::ScaleAdaptation;
+        // A grossly over-dispersed Ω (SD 10 on a log-scale η): the block
+        // proposals are `δ·chol(Ω)·z` ≈ 3 log-units, so almost everything is
+        // rejected. Realised tail rate on this fixture: 8.4% — below the 10%
+        // band and *above* the 1% "not mixing" tier, i.e. exactly the regime
+        // the pre-#1444 diagnostic could not see, reached by a real fit rather
+        // than by calling the predicate directly.
+        let (hot, _) = scale1444_fit(100.0, 100.0, ScaleAdaptation::Interval);
+        let hit = hot
+            .warnings
+            .iter()
+            .find(|w| w.contains("acceptance settled at"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the tail-acceptance warning, got {:?}",
+                    hot.warnings
+                )
+            });
+        assert!(
+            !hot.warnings.iter().any(|w| w.contains("not mixing")),
+            "must be the tail tier, not the stuck tier: {:?}",
+            hot.warnings
+        );
+        assert!(
+            hit.contains("rejected") && hit.contains("over the last"),
+            "message must name the direction and the window: {hit}"
+        );
+        // The proposal-weighted target has to survive the *wiring*, not just
+        // the predicate: this fixture runs 20 block proposals at 0.40 and 20
+        // componentwise at 0.44 per subject-iteration, so the weighted target
+        // is exactly 0.42. A mutation that stops accumulating `target_weight`
+        // in `run_saem` still satisfies every unit test of the predicate (they
+        // build their own samples) and prints "target of 0%" here (#1451 F2).
+        assert!(
+            hit.contains("proposal-weighted target of 42%"),
+            "must quote the weighted 42% for this 0.40/0.44 mix: {hit}"
+        );
+        // Parse the realised rate back out and check it really is outside the
+        // band, so a message carrying a wrong number could not pass.
+        let pct: f64 = hit
+            .split("settled at ")
+            .nth(1)
+            .and_then(|s| s.split('%').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no parseable rate in: {hit}"));
+        assert!(pct.is_finite(), "non-finite rate in: {hit}");
+        assert!(
+            pct / 100.0 < MH_RATE_LOW && pct / 100.0 > SAEM_MH_STUCK_ACCEPT,
+            "{pct}% must be inside the gap the old threshold missed: {hit}"
+        );
+
+        // The negative control, same code path and iteration counts: a
+        // sensibly-scaled Ω (realised tail 61.14%) must not trip it. Without
+        // this the assertion above is satisfied by a diagnostic that fires on
+        // everything.
+        let (ok, ok_tail) = scale1444_fit(0.09, 0.04, ScaleAdaptation::Interval);
+        // Pin that the control is silent *because* its rate is inside the band,
+        // not because the fixture happens to miss the tier for some other
+        // reason. Realised: 0.6114.
+        assert!(
+            ok_tail.is_finite() && (MH_RATE_LOW..=MH_RATE_HIGH).contains(&ok_tail),
+            "the control's realised tail {ok_tail:.4} must be inside the band, \
+             or its silence proves nothing"
+        );
+        assert!(
+            !ok.warnings
+                .iter()
+                .any(|w| w.contains("acceptance settled at")),
+            "well-scaled fit must stay silent, got {:?}",
+            ok.warnings
+        );
     }
 
     // ---- #895: block-kernel per-coordinate scaling ----

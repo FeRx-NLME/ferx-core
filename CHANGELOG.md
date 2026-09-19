@@ -153,6 +153,21 @@ section of the SDLC for the versioning policy).
   `CL = TVCL * exp(ETA_CL)`) and NONMEM-style explicit mu syntax
   (`MU_1 = log(TVCL)` then `CL = exp(MU_1 + ETA_CL)`) are now detected, provided the
   intermediate is assigned exactly once and carries no ETA.
+- **SAEM: `[fit_options] scale_adaptation` picks how the MH step scales are adapted**
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)). `interval` (the
+  **default**, and the pre-existing rule) multiplies the per-subject step scale by
+  1.1 / 0.9 every `adapt_interval` iterations; `robbins_monro` steps
+  `log δ += c·k^-0.6·(accept − target)` every iteration. The interval rule's reach is
+  bounded by how often it fires — 8 times on a default 400-iteration run, so at most
+  ≈2.1× up or ≈0.43× down no matter how far off the chain is — and a model whose
+  optimal step is an order of magnitude from the 0.3 start never gets there. On the
+  shipped `examples/warfarin_saem.ferx` that leaves the E-step accepting 3.90% of its
+  proposals against a 40% target for the whole run; `robbins_monro` reaches 42.05% on
+  the same model and seed. It is **opt-in**: the benchmarking in #1444 reports it
+  regressing the final estimate at 3 of 6 seeds on a model whose acceptance was
+  already above target, so the default is unchanged and existing fits keep their
+  current estimates bit-for-bit. The κ (IOV) scales stay on the interval rule under
+  both settings.
 
 ### Changed
 
@@ -231,6 +246,37 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **SAEM now reports an acceptance rate that never reached its target**
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)). The existing mixing
+  warning only fired below 1% cumulative acceptance, so a chain parked at 2–4% for an
+  entire run — which costs real estimate quality — passed in silence; that is exactly
+  what the shipped `examples/warfarin_saem.ferx` does. A combined block + componentwise
+  acceptance outside 10–80% over the **last 100** post-burn-in iterations is now added
+  to `FitResult.warnings`, carrying the realised tail rate, the target, the window
+  length and the cumulative rate, so the run does not have to be repeated with
+  `optimizer_trace` to see how far off it was. The tail rather than the whole-run
+  average is reported, because a run that mixes badly early and recovers averages to a
+  number describing neither half. Runs with fewer than 25 post-burn-in iterations stay
+  quiet, where the realised rate still describes the starting scale.
+- **`FitResult::saem_mh_accept_tail` reports the E-step's realised acceptance.** The
+  combined block + componentwise Metropolis-Hastings rate over the trailing post-burn-in
+  iterations — the exact number the acceptance diagnostic warns on — is now a field, so a
+  caller can check SAEM mixing programmatically instead of parsing a warning string. `None`
+  for non-SAEM methods and for a run that made no post-burn-in proposal
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)).
+- **A concurrent fit no longer voids another fit's optimizer trace.** `fit()` closed the
+  trace unconditionally, but the trace writer is a thread-local and `fit_inner` runs inside a
+  shared Rayon pool — so a fit that never asked for a trace, work-stolen onto a tracing fit's
+  thread, took that fit's writer out from under it and left its `FitResult::trace_path` as
+  `None`. A fit now closes only a trace it opened
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)).
+- **Two fits in the same second no longer share an optimizer-trace file.** With
+  `optimizer_trace = true` the path was `/tmp/ferx_trace_{pid}_{unix_seconds}.csv`, so a
+  script (or a test) fitting two models back to back in one process silently wrote both
+  runs to the same file — the second truncating the first — and `FitResult::trace_path`
+  then pointed at the wrong run's rows. The filename now carries nanoseconds and a
+  per-process counter, so every fit gets its own trace
+  ([#1444](https://github.com/FeRx-NLME/ferx-core/issues/1444)).
 - **SAEM no longer reports the residual σ of a `combined()` model as a single M-step draw.** The θ/σ M-step's σ half was *assigned* outright in both phases once `mstep_damping` defaulted to off ([#1415](https://github.com/FeRx-NLME/ferx-core/issues/1415)), leaving it as the only SAEM statistic with no stochastic approximation at all — Ω has its own capped SA step, and a single free additive/proportional σ has an averaged sufficient statistic. For a well-identified σ that is harmless, but the additive component of `combined(PROP, ADD)` on sparse data is a *minority* variance component whose single-draw maximiser is boundary-heavy: on a 300-subject, median-one-observation simulated fixture the per-M-step σ_add swung between 0.0087 and 2.34 (median 0.035) against a truth of 1.8, and the fit reported whichever value the last iteration drew — 0.011, 0.0025 and 0.011 on three seeds, and 4.3e-4 / 4.5e-4 (the `exp(-8)` optimizer floor) on the two real datasets in the report, *worse* with more iterations. σ now takes a Robbins-Monro step of `min(γ_k, 0.2, γ_θ)` on the **variance** scale — the scale the scalar-σ sufficient statistic already averages on, and not the packed log scale, whose geometric mean is dominated by the near-zero draws (measured: log-scale averaging leaves that fixture's σ_add at 0.47). Measured over 8 seeds: the fixture's σ_add goes 0.011/0.0025/0.011 → 1.42 [1.11, 1.75] against a simulation truth of 1.8 and **NONMEM 7.5.1 SAEM's 1.5425** on the same dataset (new anchor `nonmem_anchor/saem_sparse_combined_saem.ctl`; ferx FOCEI 3.22), and `ferx-testdata/cefepime_jordan` run64 goes ~1e-3 → 1.16 [0.97, 1.34] against NONMEM FOCEI's 1.550 and ferx FOCEI's 1.837 — with the importance-sampled −2 log L at the SAEM estimate *improving* from 4299.5 ± 4.9 to 4295.3 ± 0.9 (three seeds), the Laplace OFV from 4337.0 to 4331.7, and the `covmuref_power` no-ETA θ anchor from #1415 moving closer to NONMEM (`TH_WT` 0.9612 → 0.9026 against 0.9213). The trade is that σ is now an average and therefore lags: read it from a run long enough for it to settle rather than from a short one. σ is never given a larger step than the θ it shares a maximiser with, so a fit that sets `mstep_damping` at or below 0.2 (including the `iiv_on_ruv` default of 0.03) keeps the pair equal throughout exploration and changes only over the four convergence hand-off iterations where `1/(k−k1) > 0.2`. A single-σ additive or proportional model on the averaged-sufficient-statistic path is untouched ([#1445](https://github.com/FeRx-NLME/ferx-core/issues/1445)).
 
 - **A fit restarted mid-descent now runs on the remaining `maxiter` budget and says so.** The [#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277) restart gave its second leg a fresh evaluation budget — measured as 56 evaluations on a `maxiter = 1` (44-evaluation) fit — while documenting that it could not; it now continues on what the stalled leg left, a stall with the budget already spent is reported (with its own "increase maxiter" warning) rather than restarted, and an adopted restart is named in `FitResult.warnings` as an `optimizer_health` entry (it was visible only under `verbose`). Fits that are not restarted are bit-identical ([#1428](https://github.com/FeRx-NLME/ferx-core/issues/1428)).

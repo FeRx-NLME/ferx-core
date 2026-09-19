@@ -35,6 +35,28 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+/// Where a run's optimizer trace is written when `FitOptions::optimizer_trace`
+/// is set.
+///
+/// Unique per call, not merely per process-second. The path used to be
+/// `/tmp/ferx_trace_{pid}_{unix_seconds}.csv`, which two `fit()` calls in the
+/// same process and the same wall-clock second share — and the second one
+/// truncates the first, so a caller fitting several models (or a test running
+/// two fits back to back) silently lost a trace and read the wrong run's rows.
+/// The nanosecond field plus a monotonic counter make each call's path its own,
+/// and the counter is what covers a clock with coarse sub-second resolution.
+fn trace_file_path() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let (secs, nanos) = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("/tmp/ferx_trace_{pid}_{secs}_{nanos:09}_{seq}.csv")
+}
+
 /// Build the `FitResult.neural_networks` summary from the compiled model's
 /// `[covariate_nn]` blocks. Empty when no NN blocks are present, so output
 /// writers can always iterate `result.neural_networks` without branching.
@@ -1123,14 +1145,18 @@ fn fit_inner(
     // whichever Rayon pool is active — scoped pool when threads=Some, else global).
     let n_threads_used = rayon::current_num_threads();
 
-    // Initialise the per-iteration optimizer trace if requested.
+    // Initialise the per-iteration optimizer trace if requested. `finish()`
+    // below is called **only** when this call actually installed a writer: the
+    // trace state is a thread-local and `fit_inner` runs inside a shared Rayon
+    // pool, so a `fit()` that blocks in `install` can have another fit's job
+    // stolen onto its thread. An unconditional `finish()` there takes the
+    // *other* fit's writer out from under it, and that fit's
+    // `FitResult::trace_path` comes back `None` (observed in CI, where enough
+    // fits run concurrently to make it near-certain). A fit that never asked
+    // for a trace now leaves the thread-local alone.
+    let mut trace_installed = false;
     if options.optimizer_trace {
-        let pid = std::process::id();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let path = format!("/tmp/ferx_trace_{}_{}.csv", pid, ts);
+        let path = trace_file_path();
         // Header carries one `val:<name>`/`grad:<name>` column per optimized
         // coordinate. The coordinate structure (and hence the names) is fixed
         // across a method chain, so the template's names serve every stage.
@@ -1146,6 +1172,7 @@ fn fit_inner(
         if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
             pre_run_warnings.push(format!("could not open trace file {}: {}", path, e));
         } else {
+            trace_installed = true;
             pre_run_warnings.push(format!("optimizer trace written to {}", path));
         }
     }
@@ -1739,6 +1766,7 @@ fn fit_inner(
                         warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
                         saem_n_subjects_hmc: None,
+                        saem_mh_accept_tail: None,
                         ebe_convergence_warnings: 0,
                         max_unconverged_subjects: 0,
                         total_ebe_fallbacks: 0,
@@ -1828,6 +1856,7 @@ fn fit_inner(
                     warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
                     saem_n_subjects_hmc: None,
+                    saem_mh_accept_tail: None,
                     ebe_convergence_warnings: 0,
                     max_unconverged_subjects: 0,
                     total_ebe_fallbacks: 0,
@@ -2479,8 +2508,13 @@ fn fit_inner(
         model,
     );
 
-    // Flush and close the trace file; capture path for FitResult.
-    let trace_path = crate::estimation::trace::finish();
+    // Flush and close the trace file; capture path for FitResult. Guarded on
+    // having installed one — see the `trace_installed` comment above.
+    let trace_path = if trace_installed {
+        crate::estimation::trace::finish()
+    } else {
+        None
+    };
 
     // Estimation completed: delete the resume checkpoint (nothing left to
     // resume). Any post-estimation error below still returns Err, but a fresh
@@ -2782,6 +2816,7 @@ fn fit_inner(
         ebe_kappas: result.kappas.clone(),
         saem_mu_ref_m_step_evals_saved: result.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
+        saem_mh_accept_tail: result.saem_mh_accept_tail,
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),
         uses_ode_solver: model.is_ode_based(),
@@ -2978,6 +3013,36 @@ mod bobyqa_scale_warning_tests {
                 bobyqa_scale_warning(opt, BOBYQA_MAX_DIM * 10).is_none(),
                 "{opt:?} must not warn"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod trace_file_path_tests {
+    use super::trace_file_path;
+
+    #[test]
+    fn two_calls_never_share_a_path() {
+        // The regression: the path was `{pid}_{unix_seconds}`, so two fits in
+        // the same second wrote to the same file and the second truncated the
+        // first. A fit takes well under a second on a small model, so this was
+        // reachable from an ordinary two-model script, not only from a test.
+        let a = trace_file_path();
+        let b = trace_file_path();
+        assert_ne!(a, b, "two traces must not share a file");
+        // Still recognisable, and still under /tmp.
+        for p in [&a, &b] {
+            assert!(
+                p.starts_with("/tmp/ferx_trace_") && p.ends_with(".csv"),
+                "unexpected trace path {p}"
+            );
+        }
+        // A thousand calls inside one process-second must all be distinct —
+        // the counter, not the clock, is what guarantees that, so pin it with
+        // more calls than a coarse clock could separate.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(seen.insert(trace_file_path()), "duplicate trace path");
         }
     }
 }
