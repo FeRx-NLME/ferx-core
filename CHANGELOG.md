@@ -46,15 +46,17 @@ section of the SDLC for the versioning policy).
   row validated clean and silently did nothing, usually because the `CMT` column was
   missing or mis-mapped. The warning names the channel and the dead compartments, and
   stays silent on `ferx check` without `--data`. It suggests the missing-`CMT`-column
-  reading only when the data is consistent with it (every observation on compartment 1),
-  and names `[data_selection]` as a cause only for the dead compartments a clause
-  actually emptied. It is also reported by `predict()` and `simulate()`, which dispatch
+  reading only when the reader actually reported one (`W_CMT_DEFAULTED`), so a dataset
+  with a present, correct column is never sent to audit it, and names `[data_selection]`
+  as a cause only for the dead compartments a clause actually emptied. It is also reported by `predict()` and `simulate()`, which dispatch
   through the same per-CMT map.
-- **`ExclusionSummary` gained `obs_cmts_excluded`** — the distinct compartments the
-  observation records a `[data_selection]` clause removed were on, ascending (#1405).
-  The existing `n_obs_excluded` says how many rows went but not what they were, which is
-  the question a per-CMT diagnostic has to answer. **Breaking for struct-literal
-  construction** of `ExclusionSummary`; reading it is unchanged.
+- **`ExclusionSummary` gained `obs_cmts_excluded`** — the distinct compartments of the
+  excluded records `n_obs_excluded` counts, ascending (#1405). The count says how many
+  rows went but not what they were, which is the question a per-CMT diagnostic has to
+  answer. Note it is not the same set as `Subject::obs_cmts`: classification happens
+  where the filter runs, before the reader decides whether a row becomes a scored
+  observation. **Breaking for struct-literal construction** of `ExclusionSummary`;
+  reading it is unchanged.
 - **VI now applies covariate-NN (DCM) regularization (`nn_l2` / `nn_smooth`).** The
   same weight penalty the FOCE-family methods apply is folded into VI's Adam step, so a
   `method = vi` fit of a `[covariate_nn]` model is no longer silently unregularized (and

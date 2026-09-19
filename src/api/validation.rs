@@ -231,6 +231,15 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         return Vec::new();
     }
 
+    // `obs_cmts` is the **Gaussian** grid only: a row on a declared TTE / discrete-state
+    // / count endpoint is routed to `Subject::obs_records` and never lands here, so a
+    // compartment carrying nothing but non-Gaussian observations reads as unobserved and
+    // its declared entry is reported (#1456 review r2). Named rather than fixed, because
+    // fixing it here is the wrong shape: `check_per_cmt_error_model` reads the same field
+    // and has the same blind spot in the safe direction (it under-reports where this
+    // over-reports), so the two should gain endpoint awareness together, in the accessor,
+    // not one-off in this walk. No fixture can currently see it either — the tests read
+    // through the model-blind `read_nonmem_csv`, which runs no endpoint routing at all.
     let mut observed: BTreeSet<usize> = BTreeSet::new();
     for subj in &population.subjects {
         observed.extend(subj.obs_cmts.iter().copied());
@@ -259,23 +268,32 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
     // The advice half depends on the data and not on the channel, so it is built once,
     // outside the loop.
     //
-    // **Gated, because the missing-column reading is not always true.** `{1}` is exactly
-    // what the reader defaults a column-less dataset to (`W_CMT_DEFAULTED`, #1009), so
-    // it is the one set for which "a missing or mis-mapped CMT column keys every
-    // observation to compartment 1" is a live hypothesis. With observations on
-    // compartment 2 the column is present, correct and being read, and the sentence sent
-    // the user to audit the one thing that was right — measured on the PR's own *after*
-    // block, which is that case (#1456 review r1).
+    // **Gated on the reader's own finding, not on a symptom of it.** The sentence asserts
+    // something about the `CMT` *column* — that it is missing or mis-mapped — and the
+    // reader already decided exactly that and said so in `W_CMT_DEFAULTED` (#1009). Two
+    // earlier spellings of this gate tested the observed set instead, which is a proxy:
+    // `observed == {1}` (#1456 review r1) and then `observed ∪ excluded == {1}` (r1's own
+    // residual). Both are true of a dataset with a **present, correct, all-`1` column**,
+    // which is the ordinary `predict()` shape and the PR's own stated legitimate case —
+    // "a scaling block shared across studies may legitimately declare more compartments
+    // than one dataset exercises". Measured in review r2: that dataset and a column-less
+    // one produce byte-identical messages while `W_CMT_DEFAULTED` is `false` / `true`
+    // across the pair. Reading the reader's verdict removes the false case rather than
+    // relabelling it, and costs no signature change — `population.warnings` is already in
+    // hand.
     //
-    // The set tested is `observed ∪ excluded`, not `observed`: every scored observation
-    // the *file* carried, kept or dropped. A `[data_selection]` clause that removed the
-    // CMT-3 rows leaves `observed == {1}` on a dataset whose column plainly does carry a
-    // 3, and `obs_cmts_excluded` is the evidence that refutes the hypothesis — measured
-    // end to end, where the filter note correctly named compartment 3 while the advice
-    // half was still telling the user to go and check the column.
-    let mut seen = observed.clone();
-    seen.extend(filtered_cmts.iter().copied());
-    let advice = if seen.len() == 1 && seen.contains(&1) {
+    // Matched on the code prefix because `Population::warnings` is `Vec<String>` and
+    // carries no structured code; that is the same key `reader_warning_suppressed` and
+    // `non_fit_diagnostics` use on this field. Known residual, deliberately left: the
+    // reader also raises `W_CMT_DEFAULTED` when only *dose* rows were defaulted
+    // (`cmt_defaults.record_dose`), so this is still slightly broader than "observations
+    // were defaulted". It is strictly better than the set-shaped gate — it has no measured
+    // false case — and splitting dose from observation defaulting is a reader-side change.
+    let cmt_defaulted = population
+        .warnings
+        .iter()
+        .any(|w| w.starts_with("W_CMT_DEFAULTED"));
+    let advice = if cmt_defaulted {
         "The usual cause is on the data side: a missing or mis-mapped CMT column keys \
          every observation to compartment 1. Check the CMT column, or delete the unused \
          entries."
@@ -306,26 +324,61 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
             .copied()
             .filter(|c| filtered_cmts.contains(c))
             .collect();
+        // What the note may claim is bounded by what `obs_cmts_excluded` actually
+        // records, which is the compartments of the rows the reader *classified* as
+        // observations when the filter removed them — the same bucket `n_obs_excluded`
+        // counts. That is **not** the same set as `Subject::obs_cmts`: a row with
+        // `EVID=0, MDV=0` but `DV = .` is classified here and then skipped by
+        // `MissingDvPolicy::Skip` before it ever becomes an observation, and a row on a
+        // declared TTE / discrete / count endpoint is routed to `obs_records` instead.
+        // Measured in review r2: `obs_cmts_excluded == [2]` on a dataset whose CMT-2 rows
+        // are all `DV = .`, where the *unfiltered* read reports entry 2 dead — so the
+        // earlier wording, "so that entry is exercised by the unfiltered dataset", was
+        // false exactly where it was doing the work.
+        //
+        // Narrowing the recording instead would mean re-deciding "would this row have
+        // been scored" at the filter site, a second copy of a predicate the reader owns
+        // two hundred lines down — the arrangement CLAUDE.md's "when two implementations
+        // disagree, the fix is one implementation" rule exists to prevent. So the field
+        // keeps recording what it can honestly see, and the sentence claims only that.
+        // The intersection is untouched and is what the field is for: without it,
+        // `ignore = CMT == 3` was named as the cause of a dead `[CMT=2]` entry.
+        let entries = if blamed.len() == 1 {
+            "that entry"
+        } else {
+            "those entries"
+        };
         let filter_note = if blamed.is_empty() {
             String::new()
         } else {
             format!(
-                " A `[data_selection]` clause removed every scored observation on \
-                 compartment(s) {} from this read, so {} entry is exercised by the \
-                 unfiltered dataset.",
+                " A `[data_selection]` clause removed record(s) the reader classed as \
+                 observations on compartment(s) {}, so check the unfiltered dataset \
+                 before deleting {entries}.",
                 join_cmts(&blamed),
-                if blamed.len() == 1 { "that" } else { "those" },
             )
         };
+        // When the filter accounts for *every* unmatched entry the finding is already
+        // fully explained, and the advice half — which ends "or delete them" — would
+        // contradict the sentence above it, which has just said to check before deleting
+        // (#1456 review r2, finding 4). `advice` is loop-invariant and cannot know this,
+        // so the decision is made here, per channel, where `blamed` and `unmatched` are
+        // both in scope.
+        let advice_applies = blamed.len() != unmatched.len();
         diags.push(
             Diagnostic::warning(
                 "W_PER_CMT_UNMATCHED",
                 format!(
                     "W_PER_CMT_UNMATCHED: `{syntax}` declares compartment(s) {} that no \
                      observation is recorded on (observed: {}). Those entries are inert — \
-                     nothing dispatches to them.{filter_note} {advice}",
+                     nothing dispatches to them.{filter_note}{}",
                     join_cmts(&unmatched),
                     join_cmts(&observed.iter().copied().collect::<Vec<_>>()),
+                    if advice_applies {
+                        format!(" {advice}")
+                    } else {
+                        String::new()
+                    },
                 ),
             )
             .with_block(block),

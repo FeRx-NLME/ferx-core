@@ -174,10 +174,12 @@ impl Excluder<'_> {
 /// Per-subject exclusion counts returned by `parse_subject` when a filter is active.
 pub(crate) struct SubjectExclusion {
     pub n_obs_excluded: usize,
-    /// The **resolved** compartments those excluded observation rows were on — the
-    /// same value `Subject::obs_cmts` would have carried had the row survived, so the
-    /// two sets are comparable (`resolve_row_cmt` feeds the filter's `RowContext` the
-    /// defaulted value, see its doc). Empty when no scored observation was removed.
+    /// The **resolved** compartments of the excluded rows counted in
+    /// [`Self::n_obs_excluded`] — `resolve_row_cmt` feeds the filter's `RowContext` the
+    /// defaulted value, so these are on the same footing as `Subject::obs_cmts` even
+    /// though they are not the same *set*: a row classified here can still fail to
+    /// become an observation later (`DV = .` under `MissingDvPolicy::Skip`, or a row
+    /// routed to an endpoint). See `ExclusionSummary::obs_cmts_excluded`.
     pub obs_cmts: std::collections::BTreeSet<usize>,
     pub n_dose_excluded: usize,
     /// Records excluded that are neither scored obs nor doses (EVID 2/3, or

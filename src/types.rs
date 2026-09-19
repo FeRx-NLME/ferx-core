@@ -1349,16 +1349,25 @@ pub struct ExclusionSummary {
     pub excluded_subject_ids: Vec<String>,
     /// Number of observation records (EVID==0, MDV==0) excluded.
     pub n_obs_excluded: usize,
-    /// The distinct **resolved** compartments those excluded observation records were
-    /// on, ascending — the same values `Subject::obs_cmts` carries for the rows that
-    /// survived, so the two are directly comparable. Empty when the clauses removed no
-    /// scored observation.
+    /// The distinct **resolved** compartments of the excluded records this same summary
+    /// counts in [`Self::n_obs_excluded`], ascending. Empty when the clauses removed no
+    /// such record.
     ///
-    /// The count alone cannot say *what* a filter took away, and that is the question
-    /// a per-CMT diagnostic has to answer: `W_PER_CMT_UNMATCHED` names
-    /// `[data_selection]` as a possible cause only when a compartment it removed is one
-    /// of the unmatched entries, so `ignore = CMT == 3` is not offered as the reason a
-    /// `[CMT=2]` entry is dead (#1405).
+    /// The count alone cannot say *what* a filter took away, and that is the question a
+    /// per-CMT diagnostic has to answer: `W_PER_CMT_UNMATCHED` names `[data_selection]`
+    /// as a possible cause only when a compartment it removed is one of the unmatched
+    /// entries, so `ignore = CMT == 3` is not offered as the reason a `[CMT=2]` entry is
+    /// dead (#1405).
+    ///
+    /// **Not the same set as `Subject::obs_cmts`**, and the difference is not an
+    /// oversight. Classification happens where the filter runs, before the reader has
+    /// decided whether a row becomes a scored observation: an `EVID=0, MDV=0` row whose
+    /// `DV` is `.` is counted here and then dropped by
+    /// [`MissingDvPolicy::Skip`](crate::io::datareader::MissingDvPolicy), and a row on a
+    /// declared TTE / discrete-state / count endpoint is routed to `Subject::obs_records`
+    /// instead. Re-deciding that here would be a second copy of a predicate the reader
+    /// owns, so this field reports what it can see and its consumers claim no more than
+    /// that (#1456 review r2).
     pub obs_cmts_excluded: Vec<usize>,
     /// Number of dose records (EVID 1/4) excluded.
     pub n_dose_excluded: usize,

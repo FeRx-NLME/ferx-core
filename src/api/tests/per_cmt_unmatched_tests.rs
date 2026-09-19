@@ -39,6 +39,23 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 2,4,4.8,0,.,1,0
 ";
 
+/// The same three records with **no `CMT` column at all** — the dataset
+/// `W_CMT_DEFAULTED` exists for, and the only one the missing-column advice is true of.
+///
+/// Review r2's finding: every CSV in this file carried a `CMT` column, so the test named
+/// `..._only_when_the_data_reads_column_less` never read a column-less dataset. It
+/// straddled `observed == {1}` — a *symptom* of a defaulted column — between two datasets
+/// that both have one.
+const OBS_NO_CMT_COLUMN: &str = "\
+ID,TIME,DV,EVID,AMT,MDV
+1,0,.,1,100,1
+1,1,8.0,0,.,0
+1,4,5.0,0,.,0
+2,0,.,1,100,1
+2,1,7.5,0,.,0
+2,4,4.8,0,.,0
+";
+
 /// Observations on compartment **2** only — the mirror of `OBS_CMT1_ONLY`, and the
 /// set on which the "your CMT column is missing" advice is false: the column is
 /// present, correct, and being read.
@@ -786,8 +803,19 @@ fn the_missing_column_advice_is_offered_only_when_the_data_reads_column_less() {
     let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
     assert_only_live_channel(&m, CmtConsumer::PerCmtScaling);
 
-    // Observed {1} — reads exactly like a dataset with no CMT column.
-    let on = unmatched_messages(&m, &population(OBS_CMT1_ONLY));
+    // The column really is absent, and the reader says so. Asserted rather than assumed:
+    // review r2 measured that the old fixture pair straddled a *symptom* of a defaulted
+    // column between two datasets that both had one, so the pair could not fail.
+    let column_less = population(OBS_NO_CMT_COLUMN);
+    assert!(
+        column_less
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "this side of the pair must be the column-less case the reader reports: {:?}",
+        column_less.warnings
+    );
+    let on = unmatched_messages(&m, &column_less);
     assert_eq!(on.len(), 1, "expected one finding, got {on:?}");
     assert!(
         on[0].contains("(observed: 1)"),
@@ -796,8 +824,43 @@ fn the_missing_column_advice_is_offered_only_when_the_data_reads_column_less() {
     );
     assert!(
         on[0].contains(COLUMN_ADVICE),
-        "observed {{1}} is the case the column advice is true of: {}",
+        "a column-less dataset is the case the column advice is true of: {}",
         on[0]
+    );
+
+    // The case review r2 measured as a false positive, and the reason the gate moved
+    // off the observed set: a **present, correct, all-`1`** column. `observed == {1}` and
+    // `observed ∪ excluded == {1}` are both true here, so either earlier gate offers the
+    // column advice — and this is the ordinary `predict()` shape and the PR's own stated
+    // legitimate case, a shared `[scaling]` block declaring more than one dataset uses.
+    let present_all_ones = population(OBS_CMT1_ONLY);
+    assert!(
+        !present_all_ones
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        "this side must have a present, correct column: {:?}",
+        present_all_ones.warnings
+    );
+    let present = unmatched_messages(&m, &present_all_ones);
+    assert_eq!(present.len(), 1, "expected one finding, got {present:?}");
+    assert!(
+        present[0].contains("(observed: 1)"),
+        "and must observe exactly {{1}}, or it is not the confusable case: {}",
+        present[0]
+    );
+    assert!(
+        !present[0].contains(COLUMN_ADVICE),
+        "the column is present and correct — the advice must not be offered: {}",
+        present[0]
+    );
+    // The straddle itself. These two observe the *same* set and differ only in whether
+    // the column exists, so a gate keyed on the observed set makes them identical — which
+    // is exactly what review r2 measured (`assert_eq!` passed).
+    assert_ne!(
+        on[0], present[0],
+        "the column-less and column-present messages must differ; equal means the gate \
+         is reading a symptom again"
     );
 
     // Observed {2} — same block, same declared set, a column that is being read.
@@ -878,13 +941,13 @@ fn a_filter_is_blamed_only_for_the_compartments_it_emptied() {
         "both entries are now unmatched: {msg}"
     );
     assert!(
-        msg.contains("removed every scored observation on compartment(s) 3 "),
+        msg.contains("observations on compartment(s) 3, so check"),
         "the filter must be named for compartment 3, which it emptied: {msg}"
     );
-    // The finding itself. A note reading "compartment(s) 2, 3" — the whole unmatched
-    // list rather than the intersection — is the defect review r1 measured.
+    // The finding itself. A note naming "compartment(s) 2, 3" — the whole unmatched list
+    // rather than the intersection — is the defect review r1 measured.
     assert!(
-        !msg.contains("compartment(s) 2, 3 from this read"),
+        !msg.contains("observations on compartment(s) 2, 3,"),
         "the filter must NOT be blamed for entry 2, which it never touched: {msg}"
     );
 }
@@ -929,27 +992,31 @@ fn a_filter_that_emptied_no_declared_compartment_is_not_blamed_at_all() {
 }
 
 #[test]
-fn the_missing_column_advice_is_withdrawn_when_the_filter_shows_the_column_carries_others() {
-    // The residual of finding 1 that only became reachable once finding 3 recorded the
-    // excluded compartments, and it was measured through the CLI rather than reasoned
-    // about: declared {1,2,3}, observed {1,3}, `ignore = CMT == 3`. After the filter
-    // `observed == {1}`, so the gate on `observed` alone fired and the message read
+fn the_missing_column_advice_stays_withdrawn_on_a_filtered_read_of_a_column_bearing_file() {
+    // A regression pin on a gate that has been wrong twice, kept because it is the case
+    // that breaks *both* discarded spellings while looking innocuous.
+    //
+    // History, since the name changed with the gate. The first gate tested
+    // `observed == {1}`; this fixture defeats it, because after `ignore = CMT == 3` the
+    // observed set really is `{1}` on a file whose column plainly carries a 3, and the
+    // message read
     //
     //   "... A `[data_selection]` clause removed every scored observation on
     //    compartment(s) 3 ... The usual cause is ... a missing or mis-mapped CMT column
     //    keys every observation to compartment 1. Check the CMT column ..."
     //
-    // — two sentences of one message contradicting each other. `obs_cmts_excluded = {3}`
-    // is proof the column carries a 3, so the column hypothesis is refuted by data the
-    // check is holding. The gate now tests `observed ∪ excluded`: every scored
-    // observation the *file* carried, kept or dropped.
+    // — two sentences of one message contradicting each other. The second gate widened
+    // to `observed ∪ excluded`, which this fixture passes.
     //
-    // Straddle: the same clause against a dataset that really is column-less cannot be
-    // built (a clause naming CMT needs the column), so the other side of the pair is the
-    // *unfiltered* read of this same file, which leaves `observed == {1, 3}` and must
-    // also withhold the advice — and `the_missing_column_advice_is_offered_only_when_the_data_reads_column_less`
-    // holds the `{1}`-side. What this pins is that the union, not `observed`, is what is
-    // tested: a gate on `observed` alone passes that test and fails this one.
+    // Review r2 then showed the second gate was the same mistake one step out: both are
+    // *symptoms* of a defaulted `CMT` column rather than the column's state, and a
+    // present, correct, all-`1` column satisfies either. The gate now reads the reader's
+    // own `W_CMT_DEFAULTED`, and the pair that pins it lives in
+    // `the_missing_column_advice_is_offered_only_when_the_data_reads_column_less`.
+    //
+    // What this test still pins, and why it survives its own rationale: a future gate
+    // that goes back to keying on the observed set fails *here* and passes there, because
+    // here `observed == {1}` arises from filtering rather than from the data.
     const COLUMN_ADVICE: &str = "missing or mis-mapped CMT column";
     let m = per_cmt_scaling_model(
         "  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500",
@@ -981,13 +1048,13 @@ fn the_missing_column_advice_is_withdrawn_when_the_filter_shows_the_column_carri
         "the observed set really is {{1}} here: {msg}"
     );
     assert!(
-        msg.contains("removed every scored observation on compartment(s) 3 "),
+        msg.contains("observations on compartment(s) 3, so check"),
         "the filter note must still name compartment 3: {msg}"
     );
     assert!(
         !msg.contains(COLUMN_ADVICE),
-        "the excluded set proves the column carries a 3, so the column hypothesis must \
-         not be offered: {msg}"
+        "the file has a CMT column and the reader did not default it, so the column \
+         hypothesis must not be offered: {msg}"
     );
 }
 
@@ -1121,5 +1188,200 @@ fn predict_and_simulate_report_it_too() {
         .iter()
         .any(|w| w.contains(CODE)),
         "simulate() must stay silent when every entry is exercised"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the filter note may claim (#1456 review r2, findings 2, 3 and 4)
+// ---------------------------------------------------------------------------
+
+/// `EVID=0, MDV=0` rows whose `DV` is `.` — classified as observations where the filter
+/// runs, then dropped by `MissingDvPolicy::Skip` before they become any.
+const DV_DOT_ON_CMT2: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,8.0,0,.,1,0
+1,4,5.0,0,.,1,0
+1,1,.,0,.,2,0
+1,4,.,0,.,2,0
+";
+
+/// Observations on 1, 2 and 3 — the fixture that can put **two** compartments in `blamed`.
+const OBS_CMT_1_2_3: &str = "\
+ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,.,1,100,1,1
+1,1,8.0,0,.,1,0
+1,1,0.9,0,.,2,0
+1,4,0.6,0,.,3,0
+2,0,.,1,100,1,1
+2,1,7.5,0,.,1,0
+2,1,0.8,0,.,2,0
+2,4,0.5,0,.,3,0
+";
+
+/// `filtered_population` with more than one clause.
+fn filtered_population_multi(model: &CompiledModel, body: &str, ignores: &[&str]) -> Population {
+    let f = csv(body);
+    let owned: Vec<String> = ignores.iter().map(|s| s.to_string()).collect();
+    let filter = SelectionFilter::from_opts(&owned, &[], &[]).expect("clauses parse");
+    crate::api::read_population_for(
+        model,
+        &None,
+        f.path().to_str().unwrap(),
+        None,
+        None,
+        Some(&filter),
+        &[],
+    )
+    .expect("filtered read")
+    .0
+}
+
+#[test]
+fn the_filter_note_does_not_claim_the_removed_rows_would_have_been_scored() {
+    // Review r2, finding 2. `obs_cmts_excluded` is filled where the filter runs, which is
+    // before the reader decides whether a row becomes a scored observation. A row with
+    // `EVID=0, MDV=0` and `DV = .` is counted there and then skipped, so the set can name
+    // a compartment that carries no observation even unfiltered.
+    //
+    // The control is the unfiltered read of the same file, which is the refutation the
+    // old wording printed next to itself: entry 2 is dead *without* the filter, so
+    // "that entry is exercised by the unfiltered dataset" was false exactly where it was
+    // load-bearing.
+    let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
+    let unfiltered = unmatched_messages(&m, &population(DV_DOT_ON_CMT2));
+    assert_eq!(
+        unfiltered.len(),
+        1,
+        "expected one finding, got {unfiltered:?}"
+    );
+    assert!(
+        unfiltered[0].contains("declares compartment(s) 2 "),
+        "entry 2 must be dead even unfiltered, or this proves nothing: {}",
+        unfiltered[0]
+    );
+
+    let pop = filtered_population(&m, DV_DOT_ON_CMT2, "CMT == 2");
+    let excl = pop
+        .exclusions
+        .as_ref()
+        .expect("a filtered read records its exclusions");
+    assert_eq!(
+        excl.obs_cmts_excluded,
+        vec![2],
+        "the clause must put compartment 2 in the excluded set — the whole point is that \
+         it lands there although no observation was ever on it: {excl:?}"
+    );
+
+    let msgs = unmatched_messages(&m, &pop);
+    assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
+    assert!(
+        msgs[0].contains("removed record(s) the reader classed as observations"),
+        "the note must say what the field actually records: {}",
+        msgs[0]
+    );
+    assert!(
+        !msgs[0].contains("is exercised by the unfiltered dataset")
+            && !msgs[0].contains("are exercised by the unfiltered dataset"),
+        "and must not assert the entry is live, which the unfiltered read above \
+         disproves: {}",
+        msgs[0]
+    );
+}
+
+#[test]
+fn the_filter_note_agrees_in_number_with_the_compartments_it_names() {
+    // Review r2, finding 3, and the first defect found by the rule this PR adds to
+    // CLAUDE.md: deleting the plural spelling killed no test, because both existing
+    // filter tests put exactly one compartment in `blamed`. The old text read
+    // "so those entry is exercised".
+    //
+    // Straddle: one clause and two clauses on the same file and the same block, so the
+    // only thing that changes is how many compartments are blamed.
+    let m = per_cmt_scaling_model(
+        "  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500",
+    );
+
+    let one = filtered_population_multi(&m, OBS_CMT_1_2_3, &["CMT == 2"]);
+    assert_eq!(
+        one.exclusions.as_ref().unwrap().obs_cmts_excluded,
+        vec![2],
+        "singular side must blame exactly one compartment"
+    );
+    let singular = unmatched_messages(&m, &one);
+    assert_eq!(singular.len(), 1, "expected one finding, got {singular:?}");
+    assert!(
+        singular[0].contains("compartment(s) 2, so check") && singular[0].contains("that entry"),
+        "singular: {}",
+        singular[0]
+    );
+
+    let two = filtered_population_multi(&m, OBS_CMT_1_2_3, &["CMT == 2", "CMT == 3"]);
+    assert_eq!(
+        two.exclusions.as_ref().unwrap().obs_cmts_excluded,
+        vec![2, 3],
+        "plural side must blame two compartments, or the branch is not reached"
+    );
+    let plural = unmatched_messages(&m, &two);
+    assert_eq!(plural.len(), 1, "expected one finding, got {plural:?}");
+    assert!(
+        plural[0].contains("compartment(s) 2, 3, so check") && plural[0].contains("those entries"),
+        "plural: {}",
+        plural[0]
+    );
+    // The defect itself, spelled out so a regression cannot pass by being merely
+    // different: no mixed number anywhere in either message.
+    for msg in [&singular[0], &plural[0]] {
+        assert!(
+            !msg.contains("those entry") && !msg.contains("that entries"),
+            "number must agree: {msg}"
+        );
+    }
+}
+
+#[test]
+fn a_finding_the_filter_fully_explains_does_not_also_say_to_delete_the_entries() {
+    // Review r2, finding 4. When every unmatched entry is one the filter emptied, the
+    // finding is already fully accounted for — and the advice half ends "or delete them",
+    // contradicting the sentence before it, which says to check the unfiltered dataset
+    // first. `advice` is loop-invariant and cannot see `blamed`, so the suppression is
+    // decided per channel.
+    //
+    // Straddle: the same file and the same clause against two blocks. With `[CMT=2]` and
+    // `[CMT=3]` declared, the filter explains both and the advice is dropped. Add
+    // `[CMT=4]`, which the dataset never carries and no clause touches, and the advice
+    // returns — because now something is unexplained.
+    let filtered = |declared: &str| {
+        let m = per_cmt_scaling_model(declared);
+        let pop = filtered_population_multi(&m, OBS_CMT_1_2_3, &["CMT == 2", "CMT == 3"]);
+        let msgs = unmatched_messages(&m, &pop);
+        assert_eq!(msgs.len(), 1, "expected one finding, got {msgs:?}");
+        msgs[0].clone()
+    };
+
+    let fully =
+        filtered("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500");
+    assert!(
+        fully.contains("declares compartment(s) 2, 3 ")
+            && fully.contains("compartment(s) 2, 3, so check"),
+        "the filter must account for every unmatched entry on this side: {fully}"
+    );
+    assert!(
+        !fully.contains("delete them") && !fully.contains("delete the unused entries"),
+        "a fully explained finding must not also tell the user to delete the entries: \
+         {fully}"
+    );
+
+    let partly = filtered(
+        "  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000\n  obs_scale[CMT=3] = 500\n  obs_scale[CMT=4] = 250",
+    );
+    assert!(
+        partly.contains("declares compartment(s) 2, 3, 4 ")
+            && partly.contains("compartment(s) 2, 3, so check"),
+        "the other side must leave entry 4 unexplained: {partly}"
+    );
+    assert!(
+        partly.contains("delete them"),
+        "and must still give the advice, or the suppression is unconditional: {partly}"
     );
 }
