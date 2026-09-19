@@ -954,6 +954,15 @@ fn run_inner_loop_and_nll(
     (etas, h_matrices, stats, kappas, nll)
 }
 
+fn skip_duplicate_laplace_terminal_capture() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERX_NO_LAPLACE_GRADIENT_CAPTURE_SKIP")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+    })
+}
+
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
 /// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
@@ -985,14 +994,15 @@ fn run_inner_loop_and_nll_prepared(
         // would be a full provider pass per subject thrown away.
         let policy = InnerSolvePolicy {
             seed: InnerHessianSeed::for_options(options),
-            capture_terminal_hessian: agq_gradient_inputs.is_none()
+            capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture()
+                || agq_gradient_inputs.is_none())
                 && matches!(options.hessian_anchor(), HessianAnchor::Exact),
         };
-        let take_terminal_hessian =
+        let take_terminal_work =
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
-                ebe.terminal_hessian.clone()
+                (ebe.terminal_hessian.clone(), ebe.nll)
             };
-        let (etas, h_matrices, stats, kappas, terminal_hessians) = match schedules {
+        let (etas, h_matrices, stats, kappas, terminal_work) = match schedules {
             Some(cache) => crate::estimation::inner_optimizer::run_inner_loop_warm_map_cached(
                 model,
                 population,
@@ -1005,7 +1015,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.inner_restarts,
                 cache,
                 policy,
-                take_terminal_hessian,
+                take_terminal_work,
             ),
             None => crate::estimation::inner_optimizer::run_inner_loop_warm_map(
                 model,
@@ -1018,7 +1028,7 @@ fn run_inner_loop_and_nll_prepared(
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 policy,
-                take_terminal_hessian,
+                take_terminal_work,
             ),
         };
         let n_nodes = options.agq_nodes().expect("AGQ branch");
@@ -1036,6 +1046,7 @@ fn run_inner_loop_and_nll_prepared(
                 n_nodes,
                 options.hessian_anchor(),
                 cache,
+                &terminal_work,
             ),
             None => crate::estimation::agq::agq_population_evaluate(
                 model,
@@ -1062,7 +1073,7 @@ fn run_inner_loop_and_nll_prepared(
                     n_nodes,
                     options.hessian_anchor(),
                     schedules,
-                    Some(&terminal_hessians),
+                    Some(&terminal_work),
                 )
             },
             |evaluation| evaluation.nll,
@@ -3449,6 +3460,7 @@ fn optimize_nlopt_once(
     // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
+    crate::estimation::inner_optimizer::set_capture_terminal_hessian(false);
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x0,
