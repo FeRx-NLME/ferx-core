@@ -1802,6 +1802,17 @@ pub(crate) fn check_dose_compartments(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
+    // A compartment-free model (#811) applies no dose on any engine, and its
+    // `pk_model` is the `one_cpt_iv` **placeholder** the parser installs for the
+    // class — so a `CMT=2` dose would be rejected as out of that placeholder's
+    // range, with a message about an analytical model the user never wrote
+    // (#1443 review). Nothing here can be routed or dropped; the dose records are
+    // reported once, model-wide, by `W_COMPARTMENT_FREE_DOSES` in
+    // `check_model_data_warnings`. Placed ahead of the analytical-only gate below
+    // because `population_uses_analytical_pk` is true for this class (no endpoints).
+    if model.is_algebraic() {
+        return Vec::new();
+    }
     let pk_model = model.pk_model;
     let topology = pk_model.topology();
     let name = pk_model.canonical_name();
@@ -5409,7 +5420,8 @@ pub fn check_model_data_warnings(
 
     // A compartment-free model (#811) has nothing for a dose to land in, so every
     // dose record the reader parsed is silently dropped from the prediction —
-    // the reader is model-blind and cannot know. Say so once, with the count,
+    // the reader is model-blind and cannot know. Say so once, with the count
+    // (dose *events*, i.e. after ADDL expansion — what `subject.doses` holds),
     // rather than let a `$PRED`-style dataset that still carries `EVID=1` rows
     // (or a `RATE=-2` row whose `D1` the model cannot consume, #1443) look as if
     // it were being dosed. A dose-free dataset is this model class's normal
@@ -5426,11 +5438,12 @@ pub fn check_model_data_warnings(
             diags.push(Diagnostic::warning(
                 "W_COMPARTMENT_FREE_DOSES",
                 format!(
-                    "{n_doses} dose record(s) across {n_subjects} subject(s) are ignored: the \
-                     [structural_model] is compartment-free ($PRED-equivalent), so no dose is \
-                     applied and `AMT` / `RATE` / `SS` on those rows have no effect on the \
-                     prediction. Drop the dose rows, or declare a compartment model \
-                     (`pk NAME(...)` / `ode(states=[...])`) if the doses are meant to act."
+                    "{n_doses} dose event(s) (after ADDL expansion) across {n_subjects} \
+                     subject(s) are ignored: the [structural_model] is compartment-free \
+                     ($PRED-equivalent), so no dose is applied and `AMT` / `RATE` / `SS` / \
+                     `CMT` on those rows have no effect on the prediction. Drop the dose rows, \
+                     or declare a compartment model (`pk NAME(...)` / `ode(states=[...])`) if \
+                     the doses are meant to act."
                 ),
             ));
         }

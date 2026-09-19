@@ -5072,10 +5072,14 @@ pub fn parse_full_model_with(
     // deliberate choice: it covers *every* block uniformly — including ones whose
     // references aren't retained as walkable ASTs at this point (`[output]`,
     // `[scaling]`, …) — so it cannot false-positive by overlooking a usage site.
-    // It iterates `blocks.values()` = the *unnamed* blocks only; this is safe
-    // because individual-parameter names are confined to unnamed blocks (named
-    // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
-    // covariates, never indiv params — so a param can't be "used" solely there).
+    // It iterates `blocks.values()` = the *unnamed* blocks only. `[covariate_nn
+    // NAME]` blocks reference thetas/etas/covariates, never indiv params. A named
+    // `[event_model LABEL]` / `[binary_model LABEL]` predictor CAN read an
+    // individual parameter (`restrict_and_validate_indiv_stmts` keeps exactly the
+    // statements it reads), and those blocks are not tokenised here — so a
+    // parameter read *only* by a named endpoint block is reported dead. That is a
+    // pre-existing false positive of this census (joint `pk`/ODE + named hazard),
+    // reachable for compartment-free models too since #1443; tracked in #1455.
     if !pk_param_map.is_empty() || is_ode || is_algebraic {
         let mut token_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();

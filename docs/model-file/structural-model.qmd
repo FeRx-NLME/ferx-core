@@ -197,9 +197,10 @@ on (dose, arm size, a study-level flag), and the column then becomes required.
 There are no compartments, so there is nothing to dose and nothing to integrate.
 The dataset needs no `AMT` column and normally has no dose records at all; if it
 carries some anyway (a `$PRED` dataset that kept its `EVID=1` rows, say), they are
-not applied, and the model/data check says so once, with counts
-(`W_COMPARTMENT_FREE_DOSES`). The following are rejected by name rather than
-silently ignored:
+not applied — whatever their `AMT`, `RATE`, `SS` or `CMT` — and the model/data
+check says so once, with the dose-event and subject counts
+(`W_COMPARTMENT_FREE_DOSES`); no dose-level error is raised for them. The
+following are rejected by name rather than silently ignored:
 
 | | Why |
 |---|---|
