@@ -6575,6 +6575,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_missing_dv") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.contains("no dose is applied") {
+        // #1443: dose records on a compartment-free model, from
+        // `check_model_data_warnings`. `fit()` pushes the message without its
+        // `W_` code, so the route is the phrase — placed with the other data-quality
+        // arms so ferx-r's remediation table (keyed on the category) finds it.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_cmt_defaulted") {
         // #1009: rows whose compartment the reader chose because the dataset did
         // not say. Matched on its `W_` token and placed with the other reader
