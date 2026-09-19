@@ -468,7 +468,7 @@ section of the SDLC for the versioning policy).
   `dη̂/dx`, eliminating one full sensitivity traversal per subject-gradient
   evaluation. This removes 9.9% of provider calls and lowers median CPU by 2.2–3.0%
   across diagonal-Ω, block-Ω, and ODE fixtures without changing the objective or
-  gradient (#1467).
+  gradient (#1469).
 
 - **One-node Laplace no longer repeats work already completed at the EBE mode.**
   Fused objective/gradient evaluations avoid capturing an exact terminal Hessian that
