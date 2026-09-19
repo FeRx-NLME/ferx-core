@@ -378,7 +378,10 @@ worth knowing before you rely on it. `cargo clippy` exits 0 on warn-level
 findings, so only two things redden the job: clippy's deny-by-default
 `correctness` group, and rustc's `unused` group, which `tools/preflight.sh`
 denies explicitly (`-Dunused`, #1470). That covers the leftovers a refactor drops — an
-orphaned `use`, a field nothing reads, a variable nothing consumes. The rest of
+orphaned `use`, a field nothing reads, a variable nothing consumes — and, because
+`-D` on a *group* also promotes its allow-by-default members, a `macro_rules!` arm
+nothing invokes. It does not cover a `pub` item nobody calls, since `dead_code` never
+fires on one, nor anything compiled out of the `ci,markov,nn` feature set. The rest of
 clippy's warn-level surface (style, complexity, pedantic-adjacent perf lints) is
 advisory: it is printed, it does not fail, and a green `Clippy` job is therefore
 not a warning-free tree.

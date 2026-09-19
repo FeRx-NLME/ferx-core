@@ -325,12 +325,25 @@ group_clippy() {
   # the gate: CI installs a fresh
   # nightly every run (see the note below), and clippy's warn-level lint set grows
   # with it, so an unrelated PR would go red on a lint that did not exist when it was
-  # opened. `unused` is the opposite on both counts. It is one long-stable rustc group
-  # — `unused_imports`, `dead_code`, `unused_variables`, `unused_mut`,
-  # `unused_must_use`, … — it is not a style opinion but the factual claim that a
-  # refactor left something behind, and the tree is already clean under it: the two
-  # findings it had are the saem.rs import above and a `JointPkTteSolve` field that
-  # only a test reads (`src/stats/likelihood.rs`), both fixed in #1470.
+  # opened. `unused` is smaller on the first count and SLOWER, not still, on the second.
+  # Measured with `rustc -W help` on the three toolchains installed here: the group holds
+  # 23 lints on `stable` and on `nightly-2026-05-29`, and 25 on the `nightly` of
+  # 2026-08-29 — `repeated_reprs` and `unreachable_cfg_select_predicates` joined it
+  # inside three months of one channel. So the argument is blast radius and recovery, not
+  # stasis: a couple of lints a quarter, each stating that one item is unused, where the
+  # fix is deleting the item rather than an 800-finding cleanup. Do not write this down as
+  # "long-stable" again — one `rustc -W help` is the measurement.
+  #
+  # Two consequences worth knowing before you hit one. Denying a GROUP also promotes its
+  # allow-by-default members: `unused_extern_crates` and `unused_macro_rules` are `allow`
+  # in `rustc -W help` but in `unused`, so a `macro_rules!` arm nothing invokes is an
+  # error here even though a plain nightly build never mentions it. And `dead_code` never
+  # fires on a `pub` item and counts a test-only reader as a use under `--all-targets` —
+  # which is exactly what the two `#[cfg(test)]`s in #1470 rely on, and the reason a green
+  # run means "nothing unused among non-`pub` items", not "no dead code". The tree is
+  # clean under all of that: the findings it had were the saem.rs import above, a
+  # `JointPkTteSolve` field only a test reads (`src/stats/likelihood.rs`) and
+  # `MstepScoreSa::failure_total`, all three resolved in #1470.
   #
   # It rides in the argument vector, after `--`, for two reasons. `run` echoes `$*`, so
   # `--list` shows what will actually run (the same argument `group_rustdoc` makes for

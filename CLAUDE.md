@@ -152,15 +152,24 @@ group is deny-by-default — that is why #1023's `approx_constant` findings were
 caught, they were *errors* — so before #1470 the group printed
 `warning: unused import: individual_nll_into` and then `preflight OK`, exit 0, across
 the six commits that landed on `main` after the import was orphaned. `-Dunused` is
-rustc's long-stable group (`unused_imports`, `dead_code`, `unused_variables`,
+rustc's `unused` group (`unused_imports`, `dead_code`, `unused_variables`,
 `unused_must_use`, …): the factual claim that a refactor left something behind, not a
 style preference. It is deliberately **not**
 `-Dwarnings` — the ferx-core clippy command alone prints 819 warn-level findings
 today (272 `field_reassign_with_default`, 74 `too_many_arguments`, 67
 `type_complexity`, …), and CI installs a fresh nightly every run, so denying the
 whole moving surface would redden PRs on lints that did not exist when they were
-opened. So a green `Clippy`
-job means *no dead code and no correctness lint*, not a warning-free tree. What it
+opened. **`unused` is not a frozen surface either** — measured with `rustc -W help`,
+the group holds 23 lints on `stable` and on `nightly-2026-05-29` but **25** on the
+`nightly` of 2026-08-29 (`repeated_reprs`, `unreachable_cfg_select_predicates`). So the
+argument for it over `-Dwarnings` is blast radius and recovery, not stasis: a couple of
+lints a quarter, each asserting that one item is unused, where the fix is deleting the
+item. Note also that denying a *group* promotes its allow-by-default members
+(`unused_extern_crates`, `unused_macro_rules`), so a `macro_rules!` arm nothing invokes
+is an error here. A green `Clippy` job therefore means no correctness lint and no item
+that neither production nor test code uses — among non-`pub` items, since `dead_code`
+never fires on a `pub` one, and under `--all-targets` a test-only reader counts as a
+use, which is what #1470's two `#[cfg(test)]`s rely on. Not a warning-free tree. What it
 still cannot see is an unused item inside a `slow-tests`-gated body, which this
 group does not compile.
 
