@@ -3681,6 +3681,76 @@ fn test_mstep_damping_round_trips_and_validates() {
     assert_eq!(opts.saem_mstep_damping, Some(1.0));
 }
 
+/// `mstep_solver` and `mstep_draws` (#1458) round-trip under both spellings,
+/// default to the historical single-draw maximiser, and reject what they cannot
+/// act on.
+#[test]
+fn test_mstep_solver_and_draws_round_trip_and_validate() {
+    let mut opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::Bobyqa,
+        "the default must stay the historical solver"
+    );
+    assert_eq!(opts.saem_mstep_draws, 1, "the default must stay one draw");
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_solver", "score_sa"),
+        Ok(true)
+    );
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::ScoreSa
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_solver", "BOBYQA"),
+        Ok(true)
+    );
+    assert_eq!(
+        opts.saem_mstep_solver,
+        crate::types::SaemMstepSolver::Bobyqa
+    );
+    let err = apply_fit_option(&mut opts, "mstep_solver", "newton")
+        .expect_err("an unknown solver must be rejected");
+    assert!(err.contains("bobyqa/score_sa"), "got: {err}");
+    assert!(err.contains("newton"), "value not echoed, got: {err}");
+
+    assert_eq!(apply_fit_option(&mut opts, "mstep_draws", "3"), Ok(true));
+    assert_eq!(opts.saem_mstep_draws, 3);
+    assert_eq!(
+        apply_fit_option(&mut opts, "saem_mstep_draws", "1"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_mstep_draws, 1);
+    let err =
+        apply_fit_option(&mut opts, "mstep_draws", "0").expect_err("zero draws must be rejected");
+    assert!(err.contains("at least 1"), "got: {err}");
+    // A rejected value must not have clobbered the last good one.
+    assert_eq!(opts.saem_mstep_draws, 1);
+}
+
+/// Both keys are advertised as SAEM-specific, so using them under FOCEI warns
+/// rather than silently doing nothing.
+#[test]
+fn test_mstep_solver_and_draws_under_focei_warn() {
+    let opts = parse_fit_options(&[
+        "method = focei".to_string(),
+        "mstep_solver = score_sa".to_string(),
+        "mstep_draws = 2".to_string(),
+    ])
+    .expect("parses");
+    assert!(
+        opts.warnings.iter().any(|w| w.contains("mstep_solver")),
+        "mstep_solver under FOCEI must warn: {:?}",
+        opts.warnings
+    );
+    assert!(
+        opts.warnings.iter().any(|w| w.contains("mstep_draws")),
+        "mstep_draws under FOCEI must warn: {:?}",
+        opts.warnings
+    );
+}
+
 /// The key is advertised as SAEM-specific, so using it under FOCEI warns rather
 /// than silently doing nothing.
 #[test]

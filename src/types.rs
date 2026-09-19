@@ -7570,6 +7570,26 @@ pub struct FitOptions {
     /// mu-referenced or `FIX`), and for mixture models — see
     /// `estimation::saem::damps_numerical_mstep`.
     pub saem_mstep_damping: Option<f64>,
+    /// Which solver moves the numerical θ/σ M-step (#1458). Defaults to
+    /// [`SaemMstepSolver::Bobyqa`], the historical single-draw re-maximisation,
+    /// so an existing fit's estimates do not change.
+    pub saem_mstep_solver: SaemMstepSolver,
+    /// Number of E-step draws the **`bobyqa`** M-step objective is averaged over
+    /// (#1458). `1` (the default) is the historical single-draw objective.
+    ///
+    /// `K > 1` evaluates the frozen-η objective as the mean over this
+    /// iteration's η draw and the previous `K − 1` iterations' draws, so the
+    /// maximiser it returns is the maximiser of an average rather than the
+    /// average of maximisers — the Jensen bias of the single-draw path falls
+    /// roughly as `1/K`. The cost is `K` times the M-step's objective
+    /// evaluations, and the saving is real only when consecutive draws
+    /// decorrelate; under the default sticky random-walk E-step they largely do
+    /// not. Ignored under [`SaemMstepSolver::ScoreSa`], whose Robbins-Monro
+    /// average already spans every past draw.
+    ///
+    /// Restricted to the same non-IOV, non-mixture scope as `score_sa`; outside
+    /// it the fit falls back to `K = 1` with a warning.
+    pub saem_mstep_draws: usize,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
     /// M-step is suppressed (Ω held at its initial value) while the MH chain
     /// warms up. Prevents the iteration-1 Ω collapse on sparse data, where a
@@ -8206,6 +8226,8 @@ impl Default for FitOptions {
             saem_adapt_interval: 50,
             saem_scale_adaptation: ScaleAdaptation::Interval,
             saem_mstep_damping: None,
+            saem_mstep_solver: SaemMstepSolver::default(),
+            saem_mstep_draws: 1,
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_conddist: false,
@@ -8398,6 +8420,39 @@ pub enum ScaleAdaptation {
     /// to *regress* the final estimate on a model whose acceptance was already
     /// above target, so it is not the default.
     RobbinsMonro,
+}
+
+/// Which solver moves the SAEM numerical θ/σ M-step, set via
+/// `[fit_options] mstep_solver` (#1458).
+///
+/// The choice is not a speed knob: the two arms estimate the *same* parameters
+/// through statistically different recursions, and they do not share a fixed
+/// point when the E-step draws are dispersed. See [`SaemMstepSolver::ScoreSa`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaemMstepSolver {
+    /// The historical rule, and **the default**: a short derivative-free
+    /// (BOBYQA) re-maximisation of the frozen-η conditional objective at this
+    /// iteration's single η draw, whose *maximiser* is then assigned (or
+    /// Robbins-Monro blended when `mstep_damping` is set).
+    #[default]
+    Bobyqa,
+    /// Stochastic approximation on the **score and expected information**, with
+    /// one Levenberg-Marquardt-damped Newton step per M-step on the averaged
+    /// quantities (Kuhn & Lavielle 2005; #1458).
+    ///
+    /// Both averaged quantities are *linear* in the per-draw contribution, so
+    /// the recursion has no Jensen term — unlike an average of maximisers,
+    /// which converges to `E[θ*(η)]` rather than to the maximiser of
+    /// `E[Q(θ, η)]`. That bias is what makes a θ with no ETA (a covariate
+    /// effect, a structural parameter left without IIV) land away from its
+    /// optimum, and it grows when the E-step mixes better.
+    ///
+    /// Opt-in, and **restricted to the plain Gaussian residual scope** the
+    /// expected information has a closed form on: no IOV, no mixture, no M3, no
+    /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
+    /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
+    /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    ScoreSa,
 }
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
@@ -9400,6 +9455,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_scale_adaptation",
             "mstep_damping",
             "saem_mstep_damping",
+            "mstep_solver",
+            "saem_mstep_solver",
+            "mstep_draws",
+            "saem_mstep_draws",
             "omega_burnin",
             "conddist",
             "saem_conddist",
