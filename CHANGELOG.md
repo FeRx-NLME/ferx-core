@@ -508,10 +508,10 @@ section of the SDLC for the versioning policy).
 
 - **Closed-form analytical FOCE and FOCEI fits avoid redundant sensitivity, inner-solver,
   and covariance work.** On the one-thread warfarin benchmark, whole-fit median time fell
-  from 55.7 to 22.3 ms for FOCE (2.50x) and from 40.0 to 20.1 ms for FOCEI (1.99x), while
-  requested allocation bytes fell 57.7% and 37.2%, respectively, with OFV changes below
-  `7e-10`. ODE, FREM, covariance/diagnostic, and Laplace/AGQ inner solves retain their
-  stricter convergence paths (#1486).
+  from 55.7 to 33.6 ms for FOCE (1.66x) and from 40.0 to 35.4 ms for FOCEI (1.13x), with
+  OFV changes below `3e-10`. Explicit inner tolerances and the conservative outer
+  stagnation window are preserved; ODE, FREM, covariance/diagnostic, finite-difference,
+  and Laplace/AGQ inner solves retain their strict work policies (#1486).
 
 - **Multi-node analytic AGQ reuses each node's sensitivity jet for both its likelihood
   and packed score.** This removes one redundant ordinary prediction traversal per scored

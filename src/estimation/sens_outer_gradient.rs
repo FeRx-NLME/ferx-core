@@ -2231,6 +2231,7 @@ fn foce_low_rank_trace_quad(
 
 fn foce_rtilde_inverse(
     jmat: &DMatrix<f64>,
+    omega: &DMatrix<f64>,
     omega_inv: &DMatrix<f64>,
     r0: &[f64],
 ) -> Option<DMatrix<f64>> {
@@ -2246,10 +2247,27 @@ fn foce_rtilde_inverse(
     let middle = omega_inv + jmat.transpose() * &dinv_j;
     let middle_inv = middle.cholesky()?.inverse();
     let mut out = -(&dinv_j * middle_inv * dinv_j.transpose());
+    let mut unstable = false;
     for i in 0..out.nrows() {
-        out[(i, i)] += 1.0 / r0[i];
+        let dinv = 1.0 / r0[i];
+        let correction = -out[(i, i)];
+        out[(i, i)] += dinv;
+        // Only the diagonal performs a subtraction. If its result is tiny relative to
+        // the two operands, Woodbury has lost useful digits and the dense form is safer.
+        unstable |= !out[(i, i)].is_finite()
+            || out[(i, i)] <= f64::EPSILON.sqrt() * (dinv + correction).abs();
     }
-    Some(out)
+    if !unstable && out.iter().all(|v| v.is_finite()) {
+        return Some(out);
+    }
+
+    // The subtractive Woodbury form can lose all significant digits when D is tiny
+    // relative to JΩJᵀ. The original observation-sized Cholesky is the rare fallback.
+    let mut dense = jmat * omega * jmat.transpose();
+    for i in 0..dense.nrows() {
+        dense[(i, i)] += r0[i];
+    }
+    Some(dense.cholesky()?.inverse())
 }
 
 pub fn subject_packed_gradient_foce(
@@ -2400,7 +2418,7 @@ pub fn subject_packed_gradient_foce(
     }
 
     // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
-    let rtilde_inv = foce_rtilde_inverse(&jmat, &params.omega.inv, &r0)?;
+    let rtilde_inv = foce_rtilde_inverse(&jmat, omega, &params.omega.inv, &r0)?;
     let u = &rtilde_inv * &rho;
     let ojt = omega * jmat.transpose(); // Ω Jᵀ (n_eta×nq)
     let ojt_u = &ojt * &u;

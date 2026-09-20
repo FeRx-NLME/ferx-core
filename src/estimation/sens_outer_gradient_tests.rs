@@ -5847,8 +5847,18 @@ fn foce_woodbury_inverse_matches_dense_rtilde() {
         dense[(i, i)] += r0[i];
     }
     let dense_inv = dense.cholesky().unwrap().inverse();
-    let woodbury = foce_rtilde_inverse(&j, &omega_inv, &r0).unwrap();
+    let woodbury = foce_rtilde_inverse(&j, &omega, &omega_inv, &r0).unwrap();
     assert!((&dense_inv - woodbury).amax() < 2e-14);
+}
+
+#[test]
+fn foce_woodbury_inverse_falls_back_when_subtraction_is_unstable() {
+    let j = DMatrix::from_element(1, 1, 100.0);
+    let omega = DMatrix::identity(1, 1);
+    let omega_inv = DMatrix::identity(1, 1);
+    let actual = foce_rtilde_inverse(&j, &omega, &omega_inv, &[1e-12]).unwrap();
+    let expected = 1.0 / (10000.0 + 1e-12);
+    assert!((actual[(0, 0)] - expected).abs() < expected * 1e-12);
 }
 
 #[test]

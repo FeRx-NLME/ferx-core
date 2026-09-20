@@ -858,7 +858,7 @@ fn test_detect_stagnation_disabled_never_fires() {
     for n_evals in 0..200 {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, 7, false, false),
+            !detect_stagnation(&mut state, 7, false),
             "enabled=false must never fire (n_evals={n_evals})"
         );
     }
@@ -884,7 +884,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     for n_evals in 1..window {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, n, true, false),
+            !detect_stagnation(&mut state, n, true),
             "must not fire inside window (n_evals={n_evals}, window={window})"
         );
         assert!(!state.stagnation_stopped);
@@ -893,7 +893,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // At the window, fires and latches.
     state.n_evals = window;
     assert!(
-        detect_stagnation(&mut state, n, true, false),
+        detect_stagnation(&mut state, n, true),
         "must fire at window (n_evals={window})"
     );
     assert!(
@@ -906,25 +906,9 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // the short-circuit is on `stagnation_stopped`, not on the counter.
     state.n_evals = 1;
     assert!(
-        detect_stagnation(&mut state, n, true, false),
+        detect_stagnation(&mut state, n, true),
         "latched state must stay sticky-true regardless of n_evals"
     );
-}
-
-#[test]
-fn test_detect_stagnation_analytic_gradient_uses_short_window() {
-    let mut state = fresh_state();
-    state.best_ofv = -100.0;
-    state.best_at_last_improvement = -100.0;
-
-    for n_evals in 1..4 {
-        state.n_evals = n_evals;
-        assert!(!detect_stagnation(&mut state, 7, true, true));
-    }
-
-    state.n_evals = 4;
-    assert!(detect_stagnation(&mut state, 7, true, true));
-    assert!(state.stagnation_stopped);
 }
 
 /// `detect_stagnation` resets the improvement counter when OFV moves down
@@ -940,14 +924,14 @@ fn test_detect_stagnation_resets_on_improvement() {
     let n = 7usize;
     // Walk almost up to the window with zero improvement…
     state.n_evals = 49;
-    assert!(!detect_stagnation(&mut state, n, true, false));
+    assert!(!detect_stagnation(&mut state, n, true));
 
     // …then improve OFV by > 1e-3.  Improvement must reset the
     // last-improvement counter so the next 50 evals start fresh.
     state.best_ofv = -100.5;
     state.n_evals = 50;
     assert!(
-        !detect_stagnation(&mut state, n, true, false),
+        !detect_stagnation(&mut state, n, true),
         "improvement must reset the counter"
     );
     assert_eq!(
@@ -961,9 +945,9 @@ fn test_detect_stagnation_resets_on_improvement() {
 
     // Now we need another full window of zero improvement before firing.
     state.n_evals = 99;
-    assert!(!detect_stagnation(&mut state, n, true, false));
+    assert!(!detect_stagnation(&mut state, n, true));
     state.n_evals = 100;
-    assert!(detect_stagnation(&mut state, n, true, false));
+    assert!(detect_stagnation(&mut state, n, true));
 }
 
 /// Improvement *below* the 1e-3 threshold counts as stagnation — the
@@ -982,7 +966,7 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
     // NOT reset.
     state.best_ofv = -100.0005;
     state.n_evals = 25;
-    assert!(!detect_stagnation(&mut state, n, true, false));
+    assert!(!detect_stagnation(&mut state, n, true));
     assert_eq!(
         state.last_improvement_eval, 0,
         "sub-threshold improvement must not advance the counter"
@@ -990,7 +974,7 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
 
     // 50 evals after the original last_improvement_eval (= 0), it fires.
     state.n_evals = 50;
-    assert!(detect_stagnation(&mut state, n, true, false));
+    assert!(detect_stagnation(&mut state, n, true));
 }
 
 #[test]
