@@ -45,9 +45,10 @@ use std::time::Instant;
 ///
 /// On a model/data precondition failure — a dose the model cannot route or honour, an
 /// unsupported absorption or survival combination, a covariate the data does not carry, an
-/// IOV model without `omega_iov`. The payload is exactly the `Err` text
-/// [`simulate_with_options`] returns for the same input (which is also `fit()`'s); this
-/// `Vec`-returning form has no channel to return it on (#898). Call
+/// IOV model without `omega_iov`, or (under `markov`) a CTMM endpoint, which has no
+/// simulation path yet. The payload is exactly the `Err` text [`simulate_with_options`]
+/// returns for the same input; this `Vec`-returning form has no channel to return it on
+/// (#898). Call
 /// [`simulate_with_options`] to receive it as an `Err` instead.
 pub fn simulate(
     model: &CompiledModel,
@@ -327,8 +328,12 @@ pub(crate) fn validate_iov_simulatable(
     Ok(())
 }
 
-/// The model/data preconditions every `simulate*` entry point shares, as an `Err` carrying
-/// the bare check message — byte-identical to what `fit()` returns for the same input (#898).
+/// The model/data preconditions shared by `simulate`, `simulate_with_seed`,
+/// `simulate_with_options{,_diag}` and `simulate_with_uncertainty`, as an `Err` carrying the
+/// bare check message — the text `fit()` gives for that precondition (#898).
+/// **`simulate_adaptive*` does not call this**: it runs its own, shorter list in
+/// `api/adaptive.rs` (no flip-flop and no time-varying-covariate check), so a precondition
+/// added here does not reach it.
 ///
 /// One list, two callers: [`simulate_with_options_diag`] runs it up front (its propensity
 /// branch integrates every subject *before* reaching the chokepoint), and

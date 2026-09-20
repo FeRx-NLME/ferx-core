@@ -1449,6 +1449,9 @@ fn fit_inner(
     // inits_from_nca: derive NCA-based starting values before the optimizer
     // loop, using the strategy the user selected (nca / nca_sweep / nca_ebe).
     if let Some(method) = options.inits_from_nca {
+        // The `?` is defensive, not reachable through `fit()`: both checks `inits_from_nca`
+        // can fail on are in `check_model_data_rule`, whose first error `fit()` has already
+        // returned before entering this function. No test covers it for that reason.
         let suggested = crate::suggest_start::inits_from_nca(model, population, method)?;
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);

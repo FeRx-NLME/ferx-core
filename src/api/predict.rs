@@ -113,10 +113,12 @@ pub struct PredictionOutput {
 ///
 /// # Errors
 ///
-/// A model/data precondition failure is an `Err` carrying the bare check message —
-/// byte-identical to what `fit()` returns for the same input (#898): a dose the model cannot
-/// route or honour, a covariate the data does not carry, an unrouted non-Gaussian endpoint, an
-/// unbound `[covariate_model]`, an unsupported absorption / readout / survival combination.
+/// A model/data precondition failure is an `Err` carrying the bare check message — the text
+/// `fit()` gives for that precondition (#898): a dose the model cannot route or honour, a
+/// covariate the data does not carry, an unrouted non-Gaussian endpoint, an unbound
+/// `[covariate_model]`, an unsupported absorption / readout / survival combination, or (under
+/// `markov`) a CTMM-only model, which has no predictor yet. An input failing several at once
+/// reports the first in *this* function's order, which is not `fit()`'s.
 /// [`predict`] re-raises that same text as a panic, having no channel to return it on. Adding
 /// an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
 /// that is what `warnings` is for.
@@ -278,7 +280,8 @@ pub struct PredictionResult {
 /// # Errors
 ///
 /// A time-varying covariate on the linear predictor, or a population loaded without endpoint
-/// routing, is an `Err` carrying the text `fit()` returns for the same input (#898).
+/// routing, is an `Err` carrying the text `fit()` gives for that precondition (#898). These
+/// are the only two it checks.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
     model: &CompiledModel,
@@ -384,7 +387,8 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// # Errors
 ///
 /// A time-varying covariate on a hazard, or a dose into a compartment the model cannot
-/// deliver into, is an `Err` carrying the text `fit()` returns for the same input (#898).
+/// deliver into, is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// These are the only two it checks.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,

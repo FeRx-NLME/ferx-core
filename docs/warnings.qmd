@@ -59,14 +59,30 @@ A warning is a finding the run survives. A **precondition** is one it does not:
 a dose into a compartment the model cannot deliver into, a coded `RATE` with no
 `D{n}` / `R{n}` parameter behind it, a covariate the data does not carry, a
 time-varying covariate on a hazard, an absorption form the closed form cannot
-honour. `fit()` has always returned these as an `Err`. Since ferx 0.4.0 so does
-every other entry point that returns a `Result`, **with the same text** — the
-subject, the time and the remedy, and nothing wrapped around them:
+honour. `fit()` has always returned these as an `Err`. Since ferx 0.4.0 every
+other entry point that returns a `Result` does too — **for the preconditions it
+checks**, which is not the same list on each:
 
-| Entry point | On a failed precondition |
+| Entry point | Preconditions it checks |
 |---|---|
-| `fit()`, `predict_diag()`, `predict_survival()`, `predict_categorical()`, `inits_from_nca()`, `simulate_with_options()`, `simulate_with_options_diag()`, `simulate_with_uncertainty()`, `simulate_adaptive()` | `Err(message)` |
-| `predict()`, `simulate()`, `simulate_with_seed()` | panic whose payload is that same `message` — they return a bare `Vec` and have no error channel. Call the `Result` form above them to handle the failure instead. |
+| `fit()`, `ferx check` | all of them |
+| `predict_diag()` | coded `RATE`, covariates present, endpoint routing, `[covariate_model]` bound, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout across a reset, absorption input rate, a CTMM-only model |
+| `simulate_with_options()`, `simulate_with_options_diag()`, `simulate_with_uncertainty()` | the simulation data checks (covariates present, `[covariate_model]` bound and levels, endpoint routing, κ and residual weights), the TTE horizon, Ω~IOV~ present, then coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
+| `predict_survival()` | time-varying covariate on a hazard, dose compartment |
+| `predict_categorical()` | time-varying covariate on the linear predictor, endpoint routing |
+| `inits_from_nca()` | coded `RATE`, dose compartment |
+| `simulate_adaptive()` | coded `RATE`, dose compartment, absorption closed-form support, absorption input rate, plus its own adaptive-dosing rejections. **Not** the time-varying covariate on a hazard. |
+| `predict()`, `simulate()`, `simulate_with_seed()` | the list of the `Result` form each wraps — but the failure is a **panic** whose payload is that same message, because they return a bare `Vec` and have no error channel. Call the `Result` form to handle it instead. |
+
+A precondition an entry point does not check is **not refused** by it: the call
+returns rows computed from an input `fit()` would have rejected. Validate a new
+model and dataset with `fit()` or `ferx check` first.
+
+The message is the one `fit()` gives **for that precondition** — the subject, the
+time and the remedy, with nothing wrapped around them. When an input fails
+several preconditions at once, each entry point reports the first one in *its
+own* check order, and the orders differ, so two entry points can name two
+different (both real) defects for the same input.
 
 Before 0.4.0 `predict_survival()`, `predict_categorical()` and
 `inits_from_nca()` returned bare values and panicked, and the three

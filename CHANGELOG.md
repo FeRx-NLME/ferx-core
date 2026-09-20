@@ -228,8 +228,9 @@ section of the SDLC for the versioning policy).
   `simulate_with_options_diag()` and `simulate_with_uncertainty()` keep their signatures but
   no longer panic *out of* a `Result`-returning function — a dose into a compartment the
   model cannot deliver into, a coded `RATE` with no `D{n}`/`R{n}` behind it, an unsupported
-  absorption or survival combination now reaches the `Err` arm. The text is byte-identical to
-  what `fit()` returns for the same input; the wrapper sentences ("predict()/simulate()
+  absorption or survival combination now reaches the `Err` arm. Each message is the one `fit()`
+  gives for that precondition (an input failing several at once is reported by whichever
+  each entry point checks first, and the orders differ); the wrapper sentences ("predict()/simulate()
   received …", "fit() reports this as an error rather than panicking") are gone.
   `predict()`, `simulate()` and `simulate_with_seed()` keep their `Vec` signatures for now
   and still panic, with exactly that `Err` text as the payload; they become `Result` in a

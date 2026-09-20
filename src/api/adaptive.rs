@@ -341,10 +341,12 @@ where
     // out-of-domain absorption parameter, or (once base regimens are supported, #702) a
     // modeled `RATE` would silently mis-deliver the dose — the exact class #588 closed
     // for the static paths. Surface them as a typed error (the `check_*` form `fit()`
-    // uses, and the form `reject_unsupported_adaptive` just above already uses) rather
-    // than the panic `simulate()` / `predict()` raise via `assert_*`: this
+    // uses, and the form `reject_unsupported_adaptive` just above already uses): this
     // `Result`-returning chokepoint — and its ferx-r FFI surface — then fails with one
-    // uniform, recoverable error contract instead of aborting the process.
+    // uniform, recoverable error contract instead of aborting the process. (Since #898
+    // every `Result`-returning predict / simulate entry point does the same.) This list is
+    // shorter than `simulate`'s `check_simulate_preconditions` — no flip-flop and no
+    // time-varying-covariate-on-a-hazard check — and is not kept in step with it.
     // (`check_absorption_closed_form_support` is a no-op here — it returns `None` unless
     // the model is an analytic absorption closed form, which this ODE-only path rejects
     // up front — but is wired for parity and #702 base-regimen support.)

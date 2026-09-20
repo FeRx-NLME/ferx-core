@@ -71,7 +71,8 @@ pub enum NcaInit {
 /// # Errors
 ///
 /// A modeled-`RATE` dose the model cannot honour, or a dose into a compartment it cannot
-/// deliver into, is an `Err` carrying the text `fit()` returns for the same input (#898).
+/// deliver into, is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// These are the only two it checks.
 pub fn inits_from_nca(
     model: &CompiledModel,
     population: &Population,

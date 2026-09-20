@@ -1299,7 +1299,8 @@ pub(crate) fn check_simulation_data(
 
 /// All data-dependent *fatal* compatibility checks between a compiled model and
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
-/// stops at the first error via [`first_error`](crate::diagnostics::first_error)) and `ferx check` (which
+/// stops at the first error via
+/// [`first_error`](crate::diagnostics::first_error)) and `ferx check` (which
 /// reports every finding). Check order matches the historical inline order in
 /// `fit()` so the first error is unchanged: covariates, endpoint routing (#1199,
 /// ahead of the per-CMT checks so it names the cause), scaling, error model,
