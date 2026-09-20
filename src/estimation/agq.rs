@@ -346,9 +346,9 @@ struct PreparedGrid {
     /// Row-major quadrature modes (`n_grid × d`) in one allocation.
     bs: Vec<f64>,
     softmax: Vec<f64>,
-    /// Unweighted fixed-node packed scores, row-major (`n_grid × n_packed`).
-    /// When present, the same sensitivity pass supplied both these scores and
-    /// the likelihood terms used to form `softmax`.
+    /// Row-major fixed-node scores (`n_grid × packed_width`) produced alongside
+    /// the node likelihoods.  Keeping this single matrix avoids recomputing jets;
+    /// gradient assembly consumes it directly without a second weighted matrix.
     node_scores: Option<Vec<f64>>,
     base_jet: Option<SubjectSens>,
 }
@@ -890,7 +890,7 @@ fn agq_subject_evaluate(
         return (nll, prepared);
     }
 
-    let (bs, terms, node_scores) = agq_nodes_and_terms(
+    let (bs, mut terms, node_scores) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -908,10 +908,13 @@ fn agq_subject_evaluate(
     let lse = logsumexp(&terms);
     let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - lse;
     if nll.is_finite() {
+        for term in &mut terms {
+            *term = (*term - lse).exp();
+        }
         let prepared = retain_gradient_work.then(|| PreparedGrid {
             h,
             bs,
-            softmax: terms.iter().map(|&t| (t - lse).exp()).collect(),
+            softmax: terms,
             node_scores,
             base_jet,
         });
@@ -955,7 +958,8 @@ fn agq_nodes_and_terms(
     let score_width = score_template
         .map(crate::estimation::parameterization::packed_len)
         .unwrap_or(0);
-    let mut node_scores = score_template.map(|_| Vec::with_capacity(cap * score_width));
+    let mut node_scores = score_template.map(|_| vec![0.0; cap * score_width]);
+    let mut score_valid = score_template.is_some();
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
@@ -984,25 +988,24 @@ fn agq_nodes_and_terms(
             b[k] = b_hat[k] + step[k];
         }
 
-        let fused = match (score_template, node_scores.as_mut()) {
-            (Some(template), Some(scores)) => {
-                let start = scores.len();
-                scores.resize(start + score_width, 0.0);
-                let result = fused_node_nll_and_score(
-                    model,
-                    subject,
-                    params,
-                    template,
-                    stack,
-                    &b,
-                    &mut pred_recycle,
-                    &mut scores[start..],
-                );
-                if result.is_none() {
-                    scores[start..].fill(f64::NAN);
-                }
-                result
-            }
+        let node_index = terms.len();
+        let mut empty_score = [];
+        let node_score = node_scores.as_mut().map_or(&mut empty_score[..], |scores| {
+            let start = node_index * score_width;
+            &mut scores[start..start + score_width]
+        });
+        node_score.fill(0.0);
+        let fused = match score_template {
+            Some(template) => fused_node_nll_and_score(
+                model,
+                subject,
+                params,
+                template,
+                stack,
+                &b,
+                &mut pred_recycle,
+                node_score,
+            ),
             _ => None,
         };
         let nll = if let Some(nll) = fused {
@@ -1025,7 +1028,21 @@ fn agq_nodes_and_terms(
         // A diverged node returns `individual_nll`'s 1e20 sentinel, which lands here as a
         // ~−1e20 log-term — negligible under logsumexp unless *every* node diverged, in
         // which case the subject correctly reports the sentinel back.
-        terms.push(log_w + z_sq - nll);
+        if fused.is_none() && score_template.is_some() {
+            score_valid &= accumulate_fixed_eta_packed_gradient(
+                model,
+                subject,
+                params,
+                score_template.expect("checked above"),
+                stack,
+                &b,
+                1.0,
+                node_score,
+            )
+            .is_some();
+        }
+        let term = log_w + z_sq - nll;
+        terms.push(term);
         if retain_nodes {
             bs.extend_from_slice(&b);
         }
@@ -1044,7 +1061,7 @@ fn agq_nodes_and_terms(
             break;
         }
     }
-    (bs, terms, node_scores)
+    (bs, terms, if score_valid { node_scores } else { None })
 }
 
 /// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
@@ -2862,54 +2879,10 @@ fn finish_agq_subject_gradient(
     out: &mut [f64],
 ) -> Option<()> {
     if let Some(scores) = node_scores {
-        let score_width = out.len();
-        debug_assert_eq!(scores.len(), softmax.len() * score_width);
-        if parallel_grid {
-            let d = stack.d();
-            let mut weighted = vec![0.0; scores.len()];
-            weighted
-                .par_chunks_mut(score_width)
-                .zip(scores.par_chunks(score_width))
-                .zip(bs.par_chunks(d))
-                .zip(softmax.par_iter())
-                .try_for_each(|(((dst, score), b_j), &w)| {
-                    if w == 0.0 {
-                        return Some(());
-                    }
-                    if score.iter().all(|v| v.is_finite()) {
-                        for (slot, &value) in dst.iter_mut().zip(score) {
-                            *slot = w * value;
-                        }
-                    } else {
-                        accumulate_fixed_eta_packed_gradient(
-                            model, subject, params, template, stack, b_j, w, dst,
-                        )?;
-                    }
-                    Some(())
-                })?;
-            for score in weighted.chunks_exact(score_width) {
-                for (dst, value) in out.iter_mut().zip(score) {
-                    *dst += *value;
-                }
-            }
-        } else {
-            for ((score, b_j), &w) in scores
-                .chunks_exact(score_width)
-                .zip(bs.chunks_exact(stack.d()))
-                .zip(softmax)
-            {
-                if w == 0.0 {
-                    continue;
-                }
-                if score.iter().all(|v| v.is_finite()) {
-                    for (dst, &value) in out.iter_mut().zip(score) {
-                        *dst += w * value;
-                    }
-                } else {
-                    accumulate_fixed_eta_packed_gradient(
-                        model, subject, params, template, stack, b_j, w, out,
-                    )?;
-                }
+        debug_assert_eq!(scores.len(), softmax.len() * out.len());
+        for (score, &weight) in scores.chunks_exact(out.len()).zip(softmax) {
+            for (dst, &value) in out.iter_mut().zip(score) {
+                *dst += weight * value;
             }
         }
     } else if parallel_grid {
