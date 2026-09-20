@@ -499,6 +499,12 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **Analytic AGQ now applies posterior weights without materializing a second packed-score
+  matrix.** The score scratch is halved, posterior weights reuse the log-term allocation,
+  and allocation calls fall while preserving node-major summation. On a 200-subject,
+  2,200-observation `n_agq = 3` benchmark, diagonal Ω was 1.6% faster and block Ω was
+  CPU-neutral; requested allocation bytes fell in both cases (#1483).
+
 - **Multi-node analytic AGQ reuses each node's sensitivity jet for both its likelihood
   and packed score.** This removes one redundant ordinary prediction traversal per scored
   node while preserving the established fallback and leaving ODE grids on their
