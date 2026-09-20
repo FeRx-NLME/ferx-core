@@ -99,14 +99,21 @@ fn assert_same_model(generated: &str, hand_written: &str) {
 /// that directly.
 ///
 /// It matters because the ODE cases are not cheap, and the per-PR coverage
-/// job runs this file instrumented on one thread. Each outer iteration
-/// finite-differences the whole population objective once per free
-/// parameter, so an evaluation is far less work for the same claim.
-/// Measured on this file: four ODE cases at `outer_maxiter = 2` cost 402 s
-/// of its 435 s; with three of them evaluating the file is 222 s. The
-/// Michaelis-Menten case keeps its two iterations, so the optimizer path
-/// over a generated `[odes]` model is still exercised — on the variant the
-/// NONMEM anchor covers.
+/// job runs this file instrumented. Each outer iteration finite-differences
+/// the whole population objective once per free parameter, so an evaluation
+/// is far less work for the same claim. The Michaelis-Menten case keeps its
+/// two iterations, so the optimizer path over a generated `[odes]` model is
+/// still exercised — on the variant the NONMEM anchor covers.
+///
+/// **The covariance step is off, and that is most of this file's cost**
+/// (#1476). `outer_maxiter = 0` does not skip it: `FitOptions::default()`
+/// runs the FD-of-OFV Hessian after the (empty) outer loop, twice per case,
+/// and nothing here reads its output — the identity claim is θ/η names,
+/// `predict()` bits, OFV and θ. Measured on this file under `cargo llvm-cov
+/// --profile ci-cov`, `--test-threads=1`: 1206.9 s with the step on (CI:
+/// 1264 s), 57.2 s with it off; uninstrumented 93.8 s → 4.9 s. Coverage
+/// instrumentation costs ~14× on the ODE cases against ~3× on the analytic
+/// ones, which is why an ODE covariance step is the thing not to run idly.
 fn assert_same_model_at(generated: &str, hand_written: &str, outer_maxiter: usize) {
     let gen = parse_full_model(generated)
         .unwrap_or_else(|e| panic!("the generated model must parse: {e}\n---\n{generated}"));
@@ -138,6 +145,7 @@ fn assert_same_model_at(generated: &str, hand_written: &str, outer_maxiter: usiz
 
     let opts = FitOptions {
         outer_maxiter,
+        run_covariance_step: false,
         ..FitOptions::default()
     };
     let gen_fit = fit(&gen.model, &pop, &gen.model.default_params, &opts)
