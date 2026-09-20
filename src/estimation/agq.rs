@@ -344,6 +344,9 @@ static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
 struct PreparedGrid {
     h: DMatrix<f64>,
     regularised_anchor: Option<crate::estimation::agq_cov_hessian::RegularisedAnchor>,
+    /// The one-node Laplace grid is exactly the separately retained `b_hat`
+    /// with unit weight, so its node and weight vectors need no allocations.
+    one_point: bool,
     /// Row-major quadrature modes (`n_grid × d`) in one allocation.
     bs: Vec<f64>,
     softmax: Vec<f64>,
@@ -891,8 +894,9 @@ fn agq_subject_evaluate(
         let prepared = retain_gradient_work.then(|| PreparedGrid {
             h,
             regularised_anchor,
-            bs: b_hat.to_vec(),
-            softmax: vec![1.0],
+            one_point: true,
+            bs: Vec::new(),
+            softmax: Vec::new(),
             node_scores: None,
             base_jet,
         });
@@ -924,6 +928,7 @@ fn agq_subject_evaluate(
             PreparedGrid {
                 h,
                 regularised_anchor,
+                one_point: false,
                 bs,
                 softmax: terms,
                 node_scores,
@@ -3115,6 +3120,12 @@ impl<'a> SubjectScoreContext<'a> {
         match prepared {
             PreparedSubject::Grid { stack, b_hat, grid } => {
                 let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+                let one_weight = [1.0];
+                let (bs, softmax) = if grid.one_point {
+                    (b_hat.as_slice(), one_weight.as_slice())
+                } else {
+                    (grid.bs.as_slice(), grid.softmax.as_slice())
+                };
                 finish_agq_subject_gradient(
                     self.model,
                     subject,
@@ -3129,8 +3140,8 @@ impl<'a> SubjectScoreContext<'a> {
                     self.parallel_grid,
                     &grid.h,
                     grid.regularised_anchor.as_ref(),
-                    &grid.bs,
-                    &grid.softmax,
+                    bs,
+                    softmax,
                     grid.node_scores.as_deref(),
                     &mut scratch,
                     schedule,
