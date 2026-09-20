@@ -196,7 +196,7 @@ fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
 /// clause that will not compile has already been reported as `E_PARSE` and
 /// `validate_model_file` returned long before this point. It is split out anyway,
 /// because it must exist, must not panic, and is only *testable* from a hand-built
-/// [`FitOptions`] — see `check_selection_filter_tests`. A data check run on the
+/// [`FitOptions`] — see `check_data_read_tests`. A data check run on the
 /// unfiltered dataset would describe records the fit will not score, which is the
 /// whole of #1465, so the `Err` arm skips the data checks rather than falling back
 /// to no filter.
@@ -205,6 +205,37 @@ fn check_selection_filter(
 ) -> Result<Option<crate::io::datareader::SelectionFilter>, Diagnostic> {
     crate::api::run::build_selection_filter(opts)
         .map_err(|e| Diagnostic::error("E_PARSE", e).with_block("data_selection"))
+}
+
+/// The code a reader warning already carries, for the `ferx check` diagnostic that
+/// relays it — `W_DATA` only when the message states none.
+///
+/// The reader writes its own code at the head of every message it pushes onto
+/// `Population::warnings` (`W_MISSING_DV: …`, `W_ADDL_MISSING_II subject 3: …`), so
+/// this reads what is there rather than deciding it again. It replaces a list of
+/// three hand-written prefixes that relayed everything else as `W_DATA`: measured
+/// at `6cbf5dbd`, `ferx check` printed `warning[W_DATA]: W_MISSING_DV: …` for a code
+/// `check-report.qmd` documents by name, and #1465 made three more reader warnings
+/// reachable from check that the list did not know about either.
+///
+/// **Not a third taxonomy.** `types::classify_warning` maps fit-side warnings onto
+/// the `WarningCode` enum by substring; this reads a string the reader has already
+/// written and never invents one.
+///
+/// The code is the leading run of `[A-Z0-9_]`, which is what separates
+/// `W_ADDL_MISSING_II subject 3:` (no colon after the code) from `W_MISSING_DV:`.
+/// A message that does not open with one is relayed as `W_DATA`.
+fn reader_warning_code(w: &str) -> &str {
+    let code = w
+        .split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        .next()
+        .unwrap_or_default();
+    // `W_` alone is a prefix, not a code.
+    if code.len() > 2 && code.starts_with("W_") {
+        code
+    } else {
+        "W_DATA"
+    }
 }
 
 /// Per-CMT scaling needs every observed CMT to have an entry in the
@@ -6689,8 +6720,8 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 mod block_name_diagnostic_tests;
 
 #[cfg(test)]
-#[path = "tests/check_selection_filter_tests.rs"]
-mod check_selection_filter_tests;
+#[path = "tests/check_data_read_tests.rs"]
+mod check_data_read_tests;
 
 #[cfg(test)]
 #[path = "tests/model_name_report_tests.rs"]
@@ -6957,16 +6988,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     .iter()
                     .filter(|w| !reader_warning_suppressed(&parsed.model, &parsed.fit_options, w))
                 {
-                    let code = if w.starts_with("W_ADDL_MISSING_II") {
-                        "W_ADDL_MISSING_II"
-                    } else if w.starts_with("W_IOV_OCC_MISSING") {
-                        "W_IOV_OCC_MISSING"
-                    } else if w.starts_with("W_CMT_DEFAULTED") {
-                        "W_CMT_DEFAULTED"
-                    } else {
-                        "W_DATA"
-                    };
-                    diags.push(Diagnostic::warning(code, w.clone()));
+                    diags.push(Diagnostic::warning(reader_warning_code(w), w.clone()));
                 }
                 let binding = std::fs::read_to_string(model_path)
                     .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))

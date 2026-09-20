@@ -117,6 +117,27 @@ const H_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                      2,1,2.9,0,.,3,0\n\
                      2,2,2.2,0,.,3,0\n";
 
+/// One `EVID=0` row with a missing `DV` and no `MDV=1` — the reader skips it and
+/// says so as `W_MISSING_DV`.
+const H_MISSING_DV_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+                                1,0,.,1,100,1,1\n\
+                                1,1,9.0,0,.,1,0\n\
+                                1,2,8.2,0,.,1,0\n\
+                                1,4,.,0,.,1,0\n\
+                                2,0,.,1,100,1,1\n\
+                                2,1,9.4,0,.,1,0\n\
+                                2,2,8.0,0,.,1,0\n";
+
+/// No `CMT` column at all, against H's per-CMT scaling — the reader defaults every
+/// row to compartment 1 and says so as `W_CMT_DEFAULTED`.
+const H_NO_CMT_CSV: &str = "ID,TIME,DV,EVID,AMT,MDV\n\
+                            1,0,.,1,100,1\n\
+                            1,1,9.0,0,.,0\n\
+                            1,2,8.2,0,.,0\n\
+                            2,0,.,1,100,1\n\
+                            2,1,9.4,0,.,0\n\
+                            2,2,8.0,0,.,0\n";
+
 /// A `[data_selection]` block, or nothing at all.
 const NO_SELECTION: &str = "";
 const IGNORE_CMT2: &str = "\n[data_selection]\n  ignore = CMT == 2\n";
@@ -125,6 +146,9 @@ const IGNORE_SUBJECT_2: &str = "\n[data_selection]\n  ignore_subjects = [2]\n";
 /// A clause that parses and compiles but matches no record in either dataset.
 const IGNORE_NOTHING: &str = "\n[data_selection]\n  ignore = CMT == 9\n";
 const IGNORE_CMT3: &str = "\n[data_selection]\n  ignore = CMT == 3\n";
+/// A clause naming a column the dataset does not have. It compiles, matches
+/// nothing, and makes the reader say so.
+const IGNORE_ABSENT_COLUMN: &str = "\n[data_selection]\n  ignore = STUDY == 7\n";
 
 fn temp(contents: &str, suffix: &str) -> NamedTempFile {
     let mut f = tempfile::Builder::new()
@@ -360,5 +384,54 @@ fn every_clause_kind_reaches_the_check_read() {
         (subject_ofv - accept_ofv).abs() > 1.0,
         "the two clauses must select different records, or this test has one leg: \
          {subject_ofv} vs {accept_ofv}"
+    );
+}
+/// T5 — a reader warning is reported under the code the reader itself wrote.
+///
+/// `W_FILTER_COLUMN_ABSENT` is unreachable from `ferx check` until the filter is
+/// applied at all; the other two were reachable before, and `W_MISSING_DV` was
+/// being reported as `warning[W_DATA]` because the code was chosen from a
+/// hand-written list of three prefixes.
+///
+/// Mutation that must redden it: restore the three-arm `if`/`else if` chain, or
+/// strip the prefix extraction's fallback.
+#[test]
+fn a_reader_warning_is_reported_under_the_code_the_reader_wrote() {
+    // Only reachable once check applies the filter: the reader raises this while
+    // compiling the clause against the dataset's columns.
+    let (absent, absent_fit) = check_and_fit(&format!("{H_MODEL}{IGNORE_ABSENT_COLUMN}"), H_CSV);
+    let d = diagnostic_for(&absent, "W_FILTER_COLUMN_ABSENT");
+    assert_eq!(
+        d.code, "W_FILTER_COLUMN_ABSENT",
+        "not the generic `W_DATA`: {}",
+        d.message
+    );
+    assert!(
+        absent_fit
+            .expect("the fit evaluates this pair")
+            .warnings
+            .iter()
+            .any(|w| *w == d.message),
+        "and it is the fit's own sentence, not a re-spelling: {}",
+        d.message
+    );
+
+    // Reachable before this change, and miscoded: `warning[W_DATA]: W_MISSING_DV: …`.
+    let (missing_dv, _) = check_and_fit(H_MODEL, H_MISSING_DV_CSV);
+    let d = diagnostic_for(&missing_dv, "W_MISSING_DV");
+    assert_eq!(
+        d.code, "W_MISSING_DV",
+        "the code `check-report.qmd` documents: {}",
+        d.message
+    );
+
+    // The hand-written arm this replaces. `W_CMT_DEFAULTED` had one, so it is the
+    // arm the prefix rule has to reproduce rather than merely not break.
+    let (defaulted, _) = check_and_fit(H_MODEL, H_NO_CMT_CSV);
+    let d = diagnostic_for(&defaulted, "W_CMT_DEFAULTED");
+    assert_eq!(
+        d.code, "W_CMT_DEFAULTED",
+        "unchanged by the prefix rule: {}",
+        d.message
     );
 }
