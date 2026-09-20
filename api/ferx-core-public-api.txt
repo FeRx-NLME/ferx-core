@@ -1430,7 +1430,7 @@ pub ferx_core::pk::event_driven::EventSchedule::bounds_per_interval: alloc::vec:
 pub ferx_core::pk::event_driven::EventSchedule::dose_lagtimes: alloc::vec::Vec<f64>
 pub ferx_core::pk::event_driven::EventSchedule::events: alloc::vec::Vec<ferx_core::pk::event_driven::Event>
 impl ferx_core::pk::event_driven::EventSchedule
-pub fn ferx_core::pk::event_driven::EventSchedule::for_subject(subject: &ferx_core::Subject, _pk_model: ferx_core::PkModel, doses: &[ferx_core::DoseEvent], dose_lagtimes: &[f64]) -> Self
+pub fn ferx_core::pk::event_driven::EventSchedule::for_subject(subject: &ferx_core::Subject, pk_model: ferx_core::PkModel, doses: &[ferx_core::DoseEvent], dose_lagtimes: &[f64]) -> Self
 pub fn ferx_core::pk::event_driven::event_driven_predictions(pk_model: ferx_core::PkModel, subject: &ferx_core::Subject, pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::pk::event_driven::event_driven_predictions_with_schedule(pk_model: ferx_core::PkModel, subject: &ferx_core::Subject, schedule: &ferx_core::pk::event_driven::EventSchedule, pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::pk::event_driven::profile_report()

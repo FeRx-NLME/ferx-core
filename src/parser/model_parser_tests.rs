@@ -25841,6 +25841,16 @@ fn e6_model_bodies() -> Vec<(&'static str, &'static str)> {
              \x20 KA   = TVKA * DECAY\n",
         ),
         (
+            // Pembrolizumab's shape (#1477): every `powf` sits inside an η-dependent
+            // statement, and two of them read `TIME`.
+            "time_power_inside_an_eta_statement",
+            "  TI50 = TVV * exp(ETA_V)\n\
+             \x20 HILL = TVKA\n\
+             \x20 CL   = TVCL * (WT / 70)^0.75 * exp(-0.5 * TIME^HILL / (TI50^HILL + TIME^HILL)) * exp(ETA_CL)\n\
+             \x20 V    = TVV * (WT / 70) * exp(ETA_V)\n\
+             \x20 KA   = TVKA * (WT / 70)^0.75\n",
+        ),
+        (
             "reassignment_after_an_eta_write",
             "  BMI = WT / (HT / 100)^2\n\
              \x20 CL  = TVCL * BMI * exp(ETA_CL)\n\
@@ -25939,7 +25949,9 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
                 stmts, &theta, &eta, &cov, &mut want, None, &nn, &mut stack,
             );
 
-            let mut got = vec![0.0f64; n_vars];
+            // The split program may carry synthetic slots past `n_vars` for lifted
+            // sub-expressions (#1477); only the program's own slots are compared.
+            let mut got = vec![0.0f64; split.n_vars];
             eval_statements_indexed_with_stack(
                 &split.prefix,
                 &theta,
@@ -26082,6 +26094,115 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
             }
         }
     }
+}
+
+/// `Op::Pow` count over every `AssignBc` in `stmts` (the `If` arms are not
+/// descended — the lift never touches them).
+fn count_pow_ops(stmts: &[Statement]) -> usize {
+    stmts
+        .iter()
+        .map(|s| match s {
+            Statement::AssignBc(_, bc) => bc.ops.iter().filter(|o| matches!(o, Op::Pow)).count(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The sub-expression hoist (#1477) must lift the η-independent `powf`s out of an
+/// η-dependent statement — that is its whole purpose — and the two
+/// value-preservation tests above (`eta_independent_split_is_value_preserving_on_every_shape`,
+/// `hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs`) run the same
+/// zoo entry, so this only has to pin that the lift *happened*: without it both
+/// of those pass on a program that lifts nothing.
+///
+/// On the pembrolizumab-shaped body the η-dependent `CL` carries four `^`:
+/// `(WT/70)^0.75`, `TIME^HILL` twice and `TI50^HILL`. Only the first leaves: it reads
+/// θ and a covariate. The two `TIME^HILL` are η-independent but read `TIME`, which
+/// the lift declines by measurement (see `ip_lift_subexprs`: a per-event key misses
+/// on every M-step visit), and `TI50^HILL` reads the η-dependent `TI50`. Pinned as an
+/// exact count on each side, so a lift that stops at the first hit, one that lifts a
+/// `TIME` reader, or one that lifts the tainted `TI50^HILL` is red rather than merely
+/// less effective.
+#[test]
+fn eta_dependent_statements_shed_their_eta_independent_powers() {
+    let body = e6_model_bodies()
+        .into_iter()
+        .find(|(n, _)| *n == "time_power_inside_an_eta_statement")
+        .map(|(_, b)| b)
+        .expect("zoo entry");
+    let model = parse_model_string(&e6_model_text(body)).expect("parse");
+    let program = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    let split = split_ip_eta_independent_prefix(
+        &program.stmts,
+        program.n_vars,
+        model.n_theta,
+        model.referenced_covariates.len(),
+    )
+    .expect("this shape hoists");
+    // Whole statements: HILL and KA are η-independent and hoist whole; V's `(WT/70)`
+    // is too cheap to lift (cost < 20) so V stays whole in the suffix.
+    assert_eq!(split.n_subexpr, 1, "lifted sub-expressions");
+    assert_eq!(
+        split.n_vars,
+        program.n_vars + 1,
+        "one synthetic slot per lift"
+    );
+    assert!(
+        !split.key_time,
+        "no TIME reader may be lifted, so TIME stays out of the key"
+    );
+    // Powers: original program has 1 (KA) + 4 (CL) = 5; the suffix keeps the two
+    // `TIME^HILL` and `TI50^HILL`.
+    assert_eq!(count_pow_ops(&program.stmts), 5);
+    assert_eq!(
+        count_pow_ops(&split.suffix),
+        3,
+        "TIME readers and the η reader stay"
+    );
+    assert_eq!(
+        count_pow_ops(&split.prefix),
+        2,
+        "KA's and CL's lifted allometric power"
+    );
+    // The synthetic slot is the tail of `writes`, so the cache entry's `vals` stays
+    // parallel to it.
+    assert_eq!(split.writes.last().copied(), Some(program.n_vars));
+}
+
+/// A slot an earlier **suffix** statement wrote is tainted, and a subtree reading
+/// it must not be lifted even when it clears the cost floor — the prefix would
+/// read the value from before that write. Mutation check: dropping the `tainted`
+/// test in `ip_lift_subexprs` lifts `SCALE^0.5` here (this assertion goes red) and
+/// `eta_independent_split_is_value_preserving_on_every_shape` would too, were the
+/// shape in the zoo — it is kept out so the two properties fail independently.
+#[test]
+fn a_tainted_slot_blocks_the_sub_expression_lift() {
+    let body = "  SCALE = (WT / 70)^0.75\n\
+                \x20 CL    = TVCL * SCALE * exp(ETA_CL)\n\
+                \x20 SCALE = SCALE^2\n\
+                \x20 V     = TVV * SCALE^0.5 * exp(ETA_V)\n\
+                \x20 KA    = TVKA\n";
+    let model = parse_model_string(&e6_model_text(body)).expect("parse");
+    let program = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    let split = split_ip_eta_independent_prefix(
+        &program.stmts,
+        program.n_vars,
+        model.n_theta,
+        model.referenced_covariates.len(),
+    )
+    .expect("SCALE's first assignment hoists");
+    assert_eq!(split.n_subexpr, 0, "`SCALE^0.5` reads a tainted slot");
+    assert_eq!(split.n_vars, program.n_vars);
+    // `SCALE = SCALE^2` conflicts with CL's read, so it and `V` stay whole.
+    assert_eq!(count_pow_ops(&split.suffix), 2);
 }
 
 /// A `[covariate_nn]` output is recomputed outside the statement list on every

@@ -528,6 +528,23 @@ section of the SDLC for the versioning policy).
   weight-first path. A 200-subject, 2,200-observation `n_agq = 3` benchmark measured a
   3.0% median paired speedup with diagonal Ω; block Ω was neutral (#1473).
 
+- **Time-varying (event-driven) analytic models evaluate faster: no more 1 KB
+  parameter-snapshot copies per event, per-schedule infusion rates, allometric
+  sub-expressions cached across proposals, and a first-order η-gradient.** A model
+  whose `[individual_parameters]` reads `TIME` or a time-varying covariate resolves
+  its PK parameters at every record; the walk copied each 1 KB snapshot several
+  times per event (19 % of a single-threaded SAEM fit), rescanned every dose of the
+  subject on every sub-interval to find the running infusions, re-ran the
+  η-independent allometric `powf`s inside η-dependent statements on every
+  proposal, and built the inner η-gradient from the outer path's full second-order
+  `(θ, η)` jet. On the pembrolizumab benchmark (303 subjects, up to 58 infusions per
+  subject, `CL` with an Imax/Hill term in `TIME`), 1 thread, identical estimates:
+  SAEM 21.3 s → 17.6 s CPU (−18 %), and 13.4 s → 10.9 s under
+  `mstep_solver = score_sa`. The SAEM chain itself is bit-identical; the final-EBE
+  pass, which uses the inner gradient, moved one weakly identified subject to a
+  lower individual objective (−1.16 OFV). A `TIME`-reading sub-expression is
+  deliberately *not* cached: keyed per event it misses on every M-step visit and
+  measured 12 % slower (#1477).
 - **`ferx --threads N` now holds `N` worker threads, not `2N`.** The flag sized Rayon's
   process-global pool *and* the fit then leased a separate `N`-worker pool of its own —
   the one carrying the 32 MiB stacks wide analytic gradients need — so the global `N`

@@ -5724,6 +5724,41 @@ const ONECPT_IV_TVCOV: &str = r#"
 "#;
 
 // 2-cpt IV with WT-on-CL. θ = [TVCL, TVV1, TVQ, TVV2, THETA_WT].
+/// Pembrolizumab's shape (#1477): a `TIME`-dependent clearance through an Imax/Hill
+/// term whose half-time carries an η, so the per-event `∂p/∂η` depends on both the
+/// event time and η through a `powf` — the case the first-order η-only program
+/// (`eval_param_eta_grad`) has to reproduce against the full `Dual2` jet.
+const TWOCPT_IV_TIME_HILL: &str = r#"
+[parameters]
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVCL(0.15, 0.001, 10.0)
+  theta TVV1(3.3, 0.1, 100.0)
+  theta TVQ(1.0, 0.01, 10.0)
+  theta TVV2(4.5, 0.1, 100.0)
+  theta TVIMAX(-0.45, -10.0, 10.0)
+  theta TVTI50(55.0, 1.0, 700.0)
+  theta TVHILL(1.3, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_V2 ~ 0.09
+  omega ETA_TI50 ~ 0.5
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  IMAX = TVIMAX
+  TI50 = TVTI50 * exp(ETA_TI50)
+  HILL = TVHILL
+  CL   = TVCL * (WT/70)^THETA_WT * exp(IMAX*TIME^HILL/(TI50^HILL+TIME^HILL)) * exp(ETA_CL)
+  V1   = TVV1 * (WT/70)^THETA_WT * exp(ETA_V1)
+  Q    = TVQ * (WT/70)^THETA_WT
+  V2   = TVV2 * (WT/70)^THETA_WT * exp(ETA_V2)
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
 const TWOCPT_IV_TVCOV: &str = r#"
 [parameters]
   theta TVCL(10.0, 1.0, 100.0)
@@ -6703,6 +6738,30 @@ fn tvcov_eta_grad_matches_full() {
             (m, s, vec![0.2, 10.0, 0.75], vec![0.12, -0.09])
         },
         {
+            // `TIME`-dependent clearance with an η inside the Hill term (#1477): the
+            // inner's first-order η-only program against the outer's full jet, on a
+            // multi-dose infusion subject with a covariate change so that every event
+            // carries its own snapshot. Weights vary so the walk's per-event
+            // snapshot is live, not a constant.
+            let m = parse_model_string(TWOCPT_IV_TIME_HILL).expect("parse 2cpt iv time hill");
+            let inf = |t: f64| DoseEvent::new(t, 200.0, 1, 400.0, false, 0.0);
+            let s = tvcov_subject(
+                vec![inf(0.0), inf(504.0), inf(1008.0)],
+                &[70.0, 72.0, 75.0],
+                &[0.5, 24.0, 500.0, 504.5, 700.0, 1008.5, 1500.0],
+                &[70.0, 70.0, 72.0, 72.0, 74.0, 75.0, 76.0],
+                Vec::new(),
+                Vec::new(),
+                &[],
+            );
+            (
+                m,
+                s,
+                vec![0.8, 0.25, 3.3, 1.07, 4.6, -0.47, 55.5, 1.26],
+                vec![0.12, -0.08, 0.2, 0.3],
+            )
+        },
+        {
             // Constant `ScalarScale` (`obs_scale = 1000`) on the TV-cov **inner**:
             // exercises `run_obs_grad_tvcov`'s `∂(f/k)/∂η = (∂f/∂η)/k` division,
             // which the other inner cases (no output scaling) leave uncovered
@@ -6735,6 +6794,108 @@ fn tvcov_eta_grad_matches_full() {
                     epsilon = 1e-11
                 );
             }
+        }
+    }
+}
+
+/// A 2-cpt IV TV-cov model with `n_theta` declared thetas, every one of them read by
+/// `CL` so the program carries every θ axis, and two etas.
+fn twocpt_iv_tvcov_wide_src(n_theta: usize) -> String {
+    let n_exp = n_theta - 4;
+    let mut src = String::from(
+        "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV1(50.0, 5.0, 500.0)\n  \
+         theta TVQ(15.0, 1.0, 100.0)\n  theta TVV2(100.0, 10.0, 1000.0)\n",
+    );
+    for i in 1..=n_exp {
+        src += &format!("  theta E{i}(0.04, 0.001, 1.0)\n");
+    }
+    src += "  omega ETA_CL ~ 0.09\n  omega ETA_V1 ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
+            [individual_parameters]\n  CL = TVCL * (WT/70)^(";
+    src += &(1..=n_exp)
+        .map(|i| format!("E{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    src += ") * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n  Q  = TVQ\n  V2 = TVV2\n\
+            [structural_model]\n  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n\
+            [covariates]\n  WT continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    src
+}
+
+/// The inner η-only program (`tvcov_eta_rows_at`, #1477) dropped the
+/// `prog.n_axes() > MAX_TVCOV_AXES` decline that `param_derivatives_at_cov` carries,
+/// on the argument that `tvcov_analytical_supported` bounds the same count before any
+/// per-subject work — so a model one axis past the cap must decline on **both** loops,
+/// not run the inner analytically while the outer falls to FD (PR #1482 review). The
+/// twin at exactly the cap runs both, and its inner rows still match the outer η block.
+#[test]
+fn tvcov_inner_and_outer_decline_together_past_the_axis_cap() {
+    let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let subject = tvcov_subject(
+        vec![bolus(0.0)],
+        &[70.0],
+        &[0.5, 2.0, 6.0, 12.0, 24.0],
+        &[70.0, 75.0, 82.0, 88.0, 95.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    let eta = vec![0.12, -0.08];
+    let theta_for = |n_theta: usize| -> Vec<f64> {
+        let mut th = vec![10.0, 50.0, 15.0, 100.0];
+        th.extend(std::iter::repeat_n(
+            0.75 / (n_theta - 4) as f64,
+            n_theta - 4,
+        ));
+        th
+    };
+
+    // One past the cap: 23 θ + 2 η = 25 axes.
+    let over = parse_model_string(&twocpt_iv_tvcov_wide_src(MAX_TVCOV_AXES - 1))
+        .expect("parse over-cap tvcov");
+    assert_eq!(over.n_theta, MAX_TVCOV_AXES - 1);
+    assert_eq!(over.n_eta, 2);
+    assert_eq!(tvcov_program_axes(&over), MAX_TVCOV_AXES + 1);
+    let prog = over
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    assert_eq!(
+        prog.n_axes(),
+        MAX_TVCOV_AXES + 1,
+        "the program's axis count is the gate's count, so the dropped guard was redundant"
+    );
+    assert!(!tvcov_analytical_supported(&over));
+    let theta = theta_for(over.n_theta);
+    assert!(
+        subject_sensitivities_tvcov(&over, &subject, &theta, &eta).is_none(),
+        "outer must decline past the cap"
+    );
+    assert!(
+        subject_eta_grad_tvcov(&over, &subject, &theta, &eta).is_none(),
+        "inner must decline with the outer, not split to an analytic η-only route"
+    );
+
+    // Exactly at the cap: 22 θ + 2 η = 24 axes — both loops analytic and in agreement.
+    let at = parse_model_string(&twocpt_iv_tvcov_wide_src(MAX_TVCOV_AXES - 2))
+        .expect("parse at-cap tvcov");
+    assert_eq!(tvcov_program_axes(&at), MAX_TVCOV_AXES);
+    assert!(tvcov_analytical_supported(&at));
+    let theta = theta_for(at.n_theta);
+    let full = subject_sensitivities_tvcov(&at, &subject, &theta, &eta).expect("outer at cap");
+    let light = subject_eta_grad_tvcov(&at, &subject, &theta, &eta).expect("inner at cap");
+    assert_eq!(full.obs.len(), light.len());
+    for (a, b) in full.obs.iter().zip(light.iter()) {
+        assert!(a.f.is_finite() && a.f > 0.0, "{}", a.f);
+        approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+        for k in 0..at.n_eta {
+            assert!(a.df_deta[k].is_finite());
+            approx::assert_relative_eq!(
+                a.df_deta[k],
+                b.df_deta[k],
+                max_relative = 1e-10,
+                epsilon = 1e-11
+            );
         }
     }
 }
