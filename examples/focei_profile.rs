@@ -1,5 +1,6 @@
 //! Usage: focei_profile CASE THREADS REPEATS MODE OUTPUT_JSON
-//! CASE: analytical | iov | stiff. MODE: time | kernels | counts | stacks | byte_stacks.
+//! CASE: analytical | agq | agq_block | iov | stiff.
+//! MODE: time | kernels | counts | stacks | byte_stacks.
 //! Allocation builds: cargo rustc --profile ci-test --example focei_profile --
 //! --cfg profiling_allocations -C debuginfo=1. Normal builds have no allocator hook.
 #![allow(unexpected_cfgs)] // example-only --cfg, not an engine feature/API
@@ -74,6 +75,16 @@ fn fixture(case: &str) -> (CompiledModel, Population) {
     if case != "stiff" {
         let (model_file, data_file, occ) = match case {
             "analytical" => ("examples/warfarin.ferx", "data/warfarin.csv", None),
+            "agq" => (
+                "plans/laplace-sensitivity-speed/warfarin_focei_agq.ferx",
+                "data/warfarin.csv",
+                None,
+            ),
+            "agq_block" => (
+                "plans/laplace-sensitivity-speed/warfarin_block_omega_focei_agq.ferx",
+                "data/warfarin.csv",
+                None,
+            ),
             "iov" => (
                 "examples/warfarin_iov.ferx",
                 "data/warfarin_iov.csv",
@@ -168,6 +179,11 @@ fn main() {
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
+        n_agq: if case == "agq" || case == "agq_block" {
+            3
+        } else {
+            1
+        },
         threads: Some(threads),
         outer_maxiter: 5,
         inner_maxiter: 30,

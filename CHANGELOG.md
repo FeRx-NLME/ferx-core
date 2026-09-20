@@ -499,6 +499,12 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **Multi-node analytic AGQ reuses each node's sensitivity jet for both its likelihood
+  and packed score.** This removes one redundant ordinary prediction traversal per scored
+  node while preserving the established fallback and leaving ODE grids on their
+  weight-first path. A 200-subject, 2,200-observation `n_agq = 3` benchmark measured a
+  3.0% median paired speedup with diagonal Ω; block Ω was neutral (#1473).
+
 - **`ferx --threads N` now holds `N` worker threads, not `2N`.** The flag sized Rayon's
   process-global pool *and* the fit then leased a separate `N`-worker pool of its own —
   the one carrying the 32 MiB stacks wide analytic gradients need — so the global `N`
