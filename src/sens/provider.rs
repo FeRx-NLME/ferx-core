@@ -3241,9 +3241,13 @@ fn tvcov_param_derivs_at(
 /// route the IOV η-only walk takes (`iov_eta_only_derivs_dyn`) — and its `dp_deta` rows
 /// are re-packed into the same shape.
 ///
-/// `None` when the program's η width is not the model's — the guard
-/// `param_derivatives_at_cov` applied, kept so the decline behaviour is unchanged — or
-/// when the NN builder declines.
+/// `None` when the program's η width is not the model's, when a non-NN program's θ
+/// width is not the model's — the two guards `param_derivatives_at_cov` applied, kept
+/// so the decline behaviour is unchanged — or when the NN builder declines. The θ
+/// guard is **not** applied on the NN arm: there `model.n_theta` counts the generated
+/// network-weight thetas that the program never sees (`prog.n_theta_axis()` is the
+/// declared count), so the comparison would send every time-varying NN subject to FD
+/// and undo #1300's analytic inner route (#1482 review).
 fn tvcov_eta_rows_at<const N: usize>(
     model: &CompiledModel,
     prog: &crate::parser::model_parser::IndivParamProgram,
@@ -3251,7 +3255,7 @@ fn tvcov_eta_rows_at<const N: usize>(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<Dual1<N>>> {
-    if prog.n_eta_axis() != model.n_eta || prog.n_theta_axis() != model.n_theta {
+    if prog.n_eta_axis() != model.n_eta {
         return None;
     }
     if nn_weight_theta_count(model) > 0 {
@@ -3268,6 +3272,9 @@ fn tvcov_eta_rows_at<const N: usize>(
                 })
                 .collect(),
         );
+    }
+    if prog.n_theta_axis() != model.n_theta {
+        return None;
     }
     Some(prog.eval_param_eta_grad::<N>(theta, eta, cov))
 }
