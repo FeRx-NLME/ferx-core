@@ -7620,9 +7620,10 @@ pub struct FitOptions {
     /// iteration to average over.
     pub saem_scale_adaptation: ScaleAdaptation,
     /// Dead band on the acceptance rate for [`ScaleAdaptation::RobbinsMonro`],
-    /// set via `[fit_options] scale_deadband = <lo>,<hi>`. `None` — the
-    /// default — steps the scale on every iteration, which is the historical
-    /// Robbins-Monro behaviour of #1444.
+    /// set via `[fit_options] scale_deadband = <lo>,<hi>`. Defaults to
+    /// `0.15,0.60` (`types::DEFAULT_SCALE_DEADBAND`) since #1449; `None`
+    /// (`scale_deadband = none`) steps the scale on every iteration, which is
+    /// the unbanded Robbins-Monro rule of #1444.
     ///
     /// With `Some((lo, hi))` the step is skipped whenever that iteration's
     /// acceptance rate lies in `[lo, hi]` **inclusive**, for both the primary
@@ -8323,8 +8324,8 @@ impl Default for FitOptions {
             // `estimation::saem::auto_n_mh_steps` (#1459).
             saem_n_mh_steps: 0,
             saem_adapt_interval: 50,
-            saem_scale_adaptation: ScaleAdaptation::Interval,
-            saem_scale_deadband: None,
+            saem_scale_adaptation: ScaleAdaptation::default(),
+            saem_scale_deadband: Some(DEFAULT_SCALE_DEADBAND),
             saem_mstep_damping: None,
             saem_mstep_solver: SaemMstepSolver::default(),
             saem_mstep_draws: 1,
@@ -8488,6 +8489,28 @@ pub enum Optimizer {
     TrustRegion,
 }
 
+/// The default [`FitOptions::saem_scale_deadband`]: the Robbins-Monro step is
+/// skipped while an iteration's acceptance is between 15% and 60%.
+///
+/// Measured rather than picked (#1449): four candidate bands were compared on
+/// the importance-sampled −2 log L over seven benchmarks × 6 seeds. All four
+/// are tie-or-better than the shipped defaults everywhere; this one has the
+/// best total (−8.75 summed over the seven, against −4.37 for `0.25,0.60`,
+/// −5.84 for `0.05,0.75` and −3.66 for `0.30,0.55`) and it is the only one
+/// that is *better* rather than merely tie on vancomycin, the bench the
+/// unbanded rule loses (`+0.98` against a `0.94` cross-seed sd, versus `−0.13`
+/// here).
+///
+/// Two of those four candidates — `0.25,0.60` and `0.30,0.55` — produced
+/// **bit-identical** fits on all four benches whose kernel resolves to 6
+/// proposals and 2 componentwise sweeps, and differed only on the three that
+/// resolve to 9 or 7. That is the quantisation of a per-iteration rate showing
+/// through: at 6 proposals both bands contain `1/3` and `1/2` and exclude
+/// `1/6` and `2/3`, so they are the *same band*, while at 7 they part over
+/// `4/7 = 0.571`. A band's edges only matter where they separate two attainable
+/// `n_accepted / n_proposals`.
+pub(crate) const DEFAULT_SCALE_DEADBAND: (f64, f64) = (0.15, 0.60);
+
 /// How SAEM adapts its per-subject MH step scales, set via
 /// `[fit_options] scale_adaptation`.
 ///
@@ -8499,15 +8522,14 @@ pub enum Optimizer {
 /// for an entire 400-iteration run (issue #1444).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleAdaptation {
-    /// The historical rule, and **the default**: every `adapt_interval`
-    /// iterations, multiply `δ` by 1.1 if the window's acceptance is above
-    /// target and by 0.9 otherwise.
+    /// The historical rule, opt-in since #1449 as `scale_adaptation =
+    /// interval`: every `adapt_interval` iterations, multiply `δ` by 1.1 if
+    /// the window's acceptance is above target and by 0.9 otherwise.
     ///
     /// Note its reach. Over a 400-iteration run at the default
     /// `adapt_interval = 50` it fires **8** times, each by a fixed factor, so
     /// `δ` can move by at most `1.1^8 ≈ 2.1×` up or `0.9^8 ≈ 0.43×` down no
     /// matter how far from target the chain is.
-    #[default]
     Interval,
     /// Robbins-Monro, every iteration: `log δ += c·k^-0.6·(accept_k − target)`,
     /// where `accept_k` is *that* iteration's rate for the kernel being
@@ -8515,10 +8537,14 @@ pub enum ScaleAdaptation {
     /// as `k^-0.6`, which both reaches the target quickly and satisfies the
     /// diminishing-adaptation condition (Roberts & Rosenthal 2007).
     ///
-    /// Opt-in. It is a large win when the chain cannot otherwise reach its
-    /// target and roughly neutral when it already can, but it has been measured
-    /// to *regress* the final estimate on a model whose acceptance was already
-    /// above target, so it is not the default.
+    /// **The default since #1449**, together with the dead band of
+    /// [`FitOptions::saem_scale_deadband`]. It is a large win when the chain
+    /// cannot otherwise reach its target and roughly neutral when it already
+    /// can; the one model it had been measured to *regress* (a chain starting
+    /// above target) no longer regresses at the `n_mh_steps = auto` count that
+    /// became the default in #1468, and the dead band covers the remaining
+    /// case — see the SAEM docs page for the six-seed measurement behind both.
+    #[default]
     RobbinsMonro,
 }
 
@@ -8552,6 +8578,15 @@ pub enum SaemMstepSolver {
     /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
     /// θ, no residual magnitude, no FREM. A fit outside that scope falls back to
     /// [`SaemMstepSolver::Bobyqa`] with a warning naming the reason.
+    ///
+    /// It was a **candidate default** in #1449 and did not become one: it is
+    /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all
+    /// eight SAEM benchmarks at 25–54 % less CPU, but on the sparse
+    /// combined-error fixture of #1445 it scatters a weakly identified
+    /// *minority* `σ_add` that the objective barely sees — 0.85 / 0.38 / 2.66
+    /// over three seeds against a simulation truth of 1.8, where `bobyqa`
+    /// returns 1.99 / 1.62 / 1.59. See
+    /// `tests/saem_combined_error.rs::score_sa_does_not_bring_back_the_additive_sigma_collapse`.
     ScoreSa,
 }
 

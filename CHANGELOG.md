@@ -21,14 +21,15 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
-  on being off target.** Under `scale_adaptation = robbins_monro` the step now fires only
+  on being off target.** Under `scale_adaptation = robbins_monro` the step fires only
   when an iteration's MH acceptance falls outside the band; inside it the step scale is
   left untouched. The rule was written for chains stuck at 2–4 % acceptance, but it also
   pulls a chain that starts *above* the 40 % target down onto it, which was measured to
-  make the final estimates worse — a band leaves that case alone. Default `none`
-  (unchanged behaviour). Note that the rule fires only *outside* the band, so a band wide
-  enough to cover every attainable rate freezes the scales instead of disabling the
-  feature; `0,1` is rejected with that explanation (#1449).
+  make the final estimates worse — a band leaves that case alone. **Defaults to
+  `0.15,0.60`** (see the `Changed` entry); `scale_deadband = none` restores the unbanded
+  rule. Note that the rule fires only *outside* the band, so a band wide enough to cover
+  every attainable rate freezes the scales instead of disabling the feature; `0,1` is
+  rejected with that explanation (#1449).
 
 - **SAEM: two opt-in estimators for the numerical θ/σ M-step that remove or shrink its
   Jensen bias (`mstep_solver = score_sa`, `mstep_draws = K`).** A θ with no ETA is moved
@@ -40,7 +41,8 @@ section of the SDLC for the versioning policy).
   `score_sa`, at the same CPU. Both are off by default, bit-identical to before when
   unset, and restricted to the plain Gaussian residual scope — see the
   [SAEM docs](docs/estimation/saem.qmd) for the recursion, the scope and the full
-  measurement (#1458).
+  measurement (#1458), including why #1449 measured `score_sa` as a candidate default
+  and left it opt-in.
 
 - **`install_on_engine_pool(f)`** runs population-wide parallel work that is not a `fit()`
   on the engine's worker pool instead of Rayon's process-global one. This is what makes a
@@ -210,13 +212,38 @@ section of the SDLC for the versioning policy).
   optimal step is an order of magnitude from the 0.3 start never gets there. On the
   shipped `examples/warfarin_saem.ferx` that leaves the E-step accepting 3.90% of its
   proposals against a 40% target for the whole run; `robbins_monro` reaches 42.05% on
-  the same model and seed. It is **opt-in**: the benchmarking in #1444 reports it
-  regressing the final estimate at 3 of 6 seeds on a model whose acceptance was
-  already above target, so the default is unchanged and existing fits keep their
-  current estimates bit-for-bit. The κ (IOV) scales stay on the interval rule under
-  both settings.
+  the same model and seed. It landed **opt-in**, because the benchmarking in #1444
+  reported it regressing the final estimate on a model whose acceptance was already
+  above target; **it became the default later in this same release cycle** — see the
+  `Changed` entry for #1449, which re-measured that regression away at the
+  `n_mh_steps = auto` count of #1459 and added the dead band. The κ (IOV) scales stay
+  on the interval rule under both settings.
 
 ### Changed
+
+- **SAEM default: the MH step scales are now adapted by `scale_adaptation = robbins_monro`
+  with `scale_deadband = 0.15,0.60` (#1449).** This was opt-in; it is now what a SAEM fit
+  runs unless it says otherwise, so **estimates from an existing model file will move**.
+  Set `scale_adaptation = interval` in `[fit_options]` to get the previous behaviour
+  exactly, and `scale_deadband = none` for the unbanded rule of #1444.
+
+  Measured over all eight SAEM benchmarks, 6 seeds each, single-threaded, on the
+  importance-sampled −2 log L, against the previous defaults: tie-or-better on every one
+  (pembrolizumab −3.74, busulfan-`TVQ`-FIX −2.73, cefepime −0.88, vancomycin −0.13), and
+  on the shipped `examples/warfarin_saem.ferx` the E-step goes from **4 %** acceptance
+  against a 40 % target to **39 %**, which is the defect #1444 reported. The regression
+  that had kept the rule opt-in — pembrolizumab, +4.7 — is gone at today's defaults: it
+  was measured at a fixed `n_mh_steps = 20`, and #1459 made that count `auto`, which
+  resolves to 6 on that model. Unbanded Robbins–Monro still costs vancomycin +0.98
+  against a 0.94 cross-seed sd; the dead band, which skips the step while an iteration's
+  acceptance is already inside the band, turns that into −0.13.
+
+  `mstep_solver = score_sa` was measured as a candidate default in the same experiment
+  and **stays opt-in**: it is tie-or-better on the −2 log L of all eight benchmarks at
+  25–54 % less CPU, but on the sparse combined-error fixture of #1445 it scatters a
+  weakly identified minority `σ_add` (0.85 / 0.38 / 2.66 against a simulation truth of
+  1.8, where the default returns 1.99 / 1.62 / 1.59) at an objective that differs by
+  under 2 units. See the SAEM docs page.
 
 - **SAEM's `n_mh_steps` default is now `auto`, sized from the dataset instead of a flat
   20 (#1459).** The block-MH proposal count per subject per iteration is resolved as

@@ -9981,7 +9981,7 @@ DV ~ additive(EPS)
     }
 
     #[test]
-    fn scale_deadband_is_inclusive_at_both_ends_and_absent_by_default() {
+    fn scale_deadband_is_inclusive_at_both_ends_and_shipped_by_default() {
         // The comparison itself, mutation-tested — measured, not assumed:
         // `rate >= lo` → `rate > lo` kills the lo-edge assertion, `rate <= hi`
         // → `rate < hi` kills the hi-edge one, and a predicate hard-wired to
@@ -9999,15 +9999,19 @@ DV ~ additive(EPS)
         assert!(!inside_scale_deadband(below, band), "{below} < lo");
         assert!(!inside_scale_deadband(above, band), "{above} > hi");
         assert!(!inside_scale_deadband(0.0, band) && !inside_scale_deadband(1.0, band));
-        // No band is never inside, at any rate — the unbanded rule must keep
-        // stepping every iteration, which is what the default does.
+        // No band is never inside, at any rate — `scale_deadband = none` must keep
+        // stepping every iteration, which is what #1444 shipped.
         for r in [0.0, 0.15, 0.40, 0.60, 1.0] {
             assert!(
                 !inside_scale_deadband(r, None),
                 "None must never skip ({r})"
             );
         }
-        assert_eq!(FitOptions::default().saem_scale_deadband, None);
+        assert_eq!(
+            FitOptions::default().saem_scale_deadband,
+            Some(crate::types::DEFAULT_SCALE_DEADBAND),
+            "the shipped default is the band #1449 measured, not `None`"
+        );
 
         // Composed with the step, the way the two call sites do it: inside the
         // band the scale comes back bit-for-bit unchanged, outside it is
@@ -10115,12 +10119,13 @@ DV ~ additive(EPS)
             "{err}"
         );
 
-        // The default stays the legacy rule: shipping Robbins-Monro as the
-        // default would silently move every existing SAEM user's estimates, and
-        // it is measured to regress one benchmark (issue #1444).
+        // The default is Robbins-Monro since #1449, which measured the
+        // regression that had kept it opt-in (issue #1444) gone at the
+        // `n_mh_steps = auto` count of #1468, and covered the remaining case
+        // with `scale_deadband`. `interval` is now the opt-in.
         assert_eq!(
             FitOptions::default().saem_scale_adaptation,
-            ScaleAdaptation::Interval
+            ScaleAdaptation::RobbinsMonro
         );
     }
 
@@ -10257,8 +10262,8 @@ DV ~ additive(EPS)
     }
 
     #[test]
-    fn interval_is_the_default_and_bit_identical_to_asking_for_it() {
-        use crate::types::ScaleAdaptation;
+    fn the_default_is_robbins_monro_with_the_shipped_dead_band() {
+        use crate::types::{ScaleAdaptation, DEFAULT_SCALE_DEADBAND};
         let model = scale1444_model(0.09, 0.04);
         let pop = mix996_pop(4);
         let base = FitOptions {
@@ -10270,28 +10275,29 @@ DV ~ additive(EPS)
             run_covariance_step: false,
             ..FitOptions::default()
         };
-        // Arm 1: the option left alone. Arm 2: `interval` asked for explicitly.
+        // Arm 1: the options left alone. Arm 2: exactly what #1449 says the
+        // default now resolves to, asked for by hand.
         let untouched = crate::api::fit(&model, &pop, &model.default_params, &base).expect("Ok");
         let explicit = crate::api::fit(
             &model,
             &pop,
             &model.default_params,
             &FitOptions {
-                saem_scale_adaptation: ScaleAdaptation::Interval,
-                ..base
+                saem_scale_adaptation: ScaleAdaptation::RobbinsMonro,
+                saem_scale_deadband: Some(DEFAULT_SCALE_DEADBAND),
+                ..base.clone()
             },
         )
         .expect("Ok");
-        // Bit-for-bit, not to a tolerance: the legacy path must still be the
-        // code that ran before #1444, and the default must select it. A single
-        // `f64` differing in its last bit fails this. The regression it catches
-        // is the default flipping to `RobbinsMonro` — which is what the
-        // research branch this came from shipped.
+        // Bit-for-bit, not to a tolerance: a single `f64` differing in its
+        // last bit fails this. What it pins is that the shipped default *is*
+        // the configuration the #1449 measurement was taken on — the
+        // regression it catches is either half of the pair silently reverting.
         assert!(untouched.ofv.is_finite(), "OFV {}", untouched.ofv);
         assert_eq!(
             untouched.ofv.to_bits(),
             explicit.ofv.to_bits(),
-            "default arm OFV {} vs explicit-interval {}",
+            "default arm OFV {} vs explicit robbins_monro + band {}",
             untouched.ofv,
             explicit.ofv
         );
@@ -10302,6 +10308,25 @@ DV ~ additive(EPS)
         for (a, b) in untouched.sigma.iter().zip(&explicit.sigma) {
             assert_eq!(a.to_bits(), b.to_bits(), "sigma {a} vs {b}");
         }
+
+        // The control, without which the equality above is satisfied by a
+        // default that never changed: the historical rule must now be
+        // reachable only by asking, and must give a *different* fit.
+        let legacy = crate::api::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                saem_scale_adaptation: ScaleAdaptation::Interval,
+                ..base
+            },
+        )
+        .expect("Ok");
+        assert!(
+            legacy.ofv.to_bits() != untouched.ofv.to_bits(),
+            "`interval` must no longer be what the default runs, got {} both ways",
+            legacy.ofv
+        );
     }
 
     #[test]

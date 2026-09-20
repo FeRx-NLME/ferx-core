@@ -347,6 +347,8 @@ attack it: one **removes** the Jensen term by never forming a maximiser, the
 other **shrinks** it by averaging more draws into the one it forms. Both are
 **off by default**, and a fit that sets neither is bit-identical to before.
 
+#### The two alternatives
+
 `mstep_solver = score_sa`
 : Solves the score equation `E[∇Q(x, η)] = 0` by stochastic approximation,
   preconditioned by the SA-averaged expected information (Kuhn & Lavielle 2005):
@@ -377,7 +379,9 @@ time-to-event endpoint, no `block_sigma` residual correlation, no
 `[covariate_nn]` θ, no residual magnitude, no FREM. A model outside it keeps the
 historical solver and says so by name in the fit's warnings.
 
-**Measured** on the busulfan benchmark of #1458 (`ferx-testdata/busulfan_dominic`, 600
+#### Measured
+
+On the busulfan benchmark of #1458 (`ferx-testdata/busulfan_dominic`, 600
 subjects, analytic 2-cpt IV, `block_omega(ETA_CL, ETA_V1)` + `omega ETA_V2`, combined
 error, `TVQ` with no ETA), 6 seeds at the default 150/250/20 schedule, on the
 importance-sampled −2 log L — the neutral readout, since a SAEM fit has no objective of
@@ -400,8 +404,42 @@ correlated for a two- or three-draw average to be worth anything, which is the r
 not about the estimator, and a near-i.i.d. kernel changes it.
 
 On the 100-subject subset the three arms are a tie (7531.37 ± 0.37 default against
-7531.14 ± 0.93 for `score_sa`), with `score_sa`'s seed spread 2.5× wider — so neither is
-recommended below a few hundred subjects, and neither is on by default.
+7531.14 ± 0.93 for `score_sa`), with `score_sa`'s seed spread 2.5× wider.
+
+#### Why `score_sa` is not the default
+
+It was a candidate in [#1449](https://github.com/FeRx-NLME/ferx-core/issues/1449) and it
+is not a close call on either side, which is why the answer is worth recording.
+
+**For.** Re-measured at today's shipped defaults (`n_mh_steps = auto`) over all eight
+SAEM benchmarks, 6 seeds each, single-threaded, it is tie-or-better than `bobyqa` on the
+importance-sampled −2 log L on every one — best on busulfan (−5.14), busulfan-`TVQ`-FIX
+(−5.58) and the thiotepa ODE bench (−11.07) — and it costs **25–54 % less CPU** (cefepime
+5.36 → 2.45 s, thiotepa 215 → 94 s), because one gradient sweep per iteration replaces a
+derivative-free solve whose cost is `mstep_maxiter·(n+1)` population passes.
+
+**Against.** On the sparse combined-error fixture of #1445 — 300 subjects with a median
+of one observation each, truth `combined(prop = 0.13, add = 1.8)` — it scatters the
+*minority* additive σ:
+
+| seeds 1 / 2 / 3 | `ADD_ERR` (truth 1.8) |
+|---|---|
+| `bobyqa` | 1.99 / 1.62 / 1.59 |
+| `score_sa` | 0.85 / 0.38 / 2.66 |
+
+a 7× seed spread against 1.25×, and two of the three seeds outside a factor of two of
+truth. The objective cannot see it: the FOCE readout differs by under 2 units across all
+six fits, and the benchmark suite's −2 log L prefers `score_sa`. This is the same channel
+#1445 is about — a variance component identified only where `σ_add` and `σ_prop·f` are
+comparable — and it is why `tests/saem_combined_error.rs` scores it against **simulation
+truth** rather than against another estimator. A default has to be safe for the parameter
+the likelihood barely constrains, so `score_sa` stays opt-in and is worth reaching for on
+a model with a free θ that has no ETA.
+
+One further thing #1449 measured: `score_sa`'s score/information sweep does not reuse the
+cached event schedule, so on a model whose `[individual_parameters]` read `TIME` or a
+time-varying covariate it rebuilds two schedules per subject per iteration. That is an
+unrealised saving on top of the CPU numbers above, not a regression against them.
 
 Two things the numbers do **not** say. First, `d_final` against a long-run reference gets
 *worse* under `score_sa` (`TVQ` moves from −0.04 to −0.18 log units away from it) — but
@@ -529,7 +567,7 @@ when `n_leapfrog > 0`), 44% for the componentwise kernel. The block kernel and
 the componentwise kernel carry independent per-subject scales, and each η's
 componentwise scale is adapted separately.
 
-#### `scale_adaptation = interval` (default)
+#### `scale_adaptation = interval`
 
 Every `adapt_interval` iterations, from that window's acceptance rate:
 
@@ -546,7 +584,7 @@ never reaches it. `examples/warfarin_saem.ferx` is such a model: on the default
 settings its combined acceptance collapses to 1.6% by iteration 26 and sits at
 2–4% for the remaining ~375 iterations against the 40% target (issue #1444).
 
-#### `scale_adaptation = robbins_monro`
+#### `scale_adaptation = robbins_monro` (default)
 
 A Robbins–Monro step taken **every** iteration, from that iteration's own rate:
 
@@ -558,8 +596,8 @@ reach is unlimited, and the $k^{-0.6}$ decay is the diminishing-adaptation
 condition that keeps an adapting chain valid (Roberts & Rosenthal 2007). The
 clamps are the same as the interval rule's.
 
-**It is opt-in, and not a free win.** What ferx measures directly is the
-acceptance rate, and on `examples/warfarin_saem.ferx` at its shipped settings
+**It is the default since #1449, and it was not always a free win.** What ferx
+measures directly is the acceptance rate, and on `examples/warfarin_saem.ferx` at its shipped settings
 (150 + 250 iterations, `n_mh_steps = 20`, seed 12345) the combined rate over
 the last 100 iterations goes from **3.90%** under `interval` to **42.05%**
 under `robbins_monro`, against the 40% target. That much is reproduced by
@@ -567,16 +605,25 @@ under `robbins_monro`, against the 40% target. That much is reproduced by
 
 Whether a rate at target makes the *estimates* better is a separate question,
 and one this page does not answer from its own runs. The SAEM benchmarking in
-[issue #1444](https://github.com/FeRx-NLME/ferx-core/issues/1444) reports, over
+[issue #1444](https://github.com/FeRx-NLME/ferx-core/issues/1444) reported, over
 6 seeds on real datasets, that Robbins–Monro roughly halves warfarin's
 final-estimate error against a long-run reference, changes little on models
-whose baseline scale is already near target, and **regresses** pembrolizumab
-(303 subjects, 4 η) at 3 of 6 seeds — a model whose acceptance was already
-*above* target. Those numbers come from that benchmark suite, not from this
-repository's test suite, and they have no NONMEM counterpart (NONMEM's SAEM
-exposes no comparable step-scale knob). Treat them as the reason the default
-did not change rather than as a performance guarantee: `interval` remains the
-default, so no existing fit's estimates move.
+whose baseline scale is already near target, and **regressed** pembrolizumab
+(303 subjects, 4 η) — a model whose acceptance was already *above* target — by
++4.7 on the importance-sampled −2 log L. That regression is what kept the rule
+opt-in.
+
+It is gone at today's defaults, and the reason is worth knowing: those
+measurements were taken at a fixed `n_mh_steps = 20`, and #1468 made the
+proposal count `auto`, which resolves to **6** on that model. Re-measured at
+the shipped defaults over 6 seeds ([#1449](https://github.com/FeRx-NLME/ferx-core/issues/1449)),
+Robbins–Monro *improves* pembrolizumab by **−4.7**, and the only bench it costs
+anything on is vancomycin (+0.98 against a 0.94 cross-seed sd) — which the dead
+band below removes. #1444's own data already pointed this way: at
+`n_mh_steps = 8` it won on that bench too. These numbers have no NONMEM
+counterpart (NONMEM's SAEM exposes no comparable step-scale knob).
+
+`scale_adaptation = interval` restores the historical rule exactly.
 
 The κ (IOV) scales stay on the interval rule under both settings: the
 per-occasion kernel makes one proposal per occasion per iteration, so a single
@@ -585,19 +632,28 @@ Robbins–Monro arm has not been measured there.
 
 #### `scale_deadband` — only correct a chain that is off target
 
-`[fit_options] scale_deadband = <lo>,<hi>` makes the Robbins–Monro step
-conditional: it fires only when that iteration's acceptance is **outside**
-`[lo, hi]`, and inside the band the scale is left bit-for-bit alone (there is
-no interval bump underneath it — the interval rule is off for the whole run
-under `robbins_monro`). The band is one absolute acceptance window shared by
-the block kernel (target 40%) and each componentwise coordinate (44%). It is
-ignored under `scale_adaptation = interval`, which has no per-iteration step to
-skip.
+`[fit_options] scale_deadband = <lo>,<hi>`, **default `0.15,0.60`**, makes the
+Robbins–Monro step conditional: it fires only when that iteration's acceptance
+is **outside** `[lo, hi]`, and inside the band the scale is left bit-for-bit
+alone (there is no interval bump underneath it — the interval rule is off for
+the whole run under `robbins_monro`). The band is one absolute acceptance
+window shared by the block kernel (target 40%) and each componentwise
+coordinate (44%). It is ignored under `scale_adaptation = interval`, which has
+no per-iteration step to skip.
 
 It exists for the failure the previous section names: the models Robbins–Monro
 was written for sit at 2–4%, and the one it regressed was already *above*
-target and got pulled down onto it. A band leaves the second alone and still
-rescues the first.
+target and got pulled down onto it.
+
+**What it does, measured, is not quite what it was built for.** Over the
+8-benchmark, 6-seed suite of #1449 the band turns the unbanded rule's one loss
+into a win (vancomycin +0.98 → −0.13 on the importance-sampled −2 log L,
+against a 0.94 cross-seed sd) and keeps most of its gains (pembrolizumab −4.69
+→ −3.74, warfarin's rescue intact: tail acceptance 0.041 under `interval`,
+0.422 unbanded, 0.391 banded). But it does **not** leave a near-target chain
+alone: the realised tail acceptance is *lower* under the band than without it
+on every bench measured, because of the fixed-point shift described below. The
+improvement is real; the mechanism is not "the controller declined to act".
 
 Two things to know before setting one:
 
