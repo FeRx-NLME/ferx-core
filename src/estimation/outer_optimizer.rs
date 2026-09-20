@@ -3634,7 +3634,7 @@ fn worth_restarting_mid_descent(
 /// The `FitResult` warning a fit carries when it was restarted mid-descent and
 /// the restart was adopted (#1428). The phrase "resumed from the best point
 /// seen" is what `classify_warning` files under `optimizer_health`, and what the
-/// PR-time regression test (`nn::regularizer_fit_tests::first_line_search_abort_is_resumed_not_reported`)
+/// PR-time regression test (`nn::regularizer_fit_tests::first_line_search_abort_is_avoided_or_resumed_not_reported`)
 /// looks for; keep it if the wording changes.
 fn mid_descent_restart_warning(
     optimizer: Optimizer,
