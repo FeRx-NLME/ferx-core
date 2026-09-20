@@ -226,10 +226,14 @@ fn check_selection_filter(
 /// `W_ADDL_MISSING_II subject 3:` (no colon after the code) from `W_MISSING_DV:`.
 /// A message that does not open with one is relayed as `W_DATA`.
 fn reader_warning_code(w: &str) -> &str {
-    let code = w
-        .split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-        .next()
-        .unwrap_or_default();
+    // Both arms are live: `None` is a message that is *nothing but* a code, which
+    // `a_reader_warning_is_relayed_under_the_code_it_states` covers. (An earlier
+    // `split(..).next().unwrap_or_default()` had a `None` arm `str::split` can
+    // never take — dead, and so unpinnable by any test.)
+    let end = w
+        .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        .unwrap_or(w.len());
+    let code = &w[..end];
     // `W_` alone is a prefix, not a code.
     if code.len() > 2 && code.starts_with("W_") {
         code

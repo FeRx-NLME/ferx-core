@@ -128,6 +128,17 @@ const H_MISSING_DV_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                                 2,1,9.4,0,.,1,0\n\
                                 2,2,8.0,0,.,1,0\n";
 
+/// One observation row whose `CENS` cell is `7` — neither `-1`, `0` nor `1`. The M3
+/// likelihood coerces every nonzero flag to a left tail, so the row is scored as
+/// censored rather than rejected, and the reader says so as `W_CENS_UNEXPECTED`.
+const H_BAD_CENS_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
+                              1,0,.,1,100,1,1,0\n\
+                              1,1,9.0,0,.,1,0,0\n\
+                              1,2,8.2,0,.,1,0,7\n\
+                              2,0,.,1,100,1,1,0\n\
+                              2,1,9.4,0,.,1,0,0\n\
+                              2,2,8.0,0,.,1,0,0\n";
+
 /// No `CMT` column at all, against H's per-CMT scaling — the reader defaults every
 /// row to compartment 1 and says so as `W_CMT_DEFAULTED`.
 const H_NO_CMT_CSV: &str = "ID,TIME,DV,EVID,AMT,MDV\n\
@@ -432,6 +443,19 @@ fn a_reader_warning_is_reported_under_the_code_the_reader_wrote() {
     assert_eq!(
         d.code, "W_CMT_DEFAULTED",
         "unchanged by the prefix rule: {}",
+        d.message
+    );
+
+    // The one the first review round found: reachable from `ferx check --data` with
+    // no feature gate and no clause, newly coded here (the three-arm chain relayed
+    // it as `W_DATA`), and documented in neither code table until #1494's round 1.
+    // A *hand-written* list of codes is what let it through 7 mutations — see
+    // #1495, which proposes asserting the registries instead of enumerating them.
+    let (censored, _) = check_and_fit(H_MODEL, H_BAD_CENS_CSV);
+    let d = diagnostic_for(&censored, "W_CENS_UNEXPECTED");
+    assert_eq!(
+        d.code, "W_CENS_UNEXPECTED",
+        "not the generic `W_DATA`: {}",
         d.message
     );
 }

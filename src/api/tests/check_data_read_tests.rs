@@ -141,6 +141,15 @@ fn a_reader_warning_is_relayed_under_the_code_it_states() {
             "W_AMT_NOT_DOSED: 2 record(s) across 1 subject(s)",
             "W_AMT_NOT_DOSED",
         ),
+        (
+            "W_CENS_UNEXPECTED subject 1: CENS=7 is not -1, 0, or 1",
+            "W_CENS_UNEXPECTED",
+        ),
+        // Nothing but a code. This is the `find(..) == None` arm — the whole
+        // message is the run — and it is here because the arm it replaced
+        // (`split(..).next().unwrap_or_default()`) was one `str::split` can never
+        // take, so no test could pin it (#1494 review, finding 5).
+        ("W_NO_DOSES", "W_NO_DOSES"),
     ] {
         assert_eq!(reader_warning_code(message), want, "on {message:?}");
     }
