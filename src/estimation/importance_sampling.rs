@@ -1986,7 +1986,7 @@ pub(crate) struct Proposal {
 pub(crate) fn proposal_from_regularised_anchor(
     anchor: &crate::estimation::agq_cov_hessian::RegularisedAnchor,
 ) -> Proposal {
-    let chol_h = anchor.chol.l().clone_owned();
+    let chol_h = anchor.chol.l();
     let d = chol_h.nrows();
     let log_det_inv_scale = 2.0 * (0..d).map(|i| chol_h[(i, i)].ln()).sum::<f64>();
     Proposal {
