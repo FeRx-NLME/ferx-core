@@ -5724,6 +5724,41 @@ const ONECPT_IV_TVCOV: &str = r#"
 "#;
 
 // 2-cpt IV with WT-on-CL. θ = [TVCL, TVV1, TVQ, TVV2, THETA_WT].
+/// Pembrolizumab's shape (#1477): a `TIME`-dependent clearance through an Imax/Hill
+/// term whose half-time carries an η, so the per-event `∂p/∂η` depends on both the
+/// event time and η through a `powf` — the case the first-order η-only program
+/// (`eval_param_eta_grad`) has to reproduce against the full `Dual2` jet.
+const TWOCPT_IV_TIME_HILL: &str = r#"
+[parameters]
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVCL(0.15, 0.001, 10.0)
+  theta TVV1(3.3, 0.1, 100.0)
+  theta TVQ(1.0, 0.01, 10.0)
+  theta TVV2(4.5, 0.1, 100.0)
+  theta TVIMAX(-0.45, -10.0, 10.0)
+  theta TVTI50(55.0, 1.0, 700.0)
+  theta TVHILL(1.3, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  omega ETA_V2 ~ 0.09
+  omega ETA_TI50 ~ 0.5
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  IMAX = TVIMAX
+  TI50 = TVTI50 * exp(ETA_TI50)
+  HILL = TVHILL
+  CL   = TVCL * (WT/70)^THETA_WT * exp(IMAX*TIME^HILL/(TI50^HILL+TIME^HILL)) * exp(ETA_CL)
+  V1   = TVV1 * (WT/70)^THETA_WT * exp(ETA_V1)
+  Q    = TVQ * (WT/70)^THETA_WT
+  V2   = TVV2 * (WT/70)^THETA_WT * exp(ETA_V2)
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
 const TWOCPT_IV_TVCOV: &str = r#"
 [parameters]
   theta TVCL(10.0, 1.0, 100.0)
@@ -6701,6 +6736,30 @@ fn tvcov_eta_grad_matches_full() {
                 &[],
             );
             (m, s, vec![0.2, 10.0, 0.75], vec![0.12, -0.09])
+        },
+        {
+            // `TIME`-dependent clearance with an η inside the Hill term (#1477): the
+            // inner's first-order η-only program against the outer's full jet, on a
+            // multi-dose infusion subject with a covariate change so that every event
+            // carries its own snapshot. Weights vary so the walk's per-event
+            // snapshot is live, not a constant.
+            let m = parse_model_string(TWOCPT_IV_TIME_HILL).expect("parse 2cpt iv time hill");
+            let inf = |t: f64| DoseEvent::new(t, 200.0, 1, 400.0, false, 0.0);
+            let s = tvcov_subject(
+                vec![inf(0.0), inf(504.0), inf(1008.0)],
+                &[70.0, 72.0, 75.0],
+                &[0.5, 24.0, 500.0, 504.5, 700.0, 1008.5, 1500.0],
+                &[70.0, 70.0, 72.0, 72.0, 74.0, 75.0, 76.0],
+                Vec::new(),
+                Vec::new(),
+                &[],
+            );
+            (
+                m,
+                s,
+                vec![0.8, 0.25, 3.3, 1.07, 4.6, -0.47, 55.5, 1.26],
+                vec![0.12, -0.08, 0.2, 0.3],
+            )
         },
         {
             // Constant `ScalarScale` (`obs_scale = 1000`) on the TV-cov **inner**:

@@ -18288,6 +18288,10 @@ fn build_pk_param_fn(
         ip_split = None;
     }
     let ip_split = ip_split;
+    // The split program may carry synthetic slots past `n_vars` for lifted
+    // sub-expressions (#1477); the evaluation buffer is sized to whichever
+    // program the closure actually runs.
+    let n_vars_eval = ip_split.as_ref().map_or(n_vars, |s| s.n_vars);
     let ip_model_id = IP_MODEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // One line per built closure under `FERX_IP_HOIST_REPORT=1`, so a benchmark
     // can say whether it hoisted anything or fell back — the question "which
@@ -18299,11 +18303,12 @@ fn build_pk_param_fn(
                 stmts_owned.len()
             ),
             Some(sp) => eprintln!(
-                "IP_HOIST model={ip_model_id} prefix={} suffix={} cached_slots={} \
+                "IP_HOIST model={ip_model_id} prefix={} suffix={} subexpr={} cached_slots={} \
                  key_thetas={} key_covs={} key_time={} key_mixnum={} n_vars={n_vars} \
                  n_theta={n_theta_base} n_cov={n_cov}",
                 sp.prefix.len(),
                 sp.suffix.len(),
+                sp.n_subexpr,
                 sp.writes.len(),
                 sp.key_thetas
                     .as_ref()
@@ -18374,7 +18379,7 @@ fn build_pk_param_fn(
                 for (i, name) in cov_names_for_lookup.iter().enumerate() {
                     pk_cov[i] = covariates.get(name).copied().unwrap_or(0.0);
                 }
-                pk_vars.resize(n_vars, 0.0);
+                pk_vars.resize(n_vars_eval, 0.0);
                 pk_vars.fill(0.0);
 
                 // pk_param_fn doesn't compute derivatives — no `du` to pass.
@@ -21364,6 +21369,209 @@ struct IpPrefixSplit {
     key_thetas: Option<Vec<usize>>,
     /// Covariate indices in the key, ascending.
     key_covs: Vec<usize>,
+    /// Width of the variable buffer the split program needs: the program's own
+    /// `n_vars` plus one synthetic slot per hoisted sub-expression (#1477).
+    n_vars: usize,
+    /// How many η-independent sub-expressions were lifted out of η-dependent
+    /// statements into synthetic prefix slots (#1477). Reported, not consumed.
+    n_subexpr: usize,
+}
+
+/// Weighted-cost floor for lifting an η-independent **sub-expression** out of an
+/// η-dependent statement (#1477): one transcendental (`ip_op_cost` = 20). Below it
+/// the `PushVar` that replaces the subtree, plus its share of the cache key, is not
+/// clearly cheaper than recomputing.
+const IP_SUBEXPR_MIN_COST: u32 = 20;
+
+/// Stack pops of one bytecode op, or `None` for control flow (a statement whose
+/// bytecode branches is left whole — its arms are not a tree of balanced subtrees
+/// in `ops` order). Every op pushes exactly one value except the jumps.
+///
+/// **Listed one by one on purpose — no `_` arm** (see `ip_deps_bytecode`): a new
+/// `Op` must say how it shapes the stack before a subtree containing it can be
+/// lifted.
+fn ip_op_pops(op: &Op) -> Option<usize> {
+    Some(match op {
+        Op::PushConst(_)
+        | Op::PushTheta(_)
+        | Op::PushEta(_)
+        | Op::PushTime
+        | Op::PushMixNum
+        | Op::PushVar(_)
+        | Op::PushCov(_)
+        | Op::PushNnOutput(..) => 0,
+        Op::PushThetaGather(_)
+        | Op::Exp
+        | Op::Ln
+        | Op::Sqrt
+        | Op::Abs
+        | Op::InvLogit
+        | Op::Logit
+        | Op::LogicNot
+        | Op::IsPresent
+        | Op::Floor
+        | Op::Ceil
+        | Op::Round => 1,
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Pow
+        | Op::Mod
+        | Op::CmpLt
+        | Op::CmpLe
+        | Op::CmpGt
+        | Op::CmpGe
+        | Op::CmpEq
+        | Op::CmpNe
+        | Op::LogicAnd
+        | Op::LogicOr => 2,
+        Op::JumpIfFalse(_) | Op::Jump(_) => return None,
+    })
+}
+
+/// One subtree of a statement's postfix bytecode: the op range `start..=end`
+/// that computes it, its weighted cost, and whether every input it reads is
+/// available to the prefix (no η, no NN output, no tainted or out-of-range slot).
+struct IpSubtree {
+    start: usize,
+    end: usize,
+    cost: u32,
+    hoistable: bool,
+    children: Vec<usize>,
+}
+
+/// Lift the maximal η-independent sub-expressions of an η-dependent assignment
+/// into synthetic prefix statements (#1477).
+///
+/// The statement-level split cannot touch `CL = TVCL · (WT/70)^θ · exp(η)`: the
+/// statement reads `η`, so the allometric factor is re-evaluated on every proposal
+/// even though nothing in it changes. On a time-varying model this repeats **per
+/// event**: on the pembrolizumab bench the statement-level prefix held three cheap
+/// statements while the four η-dependent ones carried seven `powf` between them —
+/// five of which read only θ, `LBWT` and `TIME`.
+///
+/// Reconstructs the expression tree from the postfix `ops` (every op has a fixed
+/// pop count, so a subtree is a contiguous op range), then walks it from the root:
+/// a hoistable subtree of weighted cost ≥ [`IP_SUBEXPR_MIN_COST`] is cut out whole,
+/// its ops copied verbatim into a new `AssignBc(slot, …)` on a fresh slot past
+/// `n_vars`, and replaced in the parent by `PushVar(slot)`; a hoistable subtree
+/// below the floor is left in place (its children are cheaper still); a non-hoistable
+/// node is descended. Hoisted ops keep their relative order and operands, so the
+/// value each produces is bit-identical to the inline evaluation — the parent then
+/// consumes the identical `f64` from a slot instead of from the stack.
+///
+/// Returns the rewritten statement bytecode, or `None` when nothing was lifted: the
+/// bytecode branches, is malformed, has a hoistable root (that is the statement-level
+/// split's business — it is here only because of a write conflict), or has no subtree
+/// clearing the floor. `next_slot` is advanced by one per lifted subtree and the new
+/// `(slot, bytecode)` pairs are appended to `lifted` in `ops` order.
+fn ip_lift_subexprs(
+    bc: &Bytecode,
+    tainted: &[bool],
+    n_vars: usize,
+    next_slot: &mut usize,
+    lifted: &mut Vec<(usize, Bytecode)>,
+) -> Option<Bytecode> {
+    let mut nodes: Vec<IpSubtree> = Vec::with_capacity(bc.ops.len());
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, op) in bc.ops.iter().enumerate() {
+        let pops = ip_op_pops(op)?;
+        if stack.len() < pops {
+            return None;
+        }
+        let children = stack.split_off(stack.len() - pops);
+        let self_ok = match *op {
+            Op::PushEta(_) | Op::PushNnOutput(..) => false,
+            // A `TIME`-reading subtree is left in place, and this is a measurement,
+            // not a principle. Lifting it puts `TIME` in the cache key, and a key that
+            // differs per event can only hit across *proposals* for the same event.
+            // SAEM's M-step visits every event exactly once per population pass at a
+            // fresh θ, so there every lookup misses and the key build + probe + store
+            // is pure overhead: on the pembrolizumab bench (`TIME^HILL` twice inside
+            // `CL`) that variant measured **+12 % CPU** against the same build without
+            // it (21.6 s vs 19.3 s, 1 thread, 3 interleaved reps), while the
+            // time-free lifts below hit across a subject's events in both steps. A
+            // whole `TIME`-reading statement is still the statement-level split's
+            // decision (`e6` zoo: `time_builtin`), unchanged here.
+            Op::PushTime => false,
+            Op::PushVar(v) => (v as usize) < n_vars && !tainted[v as usize],
+            _ => true,
+        };
+        let start = children.first().map_or(i, |&c| nodes[c].start);
+        let cost = children
+            .iter()
+            .fold(ip_op_cost(op), |acc, &c| acc.saturating_add(nodes[c].cost));
+        let hoistable = self_ok && children.iter().all(|&c| nodes[c].hoistable);
+        nodes.push(IpSubtree {
+            start,
+            end: i,
+            cost,
+            hoistable,
+            children,
+        });
+        stack.push(nodes.len() - 1);
+    }
+    let [root] = stack.as_slice() else {
+        return None;
+    };
+    if nodes[*root].hoistable {
+        return None;
+    }
+    // Maximal hoistable subtrees clearing the floor, in `ops` order (a pre-order walk
+    // over disjoint ranges visits them left to right).
+    let mut picks: Vec<usize> = Vec::new();
+    let mut todo = vec![*root];
+    while let Some(n) = todo.pop() {
+        let node = &nodes[n];
+        if node.hoistable {
+            if node.cost >= IP_SUBEXPR_MIN_COST {
+                picks.push(n);
+            }
+        } else {
+            todo.extend(node.children.iter().rev());
+        }
+    }
+    if picks.is_empty() {
+        return None;
+    }
+    picks.sort_by_key(|&n| nodes[n].start);
+
+    let mut out = Bytecode::new();
+    out.gathers = bc.gathers.clone();
+    let mut i = 0;
+    for &n in &picks {
+        let (start, end) = (nodes[n].start, nodes[n].end);
+        while i < start {
+            copy_ip_op(bc, i, &mut out);
+            i += 1;
+        }
+        let mut sub = Bytecode::new();
+        sub.gathers = bc.gathers.clone();
+        for j in start..=end {
+            copy_ip_op(bc, j, &mut sub);
+        }
+        sub.max_stack = compute_max_stack(&sub.ops);
+        let slot = *next_slot;
+        *next_slot += 1;
+        lifted.push((slot, sub));
+        out.ops.push(Op::PushVar(slot as u32));
+        i = end + 1;
+    }
+    while i < bc.ops.len() {
+        copy_ip_op(bc, i, &mut out);
+        i += 1;
+    }
+    out.max_stack = compute_max_stack(&out.ops);
+    Some(out)
+}
+
+/// Append `bc.ops[i]` to `out`, re-homing a constant into `out`'s own table.
+fn copy_ip_op(bc: &Bytecode, i: usize, out: &mut Bytecode) {
+    match bc.ops[i] {
+        Op::PushConst(c) => out.push_const(bc.constants[c as usize]),
+        op => out.ops.push(op),
+    }
 }
 
 /// Partition `stmts` into an η-independent prefix and the remainder.
@@ -21398,11 +21606,17 @@ fn split_ip_eta_independent_prefix(
     let mut written_by_prefix = vec![false; n_vars];
     let mut prefix: Vec<Statement> = Vec::new();
     let mut suffix: Vec<Statement> = Vec::new();
-    let (mut key_time, mut key_mixnum) = (false, false);
-    let mut key_theta_set = vec![false; n_theta];
-    let mut key_cov_set = vec![false; n_cov];
-    let mut all_thetas = false;
-    let mut prefix_cost: u32 = 0;
+    let mut key = IpKeyAcc {
+        key_time: false,
+        key_mixnum: false,
+        all_thetas: false,
+        key_theta_set: vec![false; n_theta],
+        key_cov_set: vec![false; n_cov],
+        prefix_cost: 0,
+    };
+    // Synthetic slots for lifted sub-expressions start past the program's own.
+    let mut next_slot = n_vars;
+    let mut synth_writes: Vec<usize> = Vec::new();
 
     for s in stmts {
         let mut d = IpStmtDeps::default();
@@ -21414,6 +21628,29 @@ fn split_ip_eta_independent_prefix(
         let depends_on_eta = d.dynamic || out_of_range || d.reads.iter().any(|&i| tainted[i]);
         let conflicts = d.writes.iter().any(|&i| touched_by_suffix[i]);
         if depends_on_eta || conflicts {
+            // Sub-expression hoist (#1477), decided against the taint state *as of
+            // this statement*, before its own writes taint anything: a slot an
+            // earlier suffix statement wrote is unavailable to the prefix, one
+            // this statement is about to overwrite is still the prefix's value.
+            let mut lifted: Vec<(usize, Bytecode)> = Vec::new();
+            let rewritten = match s {
+                Statement::AssignBc(idx, bc) => {
+                    ip_lift_subexprs(bc, &tainted, n_vars, &mut next_slot, &mut lifted)
+                        .map(|bc2| Statement::AssignBc(*idx, bc2))
+                }
+                _ => None,
+            };
+            for (slot, sub) in lifted {
+                let mut sd = IpStmtDeps::default();
+                ip_deps_bytecode(&sub, &mut sd);
+                key.absorb(&sd, n_theta, n_cov);
+                synth_writes.push(slot);
+                prefix.push(Statement::AssignBc(slot, sub));
+            }
+            // Every slot the *original* statement read stays marked as a suffix
+            // read, lifted or not, so a later η-independent writer of one of them is
+            // still held back — the synthetic statement must see the value the
+            // original read, which was the one before that later write.
             for &i in &d.writes {
                 if i < n_vars {
                     tainted[i] = true;
@@ -21425,29 +21662,12 @@ fn split_ip_eta_independent_prefix(
                     touched_by_suffix[i] = true;
                 }
             }
-            suffix.push(s.clone());
+            suffix.push(rewritten.unwrap_or_else(|| s.clone()));
         } else {
             for &i in &d.writes {
                 written_by_prefix[i] = true;
             }
-            key_time |= d.reads_time;
-            key_mixnum |= d.reads_mixnum;
-            all_thetas |= d.all_thetas;
-            for &i in &d.thetas {
-                if i < n_theta {
-                    key_theta_set[i] = true;
-                } else {
-                    // An out-of-range θ index can only come from a malformed
-                    // program; widen the key rather than narrow it.
-                    all_thetas = true;
-                }
-            }
-            for &i in &d.covs {
-                if i < n_cov {
-                    key_cov_set[i] = true;
-                }
-            }
-            prefix_cost = prefix_cost.saturating_add(d.cost);
+            key.absorb(&d, n_theta, n_cov);
             prefix.push(s.clone());
         }
     }
@@ -21455,6 +21675,15 @@ fn split_ip_eta_independent_prefix(
     if prefix.is_empty() {
         return None;
     }
+    let n_subexpr = synth_writes.len();
+    let IpKeyAcc {
+        key_time,
+        key_mixnum,
+        all_thetas,
+        key_theta_set,
+        key_cov_set,
+        prefix_cost,
+    } = key;
     let key_thetas: Option<Vec<usize>> = if all_thetas {
         None
     } else {
@@ -21483,7 +21712,10 @@ fn split_ip_eta_independent_prefix(
         return None;
     }
 
-    let writes: Vec<usize> = (0..n_vars).filter(|&i| written_by_prefix[i]).collect();
+    let mut writes: Vec<usize> = (0..n_vars).filter(|&i| written_by_prefix[i]).collect();
+    // Synthetic slots are allocated ascending from `n_vars`, so this keeps `writes`
+    // sorted and parallel to the cache entry's `vals`.
+    writes.extend(synth_writes);
     Some(IpPrefixSplit {
         prefix,
         suffix,
@@ -21492,7 +21724,43 @@ fn split_ip_eta_independent_prefix(
         key_mixnum,
         key_thetas,
         key_covs,
+        n_vars: next_slot,
+        n_subexpr,
     })
+}
+
+/// The cache-key inputs and saved cost accumulated over the prefix statements
+/// (whole statements and lifted sub-expressions alike).
+struct IpKeyAcc {
+    key_time: bool,
+    key_mixnum: bool,
+    all_thetas: bool,
+    key_theta_set: Vec<bool>,
+    key_cov_set: Vec<bool>,
+    prefix_cost: u32,
+}
+
+impl IpKeyAcc {
+    fn absorb(&mut self, d: &IpStmtDeps, n_theta: usize, n_cov: usize) {
+        self.key_time |= d.reads_time;
+        self.key_mixnum |= d.reads_mixnum;
+        self.all_thetas |= d.all_thetas;
+        for &i in &d.thetas {
+            if i < n_theta {
+                self.key_theta_set[i] = true;
+            } else {
+                // An out-of-range θ index can only come from a malformed
+                // program; widen the key rather than narrow it.
+                self.all_thetas = true;
+            }
+        }
+        for &i in &d.covs {
+            if i < n_cov {
+                self.key_cov_set[i] = true;
+            }
+        }
+        self.prefix_cost = self.prefix_cost.saturating_add(d.cost);
+    }
 }
 
 /// Entries in the per-thread η-independent-prefix cache. A power of two so the

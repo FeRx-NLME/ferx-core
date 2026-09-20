@@ -879,15 +879,40 @@ fn fill_dose_pk_params(
         Some(p) => out.resize(subject.doses.len(), p),
         None => {
             for k in 0..subject.doses.len() {
-                out.push(pk_params_at_time(
-                    model,
-                    theta,
-                    eta,
-                    subject.dose_cov(k),
-                    subject.doses[k].time,
-                ));
+                push_pk_in_place(out, || {
+                    pk_params_at_time(
+                        model,
+                        theta,
+                        eta,
+                        subject.dose_cov(k),
+                        subject.doses[k].time,
+                    )
+                });
             }
         }
+    }
+}
+
+/// `out.push(f())` without the intermediate copy.
+///
+/// `PkParams` is `[f64; MAX_PK_PARAMS]` — 1 KB — and `pk_param_fn` returns it by
+/// value, so `Vec::push(f())` materialises the snapshot on the stack and then
+/// `memcpy`s it into the vector: two 1 KB writes per event, on every proposal of
+/// SAEM's MH loop and every FOCE objective evaluation of a time-varying subject.
+/// Writing the return value straight into the reserved slot lets the compiler
+/// place the callee's return directly there (#1477). The per-event materializer
+/// is the only caller; the constant arm's `resize` clones one snapshot and is left
+/// as is.
+#[inline]
+fn push_pk_in_place(out: &mut Vec<PkParams>, f: impl FnOnce() -> PkParams) {
+    out.reserve(1);
+    let len = out.len();
+    // SAFETY: `reserve(1)` guarantees `capacity() > len`, so `ptr.add(len)` is a
+    // valid, unaliased, uninitialised slot inside the allocation; it is fully
+    // written before `set_len` publishes it, and `f` cannot observe `out`.
+    unsafe {
+        out.as_mut_ptr().add(len).write(f());
+        out.set_len(len + 1);
     }
 }
 
@@ -953,34 +978,34 @@ pub fn compute_event_pk_params_into(
         // drift from this one (#1235).
         fill_dose_pk_params(model, subject, theta, eta, None, &mut out.dose);
         for j in 0..subject.obs_times.len() {
-            out.obs.push(pk_params_at_time(
-                model,
-                theta,
-                eta,
-                subject.obs_cov(j),
-                subject.obs_times[j],
-            ));
+            push_pk_in_place(&mut out.obs, || {
+                pk_params_at_time(model, theta, eta, subject.obs_cov(j), subject.obs_times[j])
+            });
         }
         for m in 0..subject.pk_only_times.len() {
-            out.pk_only.push(pk_params_at_time(
-                model,
-                theta,
-                eta,
-                subject.pk_only_cov(m),
-                subject.pk_only_times[m],
-            ));
+            push_pk_in_place(&mut out.pk_only, || {
+                pk_params_at_time(
+                    model,
+                    theta,
+                    eta,
+                    subject.pk_only_cov(m),
+                    subject.pk_only_times[m],
+                )
+            });
         }
         // EVID=3/4 rows are data records too (#1133): `$PK` runs at them, and the
         // resulting snapshot is what re-seeds `[odes] init(...)` when the reset
         // restarts the episode.
         for r in 0..subject.reset_times.len() {
-            out.reset.push(pk_params_at_time(
-                model,
-                theta,
-                eta,
-                subject.reset_cov(r),
-                subject.reset_times[r],
-            ));
+            push_pk_in_place(&mut out.reset, || {
+                pk_params_at_time(
+                    model,
+                    theta,
+                    eta,
+                    subject.reset_cov(r),
+                    subject.reset_times[r],
+                )
+            });
         }
     } else {
         // Reached only when the subject carries no time-varying covariates (on

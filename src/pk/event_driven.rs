@@ -197,9 +197,39 @@ pub struct EventSchedule {
     /// active-infusion check) use the same shifted times the schedule
     /// was built with.
     pub dose_lagtimes: Vec<f64>,
+    /// Per interval `i`, the active infusion rate per channel of each sub-interval
+    /// of `bounds_per_interval[i]` (parallel to its `windows(2)`), as
+    /// [`active_rates_at`] computes it at that sub-interval's midpoint under the
+    /// reset floor the walk has at that point (#1477). Built from the `doses` this
+    /// schedule was built from — see `rates_dose_key`.
+    pub(crate) rates_per_interval: Vec<Vec<[f64; 4]>>,
+    /// `(rate, duration)` of every dose `rates_per_interval` was computed from,
+    /// parallel to `subject.doses`. A walk may use the precomputed rates only for
+    /// doses that still carry these two values bit-for-bit
+    /// ([`EventSchedule::rates_valid_for`]): bioavailability reshapes a
+    /// duration-defined infusion's rate and a modeled `RATE=-1/-2` dose resolves
+    /// per η, and the cached schedule built from the unreshaped doses is still
+    /// reused in the first case (its *bounds* do not move), so the rates are
+    /// validated per walk rather than assumed.
+    pub(crate) rates_dose_key: Vec<(f64, f64)>,
 }
 
 impl EventSchedule {
+    /// Whether [`Self::rates_per_interval`] applies to `doses`: same count, and every
+    /// dose's `(rate, duration)` bit-identical to the ones the rates were built from.
+    /// `O(n_doses)` once per walk, against the `O(n_doses)` scan per sub-interval it
+    /// replaces.
+    pub(crate) fn rates_valid_for(&self, doses: &[DoseEvent]) -> bool {
+        self.rates_dose_key.len() == doses.len()
+            && self
+                .rates_dose_key
+                .iter()
+                .zip(doses.iter())
+                .all(|(&(r, d), dose)| {
+                    r.to_bits() == dose.rate.to_bits() && d.to_bits() == dose.duration.to_bits()
+                })
+    }
+
     /// Pre-compute the event timeline and per-interval infusion bounds
     /// for `subject` under `pk_model`. The result is reusable across
     /// arbitrary `(theta, eta)` evaluations of the same subject *as long
@@ -220,7 +250,7 @@ impl EventSchedule {
     /// `subject.doses` (same length/order; only `rate`/`duration` may differ).
     pub fn for_subject(
         subject: &Subject,
-        _pk_model: PkModel,
+        pk_model: PkModel,
         doses: &[DoseEvent],
         dose_lagtimes: &[f64],
     ) -> Self {
@@ -328,11 +358,44 @@ impl EventSchedule {
 
         let non_finite_event_time = events.iter().any(|e| !e.time.is_finite());
 
+        // Active rates per sub-interval (#1477), under the reset floor the walk will
+        // hold when it propagates that interval: the latest `Reset` at or before the
+        // interval's start event — exactly `event_driven_predictions_with_schedule_impl`'s
+        // running `reset_floor`, which it raises when it *visits* a reset and reads when
+        // it propagates the next interval. Zero-length intervals carry no bounds and
+        // so no rates. The `O(n_doses)` scan runs once per sub-interval here instead of
+        // once per sub-interval per evaluation in the walk.
+        let mut reset_floor = f64::NEG_INFINITY;
+        let mut rates_per_interval: Vec<Vec<[f64; 4]>> =
+            Vec::with_capacity(bounds_per_interval.len());
+        for (i, bounds) in bounds_per_interval.iter().enumerate() {
+            if events[i].kind == EventKind::Reset {
+                reset_floor = events[i].time;
+            }
+            rates_per_interval.push(
+                bounds
+                    .windows(2)
+                    .map(|w| {
+                        active_rates_at(
+                            0.5 * (w[0] + w[1]),
+                            doses,
+                            &stored_lagtimes,
+                            reset_floor,
+                            pk_model,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        let rates_dose_key: Vec<(f64, f64)> = doses.iter().map(|d| (d.rate, d.duration)).collect();
+
         Self {
             events,
             bounds_per_interval,
             dose_lagtimes: stored_lagtimes,
             non_finite_event_time,
+            rates_per_interval,
+            rates_dose_key,
         }
     }
 }
@@ -532,6 +595,7 @@ fn equilibrate_ss_state_event_driven(
             lagtimes,
             f64::NEG_INFINITY,
             &mut eigen.borrow_mut(),
+            None,
         );
         Some(s)
     };
@@ -571,6 +635,7 @@ fn equilibrate_ss_state_event_driven(
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
             &mut eigen.borrow_mut(),
+            None,
         );
         cycles_run = cycle + 1;
         if tracker.should_stop(cycle, &state) {
@@ -642,6 +707,7 @@ fn ss_state_at_phase_event_driven(
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
             &mut eigen,
+            None,
         );
     } else {
         state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -654,6 +720,7 @@ fn ss_state_at_phase_event_driven(
             &[],
             f64::NEG_INFINITY,
             &mut eigen,
+            None,
         );
     }
     state
@@ -841,6 +908,10 @@ fn event_driven_predictions_with_schedule_impl(
     // eigenvalue solve runs once and is reused (the Schnider speedup). A TV-cov
     // change is a cache miss that recomputes transparently.
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
+    // The schedule's precomputed per-sub-interval rates apply only when these are
+    // the doses it was built from (`F` may have reshaped a rate, #419; a modeled
+    // dose resolves per η); checked once here, not assumed (#1477).
+    let rates_valid = schedule.rates_valid_for(eff_doses);
 
     // Parameters for the interval ENDING at each event (#1073). A record supplies
     // its own; a non-record — the lagged dose arrival — supplies none and takes
@@ -851,12 +922,16 @@ fn event_driven_predictions_with_schedule_impl(
     let governing_record = crate::dosing::governing_record_indices(schedule.events.len(), |i| {
         is_record(schedule.events[i].kind)
     });
-    let record_pk_at = |q: usize| -> PkParams {
+    // Borrowed, never copied: `PkParams` is `[f64; MAX_PK_PARAMS]` — 1 KB — and this
+    // walk resolves one per event. Returning it by value put a 1 KB `memcpy` on every
+    // event, and with `pk_for` and the `Dose` arm's snapshot doing the same the copies
+    // were 19 % of a single-threaded SAEM fit on the pembrolizumab bench (#1477).
+    let record_pk_at = |q: usize| -> &PkParams {
         let ev = schedule.events[q];
         match ev.kind {
-            EventKind::DoseRecord => pk_at_dose[ev.orig_idx],
-            EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
-            _ => pk_at_obs[ev.orig_idx],
+            EventKind::DoseRecord => &pk_at_dose[ev.orig_idx],
+            EventKind::PkOnly => &pk_at_pk_only[ev.orig_idx],
+            _ => &pk_at_obs[ev.orig_idx],
         }
     };
 
@@ -888,17 +963,25 @@ fn event_driven_predictions_with_schedule_impl(
 
         if ev.time > cur_t {
             // The interval (events[i-1], events[i]) — its bounds were
-            // pre-computed at schedule.bounds_per_interval[i-1].
+            // pre-computed at schedule.bounds_per_interval[i-1], and so were its
+            // active rates when `eff_doses` are the doses the schedule was built
+            // from (#1477).
             let bounds = &schedule.bounds_per_interval[i - 1];
+            let rates = if rates_valid {
+                schedule.rates_per_interval.get(i - 1).map(Vec::as_slice)
+            } else {
+                None
+            };
             propagate_with_bounds(
                 &mut state,
                 bounds,
-                &pk_now,
+                pk_now,
                 pk_model,
                 eff_doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
                 &mut eigen,
+                rates,
             );
             cur_t = ev.time;
         }
@@ -938,7 +1021,7 @@ fn event_driven_predictions_with_schedule_impl(
                 // Dose *attributes* belong to the dose row, so they read that
                 // row's own snapshot and never `pk_now`, which after #1073 is the
                 // next record's. Before the split the two were the same object.
-                let dose_pk = pk_at_dose[ev.orig_idx];
+                let dose_pk = &pk_at_dose[ev.orig_idx];
                 // Steady-state (SS=1): reset state and load with the SS
                 // amount from the infinite-past pulse train before the SS
                 // dose's own pulse is applied through the normal flow.
@@ -954,7 +1037,7 @@ fn event_driven_predictions_with_schedule_impl(
                     .copied()
                     .unwrap_or(0.0);
                 if d.ss && d.ii > 0.0 && !crate::dosing::ss_seeded_at_record(d, lag) {
-                    state = equilibrate_ss_state_event_driven(pk_model, &dose_pk, d);
+                    state = equilibrate_ss_state_event_driven(pk_model, dose_pk, d);
                 }
                 if d.rate <= 0.0 {
                     // Bolus: instantaneous amount jump in dose's compartment.
@@ -1030,21 +1113,97 @@ fn event_driven_predictions_with_schedule_impl(
     preds
 }
 
+/// Borrows the event's snapshot (1 KB — see the note at `record_pk_at`).
 #[inline]
-fn pk_for(
+fn pk_for<'a>(
     ev: Event,
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
-) -> PkParams {
+    pk_at_dose: &'a [PkParams],
+    pk_at_obs: &'a [PkParams],
+    pk_at_pk_only: &'a [PkParams],
+) -> &'a PkParams {
     match ev.kind {
-        EventKind::DoseRecord | EventKind::Dose => pk_at_dose[ev.orig_idx],
-        EventKind::Obs => pk_at_obs[ev.orig_idx],
-        EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
+        EventKind::DoseRecord | EventKind::Dose => &pk_at_dose[ev.orig_idx],
+        EventKind::Obs => &pk_at_obs[ev.orig_idx],
+        EventKind::PkOnly => &pk_at_pk_only[ev.orig_idx],
         // Resets are handled by the caller before `pk_for`; they carry no
         // per-event PK snapshot.
         EventKind::Reset => unreachable!("Reset carries no PK params"),
     }
+}
+
+/// The zero-order input rate per channel — `[central, periph1, periph2, depot]` —
+/// active at time `mid`, summed over `doses` in dose order.
+///
+/// **The one spelling of "which infusions are running"** for the f64 walk: the
+/// per-call scan in [`propagate_with_bounds`] and the per-schedule precompute in
+/// [`EventSchedule::for_subject`] both call it, so the cached rates cannot drift
+/// from the scanned ones (#1477). It is `O(n_doses)`, which is why the schedule
+/// caches its result: the walk used to run it once per sub-interval of every
+/// evaluation, and on an infusion-heavy subject (the pembrolizumab bench: up to 58
+/// doses and 74 events) that scan was most of `propagate_with_bounds`'s 13 % self
+/// time in a single-threaded SAEM fit.
+///
+/// `doses` are the bioavailability-adjusted (`eff_doses`) copies, so
+/// `d.rate`/`d.duration` already carry `F` (#419): the rate is injected as-is and
+/// the window `[t_start, t_start + d.duration]` is the `F`-reshaped one. A dur->0
+/// infusion still limits to the `F·AMT` bolus. `dose_lagtimes[k]` shifts dose `k`'s
+/// window; `reset_floor` turns off infusions that started before the last
+/// EVID=3/4 reset. The depot channel (`cmt 1`, #400) is a zero-order release into
+/// the oral depot followed by first-order `ka` absorption — distinct from the
+/// central channel (cmt 2, depot bypass).
+fn active_rates_at(
+    mid: f64,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    reset_floor: f64,
+    pk_model: PkModel,
+) -> [f64; 4] {
+    let mut rate_central = 0.0;
+    let mut rate_periph1 = 0.0;
+    let mut rate_periph2 = 0.0;
+    let mut rate_depot = 0.0;
+    for (k, d) in doses.iter().enumerate() {
+        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let t_start = d.time + lag;
+        let t_end = t_start + d.duration;
+        // A seeded SS dose whose *previous* cycle is still infusing at the
+        // dose record keeps delivering across the pre-arrival window (#1121),
+        // on `[d.time, residual_end]` — a window that belongs to no
+        // `DoseEvent`, so it is tested here rather than by the arrival window
+        // below. Its own reset floor is the *record*, not the arrival: an
+        // EVID=3/4 inside the pre-arrival window zeros the seeded state, and
+        // a rate that survived it would refill what the reset just emptied.
+        let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
+            .is_some_and(|end| d.time >= reset_floor && d.time <= mid && end >= mid);
+        // Infusions that started before the last reset are turned off.
+        if t_start < reset_floor && !residual {
+            continue;
+        }
+        if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
+            let r = d.rate;
+            match pk_model.topology().dose_channel(d.cmt_raw()) {
+                Some(Channel::Central) => rate_central += r,
+                Some(Channel::Periph1) => rate_periph1 += r,
+                Some(Channel::Periph2) => rate_periph2 += r,
+                Some(Channel::Depot) => rate_depot += r,
+                // Unreachable from a validated call: `check_dose_compartments`
+                // (#375) rejects an infusion outside `infusable_compartments()`
+                // up front, with the subject/time context this deep-in-the-walk
+                // panic could never carry. Kept as a defensive guard, and
+                // mirrored by `sens::propagate::active_rates_g` so the value
+                // and gradient walks agree on what is unroutable.
+                None => panic!(
+                    "event-driven PK: infusion into compartment {} not supported \
+                     for model {:?}. Supported: central for all models; depot (cmt 1) \
+                     and peripheral(s) for oral models; periph1/2 for 2- and 3-cpt IV \
+                     models — should have been rejected by `check_dose_compartments`.",
+                    d.cmt_raw(),
+                    pk_model
+                ),
+            }
+        }
+    }
+    [rate_central, rate_periph1, rate_periph2, rate_depot]
 }
 
 /// Propagate the compartment-amount state across pre-built sub-event
@@ -1070,67 +1229,22 @@ fn propagate_with_bounds(
     dose_lagtimes: &[f64],
     reset_floor: f64,
     eigen: &mut crate::sens::propagate::EigenCacheG,
+    // The active rates of every sub-interval of `bounds`, parallel to
+    // `bounds.windows(2)`, when the schedule precomputed them for exactly these
+    // `doses` (`EventSchedule::rates_valid_for`, #1477); `None` scans `doses`.
+    precomputed: Option<&[[f64; 4]]>,
 ) {
-    for w in bounds.windows(2) {
+    for (wi, w) in bounds.windows(2).enumerate() {
         let s0 = w[0];
         let s1 = w[1];
         let dt = s1 - s0;
         if dt <= 0.0 {
             continue;
         }
-        let mid = 0.5 * (s0 + s1);
-        let mut rate_central = 0.0;
-        let mut rate_periph1 = 0.0;
-        let mut rate_periph2 = 0.0;
-        // Zero-order input into the oral **depot** (cmt 1, #400) — a zero-order
-        // release into the depot followed by first-order `ka` absorption into
-        // central. Distinct channel from `rate_central` (cmt 2, depot bypass).
-        let mut rate_depot = 0.0;
-        // `doses` are the bioavailability-adjusted (`eff_doses`) copies, so
-        // `d.rate`/`d.duration` already carry `F` (#419): the rate is injected
-        // as-is and the window `[t_start, t_start + d.duration]` is the
-        // `F`-reshaped one. A dur->0 infusion still limits to the `F·AMT` bolus.
-        for (k, d) in doses.iter().enumerate() {
-            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let t_start = d.time + lag;
-            let t_end = t_start + d.duration;
-            // A seeded SS dose whose *previous* cycle is still infusing at the
-            // dose record keeps delivering across the pre-arrival window (#1121),
-            // on `[d.time, residual_end]` — a window that belongs to no
-            // `DoseEvent`, so it is tested here rather than by the arrival window
-            // below. Its own reset floor is the *record*, not the arrival: an
-            // EVID=3/4 inside the pre-arrival window zeros the seeded state, and
-            // a rate that survived it would refill what the reset just emptied.
-            let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
-                .is_some_and(|end| d.time >= reset_floor && d.time <= mid && end >= mid);
-            // Infusions that started before the last reset are turned off.
-            if t_start < reset_floor && !residual {
-                continue;
-            }
-            if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
-                let r = d.rate;
-                match pk_model.topology().dose_channel(d.cmt_raw()) {
-                    Some(Channel::Central) => rate_central += r,
-                    Some(Channel::Periph1) => rate_periph1 += r,
-                    Some(Channel::Periph2) => rate_periph2 += r,
-                    Some(Channel::Depot) => rate_depot += r,
-                    // Unreachable from a validated call: `check_dose_compartments`
-                    // (#375) rejects an infusion outside `infusable_compartments()`
-                    // up front, with the subject/time context this deep-in-the-walk
-                    // panic could never carry. Kept as a defensive guard, and
-                    // mirrored by `sens::propagate::active_rates_g` so the value
-                    // and gradient walks agree on what is unroutable.
-                    None => panic!(
-                        "event-driven PK: infusion into compartment {} not supported \
-                         for model {:?}. Supported: central for all models; depot (cmt 1) \
-                         and peripheral(s) for oral models; periph1/2 for 2- and 3-cpt IV \
-                         models — should have been rejected by `check_dose_compartments`.",
-                        d.cmt_raw(),
-                        pk_model
-                    ),
-                }
-            }
-        }
+        let [rate_central, rate_periph1, rate_periph2, rate_depot] = match precomputed {
+            Some(r) => r[wi],
+            None => active_rates_at(0.5 * (s0 + s1), doses, dose_lagtimes, reset_floor, pk_model),
+        };
 
         // 2-/3-cpt dispatch goes through the per-walk eigendata memo (`eigen`) and
         // the single-source `*_core_g` propagators: the `sqrt`/`acos` eigenvalue
@@ -1872,6 +1986,123 @@ mod tests {
             "mid-infusion pre-reset obs should be positive"
         );
         assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
+    }
+
+    /// #1477: the schedule's precomputed per-sub-interval rates must reproduce the
+    /// walk's per-call scan **bit for bit**, including the walk's *running* reset
+    /// floor. The fixture makes every branch of `active_rates_at` live on the
+    /// precomputed side — two overlapping infusions (summed in dose order), a reset
+    /// mid-infusion (turns both off), a lagged second dose (shifted window) and a
+    /// steady-state infusion (the #1121 residual window) — and the scan side is
+    /// forced by invalidating the key, which is also the route an `F`-reshaped or
+    /// η-resolved dose takes. Mutation check: a precompute that ignores the reset
+    /// floor keeps 175 running past 4 h and the 5 h observation diverges; one that
+    /// skips the lag misplaces the 2.5–6.5 h window and the 3 h observation diverges.
+    #[test]
+    fn precomputed_interval_rates_match_the_per_call_scan_bit_for_bit() {
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 125.0, false, 0.0),
+            DoseEvent::new(2.0, 200.0, 1, 50.0, false, 0.0),
+            DoseEvent::new(20.0, 200.0, 1, 100.0, true, 12.0),
+        ];
+        let obs_times = vec![1.0, 2.7, 3.0, 5.0, 7.0, 10.0, 21.0, 23.0, 30.0];
+        let mut subj = make_subject(doses, obs_times.clone());
+        subj.reset_times = vec![4.0];
+        let lag = vec![0.0, 0.5, 0.0];
+        let pk = pk_two(10.0, 50.0, 5.0, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+        let sched = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &subj.doses, &lag);
+        assert!(sched.rates_valid_for(&subj.doses));
+        // The precompute is live and sees each regime: the 2.5–6.5 h overlap before
+        // the reset (125 + 50), quiet stretches, and the SS infusion alone.
+        let central: Vec<f64> = sched
+            .rates_per_interval
+            .iter()
+            .flatten()
+            .map(|r| r[0])
+            .collect();
+        for want in [175.0, 125.0, 0.0, 100.0] {
+            assert!(
+                central.contains(&want),
+                "no sub-interval at rate {want}: {central:?}"
+            );
+        }
+        // After the 4 h reset both running infusions are off: the sub-interval
+        // containing 5 h reads 0, not 175 — the reset-floor branch on this side.
+        let (i5, _) = sched
+            .events
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.kind == EventKind::Obs && e.time == 5.0)
+            .expect("obs at 5 h");
+        assert!(
+            sched.rates_per_interval[i5 - 1].iter().all(|r| r[0] == 0.0),
+            "interval ending at 5 h must be quiet after the 4 h reset: {:?}",
+            sched.rates_per_interval[i5 - 1]
+        );
+
+        let fast = event_driven_predictions_with_schedule(
+            PkModel::TwoCptIv,
+            &subj,
+            &sched,
+            &pk_dose,
+            &pk_obs,
+            &[],
+        );
+        let mut scan = sched.clone();
+        scan.rates_dose_key.clear();
+        assert!(
+            !scan.rates_valid_for(&subj.doses),
+            "an empty key must force the scan"
+        );
+        let slow = event_driven_predictions_with_schedule(
+            PkModel::TwoCptIv,
+            &subj,
+            &scan,
+            &pk_dose,
+            &pk_obs,
+            &[],
+        );
+        assert_eq!(fast.len(), obs_times.len());
+        for (j, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+            assert!(a.is_finite(), "obs {j} non-finite: {a}");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "obs {j}: precomputed {a} vs scanned {b}"
+            );
+        }
+        // The pre-reset observations see drug and the post-reset one does not — so the
+        // identity above is between two live numbers, not two zeros.
+        assert!(fast[2] > 0.0 && fast[3] == 0.0, "{fast:?}");
+    }
+
+    /// A dose whose `(rate, duration)` no longer matches what the schedule was built
+    /// from — bioavailability reshaping a rate, a modeled dose resolving per η — must
+    /// not be served the cached rates (#1477).
+    #[test]
+    fn precomputed_interval_rates_are_declined_for_reshaped_doses() {
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 125.0, false, 0.0)];
+        let subj = make_subject(doses, vec![1.0, 9.0]);
+        let sched = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[]);
+        assert!(sched.rates_valid_for(&subj.doses));
+        let mut reshaped = subj.doses.clone();
+        reshaped[0].rate *= 0.5;
+        assert!(
+            !sched.rates_valid_for(&reshaped),
+            "a changed rate invalidates"
+        );
+        let mut longer = subj.doses.clone();
+        longer[0].duration += 1.0;
+        assert!(
+            !sched.rates_valid_for(&longer),
+            "a changed duration invalidates"
+        );
+        assert!(
+            !sched.rates_valid_for(&[]),
+            "a different dose count invalidates"
+        );
     }
 
     #[test]
