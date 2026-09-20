@@ -908,15 +908,17 @@ fn agq_subject_evaluate(
     let lse = logsumexp(&terms);
     let nll = 0.5 * d as f64 * PI.ln() + 0.5 * proposal.log_det_inv_scale - lse;
     if nll.is_finite() {
-        for term in &mut terms {
-            *term = (*term - lse).exp();
-        }
-        let prepared = retain_gradient_work.then(|| PreparedGrid {
-            h,
-            bs,
-            softmax: terms,
-            node_scores,
-            base_jet,
+        let prepared = retain_gradient_work.then(|| {
+            for term in &mut terms {
+                *term = (*term - lse).exp();
+            }
+            PreparedGrid {
+                h,
+                bs,
+                softmax: terms,
+                node_scores,
+                base_jet,
+            }
         });
         (nll, prepared)
     } else {
@@ -2880,9 +2882,15 @@ fn finish_agq_subject_gradient(
 ) -> Option<()> {
     if let Some(scores) = node_scores {
         debug_assert_eq!(scores.len(), softmax.len() * out.len());
-        for (score, &weight) in scores.chunks_exact(out.len()).zip(softmax) {
-            for (dst, &value) in out.iter_mut().zip(score) {
-                *dst += weight * value;
+        for ((score, b_j), &weight) in scores
+            .chunks_exact(out.len())
+            .zip(bs.chunks_exact(stack.d()))
+            .zip(softmax)
+        {
+            if !accumulate_weighted_node_score(score, weight, out) {
+                accumulate_fixed_eta_packed_gradient(
+                    model, subject, params, template, stack, b_j, weight, out,
+                )?;
             }
         }
     } else if parallel_grid {
@@ -2941,6 +2949,22 @@ fn finish_agq_subject_gradient(
         out,
     )?;
     Some(())
+}
+
+/// Add one retained node score without letting an underflowed posterior tail
+/// contaminate the subject gradient. Returns `false` when the caller must
+/// recompute a non-finite, nonzero-weight score through the established fallback.
+fn accumulate_weighted_node_score(score: &[f64], weight: f64, out: &mut [f64]) -> bool {
+    if weight == 0.0 {
+        return true;
+    }
+    if !score.iter().all(|value| value.is_finite()) {
+        return false;
+    }
+    for (dst, &value) in out.iter_mut().zip(score) {
+        *dst += weight * value;
+    }
+    true
 }
 
 /// Shared quadrature inputs for subject scores. No synthetic population or optimizer
@@ -3598,6 +3622,27 @@ mod tests {
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
         subject.observations = preds.iter().map(|p| p * 0.85).collect();
         subject
+    }
+
+    #[test]
+    fn retained_node_score_skips_zero_weight_before_finite_check() {
+        let mut out = [2.0, -3.0];
+        assert!(accumulate_weighted_node_score(
+            &[f64::NAN, f64::INFINITY],
+            0.0,
+            &mut out,
+        ));
+        assert_eq!(out, [2.0, -3.0]);
+
+        assert!(!accumulate_weighted_node_score(
+            &[f64::NAN, 1.0],
+            0.5,
+            &mut out,
+        ));
+        assert_eq!(out, [2.0, -3.0]);
+
+        assert!(accumulate_weighted_node_score(&[4.0, -2.0], 0.25, &mut out,));
+        assert_eq!(out, [3.0, -3.5]);
     }
 
     #[test]
