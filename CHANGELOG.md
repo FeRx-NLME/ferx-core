@@ -516,6 +516,13 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **Laplace reuses its prepared Hessian factor and no longer allocates one-element grid
+  vectors.** The objective hands the regularized Cholesky factor directly to the matching
+  gradient, and the one-node rule reads its mode and unit weight without heap-backed node
+  or weight vectors. Thirty paired one-thread runs were 1.7% faster for diagonal Ω and
+  0.5% faster for block Ω; the ODE control was timing-neutral, and every prepared subject
+  evaluation removes two allocations (#1490).
+
 - **Analytic AGQ now applies posterior weights without materializing a second packed-score
   matrix.** The score scratch is halved, posterior weights reuse the log-term allocation,
   and allocation calls fall while preserving node-major summation. On a 200-subject,

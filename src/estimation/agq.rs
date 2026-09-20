@@ -78,7 +78,7 @@ use rayon::prelude::*;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
-use crate::estimation::importance_sampling::build_proposal;
+use crate::estimation::importance_sampling::{build_proposal, proposal_from_regularised_anchor};
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
 use crate::sens::provider::SubjectSens;
@@ -343,6 +343,10 @@ static LEGACY_KAPPA_SLICE_ALLOCATION: std::sync::atomic::AtomicBool =
 /// to the gradient requested by the same optimizer callback.
 struct PreparedGrid {
     h: DMatrix<f64>,
+    regularised_anchor: Option<crate::estimation::agq_cov_hessian::RegularisedAnchor>,
+    /// The one-node Laplace grid is exactly the separately retained `b_hat`
+    /// with unit weight, so its node and weight vectors need no allocations.
+    one_point: bool,
     /// Row-major quadrature modes (`n_grid × d`) in one allocation.
     bs: Vec<f64>,
     softmax: Vec<f64>,
@@ -861,7 +865,14 @@ fn agq_subject_evaluate(
     // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
     // *consistent* (any invertible scale integrates to the same limit); it only costs
     // nodes-worth of efficiency, which is the right failure mode.
-    let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
+    let regularised_anchor = retain_gradient_work
+        .then(|| crate::estimation::agq_cov_hessian::regularised_anchor(&h))
+        .flatten();
+    let proposal = regularised_anchor
+        .as_ref()
+        .map(proposal_from_regularised_anchor)
+        .or_else(|| build_proposal(&h, &stack.omega_joint_inv, d));
+    let Some(proposal) = proposal else {
         return (NLL_SENTINEL, None);
     };
 
@@ -882,8 +893,10 @@ fn agq_subject_evaluate(
         }
         let prepared = retain_gradient_work.then(|| PreparedGrid {
             h,
-            bs: b_hat.to_vec(),
-            softmax: vec![1.0],
+            regularised_anchor,
+            one_point: true,
+            bs: Vec::new(),
+            softmax: Vec::new(),
             node_scores: None,
             base_jet,
         });
@@ -914,6 +927,8 @@ fn agq_subject_evaluate(
             }
             PreparedGrid {
                 h,
+                regularised_anchor,
+                one_point: false,
                 bs,
                 softmax: terms,
                 node_scores,
@@ -2028,6 +2043,7 @@ fn grid_response_correction(
     anchor: HessianAnchor,
     parallel_grid: bool,
     h: &DMatrix<f64>,
+    retained_anchor: Option<&crate::estimation::agq_cov_hessian::RegularisedAnchor>,
     x: &[f64],
     b_hat: &[f64],
     nodes: &[f64],
@@ -2135,8 +2151,22 @@ fn grid_response_correction(
     if use_analytic_grid_response() {
         if let Some(gs) = node_grads.as_ref() {
             if analytic_grid_response(
-                anchor, model, subject, params, template, stack, h, x, b_hat, nodes, &db_dx, gs,
-                softmax, base_jet, out,
+                anchor,
+                model,
+                subject,
+                params,
+                template,
+                stack,
+                h,
+                retained_anchor,
+                x,
+                b_hat,
+                nodes,
+                &db_dx,
+                gs,
+                softmax,
+                base_jet,
+                out,
             )
             .is_some()
             {
@@ -2354,6 +2384,7 @@ fn analytic_grid_response(
     template: &ModelParameters,
     stack: &Stack,
     h: &DMatrix<f64>,
+    retained_anchor: Option<&crate::estimation::agq_cov_hessian::RegularisedAnchor>,
     x: &[f64],
     b_hat: &[f64],
     nodes: &[f64],
@@ -2367,7 +2398,13 @@ fn analytic_grid_response(
     use crate::estimation::parameterization::packed_fixed_mask;
 
     let d = stack.d();
-    let reg = regularised_anchor(h)?;
+    let owned_reg;
+    let reg = if let Some(retained) = retained_anchor {
+        retained
+    } else {
+        owned_reg = regularised_anchor(h)?;
+        &owned_reg
+    };
     // `tr(S⁻¹S_k)` contracts `S⁻¹` once here rather than twice as the covariance Hessian
     // does, so this screen is stricter than it needs to be — but an anchor that fails it is
     // one whose `½log|H|` term is not identified anyway, and the FD route is the honest
@@ -2848,6 +2885,7 @@ fn agq_subject_packed_gradient(
         anchor,
         parallel_grid,
         &h,
+        None,
         &bs,
         &softmax,
         None,
@@ -2872,6 +2910,7 @@ fn finish_agq_subject_gradient(
     anchor: HessianAnchor,
     parallel_grid: bool,
     h: &DMatrix<f64>,
+    retained_anchor: Option<&crate::estimation::agq_cov_hessian::RegularisedAnchor>,
     bs: &[f64],
     softmax: &[f64],
     node_scores: Option<&[f64]>,
@@ -2937,6 +2976,7 @@ fn finish_agq_subject_gradient(
         anchor,
         parallel_grid,
         h,
+        retained_anchor,
         x,
         b_hat,
         nodes,
@@ -3080,6 +3120,12 @@ impl<'a> SubjectScoreContext<'a> {
         match prepared {
             PreparedSubject::Grid { stack, b_hat, grid } => {
                 let mut scratch = pk::EventPkParams::with_capacity_for(subject);
+                let one_weight = [1.0];
+                let (bs, softmax) = if grid.one_point {
+                    (b_hat.as_slice(), one_weight.as_slice())
+                } else {
+                    (grid.bs.as_slice(), grid.softmax.as_slice())
+                };
                 finish_agq_subject_gradient(
                     self.model,
                     subject,
@@ -3093,8 +3139,9 @@ impl<'a> SubjectScoreContext<'a> {
                     self.options.hessian_anchor(),
                     self.parallel_grid,
                     &grid.h,
-                    &grid.bs,
-                    &grid.softmax,
+                    grid.regularised_anchor.as_ref(),
+                    bs,
+                    softmax,
                     grid.node_scores.as_deref(),
                     &mut scratch,
                     schedule,
@@ -4066,6 +4113,7 @@ mod tests {
                     &template,
                     &stack,
                     &h,
+                    None,
                     &x,
                     b_hat,
                     &nodes,
@@ -4208,6 +4256,7 @@ mod tests {
                 &template,
                 &stack,
                 &h,
+                None,
                 &x,
                 b_hat,
                 &nodes,
