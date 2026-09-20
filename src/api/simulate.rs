@@ -40,6 +40,15 @@ use std::time::Instant;
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
 /// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
+///
+/// # Panics
+///
+/// On a model/data precondition failure — a dose the model cannot route or honour, an
+/// unsupported absorption or survival combination, a covariate the data does not carry, an
+/// IOV model without `omega_iov`. The payload is exactly the `Err` text
+/// [`simulate_with_options`] returns for the same input (which is also `fit()`'s); this
+/// `Vec`-returning form has no channel to return it on (#898). Call
+/// [`simulate_with_options`] to receive it as an `Err` instead.
 pub fn simulate(
     model: &CompiledModel,
     population: &Population,
@@ -47,10 +56,15 @@ pub fn simulate(
     n_sim: usize,
 ) -> Vec<SimulationResult> {
     let mut rng = rand::rng();
-    simulate_inner(model, population, params, n_sim, &mut rng)
+    simulate_inner(model, population, params, n_sim, &mut rng).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Simulate with a fixed seed for reproducibility.
+///
+/// # Panics
+///
+/// As [`simulate`]: a precondition failure panics with the `Err` text
+/// [`simulate_with_options`] returns for the same input (#898).
 pub fn simulate_with_seed(
     model: &CompiledModel,
     population: &Population,
@@ -60,7 +74,7 @@ pub fn simulate_with_seed(
 ) -> Vec<SimulationResult> {
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    simulate_inner(model, population, params, n_sim, &mut rng)
+    simulate_inner(model, population, params, n_sim, &mut rng).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Options controlling [`simulate_with_options`].
@@ -313,6 +327,31 @@ pub(crate) fn validate_iov_simulatable(
     Ok(())
 }
 
+/// The model/data preconditions every `simulate*` entry point shares, as an `Err` carrying
+/// the bare check message — byte-identical to what `fit()` returns for the same input (#898).
+///
+/// One list, two callers: [`simulate_with_options_diag`] runs it up front (its propensity
+/// branch integrates every subject *before* reaching the chokepoint), and
+/// `simulate_inner_with_draw` runs it for the `Vec`-returning forms and the uncertainty
+/// path. `simulate()` runs no `check_model_data`, so without these a modeled-`RATE` dose
+/// (#324), an unroutable dose compartment (#375), an unsupported transit / IG closed form, a
+/// twin-less flip-flop typical value, a time-varying covariate on a hazard (#741 — it would
+/// be silently frozen) or a malformed built-in absorption input rate (#588) reaches the
+/// emitter and produces wrong rows or a panic deep in the prediction loop.
+fn check_simulate_preconditions(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Result<(), String> {
+    first_error(&check_modeled_dose_rates(model, population))?;
+    first_error(&check_dose_compartments(model, population))?;
+    check_absorption_closed_form_support(model, population).map_or(Ok(()), Err)?;
+    check_absorption_flip_flop_no_twin(model, population, theta).map_or(Ok(()), Err)?;
+    #[cfg(feature = "survival")]
+    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_absorption_dosing(model, population))
+}
+
 /// Simulate observations under `opts`, returning only the observation rows.
 ///
 /// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
@@ -437,21 +476,15 @@ pub fn simulate_with_options_diag(
     // (`run_inner_loop_warm` below) that integrates every subject — on an
     // unsupported config that would hit the per-path tripwire (silently in
     // release) or `resolve_rate`'s opaque `.expect` *before* the chokepoint
-    // guard. Asserting here makes both branches fail with the same actionable
-    // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
+    // guard. Checking here makes both branches return the same actionable
+    // `Err` (#898: the text `fit()` returns for the same input, not a panic out
+    // of a `Result`-returning function); it is a no-op O(doses) scan on the
+    // common all-`Fixed` dataset.
     // The built-in absorption input-rate guard (#588) is hoisted for the same
     // reason: otherwise a malformed multi-pathway / SS / infusion absorption model
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
-    assert_modeled_doses_supported(model, population);
-    assert_dose_compartments_supported(model, population);
-    assert_absorption_closed_form_support(model, population);
-    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
-    // A time-varying covariate on a survival hazard would be silently frozen — panic
-    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
-    #[cfg(feature = "survival")]
-    assert_survival_tv_covariates(model, population);
-    assert_absorption_dosing_supported(model, population);
+    check_simulate_preconditions(model, population, &params.theta)?;
 
     let method = match opts.match_method {
         Some(m) => m,
@@ -473,6 +506,7 @@ pub fn simulate_with_options_diag(
                     &mut warnings,
                 )
             });
+            let results = results?;
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             warnings.extend(super::non_fit_diagnostics(
                 model,
@@ -567,6 +601,7 @@ pub fn simulate_with_options_diag(
             &mut warnings,
         )
     });
+    let results = results?;
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     warnings.extend(super::non_fit_diagnostics(
         model,
@@ -584,7 +619,7 @@ fn simulate_inner<R: rand::Rng>(
     params: &ModelParameters,
     n_sim: usize,
     rng: &mut R,
-) -> Vec<SimulationResult> {
+) -> Result<Vec<SimulationResult>, String> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
     // These entry points return only the rows; per-subject simulation diagnostics
@@ -908,7 +943,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     warnings: &mut Vec<String>,
-) -> Vec<SimulationResult> {
+) -> Result<Vec<SimulationResult>, String> {
     use rand_distr::Normal;
 
     // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
@@ -916,50 +951,44 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // precondition once per call, as `predict()` does — `simulate()` runs no
     // data-check otherwise. #324. The dose-compartment routing guard (#375) rides
     // the same chokepoint.
-    assert_modeled_doses_supported(model, population);
-    assert_dose_compartments_supported(model, population);
-    assert_absorption_closed_form_support(model, population);
-    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
-    // A time-varying covariate on a survival hazard would be silently frozen — panic
-    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
-    #[cfg(feature = "survival")]
-    assert_survival_tv_covariates(model, population);
-    assert_absorption_dosing_supported(model, population);
+    //
+    // Every precondition below is an `Err`, never a panic (#898). The `Result`
+    // entry points propagate it; the `Vec`-returning `simulate` /
+    // `simulate_with_seed` cannot signal, so *they* re-raise the identical text
+    // as a panic — one line each, at the public boundary, not in here.
+    check_simulate_preconditions(model, population, &params.theta)?;
     // CTMM (#759) has no simulation path yet: the Gaussian/PK emitter below would write
     // meaningless all-zero DV rows for a discrete-state endpoint (the generator is never
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()
     // does not. Mirrors the survival guards above; the CLI `--simulate` path returns this
     // as a clean Err in `run_model_simulate`. This is the single simulate chokepoint.
     #[cfg(feature = "markov")]
-    assert!(
-        !model.has_ctmm(),
-        "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
-         discrete-state trajectory has no simulation path, so the Gaussian emitter would \
-         produce meaningless all-zero observations. CTMM simulation is a later slice."
-    );
+    if model.has_ctmm() {
+        return Err(
+            "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
+             discrete-state trajectory has no simulation path, so the Gaussian emitter would \
+             produce meaningless all-zero observations. CTMM simulation is a later slice."
+                .to_string(),
+        );
+    }
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
     // no resets / left truncation). `simulate_with_options` checks them first and
-    // returns a clean Err; the Vec-returning `simulate` / `simulate_with_seed` (and
-    // the uncertainty path) funnel through here and cannot signal an error, so
-    // enforce the identical contract as a panic rather than emitting wrong rows.
+    // returns a clean Err; the Vec-returning `simulate` / `simulate_with_seed` reach
+    // them only here, and re-raise this `Err` as a panic at their own boundary rather
+    // than emitting wrong rows.
     #[cfg(feature = "survival")]
-    if let Err(e) = validate_tte_simulatable(model, population, horizon) {
-        panic!("{e}");
-    }
+    validate_tte_simulatable(model, population, horizon)?;
 
     // Same split for the IOV precondition (#1019): `simulate_with_options*` already
-    // returned a clean Err; the Vec-returning `simulate` / `simulate_with_seed` and the
-    // uncertainty path funnel through here, where the only way to enforce the contract
-    // is to fail loud rather than emit rows with no inter-occasion variability.
-    if let Err(e) = validate_iov_simulatable(model, params) {
-        panic!("{e}");
-    }
+    // returned a clean Err; the Vec-returning `simulate` / `simulate_with_seed` reach it
+    // only here, where rows with no inter-occasion variability must not be emitted.
+    validate_iov_simulatable(model, params)?;
 
     // Same split again for the model-vs-population checks (#1083). The
     // `Result`-returning entry points above have already run this list and
-    // returned a clean `Err`; `simulate` / `simulate_with_seed` funnel through
-    // here and cannot signal, and the failures this catches are silent by
+    // returned a clean `Err`; `simulate` / `simulate_with_seed` reach it only
+    // here, and the failures this catches are silent by
     // construction — a weight that underflows to zero produces finite, plottable
     // rows with the variability quietly removed.
     //
@@ -969,9 +998,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // (`has_weighted_kappa` / `has_custom_ruv_magnitude`), which is false for
     // every model that does not use one; and where it is true, the pass is linear
     // in the observations the draw is about to simulate anyway.
-    if let Err(e) = first_error(&check_simulation_data(model, population)) {
-        panic!("{e}");
-    }
+    first_error(&check_simulation_data(model, population))?;
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -1039,7 +1066,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
         }
     }
 
-    results
+    Ok(results)
 }
 
 /// Options controlling `simulate_with_uncertainty()`.
@@ -1082,8 +1109,8 @@ pub fn simulate_with_uncertainty(
     use rand::SeedableRng;
 
     // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
-    // uncertainty path does not yet expose — validate for a clean Err here (the
-    // inner chokepoint would otherwise enforce the same contract as a panic).
+    // uncertainty path does not yet expose — validate once here rather than per
+    // draw at the inner chokepoint (which returns the same `Err`).
     #[cfg(feature = "survival")]
     validate_tte_simulatable(model, population, None)?;
 
@@ -1124,11 +1151,12 @@ pub fn simulate_with_uncertainty(
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,
-        // `simulate_inner_with_draw`'s `assert_absorption_flip_flop_no_twin` would then
-        // panic — aborting the *entire* uncertainty run. Skip such a draw with a
-        // recorded warning instead, so the remaining draws still yield results (#786).
-        // The single-shot `predict()`/`simulate()` paths keep the panic (their
-        // Vec-returning contract). Twin-carrying models return `None` here and proceed
+        // `simulate_inner_with_draw`'s own flip-flop check would then return `Err` —
+        // and the `?` below would fail the *entire* uncertainty run on one draw. Skip
+        // such a draw with a recorded warning instead, so the remaining draws still
+        // yield results (#786). **This check must stay ahead of that `?`** (#898).
+        // The single-shot `predict()`/`simulate()` paths keep the failure (there is no
+        // other draw to fall back on). Twin-carrying models return `None` here and proceed
         // (they reroute per-eval), so this only skips genuinely un-simulatable draws.
         if let Some(msg) = check_absorption_flip_flop_no_twin(model, population, &params.theta) {
             sim_warnings.push(format!("uncertainty draw {} skipped — {}", k + 1, msg));
@@ -1144,7 +1172,7 @@ pub fn simulate_with_uncertainty(
             None,
             &mut rng,
             &mut sim_warnings,
-        );
+        )?;
         results.append(&mut rows);
     }
     Ok(results)

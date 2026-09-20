@@ -393,7 +393,7 @@ fn tiny_population() -> Population {
 /// from `template` plus a small identity covariance in packed log-space.
 /// Avoids invoking `fit()` (slow) while still exercising the full
 /// `simulate_with_uncertainty` wiring.
-fn synthetic_fit(template: &ModelParameters) -> FitResult {
+pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
     let n_packed = crate::estimation::parameterization::packed_len(template);
     let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
     FitResult {
@@ -760,8 +760,8 @@ fn flip_flop_ebe_warning_skips_wrong_length_eta() {
 
 /// #786: `simulate_with_uncertainty` on a twin-less transit model whose point
 /// estimate is in-domain but whose covariance spreads some draws into the
-/// flip-flop regime must NOT panic (pre-fix: the per-draw
-/// `assert_absorption_flip_flop_no_twin` aborted the whole run). The crossing
+/// flip-flop regime must NOT fail (pre-fix: the per-draw
+/// chokepoint flip-flop check aborted the whole run). The crossing
 /// draws are skipped; the rest still yield rows.
 #[test]
 fn uncertainty_skips_flip_flop_draws_without_panicking() {

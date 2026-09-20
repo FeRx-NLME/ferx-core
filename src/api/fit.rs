@@ -1449,7 +1449,7 @@ fn fit_inner(
     // inits_from_nca: derive NCA-based starting values before the optimizer
     // loop, using the strategy the user selected (nca / nca_sweep / nca_ebe).
     if let Some(method) = options.inits_from_nca {
-        let suggested = crate::suggest_start::inits_from_nca(model, population, method);
+        let suggested = crate::suggest_start::inits_from_nca(model, population, method)?;
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }

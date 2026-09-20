@@ -53,6 +53,32 @@ column of `NaN` with no explanation, and a segment that exhausted
 `ode_max_steps` came back as a column of *identical* finite numbers — plottable,
 and wrong.
 
+### When a precondition fails {#entry-point-errors}
+
+A warning is a finding the run survives. A **precondition** is one it does not:
+a dose into a compartment the model cannot deliver into, a coded `RATE` with no
+`D{n}` / `R{n}` parameter behind it, a covariate the data does not carry, a
+time-varying covariate on a hazard, an absorption form the closed form cannot
+honour. `fit()` has always returned these as an `Err`. Since ferx 0.4.0 so does
+every other entry point that returns a `Result`, **with the same text** — the
+subject, the time and the remedy, and nothing wrapped around them:
+
+| Entry point | On a failed precondition |
+|---|---|
+| `fit()`, `predict_diag()`, `predict_survival()`, `predict_categorical()`, `inits_from_nca()`, `simulate_with_options()`, `simulate_with_options_diag()`, `simulate_with_uncertainty()`, `simulate_adaptive()` | `Err(message)` |
+| `predict()`, `simulate()`, `simulate_with_seed()` | panic whose payload is that same `message` — they return a bare `Vec` and have no error channel. Call the `Result` form above them to handle the failure instead. |
+
+Before 0.4.0 `predict_survival()`, `predict_categorical()` and
+`inits_from_nca()` returned bare values and panicked, and the three
+`simulate_with_*` forms panicked *out of a function that returns `Result`*, so a
+caller matching on `Err` never saw the failure. The panic text also carried a
+wrapper sentence around the diagnostic; that wording is gone.
+
+One deliberate exception: inside `simulate_with_uncertainty()`, a parameter
+*draw* that lands in a twin-less transit model's flip-flop regime is skipped and
+the run continues. The point estimate was in-domain; one draw out of it is not a
+reason to lose the others.
+
 ### The non-fit bundle {#non-fit-bundle}
 
 The rule is that **a finding about the model or the data is carried; a finding

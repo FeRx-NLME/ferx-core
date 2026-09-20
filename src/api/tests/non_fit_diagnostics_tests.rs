@@ -135,7 +135,7 @@ const FREEZE_PAD: &str = "stopped before their requested end time and freeze-pad
 fn predict_carries_the_model_data_bundle_that_predict_used_to_drop() {
     let m = analytic_model();
     let p = pop_ss_bad_ii(1);
-    let out = predict_diag(&m, &p, &m.default_params);
+    let out = predict_diag(&m, &p, &m.default_params).unwrap();
     assert!(
         has(&out.warnings, SS_II),
         "predict_diag must report the same model/data findings fit() does: {:?}",
@@ -144,7 +144,7 @@ fn predict_carries_the_model_data_bundle_that_predict_used_to_drop() {
     // The straddle, under the *old* behaviour as well as the new: the identical call on a
     // population whose dose is not SS reports nothing. Without this the assertion above passes
     // on an implementation that pushes a fixed string into every prediction.
-    let clean = predict_diag(&m, &pop(1), &m.default_params);
+    let clean = predict_diag(&m, &pop(1), &m.default_params).unwrap();
     assert!(
         clean.warnings.is_empty(),
         "a well-formed model/data pair must come back silent, or the warning above proves \
@@ -234,7 +234,7 @@ fn predict_returns_exactly_the_diag_forms_rows() {
     let m = ode_model(1.0, 10_000);
     let p = pop(3);
     let rows = predict(&m, &p, &m.default_params);
-    let out = predict_diag(&m, &p, &m.default_params);
+    let out = predict_diag(&m, &p, &m.default_params).unwrap();
     assert_eq!(rows.len(), out.results.len());
     assert!(!rows.is_empty(), "the fixture must produce rows to compare");
     for (a, b) in rows.iter().zip(out.results.iter()) {
@@ -243,7 +243,7 @@ fn predict_returns_exactly_the_diag_forms_rows() {
         assert_eq!(
             a.pred.to_bits(),
             b.pred.to_bits(),
-            "predict() and predict_diag() must return bit-identical predictions \
+            "predict() and predict_diag().unwrap() must return bit-identical predictions \
              (subject {}, t = {})",
             a.id,
             a.time
@@ -276,7 +276,7 @@ fn predict_reports_a_freeze_padded_segment_instead_of_serving_it_silently() {
     // 20 steps is nowhere near enough for this exchange rate, so the segment gives up almost
     // immediately — the diagnostic without the grind.
     let m = ode_model(1e5, 20);
-    let out = predict_diag(&m, &pop(2), &m.default_params);
+    let out = predict_diag(&m, &pop(2), &m.default_params).unwrap();
     assert!(
         has(&out.warnings, SOLVER) && has(&out.warnings, FREEZE_PAD),
         "a segment that stopped early and padded its tail must be named: {:?}",
@@ -291,7 +291,7 @@ fn predict_reports_a_freeze_padded_segment_instead_of_serving_it_silently() {
     // θ (`KFAST = 1e5`) put the stiffness back and made this arm report two padded segments of
     // its own — a straddle that does not straddle, caught here rather than shipped.
     let clean_m = ode_model(1.0, 10_000);
-    let clean = predict_diag(&clean_m, &pop(2), &clean_m.default_params);
+    let clean = predict_diag(&clean_m, &pop(2), &clean_m.default_params).unwrap();
     assert!(
         !has(&clean.warnings, SOLVER),
         "a clean integration must not carry a solver diagnostic: {:?}",
@@ -343,8 +343,8 @@ fn simulate_reports_a_freeze_padded_segment_instead_of_serving_it_silently() {
 #[test]
 fn predicts_solver_counters_cover_every_subject_not_just_the_calling_threads() {
     let m = ode_model(1e5, 20);
-    let one = predict_diag(&m, &pop(1), &m.default_params);
-    let many = predict_diag(&m, &pop(16), &m.default_params);
+    let one = predict_diag(&m, &pop(1), &m.default_params).unwrap();
+    let many = predict_diag(&m, &pop(16), &m.default_params).unwrap();
     let n_one = segment_count(&one.warnings).expect("one subject must report padded segments");
     let n_many = segment_count(&many.warnings).expect("sixteen subjects must report them too");
     assert_eq!(
@@ -399,7 +399,7 @@ fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
         ..Default::default()
     };
 
-    let from_predict = codes(&predict_diag(&m, &p, &m.default_params).warnings);
+    let from_predict = codes(&predict_diag(&m, &p, &m.default_params).unwrap().warnings);
     assert!(
         from_predict.contains(&SOLVER.to_string()),
         "the fixture must trip the solver half: {from_predict:?}"
@@ -557,7 +557,10 @@ fn the_row_only_entry_points_stay_silent_by_contract() {
     // `predict` → rows only, and they are the `_diag` form's rows.
     assert_eq!(
         predict(&m, &p, &m.default_params).len(),
-        predict_diag(&m, &p, &m.default_params).results.len()
+        predict_diag(&m, &p, &m.default_params)
+            .unwrap()
+            .results
+            .len()
     );
     // `simulate_with_options` → rows only, from an output that *did* carry warnings.
     let opts = SimulateOptions {
@@ -695,7 +698,7 @@ fn the_reported_ode_method_is_the_models_own_not_the_fitoptions_default() {
         solver_reporting_options(&m).ode_method,
         crate::ode::OdeMethod::Rk45
     );
-    let out = predict_diag(&m, &pop(1), &m.default_params);
+    let out = predict_diag(&m, &pop(1), &m.default_params).unwrap();
     let w = out
         .warnings
         .iter()
@@ -805,7 +808,7 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
     const ADDITIVE_INIT: &str = "additive SD initial estimate";
 
     // The control: with real observations the finding fires, so the fixture is capable of it.
-    let with_dv = predict_diag(&m, &pop(1), &m.default_params);
+    let with_dv = predict_diag(&m, &pop(1), &m.default_params).unwrap();
     assert!(
         has(&with_dv.warnings, ADDITIVE_INIT),
         "the fixture must be able to trip the DV-reading member, or its silence below \
@@ -902,7 +905,7 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     let mut p = pop_ss_bad_ii(1);
     p.warnings
         .push("W_ADDL_MISSING_II: subject '1' has ADDL with no II".into());
-    let out = predict_diag(&m, &p, &m.default_params);
+    let out = predict_diag(&m, &p, &m.default_params).unwrap();
     assert!(
         has(&out.warnings, "W_ADDL_MISSING_II"),
         "a reader warning must reach predict_diag — it is the example the review named: {:?}",
@@ -910,7 +913,9 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     );
     assert!(
         !has(
-            &predict_diag(&m, &pop_ss_bad_ii(1), &m.default_params).warnings,
+            &predict_diag(&m, &pop_ss_bad_ii(1), &m.default_params)
+                .unwrap()
+                .warnings,
             "W_ADDL_MISSING_II"
         ),
         "…and must not appear when the population carries none"
@@ -931,7 +936,8 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
         &with_parse_warning,
         &pop(1),
         &with_parse_warning.default_params,
-    );
+    )
+    .unwrap();
     assert!(
         has(&with_parse.warnings, "W_TEST_PARSE"),
         "a parse warning must reach predict_diag — `W_ABSORPTION_TWIN_DECLINED` changes what \
@@ -941,7 +947,9 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     let clean = ode_model(1.0, 10_000);
     assert!(
         !has(
-            &predict_diag(&clean, &pop(1), &clean.default_params).warnings,
+            &predict_diag(&clean, &pop(1), &clean.default_params)
+                .unwrap()
+                .warnings,
             "W_TEST_PARSE"
         ),
         "…and must not appear on a model that carries none"
@@ -949,7 +957,7 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
 
     // (4) the experimental-feature notice, through the same call.
     let (exp_model, exp_pop) = experimental_feature_fixture();
-    let exp = predict_diag(&exp_model, &exp_pop, &exp_model.default_params);
+    let exp = predict_diag(&exp_model, &exp_pop, &exp_model.default_params).unwrap();
     assert!(
         has(&exp.warnings, "EXPERIMENTAL feature"),
         "an experimental-feature notice must reach predict_diag — a feature is experimental \
@@ -958,7 +966,9 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     );
     assert!(
         !has(
-            &predict_diag(&clean, &pop(1), &clean.default_params).warnings,
+            &predict_diag(&clean, &pop(1), &clean.default_params)
+                .unwrap()
+                .warnings,
             "EXPERIMENTAL feature"
         ),
         "…and a non-experimental model must not carry one"
@@ -1042,7 +1052,7 @@ fn the_bundle_excludes_the_findings_that_are_about_a_fit() {
         "the fixture must raise at least one option warning, or the exclusion below is \
          vacuous: {option_diags:?}"
     );
-    let out = predict_diag(&m, &pop(1), &m.default_params);
+    let out = predict_diag(&m, &pop(1), &m.default_params).unwrap();
     for w in &fit_only {
         assert!(
             !out.warnings.contains(w),
@@ -1182,7 +1192,7 @@ fn reader_warnings_go_through_the_same_suppression_filter_fit_uses() {
     p.subjects[0].doses.clear();
     p.warnings.push(NO_DOSES.into());
 
-    let suppressed = predict_diag(&algebraic, &p, &algebraic.default_params);
+    let suppressed = predict_diag(&algebraic, &p, &algebraic.default_params).unwrap();
     assert!(
         !has(&suppressed.warnings, "W_NO_DOSES"),
         "a compartment-free model has nothing to dose; telling it its data are malformed is \
@@ -1193,7 +1203,7 @@ fn reader_warnings_go_through_the_same_suppression_filter_fit_uses() {
     // The straddle: the same warning on a compartment model is a real finding and is reported.
     let compartmental = analytic_model();
     assert!(!compartmental.is_algebraic());
-    let reported = predict_diag(&compartmental, &p, &compartmental.default_params);
+    let reported = predict_diag(&compartmental, &p, &compartmental.default_params).unwrap();
     assert!(
         has(&reported.warnings, "W_NO_DOSES"),
         "…while on a model that does have compartments it is a real finding: {:?}",

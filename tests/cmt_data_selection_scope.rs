@@ -626,7 +626,8 @@ fn a_filter_deleted_row_is_reported_by_every_entry_point_including_predict() {
 
     // `predict_diag` carries the same bundle as `simulate`/`simulate_adaptive`
     // (`non_fit_diagnostics`), so one of the three is enough to pin the shared filter.
-    let out = ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params);
+    let out =
+        ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params).unwrap();
     assert!(
         out.warnings
             .iter()
@@ -663,7 +664,8 @@ fn predict_still_suppresses_a_cmt_guess_that_addresses_nothing() {
             .any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "the reader still counts the guess — it is the model-aware filter that drops it"
     );
-    let out = ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params);
+    let out =
+        ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params).unwrap();
     assert!(
         !out.warnings
             .iter()

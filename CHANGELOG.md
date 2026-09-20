@@ -221,6 +221,21 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
+  that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
+  `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
+  returned bare values and panicked); `simulate_with_options()`,
+  `simulate_with_options_diag()` and `simulate_with_uncertainty()` keep their signatures but
+  no longer panic *out of* a `Result`-returning function — a dose into a compartment the
+  model cannot deliver into, a coded `RATE` with no `D{n}`/`R{n}` behind it, an unsupported
+  absorption or survival combination now reaches the `Err` arm. The text is byte-identical to
+  what `fit()` returns for the same input; the wrapper sentences ("predict()/simulate()
+  received …", "fit() reports this as an error rather than panicking") are gone.
+  `predict()`, `simulate()` and `simulate_with_seed()` keep their `Vec` signatures for now
+  and still panic, with exactly that `Err` text as the payload; they become `Result` in a
+  later release. No prediction or simulated row changes. See
+  `docs/warnings.qmd#entry-point-errors`.
+
 - **SAEM default: the MH step scales are now adapted by `scale_adaptation = robbins_monro`
   with `scale_deadband = 0.15,0.60` (#1449).** This was opt-in; it is now what a SAEM fit
   runs unless it says otherwise, so **estimates from an existing model file will move**.

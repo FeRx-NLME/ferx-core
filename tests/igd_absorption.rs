@@ -230,8 +230,8 @@ fn biphasic_igd_fraction_value_validation() {
     // **Value** fraction checks — each fraction in (0, 1], and the fractions on a
     // compartment sum to ≈ 1 — depend on the typical parameter values (η = 0), so
     // they live in the data-level `check_model_data` (reached by `fit()` / `ferx
-    // check`, and now by `simulate()` / `predict()` via
-    // `assert_absorption_dosing_supported`, #588). Each model here is *structurally*
+    // check`, and by `simulate()` / `predict()`, which run the same
+    // `check_absorption_dosing`, #588 / #898). Each model here is *structurally*
     // well-formed (both pathways carry a fraction), so it parses; only the value is
     // wrong.
     use ferx_core::check_model_data;
@@ -298,7 +298,7 @@ fn biphasic_igd_fraction_structural_rejected_at_parse() {
 }
 
 #[test]
-#[should_panic(expected = "absorption input-rate machinery cannot honour")]
+#[should_panic(expected = "Pathway fractions on compartment")]
 fn biphasic_igd_fraction_value_error_panics_on_predict() {
     // #588: the value fraction checks now guard the `Vec`-returning `predict()` path.
     // A structurally-valid but value-malformed multi-pathway model (both fractions
@@ -311,7 +311,7 @@ fn biphasic_igd_fraction_value_error_panics_on_predict() {
 }
 
 #[test]
-#[should_panic(expected = "absorption input-rate machinery cannot honour")]
+#[should_panic(expected = "Pathway fractions on compartment")]
 fn biphasic_igd_fraction_value_error_panics_on_simulate() {
     // #588 (simulate path): the same value-malformed multi-pathway model is rejected
     // when *simulated*, via the `simulate_inner_with_draw` chokepoint guard — the exact

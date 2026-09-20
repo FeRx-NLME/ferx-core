@@ -467,6 +467,44 @@ mod ctmm_smoke {
         let _ = predict(&model, &pop, &model.default_params);
     }
 
+    /// #898: on the `Result`-returning entry points the same two CTMM refusals are an `Err`,
+    /// not a panic — `predict_diag` was new and panicked, `simulate_with_options` returned
+    /// `Result` and panicked out of it. The two `should_panic` tests above stay: `predict` /
+    /// `simulate` keep their `Vec` signatures in this PR and re-raise this text.
+    ///
+    /// Mutation — drop the CTMM `return Err` from `predict_diag` and it returns `Ok` with zero
+    /// rows; drop it from the simulate chokepoint and it returns `Ok` with all-zero rows.
+    #[test]
+    fn ctmm_result_entry_points_err_instead_of_panicking() {
+        use ferx_core::{predict_diag, simulate_with_options, SimulateOptions};
+        let model = parse_model_string(FIXED_MODEL).unwrap();
+        let pop = common::binary_pop(&[(0.0, vec![(0.0, 0), (1.0, 1)])], 5);
+        let params = &model.default_params;
+
+        let err = match predict_diag(&model, &pop, params) {
+            Err(e) => e,
+            Ok(out) => panic!("predict_diag accepted CTMM: {} rows", out.results.len()),
+        };
+        assert!(
+            err.contains("predict() does not support a [markov_model] (CTMM)"),
+            "{err}"
+        );
+        assert!(err.contains("#820"), "{err}");
+
+        let opts = SimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = simulate_with_options(&model, &pop, params, 1, &opts)
+            .expect_err("simulate_with_options must refuse CTMM");
+        assert!(
+            err.contains("does not support a [markov_model] (CTMM)"),
+            "{err}"
+        );
+        assert!(err.contains("no simulation path"), "{err}");
+        assert!(err.contains("CTMM simulation is a later slice."), "{err}");
+    }
+
     /// Out-of-order CTMM observation times are rejected at fit setup (the datareader sorts
     /// doses, not observations), rather than silently collapsing the subject to the 1e20
     /// sentinel and biasing the population OFV.

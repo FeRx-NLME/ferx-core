@@ -5008,7 +5008,7 @@ DV ~ proportional(PROP_ERR)
                 exclusions: None,
                 warnings: Vec::new(),
             };
-            let surv = crate::api::predict_survival(&model, &population, p, &[t_pre]);
+            let surv = crate::api::predict_survival(&model, &population, p, &[t_pre]).unwrap();
             let row = surv
                 .iter()
                 .find(|r| r.cmt == 2 && r.time == t_pre)

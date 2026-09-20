@@ -1,7 +1,7 @@
 //! Model/data validation gauntlet shared verbatim by `fit()`/`fit_inner()`
 //! and the `ferx check` orchestrator (`validate_model_file`). Pure predicate
-//! functions returning `Vec<Diagnostic>` / `Option<String>` (or panicking
-//! asserts) — no numerical surface, no f64 arithmetic reordered by this move.
+//! functions returning `Vec<Diagnostic>` / `Option<String>` — no panicking
+//! wrappers (#898) — no numerical surface, no f64 arithmetic reordered by this move.
 //!
 //! Extracted verbatim from `api.rs`; every path stays resolvable through the
 //! `pub` / `pub(crate)` re-exports in the parent module.
@@ -63,7 +63,7 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// estimates with no visible diagnostic (see commit introducing this check).
 ///
 /// Unresolved names that read as random effects get their own `E_ETA_NOT_DECLARED`
-/// diagnostic, pushed first so [`first_error`] — which is what `fit()` reports —
+/// diagnostic, pushed first so [`first_error`](crate::diagnostics::first_error) — which is what `fit()` reports —
 /// surfaces the actionable message instead of "covariate not found in data". The
 /// `E_MISSING_COVARIATE` message text stays byte-for-byte identical to the
 /// historical `Err(String)` for the names that remain.
@@ -559,16 +559,6 @@ pub(crate) fn check_endpoint_routing(
     _require_records: bool,
 ) -> Vec<Diagnostic> {
     Vec::new()
-}
-
-/// `predict()` twin of the `E_ENDPOINT_UNROUTED` half of [`check_endpoint_routing`]
-/// (the no-records half is fit-only). Panics per the `predict()` convention (#898).
-pub(crate) fn assert_endpoint_routing(model: &CompiledModel, population: &Population) {
-    panic_if_unsupported(
-        first_error(&check_endpoint_routing(model, population, false)).err(),
-        "a population loaded without endpoint routing (`read_nonmem_csv` on a model with a \
-         non-Gaussian endpoint)",
-    );
 }
 
 /// Every per-observation residual-error magnitude (#484) — including the one a
@@ -1309,7 +1299,7 @@ pub(crate) fn check_simulation_data(
 
 /// All data-dependent *fatal* compatibility checks between a compiled model and
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
-/// stops at the first error via [`first_error`]) and `ferx check` (which
+/// stops at the first error via [`first_error`](crate::diagnostics::first_error)) and `ferx check` (which
 /// reports every finding). Check order matches the historical inline order in
 /// `fit()` so the first error is unchanged: covariates, endpoint routing (#1199,
 /// ahead of the per-CMT checks so it names the cause), scaling, error model,
@@ -2715,58 +2705,6 @@ pub(crate) fn check_dose_attr_finiteness(
     Vec::new()
 }
 
-/// Precondition shared by [`predict`] and the `simulate*` family: every dose
-/// must name a compartment the analytical engine can deliver it into (#375) —
-/// the `predict()`/`simulate()` twin of [`check_dose_compartments`], which
-/// `fit()` reaches through [`check_model_data`]. Without it these entry points
-/// reach the event-driven walk's routing `match` with an unroutable
-/// compartment, which used to `panic!` from deep inside the prediction loop
-/// with no subject/time context.
-pub(crate) fn assert_dose_compartments_supported(model: &CompiledModel, population: &Population) {
-    panic_if_unsupported(
-        first_error(&check_dose_compartments(model, population)).err(),
-        "a dose into a compartment the model cannot deliver into",
-    );
-}
-
-/// Precondition shared by [`predict`] and the `simulate*` family: every
-/// modeled-`RATE` dose (#324: `RATE=-2` → `D{cmt}` duration, `RATE=-1` → `R{cmt}`
-/// rate) must be supported by the model — the matching `D{cmt}`/`R{cmt}`
-/// parameter exists and infuses an infusable compartment, on either engine.
-///
-/// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
-/// but `predict()` / `simulate()` deliberately skip that data-check (they assume
-/// a model the caller already validated, and run no other data validation). A
-/// modeled dose slipping through would otherwise hit one of two failure modes
-/// downstream that the per-path `debug_assert!` tripwires only catch in
-/// debug/test builds — silently in release: a 0-rate "infusion" on the
-/// analytical path, or [`DoseEvent::resolve_rate`]'s slot `.expect`. This gate
-/// turns both into a loud, actionable panic carrying the same diagnostic message
-/// `check_model_data` would have produced, reusing the single-source-of-truth
-/// [`check_modeled_dose_rates`]. It is O(doses) and runs once per public call
-/// (not in the inner loop), and is a no-op for the common all-`Fixed` dataset.
-pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: &Population) {
-    if let Err(msg) = first_error(&check_modeled_dose_rates(model, population)) {
-        panic!(
-            "predict()/simulate() received a dose the model cannot honour: {msg}\n\
-             (fit() reports this as an error rather than panicking; validate with \
-             `check_model_data` before predicting on untrusted input.)"
-        );
-    }
-}
-
-/// Panic when the data does not carry every covariate the model references, for
-/// the `Vec`-returning [`predict()`](crate::predict) path (issue #1028).
-///
-/// `fit()` runs [`check_covariates`] through [`check_model_data`] and `simulate()`
-/// calls it directly, so both already refuse a model whose identifiers don't bind
-/// to a data column. `predict()` ran no data check at all, which is what let an
-/// undefined name in `[scaling]` reach the predictor: the parser classifies any
-/// identifier it cannot bind to a theta / eta / individual parameter / state as a
-/// covariate, and a covariate missing from the data resolves to the map's `0.0`
-/// default — so `y[CMT=1] = A * TOTALLY_UNDEFINED_NAME` returned an all-zero
-/// structural prediction with no diagnostic. This closes that gap so `predict()`
-/// fails as loudly as `fit()` does, on the same message.
 /// A `[covariate_model]` relation stated with a symbolic statistic (#1111) is
 /// only buildable once a dataset has been summarised. Reaching a fit with one
 /// still unresolved means the covariate effect is simply *absent* from the
@@ -2844,35 +2782,6 @@ fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec
     diags
 }
 
-/// The `predict()`/`simulate()` counterpart of [`check_covariate_model_bound`].
-pub(crate) fn assert_covariate_model_bound(model: &CompiledModel) {
-    panic_if_unsupported(
-        crate::api::assert_covariate_model_bound(model).err(),
-        "a [covariate_model] whose data-derived statistics were never bound",
-    );
-}
-
-pub(crate) fn assert_covariates_present(model: &CompiledModel, population: &Population) {
-    panic_if_unsupported(
-        first_error(&check_covariates(model, population)).err(),
-        "a model referencing covariates the data does not carry",
-    );
-}
-
-/// Shared check→`panic!` wrapper for the non-`fit` entry points (`predict()`/
-/// `simulate()`): if the sibling `check_*` produced a message, fail loudly with
-/// the common template naming `what` the engine received. `fit()` surfaces the
-/// same conditions as an `Err` instead of panicking. Callers holding a
-/// `Result`-returning check pass `first_error(&check).err()`.
-fn panic_if_unsupported(result: Option<String>, what: &str) {
-    if let Some(msg) = result {
-        panic!(
-            "predict()/simulate() received {what}: {msg}\n\
-             (fit() reports this as an error rather than panicking.)"
-        );
-    }
-}
-
 /// The short parenthetical naming *why* a closed-form absorption model has no ODE twin, for the
 /// twin-less rejection messages below.
 ///
@@ -2922,10 +2831,10 @@ fn twin_decline_clause(model: &CompiledModel) -> String {
 /// are instead transparently rerouted to the plain form's ODE twin — `transit()` / `igd()`
 /// forcing — via [`CompiledModel::effective_for`]: the twin integrates the cross-occasion
 /// dose carryover (#104/#663) the superposition cannot. Only a form outside that twin's
-/// scope rejects them.) `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
-/// [`assert_absorption_closed_form_support`], mirroring
-/// [`assert_modeled_doses_supported`]. Returns the first offending feature's message,
-/// or `None` when compatible.
+/// scope rejects them.) `fit()` and every `Result`-returning predict / simulate entry point
+/// surface this as an `Err`; the `Vec`-returning `predict()` / `simulate()` re-raise the same
+/// text as a panic (#898). Returns the first offending feature's message, or `None` when
+/// compatible.
 pub(crate) fn check_absorption_closed_form_support(
     model: &CompiledModel,
     population: &Population,
@@ -3277,8 +3186,9 @@ pub(crate) fn check_rtte_records(model: &CompiledModel, population: &Population)
 ///     survival ODE solve freezes the whole PK-parameter vector at `t=0`, so a covariate
 ///     feeding the concentration (and hence the drug-driven hazard) is equally frozen.
 ///
-/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` surfaces
-/// the message as an `Err`; `predict()`/`simulate()` panic via [`assert_survival_tv_covariates`].
+/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` and the
+/// `Result`-returning predict / simulate entry points surface the message as an `Err`; the
+/// `Vec`-returning `predict()` / `simulate()` re-raise the same text as a panic (#898).
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_tv_covariates(
     model: &CompiledModel,
@@ -3382,19 +3292,6 @@ pub(crate) fn check_survival_tv_covariates(
     None
 }
 
-/// Panic wrapper over [`check_survival_tv_covariates`] for the non-`fit` entry points
-/// (`predict()`/`simulate()`), mirroring [`assert_absorption_closed_form_support`]: the same
-/// time-varying-covariate-on-hazard combination that `fit()` rejects as an `Err` cannot be
-/// honoured by prediction / simulation either (the hazard would be silently frozen), so fail
-/// loudly rather than return a subtly wrong result.
-#[cfg(feature = "survival")]
-pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
-    panic_if_unsupported(
-        check_survival_tv_covariates(model, population),
-        "a survival model / data combination with a time-varying covariate on a hazard",
-    );
-}
-
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject whose dose history dose superposition
 /// cannot reconstruct — an EVID=3/4 reset, or a dose the superposition state
@@ -3461,19 +3358,6 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
-/// Panic on an unsupported transit / IG closed-form model/data combination, for the
-/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
-/// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
-pub(crate) fn assert_absorption_closed_form_support(
-    model: &CompiledModel,
-    population: &Population,
-) {
-    panic_if_unsupported(
-        check_absorption_closed_form_support(model, population),
-        "a model/data combination the analytic absorption closed form cannot honour",
-    );
-}
-
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
 /// fall **outside the closed form's convergence domain** — the flip-flop regime
 /// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
@@ -3489,8 +3373,9 @@ pub(crate) fn assert_absorption_closed_form_support(
 /// informational `W_TRANSIT_FLIP_FLOP` warning that fires for the twin-carrying case.
 /// Returns the first offending subject's message, or `None` when no reject applies
 /// (non-transit, twin present, or in-domain). `fit()` / `ferx check` surface this as
-/// an error; `predict()`/`simulate()` panic via [`assert_absorption_flip_flop_no_twin`],
-/// mirroring [`check_absorption_closed_form_support`] / [`assert_absorption_closed_form_support`].
+/// an error, as do the `Result`-returning predict / simulate entry points; the `Vec`-returning
+/// `predict()` / `simulate()` re-raise the same text as a panic (#898). Mirrors
+/// [`check_absorption_closed_form_support`].
 pub(crate) fn check_absorption_flip_flop_no_twin(
     model: &CompiledModel,
     population: &Population,
@@ -3541,54 +3426,12 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     None
 }
 
-/// Panic on a twin-less flip-flop absorption model for the `Vec`-returning
-/// `predict()`/`simulate()` paths (mirrors [`assert_absorption_closed_form_support`]). `fit()`
-/// returns this as an `Err`.
-pub(crate) fn assert_absorption_flip_flop_no_twin(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-) {
-    panic_if_unsupported(
-        check_absorption_flip_flop_no_twin(model, population, theta),
-        "a model/data combination the absorption closed form cannot honour",
-    );
-}
-
-/// Panic on a depot-referencing analytic Form C readout + reset subject, for the
-/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
-/// [`assert_absorption_closed_form_support`]). `fit()` returns this as an `Err`.
-pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
-    panic_if_unsupported(
-        check_analytic_readout_support(model, population),
-        "a model/data combination the analytic Form C readout cannot honour",
-    );
-}
-
-/// Panic on a malformed built-in **absorption input-rate** model/data combination —
-/// a pathway-fraction value out of `(0, 1]` or not summing to 1, an out-of-domain
-/// forcing parameter, or an SS / infusion / `[diffusion]` dose into an input-rate
-/// compartment — for the `Vec`-returning `predict()` / `simulate()` paths (mirrors
-/// [`assert_absorption_closed_form_support`]). `fit()` (and `ferx check`) surface these as an `Err`
-/// via [`check_model_data`], but the simulate/predict paths run no data-check, so
-/// without this a malformed multi-pathway model would be simulated with silently
-/// wrong dose delivery (#588). The data-independent *structural* fraction rules are
-/// enforced even earlier, at parse time in `build_ode_spec`; this reuses
-/// [`check_absorption_dosing`] for the *value* / domain checks that need data. A
-/// no-op for any model with no built-in input-rate forcing (the common case).
-pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, population: &Population) {
-    panic_if_unsupported(
-        first_error(&check_absorption_dosing(model, population)).err(),
-        "a model/data combination the built-in absorption input-rate machinery cannot honour",
-    );
-}
-
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
 /// clean `ferx check` and a `fit()` agree on which method/model combinations are
 /// rejected (rather than reporting `valid: true` and then failing at fit time).
-/// `fit_inner` consumes these via [`first_error`]; message text is identical to
+/// `fit_inner` consumes these via [`first_error`](crate::diagnostics::first_error); message text is identical to
 /// the historical inline guards. Check order matches `fit_inner` so the first
 /// error is unchanged.
 pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {

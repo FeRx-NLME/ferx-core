@@ -12525,8 +12525,8 @@ fn build_ode_spec(
     // never run that fit-init check — reject a malformed multi-pathway model too
     // (every entry point parses the model first). The companion **value** checks
     // (each fraction in (0, 1], Σ ≈ 1) depend on typical parameter values, so they
-    // stay data-level; the simulate/predict paths reach them via
-    // `assert_absorption_dosing_supported`.
+    // stay data-level; the simulate/predict paths reach them via the same
+    // `check_absorption_dosing` (#898).
     {
         let mut frac_count: std::collections::BTreeMap<usize, (usize, usize)> =
             std::collections::BTreeMap::new(); // cmt -> (total, fractioned)

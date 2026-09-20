@@ -1137,7 +1137,7 @@ fn predict_and_simulate_report_it_too() {
     let m = per_cmt_scaling_model("  obs_scale[CMT=1] = 1\n  obs_scale[CMT=2] = 1000");
     let pop = population(OBS_CMT1_ONLY);
 
-    let predicted = predict_diag(&m, &pop, &m.default_params);
+    let predicted = predict_diag(&m, &pop, &m.default_params).unwrap();
     assert!(
         predicted.warnings.iter().any(|w| w.contains(CODE)),
         "predict() must carry the finding: {:?}",
@@ -1167,6 +1167,7 @@ fn predict_and_simulate_report_it_too() {
     let matched = population(OBS_BOTH_CMTS);
     assert!(
         !predict_diag(&m, &matched, &m.default_params)
+            .unwrap()
             .warnings
             .iter()
             .any(|w| w.contains(CODE)),

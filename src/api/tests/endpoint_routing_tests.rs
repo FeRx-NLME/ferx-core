@@ -391,14 +391,15 @@ fn run_covariance_and_run_sir_reread_the_dataset_routed() {
 }
 
 /// `predict_categorical` walks `obs_records`, so on a model-blind population it would
-/// return nothing — indistinguishable from a model without a binary endpoint. Same
-/// panic convention as `predict()`.
+/// return nothing — indistinguishable from a model without a binary endpoint. An `Err`
+/// since #898 (it panicked before), carrying the text `fit()` returns.
 #[test]
-#[should_panic(expected = "E_ENDPOINT_UNROUTED")]
-fn predict_categorical_panics_on_an_unrouted_population() {
+fn predict_categorical_errs_on_an_unrouted_population() {
     let m = model(BINARY_MODEL);
     let u = unrouted(BINARY_DATA);
-    let _ = crate::api::predict_categorical(&m, &u, &m.default_params);
+    let err = crate::api::predict_categorical(&m, &u, &m.default_params)
+        .expect_err("an unrouted population must be refused");
+    assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
 }
 
 /// …and on the routed population it returns one row per binary record.
@@ -406,7 +407,7 @@ fn predict_categorical_panics_on_an_unrouted_population() {
 fn predict_categorical_on_the_routed_population_returns_one_row_per_record() {
     let m = model(BINARY_MODEL);
     let r = routed(&m, BINARY_DATA);
-    let rows = crate::api::predict_categorical(&m, &r, &m.default_params);
+    let rows = crate::api::predict_categorical(&m, &r, &m.default_params).unwrap();
     assert!(total_events(&r) > 0, "the fixture carries binary rows");
     assert_eq!(rows.len(), total_events(&r));
 }

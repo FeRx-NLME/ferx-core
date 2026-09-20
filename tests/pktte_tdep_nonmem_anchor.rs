@@ -96,7 +96,7 @@ fn cumulative_hazard_matches_nonmem_for_a_time_dependent_hazard() {
     let mut grid: Vec<f64> = rows.iter().map(|r| r.1).collect();
     grid.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));
     grid.dedup();
-    let sv = predict_survival(&m, &pop, &m.default_params, &grid);
+    let sv = predict_survival(&m, &pop, &m.default_params, &grid).unwrap();
 
     let (mut worst_h, mut worst_haz) = (0.0f64, 0.0f64);
     for (id, t, chz, haz) in &rows {
@@ -182,8 +182,8 @@ fn the_time_term_in_the_hazard_is_live_at_every_record() {
     let mut grid: Vec<f64> = rows.iter().map(|r| r.1).collect();
     grid.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));
     grid.dedup();
-    let live = predict_survival(&m, &pop, &m.default_params, &grid);
-    let flat = predict_survival(&m0, &pop0, &m0.default_params, &grid);
+    let live = predict_survival(&m, &pop, &m.default_params, &grid).unwrap();
+    let flat = predict_survival(&m0, &pop0, &m0.default_params, &grid).unwrap();
 
     let (mut smallest, mut largest) = (f64::INFINITY, 0.0f64);
     for (id, t, _, _) in &rows {

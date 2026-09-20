@@ -392,7 +392,7 @@ mod binary_smoke {
         let n_records: usize = subjects.iter().map(|(_, obs)| obs.len()).sum();
         let pop = common::binary_pop(&subjects, 3);
 
-        let preds = ferx_core::predict_categorical(&model, &pop, &model.default_params);
+        let preds = ferx_core::predict_categorical(&model, &pop, &model.default_params).unwrap();
         assert_eq!(preds.len(), n_records, "one prediction per binary record");
         for p in &preds {
             assert_eq!(p.cmt, 3);
@@ -994,7 +994,7 @@ mod binary_smoke {
             exclusions: None,
             warnings: vec![],
         };
-        let preds = ferx_core::predict_categorical(&model, &pop, &model.default_params);
+        let preds = ferx_core::predict_categorical(&model, &pop, &model.default_params).unwrap();
         assert_eq!(preds.len(), 1);
         assert_eq!(
             preds[0].time, 1.0,
@@ -1037,7 +1037,7 @@ mod binary_smoke {
         // it uses the same θ sdtab's PRED does.
         let mut fitted = model.default_params.clone();
         fitted.theta = res.theta.clone();
-        let preds = ferx_core::predict_categorical(&model, &pop, &fitted);
+        let preds = ferx_core::predict_categorical(&model, &pop, &fitted).unwrap();
 
         let cols = sdtab(&res, &pop);
         let col = |name: &str| &cols.iter().find(|(n, _)| n == name).expect("column").1;

@@ -1,4 +1,4 @@
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{CheckReport, Diagnostic};
 use crate::io::datareader::{ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC};
 use crate::pk;
 use crate::types::*;
@@ -17,23 +17,18 @@ mod validation;
 // individually — hence the allow, which would otherwise fire on a non-test build.
 #[allow(unused_imports)]
 pub(crate) use validation::{
-    apply_iov_occasion_rule, assert_absorption_closed_form_support,
-    assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
-    assert_analytic_readout_support, assert_covariates_present, assert_dose_compartments_supported,
-    assert_endpoint_routing, assert_modeled_doses_supported, check_absorption_closed_form_support,
-    check_absorption_dosing, check_absorption_flip_flop_no_twin, check_analytic_readout_support,
-    check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
-    check_modeled_dose_rates, check_packed_start_in_box, check_residual_magnitude,
-    check_simulation_data, check_variance_init_rails,
-};
-#[cfg(feature = "survival")]
-pub(crate) use validation::{
-    assert_survival_tv_covariates, check_rtte_records, check_survival_tv_covariates,
+    apply_iov_occasion_rule, check_absorption_closed_form_support, check_absorption_dosing,
+    check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
+    check_dose_compartments, check_endpoint_routing, check_kappa_weights, check_modeled_dose_rates,
+    check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
+    check_variance_init_rails,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
     check_model_data_warnings, check_model_options, validate_model_file, validate_output_columns,
 };
+#[cfg(feature = "survival")]
+pub(crate) use validation::{check_rtte_records, check_survival_tv_covariates};
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
@@ -306,6 +301,12 @@ mod ode_solver_options_tests;
 #[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
+
+// #898: a precondition failure on a non-`fit()` entry point is an `Err` carrying `fit()`'s
+// text, not a panic.
+#[cfg(test)]
+#[path = "tests/entry_point_errors_tests.rs"]
+mod entry_point_errors_tests;
 
 // ── SDE end-to-end integration ───────────────────────────────────────────────
 

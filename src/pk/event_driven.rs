@@ -702,7 +702,7 @@ pub fn event_driven_predictions(
     // walker — the analytical dispatcher resolves them via the model's
     // `dose_attr_map`, and the public entrypoints reject an unbacked modeled dose
     // first (`fit()` / `ferx check` via `check_model_data`, `predict()` /
-    // `simulate()` via `assert_modeled_doses_supported`). Reaching here unresolved
+    // `simulate()` via the same `check_modeled_dose_rates`, #898). Reaching here unresolved
     // means a path forgot to resolve (e.g. a direct caller of this `pub` fn). A
     // real `assert!` (not `debug_assert!`) so release builds fail loudly too
     // instead of silently mis-handling a 0-rate "infusion"; it is O(doses) and

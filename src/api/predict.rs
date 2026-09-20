@@ -63,7 +63,9 @@ pub fn predict(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<PredictionResult> {
-    predict_diag(model, population, params).results
+    predict_diag(model, population, params)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .results
 }
 
 /// The rows [`predict`] returns, plus the diagnostics it discards.
@@ -109,45 +111,51 @@ pub struct PredictionOutput {
 /// task and only on a model that integrates something, so a closed-form model takes the
 /// identical path it did before.
 ///
-/// **Panics, not `Err`s, on a precondition.** The `assert_*` guards below are unchanged by this
-/// function and are the subject of #898, not of this one. Adding an eleventh assert is
-/// explicitly *not* how a warning-severity finding reaches `predict()`; that is what `warnings`
-/// is for.
+/// # Errors
+///
+/// A model/data precondition failure is an `Err` carrying the bare check message —
+/// byte-identical to what `fit()` returns for the same input (#898): a dose the model cannot
+/// route or honour, a covariate the data does not carry, an unrouted non-Gaussian endpoint, an
+/// unbound `[covariate_model]`, an unsupported absorption / readout / survival combination.
+/// [`predict`] re-raises that same text as a panic, having no channel to return it on. Adding
+/// an eleventh check is explicitly *not* how a warning-severity finding reaches `predict()`;
+/// that is what `warnings` is for.
 pub fn predict_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> PredictionOutput {
+) -> Result<PredictionOutput, String> {
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
-    assert_modeled_doses_supported(model, population);
+    first_error(&check_modeled_dose_rates(model, population))?;
     // Every identifier the parser could not bind resolves as a covariate, and a
     // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
     // and `simulate()` already refuse this; match them here.
-    assert_covariates_present(model, population);
+    first_error(&check_covariates(model, population))?;
     // A population read by the model-blind `read_nonmem_csv` carries a declared
     // endpoint's rows as Gaussian observations, and this function would return a
     // *concentration* for the event row (#1199). `fit()` Err's on the same signature.
-    assert_endpoint_routing(model, population);
+    // (`false`: the no-records half of the check is fit-only.)
+    first_error(&check_endpoint_routing(model, population, false))?;
     // …and that no `[covariate_model]` relation is still waiting on the
     // data-derived statistics that build it (#1111): an unresolved relation
     // simply is not in the compiled expression, and a dropped covariate effect
     // is invisible in a prediction.
-    crate::api::validation::assert_covariate_model_bound(model);
+    crate::api::assert_covariate_model_bound(model)?;
     // …and that every dose names a compartment the analytical engine can route
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).
-    assert_dose_compartments_supported(model, population);
-    assert_absorption_closed_form_support(model, population);
-    assert_absorption_flip_flop_no_twin(model, population, &params.theta);
-    // A time-varying covariate on a survival hazard would be silently frozen — panic
-    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    first_error(&check_dose_compartments(model, population))?;
+    check_absorption_closed_form_support(model, population).map_or(Ok(()), Err)?;
+    check_absorption_flip_flop_no_twin(model, population, &params.theta).map_or(Ok(()), Err)?;
+    // A time-varying covariate on a survival hazard would be silently frozen — refuse
+    // rather than return a subtly wrong prediction / simulation (#741; as fit() does).
     #[cfg(feature = "survival")]
-    assert_survival_tv_covariates(model, population);
-    assert_analytic_readout_support(model, population);
-    assert_absorption_dosing_supported(model, population);
+    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    check_analytic_readout_support(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_absorption_dosing(model, population))?;
     // CTMM (#759) has no prediction path: its records live in `obs_records`, which the
     // Gaussian loop below never visits, so a CTMM-only model would silently return an
     // empty vec rather than an occupancy π(t). `simulate()`'s twin assert already
@@ -163,12 +171,14 @@ pub fn predict_diag(
     // mixed model with continuous data passes and returns its Gaussian rows; the CTMM rows
     // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
     #[cfg(feature = "markov")]
-    assert!(
-        !model.has_ctmm() || population.subjects.iter().any(|s| !s.obs_times.is_empty()),
-        "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population has \
-         no continuous observations either — so the call would return an empty vec rather than an \
-         occupancy π(t). State-occupancy prediction is a later slice (#820)."
-    );
+    if model.has_ctmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
+        return Err(
+            "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population \
+             has no continuous observations either — so the call would return an empty vec rather \
+             than an occupancy π(t). State-occupancy prediction is a later slice (#820)."
+                .to_string(),
+        );
+    }
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     // Whether there is anything for a `SolverStatsScope` to record. Entering a scope
@@ -233,7 +243,7 @@ pub fn predict_diag(
             None => predict_subjects_serial(),
         }
     };
-    PredictionOutput {
+    Ok(PredictionOutput {
         results,
         warnings: super::non_fit_diagnostics(
             model,
@@ -242,7 +252,7 @@ pub fn predict_diag(
             &stats,
             super::SolverStatsPhase::Predict,
         ),
-    }
+    })
 }
 
 /// A single prediction
@@ -264,28 +274,33 @@ pub struct PredictionResult {
 /// Predictions are at `η = 0` (the population-typical subject), matching [`predict`]'s
 /// own convention; the EBE-conditioned per-subject values are an sdtab concern.
 /// Returns an empty vec for a model with no `Binary` endpoint.
+///
+/// # Errors
+///
+/// A time-varying covariate on the linear predictor, or a population loaded without endpoint
+/// routing, is an `Err` carrying the text `fit()` returns for the same input (#898).
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Vec<EndpointPredictionResult> {
+) -> Result<Vec<EndpointPredictionResult>, String> {
     // Same guard `predict()` and `fit()` apply: a time-varying covariate on the linear
     // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
-    assert_survival_tv_covariates(model, population);
+    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
     // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
     // `obs_records`, so a population read model-blind — its binary rows in the
     // Gaussian grid — would come back empty, indistinguishable from a model with no
     // binary endpoint.
-    assert_endpoint_routing(model, population);
+    first_error(&check_endpoint_routing(model, population, false))?;
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
     for subject in &population.subjects {
         crate::categorical::predict_binary(model, subject, &params.theta, &zero_eta, &mut results);
     }
-    results
+    Ok(results)
 }
 
 /// Survival function prediction for one (subject, time) grid point.
@@ -365,14 +380,19 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// clock-forward RTTE, not the survival summaries and not for clock-reset.
 ///
 /// Returns an empty Vec when the model has no TTE endpoints.
+///
+/// # Errors
+///
+/// A time-varying covariate on a hazard, or a dose into a compartment the model cannot
+/// deliver into, is an `Err` carrying the text `fit()` returns for the same input (#898).
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     time_grid: &[f64],
-) -> Vec<SurvivalPredictionResult> {
-    // Deliberately no `assert_absorption_flip_flop_no_twin` guard here (unlike
+) -> Result<Vec<SurvivalPredictionResult>, String> {
+    // Deliberately no `check_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
     // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
     // model then carries `ode_spec` and never takes the closed-form transit path), and a
@@ -384,14 +404,14 @@ pub fn predict_survival(
 
     // Like predict()/simulate(), the survival curves read the hazard at a frozen
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
-    // silently applied at its baseline, so fail loudly instead (#741).
-    assert_survival_tv_covariates(model, population);
+    // silently applied at its baseline, so refuse instead (#741).
+    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
 
     // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently
     // changes the exposure the hazard sees. This entry point was the one member of
     // the `predict`/`simulate` family missing the guard (#899); it is a no-op for a
     // pure-TTE model, where nothing asks the PK predictor for a value.
-    assert_dose_compartments_supported(model, population);
+    first_error(&check_dose_compartments(model, population))?;
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -481,5 +501,5 @@ pub fn predict_survival(
         }
     }
 
-    results
+    Ok(results)
 }

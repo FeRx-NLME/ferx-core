@@ -239,7 +239,7 @@ fn nonmem_rows_r5() -> Vec<(f64, f64, f64, f64)> {
 fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
     for arm in ["const", "drug"] {
         let (m, pop) = load_with(arm, DATA_MID_RECORD);
-        let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R3);
+        let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R3).unwrap();
         let pred = predict(&m, &pop, &m.default_params);
         let reference = nonmem_rows_r3(arm);
 
@@ -389,7 +389,7 @@ fn every_committed_reference_run_is_what_it_claims_to_be() {
 ///
 /// The lag is a **fixed theta**, not a column: `ode_cumhaz_hazard` snapshots the PK parameters
 /// at `t = 0`, so a per-dose lag column would be read at its baseline for every dose, and a
-/// time-varying one would trip `assert_survival_tv_covariates`.
+/// time-varying one would trip `check_survival_tv_covariates`.
 #[test]
 fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
     let (m, pop) = load_with("drug_lag", DATA_MID_RECORD_LAG);
@@ -409,7 +409,7 @@ fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
         lag > ii,
         "this arm anchors the `lag >= II` regime; got ALAG1={lag}, II={ii}"
     );
-    let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R5);
+    let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R5).unwrap();
     let pred = predict(&m, &pop, &m.default_params);
     let reference = nonmem_rows_r5();
 
@@ -540,7 +540,7 @@ fn the_constant_arm_of_the_reference_reproduces_the_closed_form() {
 fn cumulative_hazard_after_an_ss_dose_matches_nonmem() {
     for arm in ["const", "drug", "tdep"] {
         let (m, pop) = load(arm);
-        let sv = predict_survival(&m, &pop, &m.default_params, &GRID);
+        let sv = predict_survival(&m, &pop, &m.default_params, &GRID).unwrap();
         let mut worst = 0.0f64;
         for (t, _, chz, _) in nonmem_rows(arm) {
             let r = sv
@@ -574,7 +574,7 @@ fn cumulative_hazard_after_an_ss_dose_matches_nonmem() {
 fn instantaneous_hazard_after_an_ss_dose_matches_nonmem() {
     for arm in ["const", "drug", "tdep"] {
         let (m, pop) = load(arm);
-        let sv = predict_survival(&m, &pop, &m.default_params, &GRID);
+        let sv = predict_survival(&m, &pop, &m.default_params, &GRID).unwrap();
         let mut worst = 0.0f64;
         for (t, _, _, haz) in nonmem_rows(arm) {
             let r = sv
@@ -666,7 +666,7 @@ fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
     // Asked for on its own. Until #1218 a grid whose maximum is 0 returned `NaN` and this had
     // to pad the grid with `GRID` to get a finite row; the single-instant path is pinned by
     // `predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid` below.
-    let sv = predict_survival(&m, &pop, &m.default_params, &[0.0]);
+    let sv = predict_survival(&m, &pop, &m.default_params, &[0.0]).unwrap();
     let at_zero = survival_rows_at(&sv, 0.0);
     assert!(!at_zero.is_empty(), "no survival row at t = 0");
     for (h, _) in at_zero {
@@ -817,7 +817,7 @@ fn nonmem_rows_r4() -> Vec<(f64, f64, f64, f64)> {
 #[test]
 fn a_reset_zeroes_the_accumulated_hazard_and_matches_nonmem() {
     let (m, pop) = load_with("const", DATA_RESET);
-    let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R4);
+    let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R4).unwrap();
     let pred = predict(&m, &pop, &m.default_params);
     let reference = nonmem_rows_r4();
 
@@ -895,7 +895,7 @@ fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
     for (arm, drug_driven) in [("const", false), ("drug", true)] {
         let (m, pop) = load(arm);
         let want = survival_rows_at(
-            &predict_survival(&m, &pop, &m.default_params, &[0.0, 1.0]),
+            &predict_survival(&m, &pop, &m.default_params, &[0.0, 1.0]).unwrap(),
             0.0,
         );
         assert_eq!(want.len(), 1, "{arm}: one subject, one row at t = 0");
@@ -915,9 +915,9 @@ fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
             );
         }
 
-        let single = predict_survival(&m, &pop, &m.default_params, &[0.0]);
-        let dup = predict_survival(&m, &pop, &m.default_params, &[0.0, 0.0]);
-        let pre_grid = predict_survival(&m, &pop, &m.default_params, &[-1.0, 0.0]);
+        let single = predict_survival(&m, &pop, &m.default_params, &[0.0]).unwrap();
+        let dup = predict_survival(&m, &pop, &m.default_params, &[0.0, 0.0]).unwrap();
+        let pre_grid = predict_survival(&m, &pop, &m.default_params, &[-1.0, 0.0]).unwrap();
         for (label, rows, n_zero) in [
             ("[0.0]", &single, 1),
             ("[0.0, 0.0]", &dup, 2),
