@@ -1615,6 +1615,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             InnerSolvePolicy {
                 seed,
                 capture_terminal_hessian: false,
+                accelerate_exact_outer: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
