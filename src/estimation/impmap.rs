@@ -3142,9 +3142,9 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Imp;
-        opts.impmap_iterations = 2;
-        opts.impmap_samples = 40;
-        opts.impmap_seed = Some(996);
+        opts.imp_iterations = 2;
+        opts.imp_samples = 40;
+        opts.imp_seed = Some(996);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
         let hit = res
@@ -3187,9 +3187,9 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Imp;
-        opts.impmap_iterations = 2;
-        opts.impmap_samples = 40;
-        opts.impmap_seed = Some(996);
+        opts.imp_iterations = 2;
+        opts.imp_samples = 40;
+        opts.imp_seed = Some(996);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
         let hit = res
@@ -3348,9 +3348,9 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Imp;
-        opts.impmap_iterations = 2;
-        opts.impmap_samples = 40;
-        opts.impmap_seed = Some(996);
+        opts.imp_iterations = 2;
+        opts.imp_samples = 40;
+        opts.imp_seed = Some(996);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
         assert!(
