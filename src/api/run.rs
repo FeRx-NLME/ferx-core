@@ -1001,11 +1001,16 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
         .collect()
 }
 
-/// Single covariate-aware reader used by every file-based entry point (`fit`
-/// wrappers and `ferx check`), so they all apply identical covariate validation.
 /// Build a `SelectionFilter` from a model file's `FitOptions` alone.
 /// Returns `None` when no selection rules are set.
-fn build_selection_filter(opts: &FitOptions) -> Result<Option<SelectionFilter>, String> {
+///
+/// Shared with `ferx check` (`api::validation::check_selection_filter`, #1465), so
+/// the records a check reads are the records the CLI fit scores. A second spelling
+/// is what the defect was: `validate_model_file` passed `filter: None` while this
+/// builder sat two lines from the same `parsed.fit_options`. `validation.rs` does
+/// still hold a deliberately *partial* one — `data_selection_reads_cmt` drops
+/// `ignore_subjects`, which never reads a row's `CMT` — and that one is not this.
+pub(crate) fn build_selection_filter(opts: &FitOptions) -> Result<Option<SelectionFilter>, String> {
     if opts.ignore_exprs.is_empty()
         && opts.accept_exprs.is_empty()
         && opts.ignore_subjects.is_empty()
