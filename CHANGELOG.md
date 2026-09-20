@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
+  on being off target.** Under `scale_adaptation = robbins_monro` the step now fires only
+  when an iteration's MH acceptance falls outside the band; inside it the step scale is
+  left untouched. The rule was written for chains stuck at 2–4 % acceptance, but it also
+  pulls a chain that starts *above* the 40 % target down onto it, which was measured to
+  make the final estimates worse — a band leaves that case alone. Default `none`
+  (unchanged behaviour). Note that the rule fires only *outside* the band, so a band wide
+  enough to cover every attainable rate freezes the scales instead of disabling the
+  feature; `0,1` is rejected with that explanation (#1449).
+
 - **SAEM: two opt-in estimators for the numerical θ/σ M-step that remove or shrink its
   Jensen bias (`mstep_solver = score_sa`, `mstep_draws = K`).** A θ with no ETA is moved
   only by the η-frozen numerical M-step, which adopts the *maximiser* at each iteration's

@@ -46,6 +46,10 @@ fn warfarin_tail_rate(rule: &str) -> f64 {
 }
 
 fn warfarin_tail_rate_seed(rule: &str, seed: u64) -> f64 {
+    warfarin_tail_rate_banded(rule, seed, None)
+}
+
+fn warfarin_tail_rate_banded(rule: &str, seed: u64, band: Option<&str>) -> f64 {
     let model = parse_model_file(std::path::Path::new("examples/warfarin_saem.ferx"))
         .expect("example parses");
     let pop = read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
@@ -66,6 +70,10 @@ fn warfarin_tail_rate_seed(rule: &str, seed: u64) -> f64 {
     // Via the parser, so the `[fit_options]` spelling is exercised too.
     ferx_core::parser::model_parser::apply_fit_option(&mut opts, "scale_adaptation", rule)
         .expect("scale_adaptation parses");
+    if let Some(b) = band {
+        ferx_core::parser::model_parser::apply_fit_option(&mut opts, "scale_deadband", b)
+            .expect("scale_deadband parses");
+    }
     let res = fit(&model, &pop, &model.default_params, &opts).expect("warfarin SAEM Ok");
     let rate = res
         .saem_mh_accept_tail
@@ -129,5 +137,45 @@ fn warfarin_saem_reaches_target_only_under_robbins_monro() {
     assert!(
         interval < MH_RATE_LOW && MH_RATE_LOW < rm,
         "the pair must straddle MH_RATE_LOW = {MH_RATE_LOW}: interval {interval:.4}, rm {rm:.4}"
+    );
+}
+
+/// The dead band of #1449 must not cost warfarin its rescue.
+///
+/// The band exists so that a chain already *near* target is left alone; the
+/// whole point of #1444's Robbins-Monro rule is a chain that is nowhere near
+/// it. Warfarin is that chain — a few percent against a 40% target — so the
+/// default band must still let the rule act here, and the banded arm must land
+/// on the same side of `MH_RATE_LOW` as the unbanded one while the legacy rule
+/// stays on the other side.
+///
+/// The band's own effect is bounded rather than asserted to be nil: with
+/// `n_mh_steps = 20` a subject's per-iteration rate is a multiple of 0.05, so
+/// once the chain has arrived some iterations *do* fall inside `[0.15, 0.60]`
+/// and are skipped. Realised tail acceptance, seed 12345, 20 MH steps:
+/// `interval` PLACEHOLDER_INT, `robbins_monro` PLACEHOLDER_RM, `robbins_monro`
+/// + the default band PLACEHOLDER_BAND (measured, not bracketed). The bound
+/// below is `|rate − 0.40| < 0.08`, the same 3.5x-headroom bound the unbanded
+/// arm carries.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn the_default_deadband_still_rescues_warfarin() {
+    let interval = warfarin_tail_rate("interval");
+    let banded = warfarin_tail_rate_banded("robbins_monro", 12345, Some("0.15,0.60"));
+    assert!(
+        interval.is_finite() && banded.is_finite(),
+        "non-finite tail rates: interval {interval}, banded {banded}"
+    );
+    assert!(
+        (banded - 0.40_f64).abs() < 0.08,
+        "the banded arm must still reach the 40% target, got {banded:.4}"
+    );
+    assert!(
+        interval < MH_RATE_LOW && MH_RATE_LOW < banded,
+        "the pair must straddle MH_RATE_LOW = {MH_RATE_LOW}: \
+         interval {interval:.4}, banded {banded:.4}"
     );
 }

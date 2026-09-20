@@ -187,6 +187,28 @@ fn rm_scale_update(scale: f64, rate: f64, target: f64, k: usize, lo: f64, hi: f6
     (scale.ln() + step).exp().clamp(lo, hi)
 }
 
+/// Whether `rate` sits inside the [`FitOptions::saem_scale_deadband`] band, in
+/// which case the Robbins-Monro step above is **skipped** and the scale is left
+/// bit-for-bit unchanged.
+///
+/// Inclusive at both ends, and `None` — the default — is never inside, so the
+/// unbanded rule steps on every iteration exactly as before. The parser maps an
+/// empty band (`lo == hi`) to `None`, so there is no interval here that is both
+/// non-empty and unreachable.
+///
+/// The band is an *absolute* acceptance window shared by the block (target
+/// 0.40) and componentwise (0.44) kernels rather than a distance from each
+/// kernel's own target. That is deliberate — it is the quantity the trace
+/// prints and the diagnostic warns on — but it is also why the band cannot be
+/// symmetric around both targets at once; see the SAEM docs page for what that
+/// asymmetry does to the fixed point.
+fn inside_scale_deadband(rate: f64, band: Option<(f64, f64)>) -> bool {
+    match band {
+        Some((lo, hi)) => rate >= lo && rate <= hi,
+        None => false,
+    }
+}
+
 /// Combined (block + componentwise) post-burn-in MH acceptance rate below which
 /// SAEM appends a "sampler is not mixing" warning to `FitResult.warnings`
 /// (issue #895). A genuinely stuck E-step never updates the ETAs, so the M-step
@@ -3416,6 +3438,9 @@ pub fn run_saem(
         options.saem_scale_adaptation,
         crate::types::ScaleAdaptation::RobbinsMonro
     );
+    // Acceptance window in which the Robbins-Monro step is skipped entirely
+    // (#1449). Read once here so the two call sites below cannot drift.
+    let scale_deadband = options.saem_scale_deadband;
     let verbose = options.verbose;
     let n_leapfrog = options.saem_n_leapfrog;
     // HMC is BSV-only (kappa-unaware); disable it for IOV models so eta sampling
@@ -4681,14 +4706,20 @@ pub fn run_saem(
                     }
                     if n_prop > 0 {
                         let rate = n_acc as f64 / n_prop as f64;
-                        state.step_scales[i] = rm_scale_update(
-                            state.step_scales[i],
-                            rate,
-                            target_accept_rate,
-                            k,
-                            MH_BLOCK_SCALE_MIN,
-                            MH_BLOCK_SCALE_MAX,
-                        );
+                        // Inside the dead band the scale is left alone — no
+                        // Robbins-Monro step, and no interval bump either,
+                        // since the interval rule is already suppressed for
+                        // the whole run under this mode (see the block below).
+                        if !inside_scale_deadband(rate, scale_deadband) {
+                            state.step_scales[i] = rm_scale_update(
+                                state.step_scales[i],
+                                rate,
+                                target_accept_rate,
+                                k,
+                                MH_BLOCK_SCALE_MIN,
+                                MH_BLOCK_SCALE_MAX,
+                            );
+                        }
                     }
                     // Per-η, for the same reason the interval rule adapts each
                     // coordinate separately: a FREM covariate η and a PK η have
@@ -4696,6 +4727,9 @@ pub fn run_saem(
                     if n_cw_sweeps > 0 {
                         for j in 0..n_eta.min(per_eta_acc_cw.len()) {
                             let rate = per_eta_acc_cw[j] as f64 / n_cw_sweeps as f64;
+                            if inside_scale_deadband(rate, scale_deadband) {
+                                continue;
+                            }
                             state.cw_step_scales[i][j] = rm_scale_update(
                                 state.cw_step_scales[i][j],
                                 rate,
@@ -9947,6 +9981,107 @@ DV ~ additive(EPS)
     }
 
     #[test]
+    fn scale_deadband_is_inclusive_at_both_ends_and_absent_by_default() {
+        // The comparison itself, mutation-tested — measured, not assumed:
+        // `rate >= lo` → `rate > lo` kills the lo-edge assertion, `rate <= hi`
+        // → `rate < hi` kills the hi-edge one, and a predicate hard-wired to
+        // `false` (the band ignored) kills this test plus both fit-level ones
+        // below.
+        let band = Some((0.15, 0.60));
+        // Exactly on each end is *inside* — this is what kills `>` and `<`.
+        assert!(inside_scale_deadband(0.15, band), "lo edge must be inside");
+        assert!(inside_scale_deadband(0.60, band), "hi edge must be inside");
+        assert!(inside_scale_deadband(0.40, band), "the target is inside");
+        // The nearest representable neighbours outside each end are outside, so
+        // the band is the closed interval and nothing wider.
+        let below = f64::from_bits(0.15_f64.to_bits() - 1);
+        let above = f64::from_bits(0.60_f64.to_bits() + 1);
+        assert!(!inside_scale_deadband(below, band), "{below} < lo");
+        assert!(!inside_scale_deadband(above, band), "{above} > hi");
+        assert!(!inside_scale_deadband(0.0, band) && !inside_scale_deadband(1.0, band));
+        // No band is never inside, at any rate — the unbanded rule must keep
+        // stepping every iteration, which is what the default does.
+        for r in [0.0, 0.15, 0.40, 0.60, 1.0] {
+            assert!(
+                !inside_scale_deadband(r, None),
+                "None must never skip ({r})"
+            );
+        }
+        assert_eq!(FitOptions::default().saem_scale_deadband, None);
+
+        // Composed with the step, the way the two call sites do it: inside the
+        // band the scale comes back bit-for-bit unchanged, outside it is
+        // exactly the Robbins-Monro step and nothing else.
+        let step = |rate: f64| -> f64 {
+            if inside_scale_deadband(rate, band) {
+                0.3
+            } else {
+                rm_scale_update(0.3, rate, 0.40, 1, MH_BLOCK_SCALE_MIN, MH_BLOCK_SCALE_MAX)
+            }
+        };
+        assert_eq!(step(0.60).to_bits(), 0.3_f64.to_bits());
+        assert_eq!(
+            step(0.65).to_bits(),
+            rm_scale_update(0.3, 0.65, 0.40, 1, MH_BLOCK_SCALE_MIN, MH_BLOCK_SCALE_MAX).to_bits()
+        );
+    }
+
+    #[test]
+    fn scale_deadband_parses_every_documented_spelling_and_rejects_the_trap() {
+        let parse = |key: &str, v: &str| -> Result<Option<(f64, f64)>, String> {
+            let mut opts = FitOptions::default();
+            crate::parser::model_parser::apply_fit_option(&mut opts, key, v)
+                .map(|_| opts.saem_scale_deadband)
+        };
+        assert_eq!(
+            parse("scale_deadband", "0.15,0.60").unwrap(),
+            Some((0.15, 0.60))
+        );
+        // Whitespace around either end, and the long key spelling.
+        assert_eq!(
+            parse("saem_scale_deadband", " 0.2 , 0.5 ").unwrap(),
+            Some((0.2, 0.5))
+        );
+        // The three disable spellings all mean "no band", i.e. plain
+        // Robbins-Monro stepped every iteration.
+        for off in ["none", "NONE", "off", "0,0", "0.4,0.4"] {
+            assert_eq!(parse("scale_deadband", off).unwrap(), None, "`{off}`");
+        }
+        // A band covering every attainable rate is refused rather than
+        // silently freezing the step scales for the whole fit, and the message
+        // has to name the spelling that actually disables the band.
+        let frozen = parse("scale_deadband", "0,1").unwrap_err();
+        assert!(
+            frozen.contains("never run") && frozen.contains("scale_deadband = none"),
+            "the freeze trap must be explained: {frozen}"
+        );
+        // Ordinary input errors.
+        for bad in ["0.5", "lo,hi", "0.6,0.2", "-0.1,0.5", "0.5,1.5"] {
+            let err = parse("scale_deadband", bad).unwrap_err();
+            assert!(
+                err.contains("scale_deadband"),
+                "`{bad}` must be rejected by name: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_deadband_keys_are_registered_as_saem_options() {
+        // Same gap as `scale_adaptation_keys_are_registered_as_saem_options`
+        // below: a key the parser accepts but `method_specific_keys` does not
+        // list works while warning that it "will be ignored".
+        for key in ["scale_deadband", "saem_scale_deadband"] {
+            let opts = FitOptions {
+                method: EstimationMethod::Saem,
+                user_set_keys: vec![key.to_string()],
+                ..FitOptions::default()
+            };
+            let w = opts.unsupported_keys_warnings();
+            assert!(w.is_empty(), "`{key}` must not warn under saem: {w:?}");
+        }
+    }
+
+    #[test]
     fn scale_adaptation_parses_every_documented_spelling() {
         use crate::types::ScaleAdaptation;
         let parse = |key: &str, v: &str| -> Result<ScaleAdaptation, String> {
@@ -10085,6 +10220,16 @@ DV ~ additive(EPS)
         omega_v: f64,
         rule: crate::types::ScaleAdaptation,
     ) -> (crate::types::FitResult, f64) {
+        scale1444_fit_band(omega_cl, omega_v, rule, None)
+    }
+
+    /// [`scale1444_fit`] with a [`FitOptions::saem_scale_deadband`] (#1449).
+    fn scale1444_fit_band(
+        omega_cl: f64,
+        omega_v: f64,
+        rule: crate::types::ScaleAdaptation,
+        band: Option<(f64, f64)>,
+    ) -> (crate::types::FitResult, f64) {
         let model = scale1444_model(omega_cl, omega_v);
         let pop = mix996_pop(4);
         let opts = FitOptions {
@@ -10098,6 +10243,7 @@ DV ~ additive(EPS)
             // window would open at 21 and straddle that first adaptation.
             saem_omega_burnin: SCALE1444_BURNIN,
             saem_scale_adaptation: rule,
+            saem_scale_deadband: band,
             saem_seed: Some(1444),
             run_covariance_step: false,
             ..FitOptions::default()
@@ -10235,6 +10381,91 @@ DV ~ additive(EPS)
         assert!(
             hi_rm < hi_int,
             "above target RM must lower the rate: {hi_rm:.4} vs {hi_int:.4}"
+        );
+    }
+
+    #[test]
+    fn a_deadband_no_rate_can_land_in_is_bit_identical_to_plain_robbins_monro() {
+        use crate::types::ScaleAdaptation;
+        // This fixture resolves `n_mh_steps` to the auto floor of 6 with 2 η,
+        // so `n_cw_sweeps = max(2, 6/2) = 3` and the only attainable
+        // per-iteration rates are the sixths (block) and the thirds
+        // (componentwise). **(0.70, 0.80) contains neither 2/3 nor 5/6**, so
+        // the band can never fire and the run must be the plain Robbins-Monro
+        // one to the last bit — nothing about the option may perturb the
+        // stream, the RNG draw order or the scales when it does not apply.
+        let (plain, plain_tail) = scale1444_fit(100.0, 100.0, ScaleAdaptation::RobbinsMonro);
+        let (dead, dead_tail) = scale1444_fit_band(
+            100.0,
+            100.0,
+            ScaleAdaptation::RobbinsMonro,
+            Some((0.70, 0.80)),
+        );
+        assert!(plain.ofv.is_finite(), "OFV {}", plain.ofv);
+        assert_eq!(
+            plain.ofv.to_bits(),
+            dead.ofv.to_bits(),
+            "unreachable band changed the OFV: {} vs {}",
+            plain.ofv,
+            dead.ofv
+        );
+        assert_eq!(plain_tail.to_bits(), dead_tail.to_bits());
+        for (a, b) in plain.theta.iter().zip(&dead.theta) {
+            assert_eq!(a.to_bits(), b.to_bits(), "theta {a} vs {b}");
+        }
+        for (a, b) in plain.sigma.iter().zip(&dead.sigma) {
+            assert_eq!(a.to_bits(), b.to_bits(), "sigma {a} vs {b}");
+        }
+
+        // The control that stops this from passing for the wrong reason — a
+        // band the option never reads would satisfy every assertion above. A
+        // band the rates *do* land in must change the same fit.
+        let (live, _) = scale1444_fit_band(
+            100.0,
+            100.0,
+            ScaleAdaptation::RobbinsMonro,
+            Some((0.0, 0.5)),
+        );
+        assert!(
+            live.ofv.to_bits() != plain.ofv.to_bits(),
+            "a band covering the realised rates must change the fit, got {} both ways",
+            plain.ofv
+        );
+    }
+
+    #[test]
+    fn a_deadband_covering_the_realised_rate_freezes_the_step_scale() {
+        use crate::types::ScaleAdaptation;
+        // The mechanism the band exists for, as a differential pair that
+        // straddles the diagnostic's gate. Same grossly over-dispersed Ω as the
+        // pair above, whose chain sits at a few percent: Robbins-Monro rescues
+        // it, and a band containing those low rates must decline to, leaving
+        // the chain stuck.
+        //
+        // This fixture resolves to 6 block proposals and 3 componentwise
+        // sweeps, so `(0.0, 0.5)` contains every attainable rate the chain
+        // actually produces down here (the sixths 0 … 1/2 and the thirds 0,
+        // 1/3) and essentially every step is skipped. Realised tail
+        // acceptance: plain RM **0.3240**, banded **0.0788**, against the
+        // interval rule's 0.0844 on the same fixture — i.e. the banded arm
+        // stays where a chain whose scale is left alone stays.
+        let (_, rm) = scale1444_fit(100.0, 100.0, ScaleAdaptation::RobbinsMonro);
+        let (_, banded) = scale1444_fit_band(
+            100.0,
+            100.0,
+            ScaleAdaptation::RobbinsMonro,
+            Some((0.0, 0.5)),
+        );
+        println!("tail acceptance: rm {rm:.4}, banded {banded:.4}");
+        assert!(
+            rm.is_finite() && banded.is_finite(),
+            "non-finite tail rates: rm {rm}, banded {banded}"
+        );
+        // The straddle itself, so the pair cannot quietly become two runs on
+        // the same side of the gate: RM arrives, the banded arm does not.
+        assert!(
+            banded < MH_RATE_LOW && MH_RATE_LOW < rm,
+            "the pair must straddle MH_RATE_LOW = {MH_RATE_LOW}: banded {banded:.4}, rm {rm:.4}"
         );
     }
 

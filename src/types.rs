@@ -7619,6 +7619,35 @@ pub struct FitOptions {
     /// componentwise kernels have `n_mh_steps` and `n_cw_sweeps` proposals per
     /// iteration to average over.
     pub saem_scale_adaptation: ScaleAdaptation,
+    /// Dead band on the acceptance rate for [`ScaleAdaptation::RobbinsMonro`],
+    /// set via `[fit_options] scale_deadband = <lo>,<hi>`. `None` — the
+    /// default — steps the scale on every iteration, which is the historical
+    /// Robbins-Monro behaviour of #1444.
+    ///
+    /// With `Some((lo, hi))` the step is skipped whenever that iteration's
+    /// acceptance rate lies in `[lo, hi]` **inclusive**, for both the primary
+    /// block kernel (target 0.40) and each componentwise coordinate (target
+    /// 0.44); outside the band the ordinary Robbins-Monro step applies. The
+    /// band is one absolute acceptance window shared by both kernels, not a
+    /// distance from each kernel's own target.
+    ///
+    /// The motivating case is a chain that *starts* near target: driving it
+    /// exactly onto the nominal 0.40 has been measured to make the final
+    /// estimate worse (the pembrolizumab bench of #1449, 0.45 → 0.42 and a
+    /// worse importance-sampling −2 log L), while the chains Robbins-Monro
+    /// exists for sit at 2–4 %. A band leaves the first alone and still
+    /// rescues the second.
+    ///
+    /// Note what a *wide* band does: the rule only ever fires on rates outside
+    /// it, so a band wider than the spread of the per-iteration rate freezes
+    /// the scales instead of disabling the dead band. `scale_deadband = none`
+    /// (or an empty band, `lo == hi`) is the spelling that restores plain
+    /// Robbins-Monro; a band covering all of `[0, 1]` is rejected by the
+    /// parser for exactly that reason.
+    ///
+    /// Ignored under [`ScaleAdaptation::Interval`], which has no per-iteration
+    /// step to skip.
+    pub saem_scale_deadband: Option<(f64, f64)>,
     /// Optional exploration-phase cap on the stochastic-approximation step for
     /// the **numerical θ/σ M-step** (issue #1011); `None` uses the model-keyed
     /// default of `estimation::saem::default_mstep_damping`: `1.0` — **off** —
@@ -8295,6 +8324,7 @@ impl Default for FitOptions {
             saem_n_mh_steps: 0,
             saem_adapt_interval: 50,
             saem_scale_adaptation: ScaleAdaptation::Interval,
+            saem_scale_deadband: None,
             saem_mstep_damping: None,
             saem_mstep_solver: SaemMstepSolver::default(),
             saem_mstep_draws: 1,
@@ -9523,6 +9553,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "adapt_interval",
             "scale_adaptation",
             "saem_scale_adaptation",
+            "scale_deadband",
+            "saem_scale_deadband",
             "mstep_damping",
             "saem_mstep_damping",
             "mstep_solver",

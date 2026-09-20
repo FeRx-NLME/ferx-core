@@ -583,6 +583,39 @@ per-occasion kernel makes one proposal per occasion per iteration, so a single
 iteration's rate for one subject is a ratio of small integers, and the
 Robbins–Monro arm has not been measured there.
 
+#### `scale_deadband` — only correct a chain that is off target
+
+`[fit_options] scale_deadband = <lo>,<hi>` makes the Robbins–Monro step
+conditional: it fires only when that iteration's acceptance is **outside**
+`[lo, hi]`, and inside the band the scale is left bit-for-bit alone (there is
+no interval bump underneath it — the interval rule is off for the whole run
+under `robbins_monro`). The band is one absolute acceptance window shared by
+the block kernel (target 40%) and each componentwise coordinate (44%). It is
+ignored under `scale_adaptation = interval`, which has no per-iteration step to
+skip.
+
+It exists for the failure the previous section names: the models Robbins–Monro
+was written for sit at 2–4%, and the one it regressed was already *above*
+target and got pulled down onto it. A band leaves the second alone and still
+rescues the first.
+
+Two things to know before setting one:
+
+- **A wide band freezes the scales; it does not disable the dead band.** The
+  rule fires only outside the band, so a band wider than the spread of the
+  per-iteration rate means no step ever runs. `scale_deadband = none` (or an
+  empty band, `lo == hi`) is the spelling that restores plain Robbins–Monro,
+  and a band covering all of `[0, 1]` is rejected with that message rather
+  than accepted.
+- **A band moves the fixed point.** A per-iteration rate is `n_accepted /
+  n_proposals`, so it is quantised to multiples of `1/n_mh_steps` (block) or
+  `1/n_cw_sweeps` (componentwise), and the band censors the small deviations
+  while keeping the tails. Unless the band is symmetric about the target *and*
+  the rate's distribution is symmetric, the surviving steps do not cancel at
+  the target: the scale settles where the censored deviations balance, which is
+  not where the unbanded rule settles. With the shipped band and
+  `n_mh_steps = 6` that equilibrium is near 33% rather than 40%.
+
 #### Acceptance-rate diagnostics
 
 Two warnings land in `FitResult.warnings` (never on stderr), most severe first:
