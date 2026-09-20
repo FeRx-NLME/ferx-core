@@ -19,6 +19,8 @@ mod sweep;
 
 use rayon::prelude::*;
 
+use crate::diagnostics::first_error;
+
 use crate::types::{
     CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_F,
     PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
@@ -65,22 +67,28 @@ pub enum NcaInit {
 /// - All written values are clamped to `[theta_lower, theta_upper]`.
 /// - Omega for the CL/CL_F eta is updated from inter-subject CV² when ≥ 3
 ///   subjects have a valid CL estimate; all other omegas keep their defaults.
+///
+/// # Errors
+///
+/// A modeled-`RATE` dose the model cannot honour, or a dose into a compartment it cannot
+/// deliver into, is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// These are the only two it checks.
 pub fn inits_from_nca(
     model: &CompiledModel,
     population: &Population,
     method: NcaInit,
-) -> SuggestedStart {
+) -> Result<SuggestedStart, String> {
     // Reached from `fit()` (which validates first) but also a standalone public
     // entrypoint; the Sweep/Ebe strategies predict, so guard the modeled-`RATE`
     // dose precondition here too — same loud-not-silent contract as
     // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
-    crate::api::assert_modeled_doses_supported(model, population);
-    crate::api::assert_dose_compartments_supported(model, population);
-    match method {
+    first_error(&crate::api::check_modeled_dose_rates(model, population))?;
+    first_error(&crate::api::check_dose_compartments(model, population))?;
+    Ok(match method {
         NcaInit::Nca => nca_only(model, population),
         NcaInit::Sweep => nca_with_sweep(model, population),
         NcaInit::Ebe => nca_with_ebe(model, population),
-    }
+    })
 }
 
 /// Fast NCA-based starting value estimation (`NcaInit::Nca`).
@@ -851,7 +859,7 @@ mod tests {
             exclusions: None,
             warnings: vec![],
         };
-        let result = inits_from_nca(&model, &empty_pop, NcaInit::Nca);
+        let result = inits_from_nca(&model, &empty_pop, NcaInit::Nca).unwrap();
         // Must not panic and should warn.
         assert!(!result.warnings.is_empty());
         // Params should equal model defaults.
@@ -874,7 +882,7 @@ mod tests {
             model.pk_model
         );
         let population = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).unwrap();
-        let result = inits_from_nca(&model, &population, NcaInit::Nca);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
         for (i, &theta) in result.params.theta.iter().enumerate() {
             let lo = result.params.theta_lower[i];
             let hi = result.params.theta_upper[i];
@@ -895,7 +903,7 @@ mod tests {
     fn test_suggest_start_respects_bounds() {
         let model = parse_model_file(Path::new("examples/warfarin.ferx")).unwrap();
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
-        let result = inits_from_nca(&model, &population, NcaInit::Nca);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
         for (i, &theta) in result.params.theta.iter().enumerate() {
             let lo = result.params.theta_lower[i];
             let hi = result.params.theta_upper[i];
@@ -913,7 +921,7 @@ mod tests {
         model.default_params.theta_fixed[0] = true;
         let original_val = model.default_params.theta[0];
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
-        let result = inits_from_nca(&model, &population, NcaInit::Nca);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
         assert_eq!(
             result.params.theta[0], original_val,
             "fixed theta must not be overwritten"

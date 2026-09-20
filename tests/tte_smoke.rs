@@ -426,13 +426,16 @@ mod survival_smoke {
         let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0);
     }
 
-    /// `predict_survival()` panics too — the survival curves read the hazard at the
+    /// `predict_survival()` refuses too — the survival curves read the hazard at the
     /// frozen baseline covariate, so a time-varying covariate must fail loudly (#741).
+    /// An `Err` since #898; it panicked before.
     #[test]
-    #[should_panic(expected = "#741")]
-    fn tv_cov_hazard_predict_survival_panics() {
+    fn tv_cov_hazard_predict_survival_errs() {
         let (model, pop) = tv_cov_hazard_model_and_pop();
-        let _ = ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0]);
+        let err =
+            ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0])
+                .expect_err("a time-varying covariate on a hazard must be refused");
+        assert!(err.contains("#741"), "{err}");
     }
 
     /// A zero-rate hazard (`λ = 0`): every draw hits the degenerate sentinel, so each
@@ -1469,7 +1472,7 @@ mod survival_smoke {
         // CIF invariant: the two CMT rows at the same (subject, time) must
         // partition 1 with the all-cause survival.
         let grid = [0.0, 2.0, 6.0, 15.0, 40.0];
-        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid).unwrap();
         assert!(!preds.is_empty(), "predict_survival must return rows");
         let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
         for p in &preds {
@@ -2309,7 +2312,7 @@ mod survival_smoke {
         let pop = common::tte_competing_pop(&[(5.0, 2u8), (8.0, 3u8), (30.0, 0u8)]);
         // Deliberately unsorted.
         let grid = [15.0, 0.0, 6.0, 2.0, 40.0];
-        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid).unwrap();
         assert!(!preds.is_empty(), "predict_survival must return rows");
         let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
         for p in &preds {
@@ -2979,7 +2982,7 @@ mod survival_smoke {
         let model = parse_model_string(EXP_TTE_MODEL).expect("must parse");
         let pop = common::tte_pop_from_pairs(&TTE_DATA[..3]);
         let grid = vec![1.0, 5.0, 10.0, 20.0];
-        let rows = predict_survival(&model, &pop, &model.default_params, &grid);
+        let rows = predict_survival(&model, &pop, &model.default_params, &grid).unwrap();
         assert!(
             !rows.is_empty(),
             "predict_survival must return rows for TTE model"
@@ -3729,7 +3732,7 @@ mod survival_smoke {
         let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
         let pop = joint_pktte_pop();
         let grid = [0.0, 4.0, 8.0, 16.0, 24.0];
-        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid).unwrap();
 
         assert_eq!(
             preds.len(),

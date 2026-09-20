@@ -184,7 +184,7 @@ fn check_model_data_reports_the_unroutable_infusion() {
 // ── predict()/simulate(): the existing loud-not-silent convention ──
 
 #[test]
-#[should_panic(expected = "a dose into a compartment the model cannot deliver into")]
+#[should_panic(expected = "subject 1, time 0: infusion into compartment 0")]
 fn predict_panics_before_reaching_the_event_driven_walk() {
     // Previously this panicked from `propagate_with_bounds`'s routing `match`
     // with no subject/time context; now the entry-point guard intercepts it.
@@ -194,7 +194,7 @@ fn predict_panics_before_reaching_the_event_driven_walk() {
 }
 
 #[test]
-#[should_panic(expected = "a dose into a compartment the model cannot deliver into")]
+#[should_panic(expected = "subject 1, time 0: infusion into compartment 0")]
 fn simulate_panics_before_reaching_the_event_driven_walk() {
     let model = model_of(TWO_CPT_ORAL);
     let pop = pop_of(&unroutable_infusion_csv());
@@ -796,7 +796,9 @@ fn check_model_data_reports_the_out_of_range_ode_dose() {
 }
 
 #[test]
-#[should_panic(expected = "a dose into a compartment the model cannot deliver into")]
+#[should_panic(
+    expected = "subject 1, time 0: dose into compartment 3, but the `[odes]` block declares only 2 state(s)"
+)]
 fn predict_panics_on_an_ode_dose_past_the_declared_states() {
     let model = model_of(ODE_TWO_STATE);
     let pop = pop_of(&ode_csv(3));

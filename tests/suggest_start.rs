@@ -31,7 +31,7 @@ fn two_cpt_iv() -> (
 #[test]
 fn test_suggest_start_warfarin_direction() {
     let (model, population) = warfarin();
-    let result = inits_from_nca(&model, &population, NcaInit::Nca);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
 
     // Find TVCL index.
     let tvcl_idx = result
@@ -59,7 +59,7 @@ fn test_suggest_start_warfarin_direction() {
 #[test]
 fn test_suggest_start_warfarin_within_bounds() {
     let (model, population) = warfarin();
-    let result = inits_from_nca(&model, &population, NcaInit::Nca);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
     for (i, &theta) in result.params.theta.iter().enumerate() {
         let lo = result.params.theta_lower[i];
         let hi = result.params.theta_upper[i];
@@ -76,7 +76,7 @@ fn test_suggest_start_warfarin_within_bounds() {
 #[test]
 fn test_suggest_start_two_cpt_iv_sanity() {
     let (model, population) = two_cpt_iv();
-    let result = inits_from_nca(&model, &population, NcaInit::Nca);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
 
     let find = |name: &str| -> f64 {
         let idx = result
@@ -122,7 +122,7 @@ fn test_suggest_start_empty_population() {
         exclusions: None,
         warnings: vec![],
     };
-    let result = inits_from_nca(&model, &empty, NcaInit::Nca);
+    let result = inits_from_nca(&model, &empty, NcaInit::Nca).unwrap();
     assert!(!result.warnings.is_empty(), "must warn on empty population");
     assert_eq!(
         result.params.theta, model.default_params.theta,
@@ -134,7 +134,7 @@ fn test_suggest_start_empty_population() {
 #[test]
 fn test_nca_sweep_two_cpt_iv_within_bounds() {
     let (model, population) = two_cpt_iv();
-    let result = inits_from_nca(&model, &population, NcaInit::Sweep);
+    let result = inits_from_nca(&model, &population, NcaInit::Sweep).unwrap();
     for (i, &theta) in result.params.theta.iter().enumerate() {
         let lo = result.params.theta_lower[i];
         let hi = result.params.theta_upper[i];
@@ -165,8 +165,8 @@ fn test_nca_sweep_moves_unwritten_thetas() {
     let population = read_nonmem_csv(Path::new("data/three_cpt_iv.csv"), None, None)
         .expect("three_cpt_iv data must load");
 
-    let fast = inits_from_nca(&model, &population, NcaInit::Nca);
-    let thorough = inits_from_nca(&model, &population, NcaInit::Sweep);
+    let fast = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
+    let thorough = inits_from_nca(&model, &population, NcaInit::Sweep).unwrap();
 
     // At least one theta should differ between the two results (the sweep did something).
     let any_changed = fast
@@ -209,7 +209,7 @@ fn test_suggest_start_two_cpt_transit_peels_q_v2() {
     model.default_params.theta[q_i] = bad_q;
     model.default_params.theta[v2_i] = bad_v2;
 
-    let result = inits_from_nca(&model, &population, NcaInit::Nca);
+    let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
     assert!(
         (result.params.theta[q_i] - bad_q).abs() > 1e-6
             || (result.params.theta[v2_i] - bad_v2).abs() > 1e-6,
@@ -247,7 +247,7 @@ fn test_suggest_start_block_omega_preserved() {
         }
         model.default_params.omega = OmegaMatrix::from_matrix_with_mask(m, names, false, free_mask);
 
-        let result = inits_from_nca(&model, &population, NcaInit::Nca);
+        let result = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
 
         // Off-diagonal (0,1) must survive the omega update.
         let off_diag = result.params.omega.matrix[(0, 1)];
@@ -265,7 +265,7 @@ fn test_inits_from_nca_sweep_changes_params() {
     // We test the plumbing by calling the nca_sweep strategy directly (the same
     // one inits_from_nca = nca_sweep invokes) and confirming it changes a theta.
     let (model, population) = warfarin();
-    let result = inits_from_nca(&model, &population, NcaInit::Sweep);
+    let result = inits_from_nca(&model, &population, NcaInit::Sweep).unwrap();
     let any_changed = result
         .params
         .theta
@@ -288,7 +288,7 @@ fn test_nca_ebe_ode_fallback_warning() {
 
     assert!(model.ode_spec.is_some(), "mm_iv model must be an ODE model");
 
-    let result = inits_from_nca(&model, &population, NcaInit::Ebe);
+    let result = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
     let has_ode_warning = result
         .warnings
         .iter()

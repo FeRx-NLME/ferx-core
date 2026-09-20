@@ -907,22 +907,22 @@ fn every_record_kind_in_domain_is_accepted_and_predicts() {
 }
 
 /// **A stated behaviour change on a public entry point.** `predict()` / `simulate()` run
-/// no `check_model_data`, but they *do* call `assert_absorption_dosing_supported`, which
-/// panics on the first error `check_absorption_dosing` returns. Widening that check's
+/// no `check_model_data`, but they *do* run `check_absorption_dosing`, and re-raise its
+/// first error as a panic (the `Result` forms return it as an `Err`, #898). Widening that check's
 /// snapshot set therefore widens what these entry points abort on: a model that returned
 /// numbers before now panics. Deliberate — the numbers it returned came from an
 /// out-of-domain forcing the engine really does apply at that record — and pinned here
 /// so the change cannot happen twice by accident (#898 is the issue for turning these
 /// aborts into diagnostics).
 ///
-/// `E_DOSE_ATTR_NONFINITE` has no such `assert_*` twin, so the widening leaves
+/// `E_DOSE_ATTR_NONFINITE` is not among the checks `predict()` runs, so the widening leaves
 /// `predict()` unchanged for it. That gap is #1280 / #898, not something to close by
-/// adding an eleventh panic wrapper here.
+/// adding an eleventh check here.
 ///
-/// The `expected` string names the **record**, not the wrapper. `panic_if_unsupported`'s
-/// "absorption input-rate machinery cannot honour" is emitted for every
+/// The `expected` string names the **record**, not the check family. Before #898 a wrapper
+/// sentence ("absorption input-rate machinery cannot honour") was emitted for every
 /// `check_absorption_dosing` error there has ever been — an SS/zero-order rejection, a
-/// `[diffusion]` clash — so matching on it would let this test pass while the widening it
+/// `[diffusion]` clash — so matching on it would have let this test pass while the widening it
 /// exists to pin was gone, on a panic raised by something else entirely (#1286 review,
 /// finding 5). `observation 2 at TIME=8` can only come from the observation snapshot.
 #[test]

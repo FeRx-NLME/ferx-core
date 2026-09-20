@@ -2461,7 +2461,7 @@ fn compute_predictions_recycle(
     // `compute_predictions_with_tv_into_with_schedule` resolve via the model's
     // `dose_attr_map`), and the public entrypoints reject an unbacked modeled dose
     // up front (`fit()` / `ferx check` via `check_model_data`, `predict()` /
-    // `simulate()` via `assert_modeled_doses_supported`). Reaching here unresolved
+    // `simulate()` via the same `check_modeled_dose_rates`, #898). Reaching here unresolved
     // means a path forgot to resolve (e.g. a direct caller of this `pub` fn on a
     // raw `Population`). A modeled dose has `rate == 0` but reports `is_infusion()`,
     // so it would route into the infusion closed form as a 0-rate "infusion" —

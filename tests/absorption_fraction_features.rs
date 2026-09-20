@@ -104,7 +104,7 @@ fn fraction_validation_valid_with_f_and_lagtime() {
 }
 
 #[test]
-#[should_panic(expected = "absorption input-rate machinery cannot honour")]
+#[should_panic(expected = "Pathway fractions on compartment")]
 fn fraction_error_still_caught_with_f_and_lagtime() {
     // Same F+lag model but a malformed split (both fractions 0.6 → Σ=1.2). The
     // features must not mask the error: predict() must still panic.

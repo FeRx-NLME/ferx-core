@@ -24,15 +24,15 @@ fn run_case(case: &Case) {
         .unwrap_or_else(|e| panic!("data {}: {e}", case.data_path));
 
     let t0 = Instant::now();
-    let a = inits_from_nca(&model, &population, NcaInit::Nca);
+    let a = inits_from_nca(&model, &population, NcaInit::Nca).unwrap();
     let t_a = t0.elapsed();
 
     let t1 = Instant::now();
-    let b = inits_from_nca(&model, &population, NcaInit::Sweep);
+    let b = inits_from_nca(&model, &population, NcaInit::Sweep).unwrap();
     let t_b = t1.elapsed();
 
     let t2 = Instant::now();
-    let c = inits_from_nca(&model, &population, NcaInit::Ebe);
+    let c = inits_from_nca(&model, &population, NcaInit::Ebe).unwrap();
     let t_c = t2.elapsed();
 
     println!("\n══ {} ══", case.label);

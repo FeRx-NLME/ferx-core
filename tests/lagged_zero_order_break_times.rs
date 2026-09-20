@@ -490,7 +490,7 @@ fn joint_pk_tte_hazard_sees_the_lagged_zero_order_route() {
     }];
     let pop = single_subject_pop(tte_subject);
 
-    let rows = ferx_core::predict_survival(&model, &pop, &model.default_params, &OBS_T);
+    let rows = ferx_core::predict_survival(&model, &pop, &model.default_params, &OBS_T).unwrap();
     assert_eq!(rows.len(), OBS_T.len(), "one survival row per grid point");
 
     let got_h: Vec<f64> = rows.iter().map(|r| r.hazard).collect();
