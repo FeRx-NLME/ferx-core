@@ -663,6 +663,13 @@ Two things to know before setting one:
   empty band, `lo == hi`) is the spelling that restores plain Robbins–Monro,
   and a band covering all of `[0, 1]` is rejected with that message rather
   than accepted.
+- **Setting it from Rust is validated too.** `FitOptions::saem_scale_deadband`
+  is public, so a band can reach the sampler without passing the model-file
+  parser. An empty, reversed, out-of-range or everything-covering band is
+  dropped there — the fit runs the unbanded Robbins-Monro rule and says so in
+  its warnings — so the two front ends cannot produce different numerical
+  behaviour for the same option, and neither can freeze the step scales.
+
 - **A band moves the fixed point.** A per-iteration rate is `n_accepted /
   n_proposals`, so it is quantised to multiples of `1/n_mh_steps` (block) or
   `1/n_cw_sweeps` (componentwise), and the band censors the small deviations

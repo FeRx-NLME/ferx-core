@@ -8722,9 +8722,12 @@ fn parse_scale_deadband(key: &str, value: &str) -> Result<Option<(f64, f64)>, St
              none` to step on every iteration instead."
         ));
     }
-    // An empty band is the same object as no band, and saying so here keeps the
-    // downstream comparison a single inclusive `lo <= rate <= hi`.
-    Ok(if lo == hi { None } else { Some((lo, hi)) })
+    // One implementation of the mapping: everything above is validation of what
+    // the *user typed*, and the normalisation itself (an empty band is the same
+    // object as no band) lives in the sanitiser `run_saem` applies to a band
+    // built in Rust, so the two front ends cannot drift (#1479 review).
+    let band = Some((lo, hi));
+    Ok(crate::estimation::saem::sanitize_scale_deadband(band).unwrap_or(band))
 }
 
 pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result<bool, String> {

@@ -7646,6 +7646,13 @@ pub struct FitOptions {
     /// Robbins-Monro; a band covering all of `[0, 1]` is rejected by the
     /// parser for exactly that reason.
     ///
+    /// A band set **here** rather than in a model file skips that validation,
+    /// so `run_saem` puts it through
+    /// `estimation::saem::sanitize_scale_deadband` first: an empty, reversed,
+    /// out-of-range or everything-covering band is dropped (leaving the
+    /// unbanded rule) with a warning in `FitResult.warnings`, rather than
+    /// freezing the step scales for the whole fit.
+    ///
     /// Ignored under [`ScaleAdaptation::Interval`], which has no per-iteration
     /// step to skip.
     pub saem_scale_deadband: Option<(f64, f64)>,
