@@ -5835,3 +5835,39 @@ fn power_exponent_with_tad_multiplier_outer_gradient_matches_fd() {
     check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
     check_magnitude_foce_packed_matches_fd(&model, &theta, &subject);
 }
+
+#[test]
+fn foce_woodbury_inverse_matches_dense_rtilde() {
+    let j = DMatrix::from_row_slice(5, 2, &[0.2, -0.1, 0.4, 0.3, -0.2, 0.5, 0.7, -0.4, 0.1, 0.6]);
+    let omega = DMatrix::from_row_slice(2, 2, &[0.5, 0.08, 0.08, 0.3]);
+    let omega_inv = omega.clone().try_inverse().unwrap();
+    let r0 = [0.4, 0.7, 0.2, 0.9, 0.6];
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let dense_inv = dense.cholesky().unwrap().inverse();
+    let woodbury = foce_rtilde_inverse(&j, &omega_inv, &r0).unwrap();
+    assert!((&dense_inv - woodbury).amax() < 2e-14);
+}
+
+#[test]
+fn foce_low_rank_contractions_match_dense_products() {
+    let rinv = DMatrix::from_row_slice(
+        4,
+        4,
+        &[
+            1.1, 0.1, 0.0, 0.2, 0.1, 0.9, -0.1, 0.0, 0.0, -0.1, 1.3, 0.1, 0.2, 0.0, 0.1, 0.8,
+        ],
+    );
+    let left = DMatrix::from_row_slice(4, 2, &[0.2, 0.1, -0.3, 0.4, 0.7, -0.2, 0.5, 0.6]);
+    let ojt = DMatrix::from_row_slice(2, 4, &[0.1, 0.3, -0.2, 0.4, 0.5, -0.1, 0.6, 0.2]);
+    let u = DVector::from_row_slice(&[0.4, -0.2, 0.7, 0.1]);
+    let ojt_u = &ojt * &u;
+    let dense = &left * &ojt;
+    let expected_trace = (&rinv * &dense).trace();
+    let expected_quad = u.dot(&(&dense * &u));
+    let (trace, quad) = foce_low_rank_trace_quad(&rinv, &left, &ojt, &u, &ojt_u);
+    assert!((trace - expected_trace).abs() < 2e-15);
+    assert!((quad - expected_quad).abs() < 2e-15);
+}

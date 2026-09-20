@@ -968,6 +968,7 @@ fn agq_inner_solve_policy(options: &FitOptions, fused_gradient: bool) -> InnerSo
         seed: InnerHessianSeed::for_options(options),
         capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture() || !fused_gradient)
             && matches!(options.hessian_anchor(), HessianAnchor::Exact),
+        accelerate_exact_outer: false,
     }
 }
 
@@ -1086,6 +1087,7 @@ fn run_inner_loop_and_nll_prepared(
     let policy = InnerSolvePolicy {
         seed: InnerHessianSeed::for_options(options),
         capture_terminal_hessian: false,
+        accelerate_exact_outer: true,
     };
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
@@ -1218,17 +1220,28 @@ fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     BASE + 50.0 * pen
 }
 
-fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
+fn detect_stagnation(
+    state: &mut NloptState,
+    n: usize,
+    enabled: bool,
+    analytic_gradient_eval: bool,
+) -> bool {
     if !enabled {
         return false;
     }
     if state.stagnation_stopped {
         return true;
     }
-    // Tied to the FD-gradient cost: 3*(n+1) evals = 3 attempted descent
-    // steps with their gradient probes. Minimum of 50 evals so very-small
-    // problems still get a real chance before we declare stagnation.
-    let stagnation_window: usize = (3 * (n + 1)).max(50);
+    // Three parameter-space sweeps remain the conservative window for FD and
+    // derivative-free optimizers. An analytic L-BFGS callback already returns the whole
+    // gradient in one evaluation, so the historical 50-evaluation floor only repeats a
+    // converged full population solve. Four unchanged full-gradient evaluations are
+    // enough to distinguish convergence from a single noisy callback.
+    let stagnation_window: usize = if analytic_gradient_eval {
+        4
+    } else {
+        (3 * (n + 1)).max(50)
+    };
     // Absolute OFV improvement below this is treated as noise. Matches
     // typical FOCE EBE-loop precision (~1e-3 OFV units) — see
     // `inner_tol` default and Sheiner–Beal linearisation comment in
@@ -2625,6 +2638,12 @@ fn optimize_nlopt_once(
     // NLopt objective: receives xs (scaled), unscales before running inner loop.
     // Gradient: d(OFV)/d(xs[i]) = d(OFV)/d(x[i]) * scale[i] (chain rule).
     let objective = |xs: &[f64], grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
+        // Keep the shorter window on deterministic closed-form predictions. ODE
+        // integration can add solver noise, so those fits retain the conservative
+        // historical window even when an analytic outer gradient is available.
+        let analytic_gradient_eval = grad.is_some()
+            && model.ode_spec.is_none()
+            && crate::sens::provider::analytic_outer_gradient_available(model);
         // Cooperative cancellation: short-circuit cheaply so NLopt burns through
         // its remaining iteration budget in microseconds instead of minutes.
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -2981,7 +3000,8 @@ fn optimize_nlopt_once(
         // After updating best_ofv, check whether we've stalled. If yes,
         // `stagnation_stopped` is latched and the early-return at the
         // top of the closure trips on the next eval.
-        if detect_stagnation(state, n, options.stagnation_guard) && verbose {
+        if detect_stagnation(state, n, options.stagnation_guard, analytic_gradient_eval) && verbose
+        {
             eprintln!(
                 "Eval {:>4}: stopping early — OFV has converged (no improvement \
                  above 1e-3 in last window). This is normal convergence behaviour, \

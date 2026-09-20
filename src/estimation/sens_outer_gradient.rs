@@ -2206,6 +2206,52 @@ pub fn per_subject_packed_gradients_iov(
 /// the Eq. 46 response `dη̂/dx` are reused verbatim from [`subject_eta_dx`]; the
 /// total derivative is `∂Fᵢ/∂x|_η̂ + c·dη̂/dx` with the coupling `c = ∂Fᵢ/∂η̂`.
 /// Only the fixed-η̂ marginal partials and `c` are FOCE-specific (computed here).
+fn foce_low_rank_trace_quad(
+    rtilde_inv: &DMatrix<f64>,
+    left: &DMatrix<f64>,
+    ojt: &DMatrix<f64>,
+    u: &DVector<f64>,
+    ojt_u: &DVector<f64>,
+) -> (f64, f64) {
+    // For M = left·ΩJᵀ, avoid materialising the nq×nq matrix:
+    // tr(R⁻¹M) = tr(ΩJᵀR⁻¹left), and uᵀMu = (leftᵀu)ᵀ(ΩJᵀu).
+    let rinv_left = rtilde_inv * left;
+    let mut trace = 0.0;
+    let mut quad = 0.0;
+    for a in 0..left.ncols() {
+        let mut left_u = 0.0;
+        for i in 0..left.nrows() {
+            trace += ojt[(a, i)] * rinv_left[(i, a)];
+            left_u += left[(i, a)] * u[i];
+        }
+        quad += left_u * ojt_u[a];
+    }
+    (trace, quad)
+}
+
+fn foce_rtilde_inverse(
+    jmat: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    r0: &[f64],
+) -> Option<DMatrix<f64>> {
+    // Woodbury: (D + JΩJᵀ)⁻¹ = D⁻¹ − D⁻¹J(Ω⁻¹+JᵀD⁻¹J)⁻¹JᵀD⁻¹.
+    // The expensive factorisation is n_eta×n_eta instead of n_obs×n_obs.
+    let mut dinv_j = jmat.clone();
+    for i in 0..dinv_j.nrows() {
+        let inv = 1.0 / r0[i];
+        for k in 0..dinv_j.ncols() {
+            dinv_j[(i, k)] *= inv;
+        }
+    }
+    let middle = omega_inv + jmat.transpose() * &dinv_j;
+    let middle_inv = middle.cholesky()?.inverse();
+    let mut out = -(&dinv_j * middle_inv * dinv_j.transpose());
+    for i in 0..out.nrows() {
+        out[(i, i)] += 1.0 / r0[i];
+    }
+    Some(out)
+}
+
 pub fn subject_packed_gradient_foce(
     model: &CompiledModel,
     subject: &Subject,
@@ -2354,14 +2400,10 @@ pub fn subject_packed_gradient_foce(
     }
 
     // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
-    let jo = &jmat * omega; // J Ω
-    let mut rtilde = &jo * jmat.transpose();
-    for i in 0..nq {
-        rtilde[(i, i)] += r0[i];
-    }
-    let rtilde_inv = rtilde.cholesky()?.inverse();
+    let rtilde_inv = foce_rtilde_inverse(&jmat, &params.omega.inv, &r0)?;
     let u = &rtilde_inv * &rho;
     let ojt = omega * jmat.transpose(); // Ω Jᵀ (n_eta×nq)
+    let ojt_u = &ojt * &u;
 
     let n_sigma = sigma.len();
     let mut fixed = vec![0.0f64; x.len()];
@@ -2395,9 +2437,7 @@ pub fn subject_packed_gradient_foce(
             }
             dvar += dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
-        let emojt = &em * &ojt;
-        let tr = (&rtilde_inv * &emojt).trace();
-        let uemu = u.dot(&(&emojt * &u));
+        let (tr, uemu) = foce_low_rank_trace_quad(&rtilde_inv, &em, &ojt, &u, &ojt_u);
         let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar + cg.theta[m];
         let dtheta_dx = theta_dx_chain(template, &params.theta, m);
         fixed[m] = nat * dtheta_dx;
@@ -2533,16 +2573,14 @@ pub fn subject_packed_gradient_foce(
             }
             pk[i] = s;
         }
-        let dkojt = &dk * &ojt;
-        let tr = (&rtilde_inv * &dkojt).trace();
-        let udku = u.dot(&(&dkojt * &u));
+        let (tr, udku) = foce_low_rank_trace_quad(&rtilde_inv, &dk, &ojt, &u, &ojt_u);
         let ck = u.dot(&pk) + tr - udku + cg.coupling[k];
         coupling[k] = ck;
     }
 
     // Total: dFᵢ/dx_k = ∂Fᵢ/∂x_k|_η̂ + c·(dη̂/dx_k). dη̂/dx is interaction-
     // independent (shared inner objective, M3-aware), so it is reused as-is.
-    let eta_dx = subject_eta_dx(model, subject, template, x, eta_hat)?;
+    let eta_dx = subject_eta_dx_from_sens(model, subject, &params, template, x, eta_hat, &sens)?;
     let mut g = vec![0.0f64; x.len()];
     for k in 0..x.len() {
         g[k] = fixed[k] + coupling.dot(&eta_dx[k]);

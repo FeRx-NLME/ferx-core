@@ -1244,7 +1244,7 @@ fn line_search_finds_armijo_step_quickly() {
         obj(xx)
     };
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial, false);
     let evals = evals.get();
     assert!(alpha > 0.0, "a descent step must be found");
     let c1 = 1e-4;
@@ -1271,7 +1271,7 @@ fn line_search_rejects_non_descent_direction() {
     let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1293,12 +1293,12 @@ fn line_search_survives_non_finite_objective() {
     // Every trial step returns NaN — must not panic, must report no step.
     let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
     assert_eq!(f_new, f0, "baseline objective is returned unchanged");
     // +inf trials behave identically (never accepted, never a panic).
     let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
-    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1314,7 +1314,7 @@ fn line_search_rejects_non_finite_direction() {
     let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
