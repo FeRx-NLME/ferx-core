@@ -3242,9 +3242,16 @@ fn tvcov_param_derivs_at(
 /// are re-packed into the same shape.
 ///
 /// `None` when the program's η width is not the model's, when a non-NN program's θ
-/// width is not the model's — the two guards `param_derivatives_at_cov` applied, kept
-/// so the decline behaviour is unchanged — or when the NN builder declines. The θ
-/// guard is **not** applied on the NN arm: there `model.n_theta` counts the generated
+/// width is not the model's — the two width guards `param_derivatives_at_cov` applied,
+/// kept so the decline behaviour is unchanged — or when the NN builder declines.
+/// `param_derivatives_at_cov`'s third decline, `prog.n_axes() > 24`, is **not**
+/// re-applied here because it is unreachable through this function: on the non-NN arm
+/// the two width guards make `prog.n_axes() == n_program_theta + n_eta ==
+/// tvcov_program_axes(model)`, which `tvcov_analytical_supported` has already bounded
+/// by `MAX_TVCOV_AXES` before any per-subject work — the same gate that bounds the outer
+/// `m_dim` dispatch, so the inner and outer analytic scopes stay matched
+/// (`tvcov_inner_and_outer_decline_together_past_the_axis_cap` pins it). The θ guard
+/// is **not** applied on the NN arm: there `model.n_theta` counts the generated
 /// network-weight thetas that the program never sees (`prog.n_theta_axis()` is the
 /// declared count), so the comparison would send every time-varying NN subject to FD
 /// and undo #1300's analytic inner route (#1482 review).

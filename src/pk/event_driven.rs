@@ -1993,11 +1993,18 @@ mod tests {
     /// floor. The fixture makes every branch of `active_rates_at` live on the
     /// precomputed side — two overlapping infusions (summed in dose order), a reset
     /// mid-infusion (turns both off), a lagged second dose (shifted window) and a
-    /// steady-state infusion (the #1121 residual window) — and the scan side is
-    /// forced by invalidating the key, which is also the route an `F`-reshaped or
-    /// η-resolved dose takes. Mutation check: a precompute that ignores the reset
-    /// floor keeps 175 running past 4 h and the 5 h observation diverges; one that
-    /// skips the lag misplaces the 2.5–6.5 h window and the 3 h observation diverges.
+    /// lagged steady-state infusion whose previous cycle is still running at its
+    /// record (the #1121 residual window, `lag = 11 > II − T_inf = 10`, so the seeded
+    /// state keeps delivering on `[20, 21]`) with a second reset *inside* that
+    /// pre-arrival window — and the scan side is forced by invalidating the key,
+    /// which is also the route an `F`-reshaped or η-resolved dose takes. Mutation
+    /// check: a precompute that ignores the reset floor keeps 175 running past 4 h
+    /// and the 5 h observation diverges; one that skips the lag misplaces the
+    /// 2.5–6.5 h window and the 3 h observation diverges; one that tests the residual
+    /// window against a stale floor keeps 100 running past the 20.6 h reset and the
+    /// 21 h observation diverges (a zero-lag SS dose cannot see that one — its
+    /// `ss_seeded_at_record` is false and the 100 comes from the ordinary arrival
+    /// window, PR #1482 review).
     #[test]
     fn precomputed_interval_rates_match_the_per_call_scan_bit_for_bit() {
         let doses = vec![
@@ -2005,13 +2012,20 @@ mod tests {
             DoseEvent::new(2.0, 200.0, 1, 50.0, false, 0.0),
             DoseEvent::new(20.0, 200.0, 1, 100.0, true, 12.0),
         ];
-        let obs_times = vec![1.0, 2.7, 3.0, 5.0, 7.0, 10.0, 21.0, 23.0, 30.0];
+        let obs_times = vec![1.0, 2.7, 3.0, 5.0, 7.0, 10.0, 20.3, 21.0, 23.0, 30.0, 32.0];
         let mut subj = make_subject(doses, obs_times.clone());
-        subj.reset_times = vec![4.0];
-        let lag = vec![0.0, 0.5, 0.0];
+        subj.reset_times = vec![4.0, 20.6];
+        let lag = vec![0.0, 0.5, 11.0];
         let pk = pk_two(10.0, 50.0, 5.0, 100.0);
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
+        // The SS dose is the residual-window case, not the arrival-window one: its
+        // previous cycle's infusion crosses the record and ends at 21 h.
+        assert!(crate::dosing::ss_seeded_at_record(&subj.doses[2], lag[2]));
+        assert_eq!(
+            crate::dosing::ss_residual_infusion_end(&subj.doses[2], lag[2], 1.0),
+            Some(21.0)
+        );
         let sched = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &subj.doses, &lag);
         assert!(sched.rates_valid_for(&subj.doses));
         // The precompute is live and sees each regime: the 2.5–6.5 h overlap before
@@ -2028,18 +2042,43 @@ mod tests {
                 "no sub-interval at rate {want}: {central:?}"
             );
         }
+        let interval_ending_at_obs = |t: f64| -> &[[f64; 4]] {
+            let (i, _) = sched
+                .events
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.kind == EventKind::Obs && e.time == t)
+                .unwrap_or_else(|| panic!("obs at {t} h"));
+            &sched.rates_per_interval[i - 1]
+        };
         // After the 4 h reset both running infusions are off: the sub-interval
         // containing 5 h reads 0, not 175 — the reset-floor branch on this side.
-        let (i5, _) = sched
-            .events
-            .iter()
-            .enumerate()
-            .find(|(_, e)| e.kind == EventKind::Obs && e.time == 5.0)
-            .expect("obs at 5 h");
         assert!(
-            sched.rates_per_interval[i5 - 1].iter().all(|r| r[0] == 0.0),
+            interval_ending_at_obs(5.0).iter().all(|r| r[0] == 0.0),
             "interval ending at 5 h must be quiet after the 4 h reset: {:?}",
-            sched.rates_per_interval[i5 - 1]
+            interval_ending_at_obs(5.0)
+        );
+        // The residual window is live on the precompute side: between the SS record
+        // at 20 h and the 20.3 h observation the previous cycle's 100 still runs,
+        // ten hours before the dose's own arrival window `[31, 33]`.
+        assert!(
+            interval_ending_at_obs(20.3).iter().all(|r| r[0] == 100.0),
+            "interval ending at 20.3 h must carry the residual 100: {:?}",
+            interval_ending_at_obs(20.3)
+        );
+        // …and the residual test reads the *running* floor: the 20.6 h reset sits
+        // inside the pre-arrival window, after which `d.time >= reset_floor` fails and
+        // the residual is off for the rest of `[20.6, 21]`.
+        assert!(
+            interval_ending_at_obs(21.0).iter().all(|r| r[0] == 0.0),
+            "interval ending at 21 h must be quiet after the 20.6 h reset: {:?}",
+            interval_ending_at_obs(21.0)
+        );
+        // The dose's own lagged arrival window is live too.
+        assert!(
+            interval_ending_at_obs(32.0).iter().all(|r| r[0] == 100.0),
+            "interval ending at 32 h must carry the arrival-window 100: {:?}",
+            interval_ending_at_obs(32.0)
         );
 
         let fast = event_driven_predictions_with_schedule(
@@ -2073,9 +2112,15 @@ mod tests {
                 "obs {j}: precomputed {a} vs scanned {b}"
             );
         }
-        // The pre-reset observations see drug and the post-reset one does not — so the
-        // identity above is between two live numbers, not two zeros.
+        // The pre-reset observations see drug and the post-reset ones do not — so the
+        // identity above is between two live numbers, not two zeros. 20.3 h sits
+        // inside the seeded residual window (drug present, still infusing); 21 h is
+        // past the 20.6 h reset (zeroed, quiet); 32 h is inside the arrival window.
         assert!(fast[2] > 0.0 && fast[3] == 0.0, "{fast:?}");
+        assert!(
+            fast[6] > 0.0 && fast[7] == 0.0 && fast[10] > 0.0,
+            "{fast:?}"
+        );
     }
 
     /// A dose whose `(rate, duration)` no longer matches what the schedule was built

@@ -6798,6 +6798,108 @@ fn tvcov_eta_grad_matches_full() {
     }
 }
 
+/// A 2-cpt IV TV-cov model with `n_theta` declared thetas, every one of them read by
+/// `CL` so the program carries every θ axis, and two etas.
+fn twocpt_iv_tvcov_wide_src(n_theta: usize) -> String {
+    let n_exp = n_theta - 4;
+    let mut src = String::from(
+        "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV1(50.0, 5.0, 500.0)\n  \
+         theta TVQ(15.0, 1.0, 100.0)\n  theta TVV2(100.0, 10.0, 1000.0)\n",
+    );
+    for i in 1..=n_exp {
+        src += &format!("  theta E{i}(0.04, 0.001, 1.0)\n");
+    }
+    src += "  omega ETA_CL ~ 0.09\n  omega ETA_V1 ~ 0.09\n  sigma PROP_ERR ~ 0.04\n\
+            [individual_parameters]\n  CL = TVCL * (WT/70)^(";
+    src += &(1..=n_exp)
+        .map(|i| format!("E{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    src += ") * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n  Q  = TVQ\n  V2 = TVV2\n\
+            [structural_model]\n  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n\
+            [covariates]\n  WT continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    src
+}
+
+/// The inner η-only program (`tvcov_eta_rows_at`, #1477) dropped the
+/// `prog.n_axes() > MAX_TVCOV_AXES` decline that `param_derivatives_at_cov` carries,
+/// on the argument that `tvcov_analytical_supported` bounds the same count before any
+/// per-subject work — so a model one axis past the cap must decline on **both** loops,
+/// not run the inner analytically while the outer falls to FD (PR #1482 review). The
+/// twin at exactly the cap runs both, and its inner rows still match the outer η block.
+#[test]
+fn tvcov_inner_and_outer_decline_together_past_the_axis_cap() {
+    let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let subject = tvcov_subject(
+        vec![bolus(0.0)],
+        &[70.0],
+        &[0.5, 2.0, 6.0, 12.0, 24.0],
+        &[70.0, 75.0, 82.0, 88.0, 95.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    let eta = vec![0.12, -0.08];
+    let theta_for = |n_theta: usize| -> Vec<f64> {
+        let mut th = vec![10.0, 50.0, 15.0, 100.0];
+        th.extend(std::iter::repeat_n(
+            0.75 / (n_theta - 4) as f64,
+            n_theta - 4,
+        ));
+        th
+    };
+
+    // One past the cap: 23 θ + 2 η = 25 axes.
+    let over = parse_model_string(&twocpt_iv_tvcov_wide_src(MAX_TVCOV_AXES - 1))
+        .expect("parse over-cap tvcov");
+    assert_eq!(over.n_theta, MAX_TVCOV_AXES - 1);
+    assert_eq!(over.n_eta, 2);
+    assert_eq!(tvcov_program_axes(&over), MAX_TVCOV_AXES + 1);
+    let prog = over
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .expect("program");
+    assert_eq!(
+        prog.n_axes(),
+        MAX_TVCOV_AXES + 1,
+        "the program's axis count is the gate's count, so the dropped guard was redundant"
+    );
+    assert!(!tvcov_analytical_supported(&over));
+    let theta = theta_for(over.n_theta);
+    assert!(
+        subject_sensitivities_tvcov(&over, &subject, &theta, &eta).is_none(),
+        "outer must decline past the cap"
+    );
+    assert!(
+        subject_eta_grad_tvcov(&over, &subject, &theta, &eta).is_none(),
+        "inner must decline with the outer, not split to an analytic η-only route"
+    );
+
+    // Exactly at the cap: 22 θ + 2 η = 24 axes — both loops analytic and in agreement.
+    let at = parse_model_string(&twocpt_iv_tvcov_wide_src(MAX_TVCOV_AXES - 2))
+        .expect("parse at-cap tvcov");
+    assert_eq!(tvcov_program_axes(&at), MAX_TVCOV_AXES);
+    assert!(tvcov_analytical_supported(&at));
+    let theta = theta_for(at.n_theta);
+    let full = subject_sensitivities_tvcov(&at, &subject, &theta, &eta).expect("outer at cap");
+    let light = subject_eta_grad_tvcov(&at, &subject, &theta, &eta).expect("inner at cap");
+    assert_eq!(full.obs.len(), light.len());
+    for (a, b) in full.obs.iter().zip(light.iter()) {
+        assert!(a.f.is_finite() && a.f > 0.0, "{}", a.f);
+        approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+        for k in 0..at.n_eta {
+            assert!(a.df_deta[k].is_finite());
+            approx::assert_relative_eq!(
+                a.df_deta[k],
+                b.df_deta[k],
+                max_relative = 1e-10,
+                epsilon = 1e-11
+            );
+        }
+    }
+}
+
 // ── IOV analytic sensitivities ───────────────────────────────────
 
 const WARFARIN_IOV: &str = r#"
