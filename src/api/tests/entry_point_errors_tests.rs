@@ -445,7 +445,9 @@ fn checked_by(family: &str) -> [Option<bool>; 4] {
 /// `Ok` cell to `Err` (the docs then under-promise), and a check dropped flips an `Err` cell to
 /// `Ok` (they over-promise). Mutation — add `check_modeled_dose_rates` to
 /// `predict_categorical`, or drop `check_dose_compartments` from `inits_from_nca`; either dies
-/// here naming the cell.
+/// here naming the cell. And a `Y` cell is held to the family's `phrase`, so a refusal through
+/// some *other* check is not mistaken for this one — mutation: keep the simulate flip-flop
+/// check but replace its message.
 #[test]
 fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
     let opts = SimulateOptions {
@@ -457,25 +459,33 @@ fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
         if let Some(theta) = &f.theta {
             params.theta = theta.clone();
         }
+        // A `Y` cell must refuse **for this family's own reason**: `is_err()` alone is green
+        // when the entry point refuses the fixture through some other check (review r2, V4).
+        let cell = |entry: &str, want: bool, got: Option<String>| {
+            assert_eq!(got.is_some(), want, "{entry} × {}: {got:?}", f.name);
+            if let Some(msg) = got {
+                assert!(msg.contains(f.phrase), "{entry} × {}: {msg}", f.name);
+            }
+        };
         let [sim, nca, surv, cat] = checked_by(f.name);
         if let Some(want) = sim {
-            let got = simulate_with_options(&f.model, &f.pop, &params, 1, &opts).is_err();
-            assert_eq!(got, want, "simulate_with_options × {}", f.name);
+            let got = simulate_with_options(&f.model, &f.pop, &params, 1, &opts).err();
+            cell("simulate_with_options", want, got);
         }
         if let Some(want) = nca {
-            let got = crate::suggest_start::inits_from_nca(&f.model, &f.pop, crate::NcaInit::Nca)
-                .is_err();
-            assert_eq!(got, want, "inits_from_nca × {}", f.name);
+            let got =
+                crate::suggest_start::inits_from_nca(&f.model, &f.pop, crate::NcaInit::Nca).err();
+            cell("inits_from_nca", want, got);
         }
         #[cfg(feature = "survival")]
         {
             if let Some(want) = surv {
-                let got = predict_survival(&f.model, &f.pop, &params, &[1.0, 2.0]).is_err();
-                assert_eq!(got, want, "predict_survival × {}", f.name);
+                let got = predict_survival(&f.model, &f.pop, &params, &[1.0, 2.0]).err();
+                cell("predict_survival", want, got);
             }
             if let Some(want) = cat {
-                let got = predict_categorical(&f.model, &f.pop, &params).is_err();
-                assert_eq!(got, want, "predict_categorical × {}", f.name);
+                let got = predict_categorical(&f.model, &f.pop, &params).err();
+                cell("predict_categorical", want, got);
             }
         }
         #[cfg(not(feature = "survival"))]

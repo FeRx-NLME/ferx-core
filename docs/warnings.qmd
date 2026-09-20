@@ -63,16 +63,18 @@ honour. `fit()` has always returned these as an `Err`. Since ferx 0.4.0 every
 other entry point that returns a `Result` does too — **for the preconditions it
 checks**, which is not the same list on each:
 
-| Entry point | Preconditions it checks |
+| Entry point | Preconditions it checks, in the order it runs them |
 |---|---|
-| `fit()`, `ferx check` | all of them |
+| `fit()`, `ferx check` | every item below that is about the model or the data. **Not** the simulate-only ones (TTE simulatable, Ω~IOV~ in the supplied parameters, `horizon`), and **not** the CTMM ones: `fit()` *supports* a `[markov_model]` endpoint — it is prediction and simulation that have no CTMM path yet. |
 | `predict_diag()` | coded `RATE`, covariates present, endpoint routing, `[covariate_model]` bound, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout across a reset, absorption input rate, a CTMM-only model |
-| `simulate_with_options()`, `simulate_with_options_diag()`, `simulate_with_uncertainty()` | the simulation data checks (covariates present, `[covariate_model]` bound and levels, endpoint routing, κ and residual weights), the TTE horizon, Ω~IOV~ present, then coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
+| `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
+| `simulate_with_uncertainty()` | TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, covariates present, endpoint routing, κ weights, residual weights); then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, absorption input rate, a CTMM model, Ω~IOV~ present. **Not** the depot readout across a reset. |
 | `predict_survival()` | time-varying covariate on a hazard, dose compartment |
 | `predict_categorical()` | time-varying covariate on the linear predictor, endpoint routing |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
-| `simulate_adaptive()` | coded `RATE`, dose compartment, absorption closed-form support, absorption input rate, plus its own adaptive-dosing rejections. **Not** the time-varying covariate on a hazard. |
-| `predict()`, `simulate()`, `simulate_with_seed()` | the list of the `Result` form each wraps — but the failure is a **panic** whose payload is that same message, because they return a bare `Vec` and have no error channel. Call the `Result` form to handle it instead. |
+| `simulate_adaptive()` | its own adaptive-dosing rejections, then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
+| `predict()` | `predict_diag()`'s list, in its order — but the failure is a **panic** whose payload is that same message, because it returns a bare `Vec` and has no error channel. Call `predict_diag()` to handle it instead. |
+| `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks — and as a **panic**, for the same reason. Call `simulate_with_options()` to handle it instead. |
 
 A precondition an entry point does not check is **not refused** by it: the call
 returns rows computed from an input `fit()` would have rejected. Validate a new
