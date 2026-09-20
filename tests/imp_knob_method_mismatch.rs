@@ -255,6 +255,28 @@ fn impmap_does_not_name_imp() {
     assert!(p.sets_impmap_knob.is_match("opts.impmap_iterations = 2;"));
 }
 
+/// A knob is a whole identifier. Read as a suffix, `simp_tol = …` counts as an
+/// `imp_*` assignment, and that is wrong in both directions: it flags an IMPMAP
+/// body that sets no IMP knob, and — worse — it *excuses* a real IMP mismatch,
+/// because the body now appears to set its own family after all.
+#[test]
+fn a_longer_identifier_is_not_a_knob() {
+    let p = Patterns::new();
+    assert!(!p.sets_imp_knob.is_match("opts.simp_tol = 1e-6;"));
+    assert!(!p.sets_impmap_knob.is_match("let preimpmap_x = 1;"));
+    assert!(p.sets_imp_knob.is_match("imp_samples = 40"));
+
+    let real_mismatch_beside_a_lookalike =
+        OLD_SHAPE.replace("opts.run_covariance_step = false;", "opts.simp_tol = 1e-6;");
+    assert_eq!(
+        p.mismatches_in_rust(&real_mismatch_beside_a_lookalike),
+        vec![(
+            "imp_shared_anchor".to_string(),
+            Mismatch::ImpWithImpmapKnobs
+        )]
+    );
+}
+
 #[test]
 fn no_tracked_source_tunes_the_other_methods_knobs() {
     let root = repo_root();
