@@ -759,6 +759,11 @@ pub(crate) struct InnerSolvePolicy {
     /// Retain `EbeResult::terminal_hessian` — a full second-order provider pass per subject.
     /// Only the objective-only Laplace/AGQ evaluation under the exact anchor reads it.
     pub(crate) capture_terminal_hessian: bool,
+    /// Enable the bounded analytical-EBE work policy used by normal FOCE/FOCEI outer
+    /// evaluations: a shorter exact-objective line search and final-iterate certification
+    /// at the requested tolerance. Diagnostic, covariance, ODE/FREM, FD, and AGQ/Laplace
+    /// solves keep strict behaviour.
+    pub(crate) accelerate_exact_outer: bool,
 }
 
 /// Aggregate statistics from running the inner loop over all subjects.
@@ -1398,6 +1403,10 @@ fn find_ebe_impl(
         }
         hessian
     });
+    let short_line_search = policy.accelerate_exact_outer
+        && use_analytic
+        && !enable_stall
+        && model.frem_config.is_none();
     let result = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -1409,6 +1418,7 @@ fn find_ebe_impl(
         initial_hessian.as_ref(),
         stop_precond,
         enable_stall,
+        short_line_search,
     );
 
     // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
@@ -1426,37 +1436,51 @@ fn find_ebe_impl(
     let bfgs_converged = result;
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
-        let cold = cold_eta_seed(model, subject, params, n_eta);
-        if enable_stall {
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
-            eta = best;
-            (ok, true)
-        } else if model.frem_config.is_some() {
-            // FREM: the BFGS partial can be a *non-stationary*, merely-low-objective point (run
-            // out along a covariate pseudo-obs flat direction) that would mis-center the
-            // FREM/IMP proposal, so the restart is what re-centers it. The restart itself now
-            // starts from the FREM-aware `cold` seed rather than a plain zero vector (#1349) —
-            // NM cannot travel the ±40 a covariate eta needs from η=0, so the "re-centred"
-            // point it returned had its covariate etas still at zero and its PK etas carrying
-            // the resulting block-Ω⁻¹ force.
-            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
-            eta = if warm { partial } else { cold };
-            let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
-            (nm_ok, true)
+        // A final BFGS update can meet the requested tolerance exactly as the iteration
+        // budget expires. Avoid a redundant cold recovery only when the same analytical
+        // gradient used by BFGS certifies that final point at the caller's tolerance.
+        // FD, ODE/FREM, and genuinely non-stationary partials retain recovery.
+        let certify_partial = !enable_stall
+            && model.frem_config.is_none()
+            && policy.accelerate_exact_outer
+            && use_analytic
+            && certifies_analytic_partial(grad_norm_metric(&agrad(&partial), stop_precond), tol);
+        if certify_partial {
+            (true, false)
         } else {
-            // Non-FREM exact objective (#378): a BFGS "failure" is often a *near-stationary*
-            // partial that merely could not reach a tightened `inner_tol` — on a multimodal
-            // subject the closed-form BFGS finds the *better* mode but stalls at a gradient norm
-            // just above `tol` (e.g. 3-cpt proportional subject-14: partial at the global mode,
-            // gnorm ≈ 2e-5 > tol 1e-5). Recovering with a cold NM then *discarded* that global
-            // partial for a worse local basin, and the tightened inner tol (#330: 1e-4→1e-5)
-            // flipped exactly this subject from "converged" to "failed→worse fallback" — the
-            // ODE↔analytical marginal-OFV divergence in #378. Keep the lower-objective of
-            // {partial, NM} instead, so a good partial is never traded for a worse NM basin —
-            // the same guard the ODE path already uses (#555).
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
-            eta = best;
-            (ok, true)
+            let cold = cold_eta_seed(model, subject, params, n_eta);
+            let outcome = if enable_stall {
+                let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+                eta = best;
+                (ok, true)
+            } else if model.frem_config.is_some() {
+                // FREM: the BFGS partial can be a *non-stationary*, merely-low-objective point (run
+                // out along a covariate pseudo-obs flat direction) that would mis-center the
+                // FREM/IMP proposal, so the restart is what re-centers it. The restart itself now
+                // starts from the FREM-aware `cold` seed rather than a plain zero vector (#1349) —
+                // NM cannot travel the ±40 a covariate eta needs from η=0, so the "re-centred"
+                // point it returned had its covariate etas still at zero and its PK etas carrying
+                // the resulting block-Ω⁻¹ force.
+                let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
+                eta = if warm { partial } else { cold };
+                let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
+                (nm_ok, true)
+            } else {
+                // Non-FREM exact objective (#378): a BFGS "failure" is often a *near-stationary*
+                // partial that merely could not reach a tightened `inner_tol` — on a multimodal
+                // subject the closed-form BFGS finds the *better* mode but stalls at a gradient norm
+                // just above `tol` (e.g. 3-cpt proportional subject-14: partial at the global mode,
+                // gnorm ≈ 2e-5 > tol 1e-5). Recovering with a cold NM then *discarded* that global
+                // partial for a worse local basin, and the tightened inner tol (#330: 1e-4→1e-5)
+                // flipped exactly this subject from "converged" to "failed→worse fallback" — the
+                // ODE↔analytical marginal-OFV divergence in #378. Keep the lower-objective of
+                // {partial, NM} instead, so a good partial is never traded for a worse NM basin —
+                // the same guard the ODE path already uses (#555).
+                let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+                eta = best;
+                (ok, true)
+            };
+            outcome
         }
     } else {
         (false, false)
@@ -1526,6 +1550,7 @@ fn find_ebe_impl(
                         None,
                         stop_precond,
                         enable_stall,
+                        false,
                     );
                     if cand.iter().all(|v| v.is_finite()) {
                         let cand_nll = obj(&cand);
@@ -1841,6 +1866,7 @@ fn find_ebe_iov(
         None,
         None,
         enable_stall,
+        false,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -3257,6 +3283,10 @@ fn grad_norm_metric(g: &[f64], precond: Option<&[f64]>) -> f64 {
     }
 }
 
+fn certifies_analytic_partial(grad_norm: f64, requested_tol: f64) -> bool {
+    grad_norm.is_finite() && grad_norm <= requested_tol
+}
+
 /// Whether to take the L-BFGS path for inner dimension `n` under the current
 /// [`inner_optimizer_mode`]. `Auto` consults the [`INNER_LBFGS_MIN_DIM`] threshold;
 /// an explicit `Bfgs`/`Lbfgs` pins it; `NelderMead` is handled by the callers
@@ -3287,6 +3317,7 @@ fn inner_minimize_with_grad(
     hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
+    short_line_search: bool,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -3305,6 +3336,7 @@ fn inner_minimize_with_grad(
             precond,
             stop_precond,
             enable_stall,
+            short_line_search,
         )
     } else {
         dense_bfgs_core(
@@ -3318,6 +3350,7 @@ fn inner_minimize_with_grad(
             hessian_seed,
             stop_precond,
             enable_stall,
+            short_line_search,
         )
     }
 }
@@ -3335,6 +3368,7 @@ fn lbfgs_core(
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
+    short_line_search: bool,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
@@ -3377,8 +3411,15 @@ fn lbfgs_core(
             };
         }
 
-        let (alpha, f_new) =
-            backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
+        let (alpha, f_new) = backtracking_line_search(
+            obj,
+            x,
+            &d,
+            &g,
+            f_cur,
+            &mut line_search_point,
+            short_line_search,
+        );
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -3436,6 +3477,7 @@ fn dense_bfgs_core(
     hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
     enable_stall: bool,
+    short_line_search: bool,
 ) -> bool {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
@@ -3497,8 +3539,15 @@ fn dense_bfgs_core(
             h_inv = init_h_inv(n, precond, seed_inv.as_ref());
             d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
             d.copy_from_slice(d_vec.as_slice());
-            let (alpha, f_new) =
-                backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
+            let (alpha, f_new) = backtracking_line_search(
+                obj,
+                x,
+                &d,
+                &g,
+                f_cur,
+                &mut line_search_point,
+                short_line_search,
+            );
             // Even steepest descent found no sufficient-decrease step: report
             // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
@@ -3517,8 +3566,15 @@ fn dense_bfgs_core(
             continue;
         }
 
-        let (alpha, f_new) =
-            backtracking_line_search(obj, x, &d, &g, f_cur, &mut line_search_point);
+        let (alpha, f_new) = backtracking_line_search(
+            obj,
+            x,
+            &d,
+            &g,
+            f_cur,
+            &mut line_search_point,
+            short_line_search,
+        );
         // No sufficient-decrease step found: report non-convergence so the caller takes the
         // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
@@ -3690,6 +3746,18 @@ fn nelder_mead_minimize(
 /// (i.e. the iterate is already at the posterior mode to machine precision).
 const MAX_LINE_SEARCH_TRIALS: usize = 30;
 
+fn inner_line_search_trials(short_line_search: bool) -> usize {
+    // Adaptive ODE objectives have a solver-noise floor and occasionally need a deep
+    // backtrack to find a reproducible decrease. Exact analytical/event-driven objectives
+    // do not: after ten rejected safeguarded quadratic trials, continuing only delays the
+    // established Nelder-Mead recovery.
+    if short_line_search {
+        10
+    } else {
+        MAX_LINE_SEARCH_TRIALS
+    }
+}
+
 /// Function-value stopping criterion for the inner BFGS, complementing the gradient
 /// norm test (`gnorm < tol`). When the objective is computed by the adaptive RK45 ODE
 /// solver, its step-pattern non-smoothness puts a noise floor on the gradient
@@ -3820,6 +3888,7 @@ fn backtracking_line_search(
     g: &[f64],
     f0: f64,
     x_new: &mut [f64],
+    short_line_search: bool,
 ) -> (f64, f64) {
     let c1 = 1e-4;
     let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
@@ -3833,7 +3902,7 @@ fn backtracking_line_search(
     }
 
     let mut alpha = 1.0;
-    for _ in 0..MAX_LINE_SEARCH_TRIALS {
+    for _ in 0..inner_line_search_trials(short_line_search) {
         for i in 0..x.len() {
             x_new[i] = x[i] + alpha * d[i];
         }
@@ -4025,6 +4094,7 @@ pub(crate) fn run_inner_loop_warm_seeded(
         InnerSolvePolicy {
             seed,
             capture_terminal_hessian: false,
+            accelerate_exact_outer: false,
         },
         |_, _| (),
     );

@@ -968,6 +968,7 @@ fn agq_inner_solve_policy(options: &FitOptions, fused_gradient: bool) -> InnerSo
         seed: InnerHessianSeed::for_options(options),
         capture_terminal_hessian: (!skip_duplicate_laplace_terminal_capture() || !fused_gradient)
             && matches!(options.hessian_anchor(), HessianAnchor::Exact),
+        accelerate_exact_outer: false,
     }
 }
 
@@ -1086,6 +1087,7 @@ fn run_inner_loop_and_nll_prepared(
     let policy = InnerSolvePolicy {
         seed: InnerHessianSeed::for_options(options),
         capture_terminal_hessian: false,
+        accelerate_exact_outer: true,
     };
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
@@ -1227,7 +1229,9 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     }
     // Tied to the FD-gradient cost: 3*(n+1) evals = 3 attempted descent
     // steps with their gradient probes. Minimum of 50 evals so very-small
-    // problems still get a real chance before we declare stagnation.
+    // problems and gradient line searches get a real chance before we declare
+    // stagnation; callback count does not distinguish accepted iterates from
+    // rejected line-search trials.
     let stagnation_window: usize = (3 * (n + 1)).max(50);
     // Absolute OFV improvement below this is treated as noise. Matches
     // typical FOCE EBE-loop precision (~1e-3 OFV units) — see

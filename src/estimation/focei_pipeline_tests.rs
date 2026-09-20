@@ -133,7 +133,11 @@ fn fused_inner_and_marginal_match_separate_passes() {
                         }
                         assert_eq!(separate.3, fused.3);
                         assert_eq!(separate.2.n_unconverged, fused.2.n_unconverged);
-                        assert_eq!(separate.2.n_fallback, fused.2.n_fallback);
+                        // The production fused FOCE/FOCEI path may certify an exhausted
+                        // analytical BFGS point as stationary and skip the cold fallback.
+                        // The strict standalone pass still runs it; the bit-identical EBEs,
+                        // Hessians, and NLL above prove that skipping it is transparent.
+                        assert!(fused.2.n_fallback <= separate.2.n_fallback);
                         assert_eq!(separate.2.n_start_rejected, fused.2.n_start_rejected);
                     }
                 });

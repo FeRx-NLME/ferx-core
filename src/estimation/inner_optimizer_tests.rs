@@ -887,9 +887,13 @@ fn inner_solver_scaling_bench() {
             }
             t0.elapsed().as_secs_f64() * 1e3 / runs as f64
         };
-        let t_dense =
-            time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, None, false));
-        let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+        let t_dense = time_it(&|x| {
+            dense_bfgs_core(
+                &obj, &grad, x, n, 2000, 1e-8, None, None, None, false, false,
+            )
+        });
+        let t_lbfgs =
+            time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false, false));
         eprintln!(
             "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
             t_dense / t_lbfgs
@@ -1133,7 +1137,9 @@ fn run_dense_scratch_fixture(n: usize, legacy: bool) -> (bool, Vec<u64>, u64, us
     let converged = if legacy {
         legacy_dense_bfgs(&obj, &grad, &mut x, n, 200, 1e-10)
     } else {
-        dense_bfgs_core(&obj, &grad, &mut x, n, 200, 1e-10, None, None, None, false)
+        dense_bfgs_core(
+            &obj, &grad, &mut x, n, 200, 1e-10, None, None, None, false, false,
+        )
     };
     let final_objective = obj(&x).to_bits();
     (
@@ -1244,7 +1250,7 @@ fn line_search_finds_armijo_step_quickly() {
         obj(xx)
     };
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial, false);
     let evals = evals.get();
     assert!(alpha > 0.0, "a descent step must be found");
     let c1 = 1e-4;
@@ -1260,6 +1266,12 @@ fn line_search_finds_armijo_step_quickly() {
     );
 }
 
+#[test]
+fn short_line_search_is_an_explicit_policy() {
+    assert_eq!(inner_line_search_trials(true), 10);
+    assert_eq!(inner_line_search_trials(false), MAX_LINE_SEARCH_TRIALS);
+}
+
 /// A non-descent direction (dg ≥ 0) yields `alpha == 0` and leaves the
 /// objective baseline untouched — the signal the inner BFGS uses to stop /
 /// fall back rather than step uphill.
@@ -1271,7 +1283,7 @@ fn line_search_rejects_non_descent_direction() {
     let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1293,12 +1305,12 @@ fn line_search_survives_non_finite_objective() {
     // Every trial step returns NaN — must not panic, must report no step.
     let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
     assert_eq!(f_new, f0, "baseline objective is returned unchanged");
     // +inf trials behave identically (never accepted, never a panic).
     let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
-    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1314,7 +1326,7 @@ fn line_search_rejects_non_finite_direction() {
     let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial);
+    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1328,7 +1340,9 @@ fn dense_bfgs_converges_on_quadratic() {
         |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
     let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
     let mut x = vec![0.0, 0.0];
-    let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, None, false);
+    let ok = dense_bfgs_core(
+        &obj, &grad, &mut x, 2, 200, 1e-10, None, None, None, false, false,
+    );
     assert!(ok, "BFGS should report convergence");
     assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
     assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -1427,6 +1441,14 @@ fn test_ebe_result_converged_flag() {
 }
 
 #[test]
+fn analytic_partial_certification_honors_requested_tolerance() {
+    assert!(certifies_analytic_partial(1e-8, 1e-8));
+    assert!(!certifies_analytic_partial(1e-7, 1e-8));
+    assert!(!certifies_analytic_partial(0.05, 1e-5));
+    assert!(!certifies_analytic_partial(f64::NAN, 1e-5));
+}
+
+#[test]
 fn hessian_seed_is_applied_through_a_cholesky_solve() {
     let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
     let got = seed_h_inv(2, Some(&h)).expect("SPD seed is accepted");
@@ -1470,7 +1492,9 @@ fn rejected_hessian_seed_reproduces_the_unseeded_solve() {
     let run = |seed: Option<&DMatrix<f64>>| {
         n_obj.set(0);
         let mut x = vec![0.0, 0.0];
-        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, seed, None, false);
+        let ok = dense_bfgs_core(
+            &obj, &grad, &mut x, 2, 200, 1e-10, None, seed, None, false, false,
+        );
         assert!(ok);
         (x, n_obj.get())
     };
@@ -1615,6 +1639,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             InnerSolvePolicy {
                 seed,
                 capture_terminal_hessian: false,
+                accelerate_exact_outer: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)

@@ -176,17 +176,43 @@ fn main() {
     allocation::sample_bytes(mode == "byte_stacks");
     let (model, pop) = fixture(case);
     let params = &model.default_params;
+    let method = match std::env::var("FERX_PROFILE_METHOD").as_deref() {
+        Ok("foce") => EstimationMethod::Foce,
+        Ok("focei") | Err(_) => EstimationMethod::FoceI,
+        Ok(other) => panic!("unsupported FERX_PROFILE_METHOD={other}"),
+    };
+    let outer_maxiter = std::env::var("FERX_PROFILE_OUTER_MAXITER")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("FERX_PROFILE_OUTER_MAXITER must be usize")
+        })
+        .unwrap_or(5);
+    let inner_maxiter = std::env::var("FERX_PROFILE_INNER_MAXITER")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("FERX_PROFILE_INNER_MAXITER must be usize")
+        })
+        .unwrap_or(30);
+    let inner_tol = std::env::var("FERX_PROFILE_INNER_TOL")
+        .ok()
+        .map(|value| value.parse().expect("FERX_PROFILE_INNER_TOL must be f64"))
+        .unwrap_or_else(|| FitOptions::default().inner_tol);
     let opts = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
+        method,
+        interaction: method == EstimationMethod::FoceI,
         n_agq: if case == "agq" || case == "agq_block" {
             3
         } else {
             1
         },
         threads: Some(threads),
-        outer_maxiter: 5,
-        inner_maxiter: 30,
+        outer_maxiter,
+        inner_maxiter,
+        inner_tol,
         run_covariance_step: false,
         ..Default::default()
     }
@@ -306,6 +332,7 @@ fn main() {
     }
     let report = json!({"case":case,"threads":threads,"mode":mode,
         "allocation_build":cfg!(profiling_allocations),"signature":expected,
+        "result":{"ofv":reference.ofv,"theta":reference.theta,"omega":reference.omega.iter().copied().collect::<Vec<_>>(),"sigma":reference.sigma,"iterations":reference.n_iterations},
         "subjects":pop.subjects.len(),"observations":pop.subjects.iter().map(|s|s.observations.len()).sum::<usize>(),
         "theta":model.n_theta,"eta":model.n_eta,"kappa":model.n_kappa,
         "outer_maxiter":opts.outer_maxiter,"inner_maxiter":opts.inner_maxiter,"measurements":measurements});
