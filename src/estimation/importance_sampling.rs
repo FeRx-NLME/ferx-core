@@ -1981,6 +1981,21 @@ pub(crate) struct Proposal {
     d: usize,
 }
 
+/// Build a proposal view from the regularised anchor retained for the matching
+/// gradient, avoiding a second Cholesky decomposition of the same matrix.
+pub(crate) fn proposal_from_regularised_anchor(
+    anchor: &crate::estimation::agq_cov_hessian::RegularisedAnchor,
+) -> Proposal {
+    let chol_h = anchor.chol.l().clone_owned();
+    let d = chol_h.nrows();
+    let log_det_inv_scale = 2.0 * (0..d).map(|i| chol_h[(i, i)].ln()).sum::<f64>();
+    Proposal {
+        chol_h,
+        log_det_inv_scale,
+        d,
+    }
+}
+
 impl Proposal {
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
@@ -2564,6 +2579,28 @@ mod tests {
         // Σ = H⁻¹ = diag(0.5, 0.25), so log|Σ⁻¹| ≈ log 8.
         // (λ jitter is ~1e-6·trace/d = 3e-6 — negligible at this precision.)
         assert!((p.log_det_inv_scale - 8.0_f64.ln()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn retained_regularised_anchor_builds_identical_proposal() {
+        let h = DMatrix::from_row_slice(3, 3, &[2.0, 0.1, 0.0, 0.1, 4.0, 0.2, 0.0, 0.2, 3.0]);
+        let omega_inv = DMatrix::identity(3, 3);
+        let rebuilt = build_proposal(&h, &omega_inv, 3).expect("proposal");
+        let anchor = crate::estimation::agq_cov_hessian::regularised_anchor(&h).expect("anchor");
+        let retained = proposal_from_regularised_anchor(&anchor);
+        assert_eq!(
+            rebuilt.log_det_inv_scale.to_bits(),
+            retained.log_det_inv_scale.to_bits()
+        );
+        let z = [0.3, -0.2, 0.7];
+        let mut rebuilt_node = [0.0; 3];
+        let mut retained_node = [0.0; 3];
+        rebuilt.apply_l_sigma(&z, &mut rebuilt_node, std::f64::consts::SQRT_2);
+        retained.apply_l_sigma(&z, &mut retained_node, std::f64::consts::SQRT_2);
+        assert_eq!(
+            rebuilt_node.map(f64::to_bits),
+            retained_node.map(f64::to_bits)
+        );
     }
 
     #[test]
