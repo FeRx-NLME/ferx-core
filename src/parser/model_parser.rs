@@ -8679,6 +8679,57 @@ fn parse_iov_occasion(value: &str) -> Result<IovOccasionRule, String> {
     ))
 }
 
+/// Parse `[fit_options] scale_deadband = <lo>,<hi>` into
+/// [`FitOptions::saem_scale_deadband`].
+///
+/// `none` / `off`, and any empty band (`lo == hi`), give `None` — plain
+/// Robbins-Monro, stepped every iteration. A band covering the whole unit
+/// interval is rejected rather than accepted: since the rule fires only
+/// *outside* the band, `0,1` would freeze every step scale for the whole run,
+/// which is the opposite of what a user reaching for "turn the dead band off"
+/// means.
+fn parse_scale_deadband(key: &str, value: &str) -> Result<Option<(f64, f64)>, String> {
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let (lo_s, hi_s) = value.split_once(',').ok_or_else(|| {
+        format!(
+            "fit option `{key}`: expected two acceptance rates `lo,hi` (or `none`), got `{value}`"
+        )
+    })?;
+    let num = |s: &str| -> Result<f64, String> {
+        s.trim().parse::<f64>().map_err(|_| {
+            format!("fit option `{key}`: expected two numbers `lo,hi` (or `none`), got `{value}`")
+        })
+    };
+    let (lo, hi) = (num(lo_s)?, num(hi_s)?);
+    if !(0.0..=1.0).contains(&lo) || !(0.0..=1.0).contains(&hi) {
+        return Err(format!(
+            "fit option `{key}`: both ends are acceptance rates and must be in [0, 1], got \
+             `{value}`"
+        ));
+    }
+    if hi < lo {
+        return Err(format!(
+            "fit option `{key}`: the band's lower end must not exceed its upper end, got `{value}`"
+        ));
+    }
+    if lo <= 0.0 && hi >= 1.0 {
+        return Err(format!(
+            "fit option `{key}`: a band of `{value}` covers every possible acceptance rate, so \
+             the Robbins-Monro step — which fires only *outside* the band — would never run and \
+             the MH step scales would stay frozen for the whole fit. Write `scale_deadband = \
+             none` to step on every iteration instead."
+        ));
+    }
+    // One implementation of the mapping: everything above is validation of what
+    // the *user typed*, and the normalisation itself (an empty band is the same
+    // object as no band) lives in the sanitiser `run_saem` applies to a band
+    // built in Rust, so the two front ends cannot drift (#1479 review).
+    let band = Some((lo, hi));
+    Ok(crate::estimation::saem::sanitize_scale_deadband(band).unwrap_or(band))
+}
+
 pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result<bool, String> {
     let value = value.trim();
 
@@ -8904,6 +8955,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                     ));
                 }
             };
+        }
+        "scale_deadband" | "saem_scale_deadband" => {
+            opts.saem_scale_deadband = parse_scale_deadband(key, value)?;
         }
         "mstep_damping" | "saem_mstep_damping" => {
             let v = parse_f64(key)?;

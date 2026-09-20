@@ -2928,6 +2928,7 @@ pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
+pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::types::FitOptions::saem_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::scale_params: bool
 pub ferx_core::types::FitOptions::sir: bool
@@ -4379,6 +4380,7 @@ pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
+pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::FitOptions::saem_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::scale_params: bool
 pub ferx_core::FitOptions::sir: bool

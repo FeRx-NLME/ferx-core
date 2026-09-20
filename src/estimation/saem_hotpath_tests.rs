@@ -1000,22 +1000,28 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
         let (_, uncached_long) = count(&long, true);
 
         // The property: tripling the iteration count must not add builds. The
-        // bound is `< n` rather than `== 0` because the once-per-fit final-EBE
-        // pass is itself a numerical solve whose line-search length depends on
-        // where the chain left off, so its own build count drifts by a couple
-        // between the two budgets (measured: 204 → 206 on the IOV arm). A single
-        // *per-evaluation* leak of one build per subject per iteration would add
-        // `14 · n` — 84 here, fourteen times the bound — so the two are not
-        // close to confusable.
+        // bound is not `== 0` because the once-per-fit final-EBE pass is itself
+        // a numerical solve whose line-search length depends on where the chain
+        // left off, so its own build count drifts between the two budgets.
+        //
+        // **Measured, not picked**, on this fixture under the #1449 defaults —
+        // the drift is `analytic 0, iov 9 (198 → 207), time-only 0`, and the
+        // iov number moved from 2 to 9 when the Robbins-Monro scale rule became
+        // the default, because the chain now ends somewhere else. A single
+        // *per-evaluation* leak of one build per subject per iteration adds
+        // `extra_iters · n` = 84. The bound below is a quarter of that: 21, so
+        // 4× clear of the leak it must catch and 2.3× clear of the worst drift
+        // it must tolerate.
         let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
             - short.saem_n_exploration
             - short.saem_n_convergence) as u64;
+        let leak_bound = extra_iters * n as u64 / 4;
         assert!(
-            cached_long.saturating_sub(cached_short) < n as u64,
+            cached_long.saturating_sub(cached_short) < leak_bound,
             "{arm}: schedule builds grew from {cached_short} to {cached_long} over \
-             {extra_iters} extra iterations on {n} subjects — the E-step, the \
-             M-step or the per-iteration NLL-cache refresh is still rebuilding \
-             per evaluation"
+             {extra_iters} extra iterations on {n} subjects, past the {leak_bound} \
+             bound — the E-step, the M-step or the per-iteration NLL-cache refresh \
+             is still rebuilding per evaluation"
         );
         // The counter has to be able to move, or the invariance above is the
         // invariance of a number that is always zero.
@@ -1030,6 +1036,85 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
             "{arm}: the cached fit diverged from the rebuild-per-call fit"
         );
     }
+}
+
+/// A gap #1449 found while measuring `score_sa` as a candidate default, pinned
+/// with its measured size.
+///
+/// `mstep_solver = score_sa` computes its score and
+/// expected information through
+/// `fixed_eta_gradient::obs_nll_subject_grad_fisher`, and that function takes
+/// **no cached schedule**: it predicts through `compute_predictions_with_tv_into`
+/// / `predict_iov` rather than their `_with_schedule` twins. On a model whose
+/// `[individual_parameters]` read `TIME` the event schedule is therefore rebuilt
+/// inside every M-step, where the derivative-free solver rebuilds none.
+///
+/// Measured on this fixture: tripling the iteration count adds **168** builds,
+/// i.e. exactly `2 · extra_iters · n` (2 per subject per M-step, and the
+/// score-SA M-step runs every iteration), against **0** for the same fixture
+/// under `mstep_solver = bobyqa`.
+///
+/// This is an unrealised saving, not a regression — `score_sa` is 25–54 % less
+/// CPU than `bobyqa` across the #1449 benchmark suite *including* the
+/// `TIME`-reading pembrolizumab bench, so the cache would make a win larger.
+/// The test asserts the leak is exactly the shape described, so that whoever
+/// threads the schedule through gets a red test naming this comment rather
+/// than a silent no-op, and so that the leak cannot grow unnoticed in the
+/// meantime.
+#[test]
+fn the_score_sa_mstep_rebuilds_the_event_schedule() {
+    let (model, pop) = (time_only_model(), baseline_cov_population());
+    let n = pop.subjects.len() as u64;
+    let short = FitOptions {
+        saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa,
+        ..saem_opts()
+    };
+    let long = FitOptions {
+        saem_n_exploration: short.saem_n_exploration * 3,
+        saem_n_convergence: short.saem_n_convergence * 3,
+        ..short.clone()
+    };
+    let count = |opts: &FitOptions| -> u64 {
+        with_build_count_1thread(|| run_bits_with(&model, &pop, opts)).1
+    };
+    let (a, b) = (count(&short), count(&long));
+    let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
+        - short.saem_n_exploration
+        - short.saem_n_convergence) as u64;
+    let drift = b.saturating_sub(a);
+    // Two builds per subject per iteration, on the nose (measured 30 → 198 over
+    // 14 extra iterations on 6 subjects). Asserted as an equality rather than a
+    // bound: a *smaller* number means someone started threading the cache
+    // through and should delete this test, and a larger one is a new leak.
+    assert_eq!(
+        drift,
+        2 * extra_iters * n,
+        "score-SA M-step schedule builds {a} → {b} (drift {drift}) over {extra_iters} \
+         extra iterations on {n} subjects — expected exactly two rebuilds per subject \
+         per iteration; if this is now lower, `obs_nll_subject_grad_fisher` has learnt \
+         to take the cached schedule and this test should go"
+    );
+    // The control: the same fixture and budgets under the derivative-free
+    // M-step rebuild nothing, so the number above is the solver's and not the
+    // fixture's.
+    let bob = |opts: &FitOptions| -> u64 {
+        with_build_count_1thread(|| {
+            run_bits_with(
+                &model,
+                &pop,
+                &FitOptions {
+                    saem_mstep_solver: crate::types::SaemMstepSolver::Bobyqa,
+                    ..opts.clone()
+                },
+            )
+        })
+        .1
+    };
+    assert_eq!(
+        bob(&long),
+        bob(&short),
+        "the derivative-free M-step must still add no builds at all"
+    );
 }
 
 /// A subject with only **baseline** covariates, in a model whose
