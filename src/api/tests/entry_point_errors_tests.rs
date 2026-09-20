@@ -376,8 +376,17 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
     let families = families();
     #[cfg(feature = "survival")]
     assert_eq!(families.len(), 10, "one fixture per `?` in predict_diag");
+    // Without `survival` two of the ten `?` lines cannot fire at all, so no fixture can exist
+    // for them: the time-varying-covariate one is `#[cfg]`-gated at the call, and the
+    // endpoint-routing one is *not* gated but calls `check_endpoint_routing`, whose
+    // non-`survival` definition returns an empty list. Deleting either `?` is invisible to a
+    // plain-`ci` build because it is inert there, not because it is untested.
     #[cfg(not(feature = "survival"))]
-    assert_eq!(families.len(), 8, "the two survival families are gated");
+    assert_eq!(
+        families.len(),
+        8,
+        "the two families whose checks are inert without `survival`"
+    );
 
     for f in &families {
         let mut params = f.model.default_params.clone();
@@ -396,6 +405,81 @@ fn each_precondition_family_is_an_err_carrying_its_own_message() {
             "{} vs fit()",
             f.name
         );
+    }
+}
+
+// ── which entry point checks which family (docs/warnings.qmd#entry-point-errors) ──
+
+/// Does each narrower entry point refuse this family? `None` = do not call it (see the one
+/// use). Order: `simulate_with_options`, `inits_from_nca`, `predict_survival`,
+/// `predict_categorical`.
+fn checked_by(family: &str) -> [Option<bool>; 4] {
+    const Y: Option<bool> = Some(true);
+    const N: Option<bool> = Some(false);
+    match family {
+        "modeled dose rates (#324)" => [Y, Y, N, N],
+        "covariates present (#1028)" => [Y, N, N, N],
+        "covariate model bound (#1111)" => [Y, N, N, N],
+        "dose compartments (#375)" => [Y, Y, Y, N],
+        "absorption closed-form support" => [Y, N, N, N],
+        "flip-flop, no twin (#776)" => [Y, N, N, N],
+        // `simulate*` has never run `check_analytic_readout_support`, and on this fixture the
+        // emitter then trips a `debug_assert!` in `pk::analytical_state_at_times` (measured; in
+        // release it returns rows instead). Pre-existing and filed separately — not called
+        // here, so this test does not pin a panic as the contract.
+        "analytic readout support (#650)" => [None, N, N, N],
+        "absorption dosing (#588)" => [Y, N, N, N],
+        "survival time-varying covariate (#741)" => [Y, N, Y, Y],
+        "endpoint routing (#1199)" => [Y, N, N, Y],
+        other => panic!("no row for family {other:?}"),
+    }
+}
+
+/// `docs/warnings.qmd#entry-point-errors` tells a caller which preconditions each entry point
+/// checks — and therefore which ones it does **not**, where a bad input comes back as `Ok`.
+/// That table was first written as "all nine entry points return `Err`", which was false for
+/// four of them (review of #1487); this is its enumerated input space, entry point × family,
+/// measured rather than read.
+///
+/// Regression this catches, both directions: a check added to a narrow entry point flips an
+/// `Ok` cell to `Err` (the docs then under-promise), and a check dropped flips an `Err` cell to
+/// `Ok` (they over-promise). Mutation — add `check_modeled_dose_rates` to
+/// `predict_categorical`, or drop `check_dose_compartments` from `inits_from_nca`; either dies
+/// here naming the cell.
+#[test]
+fn each_narrow_entry_point_refuses_exactly_the_families_the_docs_list() {
+    let opts = SimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    for f in families() {
+        let mut params = f.model.default_params.clone();
+        if let Some(theta) = &f.theta {
+            params.theta = theta.clone();
+        }
+        let [sim, nca, surv, cat] = checked_by(f.name);
+        if let Some(want) = sim {
+            let got = simulate_with_options(&f.model, &f.pop, &params, 1, &opts).is_err();
+            assert_eq!(got, want, "simulate_with_options × {}", f.name);
+        }
+        if let Some(want) = nca {
+            let got = crate::suggest_start::inits_from_nca(&f.model, &f.pop, crate::NcaInit::Nca)
+                .is_err();
+            assert_eq!(got, want, "inits_from_nca × {}", f.name);
+        }
+        #[cfg(feature = "survival")]
+        {
+            if let Some(want) = surv {
+                let got = predict_survival(&f.model, &f.pop, &params, &[1.0, 2.0]).is_err();
+                assert_eq!(got, want, "predict_survival × {}", f.name);
+            }
+            if let Some(want) = cat {
+                let got = predict_categorical(&f.model, &f.pop, &params).is_err();
+                assert_eq!(got, want, "predict_categorical × {}", f.name);
+            }
+        }
+        #[cfg(not(feature = "survival"))]
+        let _ = (surv, cat);
     }
 }
 
