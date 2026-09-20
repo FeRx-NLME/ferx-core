@@ -113,16 +113,6 @@ fn cached_log_weights_enabled() -> bool {
     })
 }
 
-/// Internal same-binary A/B switch for the fused analytic node likelihood + score path.
-fn node_score_fusion_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FERX_NO_AGQ_NODE_SCORE_FUSION")
-            .map(|v| v != "1")
-            .unwrap_or(true)
-    })
-}
-
 fn node_score_fusion_supported(model: &CompiledModel) -> bool {
     model.ode_spec.is_none() && analytic_score_supported(model)
 }
@@ -912,8 +902,7 @@ fn agq_subject_evaluate(
         &mut scratch,
         schedule,
         retain_gradient_work,
-        score_template
-            .filter(|_| node_score_fusion_enabled() && node_score_fusion_supported(model)),
+        score_template.filter(|_| node_score_fusion_supported(model)),
     );
 
     let lse = logsumexp(&terms);
