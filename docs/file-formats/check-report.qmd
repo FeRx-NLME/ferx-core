@@ -158,6 +158,19 @@ The dataset could not be read, or a dose / observation record is inconsistent wi
 | `E_NONFINITE_DV` | error | A subject carries a non-finite (`NaN`/`Inf`) observation. Usually a population read by `read_population_for_simulation()` — a simulation input — passed to `fit()`. |
 | `W_MISSING_DV` | warning | One or more `EVID=0` rows had a missing `DV` (`.`/`NA`/blank) but were not marked `MDV=1`; they were skipped rather than scored as `DV=0`. |
 | `W_DESIGN_DV` | warning | Simulation reader only: one or more `EVID=0` rows had a missing `DV` and were kept as design points to simulate at, so the dataset contributes more rows than a fit of the same file would. |
+| `W_FILTER_COLUMN_ABSENT` | warning | A `[data_selection]` condition names a column the dataset does not have. The comparison never matches, so the condition does not select what was meant — and what that costs depends on the key it was written under: an `ignore` excludes nothing, an `accept` excludes **every** row. The message names the missing column(s) and lists the headers the file does have, so a typo (`ignore = Coment`) is visible rather than silent. `ferx check --data` reports it since [#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465); before that the check never compiled the clauses, so only a fit could raise it. |
+
+#### Dose coverage
+
+Whether the dataset delivers any drug at all. These read the dose records as a
+set, so they say nothing about an individual row — for that see *Dose records*
+below.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `W_AMT_NOT_DOSED` | warning | Record(s) carry `AMT != 0` but were **not** read as dose events, because `EVID` is neither 1 nor 4; their `AMT` was ignored. In a dataset with no `EVID` column a nonzero `AMT` is enough to infer a dose, so this is a file that has one. Reported with the record and subject counts. It wins over `W_NO_DOSES`, which is the generic backstop for a dataset carrying no `AMT` signal at all. See [#262](https://github.com/FeRx-NLME/ferx-core/issues/262). |
+| `W_NO_DOSES` | warning | Zero dose events parsed across every subject, **although scored observations are present**. Silent when there are no scored observations (an all-`EVID=2`, covariate-only file is not a fit), and silent when any subject carries a non-Gaussian observation — a TTE / survival or discrete endpoint legitimately has no PK dose, so warning there would be a false positive. See [#262](https://github.com/FeRx-NLME/ferx-core/issues/262). |
+| `W_ALL_DOSES_ZERO` | warning | An `AMT` column is present and at least one dose event was parsed, but every parsed amount is exactly zero. No drug enters the system, so the objective is flat and the parameters will not move from their initial values. A warning rather than an error because the column is there and a genuinely dose-free-but-`AMT`-columned dataset is conceivable. See [#753](https://github.com/FeRx-NLME/ferx-core/issues/753). |
 
 #### Dose records
 

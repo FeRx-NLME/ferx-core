@@ -233,6 +233,15 @@ that author model files programmatically.
 - With `--data`, the dataset is read and the data-dependent checks run too:
   referenced covariates present, per-CMT scaling / error-model coverage,
   steady-state dosing well-formed, and non-negative typical-value lag time.
+- That read applies the model file's own
+  [`[data_selection]`](model-file/data-selection.qmd) clauses, so those checks
+  describe the records a fit of the same two files would score: a compartment a
+  clause empties is not reported as uncovered, and a finding that names the
+  observed compartments names the ones that survive the filter. **The model
+  file's clauses and only those** — `ferx check` takes no fit options, so
+  conditions a caller merges in (`fit_from_files`, or `ferx_fit(settings = ...)`
+  from R) are invisible to it, and a check cannot speak for them
+  ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)).
 - `--json` emits a structured [check report](file-formats/check-report.qmd) to
   stdout instead of the human-readable summary.
 
