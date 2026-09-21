@@ -390,13 +390,28 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
 /// Tier-3, #1458. The `mstep_solver = score_sa` arm on the **same** #1445
 /// fixture.
 ///
-/// σ does not get a separate treatment under that solver: it rides the one
-/// Newton step on the Robbins-Monro averaged score and information, and
-/// `sigma_mstep_sa_step`'s extra blend is deliberately *not* applied on top
-/// (applying both would step σ at `γ²`). That makes this fixture the check on
-/// whether #1445's collapse comes back through the new path — the additive term
-/// is a minority variance component here, which is the only regime in which the
-/// collapse can happen at all.
+/// This fixture is the check on whether #1445's collapse comes back through the
+/// new path — the additive term is a minority variance component here, which is
+/// the only regime in which the collapse can happen at all. It did: #1462
+/// shipped `score_sa` with σ riding the shared `γ`-scaled Newton step in packed
+/// (log σ) units, which is #1445's two defects at once — no Robbins-Monro
+/// averaging during exploration (`γ = 1` is a full step to one draw's root) and
+/// a geometric rather than arithmetic mean of the σ sequence. #1480 routes the
+/// σ half of the step through the same `damp_mstep_sigma_variance(.., γ_σ)` the
+/// derivative-free arms use, so there is one implementation of #1445's policy
+/// and this test and the one above pin the same object. Measured on this
+/// fixture, seeds 1/2/3 (`ci-test`, aarch64):
+///
+/// | | `ADD_ERR` (truth 1.8) |
+/// |---|---|
+/// | `bobyqa` (the default) | 1.33 / 1.83 / 2.17 |
+/// | `score_sa` as #1462 shipped it | **0.84 / 0.52 / 1.13** |
+/// | `score_sa` with only the γ_σ schedule | 0.87 / 0.99 / 1.20 |
+/// | `score_sa` after #1480 (schedule **and** variance scale) | 1.90 / 1.86 / 2.11 |
+///
+/// The middle row is why the fix is both halves and not just the step size: the
+/// schedule alone still leaves seed 1 at 0.87, under the 0.9 gate. Cross-seed sd
+/// after the fix is 0.137 against the default arm's 0.421.
 ///
 /// The bounds are the ones the default solver has to satisfy above, for the
 /// same reason: a factor of two either side of the simulation truth, with the

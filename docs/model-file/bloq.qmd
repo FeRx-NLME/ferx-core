@@ -27,22 +27,22 @@ ID,TIME,DV,CENS,EVID,AMT
 
 Rows with `CENS != 0` and `MDV = 1` are skipped entirely (already excluded by `MDV`). Rows with `CENS = 0` are treated as ordinary quantified observations regardless of their value.
 
-### Values outside `-1` / `0` / `1`
+### Out-of-domain values
 
-`CENS` is a flag column with a closed domain, and the reader treats a cell outside it by whether it is a *number* at all:
+A missing cell (blank, `.`, `NA`) reads as `0`. A whole number may carry a decimal point — pandas writes an integer column that has a blank cell as `1.0`, and ferx's own sdtab writes the flag as `1.000000` — and either reads as `1`.
 
-| Cell | Read as | Reported as |
-|---|---|---|
-| `1`, `-1`, `0`, and any float spelling of them (`1.0`, `+1`, `-0.0`) | the flag itself | — |
-| blank, `.`, `NA`, `NaN` | `0` (quantified) | — |
-| another whole number (`7`, `-2`, `200`) | scored by its **sign**: a positive flag like `1` (the lower tail), a negative one like `-1` (the upper tail) | `W_CENS_UNEXPECTED`, once per sign per subject, quoting the cell as written |
-| anything else (`1.5`, `abc`, `inf`) | **rejected** | an error naming the subject, the row's time and the cell |
+Any other **whole number**, such as `7` or `-2`, counts by its sign alone. Under `bloq_method = m3` a positive flag is scored like `1` (the lower tail, below the LLOQ) and a negative one like `-1` (the upper tail, above the ULOQ); under `bloq_method = drop` the row is scored as an ordinary observation, like any other `CENS` row. ferx warns with `W_CENS_UNEXPECTED`, quoting the cell, once per subject for each sign. It does not warn on a simulation design row with no `DV`, since such a row is never scored.
 
-Both the reject and the warning apply only where the flag is actually consumed — that is, to a row a **fit** will score: a Gaussian observation row that survives `[data_selection]`. A row a clause removes, and a dose row (where ferx never reads `CENS`), are not checked — as in NONMEM, which rejects a text cell only on a record its `IGNORE` statements keep. Neither is a *simulation* input checked: a dataset read for `--simulate` carries design points whose `DV` the run is about to write, nothing there reads the flag, and a cell holding none reads as `0`.
+A cell that is **not a whole number**, such as `1.5`, `abc` or `inf`, is an error on a Gaussian observation row that carries a `DV` and that [`[data_selection]`](data-selection.qmd) keeps. This holds whether the file is read for a fit or for a simulation. The message names the subject, the row's time and the cell. Correct the cell; if the column is not a censoring flag at all, rename it, in the dataset or aside in the model's [`[data]`](data.qmd) block.
 
-A whole number outside `i8` saturates to ±127 before any engine sees it — deliberately, since every consumer routes on the sign and wrapping would flip the tail. The warning still quotes the cell **as written**, so `200` is reported as `CENS=200`, not as the `127` it is scored as.
+The same cell is never read, and is not an error, on these rows:
 
-Before ferx 0.4.0 a cell like `abc` or `1.5` read as `0`, so a possibly-censored row was silently scored as a quantified measurement at its own `DV` — under `bloq_method = m3` that is a measurement at the LOQ.
+- a dose row;
+- a time-to-event or categorical row;
+- a row whose `DV` is missing;
+- a row that `[data_selection]` removes.
+
+Compared with NONMEM 7.6.0 for `abc`: NONMEM also rejects it on an observation record and accepts it on a record its `IGNORE` removes. Unlike ferx, it rejects it on a dose record too. NONMEM accepts `1.5`, as a number whose meaning your own code decides; ferx gives `CENS` a fixed meaning, so it rejects it, as it rejects `SS=1.5` ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)).
 
 ---
 

@@ -190,9 +190,10 @@ fn unparseable_iov_occasion_values_warn_not_fail() {
 #[test]
 fn test_obs_cmt_dot_defaults_to_compartment_one() {
     // Regression: a "." (missing) CMT on an observation row must default to
-    // compartment 1, not 0. `parse_usize(".")` yields 0 — an invalid
-    // compartment — so the observation path must guard "." / blank exactly
-    // like the dose path does.
+    // compartment 1, not 0. The observation arm once read the cell with a bare
+    // `parse::<usize>()` falling back to 0 — an invalid compartment — so it must
+    // guard "." / blank exactly like the dose arm does; both now share
+    // `resolve_row_cmt`.
     let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
                    1,0,.,1,100,1\n\
                    1,1,5.0,0,.,.\n";
@@ -1918,8 +1919,8 @@ fn test_covariate_declared_column_missing_errors() {
 
 #[test]
 fn test_parse_evid_defaults_to_observation() {
-    // parse_usize defaults to 1; parse_evid must default to 0 (observation)
-    // for blank / missing / unparseable cells.
+    // A blank / missing / unparseable EVID cell is 0 (observation), NONMEM's
+    // default.
     assert_eq!(parse_evid("1"), 1);
     assert_eq!(parse_evid("0"), 0);
     assert_eq!(parse_evid(""), 0);
@@ -1953,8 +1954,8 @@ fn test_parse_l2_id_accepts_integer_and_float_formats() {
 
 #[test]
 fn test_covtab_blank_evid_is_observation_not_dose() {
-    // A blank EVID cell on an observation row must be EVID=0 in the covtab,
-    // not 1 (which parse_usize would have produced).
+    // A blank EVID cell on an observation row must be EVID=0 in the covtab, as
+    // it is in the population: both read the cell through `effective_evid`.
     let csv = "ID,TIME,DV,EVID,AMT,WT\n\
                    1,0,.,1,100,70\n\
                    1,1,5.0,,.,70\n";
@@ -2731,11 +2732,11 @@ fn explicit_integer_cmt_column_including_zero_warns_nothing() {
 
 #[test]
 fn filter_context_cmt_resolves_like_the_dose_site() {
-    // T1e. The `[data]` selection filter built its `RowContext.cmt` with
-    // `parse_usize`, which maps both `.` and `2.0` to **0** — so `ignore = CMT ==
-    // 1` failed to drop a dotted row the dose arm assigns to compartment 1. One
-    // resolver now serves both, so the filter sees the compartment the row is
-    // actually given.
+    // T1e. The `[data]` selection filter built its `RowContext.cmt` with a bare
+    // `parse::<usize>()` falling back to 0, which maps both `.` and `2.0` to **0**
+    // — so `ignore = CMT == 1` failed to drop a dotted row the dose arm assigns to
+    // compartment 1. One resolver now serves both, so the filter sees the
+    // compartment the row is actually given.
     // The ignore clause is narrowed to dose rows (`EVID == 1 && CMT == 1`) so a
     // dotted *observation* survives — without a surviving defaulted row the warning never
     // fires at all and any assertion about its wording passes by absence. The
@@ -3223,7 +3224,8 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
 #[test]
 fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
     use WholeCell::{Missing, NotWhole, Value};
-    // (cell, class, CENS, EVID, OCC, MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
+    // (cell, class, CENS as a `[data_selection]` rule compares it, EVID, OCC,
+    // MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
     #[allow(clippy::type_complexity)]
     let table: &[(
         &str,
@@ -3257,7 +3259,9 @@ fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
             Some(200),
         ),
         ("-200", Value(-200.0), -128, 0, None, None, None),
-        // Not a whole number: the old fallback at every site, untouched here.
+        // Not a whole number: the old fallback at every site. For `CENS` that is
+        // now only the `[data_selection]` context; an observation row the fit
+        // scores rejects the cell (#1496 PR B, see `a_cens_cell_that_is_not_a_whole_number_*`).
         ("1.5", NotWhole, 0, 0, None, None, None),
         ("abc", NotWhole, 0, 0, None, None, None),
         ("inf", NotWhole, 0, 0, None, None, None),
@@ -3269,7 +3273,7 @@ fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
     ];
     for &(cell, class, cens, evid, occ, count, fremtype) in table {
         assert_eq!(parse_whole_number_cell(cell), class, "class of {cell:?}");
-        assert_eq!(parse_cens(cell), cens, "CENS {cell:?}");
+        assert_eq!(parse_cens(cell).selection_flag(), cens, "CENS {cell:?}");
         assert_eq!(parse_evid(cell), evid, "EVID {cell:?}");
         assert_eq!(parse_occ(cell), occ, "OCC {cell:?}");
         assert_eq!(parse_unsigned_cell::<usize>(cell), count, "usize {cell:?}");
@@ -3543,360 +3547,461 @@ fn a_float_formatted_fremtype_column_reads_like_its_integer_twin() {
     assert_eq!(float.subjects[0].fremtype, integer.subjects[0].fremtype);
 }
 
-// ── #1496 PR B: the `CENS` domain — what is rejected, and which tail a
-// ── surviving out-of-domain flag is scored on ───────────────────────────
+// ── #1496 PR B: a `CENS` cell that holds no flag, and one outside -1/0/1 ──────
+// A cell that is not a whole number (`1.5`, `abc`, `inf`) on an observation row
+// the fit scores is an error: NONMEM 7.6.0 rejects `abc` there too, and the old
+// silent 0 scored a possibly below-LLOQ row as a measurement at the LLOQ. A whole
+// number other than -1, 0 or 1 stays a warning, which now quotes the cell and
+// names the tail its sign is scored on.
 
-/// The `CENS` cell of the one observation row of a minimal single-subject file.
-/// `TIME=1` on that row, so a `[data_selection]` rule can address it.
-fn cens_obs_csv(cell: &str) -> String {
+/// Subject 7: a dose row with a blank `CENS`, a quantified row, and the row under
+/// test at `TIME 2.5` carrying `cell`.
+fn cens_cell_csv(cell: &str) -> String {
     format!(
-        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
-         1,0,.,1,100,1,1,0\n\
-         1,1,5.0,0,.,1,0,{cell}\n\
-         1,2,4.0,0,.,1,0,0\n"
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+         7,0,.,1,1,100,1,\n\
+         7,1,5.0,0,0,.,1,0\n\
+         7,2.5,4.0,0,0,.,1,{cell}\n"
     )
 }
 
-/// The `W_CENS_UNEXPECTED` messages a population carries.
-fn cens_warnings(pop: &Population) -> Vec<String> {
-    pop.warnings
-        .iter()
-        .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
-        .cloned()
-        .collect()
+/// The whole error for subject 7's cell, as the user reads it. A literal rather
+/// than a second call to the producer: an equality between two outputs of
+/// `cens_not_whole_error` would pin the routing and none of the text.
+fn cens_not_whole_message(time: &str, quoted: &str) -> String {
+    format!(
+        "subject 7, time {time}: CENS=\"{quoted}\" is not a whole number; expected -1 \
+         (above the ULOQ), 0 (quantified) or 1 (below the LLOQ), and a blank or \".\" \
+         cell reads as 0. Correct the cell, or, if this column is not a censoring flag, \
+         rename it in the dataset or in the model's [data] block."
+    )
 }
 
-/// B4. A **positive** out-of-domain flag is scored as `1` — `m3_logcdf` reads
-/// `cens < 0` as the upper tail and everything else as the lower one — so the
-/// sentence must name the lower tail, and must not name the upper.
-///
-/// Mutation that must redden it: delete the positive branch of
-/// [`cens_unexpected_warning`], or swap the two arms.
+/// B6. A `CENS` cell that is not a whole number, on an observation row the fit
+/// scores, is an error. The message is asserted whole, so deleting any part of it —
+/// the subject and written time, the cell, the accepted values, the remedy —
+/// reddens this test. Each claim the message makes is checked against the reader
+/// here as well: a blank or `.` cell reads as 0, and a column renamed in the dataset
+/// or aside in `[data]` is no longer read as the flag. The time is the one the user
+/// wrote: an `EVID=4` restart shifts the engine's clock under the second fixture.
 #[test]
-fn a_positive_out_of_domain_cens_is_reported_on_the_lower_tail() {
-    let f = write_csv(&cens_obs_csv("7"));
-    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let w = cens_warnings(&pop);
-    assert_eq!(w.len(), 1, "{w:?}");
-    let m = &w[0];
-    // The prefix #1494's `reader_warning_code` table and `ferx check` quote.
-    assert!(
-        m.starts_with("W_CENS_UNEXPECTED subject 1: CENS=7"),
-        "prefix must stay byte-stable: {m}"
-    );
-    assert!(m.contains("lower tail"), "{m}");
-    assert!(m.contains("as 1;"), "the flag it is scored as: {m}");
-    assert!(
-        !m.contains("upper"),
-        "a positive flag is never the upper tail: {m}"
-    );
-    // Conditional on `bloq_method`, which the reader cannot see. The `drop`
-    // clause is not "the flag is ignored": `suggest_start` and the
-    // `[data_selection]` context read it whatever `bloq_method` is.
-    assert!(m.contains("bloq_method = m3"), "{m}");
-    assert!(m.contains("ordinary observation"), "{m}");
-    // The value itself is preserved verbatim, as before.
-    assert_eq!(pop.subjects[0].cens, vec![7, 0]);
-}
-
-/// B5. The mirror: a **negative** out-of-domain flag is scored as `-1`, on the
-/// upper tail. Until #1496 this said "(left tail)", which was wrong for every
-/// negative flag — the defect the sentence exists to fix.
-///
-/// Mutation that must redden it: delete the negative branch of
-/// [`cens_unexpected_warning`], or swap the two arms.
-#[test]
-fn a_negative_out_of_domain_cens_is_reported_on_the_upper_tail() {
-    let f = write_csv(&cens_obs_csv("-2"));
-    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let w = cens_warnings(&pop);
-    assert_eq!(w.len(), 1, "{w:?}");
-    let m = &w[0];
-    assert!(
-        m.starts_with("W_CENS_UNEXPECTED subject 1: CENS=-2"),
-        "prefix must stay byte-stable: {m}"
-    );
-    assert!(m.contains("upper tail"), "{m}");
-    assert!(m.contains("as -1;"), "the flag it is scored as: {m}");
-    assert!(!m.contains("lower"), "{m}");
-    assert!(!m.contains("left"), "the wording #1496 removed: {m}");
-    assert_eq!(pop.subjects[0].cens, vec![-2, 0]);
-}
-
-/// B7. The two sentences are different claims, so the latch is per sign: one
-/// subject whose cells span both tails gets exactly two warnings, one each, and
-/// no more however many rows carry them.
-///
-/// Mutation that must redden it: collapse the two latches back into one (the
-/// pre-#1496 `cens_invalid_warned`) — the second tail then goes unreported.
-#[test]
-fn an_out_of_domain_cens_is_reported_once_per_sign_per_subject() {
-    let f = write_csv(
-        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
-         1,0,.,1,100,1,1,0\n\
-         1,1,5.0,0,.,1,0,7\n\
-         1,2,4.0,0,.,1,0,-2\n\
-         1,3,3.0,0,.,1,0,8\n\
-         1,4,2.0,0,.,1,0,-3\n",
-    );
-    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let w = cens_warnings(&pop);
-    assert_eq!(w.len(), 2, "one per sign, not one per row: {w:?}");
-    assert_eq!(
-        w.iter().filter(|m| m.contains("lower tail")).count(),
-        1,
-        "{w:?}"
-    );
-    assert_eq!(
-        w.iter().filter(|m| m.contains("upper tail")).count(),
-        1,
-        "{w:?}"
-    );
-    // The first value of each sign is the one named, and every flag is kept.
-    assert!(w.iter().any(|m| m.contains("CENS=7")), "{w:?}");
-    assert!(w.iter().any(|m| m.contains("CENS=-2")), "{w:?}");
-    assert_eq!(pop.subjects[0].cens, vec![7, -2, 8, -3]);
-}
-
-/// B6. A `CENS` cell that is not a whole number at all, on an observation row the
-/// fit will score, is an error — not the silent `0` (a quantified measurement)
-/// it read as before #1496, and not `W_CENS_UNEXPECTED` either, which is for a
-/// whole number outside the domain.
-///
-/// Mutations that must redden it: route the observation site back through
-/// `resolve_row_cens` (`NotWhole` → 0); delete any one sentence of
-/// [`cens_not_whole_error`] — the subject/time/cell clause, the domain clause, or
-/// the remedy.
-#[test]
-fn a_non_whole_cens_cell_on_a_scored_observation_row_is_an_error() {
+fn a_cens_cell_that_is_not_a_whole_number_is_an_error_on_a_scored_row() {
+    let read = |csv: &str| {
+        let f = write_csv(csv);
+        read_nonmem_csv(f.path(), None, None)
+    };
     for cell in ["abc", "1.5", "inf"] {
-        let f = write_csv(&cens_obs_csv(cell));
-        let err = read_nonmem_csv(f.path(), None, None)
-            .expect_err(&format!("CENS={cell:?} must not read as a flag"));
-        // Sentence 1: whose row, which row, what was in the cell.
-        assert!(err.contains("subject 1"), "{cell:?}: {err}");
-        assert!(err.contains("time 1"), "{cell:?}: {err}");
-        assert!(
-            err.contains(&format!("CENS=\"{cell}\"")),
-            "the cell as written: {cell:?}: {err}"
-        );
-        // Sentence 2: the accepted values.
-        assert!(err.contains("-1 (above the ULOQ)"), "{cell:?}: {err}");
-        assert!(err.contains("0 (quantified)"), "{cell:?}: {err}");
-        assert!(err.contains("1 (below the LLOQ)"), "{cell:?}: {err}");
-        // Sentence 3: the remedy, both halves.
-        assert!(err.contains("Fix the cell"), "{cell:?}: {err}");
-        assert!(err.contains("rename it"), "{cell:?}: {err}");
-        // The reader cannot see `bloq_method`, and the cell says nothing about a
-        // tail, so the message claims neither.
-        for forbidden in ["tail", "left", "m3", "M3"] {
+        let err = read(&cens_cell_csv(cell)).expect_err(cell);
+        assert_eq!(err, cens_not_whole_message("2.5", cell));
+        // A cell that holds no flag is scored on no tail, under any method.
+        for word in ["tail", "m3", "M3"] {
             assert!(
-                !err.contains(forbidden),
-                "{cell:?}: must not claim {forbidden:?}: {err}"
+                !err.contains(word),
+                "{cell}: the error says {word:?}: {err}"
             );
         }
-        // Not relayed as the warning, which means something else.
-        assert!(!err.contains("W_CENS_UNEXPECTED"), "{cell:?}: {err}");
     }
-}
 
-/// B6. The cell is arbitrary user text on its way into an error string, so it
-/// goes through `truncate_example` — the same escaping/truncation
-/// `W_CMT_DEFAULTED` uses, and the reason a quote in the cell cannot produce
-/// `CENS="a"b"`.
-#[test]
-fn a_rejected_cens_cell_is_quoted_through_the_shared_truncation() {
-    let f = write_csv(&cens_obs_csv("a\"b"));
-    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
-    assert!(err.contains("CENS=\"a\u{fffd}b\""), "{err}");
+    // The cell is quoted safely: a quote inside it cannot close the quote.
+    let err = read(&cens_cell_csv("\"ab\"\"c\"")).unwrap_err();
+    assert_eq!(err, cens_not_whole_message("2.5", "ab\u{fffd}c"));
 
-    let long = "x".repeat(MAX_CMT_EXAMPLE_LEN + 10);
-    let f = write_csv(&cens_obs_csv(&long));
-    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
-    assert!(err.contains('…'), "a long cell is cut: {err}");
-    assert!(!err.contains(&long), "…and not quoted whole: {err}");
-}
-
-/// B6b. Where the reject happens, in one test, so forcing either branch reddens
-/// it: the cell is only rejected on an observation row that survives
-/// `[data_selection]`.
-///
-/// (i) the same text on a **dose** row is never read — ferx does not consume
-/// `CENS` there, and a text column mis-mapped as `CENS` carries text on the
-/// observation rows too, so nothing is missed; (ii) on an observation row the
-/// filter **removes**, it is not read either — the filter's `continue` runs
-/// first, and NONMEM likewise reports no error for a text cell on an `IGNORE`d
-/// record; (iii) the same file with the clause **not** matching that row is an
-/// error. (ii) and (iii) differ by the clause alone.
-///
-/// Mutations that must redden it: raise the error in the `[data_selection]`
-/// row-context read instead of the observation arm (kills (ii)); raise it on
-/// every row rather than the Gaussian observation arm (kills (i)).
-#[test]
-fn a_non_whole_cens_cell_is_rejected_only_on_a_scored_observation_row() {
-    // (i) On the dose row, with every observation row in the domain.
-    let dose_row = write_csv(
-        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
-         1,0,.,1,100,1,1,abc\n\
-         1,1,5.0,0,.,1,0,0\n\
-         1,2,4.0,0,.,1,0,1\n",
-    );
-    let pop =
-        read_nonmem_csv(dose_row.path(), None, None).expect("ferx never reads CENS on a dose row");
-    assert_eq!(pop.subjects[0].cens, vec![0, 1]);
-    assert!(cens_warnings(&pop).is_empty(), "{:?}", pop.warnings);
-
-    // (ii) and (iii): one file, two clauses. `TIME == 1` is the offending row.
-    let obs_row = write_csv(&cens_obs_csv("abc"));
-    let read = |clause: &str| {
-        let filter = SelectionFilter::from_opts(&[clause.to_string()], &[], &[])
-            .unwrap_or_else(|e| panic!("filter: {e}"));
-        read_nonmem_csv_filtered(obs_row.path(), None, None, &filter)
+    // The time as written. The `EVID=4` restart at `TIME 0` moves every later row
+    // past the first segment on the engine's clock; the error still says 2.5.
+    let restarted = |cell: &str| {
+        format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             7,0,.,1,1,100,1,\n\
+             7,1,5.0,0,0,.,1,0\n\
+             7,0,.,4,1,100,1,\n\
+             7,2.5,4.0,0,0,.,1,{cell}\n"
+        )
     };
-    // (ii) removed — not read, so not rejected.
-    let removed = read("TIME == 1").expect("a row the filter removes is never scored");
-    assert_eq!(
-        removed.subjects[0].observations.len(),
-        1,
-        "the clause must actually remove the offending row"
-    );
-    // (iii) the same cell, a clause that leaves the row in place.
-    let err = read("TIME == 2").expect_err("the surviving row is scored, so it is rejected");
-    assert!(err.contains("CENS=\"abc\""), "{err}");
-    assert!(err.contains("subject 1"), "{err}");
-}
-
-/// B10. The **policy** axis (#1509 review, finding 1): `CENS` is read by the
-/// reading that will *score* the row, and only by it.
-///
-/// `read_population_for_simulation` reads the same file under
-/// `MissingDvPolicy::KeepAsDesign`, where every observation row is a design
-/// point the simulator is about to write a DV into. Nothing there consumes the
-/// flag, so a cell holding none is not an error — it reads back as `0`, exactly
-/// as it did before #1496. Rejecting it there would fail a simulation on a
-/// column the run never looks at, and would contradict what `bloq.qmd` and the
-/// changelog say the reject covers ("a row the fit scores").
-///
-/// Both sides in one test, on **one file**, so a gate stuck on either branch
-/// reddens it. Mutation that must redden it: drop `cens_is_scored` from the
-/// reject arm of `classify_row_cens`'s `Err` match.
-#[test]
-fn a_non_whole_cens_cell_is_rejected_only_by_a_read_that_scores_the_row() {
-    let f = write_csv(&cens_obs_csv("abc"));
-
-    // The fitting read (`MissingDvPolicy::Skip`, what `fit()` uses).
-    let err = read_nonmem_csv(f.path(), None, None)
-        .expect_err("the fitting read scores the row, so the cell is consumed");
-    assert!(err.contains("CENS=\"abc\""), "{err}");
-
-    // The simulation read of the *same file*: accepted, and the cell reads as 0.
-    let design = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
-    let pop = read_nonmem_csv_filtered_routed(f.path(), &design)
-        .expect("a simulation read never consumes CENS, so it cannot reject a cell");
-    assert_eq!(
-        pop.subjects[0].cens,
-        vec![0, 0],
-        "an unreadable cell reads as 0 on the path that does not score it"
-    );
+    let shifted = read(&restarted("0")).unwrap();
+    assert_eq!(shifted.subjects[0].obs_raw_times, vec![1.0, 2.5]);
     assert!(
-        cens_warnings(&pop).is_empty(),
-        "and it is not relayed as the out-of-domain warning either: {:?}",
-        pop.warnings
+        shifted.subjects[0].obs_times[1] > 2.5,
+        "the restart must shift the row, or this leg tests nothing: {:?}",
+        shifted.subjects[0].obs_times
     );
-
-    // The shape the simulation reader exists for — `DV = .` design points —
-    // reaches the same site: the row is *kept*, so the gate is what stops the
-    // reject, not `skip_missing_dv`'s `continue` one line above it. Under the
-    // fitting read the row is skipped instead, and is likewise not rejected.
-    let template = write_csv(
-        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
-         1,0,.,1,100,1,1,0\n\
-         1,1,.,0,.,1,0,abc\n",
-    );
-    let sim = read_nonmem_csv_filtered_routed(template.path(), &design)
-        .expect("a design point is not scored, so its CENS cell is not read");
     assert_eq!(
-        sim.subjects[0].obs_times,
-        vec![1.0],
-        "the design row must actually be kept, or the gate is untested"
+        read(&restarted("abc")).unwrap_err(),
+        cens_not_whole_message("2.5", "abc")
     );
-    assert_eq!(sim.subjects[0].cens, vec![0]);
-    let fit = read_nonmem_csv(template.path(), None, None)
-        .expect("under Skip the row is dropped before the cell is reached");
-    assert!(
-        fit.subjects[0].obs_times.is_empty(),
-        "…and dropped it is: {:?}",
-        fit.subjects[0].obs_times
-    );
-}
 
-/// B11. The same gate on `W_CENS_UNEXPECTED`, asserted separately from the
-/// reject so a gate lost from either one is localised (#1509 review, finding 1).
-///
-/// Both clauses of that sentence say how a `bloq_method` **scores** the row. A
-/// design point is not scored under either method, so on the simulation read
-/// both clauses would be false — the warning must not fire at all.
-///
-/// Mutation that must redden it: drop `cens_is_scored` from the `if` guarding
-/// the warning.
-#[test]
-fn an_out_of_domain_cens_is_warned_about_only_by_a_read_that_scores_the_row() {
-    let f = write_csv(&cens_obs_csv("7"));
-
-    let fitted = read_nonmem_csv(f.path(), None, None).unwrap();
-    assert_eq!(cens_warnings(&fitted).len(), 1, "{:?}", fitted.warnings);
-
-    let design = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
-    let pop = read_nonmem_csv_filtered_routed(f.path(), &design).unwrap();
-    assert!(
-        cens_warnings(&pop).is_empty(),
-        "nothing scores a design point, so neither bloq_method clause is true: {:?}",
-        pop.warnings
-    );
-    // The flag itself is still carried through — the read is unchanged, only the
-    // message is withheld.
-    assert_eq!(pop.subjects[0].cens, vec![7, 0]);
-}
-
-/// B12. A whole `CENS` number outside `i8` **saturates** to `±127` before any
-/// engine sees it — that is deliberate, since every consumer routes on the sign
-/// and `200i64 as i8` would wrap to `-56` and flip the tail. But the message has
-/// to name the cell the user has to go and fix, so it quotes the text as
-/// written: `200`, not the `127` it is scored as (#1509 review, finding 2).
-///
-/// Mutation that must redden it: format the `i8` instead of the cell.
-#[test]
-fn an_out_of_range_cens_is_quoted_as_written_not_as_it_saturates() {
-    // (cell, the value it saturates to, the tail it is scored on, the other tail)
-    for (cell, saturated, tail, other) in [
-        ("200", "127", "lower", "upper"),
-        ("-200", "-128", "upper", "lower"),
-        // A float spelling of the same whole number reads as that number (#1502)
-        // and is quoted the way it is spelled.
-        ("200.0", "127", "lower", "upper"),
-    ] {
-        let f = write_csv(&cens_obs_csv(cell));
-        let pop = read_nonmem_csv(f.path(), None, None)
-            .unwrap_or_else(|e| panic!("{cell}: a whole number is not rejected: {e}"));
-        let w = cens_warnings(&pop);
-        assert_eq!(w.len(), 1, "{cell}: {w:?}");
-        let m = &w[0];
-        assert!(
-            m.starts_with(&format!("W_CENS_UNEXPECTED subject 1: CENS={cell} ")),
-            "{cell}: the cell as written, in the byte-stable prefix: {m}"
-        );
-        assert!(
-            !m.contains(saturated),
-            "{cell}: must not report the saturated {saturated}, which is in no cell of the file: {m}"
-        );
-        // The saturated flag is still what is scored, and the sign it keeps is
-        // what the tail clause names.
-        assert!(m.contains(&format!("{tail} tail")), "{cell}: {m}");
-        assert!(!m.contains(other), "{cell}: {m}");
-        assert_eq!(
-            pop.subjects[0].cens[0],
-            saturated.parse::<i8>().unwrap(),
-            "{cell}: the flag the engines score is the saturated one"
-        );
+    // "a blank or "." cell reads as 0".
+    for missing in ["", "."] {
+        let pop = read(&cens_cell_csv(missing)).unwrap_or_else(|e| panic!("{missing:?}: {e}"));
+        assert_eq!(pop.subjects[0].cens, vec![0, 0], "{missing:?}");
     }
+
+    // "rename it in the dataset or in the model's [data] block": either way the
+    // column is no longer the flag, and the same file reads.
+    let renamed = cens_cell_csv("abc").replacen("CENS", "CENSNOTE", 1);
+    let pop = read(&renamed).unwrap_or_else(|e| panic!("renamed in the dataset: {e}"));
+    assert_eq!(pop.subjects[0].cens, vec![0, 0]);
+    let f = write_csv(&cens_cell_csv("abc"));
+    let aside = [("CENSNOTE".to_string(), "CENS".to_string())];
+    let pop = read_nonmem_csv_mapped(f.path(), None, None, &aside)
+        .unwrap_or_else(|e| panic!("renamed aside in [data]: {e}"));
+    assert_eq!(pop.subjects[0].cens, vec![0, 0]);
+}
+
+/// B6b. The error is raised only where the flag is read: a Gaussian observation row
+/// that the `[data_selection]` filter keeps. The same `abc` cell on a dose row (with
+/// and without an active filter), on an observation row the filter removes, on a row
+/// the reader skips for its missing `DV`, and on a discrete-endpoint row reads without
+/// error; on the kept Gaussian row it is an error. One test, so moving the check
+/// across any of these boundaries reddens it: raised in the filter context, (ii)
+/// dies; raised on every row, (i) dies; raised on every row an active filter keeps,
+/// (i) under the filter dies; raised before the missing-`DV` skip, (iv) dies; raised
+/// whatever the endpoint, (v) dies. The simulation reader's side of (iv) is
+/// `a_cens_cell_holding_no_flag_is_not_read_on_a_simulation_design_row`.
+#[test]
+fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
+    let csv = |dose: &str, dv: &str, cmt: &str, obs: &str| {
+        format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,{dose}\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,{dv},0,0,.,{cmt},{obs}\n"
+        )
+    };
+    let plain = |csv: &str| {
+        let f = write_csv(csv);
+        read_nonmem_csv(f.path(), None, None)
+    };
+
+    // (iii) The kept Gaussian observation row: an error. Every other leg is this
+    // fixture with one thing changed.
+    let err = plain(&csv("0", "4.0", "1", "abc")).expect_err("the scored row rejects `abc`");
+    assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
+
+    // (i) On the dose row, which never reads the cell.
+    let dose = plain(&csv("abc", "4.0", "1", "0")).unwrap_or_else(|e| panic!("dose row: {e}"));
+    assert_eq!(dose.subjects[0].observations, vec![5.0, 4.0]);
+
+    // (ii) On the row `ignore = TIME == 2` removes. NONMEM likewise accepts `abc` on
+    // a record its `IGNORE` removes.
+    let f = write_csv(&csv("0", "4.0", "1", "abc"));
+    let filter = SelectionFilter::from_opts(&["TIME == 2".to_string()], &[], &[])
+        .unwrap_or_else(|e| panic!("filter: {e}"));
+    let removed = read_nonmem_csv_filtered(f.path(), None, None, &filter)
+        .unwrap_or_else(|e| panic!("removed row: {e}"));
+    assert_eq!(
+        removed.subjects[0].observations,
+        vec![5.0],
+        "the rule removes the row"
+    );
+
+    // (i) again, under (ii)'s active filter. The filter keeps the dose row at TIME 0,
+    // and a kept dose row still never reads the cell. Raising the error on every row
+    // an active filter keeps survived every other test (#1506 review, finding 4).
+    let f = write_csv(&csv("abc", "4.0", "1", "0"));
+    let dose_filtered = read_nonmem_csv_filtered(f.path(), None, None, &filter)
+        .unwrap_or_else(|e| panic!("dose row under an active filter: {e}"));
+    assert_eq!(
+        dose_filtered.subjects[0].doses.len(),
+        1,
+        "the filter keeps the dose row"
+    );
+    assert_eq!(dose_filtered.subjects[0].observations, vec![5.0]);
+
+    // (iv) On a row the reader skips because its `DV` is missing (#258).
+    let skipped = plain(&csv("0", ".", "1", "abc")).unwrap_or_else(|e| panic!("missing DV: {e}"));
+    assert_eq!(skipped.subjects[0].observations, vec![5.0]);
+    assert!(
+        skipped
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_MISSING_DV")),
+        "the row was skipped as a missing DV: {:?}",
+        skipped.warnings
+    );
+
+    // (v) On a discrete-endpoint row: the non-Gaussian arms never read `CENS`. Under
+    // the same routing the row on the Gaussian compartment is an error, so the
+    // endpoint is what decides it.
+    let routing = ObsRouting {
+        discrete: [3].into_iter().collect(),
+        ..Default::default()
+    };
+    let routed = |cmt: &str| {
+        let f = write_csv(&csv("0", "1", cmt, "abc"));
+        read_nonmem_csv_filtered_routed(f.path(), &routing)
+    };
+    let discrete = routed("3").unwrap_or_else(|e| panic!("discrete row: {e}"));
+    assert_eq!(discrete.subjects[0].obs_records.len(), 1);
+    assert!(
+        routed("1").is_err(),
+        "the same row on the Gaussian compartment is scored, so it is rejected"
+    );
+}
+
+/// B6b, the simulation reader (#1506 review, finding 1). Under
+/// `MissingDvPolicy::KeepAsDesign` a row whose `DV` is missing is kept as a design
+/// point instead of skipped. It has no observation to censor, so it does not read
+/// `CENS` either. Otherwise a file the fit reader accepts could not be simulated or
+/// predicted from. Two assertions keep the legs honest:
+/// - the `Ok` leg asserts the design row was **kept**, so it cannot pass because the
+///   row is absent;
+/// - the same row with a real `DV` is still an error under the same routing, so the
+///   missing `DV` is what exempts it.
+#[test]
+fn a_cens_cell_holding_no_flag_is_not_read_on_a_simulation_design_row() {
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let read = |dv: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,{dv},0,0,.,1,abc\n"
+        ));
+        read_nonmem_csv_filtered_routed(f.path(), &routing)
+    };
+    let design = read(".").unwrap_or_else(|e| panic!("design row: {e}"));
+    assert_eq!(
+        design.subjects[0].obs_times,
+        vec![1.0, 2.0],
+        "the design row is kept, not skipped"
+    );
+    assert!(
+        design.subjects[0].observations[1].is_nan(),
+        "a design point carries no DV"
+    );
+    assert_eq!(design.subjects[0].cens, vec![0, 0]);
+    let err = read("4.0").expect_err("the same row with a DV reads the flag");
+    assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
+}
+
+/// `W_CENS_UNEXPECTED` is not raised on a simulation design row (the Codex review of
+/// #1509, which applies here too). The warning says how the row is scored under `m3`
+/// and under `drop`, and a design row with no `DV` is scored under neither, so every
+/// claim would be false there. The same row with a real `DV`, under the same routing,
+/// still warns. The gate is asserted from both sides in one test.
+#[test]
+fn w_cens_unexpected_is_not_raised_on_a_simulation_design_row() {
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let warnings = |dv: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,{dv},0,0,.,1,7\n"
+        ));
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing)
+            .unwrap_or_else(|e| panic!("DV {dv:?}: {e}"));
+        assert_eq!(pop.subjects[0].obs_times, vec![1.0, 2.0], "DV {dv:?}");
+        pop.warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .count()
+    };
+    assert_eq!(warnings("."), 0, "a design row is never scored");
+    assert_eq!(warnings("4.0"), 1, "the same row with a DV is");
+}
+
+/// B6b, the time-to-event arm, which exists only under `survival`: a TTE row never
+/// reads `CENS` either, so the same `abc` cell reads without error there. Under the
+/// same routing the row on the Gaussian compartment is an error, so the endpoint is
+/// what decides it.
+#[cfg(feature = "survival")]
+#[test]
+fn a_cens_cell_holding_no_flag_is_not_read_on_a_time_to_event_row() {
+    use crate::types::ObsRecord;
+    let routing = ObsRouting::tte_and_discrete(&[2].into_iter().collect(), &HashSet::new());
+    let read = |cmt: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,5,1,0,0,.,{cmt},abc\n"
+        ));
+        read_nonmem_csv_filtered_routed(f.path(), &routing)
+    };
+    let tte = read("2").unwrap_or_else(|e| panic!("TTE row: {e}"));
+    assert!(
+        matches!(
+            tte.subjects[0].obs_records.as_slice(),
+            [ObsRecord::Event { .. }]
+        ),
+        "{:?}",
+        tte.subjects[0].obs_records
+    );
+    assert!(
+        read("1").is_err(),
+        "the same row on the Gaussian compartment is scored, so it is rejected"
+    );
+}
+
+/// B4 + B5. `W_CENS_UNEXPECTED` quotes the cell as written and names the tail the
+/// engines score it on. Every engine routes on `cens < 0` alone — pinned per site
+/// by `m3_logcdf_scores_an_out_of_domain_flag_by_its_sign` and its three siblings
+/// in `stats::special` and `estimation::sens_cov_hessian`, and on the objective by
+/// `an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop`
+/// — so a positive flag is the lower tail, like 1, and a negative one the upper
+/// tail, like -1. Both signs in one test, so a sign gate stuck on either branch
+/// reddens it; the line is asserted whole, so deleting any clause reddens it too.
+/// Before #1496 PR B, `200` was reported as `CENS=127` and every negative flag as
+/// "(left tail)".
+#[test]
+fn w_cens_unexpected_quotes_the_cell_and_names_the_tail_its_sign_is_scored_on() {
+    let positive = |cell: &str| {
+        format!(
+            "W_CENS_UNEXPECTED subject 1: CENS={cell} is not -1, 0, or 1; under \
+             bloq_method = m3 a positive flag is scored on the lower tail, like CENS=1 \
+             (below the LLOQ), and under bloq_method = drop the row is scored as an \
+             ordinary observation"
+        )
+    };
+    let negative = |cell: &str| {
+        format!(
+            "W_CENS_UNEXPECTED subject 1: CENS={cell} is not -1, 0, or 1; under \
+             bloq_method = m3 a negative flag is scored on the upper tail, like CENS=-1 \
+             (above the ULOQ), and under bloq_method = drop the row is scored as an \
+             ordinary observation"
+        )
+    };
+    // The flag as read, and the one `W_CENS_UNEXPECTED` line.
+    let read = |cell: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,5.0,0,0,.,1,{cell}\n"
+        ));
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let lines: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{cell}: {:?}", pop.warnings);
+        (pop.subjects[0].cens[0], lines[0].clone())
+    };
+    // `200` saturates to 127 in the flag, and the line still says 200.
+    for (cell, flag) in [("7", 7), ("7.0", 7), ("+7", 7), ("200", i8::MAX)] {
+        let (read_flag, line) = read(cell);
+        assert_eq!(read_flag, flag, "{cell}");
+        assert_eq!(line, positive(cell));
+        assert!(!line.contains("upper"), "{line}");
+    }
+    for (cell, flag) in [("-2", -2), ("-2.0", -2), ("-200", i8::MIN)] {
+        let (read_flag, line) = read(cell);
+        assert_eq!(read_flag, flag, "{cell}");
+        assert_eq!(line, negative(cell));
+        assert!(!line.contains("lower") && !line.contains("left"), "{line}");
+    }
+    // Under `drop` the flag is still read — by `[data_selection]` and
+    // `suggest_start` — so the line must not call it ignored.
+    for line in [read("7").1, read("-2").1] {
+        assert!(!line.contains("ignor"), "{line}");
+    }
+    // Quoted as every cell a message quotes is: a whole number written with 30
+    // leading zeros is cut after 24 characters rather than copied whole.
+    let long = format!("{}7", "0".repeat(30));
+    assert_eq!(read(&long).1, positive(&format!("{}…", "0".repeat(24))));
+}
+
+/// B7. One `W_CENS_UNEXPECTED` per subject for each sign: the two signs are scored
+/// on different tails, so a subject holding `7` and then `-2` hears about both,
+/// each line quoting that sign's first cell. Same-sign repeats (`8`, `-3`) add
+/// nothing — which is why `test_cens_unexpected_value_warns_once` (`2` then `3`)
+/// still sees one.
+#[test]
+fn w_cens_unexpected_is_reported_once_per_subject_for_each_sign() {
+    let f = write_csv(
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+         1,0,.,1,1,100,1,\n\
+         1,1,5.0,0,0,.,1,7\n\
+         1,2,4.0,0,0,.,1,-2\n\
+         1,3,3.0,0,0,.,1,8\n\
+         1,4,2.0,0,0,.,1,-3\n",
+    );
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(pop.subjects[0].cens, vec![7, -2, 8, -3]);
+    let lines: Vec<&String> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+        .collect();
+    assert_eq!(lines.len(), 2, "one line per sign: {lines:?}");
+    assert!(
+        lines[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 ")
+            && lines[0].contains("lower tail"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("W_CENS_UNEXPECTED subject 1: CENS=-2 ")
+            && lines[1].contains("upper tail"),
+        "{}",
+        lines[1]
+    );
+}
+
+/// B6b, the leg that `a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it`
+/// cannot reach: the row an **active** `[data_selection]` filter *keeps* (#1496).
+///
+/// That test pairs an unfiltered read that rejects with a filtered read whose clause
+/// removes the offending row — two reads that differ by the clause *and* by whether a
+/// filter is compiled at all. Both `CENS` sites sit after the filter's `continue`, so
+/// "the filter kept this row" is the condition they are meant to run under, and nothing
+/// pinned that: `CensCell::NotWhole(cell) if dv_missing || filter.is_some()` on the
+/// reject, and `filter.is_none() &&` on the warning's `if`, each leave the whole suite
+/// green (measured, 137 `io::datareader` tests). A dataset that fits with an `ignore`
+/// clause — which is most of them — would then be back to the silent `0` this issue is
+/// about.
+///
+/// So both legs here hold the filter fixed and vary only **which row the clause names**:
+/// `TIME == 2` removes the offending row, `TIME == 1` removes its clean neighbour and
+/// leaves the offending one in. The removing leg asserts the row really went, or the
+/// pair collapses to two reads of the same population. The message text itself is
+/// pinned by `cens_not_whole_message` and
+/// `w_cens_unexpected_quotes_the_cell_and_names_the_tail_its_sign_is_scored_on`; what is
+/// asserted here is only that the filter does not suppress it.
+#[test]
+fn a_cens_cell_is_still_read_on_an_observation_row_an_active_filter_keeps() {
+    let read = |cell: &str, clause: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,4.0,0,0,.,1,{cell}\n"
+        ));
+        let filter = SelectionFilter::from_opts(&[clause.to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter {clause:?}: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter)
+    };
+
+    // The reject. `TIME == 2` removes the cell, `TIME == 1` keeps it.
+    let removed = read("abc", "TIME == 2").unwrap_or_else(|e| panic!("removed row: {e}"));
+    assert_eq!(
+        removed.subjects[0].observations,
+        vec![5.0],
+        "the clause must remove the offending row, or the two legs read the same rows"
+    );
+    let err = read("abc", "TIME == 1").expect_err("the kept row is scored, so it is read");
+    assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
+
+    // The warning, on the same pair of clauses.
+    let lines = |cell: &str, clause: &str| {
+        let pop = read(cell, clause).unwrap_or_else(|e| panic!("{cell} under {clause:?}: {e}"));
+        let lines: Vec<String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .cloned()
+            .collect();
+        (pop.subjects[0].cens.clone(), lines)
+    };
+    let (cens, quiet) = lines("7", "TIME == 2");
+    assert_eq!(cens, vec![0], "the clause must remove the flagged row");
+    assert!(quiet.is_empty(), "{quiet:?}");
+    let (cens, warned) = lines("7", "TIME == 1");
+    assert_eq!(cens, vec![7], "the clause must keep the flagged row");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(
+        warned[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 "),
+        "{}",
+        warned[0]
+    );
 }

@@ -720,7 +720,8 @@ pub(crate) fn compute_subject_results(
             // and CWRES diagnostics so they match the magnitude-aware OFV.
             let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
 
-            // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
+            // IWRES (NaN on rows censored *for this fit* — see compute_cwres for
+            // CWRES handling).
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
                 &ipred,
@@ -742,8 +743,12 @@ pub(crate) fn compute_subject_results(
                     }
                 }
             }
+            // Only a row the *fit* scored as censored is blanked: under the
+            // default `bloq_method = drop` a `CENS != 0` row was fitted as an
+            // ordinary observation, so it keeps its IWRES (and its weight in
+            // ε-shrinkage, which counts the finite ones) — #1499.
             for (j, c) in subject.cens.iter().enumerate() {
-                if *c != 0 {
+                if model.bloq_method.is_censored_row(*c) {
                     iwres[j] = f64::NAN;
                 }
             }
@@ -779,6 +784,7 @@ pub(crate) fn compute_subject_results(
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
                 r_preds,
+                model.bloq_method,
             );
 
             // OFV contribution

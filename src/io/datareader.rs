@@ -1597,10 +1597,11 @@ fn resolve_row_cmt(row: &[String], cmt_col: Option<usize>) -> (usize, Option<Cmt
     }
 }
 
-/// Longest cell text quoted back in the `W_CMT_DEFAULTED` summary.
+/// Longest cell text quoted back in the `W_CMT_DEFAULTED` summary, and in the two
+/// `CENS` messages (#1496).
 const MAX_CMT_EXAMPLE_LEN: usize = 24;
 
-/// A `CMT` cell rendered safe to interpolate into a warning: trimmed, any embedded
+/// A cell rendered safe to interpolate into a message: trimmed, any embedded
 /// quote or control character replaced, and cut to [`MAX_CMT_EXAMPLE_LEN`] with an
 /// ellipsis.
 ///
@@ -1771,126 +1772,104 @@ impl CmtDefaults {
     }
 }
 
-/// Classify a `CENS` cell: `-1` (above the ULOQ), `0` (quantified), `1` (below the
-/// LLOQ), or `Err` for a cell that is present but is not a whole number at all
-/// (`"1.5"`, `"abc"`, `"inf"`).
+/// A `CENS` cell, read: the flag it holds, or the text that holds none.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CensCell<'a> {
+    /// The flag, and the cell as written (trimmed). A missing cell, an absent
+    /// column and a row shorter than its header are 0.
+    Flag(i8, &'a str),
+    /// Present, but not a whole number: `"1.5"`, `"abc"`, `"inf"`, as written.
+    NotWhole(&'a str),
+}
+
+impl CensCell<'_> {
+    /// The flag a `[data_selection]` rule compares. A cell that is not a whole
+    /// number is 0 here, as it always was: the observation row rejects it only
+    /// once the filter has kept the row, which is where NONMEM rejects it too — it
+    /// accepts `abc` on a record its `IGNORE` removes (#1496).
+    fn selection_flag(self) -> i8 {
+        match self {
+            CensCell::Flag(flag, _) => flag,
+            CensCell::NotWhole(_) => 0,
+        }
+    }
+}
+
+/// Read a `CENS` cell: `-1` (above the ULOQ), `0` (quantified), `1` (below the
+/// LLOQ).
 ///
 /// A float-formatted whole number is that number (#1496): ferx's own sdtab writes
 /// the flag as `1.000000`, and before this read it as 0, scoring the row as a
 /// quantified measurement. Every `i8` literal is exactly an `f64` whole number, so
 /// a cell the old `i8` parse accepted reads as before. A whole number outside `i8`
 /// saturates and keeps its sign — every consumer routes on the sign, while
-/// `200i64 as i8` would wrap to `-56` and flip the tail. A missing cell is 0, as it
-/// always was.
-///
-/// The single classifier: [`parse_cens`] is this with the `Err` collapsed back to
-/// `0`, so the two readings of a cell cannot drift apart.
-fn classify_cens(s: &str) -> Result<i8, ()> {
-    match parse_whole_number_cell(s) {
+/// `200i64 as i8` would wrap to `-56` and flip the tail. A missing cell is 0. A
+/// cell that is not a whole number is [`CensCell::NotWhole`]; what that means is
+/// the caller's to say.
+fn parse_cens(s: &str) -> CensCell<'_> {
+    let t = s.trim();
+    match parse_whole_number_cell(t) {
         // A float-to-integer `as` saturates at `i8::MIN` / `i8::MAX`. Casting
         // through a wider integer first would truncate instead.
-        WholeCell::Value(f) => Ok(f as i8),
-        WholeCell::Missing => Ok(0),
-        WholeCell::NotWhole => Err(()),
+        WholeCell::Value(f) => CensCell::Flag(f as i8, t),
+        WholeCell::Missing => CensCell::Flag(0, t),
+        WholeCell::NotWhole => CensCell::NotWhole(t),
     }
 }
 
-/// Read a `CENS` cell, with a non-whole cell reading as `0` — what every caller
-/// that does not reject such a cell wants.
-fn parse_cens(s: &str) -> i8 {
-    classify_cens(s).unwrap_or(0)
-}
-
-/// Classify a row's `CENS` cell, keeping **the cell as written** on both arms.
-///
-/// An absent column, or a row shorter than its header, is `Ok((0, ""))`
-/// (quantified); a whole number is `Ok((flag, cell))`; a cell that is present but
-/// not a whole number is `Err(cell)` (#1496).
-///
-/// The `Ok` arm carries the text because the flag alone cannot be quoted back: a
-/// whole number outside `i8` has already **saturated** by then, so `200` would be
-/// reported as `CENS=127` and `-200` as `CENS=-128` — the value the engines score
-/// it as, not the value the user has to go and find in the file.
-fn classify_row_cens(row: &[String], cens_col: Option<usize>) -> Result<(i8, &str), &str> {
-    match cens_col.and_then(|c| row.get(c)) {
-        None => Ok((0, "")),
-        Some(cell) => classify_cens(cell)
-            .map(|flag| (flag, cell.as_str()))
-            .map_err(|()| cell.as_str()),
-    }
-}
-
-/// Resolve a row's `CENS` flag, reading an unreadable cell as `0`.
-///
-/// One resolver for the observation row and the `[data_selection]` filter's
-/// [`RowContext`], so a rule on `CENS` sees the flag the likelihood scores (#1496)
-/// — as [`resolve_row_cmt`] does for `CMT`. The observation site takes
-/// [`classify_row_cens`] instead, because only there is the cell consumed: a
-/// record the filter removes is never scored, and NONMEM likewise reports no
-/// error for a text cell on an `IGNORE`d record.
-fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> i8 {
+/// Resolve a row's `CENS` cell; an absent column, or a row shorter than its
+/// header, is flag 0 (quantified). One resolver for the observation row and the
+/// `[data_selection]` filter's [`RowContext`], so a rule on `CENS` sees the flag the
+/// likelihood scores (#1496) — as [`resolve_row_cmt`] does for `CMT`.
+fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> CensCell<'_> {
     cens_col
         .and_then(|c| row.get(c))
-        .map_or(0, |s| parse_cens(s))
+        .map_or(CensCell::Flag(0, ""), |s| parse_cens(s))
 }
 
-/// The error a `CENS` cell that is not a whole number earns on an observation row
-/// the fit will score (#1496).
+/// The error for a `CENS` cell that is not a whole number, on an observation row
+/// that reads the flag (#1496).
 ///
-/// Shape and wording follow [`validate_ss`]: subject, the row's written time, the
-/// cell, the domain, and what to do. Before this the cell read as `0` and the row
-/// was scored as a quantified measurement at its own `DV` — under
-/// `bloq_method = m3` a possibly-BLQ row scored as a measurement at the LLOQ, with
-/// no warning of any kind. The message names no tail and no `bloq_method`: the
-/// reader cannot see which one is set, and the cell says nothing about a tail
-/// anyway.
-///
-/// `time` is the user-written (`raw_time`) value, so the message names the row's
-/// own time. The cell goes through [`truncate_example`], since it is arbitrary
-/// user text that lands in this string.
+/// NONMEM 7.6.0 rejects `abc` on an observation record and accepts it on a record
+/// its `IGNORE` removes. ferx rejects it only on the rows that read the flag:
+/// Gaussian observation rows that carry a `DV` and that the `[data_selection]` filter
+/// keeps, whether the fit reader or the simulation reader reads the file. Unlike
+/// NONMEM, ferx therefore accepts `abc` on a dose record, since a dose row never reads
+/// the flag. `1.5` is rejected too, although NONMEM reads it as a number: NONMEM
+/// leaves its meaning to the user's code, while ferx gives `CENS` a fixed meaning,
+/// and `SS=1.5` is already an error ([`validate_ss`]). The shape follows
+/// [`validate_ss`]; `time` is the row's `raw_time`, the value the user wrote.
 fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
     format!(
         "subject {id}, time {time}: CENS=\"{}\" is not a whole number; expected -1 \
-         (above the ULOQ), 0 (quantified), or 1 (below the LLOQ). Fix the cell; if \
-         this column is not a censoring flag, rename it.",
+         (above the ULOQ), 0 (quantified) or 1 (below the LLOQ), and a blank or \".\" \
+         cell reads as 0. Correct the cell, or, if this column is not a censoring \
+         flag, rename it in the dataset or in the model's [data] block.",
         truncate_example(cell)
     )
 }
 
-/// `W_CENS_UNEXPECTED`: an observation row's `CENS` cell is a whole number outside
-/// the domain (`7`, `-2`).
+/// `W_CENS_UNEXPECTED`: an observation row's `CENS` cell is a whole number other
+/// than -1, 0 or 1 (#1496).
 ///
-/// Such a value is not rejected — it is scored, by its **sign**: `m3_logcdf` and
-/// the three other consumers read `cens < 0` as the upper tail and every other
-/// nonzero flag as the lower one, so `7` is scored as `1` and `-2` as `-1`. The
-/// sentence therefore names the tail the engines actually take (#1496); until this
-/// it said "(left tail)" for both, which was wrong for every negative flag.
-///
-/// Both clauses are conditional on `bloq_method`, which the reader cannot see.
-/// Under the default `drop` the row is scored as an ordinary observation — not
-/// "ignored": `suggest_start` and the `[data_selection]` context read the flag
-/// whatever `bloq_method` is.
-///
-/// `cell` is the text **as written**, not the `i8`: a whole number outside `i8`
-/// saturates at `±127`, so the flag alone would report `200` as `CENS=127` and
-/// `-200` as `CENS=-128`, sending the reader to look for a cell that is not in
-/// the file. The saturated flag is still what is *scored*, and the tail it picks
-/// is what the rest of the sentence names — saturation keeps the sign, which is
-/// all four consumers read. It goes through [`truncate_example`] for the same
-/// reason [`cens_not_whole_error`] does: a mis-mapped column puts arbitrary text
-/// here.
-fn cens_unexpected_warning(id: &str, cens: i8, cell: &str) -> String {
-    // The prefix through `CENS=` is byte-stable: `reader_warning_code` reads the
-    // code off the head of the message, and the `ferx check` report quotes it.
-    let (tail, scored_as) = if cens < 0 {
-        ("upper", -1)
+/// Every engine routes on the flag's sign alone — `cens < 0` picks the upper tail
+/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `foce_tail_jet`,
+/// and nothing compares against `1` or `-1` — so under `bloq_method = m3` a
+/// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
+/// see `bloq_method`, so the message states both methods. `cell` is quoted as
+/// written, since a whole number outside `i8` has already saturated: `200` is not
+/// `127`. The caller raises it only on a row that carries a `DV`; a simulation
+/// design row is scored under neither method.
+fn cens_unexpected_warning(id: &str, flag: i8, cell: &str) -> String {
+    let (sign, tail) = if flag < 0 {
+        ("negative", "upper tail, like CENS=-1 (above the ULOQ)")
     } else {
-        ("lower", 1)
+        ("positive", "lower tail, like CENS=1 (below the LLOQ)")
     };
     format!(
         "W_CENS_UNEXPECTED subject {id}: CENS={} is not -1, 0, or 1; under \
-         bloq_method = m3 the row is scored on the {tail} tail, as {scored_as}; \
-         under bloq_method = drop the row is scored as an ordinary observation",
+         bloq_method = m3 a {sign} flag is scored on the {tail}, and under \
+         bloq_method = drop the row is scored as an ordinary observation",
         truncate_example(cell)
     )
 }
@@ -2169,20 +2148,9 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
-    // Whether this read produces rows a *likelihood* will score, which is the only
-    // reading that consumes `CENS` (#1496). True for the fitting read
-    // (`MissingDvPolicy::Skip`, `read_population_for`); false for
-    // `read_population_for_simulation`, whose `KeepAsDesign` rows are design
-    // points the simulator writes a DV into — nothing there reads the flag, and
-    // the two `bloq_method` clauses `cens_unexpected_warning` states are both
-    // about scoring, so neither the reject nor the warning applies. Such a cell
-    // reads back as `0`, exactly as it did before #1496.
-    let cens_is_scored = routing.missing_dv == MissingDvPolicy::Skip;
-    // One `W_CENS_UNEXPECTED` per sign per subject: the sentence differs by sign
-    // (which tail the flag is scored on), so a single latch would report one tail
-    // for a subject whose cells span both.
-    let mut cens_invalid_warned_lower = false;
-    let mut cens_invalid_warned_upper = false;
+    // One `W_CENS_UNEXPECTED` per subject for each sign, since the two signs are
+    // scored on different tails (#1496): `[positive, negative]`.
+    let mut cens_unexpected_warned = [false; 2];
     // Rows that survived the data-selection filter, carry a nonzero AMT, yet
     // were not classified as a dose (EVID not 1/4) — their AMT was silently
     // dropped. Reported as a population summary so a degenerate dose-free fit
@@ -2372,7 +2340,7 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .and_then(|s| parse_unsigned_cell::<usize>(s))
                 .is_some_and(|ss| ss > 0);
-            let cens_for_ctx = resolve_row_cens(row, cens_col);
+            let cens_for_ctx = resolve_row_cens(row, cens_col).selection_flag();
             // Raw (unparsed) covariate cell strings for this row, keyed
             // lowercased. Lets string filters compare a non-numeric label column
             // (NONMEM's `IGNORE(C.EQ.C)`) that the numeric `locf_state` map drops.
@@ -2803,48 +2771,38 @@ fn parse_subject(
                 // the times, and every downstream |DV| consumer already guards on
                 // `is_finite`.
                 let dv = if dv_missing { f64::NAN } else { dv };
-                // The one site that *consumes* the flag, and so the one that
-                // rejects a cell nothing can read (#1496). The
-                // `[data_selection]` context above still reads such a cell as
-                // `0`: it runs before the filter's `continue`, and a record the
-                // filter removes is never scored — NONMEM reports no error for a
-                // text cell on an `IGNORE`d record either.
-                //
-                // …and only under a reading that will score the row: see
-                // `cens_is_scored` above. Under `KeepAsDesign` the cell is read
-                // back to `0`, exactly as it did before #1496.
-                let (cens_flag, cens_cell) = match classify_row_cens(row, cens_col) {
-                    Ok(pair) => pair,
-                    Err(cell) if cens_is_scored => {
-                        return Err(cens_not_whole_error(id, raw_time, cell))
+                // The row the filter kept and the likelihood scores, so the one
+                // place a `CENS` cell holding no flag is an error (#1496). A dose
+                // row, a non-Gaussian row, a row the filter removed and a row the
+                // fit reader skips for its missing DV never get here, and never read
+                // the cell. A design row with no DV, which the simulation reader
+                // keeps (`MissingDvPolicy::KeepAsDesign`), does get here. It has no
+                // observation to censor and is never scored, so a cell that holds
+                // no flag is read as 0 there rather than rejected, and an
+                // out-of-domain flag is not warned about below. Both readers
+                // therefore accept the same rows, and a file that fits can be
+                // simulated from.
+                let (cens_flag, cens_cell) = match resolve_row_cens(row, cens_col) {
+                    CensCell::Flag(flag, cell) => (flag, cell),
+                    CensCell::NotWhole(cell) if dv_missing => (0, cell),
+                    CensCell::NotWhole(cell) => {
+                        return Err(cens_not_whole_error(id, raw_time, cell));
                     }
-                    // The `parse_cens` collapse, spelled out: a cell holding no
-                    // flag is `0` for a read that never consumes it.
-                    Err(cell) => (0, cell),
                 };
                 obs_times.push(time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
-                // Only -1 (above ULOQ), 0 (quantified), and 1 (below LLOQ) are
-                // meaningful. Any other whole number is still scored by the M3
-                // likelihood, on the tail its *sign* picks (`m3_logcdf` reads
-                // `cens < 0` as the upper tail and every other nonzero flag as
-                // the lower one), so flag it rather than silently mis-scoring the
-                // row — and say which tail. Latched per sign: a subject holding
-                // both `7` and `-2` has two different coercions to report, and
-                // one latch would name only the first.
-                // Gated on `cens_is_scored` for the same reason the reject is,
-                // and separately from it: both clauses of the sentence describe
-                // how a `bloq_method` *scores* the row, and a design row is not
-                // scored at all, so under `KeepAsDesign` both would be false.
-                if cens_is_scored && !matches!(cens_flag, -1 | 0 | 1) {
-                    let warned = if cens_flag < 0 {
-                        &mut cens_invalid_warned_upper
-                    } else {
-                        &mut cens_invalid_warned_lower
-                    };
+                // Only -1 (above the ULOQ), 0 (quantified) and 1 (below the LLOQ)
+                // are codes. Under M3 any other whole number is scored by its sign
+                // alone — a positive flag on the lower tail, like 1, a negative one
+                // on the upper tail, like -1 — so say so rather than score the row
+                // silently. Once per subject for each sign, since the tails differ.
+                // Not on a design row with no DV: nothing scores it, so every claim
+                // the warning makes about scoring would be false there.
+                if !dv_missing && !matches!(cens_flag, -1 | 0 | 1) {
+                    let warned = &mut cens_unexpected_warned[usize::from(cens_flag < 0)];
                     if !*warned {
                         parse_warnings.push(cens_unexpected_warning(id, cens_flag, cens_cell));
                         *warned = true;

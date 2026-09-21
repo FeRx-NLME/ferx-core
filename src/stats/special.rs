@@ -1192,54 +1192,50 @@ mod tests {
         }
     }
 
-    /// B8 (#1496), site 2 of 4: **`m3_censored_kernel`**, `stats/special.rs`.
-    ///
-    /// The kernel routes on the flag's sign, so an out-of-domain flag is scored
-    /// as the in-domain flag of its own sign — the fact `W_CENS_UNEXPECTED`'s
-    /// sentence states ("scored on the lower tail, as 1").
-    ///
-    /// Mutation that must redden it: `cens < 0` → `cens == -1` in
-    /// `m3_censored_kernel` (only). Bit-exact, since the claim is that the two
-    /// calls take the *same* branch, not that they are close.
-    #[test]
-    fn m3_censored_kernel_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
-        let (y, f, v, d) = (10.0, 12.0, 4.0, 0.3);
-        let at = |cens: i8| {
-            let (h, z, m) = m3_censored_kernel(y, f, v, d, cens);
-            [h.to_bits(), z.to_bits(), m.to_bits()]
-        };
-        assert_eq!(at(7), at(1), "m3_censored_kernel: a positive flag is 1");
-        assert_eq!(at(-2), at(-1), "m3_censored_kernel: a negative flag is -1");
-        // The straddle: without it both equalities hold for a function that
-        // ignores `cens` entirely.
-        assert_ne!(at(1), at(-1), "m3_censored_kernel: the tails must differ");
+    /// Bit patterns of a tuple, so `NaN` compares and `-0.0` is not `0.0`.
+    fn bits<const N: usize>(xs: [f64; N]) -> [u64; N] {
+        xs.map(f64::to_bits)
     }
 
-    /// B8 (#1496), site 3 of 4: **`m3_censored_outer`**, `stats/special.rs`.
-    ///
-    /// Its own site, not a restatement of the kernel's: it signs `∂m/∂f` a second
-    /// time from `cens` after taking `(h, z, m)` from the kernel.
-    ///
-    /// Mutations: `cens < 0` → `cens == -1` in `m3_censored_outer` reddens this
-    /// one **and leaves the kernel's green**, which is what localises it; the
-    /// same edit in `m3_censored_kernel` reddens both, since this composes it.
+    /// #1496, site `m3_censored_kernel` (`cens < 0`): a `CENS` flag outside -1/0/1
+    /// is scored by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — as
+    /// `W_CENS_UNEXPECTED` tells the user. `y ≠ f` and `dv_df ≠ 0`, so every output
+    /// carries the tail sign and the two tails differ.
     #[test]
-    fn m3_censored_outer_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
-        let (y, f, v, d, d2) = (10.0, 12.0, 4.0, 0.3, 0.05);
+    fn m3_censored_kernel_scores_an_out_of_domain_flag_by_its_sign() {
         let at = |cens: i8| {
-            let (g1, g2, cz, cm) = m3_censored_outer(y, f, v, d, d2, cens);
-            [g1.to_bits(), g2.to_bits(), cz.to_bits(), cm.to_bits()]
+            let (h, z, m) = m3_censored_kernel(10.0, 12.0, 4.0, 0.3, cens);
+            [h, z, m]
         };
-        assert_eq!(at(7), at(1), "m3_censored_outer: a positive flag is 1");
-        assert_eq!(at(-2), at(-1), "m3_censored_outer: a negative flag is -1");
-        assert_ne!(at(1), at(-1), "m3_censored_outer: the tails must differ");
-        // `d2` must be live, or the second signing (`∂m/∂f`) is unreachable and
-        // this test cannot tell site 3 from site 2.
-        let flat = m3_censored_outer(y, f, v, d, 0.0, -1);
-        assert_ne!(
-            flat.1.to_bits(),
-            m3_censored_outer(y, f, v, d, d2, -1).1.to_bits(),
-            "the curvature term must depend on d2"
-        );
+        assert!(at(1).iter().chain(at(-1).iter()).all(|x| x.is_finite()));
+        assert_ne!(bits(at(1)), bits(at(-1)), "the two tails differ here");
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                bits(at(flag)),
+                bits(at(code)),
+                "m3_censored_kernel: CENS={flag} must score as CENS={code}"
+            );
+        }
+    }
+
+    /// #1496, site `m3_censored_outer` (its own `cens < 0`, which signs `∂m/∂f`): as
+    /// the kernel test above. The outer calls the kernel, so a kernel that tests
+    /// `cens == -1` reddens this test too; the reverse does not hold — with the
+    /// kernel intact, only this test sees the outer's own sign.
+    #[test]
+    fn m3_censored_outer_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| {
+            let (g1, g2, cz, cm) = m3_censored_outer(10.0, 12.0, 4.0, 0.3, 0.05, cens);
+            [g1, g2, cz, cm]
+        };
+        assert!(at(1).iter().chain(at(-1).iter()).all(|x| x.is_finite()));
+        assert_ne!(bits(at(1)), bits(at(-1)), "the two tails differ here");
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                bits(at(flag)),
+                bits(at(code)),
+                "m3_censored_outer: CENS={flag} must score as CENS={code}"
+            );
+        }
     }
 }

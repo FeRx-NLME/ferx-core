@@ -359,11 +359,16 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
   ```
 
   A fixed point needs `E[∇Q(x*, η)] = 0`, which is the stationarity condition of
-  the averaged objective, so no Jensen term arises. σ rides the same step and
-  does **not** additionally take `mstep_damping`'s blend — applying both would
-  step σ at `γ²`. One gradient sweep is cheaper than the `mstep_maxiter·(n+1)`
-  population passes the derivative-free solve costs, so this M-step runs every
-  iteration rather than every third during exploration.
+  the averaged objective, so no Jensen term arises. σ takes the same Newton
+  *direction* as every other coordinate, but the step gives it a **target** that
+  `damp_mstep_sigma_variance` then moves it a `γ_σ = min(γ, 0.2, γ_mstep)`
+  fraction of the way to, on the variance scale — the same
+  [#1445](https://github.com/FeRx-NLME/ferx-core/issues/1445) policy the
+  derivative-free arms use, not a second copy of it. That is a smaller *gain* on
+  the step, not the blend stacked on top of it (which really would move σ at
+  `γ²`). One gradient sweep is cheaper than the `mstep_maxiter·(n+1)` population
+  passes the derivative-free solve costs, so this M-step runs every iteration
+  rather than every third during exploration.
 
 `mstep_draws = K`
 : Averages the *derivative-free* M-step objective over this iteration's η draw
@@ -418,23 +423,44 @@ importance-sampled −2 log L on every one — best on busulfan (−5.14), busul
 5.36 → 2.45 s, thiotepa 215 → 94 s), because one gradient sweep per iteration replaces a
 derivative-free solve whose cost is `mstep_maxiter·(n+1)` population passes.
 
-**Against.** On the sparse combined-error fixture of #1445 — 300 subjects with a median
-of one observation each, truth `combined(prop = 0.13, add = 1.8)` — it scatters the
-*minority* additive σ:
+**Against — the σ half, fixed in
+[#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480).** As #1458 shipped it,
+`score_sa` stepped σ at the shared γ and in packed (log σ) units, which is #1445's two
+defects at once: during exploration `γ = 1`, so that is a *full* Newton step to one
+draw's score root with no Robbins-Monro averaging, and a log-scale blend is a geometric
+mean of the σ sequence. On the sparse combined-error fixture of #1445 — 300 subjects
+with a median of one observation each, truth `combined(prop = 0.13, add = 1.8)` — it
+scattered the *minority* additive σ. Measured seeds 1 / 2 / 3, `ci-test`, aarch64:
 
-| seeds 1 / 2 / 3 | `ADD_ERR` (truth 1.8) |
-|---|---|
-| `bobyqa` | 1.99 / 1.62 / 1.59 |
-| `score_sa` | 0.85 / 0.38 / 2.66 |
+| | `ADD_ERR` (truth 1.8) | cross-seed sd |
+|---|---|---|
+| `bobyqa` (the default) | 1.33 / 1.83 / 2.17 | 0.42 |
+| `score_sa` as #1458 shipped it | **0.84 / 0.52 / 1.13** | 0.31 |
+| `score_sa` with the γ_σ schedule only | 0.87 / 0.99 / 1.20 | 0.17 |
+| `score_sa` after #1480 | 1.90 / 1.86 / 2.11 | 0.14 |
 
-a 7× seed spread against 1.25×, and two of the three seeds outside a factor of two of
-truth. The objective cannot see it: the FOCE readout differs by under 2 units across all
-six fits, and the benchmark suite's −2 log L prefers `score_sa`. This is the same channel
-#1445 is about — a variance component identified only where `σ_add` and `σ_prop·f` are
-comparable — and it is why `tests/saem_combined_error.rs` scores it against **simulation
-truth** rather than against another estimator. A default has to be safe for the parameter
-the likelihood barely constrains, so `score_sa` stays opt-in and is worth reaching for on
-a model with a free θ that has no ETA.
+The third row is why the fix is both halves: the schedule alone still leaves seed 1 at
+0.87, under the factor-of-two gate of 0.9. The objective could not see any of it — the
+FOCE readout differs by under 2 units across all those fits, and the benchmark suite's
+−2 log L prefers `score_sa` throughout. This is the same channel #1445 is about, a
+variance component identified only where `σ_add` and `σ_prop·f` are comparable, and it
+is why `tests/saem_combined_error.rs` scores it against **simulation truth** rather than
+against another estimator.
+
+**Against — the θ half, still open (#1480).** On the #619 `covmuref_power` anchor, whose
+`TH_WT` carries no ETA and therefore moves only through this channel, `score_sa` at the
+default 150/250 schedule reaches **0.746** against NONMEM SAEM's 0.921 — outside the
+0.12 window the default solver satisfies. It is slow rather than wrong: at 300/700 it
+lands at **0.9845** (|Δ| 0.063) while `bobyqa` at that same schedule *overshoots* to
+1.1485 (|Δ| 0.227). So the window is a property of the estimator and the schedule
+together, and `score_sa` needs a longer run on a θ that starts far from its optimum.
+`tests/saem_covariate_mu_ref.rs` keeps the anchor at 300/700 live and gates the
+default-schedule arm on the open issue.
+
+A default has to be safe for the parameter the likelihood barely constrains and has to
+converge in the schedule it ships with, so `score_sa` stays opt-in. It is worth reaching
+for on a model with a free θ that has no ETA, with a longer schedule than the default if
+that θ starts far away.
 
 One further thing #1449 measured: `score_sa`'s score/information sweep does not reuse the
 cached event schedule, so on a model whose `[individual_parameters]` read `TIME` or a

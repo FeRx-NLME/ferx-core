@@ -1212,17 +1212,23 @@ fn classify_warning_roundtrips_every_engine_message() {
         ),
         // Covariance step regularised — present in all three severity tiers.
         (
-            "Covariance step regularized: eigenvalue floor applied to FD Hessian \
-                 (1 of 3 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
-                 severity: minor). Standard errors are likely reliable.",
+            "Covariance step regularized: eigenvalue floor applied to the FD Hessian \
+                 (1 of 3 free-block eigenvalues clipped; min eig = 1.200e-6, max eig = 8.4e3, \
+                 |min eig|/max eig = 0.00e0, floor = 8.4e-14; worst variance inflation from \
+                 the floor = 1.050e0\u{d7}; severity: minor). Standard errors are likely reliable.",
             Warning,
             "covariance_regularized",
         ),
+        // #520: the analytic-R-matrix spelling of the same warning must classify identically —
+        // the route is named in the text, so a taxonomy keyed on the wrong half of the sentence
+        // would split one code into two.
         (
-            "Covariance step regularized: eigenvalue floor applied to FD Hessian \
-                 (3 of 5 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
-                 severity: severe). Standard errors are likely unreliable; \
-                 SIR-based confidence intervals are recommended.",
+            "Covariance step regularized: eigenvalue floor applied to the analytic R-matrix \
+                 (3 of 5 free-block eigenvalues clipped; min eig = -1.2e-6, max eig = 8.4e3, \
+                 |min eig|/max eig = 1.43e-10, floor = 8.4e-14; worst variance inflation from \
+                 the floor = unbounded; severity: severe). Standard errors for the affected \
+                 parameters come mostly from the floor rather than from the data and are not \
+                 reliable; SIR-based confidence intervals are recommended.",
             Warning,
             "covariance_regularized",
         ),
@@ -2165,6 +2171,34 @@ fn subject_has_censored_observation_reflects_cens_flags() {
     assert!(s.has_censored_observation());
     s.cens = vec![-1, 0];
     assert!(s.has_censored_observation());
+}
+
+/// #1499: the one predicate the likelihood and the residual diagnostics share.
+/// `Drop` keeps a flagged row as an ordinary observation — the documented
+/// meaning of the default — so only `M3` reads the flag at all. Both sides of
+/// the gate in one body: a predicate stuck on either branch reddens it.
+#[test]
+fn bloq_method_reads_the_cens_flag_only_under_m3() {
+    for &flag in &[1_i8, -1, 7] {
+        assert!(
+            BloqMethod::M3.is_censored_row(flag),
+            "m3 must treat CENS={flag} as censored (m3_logcdf reads the sign)"
+        );
+        assert!(
+            !BloqMethod::Drop.is_censored_row(flag),
+            "drop must treat CENS={flag} as an ordinary observation"
+        );
+    }
+    assert!(!BloqMethod::M3.is_censored_row(0));
+    assert!(!BloqMethod::Drop.is_censored_row(0));
+
+    // The subject-level form follows the row-level one, and an empty `cens`
+    // (a dataset with no CENS column) is never censored.
+    assert!(BloqMethod::M3.has_censored_row(&[0, 1]));
+    assert!(!BloqMethod::M3.has_censored_row(&[0, 0]));
+    assert!(!BloqMethod::Drop.has_censored_row(&[0, 1]));
+    assert!(!BloqMethod::M3.has_censored_row(&[]));
+    assert!(!BloqMethod::Drop.has_censored_row(&[]));
 }
 
 #[test]

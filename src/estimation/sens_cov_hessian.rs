@@ -4884,32 +4884,27 @@ mod tests {
         // and lives in `subject_sensitivities_cov`, not in a model-level field.
     }
 
-    /// B8 (#1496), site 4 of 4: **`foce_tail_jet`**,
-    /// `estimation/sens_cov_hessian.rs`.
-    ///
-    /// The covariance step's FOCE M3 tail routes on the flag's sign like the
-    /// three scoring sites, so an out-of-domain flag lands on the in-domain flag
-    /// of its own sign here too — which is what lets
-    /// `W_CENS_UNEXPECTED`'s sentence speak for the whole engine rather than for
-    /// the likelihood alone.
-    ///
-    /// Mutation that must redden it: `cens < 0` → `cens == -1` in
-    /// `foce_tail_jet` (only).
+    /// #1496, site `foce_tail_jet` (`cens < 0`): a `CENS` flag outside -1/0/1 is scored
+    /// by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — as
+    /// `W_CENS_UNEXPECTED` tells the user. `y ≠ μ`, so every partial carries the tail
+    /// sign and the two tails differ.
     #[test]
-    fn foce_tail_jet_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
-        let (y, mu, var) = (10.0, 12.0, 4.0);
-        let jet = |cens: i8| {
-            let j = foce_tail_jet(y, mu, var, cens);
-            [
-                j.mu.to_bits(),
-                j.var.to_bits(),
-                j.mumu.to_bits(),
-                j.muvar.to_bits(),
-                j.varvar.to_bits(),
-            ]
+    fn foce_tail_jet_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| {
+            let j = foce_tail_jet(10.0, 12.0, 4.0, cens);
+            [j.mu, j.var, j.mumu, j.muvar, j.varvar].map(f64::to_bits)
         };
-        assert_eq!(jet(7), jet(1), "foce_tail_jet: positive → 1");
-        assert_eq!(jet(-2), jet(-1), "foce_tail_jet: negative → -1");
-        assert_ne!(jet(1), jet(-1), "foce_tail_jet: the two tails must differ");
+        assert!(at(1)
+            .iter()
+            .chain(at(-1).iter())
+            .all(|&b| f64::from_bits(b).is_finite()));
+        assert_ne!(at(1), at(-1), "the two tails differ here");
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                at(flag),
+                at(code),
+                "foce_tail_jet: CENS={flag} must score as CENS={code}"
+            );
+        }
     }
 }
