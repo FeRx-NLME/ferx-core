@@ -3356,3 +3356,189 @@ fn a_cens_rule_in_data_selection_removes_the_same_rows_on_both_spellings() {
         "`ignore = CENS == 1` must remove the `1.0` rows too"
     );
 }
+
+/// A4. `EVID`. A float-formatted `1.0` is a dose. Before #1496 it read as 0, so
+/// every dose became an unscored `MDV=1` observation and the fit ran without drug.
+#[test]
+fn a_float_formatted_evid_column_reads_like_its_integer_twin() {
+    let read = |dose: &str, obs: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+             1,0,.,{dose},100,1,1\n\
+             1,1,5.0,{obs},.,1,0\n\
+             1,12,.,{dose},100,1,1\n\
+             1,13,4.0,{obs},.,1,0\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("1", "0");
+    let float = read("1.0", "0.0");
+    let times = |p: &Population| {
+        p.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        times(&integer),
+        vec![0.0, 12.0],
+        "the integer leg has two doses"
+    );
+    assert_eq!(times(&float), times(&integer), "`1.0` is EVID 1, a dose");
+    assert_eq!(
+        float.subjects[0].observations,
+        integer.subjects[0].observations
+    );
+    assert!(
+        float.warnings.is_empty(),
+        "no dose may be reported as not dosed, got {:?}",
+        float.warnings
+    );
+}
+
+/// A5. `MDV`. The fixture needs an *observation* row carrying `MDV=1` and a real
+/// `DV`: on a dose row the flag decides nothing, which is why float-formatting the
+/// stock warfarin file's whole `MDV` column changes no number at all. The straddle
+/// is asserted, so the row cannot quietly stop being the one the flag excludes.
+#[test]
+fn a_float_formatted_mdv_flag_excludes_the_row_its_integer_twin_excludes() {
+    let read = |one: &str, zero: &str, flagged: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+             1,0,.,1,100,1,{one}\n\
+             1,1,5.0,0,.,1,{zero}\n\
+             1,2,4.0,0,.,1,{flagged}\n\
+             1,3,3.0,0,.,1,{zero}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("1", "0", "1");
+    let float = read("1.0", "0.0", "1.0");
+    let unflagged = read("1", "0", "0");
+    // The straddle: the flag on that row is what excludes it.
+    assert_eq!(unflagged.subjects[0].observations, vec![5.0, 4.0, 3.0]);
+    assert_eq!(integer.subjects[0].observations, vec![5.0, 3.0]);
+    assert_eq!(
+        float.subjects[0].observations, integer.subjects[0].observations,
+        "`MDV=1.0` must exclude the row as `MDV=1` does"
+    );
+}
+
+/// A6. `ADDL`. `ADDL=2.0` is two additional doses. Before #1496 it read as 0 and
+/// the train collapsed to its first dose, with no warning.
+#[test]
+fn a_float_formatted_addl_expands_like_its_integer_twin() {
+    let read = |addl: &str, zero: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,II,ADDL\n\
+             1,0,.,1,100,1,1,24,{addl}\n\
+             1,1,5.0,0,.,1,0,0,{zero}\n\
+             1,50,4.0,0,.,1,0,0,{zero}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("2", "0");
+    let float = read("2.0", "0.0");
+    let times = |p: &Population| {
+        p.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .collect::<Vec<_>>()
+    };
+    // More doses than dose rows: the expansion is live on the integer leg.
+    assert_eq!(times(&integer), vec![0.0, 24.0, 48.0]);
+    assert_eq!(
+        times(&float),
+        times(&integer),
+        "`ADDL=2.0` is two additional doses"
+    );
+}
+
+/// A7. The occasion column. `1.0` / `2.0` are occasions 1 and 2, not two rows of
+/// occasion 0 reported as `W_IOV_OCC_MISSING`.
+#[test]
+fn a_float_formatted_occasion_column_reads_like_its_integer_twin() {
+    let read = |first: &str, second: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,OCC\n\
+             1,0,.,1,100,1,1,{first}\n\
+             1,1,5.0,0,.,1,0,{first}\n\
+             1,7,.,1,100,1,1,{second}\n\
+             1,8,4.0,0,.,1,0,{second}\n"
+        ));
+        read_nonmem_csv(f.path(), None, Some("OCC")).unwrap()
+    };
+    let integer = read("1", "2");
+    let float = read("1.0", "2.0");
+    assert_eq!(integer.subjects[0].occasions, vec![1, 2]);
+    assert_eq!(float.subjects[0].occasions, integer.subjects[0].occasions);
+    assert_eq!(
+        float.subjects[0].dose_occasions,
+        integer.subjects[0].dose_occasions
+    );
+    assert!(
+        !float
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_IOV_OCC_MISSING")),
+        "a readable occasion is not a missing one, got {:?}",
+        float.warnings
+    );
+}
+
+/// A8. `SS` inside `[data_selection]`. On the dose row itself `SS=1.0` already read
+/// as steady state (it goes through `validate_ss` as a float); the filter context
+/// read it as `0`, so `ignore = SS == 1` removed nothing.
+#[test]
+fn an_ss_rule_in_data_selection_removes_the_same_doses_on_both_spellings() {
+    let read = |one: &str, zero: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,II,SS\n\
+             1,0,.,1,100,1,1,24,{one}\n\
+             1,1,5.0,0,.,1,0,0,{zero}\n\
+             1,24,.,1,100,1,1,0,{zero}\n\
+             1,25,4.0,0,.,1,0,0,{zero}\n"
+        ));
+        let filter = SelectionFilter::from_opts(&["SS == 1".to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap()
+    };
+    let integer = read("1", "0");
+    let float = read("1.0", "0.0");
+    let times = |p: &Population| {
+        p.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .collect::<Vec<_>>()
+    };
+    // The integer leg removes the steady-state dose and keeps the other.
+    assert_eq!(times(&integer), vec![24.0]);
+    assert_eq!(
+        times(&float),
+        times(&integer),
+        "`ignore = SS == 1` must remove `SS=1.0`"
+    );
+}
+
+/// `FREMTYPE`, the last integer site: `1.0` / `2.0` are FREM covariate types 1
+/// and 2, not two rows of type 0 (an ordinary observation).
+#[test]
+fn a_float_formatted_fremtype_column_reads_like_its_integer_twin() {
+    let read = |pk: &str, cov1: &str, cov2: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,FREMTYPE\n\
+             1,0,.,1,100,1,1,{pk}\n\
+             1,1,5.0,0,.,1,0,{pk}\n\
+             1,1,70.0,0,.,1,0,{cov1}\n\
+             1,1,30.0,0,.,1,0,{cov2}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("0", "1", "2");
+    let float = read("0.0", "1.0", "2.0");
+    assert_eq!(integer.subjects[0].fremtype, vec![0, 1, 2]);
+    assert_eq!(float.subjects[0].fremtype, integer.subjects[0].fremtype);
+}

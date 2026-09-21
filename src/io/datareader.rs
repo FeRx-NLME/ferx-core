@@ -1397,10 +1397,6 @@ fn parse_f64_or_nan(s: &str) -> f64 {
     }
 }
 
-fn parse_usize(s: &str) -> usize {
-    s.parse::<usize>().unwrap_or(0)
-}
-
 /// Parse an `L2` grouping-id cell. NONMEM writes an integer, but pandas/R
 /// exports commonly float-format the whole column (`"10.0"`, `"11.0"`) once any
 /// row is blank — so a strict `i64` parse would silently ungroup every record
@@ -2219,7 +2215,7 @@ fn parse_subject(
         let evid = effective_evid(row, evid_col, amt_col);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
-            .map(|s| parse_usize(s))
+            .and_then(|s| parse_unsigned_cell::<usize>(s))
             .unwrap_or(0);
         // Parse OCC. When iov_column is set but a row's value is missing or
         // unparseable, count it (caller emits a single summary warning) and
@@ -2265,8 +2261,8 @@ fn parse_subject(
                 .unwrap_or(f64::NAN);
             let ss_for_ctx = ss_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s) > 0)
-                .unwrap_or(false);
+                .and_then(|s| parse_unsigned_cell::<usize>(s))
+                .is_some_and(|ss| ss > 0);
             let cens_for_ctx = resolve_row_cens(row, cens_col);
             // Raw (unparsed) covariate cell strings for this row, keyed
             // lowercased. Lets string filters compare a non-numeric label column
@@ -2464,7 +2460,7 @@ fn parse_subject(
             // ADDL expansion: add additional doses at time + k*II for k=1..=addl.
             let addl = addl_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .and_then(|s| parse_unsigned_cell::<usize>(s))
                 .unwrap_or(0);
             if addl > 0 {
                 if ii <= 0.0 {
@@ -2523,7 +2519,7 @@ fn parse_subject(
             let dv = parse_f64(row.get(dv_col).map(|s| s.as_str()).unwrap_or("0"));
             // Resolved exactly as the dose path resolves it: a missing or
             // unparseable cell defaults to compartment 1 and is counted, rather
-            // than falling to `parse_usize`'s 0 (an invalid compartment). The
+            // than falling to a bare integer parse's 0 (an invalid compartment). The
             // count is deferred until `skip_missing_dv` is known below, so a row
             // the reader drops is not reported as one it routed.
             let (cmt, cmt_default_cause) = resolve_row_cmt(row, cmt_col);
@@ -2723,7 +2719,7 @@ fn parse_subject(
                 if fremtype_col.is_some() {
                     let ft = fremtype_col
                         .and_then(|c| row.get(c))
-                        .and_then(|s| s.parse::<u16>().ok())
+                        .and_then(|s| parse_unsigned_cell::<u16>(s))
                         .unwrap_or(0);
                     fremtype.push(ft);
                 }
