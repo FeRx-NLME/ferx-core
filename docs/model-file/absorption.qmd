@@ -1044,25 +1044,51 @@ a 20-subject / 240-observation single-dose oral dataset simulated from the model
 proportional SD 0.15). The NONMEM control stream, dataset, and ferx model live in
 `nonmem_anchor/` in the repository.
 
-| Quantity | Truth | NONMEM | ferx (default tols) | ferx (`ode_reltol=ode_abstol=1e-9`) |
-|----------|-------|--------|---------------------|-------------------------------------|
-| OFV      | —     | −1077.13 | −1069.07 | **−1076.67** |
-| TVCL     | 5.0   | 5.386  | 5.240 | 5.453 (+1.2%) |
-| TVV      | 50.0  | 56.169 | 52.563 | 55.759 (−0.7%) |
-| TVKA     | 1.0   | 0.952  | 1.018 | 0.950 (−0.2%) |
-| TVMTT    | 1.0   | 0.965  | 1.007 | 0.966 (+0.1%) |
-| TVN      | 3.0   | 3.133  | 3.033 | 3.128 (−0.2%) |
-| ω²(CL)   | 0.09  | 0.0480 | 0.0783 | 0.0409 (−15%) |
-| ω²(V)    | 0.09  | 0.0431 | 0.0950 | 0.0489 (+14%) |
-| σ² (prop)| 0.0225 | 0.0255 | 0.0253 | 0.0254 (−0.4%) |
+| Quantity | Truth | NONMEM | ferx (default tols) |
+|----------|-------|--------|---------------------|
+| OFV      | —     | −1077.13 | **−1077.1258** |
+| TVCL     | 5.0   | 5.386  | 5.3855 |
+| TVV      | 50.0  | 56.169 | 56.1694 |
+| TVKA     | 1.0   | 0.952  | 0.9523 |
+| TVMTT    | 1.0   | 0.965  | 0.9651 |
+| TVN      | 3.0   | 3.133  | 3.1332 |
+| ω²(CL)   | 0.09  | 0.0480 | 0.0480 |
+| ω²(V)    | 0.09  | 0.0431 | 0.0431 |
+| σ² (prop)| 0.0225 | 0.0255 | 0.0255 |
 
-With NONMEM-equivalent ODE accuracy, the objective function agrees to **0.46
-units**, all fixed effects to **~1%**, and the variance components bracket NONMEM
-within sampling noise (n=20). The looser default tolerances (`ode_reltol=1e-4`,
-`ode_abstol=1e-6`) recover the fixed effects well but inject integration noise
-into the FOCEI Hessian that inflates the ω² estimates. **For accurate
-variance-component estimates on transit (and other stiff) ODE models, tighten
-`ode_reltol`/`ode_abstol` toward `1e-9`** via `[fit_options]`.
+**At the default tolerances ferx matches NONMEM to every figure NONMEM prints** — including
+both variance components, which the fixed effects had always agreed on but ω² had not. The
+apparent departure from truth in ω² is a property of this 20-subject dataset, not of either
+engine: both recover ≈0.048 / 0.043 against a simulated 0.09.
+
+### Tolerance sensitivity {#transit-tolerance}
+
+The same fit swept across four orders of magnitude of `ode_reltol` / `ode_abstol`, re-measured
+2026-09-16 on `nonmem_anchor/transit_savic_fit.ferx` (#520):
+
+| `ode_reltol` / `ode_abstol` | OFV | ω²(CL) | ω²(V) | SE(TVMTT) | wall (20 subj, 2 threads) |
+|---|---|---|---|---|---|
+| **`1e-4` / `1e-6` (default)** | **−1077.1258** | **0.04800** | **0.04307** | **0.05271** | 1.5 s |
+| `1e-6` / `1e-8` | −1077.1256 | 0.04800 | 0.04307 | 0.05270 | 1.9 s (1.3×) |
+| `1e-8` / `1e-10` | −1077.1256 | 0.04800 | 0.04307 | 0.05271 | 2.7 s (1.8×) |
+| `1e-10` / `1e-12` | −1077.1256 | 0.04800 | 0.04307 | 0.05271 | 3.9 s (2.5×) |
+
+Every reported quantity is flat to four significant figures across the whole sweep; the only
+thing tightening buys is a 2.5× longer fit. **There is no reason to tighten `ode_reltol` on a
+transit model for the sake of the estimates.**
+
+::: {.callout-note}
+## This page used to say the opposite
+
+Before 2026-09-16 this section carried a table showing ω² off by ~15 % at the default and advised
+tightening `ode_reltol` / `ode_abstol` toward `1e-9`. That measurement was taken on 2026-06-17,
+two days after `transit()` landed, and it no longer reproduces: the exact analytic FOCE/FOCEI
+gradient (#367 / #381) and the analytic covariance R-matrix for `[odes]` models (#1291) both
+arrived after it, and the analytic route differentiates the trajectory consistently however
+loosely it is integrated. Standard errors on the **finite-difference** covariance route are a
+separate question — see the `ode_reltol` row in
+[fit options](fit-options.qmd#ode-solver-tolerances) and issue #520.
+:::
 
 ### Freijer & Post inverse-Gaussian (`igd`)
 

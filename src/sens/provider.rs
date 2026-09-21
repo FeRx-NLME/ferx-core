@@ -38,6 +38,7 @@ use super::num::PkNum;
 use super::one_cpt::{one_cpt_conc_g, one_cpt_ig_conc_g, one_cpt_transit_conc_g};
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::{two_cpt_conc_g, two_cpt_ig_conc_g, two_cpt_transit_conc_g};
+use crate::estimation::cov_diagnostics::CovScopeDecline;
 use crate::types::{
     CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_CV2,
     PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3,
@@ -5287,15 +5288,32 @@ pub(crate) enum ThirdOrderAxes {
     EtaOnly,
 }
 
-fn covariance_sensitivities(
+/// Which clause of the covariance scope gate declines `model`/`subject`, or `None` when the
+/// exact analytic R-matrix assembly may serve them (#520 C2).
+///
+/// **This is the gate**, not a description of it. [`covariance_sensitivities`] calls it and
+/// tests `.is_some()`, so the clause a user is told about in the `covariance_regularized`
+/// message is the clause that actually fired — there is no second copy to drift. The order of
+/// the arms is the order the clauses were evaluated in before they carried names, which also
+/// keeps the cheap predicates ahead of the two that walk the subject.
+///
+/// The gate is **not** redundant with [`subject_sensitivities`] returning `Some`: that
+/// predicate has grown well past the covariance assembly's derivation (LTBS since #665/#673,
+/// expression scaling, Form-C readouts). Handing the Gaussian-endpoint assembly a jet from any
+/// of those would not fail — it would return a plausible, wrong Hessian, i.e. wrong standard
+/// errors with no symptom. So the scope is asserted positively here and kept deliberately
+/// narrow; everything else keeps the finite-difference covariance, which is correct for all of
+/// them.
+///
+/// The clauses are aligned with the exclusions `analytic_outer_gradient_available` and
+/// `pop_nll_opts` already encode, rather than derived independently — PR #953 review findings
+/// 2/4/5/9 were all the same mistake, a gate written from scratch that then disagreed with the
+/// two predicates that had already enumerated this scope.
+pub(crate) fn covariance_scope_decline(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
     iov: bool,
-    axes: ThirdOrderAxes,
-    base_in: Option<SubjectSens>,
-) -> Option<SubjectSens> {
+) -> Option<CovScopeDecline> {
     let model_supported = if model.ode_spec.is_some() && iov {
         crate::sens::ode_provider::ode_iov_supported(model)
     } else if model.ode_spec.is_some() {
@@ -5305,60 +5323,90 @@ fn covariance_sensitivities(
     } else {
         analytical_supported(model)
     };
-    // Scope gate. This is **not** redundant with `subject_sensitivities` returning `Some`:
-    // that predicate has grown well past the covariance assembly's derivation (LTBS since
-    // #665/#673, expression scaling, Form-C readouts). Handing
-    // the Gaussian-endpoint assembly a jet from any of those would not fail — it would return a
-    // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
-    // asserted positively here and kept deliberately narrow; everything else keeps the
-    // finite-difference covariance, which is correct for all of them.
-    //
-    // The clauses below are aligned with the exclusions `analytic_outer_gradient_available`
-    // and `pop_nll_opts` already encode, rather than derived independently — PR #953 review
-    // findings 2/4/5/9 were all the same mistake, a gate written from scratch that then
-    // disagreed with the two predicates that had already enumerated this scope.
-    if !model_supported
-        // `gradient = fd` is the user's opt-out from analytic sensitivities. It is the
-        // first clause of `analytic_outer_gradient_available` for the same reason: someone
-        // who hit a bad `Dual2` result and set this must not still receive a covariance
-        // R-matrix built from third-order differences of those same jets.
-        || matches!(model.gradient_method, GradientMethod::Fd)
-        // Non-Gaussian data terms (TTE / discrete / CTMM) fold their likelihood *and* an
-        // FD η-Hessian into `hrh`/`log|H̃|` inside `foce_subject_nll`. The Gaussian `sens/`
-        // assembly cannot express either, so it would silently omit the survival/discrete
-        // information — over-optimistic SEs. Same clause, same reason, as the outer gradient.
-        || model.has_non_gaussian()
-        // FREM substitutes `EPSCOV²` on covariate pseudo-observation rows via
-        // `build_frem_r_override` and suppresses `mult_row`/`ruv` there. This assembly calls
-        // `error_spec.variance_at` / `dvar_df` directly, so it would score those rows with
-        // the PK error model — wrong SEs for exactly the covariate ω block a FREM run
-        // exists to estimate. The gradient twin of this was PR #844.
-        || model.frem_config.is_some()
-        // A `Selected` spec keys endpoints by covariate branch, decoupled from the CMT
-        // column (which is typically all-1 on an analytical single-endpoint model). The
-        // assembly reads `subject.obs_cmts` directly rather than `ErrorSpec::obs_keys`, so
-        // every row would be scored against branch 1's sigma.
-        || matches!(model.error_spec, crate::types::ErrorSpec::Selected { .. })
-        || model.log_transform
-        || (!iov && model.n_kappa > 0)
-        || (iov && (model.n_kappa == 0 || model.has_lagtime()))
-        || !matches!(model.scaling, ScalingSpec::None)
-        || model.analytic_readout.is_some()
-        || !model.analytical_init.is_empty()
-        || model.residual_error_eta.is_some()
-        || !model.residual_correlations.is_empty()
-        || model.has_custom_ruv_magnitude()
-        || (!iov && model.ode_spec.is_none() && subject_routes_to_event_walk(model, subject))
-        // Closed forms use the model-level individual-parameter program. ODE models
-        // validate their separate `ode_spec.indiv_param_program` in
-        // `ode_analytical_supported` / `ode_iov_supported` above.
-        || (model.ode_spec.is_none()
-            && model
-                .indiv_param_partials
-                .indiv_param_program
-                .as_ref()
-                .is_none_or(|p| !prog_covers_required_pk_slots(model, p)))
+    if !model_supported {
+        return Some(CovScopeDecline::ModelOutOfScope);
+    }
+    // `gradient = fd` is the user's opt-out from analytic sensitivities. It is the first
+    // clause of `analytic_outer_gradient_available` for the same reason: someone who hit a bad
+    // `Dual2` result and set this must not still receive a covariance R-matrix built from
+    // third-order differences of those same jets.
+    if matches!(model.gradient_method, GradientMethod::Fd) {
+        return Some(CovScopeDecline::GradientFd);
+    }
+    // Non-Gaussian data terms (TTE / discrete / CTMM) fold their likelihood *and* an FD
+    // η-Hessian into `hrh`/`log|H̃|` inside `foce_subject_nll`. The Gaussian `sens/` assembly
+    // cannot express either, so it would silently omit the survival/discrete information —
+    // over-optimistic SEs. Same clause, same reason, as the outer gradient.
+    if model.has_non_gaussian() {
+        return Some(CovScopeDecline::NonGaussianEndpoint);
+    }
+    // FREM substitutes `EPSCOV²` on covariate pseudo-observation rows via
+    // `build_frem_r_override` and suppresses `mult_row`/`ruv` there. This assembly calls
+    // `error_spec.variance_at` / `dvar_df` directly, so it would score those rows with the PK
+    // error model — wrong SEs for exactly the covariate ω block a FREM run exists to estimate.
+    // The gradient twin of this was PR #844.
+    if model.frem_config.is_some() {
+        return Some(CovScopeDecline::Frem);
+    }
+    // A `Selected` spec keys endpoints by covariate branch, decoupled from the CMT column
+    // (which is typically all-1 on an analytical single-endpoint model). The assembly reads
+    // `subject.obs_cmts` directly rather than `ErrorSpec::obs_keys`, so every row would be
+    // scored against branch 1's sigma.
+    if matches!(model.error_spec, crate::types::ErrorSpec::Selected { .. }) {
+        return Some(CovScopeDecline::SelectedErrorSpec);
+    }
+    if model.log_transform {
+        return Some(CovScopeDecline::LogTransform);
+    }
+    if (!iov && model.n_kappa > 0) || (iov && (model.n_kappa == 0 || model.has_lagtime())) {
+        return Some(CovScopeDecline::IovShape);
+    }
+    if !matches!(model.scaling, ScalingSpec::None) {
+        return Some(CovScopeDecline::ExpressionScale);
+    }
+    if model.analytic_readout.is_some() {
+        return Some(CovScopeDecline::AnalyticReadout);
+    }
+    if !model.analytical_init.is_empty() {
+        return Some(CovScopeDecline::AnalyticalInit);
+    }
+    if model.residual_error_eta.is_some() {
+        return Some(CovScopeDecline::ResidualErrorEta);
+    }
+    if !model.residual_correlations.is_empty() {
+        return Some(CovScopeDecline::ResidualCorrelations);
+    }
+    if model.has_custom_ruv_magnitude() {
+        return Some(CovScopeDecline::CustomRuvMagnitude);
+    }
+    if !iov && model.ode_spec.is_none() && subject_routes_to_event_walk(model, subject) {
+        return Some(CovScopeDecline::EventWalkSubject);
+    }
+    // Closed forms use the model-level individual-parameter program. ODE models validate their
+    // separate `ode_spec.indiv_param_program` in `ode_analytical_supported` / `ode_iov_supported`
+    // above.
+    if model.ode_spec.is_none()
+        && model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .is_none_or(|p| !prog_covers_required_pk_slots(model, p))
     {
+        return Some(CovScopeDecline::IndivParamProgram);
+    }
+    None
+}
+
+fn covariance_sensitivities(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    iov: bool,
+    axes: ThirdOrderAxes,
+    base_in: Option<SubjectSens>,
+) -> Option<SubjectSens> {
+    if covariance_scope_decline(model, subject, iov).is_some() {
         return None;
     }
 

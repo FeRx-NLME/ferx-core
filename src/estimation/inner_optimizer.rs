@@ -333,11 +333,18 @@ pub(crate) fn fd_fallback_warning(
     // A model that already reports FD and runs FD everywhere needs no warning.
     let model_reports_analytic = inner_reports_analytic_model(model);
     if n_fd > 0 && (n_fd < n_total || model_reports_analytic) {
+        // #520 C2: on an `[odes]` model the FD inner gradient differences a numerically
+        // integrated trajectory, so the integrator's tolerance is part of the gradient's
+        // accuracy — measured at 25-120 OFV of stall on TMDD at the default. The note is
+        // `None` on a closed-form model, where there is no integration noise to remove.
+        let tolerance_note =
+            crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model)
+                .unwrap_or_default();
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
              (outside the analytic provider's scope, e.g. steady-state + reset, \
              time-varying covariates + LTBS, or modeled-duration doses); their \
-             results are correct but slower."
+             results are correct but slower.{tolerance_note}"
         ))
     } else {
         None
@@ -370,9 +377,14 @@ fn iov_fd_fallback_warning(
         .map(|(reason, count)| format!("{reason}: {count}"))
         .collect::<Vec<_>>()
         .join("; ");
+    // Same #520 C2 note as the non-IOV twin: the tolerance clause is a property of the model
+    // integrating ODEs, not of which of the two warnings reports it.
+    let tolerance_note =
+        crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model)
+            .unwrap_or_default();
     Some(format!(
         "{n_fd} of {n_total} subjects use finite-difference inner gradients \
-         in the IOV loop ({reason_text}); their results are correct but slower."
+         in the IOV loop ({reason_text}); their results are correct but slower.{tolerance_note}"
     ))
 }
 

@@ -5,6 +5,10 @@
 //! population optimizers, the outer-gradient family, `OuterResult`, and
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
+use crate::estimation::cov_diagnostics::{
+    format_regularized_warning, CovHessianSource, CovRegularizationFacts, CovScopeDecline,
+    OdeToleranceFacts,
+};
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -553,6 +557,45 @@ pub(crate) fn assemble_score_cross_product(
         );
     }
     Ok(s)
+}
+
+/// Which clause kept this fit off the exact analytic covariance R-matrix (#520 C2).
+///
+/// Returns `None` only when the analytic route was in fact taken — so a caller that has already
+/// observed `analytic_cov_hessian(..) == None` and still gets `None` here has found a genuine
+/// drift between this walk and the assembly, and gets [`CovScopeDecline::PerSubjectBail`]
+/// instead of silence.
+///
+/// The three model-level gates `compute_covariance` applies before the assembly are checked in
+/// the order it applies them; everything after that is [`covariance_scope_decline`], which **is**
+/// the gate rather than a description of it, so the named clause cannot drift from the clause
+/// that fired. `iov` is `n_kappa > 0` because the gate declines both of the other combinations
+/// (`!iov && n_kappa > 0` and `iov && n_kappa == 0`), so it is the only value that can pass.
+///
+/// Called only when a regularization warning is about to be emitted on the FD route.
+fn analytic_cov_decline_reason(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+    is_mixture: bool,
+) -> Option<CovScopeDecline> {
+    if !options.analytic_cov_hessian {
+        return Some(CovScopeDecline::Disabled);
+    }
+    if is_mixture {
+        return Some(CovScopeDecline::Mixture);
+    }
+    // Mirrors `analytic_cov_hessian`'s own first bail: an AGQ/Laplace fit anchored on the exact
+    // `H` needs fourth-order sensitivities for `∂²H/∂x²`, which nothing computes.
+    if options.agq_nodes().is_some() && options.hessian_anchor() != HessianAnchor::GaussNewton {
+        return Some(CovScopeDecline::ExactHessianAnchor);
+    }
+    let iov = model.n_kappa > 0;
+    population
+        .subjects
+        .iter()
+        .find_map(|s| crate::sens::provider::covariance_scope_decline(model, s, iov))
+        .or(Some(CovScopeDecline::PerSubjectBail))
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -1301,29 +1344,38 @@ pub(crate) fn compute_covariance(
     // cross-product path returns `S⁻¹` (with a full-rank `S` guaranteed above), so
     // a clipped `R` there would be a misleading note about a matrix it didn't use.
     if inv.n_clipped > 0 && options.covariance_method != CovarianceMethod::CrossProduct {
-        let pct = inv.n_clipped * 100 / n_free.max(1);
-        // Informal thresholds: ≤33 % clipped → minor concern; 34–50 % → caution; >50 % → unreliable.
-        // Note: integer truncation means the boundary moves in steps of 1/n_free; for small
-        // n_free adjacent clipped counts can jump directly from "minor" to "severe".
-        let (severity, interp) = match pct {
-            0..=33 => ("minor", "Standard errors are likely reliable."),
-            34..=50 => (
-                "moderate",
-                "Standard errors should be interpreted with caution; \
-                 consider SIR-based confidence intervals.",
-            ),
-            _ => (
-                "severe",
-                "Standard errors are likely unreliable; \
-                 SIR-based confidence intervals are recommended.",
-            ),
+        // #520 C1/C2 and the label fix. Severity is graded on magnitude (`|min λ| / λ_max` and
+        // the variance inflation the floor caused), never on the clipped count; the route is
+        // named from `analytic_hess`, so "FD Hessian" is no longer printed on the analytic
+        // R-matrix route; and the FD-route-only sentences (which gate clause declined the
+        // analytic route, what tolerance the ODEs integrate at) are attached here, where all of
+        // those facts are in scope. The prose itself lives in `cov_diagnostics` and is
+        // unit-tested cell by cell without a fit.
+        let source = if analytic_hess.is_some() {
+            CovHessianSource::AnalyticRMatrix
+        } else {
+            CovHessianSource::FdStencil
         };
-        let msg = format!(
-            "Covariance step regularized: eigenvalue floor applied to FD Hessian \
-             ({} of {} free-block eigenvalues clipped; min eig = {:.3e}, floor = {:.3e}; \
-             severity: {}). {}",
-            inv.n_clipped, n_free, inv.min_eigenvalue, inv.floor, severity, interp
-        );
+        let facts = CovRegularizationFacts {
+            source,
+            n_clipped: inv.n_clipped,
+            n_free,
+            min_eigenvalue: inv.min_eigenvalue,
+            max_eigenvalue: inv.max_eigenvalue,
+            floor: inv.floor,
+            variance_inflation: inv.variance_inflation,
+            // Resolved only on the FD route, and only here: the walk is one predicate sweep per
+            // subject, which is nothing against the stencil that has just run, but it is not
+            // free on a fit that had no complaint to make.
+            decline: match source {
+                CovHessianSource::FdStencil => {
+                    analytic_cov_decline_reason(model, population, options, is_mixture)
+                }
+                CovHessianSource::AnalyticRMatrix => None,
+            },
+            ode: OdeToleranceFacts::from_model(model),
+        };
+        let msg = format_regularized_warning(&facts);
         if options.verbose {
             eprintln!("  {}", msg);
         }
@@ -1368,10 +1420,23 @@ pub(crate) struct RegularizedInverse {
     /// Smallest eigenvalue of the input matrix (before clipping). `f64::INFINITY`
     /// for 0×0 matrices.
     pub min_eigenvalue: f64,
+    /// Largest eigenvalue of the input matrix. `f64::NEG_INFINITY` for 0×0 matrices.
+    /// Paired with `min_eigenvalue` this gives the scale-free `|min λ| / λ_max` the
+    /// regularization severity is graded on (#520).
+    pub max_eigenvalue: f64,
     /// Floor used for clipping. Same shape rules as `min_eigenvalue`.
     pub floor: f64,
     /// How many eigenvalues fell below the floor and were clipped.
     pub n_clipped: usize,
+    /// Worst, over free coordinates `k`, of
+    /// `inv[k,k] / Σ_{λᵢ ≥ floor} q[k,i]² / λᵢ` — the returned variance divided by the
+    /// variance the **unclipped** part of the spectrum alone supports (#520 C1).
+    ///
+    /// `1.0` when nothing was clipped. `f64::INFINITY` when some coordinate loads entirely on
+    /// floored directions, i.e. its whole reported variance was manufactured by the floor.
+    /// This is the quantity the old count-fraction grading had no access to: it is what turns
+    /// "1 of 13 eigenvalues clipped" into "this SE is inflated 4400×".
+    pub variance_inflation: f64,
 }
 
 /// Invert a symmetric matrix by clipping eigenvalues to a small positive floor.
@@ -1402,8 +1467,10 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
         return Some(RegularizedInverse {
             inverse: DMatrix::zeros(0, 0),
             min_eigenvalue: f64::INFINITY,
+            max_eigenvalue: f64::NEG_INFINITY,
             floor: f64::INFINITY,
             n_clipped: 0,
+            variance_inflation: 1.0,
         });
     }
 
@@ -1465,11 +1532,53 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
     let inv_t = inverse.transpose();
     inverse = (&inverse + &inv_t) * 0.5;
 
+    // Worst per-coordinate variance inflation caused by the floor (#520 C1). `inv[k,k]` is
+    // `Σᵢ q[k,i]² / λ̃ᵢ` over the *clipped* spectrum; the denominator is the same sum restricted
+    // to the directions the floor left alone. Their ratio answers the question the user is
+    // actually asking — "how much of this standard error came out of the floor rather than out
+    // of the data" — which the clipped **count** cannot.
+    //
+    // Computed here rather than by the caller because it needs the eigenvectors, which do not
+    // survive this function. A coordinate whose unclipped mass is exactly zero yields
+    // `f64::INFINITY`, which is a meaningful answer and is formatted as "unbounded", not `inf`.
+    let variance_inflation = if n_clipped == 0 {
+        1.0
+    } else {
+        let mut worst: f64 = 1.0;
+        for k in 0..n {
+            let mut unclipped = 0.0;
+            for i in 0..n {
+                if lambdas[i] >= floor {
+                    unclipped += q[(k, i)] * q[(k, i)] / lambdas[i];
+                }
+            }
+            let total = inverse[(k, k)];
+            if !(total > 0.0) {
+                // A non-positive reconstructed variance is a numerical artefact of the
+                // eigendecomposition, not an inflation; skip rather than fold a negative or
+                // NaN ratio into the max (`f64::max` would silently discard the NaN and keep
+                // whatever the other coordinates produced — CLAUDE.md's fold trap).
+                continue;
+            }
+            let ratio = if unclipped > 0.0 {
+                total / unclipped
+            } else {
+                f64::INFINITY
+            };
+            if ratio > worst {
+                worst = ratio;
+            }
+        }
+        worst
+    };
+
     Some(RegularizedInverse {
         inverse,
         min_eigenvalue: min_eig,
+        max_eigenvalue: max_eig,
         floor,
         n_clipped,
+        variance_inflation,
     })
 }
 
@@ -1705,6 +1814,92 @@ mod tests {
     };
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
     use nalgebra::DMatrix;
+
+    // ── #520 C1: the magnitudes the severity grade is made from ──────────────
+
+    #[test]
+    fn invert_psd_with_floor_reports_the_spectrum_ends_and_no_inflation_when_clean() {
+        // A positive-definite input is inverted exactly: nothing is clipped, so the floor
+        // manufactured no variance and the inflation must be exactly 1.0 — the value that
+        // grades `Minor` however many free parameters there are.
+        let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, 1.0]));
+        let inv = super::invert_psd_with_floor(&m).expect("PD input inverts");
+        assert_eq!(inv.n_clipped, 0);
+        assert!(
+            (inv.max_eigenvalue - 4.0).abs() < 1e-12,
+            "{}",
+            inv.max_eigenvalue
+        );
+        assert!(
+            (inv.min_eigenvalue - 1.0).abs() < 1e-12,
+            "{}",
+            inv.min_eigenvalue
+        );
+        assert_eq!(inv.variance_inflation, 1.0);
+    }
+
+    #[test]
+    fn invert_psd_with_floor_measures_the_variance_the_floor_manufactured() {
+        // The quantity #520 added, checked against a hand computation rather than against a
+        // second implementation. Spectrum {100, -1e-3} rotated 45°, so BOTH coordinates load
+        // half their mass on the negative direction — a fixture where every eigenvector
+        // component is non-zero, so the ratio is finite and can be written down:
+        //
+        //   floor      = 100 * 1e-10 = 1e-8            (max_eig * 1e-10, above the 1e-12 floor)
+        //   inv[k,k]   = 0.5/100 + 0.5/1e-8 = 5e7 + 0.005
+        //   unclipped  = 0.5/100             = 0.005
+        //   inflation  = (5e7 + 0.005) / 0.005 = 1e10 + 1
+        //
+        // Count grades this "1 of 2 clipped" — 50%, "moderate" under the old tiers. Magnitude
+        // grades it severe, which is the whole point.
+        let a = 0.5 * (100.0 + -1e-3);
+        let b = 0.5 * (100.0 - -1e-3);
+        let m = DMatrix::from_row_slice(2, 2, &[a, b, b, a]);
+        let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
+        assert_eq!(inv.n_clipped, 1);
+        assert!(
+            (inv.max_eigenvalue - 100.0).abs() < 1e-9,
+            "{}",
+            inv.max_eigenvalue
+        );
+        assert!(
+            (inv.min_eigenvalue + 1e-3).abs() < 1e-9,
+            "{}",
+            inv.min_eigenvalue
+        );
+        assert!((inv.floor - 1e-8).abs() < 1e-18, "{}", inv.floor);
+        let expected = (0.5 / 100.0 + 0.5 / 1e-8) / (0.5 / 100.0);
+        let rel = (inv.variance_inflation - expected).abs() / expected;
+        assert!(
+            rel < 1e-6,
+            "variance_inflation {} vs hand-computed {expected}",
+            inv.variance_inflation
+        );
+        // And the grade that number produces, end to end.
+        assert_eq!(
+            crate::estimation::cov_diagnostics::grade_severity(
+                inv.min_eigenvalue.abs() / inv.max_eigenvalue,
+                inv.variance_inflation,
+            ),
+            crate::estimation::cov_diagnostics::CovSeverity::Severe,
+        );
+    }
+
+    #[test]
+    fn a_coordinate_supported_only_by_floored_directions_reports_unbounded_inflation() {
+        // The other reachable end: an axis-aligned spectrum, so coordinate 1 loads *entirely*
+        // on the clipped direction and the unclipped part of the spectrum supports no variance
+        // for it at all. The ratio is `+∞`, which `format_regularized_warning` words rather
+        // than printing as `inf`.
+        let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
+        let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
+        assert_eq!(inv.n_clipped, 1);
+        assert!(
+            inv.variance_inflation.is_infinite(),
+            "{}",
+            inv.variance_inflation
+        );
+    }
 
     // ── #1382: the estimator label published alongside the matrix ────────────
 

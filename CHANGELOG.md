@@ -221,6 +221,28 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **The `covariance_regularized` warning is graded on magnitude, names the route it applies
+  to, and says how to get off it** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)).
+  Severity used to be a function of the clipped **count** alone, so a single badly-negative
+  eigenvalue — 1 of 13, 7 % — printed *"severity: minor. Standard errors are likely reliable."*
+  directly above a standard error inflated 4400× and a `%RSE` of 24982. It is now graded on
+  `|min eig| / max eig` and on the worst **variance inflation** the eigenvalue floor caused (how
+  much of a parameter's reported variance came out of the floor rather than out of the data),
+  both of which the message now reports. When the finite-difference stencil served the step, the
+  message additionally names the gate clause that declined the exact analytic covariance
+  R-matrix (`obs_scale`, `gradient = fd`, `method = laplace`, a mixture, a non-Gaussian
+  endpoint, …) with the one-line rewrite where there is one, and — for an `[odes]` model
+  integrating looser than `ode_reltol = 1e-6` / `ode_abstol = 1e-8` — names the tolerances and
+  says that the stencil amplifies integration noise by `1/h²`. No default tolerance changes.
+
+- **The "N of M subjects use finite-difference inner gradients" warning now names the ODE
+  tolerance** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). On an `[odes]` model
+  a finite-difference inner (EBE) gradient reads the integrator's noise directly — measured at
+  25–120 OFV of stall on the TMDD QSS fixture at the default tolerance — so the warning now
+  points at `ode_reltol` / `ode_abstol` (next step `1e-9` if the fit still stalls) and at moving
+  the model into the analytic sensitivity scope. Closed-form models, which have no integration
+  noise to remove, are told nothing extra.
+
 - **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
   that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
   `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
@@ -352,6 +374,12 @@ section of the SDLC for the versioning policy).
 - **A scale tag on a `block_omega` / `block_sigma` / `block_kappa` declaration is now rejected rather than silently ignored**, with its own code `E_BLOCK_VARIANCE_ONLY`. `block_omega (ETA_CL, ETA_V) = [0.07, 0.02, 0.02] (sd)` used to parse as though the tag were absent — every lower-triangle entry read as a variance, `ferx check` reporting the file VALID with zero diagnostics — so a user who wrote standard deviations, the natural reading of the `(sd)` form that *is* accepted on a diagonal `omega`, silently started the run from the wrong initial estimates (on `0.2645751 (sd)` the intended variance is 0.07 and the run started at 0.2645751, a 3.8x error). The block forms take no scale tag, and the repair depends on which one was written - the diagnostic carries it in `suggestion` so a consumer can apply it without reading the prose: after `(sd)`, square each SD into a variance and write the off-diagonals as covariances; after `(variance)` / `(var)`, delete the tag and leave the numbers alone, since the lower triangle was already on that scale and squaring a correct model would break it. **This is a widening reject**, and it goes further than the tag: a `[parameters]` line must now be consumed end to end by exactly one declaration form, at **both** ends. Text after a complete declaration (a stray word, a misspelt `(sdx)`, a token on its own line) is an `E_PARSE` error quoting the line, and so is text before one — `block_sigma PROP ~ 0.04` previously declared a *diagonal* sigma and `; theta TVCL(1, 0.1, 100)` a live theta, since `;` is not a comment marker. A bare `FIX` on its own line after a **level-block** `theta NAME[N](...)` no longer folds onto it either; it used to fix every level silently. All of it used to be dropped without a trace. One small **widening** rides along for consistency: the scale tag now tolerates inner whitespace (`( sd )` as well as `(sd)`) on `omega` / `sigma` / `kappa`, so the grammar, the own-line fold and the block-tag classifier all read the tag the same way. Three more shapes are rejected on the same grounds: a `;` is not a comment marker in a `.ferx` file (unlike NONMEM, where it is; accepting it as one is [#1393](https://github.com/FeRx-NLME/ferx-core/issues/1393)) and does not separate declarations either, so `theta A(1); theta B(2)` - which declared only `A` - must be written one per line, and the message says which of the two a `;` line looks like; a `theta` bound that is present but not a number (`theta TVCL(50, 0.001-10.0)`, `-`, `1e`) used to take the default bound of 1e-9 or 1e9 silently; and a scale tag matches in ASCII case only, since `(ſd)` (U+017F) used to be accepted and then read as a variance, never squared. No bundled `.ferx` file changes (240 files carrying 1,698 logical `[parameters]` lines were checked). Five in-tree snippets did: three Rust test fixtures that had been silently wrong all along (two with a `[fit_options]` key inside `[parameters]`, and one whose two thetas were missing their `theta` keyword, so it declared none), and two documentation examples that joined declarations with `;` (`docs/estimation/tte.qmd`, `docs/estimation/mixture.qmd`), so they never declared the parameters they showed. A file that relied on the old silence will now fail to parse; the repair is to delete the ignored text, or put each declaration on its own line ([#1377](https://github.com/FeRx-NLME/ferx-core/issues/1377)).
 
 ### Fixed
+
+- **The covariance regularization warning no longer says "FD Hessian" on the exact analytic
+  route** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). Since #1291 most Gaussian
+  `[odes]` fits take the analytic R-matrix, which never second-differences the objective and has
+  no stencil and no step size; the message named the finite-difference Hessian on it anyway, so
+  the advice a user acted on was about a route their fit had not taken.
 
 - **A whole number written with a decimal point (`1.0`) in an integer data column now
   reads as that number — `ADDL` and `MDV` used to drop it without a word**
