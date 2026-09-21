@@ -39,6 +39,16 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `CENS` | integer | 0 | Censoring flag. `1` = below LLOQ and `DV` carries the LLOQ; `-1` = above ULOQ and `DV` carries the ULOQ; `0` = quantified. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.qmd). |
 | `L2` | integer | 0 (ungrouped) | Level-2 grouping id (NONMEM data item). Observation rows sharing an `L2` value within a subject form one **correlated observation unit** and pick up the `block_sigma` cross covariance — e.g. the total and unbound rows of one blood draw. `0` / absent = ungrouped. Only affects models with a [`block_sigma`](model-file/error-model.qmd) correlated residual; see [Covariate-selected error models](model-file/error-model.qmd). |
 
+> **An integer column may be float-formatted.** pandas and R write a whole
+> integer column as `1.0`, `2.0`, … once any cell in it is blank, and ferx's own
+> sdtab writes `CENS` as `1.000000`. Every integer column above, `ADDL`, the
+> [occasion column](#occasion-column-iov) and `FREMTYPE` read such a cell as the
+> whole number it spells, as NONMEM does: `ADDL=2.0` is two additional doses,
+> `MDV=1.0` excludes the row, `CENS=1.0` is below the LLOQ, and a
+> [`[data_selection]`](model-file/data-selection.qmd) rule such as
+> `ignore = CENS == 1` removes it
+> ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)).
+
 > **Missing DV on observation rows.** An `EVID=0` row contributes to the
 > likelihood only when its `DV` is present. If the `DV` is missing
 > (`.`, `NA`, or blank), mark the row `MDV=1`. As a safety net, ferx also treats
