@@ -3296,3 +3296,63 @@ fn unsigned_integer_cells_keep_their_type_range_and_exact_literals() {
         Some(9_007_199_254_740_993)
     );
 }
+
+/// A2. The `CENS` observation site. A pandas-shaped export: the dose row's cell is
+/// blank, so the exporter float-formats the whole column. It must read exactly as
+/// its integer twin — both tails — and warn about nothing.
+#[test]
+fn a_float_formatted_cens_column_reads_like_its_integer_twin() {
+    let read = |minus: &str, zero: &str, plus: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,50.0,0,0,.,1,{minus}\n\
+             1,2,7.0,0,0,.,1,{zero}\n\
+             1,3,2.0,0,0,.,1,{plus}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("-1", "0", "1");
+    let float = read("-1.0", "0.0", "1.0");
+    // The integer leg is not trivial: both tails and a quantified row.
+    assert_eq!(integer.subjects[0].cens, vec![-1, 0, 1]);
+    assert_eq!(
+        float.subjects[0].cens, integer.subjects[0].cens,
+        "`-1.0` / `0.0` / `1.0` are the flags -1 / 0 / 1"
+    );
+    for (leg, pop) in [("integer", &integer), ("float", &float)] {
+        assert!(
+            pop.warnings.is_empty(),
+            "{leg}: a well-formed dataset warns about nothing, got {:?}",
+            pop.warnings
+        );
+    }
+}
+
+/// A3. The `CENS` read inside `[data_selection]`. A rule on `CENS` must remove the
+/// rows the likelihood would score as censored, whichever way the flag is spelled.
+/// Paired with A2 so each of the two sites is pinned by its own test: taking the
+/// filter context off the shared resolver leaves A2 green and kills this one.
+#[test]
+fn a_cens_rule_in_data_selection_removes_the_same_rows_on_both_spellings() {
+    let read = |one: &str, zero: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,7.0,0,0,.,1,{zero}\n\
+             1,2,2.0,0,0,.,1,{one}\n\
+             1,3,2.0,0,0,.,1,{one}\n"
+        ));
+        let filter = SelectionFilter::from_opts(&["CENS == 1".to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap()
+    };
+    let integer = read("1", "0");
+    let float = read("1.0", "0.0");
+    // The integer leg removes something: two of its three observations.
+    assert_eq!(integer.subjects[0].observations, vec![7.0]);
+    assert_eq!(
+        float.subjects[0].observations, integer.subjects[0].observations,
+        "`ignore = CENS == 1` must remove the `1.0` rows too"
+    );
+}

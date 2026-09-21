@@ -1793,6 +1793,16 @@ fn parse_cens(s: &str) -> i8 {
     }
 }
 
+/// Resolve a row's `CENS` flag; an absent column, or a row shorter than its
+/// header, is 0 (quantified). One resolver for the observation row and the
+/// `[data_selection]` filter's [`RowContext`], so a rule on `CENS` sees the flag the
+/// likelihood scores (#1496) — as [`resolve_row_cmt`] does for `CMT`.
+fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> i8 {
+    cens_col
+        .and_then(|c| row.get(c))
+        .map_or(0, |s| parse_cens(s))
+}
+
 /// Parse an EVID cell. A missing / blank / unparseable value maps to 0
 /// (observation) — NONMEM's documented default. A float-formatted whole number
 /// (`"1.0"`) is that code (#1496); before, it read as 0, so every dose row was taken
@@ -2257,10 +2267,7 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_usize(s) > 0)
                 .unwrap_or(false);
-            let cens_for_ctx = cens_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_cens(s))
-                .unwrap_or(0);
+            let cens_for_ctx = resolve_row_cens(row, cens_col);
             // Raw (unparsed) covariate cell strings for this row, keyed
             // lowercased. Lets string filters compare a non-numeric label column
             // (NONMEM's `IGNORE(C.EQ.C)`) that the numeric `locf_state` map drops.
@@ -2691,10 +2698,7 @@ fn parse_subject(
                 // the times, and every downstream |DV| consumer already guards on
                 // `is_finite`.
                 let dv = if dv_missing { f64::NAN } else { dv };
-                let cens_flag = cens_col
-                    .and_then(|c| row.get(c))
-                    .map(|s| parse_cens(s))
-                    .unwrap_or(0);
+                let cens_flag = resolve_row_cens(row, cens_col);
                 obs_times.push(time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
