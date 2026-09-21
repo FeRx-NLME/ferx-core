@@ -370,10 +370,14 @@ section of the SDLC for the versioning policy).
   280.5623; `MDV`: 110 → 109 scored observations; `CENS`: 29.6713 → −216.8187), and
   NONMEM 7.6.0 reads the two spellings identically. **A fit on such a file changes
   when you upgrade; that is the fix.** Under `bloq_method = drop` a float-formatted
-  `CENS` column leaves the objective where it was, but its rows now count as censored
-  everywhere else: the sdtab gains its `CENS` column, `CWRES`/`IWRES` are blank on
-  those rows, and the `suggest_start` initial-estimate helpers stop using them. A
-  whole `CENS` value outside −128…127 now keeps its sign instead of reading as 0. What
+  `CENS` column leaves the objective where it was, but these rows now count as
+  censored, as their integer spelling does: the sdtab gains its `CENS` column and the
+  `suggest_start` initial-estimate helpers stop using them. The residual diagnostics
+  then treat them as censored too — blank `IWRES`/`CWRES`, a `NaN` NPD, and moved
+  `CWRES` for the subject's other rows — although the fit scored them as ordinary;
+  that is a defect of its own,
+  [#1499](https://github.com/FeRx-NLME/ferx-core/issues/1499). A whole `CENS` value
+  outside −128…127 now keeps its sign instead of reading as 0. What
   a cell that is not a whole number (`1.5`, `abc`) means is unchanged.
 - **`ferx check --data` reads the dataset through the model file's `[data_selection]`
   clauses, so it no longer rejects a model that fits**
