@@ -720,21 +720,33 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
 /// either way — it is not held fixed, because a different σ changes the next
 /// iteration's score and information.
 ///
-/// Realised when written (8 + 8 iterations, the same short schedule as the test
-/// above): worst |Δ log σ| = **3.280e-2** between `mstep_damping` off and 0.02,
-/// against a 1e-3 bound — 33× headroom. Mutation-checked: handing `step` the
-/// shared `gamma` makes the two arms bit-identical (0.000e0), and no other test
-/// in the repo moves.
+/// **Both call sites, asserted separately.** `run_saem` calls
+/// `MstepScoreSa::step` twice — once from the mu-referenced branch and once from
+/// the `mu_referencing = false` one — and a single fixture only reaches the
+/// first. The two are run here as two arms with the failure message naming
+/// which, so deleting either argument reddens the arm that owns it rather than
+/// being covered for by its twin.
+///
+/// Realised when written (25 + 10 iterations): worst |Δ log σ| = **1.229e-1** on
+/// the mu-referenced branch and **1.212e-1** on the other, between
+/// `mstep_damping` off and 0.005, against a 1e-3 bound — 120× headroom on both.
+/// The schedule is 25 exploration iterations rather than the 8 the test above
+/// uses because γ_σ and γ_mstep only differ *during* exploration, and at 8 + 8
+/// with `mstep_damping = 0.02` the `mu_referencing = false` branch realised
+/// 1.617e-3, only 1.6× the bound — measured, not assumed, and too thin to ship.
+/// Mutation-checked: handing `step` the shared `gamma` makes both arms
+/// bit-identical (0.000e0), and no other test in the repo moves.
 #[test]
 fn mstep_damping_reaches_sigma_under_score_sa() {
     let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
 
-    let run = |damping: Option<f64>| -> Vec<f64> {
+    let run = |mu_referencing: bool, damping: Option<f64>| -> Vec<f64> {
         let opts = FitOptions {
             saem_mstep_solver: SaemMstepSolver::ScoreSa,
             saem_mstep_damping: damping,
-            saem_n_exploration: 8,
-            saem_n_convergence: 8,
+            mu_referencing,
+            saem_n_exploration: 25,
+            saem_n_convergence: 10,
             saem_n_mh_steps: 3,
             ..saem_opts()
         };
@@ -749,33 +761,39 @@ fn mstep_damping_reaches_sigma_under_score_sa() {
         r.sigma.clone()
     };
 
-    let off = run(None);
-    // The control: the same arm twice is bit-identical, so the difference below
-    // is the option and not fit-to-fit noise.
-    assert_eq!(
-        off,
-        run(None),
-        "two score_sa fits at the same seed are not bit-identical — the difference \
-         below cannot be attributed to `mstep_damping`"
-    );
-
-    let damped = run(Some(0.02));
-    assert_eq!(
-        off.len(),
-        damped.len(),
-        "the two arms returned different σ shapes"
-    );
-    let worst = off.iter().zip(damped.iter()).fold(0.0f64, |m, (a, b)| {
-        assert!(
-            a.is_finite() && b.is_finite() && *a > 0.0 && *b > 0.0,
-            "σ must be finite and positive: {a} vs {b}"
+    for (branch, mu_referencing) in [
+        ("mu-referenced branch", true),
+        ("mu_referencing = false branch", false),
+    ] {
+        let off = run(mu_referencing, None);
+        // The control: the same arm twice is bit-identical, so the difference
+        // below is the option and not fit-to-fit noise.
+        assert_eq!(
+            off,
+            run(mu_referencing, None),
+            "{branch}: two score_sa fits at the same seed are not bit-identical — the \
+             difference below cannot be attributed to `mstep_damping`"
         );
-        m.max((a.ln() - b.ln()).abs())
-    });
-    assert!(
-        worst > 1e-3,
-        "`mstep_damping` did not reach σ under score_sa (worst |Δ log σ| = {worst:.3e}) — \
-         γ_σ is being built from the shared γ instead of γ_mstep, so a damped fit steps σ \
-         at the undamped rate. off = {off:?}, damped = {damped:?}"
-    );
+
+        let damped = run(mu_referencing, Some(0.005));
+        assert_eq!(
+            off.len(),
+            damped.len(),
+            "{branch}: the two arms returned different σ shapes"
+        );
+        let worst = off.iter().zip(damped.iter()).fold(0.0f64, |m, (a, b)| {
+            assert!(
+                a.is_finite() && b.is_finite() && *a > 0.0 && *b > 0.0,
+                "{branch}: σ must be finite and positive: {a} vs {b}"
+            );
+            m.max((a.ln() - b.ln()).abs())
+        });
+        assert!(
+            worst > 1e-3,
+            "{branch}: `mstep_damping` did not reach σ under score_sa (worst \
+             |Δ log σ| = {worst:.3e}) — γ_σ is being built from the shared γ instead of \
+             γ_mstep, so a damped fit steps σ at the undamped rate. off = {off:?}, \
+             damped = {damped:?}"
+        );
+    }
 }
