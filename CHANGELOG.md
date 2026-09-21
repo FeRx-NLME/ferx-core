@@ -221,6 +221,22 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **Breaking: a `CENS` cell that is not a whole number is now an error instead of a silent
+  `0`, and `W_CENS_UNEXPECTED` names the tail the row is actually scored on (#1496).** A
+  cell like `abc`, `1.5` or `inf`, on an observation row that survives `[data_selection]`,
+  used to read as `0` — a quantified measurement — with no warning of any kind; under
+  `bloq_method = m3` that scores a possibly-censored row as a measurement at the LOQ. It is
+  now rejected, naming the subject, the row's time, the cell and the accepted values
+  (`-1` / `0` / `1`), in the shape `SS` and `RATE` already use. The check applies only where
+  the flag is consumed: a row a `[data_selection]` clause removes, and a dose row, are not
+  checked — as in NONMEM, which rejects a text cell only on a record its `IGNORE` statements
+  keep. A dataset written with `1.0` is unaffected, since a float-formatted whole number
+  reads as that number (also #1496). Separately, `W_CENS_UNEXPECTED` — for a whole number
+  outside the domain, such as `7` or `-2` — said "treated as censored (left tail)" for every
+  value it fired on, while every consumer routes on the flag's **sign**: `7` is scored like
+  `1` (lower tail) and `-2` like `-1` (upper tail). The message now names the right tail, and
+  is reported once per *sign* per subject, so a subject carrying both is told about both.
+
 - **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
   that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
   `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they

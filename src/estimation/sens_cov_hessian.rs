@@ -4883,4 +4883,33 @@ mod tests {
         // same limitation. The flip-flop reroute (finding 5) is likewise parameter-dependent
         // and lives in `subject_sensitivities_cov`, not in a model-level field.
     }
+
+    /// B8 (#1496), site 4 of 4: **`foce_tail_jet`**,
+    /// `estimation/sens_cov_hessian.rs`.
+    ///
+    /// The covariance step's FOCE M3 tail routes on the flag's sign like the
+    /// three scoring sites, so an out-of-domain flag lands on the in-domain flag
+    /// of its own sign here too — which is what lets
+    /// `W_CENS_UNEXPECTED`'s sentence speak for the whole engine rather than for
+    /// the likelihood alone.
+    ///
+    /// Mutation that must redden it: `cens < 0` → `cens == -1` in
+    /// `foce_tail_jet` (only).
+    #[test]
+    fn foce_tail_jet_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
+        let (y, mu, var) = (10.0, 12.0, 4.0);
+        let jet = |cens: i8| {
+            let j = foce_tail_jet(y, mu, var, cens);
+            [
+                j.mu.to_bits(),
+                j.var.to_bits(),
+                j.mumu.to_bits(),
+                j.muvar.to_bits(),
+                j.varvar.to_bits(),
+            ]
+        };
+        assert_eq!(jet(7), jet(1), "foce_tail_jet: positive → 1");
+        assert_eq!(jet(-2), jet(-1), "foce_tail_jet: negative → -1");
+        assert_ne!(jet(1), jet(-1), "foce_tail_jet: the two tails must differ");
+    }
 }

@@ -1191,4 +1191,55 @@ mod tests {
             assert_relative_eq!(one_minus_erf.grad[0], q.grad[0], max_relative = 1e-9);
         }
     }
+
+    /// B8 (#1496), site 2 of 4: **`m3_censored_kernel`**, `stats/special.rs`.
+    ///
+    /// The kernel routes on the flag's sign, so an out-of-domain flag is scored
+    /// as the in-domain flag of its own sign — the fact `W_CENS_UNEXPECTED`'s
+    /// sentence states ("scored on the lower tail, as 1").
+    ///
+    /// Mutation that must redden it: `cens < 0` → `cens == -1` in
+    /// `m3_censored_kernel` (only). Bit-exact, since the claim is that the two
+    /// calls take the *same* branch, not that they are close.
+    #[test]
+    fn m3_censored_kernel_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
+        let (y, f, v, d) = (10.0, 12.0, 4.0, 0.3);
+        let at = |cens: i8| {
+            let (h, z, m) = m3_censored_kernel(y, f, v, d, cens);
+            [h.to_bits(), z.to_bits(), m.to_bits()]
+        };
+        assert_eq!(at(7), at(1), "m3_censored_kernel: a positive flag is 1");
+        assert_eq!(at(-2), at(-1), "m3_censored_kernel: a negative flag is -1");
+        // The straddle: without it both equalities hold for a function that
+        // ignores `cens` entirely.
+        assert_ne!(at(1), at(-1), "m3_censored_kernel: the tails must differ");
+    }
+
+    /// B8 (#1496), site 3 of 4: **`m3_censored_outer`**, `stats/special.rs`.
+    ///
+    /// Its own site, not a restatement of the kernel's: it signs `∂m/∂f` a second
+    /// time from `cens` after taking `(h, z, m)` from the kernel.
+    ///
+    /// Mutations: `cens < 0` → `cens == -1` in `m3_censored_outer` reddens this
+    /// one **and leaves the kernel's green**, which is what localises it; the
+    /// same edit in `m3_censored_kernel` reddens both, since this composes it.
+    #[test]
+    fn m3_censored_outer_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
+        let (y, f, v, d, d2) = (10.0, 12.0, 4.0, 0.3, 0.05);
+        let at = |cens: i8| {
+            let (g1, g2, cz, cm) = m3_censored_outer(y, f, v, d, d2, cens);
+            [g1.to_bits(), g2.to_bits(), cz.to_bits(), cm.to_bits()]
+        };
+        assert_eq!(at(7), at(1), "m3_censored_outer: a positive flag is 1");
+        assert_eq!(at(-2), at(-1), "m3_censored_outer: a negative flag is -1");
+        assert_ne!(at(1), at(-1), "m3_censored_outer: the tails must differ");
+        // `d2` must be live, or the second signing (`∂m/∂f`) is unreachable and
+        // this test cannot tell site 3 from site 2.
+        let flat = m3_censored_outer(y, f, v, d, 0.0, -1);
+        assert_ne!(
+            flat.1.to_bits(),
+            m3_censored_outer(y, f, v, d, d2, -1).1.to_bits(),
+            "the curvature term must depend on d2"
+        );
+    }
 }

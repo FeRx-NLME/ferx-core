@@ -1771,33 +1771,109 @@ impl CmtDefaults {
     }
 }
 
-/// Read a `CENS` cell: `-1` (above the ULOQ), `0` (quantified), `1` (below the
-/// LLOQ).
+/// Classify a `CENS` cell: `-1` (above the ULOQ), `0` (quantified), `1` (below the
+/// LLOQ), or `Err` for a cell that is present but is not a whole number at all
+/// (`"1.5"`, `"abc"`, `"inf"`).
 ///
 /// A float-formatted whole number is that number (#1496): ferx's own sdtab writes
 /// the flag as `1.000000`, and before this read it as 0, scoring the row as a
 /// quantified measurement. Every `i8` literal is exactly an `f64` whole number, so
 /// a cell the old `i8` parse accepted reads as before. A whole number outside `i8`
 /// saturates and keeps its sign — every consumer routes on the sign, while
-/// `200i64 as i8` would wrap to `-56` and flip the tail. A missing or non-whole
-/// cell is 0, as it always was.
-fn parse_cens(s: &str) -> i8 {
+/// `200i64 as i8` would wrap to `-56` and flip the tail. A missing cell is 0, as it
+/// always was.
+///
+/// The single classifier: [`parse_cens`] is this with the `Err` collapsed back to
+/// `0`, so the two readings of a cell cannot drift apart.
+fn classify_cens(s: &str) -> Result<i8, ()> {
     match parse_whole_number_cell(s) {
         // A float-to-integer `as` saturates at `i8::MIN` / `i8::MAX`. Casting
         // through a wider integer first would truncate instead.
-        WholeCell::Value(f) => f as i8,
-        WholeCell::Missing | WholeCell::NotWhole => 0,
+        WholeCell::Value(f) => Ok(f as i8),
+        WholeCell::Missing => Ok(0),
+        WholeCell::NotWhole => Err(()),
     }
 }
 
-/// Resolve a row's `CENS` flag; an absent column, or a row shorter than its
-/// header, is 0 (quantified). One resolver for the observation row and the
-/// `[data_selection]` filter's [`RowContext`], so a rule on `CENS` sees the flag the
-/// likelihood scores (#1496) — as [`resolve_row_cmt`] does for `CMT`.
+/// Read a `CENS` cell, with a non-whole cell reading as `0` — what every caller
+/// that does not reject such a cell wants.
+fn parse_cens(s: &str) -> i8 {
+    classify_cens(s).unwrap_or(0)
+}
+
+/// Classify a row's `CENS` cell. An absent column, or a row shorter than its
+/// header, is `Ok(0)` (quantified); a cell that is present but not a whole number
+/// is `Err`, carrying the cell as written so the caller can quote it (#1496).
+fn classify_row_cens(row: &[String], cens_col: Option<usize>) -> Result<i8, &str> {
+    match cens_col.and_then(|c| row.get(c)) {
+        None => Ok(0),
+        Some(cell) => classify_cens(cell).map_err(|()| cell.as_str()),
+    }
+}
+
+/// Resolve a row's `CENS` flag, reading an unreadable cell as `0`.
+///
+/// One resolver for the observation row and the `[data_selection]` filter's
+/// [`RowContext`], so a rule on `CENS` sees the flag the likelihood scores (#1496)
+/// — as [`resolve_row_cmt`] does for `CMT`. The observation site takes
+/// [`classify_row_cens`] instead, because only there is the cell consumed: a
+/// record the filter removes is never scored, and NONMEM likewise reports no
+/// error for a text cell on an `IGNORE`d record.
 fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> i8 {
     cens_col
         .and_then(|c| row.get(c))
         .map_or(0, |s| parse_cens(s))
+}
+
+/// The error a `CENS` cell that is not a whole number earns on an observation row
+/// the fit will score (#1496).
+///
+/// Shape and wording follow [`validate_ss`]: subject, the row's written time, the
+/// cell, the domain, and what to do. Before this the cell read as `0` and the row
+/// was scored as a quantified measurement at its own `DV` — under
+/// `bloq_method = m3` a possibly-BLQ row scored as a measurement at the LLOQ, with
+/// no warning of any kind. The message names no tail and no `bloq_method`: the
+/// reader cannot see which one is set, and the cell says nothing about a tail
+/// anyway.
+///
+/// `time` is the user-written (`raw_time`) value, so the message names the row's
+/// own time. The cell goes through [`truncate_example`], since it is arbitrary
+/// user text that lands in this string.
+fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
+    format!(
+        "subject {id}, time {time}: CENS=\"{}\" is not a whole number; expected -1 \
+         (above the ULOQ), 0 (quantified), or 1 (below the LLOQ). Fix the cell; if \
+         this column is not a censoring flag, rename it.",
+        truncate_example(cell)
+    )
+}
+
+/// `W_CENS_UNEXPECTED`: an observation row's `CENS` cell is a whole number outside
+/// the domain (`7`, `-2`).
+///
+/// Such a value is not rejected — it is scored, by its **sign**: `m3_logcdf` and
+/// the three other consumers read `cens < 0` as the upper tail and every other
+/// nonzero flag as the lower one, so `7` is scored as `1` and `-2` as `-1`. The
+/// sentence therefore names the tail the engines actually take (#1496); until this
+/// it said "(left tail)" for both, which was wrong for every negative flag.
+///
+/// Both clauses are conditional on `bloq_method`, which the reader cannot see.
+/// Under the default `drop` the row is scored as an ordinary observation — not
+/// "ignored": `suggest_start` and the `[data_selection]` context read the flag
+/// whatever `bloq_method` is.
+fn cens_unexpected_warning(id: &str, cens: i8) -> String {
+    // The prefix through `CENS=` is byte-stable: `reader_warning_code` reads the
+    // code off the head of the message, and the `ferx check` report quotes it.
+    let (tail, scored_as) = if cens < 0 {
+        ("upper", -1)
+    } else {
+        ("lower", 1)
+    };
+    format!(
+        "W_CENS_UNEXPECTED subject {id}: CENS={cens} is not -1, 0, or 1; under \
+         bloq_method = m3 the row is scored on the {tail} tail, as {scored_as}; \
+         under bloq_method = drop the row is scored as an ordinary observation"
+    )
 }
 
 /// Parse an EVID cell. A missing / blank / unparseable value maps to 0
@@ -2074,7 +2150,11 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
-    let mut cens_invalid_warned = false;
+    // One `W_CENS_UNEXPECTED` per sign per subject: the sentence differs by sign
+    // (which tail the flag is scored on), so a single latch would report one tail
+    // for a subject whose cells span both.
+    let mut cens_invalid_warned_lower = false;
+    let mut cens_invalid_warned_upper = false;
     // Rows that survived the data-selection filter, carry a nonzero AMT, yet
     // were not classified as a dose (EVID not 1/4) — their AMT was silently
     // dropped. Reported as a population summary so a degenerate dose-free fit
@@ -2695,23 +2775,39 @@ fn parse_subject(
                 // the times, and every downstream |DV| consumer already guards on
                 // `is_finite`.
                 let dv = if dv_missing { f64::NAN } else { dv };
-                let cens_flag = resolve_row_cens(row, cens_col);
+                // The one site that *consumes* the flag, and so the one that
+                // rejects a cell nothing can read (#1496). The
+                // `[data_selection]` context above still reads such a cell as
+                // `0`: it runs before the filter's `continue`, and a record the
+                // filter removes is never scored — NONMEM reports no error for a
+                // text cell on an `IGNORE`d record either.
+                let cens_flag = match classify_row_cens(row, cens_col) {
+                    Ok(flag) => flag,
+                    Err(cell) => return Err(cens_not_whole_error(id, raw_time, cell)),
+                };
                 obs_times.push(time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
                 // Only -1 (above ULOQ), 0 (quantified), and 1 (below LLOQ) are
-                // meaningful. Any other value is coerced to left-censored by the
-                // M3 likelihood (`m3_logcdf` treats every nonzero as a tail), so
-                // flag it rather than silently mis-scoring the row.
-                if !matches!(cens_flag, -1 | 0 | 1) && !cens_invalid_warned {
-                    parse_warnings.push(format!(
-                        "W_CENS_UNEXPECTED subject {}: CENS={} is not -1, 0, or 1; \
-                         treated as censored (left tail) under M3",
-                        id, cens_flag
-                    ));
-                    cens_invalid_warned = true;
+                // meaningful. Any other whole number is still scored by the M3
+                // likelihood, on the tail its *sign* picks (`m3_logcdf` reads
+                // `cens < 0` as the upper tail and every other nonzero flag as
+                // the lower one), so flag it rather than silently mis-scoring the
+                // row — and say which tail. Latched per sign: a subject holding
+                // both `7` and `-2` has two different coercions to report, and
+                // one latch would name only the first.
+                if !matches!(cens_flag, -1 | 0 | 1) {
+                    let warned = if cens_flag < 0 {
+                        &mut cens_invalid_warned_upper
+                    } else {
+                        &mut cens_invalid_warned_lower
+                    };
+                    if !*warned {
+                        parse_warnings.push(cens_unexpected_warning(id, cens_flag));
+                        *warned = true;
+                    }
                 }
                 cens.push(cens_flag);
                 if occ_col.is_some() {

@@ -3542,3 +3542,226 @@ fn a_float_formatted_fremtype_column_reads_like_its_integer_twin() {
     assert_eq!(integer.subjects[0].fremtype, vec![0, 1, 2]);
     assert_eq!(float.subjects[0].fremtype, integer.subjects[0].fremtype);
 }
+
+// ── #1496 PR B: the `CENS` domain — what is rejected, and which tail a
+// ── surviving out-of-domain flag is scored on ───────────────────────────
+
+/// The `CENS` cell of the one observation row of a minimal single-subject file.
+/// `TIME=1` on that row, so a `[data_selection]` rule can address it.
+fn cens_obs_csv(cell: &str) -> String {
+    format!(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
+         1,0,.,1,100,1,1,0\n\
+         1,1,5.0,0,.,1,0,{cell}\n\
+         1,2,4.0,0,.,1,0,0\n"
+    )
+}
+
+/// The `W_CENS_UNEXPECTED` messages a population carries.
+fn cens_warnings(pop: &Population) -> Vec<String> {
+    pop.warnings
+        .iter()
+        .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+        .cloned()
+        .collect()
+}
+
+/// B4. A **positive** out-of-domain flag is scored as `1` — `m3_logcdf` reads
+/// `cens < 0` as the upper tail and everything else as the lower one — so the
+/// sentence must name the lower tail, and must not name the upper.
+///
+/// Mutation that must redden it: delete the positive branch of
+/// [`cens_unexpected_warning`], or swap the two arms.
+#[test]
+fn a_positive_out_of_domain_cens_is_reported_on_the_lower_tail() {
+    let f = write_csv(&cens_obs_csv("7"));
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = cens_warnings(&pop);
+    assert_eq!(w.len(), 1, "{w:?}");
+    let m = &w[0];
+    // The prefix #1494's `reader_warning_code` table and `ferx check` quote.
+    assert!(
+        m.starts_with("W_CENS_UNEXPECTED subject 1: CENS=7"),
+        "prefix must stay byte-stable: {m}"
+    );
+    assert!(m.contains("lower tail"), "{m}");
+    assert!(m.contains("as 1;"), "the flag it is scored as: {m}");
+    assert!(
+        !m.contains("upper"),
+        "a positive flag is never the upper tail: {m}"
+    );
+    // Conditional on `bloq_method`, which the reader cannot see. The `drop`
+    // clause is not "the flag is ignored": `suggest_start` and the
+    // `[data_selection]` context read it whatever `bloq_method` is.
+    assert!(m.contains("bloq_method = m3"), "{m}");
+    assert!(m.contains("ordinary observation"), "{m}");
+    // The value itself is preserved verbatim, as before.
+    assert_eq!(pop.subjects[0].cens, vec![7, 0]);
+}
+
+/// B5. The mirror: a **negative** out-of-domain flag is scored as `-1`, on the
+/// upper tail. Until #1496 this said "(left tail)", which was wrong for every
+/// negative flag — the defect the sentence exists to fix.
+///
+/// Mutation that must redden it: delete the negative branch of
+/// [`cens_unexpected_warning`], or swap the two arms.
+#[test]
+fn a_negative_out_of_domain_cens_is_reported_on_the_upper_tail() {
+    let f = write_csv(&cens_obs_csv("-2"));
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = cens_warnings(&pop);
+    assert_eq!(w.len(), 1, "{w:?}");
+    let m = &w[0];
+    assert!(
+        m.starts_with("W_CENS_UNEXPECTED subject 1: CENS=-2"),
+        "prefix must stay byte-stable: {m}"
+    );
+    assert!(m.contains("upper tail"), "{m}");
+    assert!(m.contains("as -1;"), "the flag it is scored as: {m}");
+    assert!(!m.contains("lower"), "{m}");
+    assert!(!m.contains("left"), "the wording #1496 removed: {m}");
+    assert_eq!(pop.subjects[0].cens, vec![-2, 0]);
+}
+
+/// B7. The two sentences are different claims, so the latch is per sign: one
+/// subject whose cells span both tails gets exactly two warnings, one each, and
+/// no more however many rows carry them.
+///
+/// Mutation that must redden it: collapse the two latches back into one (the
+/// pre-#1496 `cens_invalid_warned`) — the second tail then goes unreported.
+#[test]
+fn an_out_of_domain_cens_is_reported_once_per_sign_per_subject() {
+    let f = write_csv(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
+         1,0,.,1,100,1,1,0\n\
+         1,1,5.0,0,.,1,0,7\n\
+         1,2,4.0,0,.,1,0,-2\n\
+         1,3,3.0,0,.,1,0,8\n\
+         1,4,2.0,0,.,1,0,-3\n",
+    );
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let w = cens_warnings(&pop);
+    assert_eq!(w.len(), 2, "one per sign, not one per row: {w:?}");
+    assert_eq!(
+        w.iter().filter(|m| m.contains("lower tail")).count(),
+        1,
+        "{w:?}"
+    );
+    assert_eq!(
+        w.iter().filter(|m| m.contains("upper tail")).count(),
+        1,
+        "{w:?}"
+    );
+    // The first value of each sign is the one named, and every flag is kept.
+    assert!(w.iter().any(|m| m.contains("CENS=7")), "{w:?}");
+    assert!(w.iter().any(|m| m.contains("CENS=-2")), "{w:?}");
+    assert_eq!(pop.subjects[0].cens, vec![7, -2, 8, -3]);
+}
+
+/// B6. A `CENS` cell that is not a whole number at all, on an observation row the
+/// fit will score, is an error — not the silent `0` (a quantified measurement)
+/// it read as before #1496, and not `W_CENS_UNEXPECTED` either, which is for a
+/// whole number outside the domain.
+///
+/// Mutations that must redden it: route the observation site back through
+/// `resolve_row_cens` (`NotWhole` → 0); delete any one sentence of
+/// [`cens_not_whole_error`] — the subject/time/cell clause, the domain clause, or
+/// the remedy.
+#[test]
+fn a_non_whole_cens_cell_on_a_scored_observation_row_is_an_error() {
+    for cell in ["abc", "1.5", "inf"] {
+        let f = write_csv(&cens_obs_csv(cell));
+        let err = read_nonmem_csv(f.path(), None, None)
+            .expect_err(&format!("CENS={cell:?} must not read as a flag"));
+        // Sentence 1: whose row, which row, what was in the cell.
+        assert!(err.contains("subject 1"), "{cell:?}: {err}");
+        assert!(err.contains("time 1"), "{cell:?}: {err}");
+        assert!(
+            err.contains(&format!("CENS=\"{cell}\"")),
+            "the cell as written: {cell:?}: {err}"
+        );
+        // Sentence 2: the accepted values.
+        assert!(err.contains("-1 (above the ULOQ)"), "{cell:?}: {err}");
+        assert!(err.contains("0 (quantified)"), "{cell:?}: {err}");
+        assert!(err.contains("1 (below the LLOQ)"), "{cell:?}: {err}");
+        // Sentence 3: the remedy, both halves.
+        assert!(err.contains("Fix the cell"), "{cell:?}: {err}");
+        assert!(err.contains("rename it"), "{cell:?}: {err}");
+        // The reader cannot see `bloq_method`, and the cell says nothing about a
+        // tail, so the message claims neither.
+        for forbidden in ["tail", "left", "m3", "M3"] {
+            assert!(
+                !err.contains(forbidden),
+                "{cell:?}: must not claim {forbidden:?}: {err}"
+            );
+        }
+        // Not relayed as the warning, which means something else.
+        assert!(!err.contains("W_CENS_UNEXPECTED"), "{cell:?}: {err}");
+    }
+}
+
+/// B6. The cell is arbitrary user text on its way into an error string, so it
+/// goes through `truncate_example` — the same escaping/truncation
+/// `W_CMT_DEFAULTED` uses, and the reason a quote in the cell cannot produce
+/// `CENS="a"b"`.
+#[test]
+fn a_rejected_cens_cell_is_quoted_through_the_shared_truncation() {
+    let f = write_csv(&cens_obs_csv("a\"b"));
+    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+    assert!(err.contains("CENS=\"a\u{fffd}b\""), "{err}");
+
+    let long = "x".repeat(MAX_CMT_EXAMPLE_LEN + 10);
+    let f = write_csv(&cens_obs_csv(&long));
+    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+    assert!(err.contains('…'), "a long cell is cut: {err}");
+    assert!(!err.contains(&long), "…and not quoted whole: {err}");
+}
+
+/// B6b. Where the reject happens, in one test, so forcing either branch reddens
+/// it: the cell is only rejected on an observation row that survives
+/// `[data_selection]`.
+///
+/// (i) the same text on a **dose** row is never read — ferx does not consume
+/// `CENS` there, and a text column mis-mapped as `CENS` carries text on the
+/// observation rows too, so nothing is missed; (ii) on an observation row the
+/// filter **removes**, it is not read either — the filter's `continue` runs
+/// first, and NONMEM likewise reports no error for a text cell on an `IGNORE`d
+/// record; (iii) the same file with the clause **not** matching that row is an
+/// error. (ii) and (iii) differ by the clause alone.
+///
+/// Mutations that must redden it: raise the error in the `[data_selection]`
+/// row-context read instead of the observation arm (kills (ii)); raise it on
+/// every row rather than the Gaussian observation arm (kills (i)).
+#[test]
+fn a_non_whole_cens_cell_is_rejected_only_on_a_scored_observation_row() {
+    // (i) On the dose row, with every observation row in the domain.
+    let dose_row = write_csv(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
+         1,0,.,1,100,1,1,abc\n\
+         1,1,5.0,0,.,1,0,0\n\
+         1,2,4.0,0,.,1,0,1\n",
+    );
+    let pop =
+        read_nonmem_csv(dose_row.path(), None, None).expect("ferx never reads CENS on a dose row");
+    assert_eq!(pop.subjects[0].cens, vec![0, 1]);
+    assert!(cens_warnings(&pop).is_empty(), "{:?}", pop.warnings);
+
+    // (ii) and (iii): one file, two clauses. `TIME == 1` is the offending row.
+    let obs_row = write_csv(&cens_obs_csv("abc"));
+    let read = |clause: &str| {
+        let filter = SelectionFilter::from_opts(&[clause.to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(obs_row.path(), None, None, &filter)
+    };
+    // (ii) removed — not read, so not rejected.
+    let removed = read("TIME == 1").expect("a row the filter removes is never scored");
+    assert_eq!(
+        removed.subjects[0].observations.len(),
+        1,
+        "the clause must actually remove the offending row"
+    );
+    // (iii) the same cell, a clause that leaves the row in place.
+    let err = read("TIME == 2").expect_err("the surviving row is scored, so it is rejected");
+    assert!(err.contains("CENS=\"abc\""), "{err}");
+    assert!(err.contains("subject 1"), "{err}");
+}

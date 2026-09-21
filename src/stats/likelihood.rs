@@ -5952,4 +5952,28 @@ DV ~ proportional(PROP_ERR)
             "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
         );
     }
+
+    /// B8 (#1496), site 1 of 4: **`m3_logcdf`**, `stats/likelihood.rs`.
+    ///
+    /// The tail is picked by the flag's **sign**, not by the literals `1` / `-1`:
+    /// every out-of-domain flag is scored as the in-domain one of its own sign.
+    /// That is the fact `W_CENS_UNEXPECTED`'s sentence states ("scored on the
+    /// lower tail, as 1"), and nothing pinned it here — the older
+    /// `m3_logcdf_uses_upper_tail_for_negative_cens` uses only `±1`, so it
+    /// survives a `cens < 0` → `cens == -1` mutation.
+    ///
+    /// Mutation that must redden it: `cens < 0` → `cens == -1` at
+    /// `likelihood.rs`'s own site (only). Bit-exact, since the claim is that the
+    /// two calls take the *same* branch, not that they are close.
+    #[test]
+    fn m3_logcdf_scores_an_out_of_domain_cens_as_its_own_signs_flag() {
+        // z = ±1 with the limit strictly inside, so the two tails differ.
+        let (limit, f, sd) = (10.0, 12.0, 2.0);
+        let at = |cens: i8| m3_logcdf(limit, f, sd, cens).to_bits();
+        assert_eq!(at(7), at(1), "m3_logcdf: a positive flag is scored as 1");
+        assert_eq!(at(-2), at(-1), "m3_logcdf: a negative flag is scored as -1");
+        // The straddle: without it the two equalities hold for a function that
+        // ignores `cens` entirely.
+        assert_ne!(at(1), at(-1), "m3_logcdf: the two tails must differ here");
+    }
 }
