@@ -128,9 +128,12 @@ const H_MISSING_DV_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
                                 2,1,9.4,0,.,1,0\n\
                                 2,2,8.0,0,.,1,0\n";
 
-/// One observation row whose `CENS` cell is `7` — neither `-1`, `0` nor `1`. The M3
-/// likelihood coerces every nonzero flag to a left tail, so the row is scored as
-/// censored rather than rejected, and the reader says so as `W_CENS_UNEXPECTED`.
+/// One observation row whose `CENS` cell is `7` — neither `-1`, `0` nor `1` — and the
+/// reader says so as `W_CENS_UNEXPECTED`. The warning is raised while reading,
+/// whatever `bloq_method` is: `H_MODEL` sets none, so it runs the default `drop`,
+/// which keeps a `CENS` row as an ordinary observation. Only under `m3` would the flag
+/// be scored as censored, and then by its sign (`m3_logcdf`: positive is the lower
+/// tail, negative the upper).
 const H_BAD_CENS_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
                               1,0,.,1,100,1,1,0\n\
                               1,1,9.0,0,.,1,0,0\n\
