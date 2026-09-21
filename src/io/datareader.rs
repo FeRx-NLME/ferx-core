@@ -1444,6 +1444,59 @@ fn parse_float_formatted_integer(t: &str) -> Option<f64> {
     (f.is_finite() && f.fract() == 0.0).then_some(f)
 }
 
+/// A cell of an integer-typed column, classified.
+///
+/// `L2` (#830) and `CMT` (#1009) each had to learn on their own that an exporter
+/// float-formats a whole integer column. `CENS`, `EVID`, `MDV`, `ADDL`, the
+/// occasion column, `SS` in the `[data_selection]` context and `FREMTYPE` had not,
+/// and read `"1.0"` as 0 — `ADDL` and `MDV` without any warning (#1496). This is the
+/// classification they share; what each does with a class stays with the caller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WholeCell {
+    /// A whole number, however it was spelled: `"1"`, `"+1"`, `"1.0"`, `"1e0"`,
+    /// `"-0.0"`.
+    Value(f64),
+    /// Blank / `.` / `NA` / `NaN` — the NONMEM missing spellings.
+    Missing,
+    /// Present, but not a whole number: `"1.5"`, `"inf"`, `"abc"`.
+    NotWhole,
+}
+
+/// Classify a cell of an integer-typed column. Range, sign, and the value a
+/// `Missing` or `NotWhole` cell stands for are each caller's own policy, as
+/// [`parse_float_formatted_integer`] prescribes.
+fn parse_whole_number_cell(s: &str) -> WholeCell {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        return WholeCell::Missing;
+    }
+    parse_float_formatted_integer(t).map_or(WholeCell::NotWhole, WholeCell::Value)
+}
+
+/// Read a cell of an unsigned integer column — `EVID`, `MDV`, `ADDL`, the occasion
+/// column, `SS` in the `[data_selection]` context, `FREMTYPE` — as a `T`.
+///
+/// The column's own integer parse runs first, so every cell it accepted reads
+/// exactly as before; a count past 2^53 would otherwise round through `f64`. Only a
+/// cell that parse rejected can read differently, and only when it is a whole
+/// number within `T`'s range (#1496). `None` for a missing, fractional, negative
+/// (`"-0"` included, as in [`parse_cmt_cell`]) or out-of-range cell: each caller
+/// keeps the fallback it always had for those.
+fn parse_unsigned_cell<T: std::str::FromStr + TryFrom<u64>>(s: &str) -> Option<T> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<T>() {
+        return Some(n);
+    }
+    match parse_whole_number_cell(t) {
+        // `u64::MAX as f64` rounds up to 2^64, so the strict `<` keeps `f as u64`
+        // exact; `try_from` then applies `T`'s own range.
+        WholeCell::Value(f) if !f.is_sign_negative() && f < u64::MAX as f64 => {
+            T::try_from(f as u64).ok()
+        }
+        _ => None,
+    }
+}
+
 /// The compartment a row falls back to when the dataset does not say which one.
 /// 1-based; the value all three `CMT` sites already used before #1009 made the
 /// fallback visible.
@@ -1721,24 +1774,31 @@ impl CmtDefaults {
     }
 }
 
+/// Read a `CENS` cell: `-1` (above the ULOQ), `0` (quantified), `1` (below the
+/// LLOQ).
+///
+/// A float-formatted whole number is that number (#1496): ferx's own sdtab writes
+/// the flag as `1.000000`, and before this read it as 0, scoring the row as a
+/// quantified measurement. Every `i8` literal is exactly an `f64` whole number, so
+/// a cell the old `i8` parse accepted reads as before. A whole number outside `i8`
+/// saturates and keeps its sign — every consumer routes on the sign, while
+/// `200i64 as i8` would wrap to `-56` and flip the tail. A missing or non-whole
+/// cell is 0, as it always was.
 fn parse_cens(s: &str) -> i8 {
-    let t = s.trim();
-    if is_missing_cell(t) {
-        0
-    } else {
-        t.parse::<i8>().unwrap_or(0)
+    match parse_whole_number_cell(s) {
+        // A float-to-integer `as` saturates at `i8::MIN` / `i8::MAX`. Casting
+        // through a wider integer first would truncate instead.
+        WholeCell::Value(f) => f as i8,
+        WholeCell::Missing | WholeCell::NotWhole => 0,
     }
 }
 
 /// Parse an EVID cell. A missing / blank / unparseable value maps to 0
-/// (observation) — NONMEM's documented default. (`parse_usize` defaults to 1,
-/// which would mislabel a blank-EVID observation row as a dose.)
+/// (observation) — NONMEM's documented default. A float-formatted whole number
+/// (`"1.0"`) is that code (#1496); before, it read as 0, so every dose row was taken
+/// for an observation record and no dose was given.
 fn parse_evid(s: &str) -> u32 {
-    let t = s.trim();
-    if is_missing_cell(t) {
-        return 0;
-    }
-    t.parse::<u32>().unwrap_or(0)
+    parse_unsigned_cell::<u32>(s).unwrap_or(0)
 }
 
 /// True for EVID values that administer a dose (1 = dose, 4 = reset + dose).
@@ -1931,13 +1991,10 @@ fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize
 
 /// Parse an occasion-column cell. Returns `None` for blank / `.` / NA / non-integer
 /// values so the caller can warn about silently dropped rows. NONMEM convention
-/// uses `.` for missing.
+/// uses `.` for missing. A float-formatted whole number (`"2.0"`) is that occasion
+/// (#1496).
 fn parse_occ(s: &str) -> Option<u32> {
-    let t = s.trim();
-    if is_missing_cell(t) {
-        return None;
-    }
-    t.parse::<u32>().ok()
+    parse_unsigned_cell::<u32>(s)
 }
 
 #[allow(clippy::too_many_arguments)]

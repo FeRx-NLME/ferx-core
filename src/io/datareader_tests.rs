@@ -3209,3 +3209,90 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
         "a capped list says so: {five_spellings}"
     );
 }
+
+// ── #1496: a float-formatted whole number in an integer column ──────────────
+// pandas and R float-format a whole integer column once any cell in it is blank,
+// and ferx's own sdtab writes `CENS` as `1.000000`. `L2` (#830) and `CMT` (#1009)
+// were each taught that alone; seven other integer sites went on reading `"1.0"`
+// as 0 — `ADDL` and `MDV` with no warning at all. They now share one
+// classification, `parse_whole_number_cell`; each caller keeps its own range and
+// its own fallback for a cell that is not a whole number.
+
+/// A1. The cell table, through the shared classification and every cell-level
+/// reader. Each row is a spelling an exporter or a hand edit produces.
+#[test]
+fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
+    use WholeCell::{Missing, NotWhole, Value};
+    // (cell, class, CENS, EVID, OCC, MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
+    #[allow(clippy::type_complexity)]
+    let table: &[(
+        &str,
+        WholeCell,
+        i8,
+        u32,
+        Option<u32>,
+        Option<usize>,
+        Option<u16>,
+    )] = &[
+        // Integer spellings: the old parse accepted these, and they read as before.
+        ("1", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        ("+1", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        // The defect: each of these read as 0 / None at every site before #1496.
+        ("1.0", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        ("1e0", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        ("0.0", Value(0.0), 0, 0, Some(0), Some(0), Some(0)),
+        // A negative whole number is a value only for the signed CENS; every
+        // unsigned column keeps its old fallback, `-0.0` included.
+        ("-1.0", Value(-1.0), -1, 0, None, None, None),
+        ("-0.0", Value(-0.0), 0, 0, None, None, None),
+        // Outside `i8`, CENS saturates and keeps its sign — a cast through `i64`
+        // wraps 200 to -56 and flips the tail. The unsigned columns read 200.
+        (
+            "200",
+            Value(200.0),
+            127,
+            200,
+            Some(200),
+            Some(200),
+            Some(200),
+        ),
+        ("-200", Value(-200.0), -128, 0, None, None, None),
+        // Not a whole number: the old fallback at every site, untouched here.
+        ("1.5", NotWhole, 0, 0, None, None, None),
+        ("abc", NotWhole, 0, 0, None, None, None),
+        ("inf", NotWhole, 0, 0, None, None, None),
+        // The NONMEM missing spellings.
+        ("", Missing, 0, 0, None, None, None),
+        (".", Missing, 0, 0, None, None, None),
+        ("NA", Missing, 0, 0, None, None, None),
+        ("NaN", Missing, 0, 0, None, None, None),
+    ];
+    for &(cell, class, cens, evid, occ, count, fremtype) in table {
+        assert_eq!(parse_whole_number_cell(cell), class, "class of {cell:?}");
+        assert_eq!(parse_cens(cell), cens, "CENS {cell:?}");
+        assert_eq!(parse_evid(cell), evid, "EVID {cell:?}");
+        assert_eq!(parse_occ(cell), occ, "OCC {cell:?}");
+        assert_eq!(parse_unsigned_cell::<usize>(cell), count, "usize {cell:?}");
+        assert_eq!(parse_unsigned_cell::<u16>(cell), fremtype, "u16 {cell:?}");
+    }
+}
+
+/// A1, the range edges of the unsigned read: one past a type's end is the
+/// fallback, never a wrap or a saturation, and an integer literal never detours
+/// through `f64`.
+#[test]
+fn unsigned_integer_cells_keep_their_type_range_and_exact_literals() {
+    assert_eq!(parse_unsigned_cell::<u16>("65535.0"), Some(u16::MAX));
+    assert_eq!(parse_unsigned_cell::<u16>("65536.0"), None);
+    assert_eq!(parse_unsigned_cell::<u32>("4294967295.0"), Some(u32::MAX));
+    assert_eq!(parse_unsigned_cell::<u32>("4294967296.0"), None);
+    // 2^64 is the first `f64` past `u64`, and `f as u64` would saturate it to
+    // `u64::MAX`.
+    assert_eq!(parse_unsigned_cell::<u64>("18446744073709551616"), None);
+    // Read by the integer parse, exactly. Through `f64` this rounds to
+    // 9007199254740992.
+    assert_eq!(
+        parse_unsigned_cell::<u64>("9007199254740993"),
+        Some(9_007_199_254_740_993)
+    );
+}
