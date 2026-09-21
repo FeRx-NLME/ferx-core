@@ -31,13 +31,23 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 |--------|------|---------|-------------|
 | `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
-| `CMT` | integer | 1 | Compartment number (1-indexed). A float-formatted integer (`2.0`, as pandas and R write a whole column once any cell in it is blank) reads as that integer. A missing (`.`/blank/`NA`) or unreadable cell, and an absent column, fall back to compartment 1 — reported as `W_CMT_DEFAULTED` whenever `CMT` selects something on that model, whether a dose's compartment or an observation's readout, scale or error model; see [`CMT` on `[odes]` models](#cmt-on-odes-models). |
+| `CMT` | integer | 1 | Compartment number (1-indexed). A float-formatted integer (`2.0`, as pandas writes a whole column once any cell in it is blank) reads as that integer. A missing (`.`/blank/`NA`) or unreadable cell, and an absent column, fall back to compartment 1 — reported as `W_CMT_DEFAULTED` whenever `CMT` selects something on that model, whether a dose's compartment or an observation's readout, scale or error model; see [`CMT` on `[odes]` models](#cmt-on-odes-models). |
 | `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate via an `R{cmt}` `$PK` parameter) and `-2` (modeled duration via a `D{cmt}` `$PK` parameter) are supported on both analytical and ODE models — see [Infusion Doses](#infusion-doses). |
 | `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
 | `CENS` | integer | 0 | Censoring flag. `1` = below LLOQ and `DV` carries the LLOQ; `-1` = above ULOQ and `DV` carries the ULOQ; `0` = quantified. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.qmd). |
 | `L2` | integer | 0 (ungrouped) | Level-2 grouping id (NONMEM data item). Observation rows sharing an `L2` value within a subject form one **correlated observation unit** and pick up the `block_sigma` cross covariance — e.g. the total and unbound rows of one blood draw. `0` / absent = ungrouped. Only affects models with a [`block_sigma`](model-file/error-model.qmd) correlated residual; see [Covariate-selected error models](model-file/error-model.qmd). |
+
+> **An integer column may be float-formatted.** pandas writes a whole integer
+> column as `1.0`, `2.0`, … once any cell in it is blank, and ferx's own sdtab
+> writes `CENS` as `1.000000`. Every integer column above, `ADDL`, the
+> [occasion column](#occasion-column-iov) and `FREMTYPE` read such a cell as the
+> whole number it spells, as NONMEM does: `ADDL=2.0` is two additional doses,
+> `MDV=1.0` excludes the row, `CENS=1.0` is below the LLOQ, and a
+> [`[data_selection]`](model-file/data-selection.qmd) rule such as
+> `ignore = CENS == 1` removes it
+> ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)).
 
 > **Missing DV on observation rows.** An `EVID=0` row contributes to the
 > likelihood only when its `DV` is present. If the `DV` is missing

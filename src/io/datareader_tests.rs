@@ -1933,7 +1933,7 @@ fn test_parse_l2_id_accepts_integer_and_float_formats() {
     // Plain integer ids.
     assert_eq!(parse_l2_id("10"), Some(10));
     assert_eq!(parse_l2_id(" 11 "), Some(11));
-    // #830: pandas/R exports float-format the whole column when any row is
+    // #830: a pandas export float-formats the whole column when any row is
     // blank ("10.0"); a strict i64 parse would ungroup everything.
     assert_eq!(parse_l2_id("10.0"), Some(10));
     assert_eq!(parse_l2_id("11.0"), Some(11));
@@ -2569,7 +2569,7 @@ fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
 
 #[test]
 fn float_formatted_cmt_cell_reads_as_its_integer() {
-    // T1a. The #830 `L2` bug in a second column: pandas/R float-format a whole
+    // T1a. The #830 `L2` bug in a second column: pandas float-formats a whole
     // integer column once any cell in it is blank, so `2.0` is how a real export
     // spells compartment 2. Before the fix `parse::<usize>()` failed on it and
     // the dose landed in compartment 1 with no warning at all.
@@ -3208,4 +3208,337 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
         five_spellings.contains("(\"a\", \"b\", \"c\", …)"),
         "a capped list says so: {five_spellings}"
     );
+}
+
+// ── #1496: a float-formatted whole number in an integer column ──────────────
+// pandas float-formats a whole integer column once any cell in it is blank, and
+// ferx's own sdtab writes `CENS` as `1.000000`. `L2` (#830) and `CMT` (#1009)
+// were each taught that alone; seven other integer sites went on reading `"1.0"`
+// as 0 — all but `EVID` and the occasion column with no warning at all. They now
+// share one classification, `parse_whole_number_cell`; each caller keeps its own
+// range and its own fallback for a cell that is not a whole number.
+
+/// A1. The cell table, through the shared classification and every cell-level
+/// reader. Each row is a spelling an exporter or a hand edit produces.
+#[test]
+fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
+    use WholeCell::{Missing, NotWhole, Value};
+    // (cell, class, CENS, EVID, OCC, MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
+    #[allow(clippy::type_complexity)]
+    let table: &[(
+        &str,
+        WholeCell,
+        i8,
+        u32,
+        Option<u32>,
+        Option<usize>,
+        Option<u16>,
+    )] = &[
+        // Integer spellings: the old parse accepted these, and they read as before.
+        ("1", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        ("+1", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        // The defect: each of these read as 0 / None at every site before #1496.
+        ("1.0", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        ("1e0", Value(1.0), 1, 1, Some(1), Some(1), Some(1)),
+        ("0.0", Value(0.0), 0, 0, Some(0), Some(0), Some(0)),
+        // A negative whole number is a value only for the signed CENS; every
+        // unsigned column keeps its old fallback, `-0.0` included.
+        ("-1.0", Value(-1.0), -1, 0, None, None, None),
+        ("-0.0", Value(-0.0), 0, 0, None, None, None),
+        // Outside `i8`, CENS saturates and keeps its sign — a cast through `i64`
+        // wraps 200 to -56 and flips the tail. The unsigned columns read 200.
+        (
+            "200",
+            Value(200.0),
+            127,
+            200,
+            Some(200),
+            Some(200),
+            Some(200),
+        ),
+        ("-200", Value(-200.0), -128, 0, None, None, None),
+        // Not a whole number: the old fallback at every site, untouched here.
+        ("1.5", NotWhole, 0, 0, None, None, None),
+        ("abc", NotWhole, 0, 0, None, None, None),
+        ("inf", NotWhole, 0, 0, None, None, None),
+        // The NONMEM missing spellings.
+        ("", Missing, 0, 0, None, None, None),
+        (".", Missing, 0, 0, None, None, None),
+        ("NA", Missing, 0, 0, None, None, None),
+        ("NaN", Missing, 0, 0, None, None, None),
+    ];
+    for &(cell, class, cens, evid, occ, count, fremtype) in table {
+        assert_eq!(parse_whole_number_cell(cell), class, "class of {cell:?}");
+        assert_eq!(parse_cens(cell), cens, "CENS {cell:?}");
+        assert_eq!(parse_evid(cell), evid, "EVID {cell:?}");
+        assert_eq!(parse_occ(cell), occ, "OCC {cell:?}");
+        assert_eq!(parse_unsigned_cell::<usize>(cell), count, "usize {cell:?}");
+        assert_eq!(parse_unsigned_cell::<u16>(cell), fremtype, "u16 {cell:?}");
+    }
+}
+
+/// A1, the range edges of the unsigned read: one past a type's end is the
+/// fallback, never a wrap or a saturation, and an integer literal never detours
+/// through `f64`.
+#[test]
+fn unsigned_integer_cells_keep_their_type_range_and_exact_literals() {
+    assert_eq!(parse_unsigned_cell::<u16>("65535.0"), Some(u16::MAX));
+    assert_eq!(parse_unsigned_cell::<u16>("65536.0"), None);
+    assert_eq!(parse_unsigned_cell::<u32>("4294967295.0"), Some(u32::MAX));
+    assert_eq!(parse_unsigned_cell::<u32>("4294967296.0"), None);
+    // 2^64 is the first `f64` past `u64`, and `f as u64` would saturate it to
+    // `u64::MAX`.
+    assert_eq!(parse_unsigned_cell::<u64>("18446744073709551616"), None);
+    // Read by the integer parse, exactly. Through `f64` this rounds to
+    // 9007199254740992.
+    assert_eq!(
+        parse_unsigned_cell::<u64>("9007199254740993"),
+        Some(9_007_199_254_740_993)
+    );
+}
+
+/// A2. The `CENS` observation site. A pandas-shaped export: the dose row's cell is
+/// blank, so the exporter float-formats the whole column. It must read exactly as
+/// its integer twin — both tails — and warn about nothing.
+#[test]
+fn a_float_formatted_cens_column_reads_like_its_integer_twin() {
+    let read = |minus: &str, zero: &str, plus: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,50.0,0,0,.,1,{minus}\n\
+             1,2,7.0,0,0,.,1,{zero}\n\
+             1,3,2.0,0,0,.,1,{plus}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("-1", "0", "1");
+    let float = read("-1.0", "0.0", "1.0");
+    // The integer leg is not trivial: both tails and a quantified row.
+    assert_eq!(integer.subjects[0].cens, vec![-1, 0, 1]);
+    assert_eq!(
+        float.subjects[0].cens, integer.subjects[0].cens,
+        "`-1.0` / `0.0` / `1.0` are the flags -1 / 0 / 1"
+    );
+    for (leg, pop) in [("integer", &integer), ("float", &float)] {
+        assert!(
+            pop.warnings.is_empty(),
+            "{leg}: a well-formed dataset warns about nothing, got {:?}",
+            pop.warnings
+        );
+    }
+}
+
+/// A3. The `CENS` read inside `[data_selection]`. A rule on `CENS` must remove the
+/// rows the likelihood would score as censored, whichever way the flag is spelled.
+/// Paired with A2 so each of the two sites is pinned by its own test: taking the
+/// filter context off the shared resolver leaves A2 green and kills this one.
+#[test]
+fn a_cens_rule_in_data_selection_removes_the_same_rows_on_both_spellings() {
+    let read = |one: &str, zero: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,7.0,0,0,.,1,{zero}\n\
+             1,2,2.0,0,0,.,1,{one}\n\
+             1,3,2.0,0,0,.,1,{one}\n"
+        ));
+        let filter = SelectionFilter::from_opts(&["CENS == 1".to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap()
+    };
+    let integer = read("1", "0");
+    let float = read("1.0", "0.0");
+    // The integer leg removes something: two of its three observations.
+    assert_eq!(integer.subjects[0].observations, vec![7.0]);
+    assert_eq!(
+        float.subjects[0].observations, integer.subjects[0].observations,
+        "`ignore = CENS == 1` must remove the `1.0` rows too"
+    );
+}
+
+/// A4. `EVID`. A float-formatted `1.0` is a dose. Before #1496 it read as 0, so
+/// every dose became an unscored `MDV=1` observation and the fit ran without drug.
+#[test]
+fn a_float_formatted_evid_column_reads_like_its_integer_twin() {
+    let read = |dose: &str, obs: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+             1,0,.,{dose},100,1,1\n\
+             1,1,5.0,{obs},.,1,0\n\
+             1,12,.,{dose},100,1,1\n\
+             1,13,4.0,{obs},.,1,0\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("1", "0");
+    let float = read("1.0", "0.0");
+    let times = |p: &Population| {
+        p.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        times(&integer),
+        vec![0.0, 12.0],
+        "the integer leg has two doses"
+    );
+    assert_eq!(times(&float), times(&integer), "`1.0` is EVID 1, a dose");
+    assert_eq!(
+        float.subjects[0].observations,
+        integer.subjects[0].observations
+    );
+    assert!(
+        float.warnings.is_empty(),
+        "no dose may be reported as not dosed, got {:?}",
+        float.warnings
+    );
+}
+
+/// A5. `MDV`. The fixture needs an *observation* row carrying `MDV=1` and a real
+/// `DV`: on a dose row the flag decides nothing, which is why float-formatting the
+/// stock warfarin file's whole `MDV` column changes no number at all. The straddle
+/// is asserted, so the row cannot quietly stop being the one the flag excludes.
+#[test]
+fn a_float_formatted_mdv_flag_excludes_the_row_its_integer_twin_excludes() {
+    let read = |one: &str, zero: &str, flagged: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+             1,0,.,1,100,1,{one}\n\
+             1,1,5.0,0,.,1,{zero}\n\
+             1,2,4.0,0,.,1,{flagged}\n\
+             1,3,3.0,0,.,1,{zero}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("1", "0", "1");
+    let float = read("1.0", "0.0", "1.0");
+    let unflagged = read("1", "0", "0");
+    // The straddle: the flag on that row is what excludes it.
+    assert_eq!(unflagged.subjects[0].observations, vec![5.0, 4.0, 3.0]);
+    assert_eq!(integer.subjects[0].observations, vec![5.0, 3.0]);
+    assert_eq!(
+        float.subjects[0].observations, integer.subjects[0].observations,
+        "`MDV=1.0` must exclude the row as `MDV=1` does"
+    );
+}
+
+/// A6. `ADDL`. `ADDL=2.0` is two additional doses. Before #1496 it read as 0 and
+/// the train collapsed to its first dose, with no warning.
+#[test]
+fn a_float_formatted_addl_expands_like_its_integer_twin() {
+    let read = |addl: &str, zero: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,II,ADDL\n\
+             1,0,.,1,100,1,1,24,{addl}\n\
+             1,1,5.0,0,.,1,0,0,{zero}\n\
+             1,50,4.0,0,.,1,0,0,{zero}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("2", "0");
+    let float = read("2.0", "0.0");
+    let times = |p: &Population| {
+        p.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .collect::<Vec<_>>()
+    };
+    // More doses than dose rows: the expansion is live on the integer leg.
+    assert_eq!(times(&integer), vec![0.0, 24.0, 48.0]);
+    assert_eq!(
+        times(&float),
+        times(&integer),
+        "`ADDL=2.0` is two additional doses"
+    );
+}
+
+/// A7. The occasion column. `1.0` / `2.0` are occasions 1 and 2, not two rows of
+/// occasion 0 reported as `W_IOV_OCC_MISSING`.
+#[test]
+fn a_float_formatted_occasion_column_reads_like_its_integer_twin() {
+    let read = |first: &str, second: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,OCC\n\
+             1,0,.,1,100,1,1,{first}\n\
+             1,1,5.0,0,.,1,0,{first}\n\
+             1,7,.,1,100,1,1,{second}\n\
+             1,8,4.0,0,.,1,0,{second}\n"
+        ));
+        read_nonmem_csv(f.path(), None, Some("OCC")).unwrap()
+    };
+    let integer = read("1", "2");
+    let float = read("1.0", "2.0");
+    assert_eq!(integer.subjects[0].occasions, vec![1, 2]);
+    assert_eq!(float.subjects[0].occasions, integer.subjects[0].occasions);
+    assert_eq!(
+        float.subjects[0].dose_occasions,
+        integer.subjects[0].dose_occasions
+    );
+    assert!(
+        !float
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_IOV_OCC_MISSING")),
+        "a readable occasion is not a missing one, got {:?}",
+        float.warnings
+    );
+}
+
+/// A8. `SS` inside `[data_selection]`. On the dose row itself `SS=1.0` already read
+/// as steady state (it goes through `validate_ss` as a float); the filter context
+/// read it as `0`, so `ignore = SS == 1` removed nothing.
+#[test]
+fn an_ss_rule_in_data_selection_removes_the_same_doses_on_both_spellings() {
+    let read = |one: &str, zero: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,II,SS\n\
+             1,0,.,1,100,1,1,24,{one}\n\
+             1,1,5.0,0,.,1,0,0,{zero}\n\
+             1,24,.,1,100,1,1,0,{zero}\n\
+             1,25,4.0,0,.,1,0,0,{zero}\n"
+        ));
+        let filter = SelectionFilter::from_opts(&["SS == 1".to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap()
+    };
+    let integer = read("1", "0");
+    let float = read("1.0", "0.0");
+    let times = |p: &Population| {
+        p.subjects[0]
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .collect::<Vec<_>>()
+    };
+    // The integer leg removes the steady-state dose and keeps the other.
+    assert_eq!(times(&integer), vec![24.0]);
+    assert_eq!(
+        times(&float),
+        times(&integer),
+        "`ignore = SS == 1` must remove `SS=1.0`"
+    );
+}
+
+/// `FREMTYPE`, the last integer site: `1.0` / `2.0` are FREM covariate types 1
+/// and 2, not two rows of type 0 (an ordinary observation).
+#[test]
+fn a_float_formatted_fremtype_column_reads_like_its_integer_twin() {
+    let read = |pk: &str, cov1: &str, cov2: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,FREMTYPE\n\
+             1,0,.,1,100,1,1,{pk}\n\
+             1,1,5.0,0,.,1,0,{pk}\n\
+             1,1,70.0,0,.,1,0,{cov1}\n\
+             1,1,30.0,0,.,1,0,{cov2}\n"
+        ));
+        read_nonmem_csv(f.path(), None, None).unwrap()
+    };
+    let integer = read("0", "1", "2");
+    let float = read("0.0", "1.0", "2.0");
+    assert_eq!(integer.subjects[0].fremtype, vec![0, 1, 2]);
+    assert_eq!(float.subjects[0].fremtype, integer.subjects[0].fremtype);
 }
