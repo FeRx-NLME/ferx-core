@@ -966,12 +966,59 @@ const SCORE_SA_MAX_BACKTRACK: u32 = 3;
 /// per-subject routine skips it - so it also decays out of the accumulator
 /// rather than fighting the pin.
 ///
-/// sigma rides the same step, and **[`sigma_mstep_sa_step`]'s extra
-/// Robbins-Monro blend does not apply on top**: that cap (#1445) exists because
-/// the sigma *maximiser* of a minority variance component is boundary-heavy
-/// from a single draw, and there is no maximiser here — sigma is moved by the
-/// same `g_k`-scaled score step every other coordinate is. Applying both would
-/// step sigma at `gamma^2`.
+/// sigma takes the same Newton *direction* as every other coordinate, but at
+/// **[`sigma_mstep_sa_step`]'s step size** rather than theta's `g_k` (#1480).
+///
+/// #1462 shipped it on the shared `g_k`, on the argument that #1445's cap exists
+/// for a boundary-heavy sigma *maximiser* and there is no maximiser here. The
+/// argument is wrong about what the cap does. During exploration `g_k = 1`, so a
+/// shared step size makes this a **full** Newton step to the root of one draw's
+/// score: the error recursion is `e_{k+1} = -noise`, no averaging at all, and the
+/// reported sigma is whatever the last draw said. That is #1445's readout with a
+/// different formula behind it, and it was measured as such — on #1445's own
+/// sparse combined-error fixture `score_sa` returned `ADD_ERR` 0.84 / 0.52 / 1.13
+/// over seeds 1/2/3 against a simulation truth of 1.8, where the default solver
+/// returns 1.33 / 1.83 / 2.17 (#1480).
+///
+/// Worse, the shared step is taken **in packed (log sigma) units**, so it is the
+/// pre-#1445 call `damp_mstep(&mut log_sigma, target, gamma)` written a third
+/// way — a geometric mean of the sigma sequence. #1445 measured that spelling on
+/// the derivative-free arm at `ADD_ERR` 0.277 against a truth of 1.8, and it is
+/// the larger of the two errors here too: fixing only the step size leaves seed
+/// 1 of the fixture above at 0.87, under its 0.9 gate, where fixing both puts
+/// the three seeds at 1.90 / 1.86 / 2.11.
+///
+/// So the sigma half of the step is routed through the #1445 policy rather than
+/// re-spelling it: the full (un-`gamma`-scaled) Newton step gives the sigma
+/// *target*, and [`damp_mstep_sigma_variance`] moves sigma a
+/// `sigma_mstep_sa_step(g_k, gamma_mstep) = min(g_k, SIGMA_SA_MAX_STEP,
+/// gamma_mstep)` fraction of the way there **on the variance scale** — the same
+/// two lines the derivative-free arms run. It is one implementation, so a change
+/// to the policy cannot reach one arm and miss the other.
+///
+/// This is **not** the blend stacked on top of a `gamma`-scaled step — that
+/// really would move sigma at `gamma^2`. The step contributes the target; the
+/// blend contributes the gain. The error recursion is
+/// `e_{k+1} = (1 - g_sigma)*e_k - g_sigma*noise` (to first order, since the
+/// blend is on `sigma^2`), which contracts while averaging the draw noise away,
+/// where the shipped `e_{k+1} = -noise` did not average at all. The gain binds
+/// only where theta's schedule is faster than [`SIGMA_SA_MAX_STEP`] — the whole
+/// exploration phase and the first four convergence iterations — and is the
+/// identity from `k - k1 = 5` on, exactly as for the derivative-free solver.
+///
+/// theta is deliberately left on `g_k` and in packed units: `gamma_mstep`
+/// (`mstep_damping`) caps the *maximiser* blend for the reasons
+/// [`mstep_sa_step`] documents and does not apply to a score step. The `min`
+/// still keeps #1445's one-sided guarantee — sigma never steps faster than
+/// theta.
+///
+/// The **information** accumulator keeps the shared `g_k`: it is the matrix gain
+/// of the whole system, not a per-coordinate quantity, and the theta rows read
+/// the same sigma columns.
+///
+/// The trust region [`SCORE_SA_MAX_STEP`] still applies to each coordinate, on
+/// whatever that coordinate actually proposes: the `g_k`-scaled step for theta,
+/// the un-scaled target offset for sigma.
 ///
 /// # Why there is no generalised-EM guard
 ///
@@ -1096,6 +1143,7 @@ impl MstepScoreSa {
         sigma_upper: &[f64],
         theta_packs_log_mask: &[bool],
         gamma: f64,
+        gamma_mstep: f64,
         schedules: &[Option<crate::pk::event_driven::EventSchedule>],
     ) -> bool {
         use rayon::prelude::*;
@@ -1170,6 +1218,13 @@ impl MstepScoreSa {
         // score is NOT accumulated — see the type's docs for the error
         // recursion that rules that out.
         let g_eff = gamma.clamp(0.0, 1.0);
+        // #1480: σ's coordinates of the step take the #1445 schedule, θ's take
+        // `g_eff`. See the type's docs for why the shared step size was the
+        // #1445 single-draw readout in another spelling.
+        let g_sigma = sigma_mstep_sa_step(g_eff, gamma_mstep.clamp(0.0, 1.0));
+        // The information is the matrix gain of the whole system, so it keeps
+        // the shared γ — capping it per coordinate would not be a slower σ, it
+        // would be a different (and asymmetric) preconditioner.
         let g_info = if self.started { g_eff } else { 1.0 };
         for a in 0..n * n {
             self.info[a] += g_info * (fisher[a] - self.info[a]);
@@ -1210,18 +1265,28 @@ impl MstepScoreSa {
         for _ in 0..=SCORE_SA_MAX_BACKTRACK {
             let mut lt = log_theta.to_vec();
             let mut ls = log_sigma.to_vec();
+            // σ is not stepped in place: the full Newton step gives the *target*
+            // and `damp_mstep_sigma_variance` moves σ a γ_σ fraction of the way
+            // there on the **variance** scale, which is the #1445 policy this
+            // arm reuses rather than re-spells (#1480). Seeded with the current
+            // value so a pinned or absent σ coordinate blends against itself and
+            // is a no-op at any γ.
+            let mut sigma_target = log_sigma.to_vec();
             for (r, &i) in free.iter().enumerate() {
-                // `g_eff` is the Robbins-Monro step size; the trust region
-                // clamps what is actually applied, not the raw direction.
-                let step = (scale * g_eff * d[r]).clamp(-SCORE_SA_MAX_STEP, SCORE_SA_MAX_STEP);
-                let target = (if i < n_theta { lt[i] } else { ls[i - n_theta] }) + step;
-                let clamped = target.clamp(lower[i], upper[i]);
+                // The trust region clamps what is actually applied, not the raw
+                // direction — so for θ it sees the γ-scaled step, and for σ the
+                // un-scaled target `damp_mstep_sigma_variance` is about to take
+                // a γ_σ fraction of.
                 if i < n_theta {
-                    lt[i] = clamped;
+                    let step = (scale * g_eff * d[r]).clamp(-SCORE_SA_MAX_STEP, SCORE_SA_MAX_STEP);
+                    lt[i] = (lt[i] + step).clamp(lower[i], upper[i]);
                 } else {
-                    ls[i - n_theta] = clamped;
+                    let j = i - n_theta;
+                    let step = (scale * d[r]).clamp(-SCORE_SA_MAX_STEP, SCORE_SA_MAX_STEP);
+                    sigma_target[j] = (ls[j] + step).clamp(lower[i], upper[i]);
                 }
             }
+            damp_mstep_sigma_variance(&mut ls, &sigma_target, g_sigma);
             // Finiteness only - see "Why there is no generalised-EM guard".
             // `1e20` is the sentinel `theta_sigma_mstep_light`'s objective and
             // `obs_nll_sum`'s callers substitute for a failed solve, and it is a
@@ -5325,9 +5390,13 @@ pub fn run_saem(
                     if let Some(sa) = score_sa.as_mut() {
                         // #1458: one Newton step on the Robbins-Monro averaged
                         // score and information, in place of blending in the
-                        // maximiser of this one draw. `gamma_mstep` /
-                        // `gamma_sigma` do not apply — the averaging *is* the
-                        // stochastic approximation here.
+                        // maximiser of this one draw. `gamma_mstep` is passed
+                        // for the σ half only: `step` derives γ_σ from it with
+                        // the same `sigma_mstep_sa_step` the derivative-free
+                        // arms use, because a σ stepped at the shared γ is the
+                        // #1445 single-draw readout again (#1480). θ still
+                        // ignores it — the averaging *is* the stochastic
+                        // approximation here.
                         sa.step(
                             model,
                             population,
@@ -5340,6 +5409,7 @@ pub fn run_saem(
                             &log_sigma_upper,
                             &theta_packs_log_mask,
                             gamma,
+                            gamma_mstep,
                             &schedules,
                         );
                     } else {
@@ -5479,7 +5549,9 @@ pub fn run_saem(
                     if let Some(sa) = score_sa.as_mut() {
                         // #1458, as in the closed-form branch above: the SA
                         // average over score and information replaces the blend
-                        // of a single draw's maximiser.
+                        // of a single draw's maximiser, and `gamma_mstep` rides
+                        // along so `step` can put σ on the #1445 schedule
+                        // (#1480).
                         sa.step(
                             model,
                             population,
@@ -5492,6 +5564,7 @@ pub fn run_saem(
                             &log_sigma_upper,
                             &theta_packs_log_mask,
                             gamma,
+                            gamma_mstep,
                             &schedules,
                         );
                     } else {
@@ -6538,6 +6611,21 @@ mod tests {
         assert!(
             src.contains(&schedule),
             "γ_σ must come from the σ schedule: `{schedule}` not found"
+        );
+
+        // #1480: the `score_sa` arm is the fourth consumer of the same policy,
+        // and it reaches it through `step`'s `gamma_mstep` argument. Passing
+        // `gamma` there instead is a **no-op under the shipped default**
+        // (`min(γ, 0.2, γ)` and `min(γ, 0.2, 1)` are the same number), so it is
+        // invisible to every fit in the repo that does not set `mstep_damping`;
+        // `mstep_damping_reaches_sigma_under_score_sa` in
+        // `tests/saem_covariate_mu_ref.rs` is the behavioural test that kills
+        // it, and this is the cheap structural half that names the call shape.
+        let sa_call = format!("gamma,{}_mstep,&schedules,", "gamma");
+        let sa_calls = src.matches(&sa_call).count();
+        assert_eq!(
+            sa_calls, 2,
+            "expected the two `score_sa` M-step arms (mu-ref and              mu_referencing = false) to hand `MstepScoreSa::step` both γ and              γ_mstep, so σ can take the #1445 schedule; found {sa_calls} of              `{sa_call}`"
         );
     }
 
