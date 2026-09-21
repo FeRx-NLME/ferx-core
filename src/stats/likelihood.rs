@@ -3169,6 +3169,115 @@ mod tests {
         assert!((ferx_ofv - nonmem_ofv).abs() < 1e-6);
     }
 
+    /// #1496, site `m3_logcdf` (`cens < 0`): a `CENS` flag outside -1/0/1 is scored
+    /// by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — which is what
+    /// `W_CENS_UNEXPECTED` tells the user. The test above uses only ±1, so it catches
+    /// a swapped tail but not a site that tests `cens == -1` instead of `cens < 0`;
+    /// this one does. The two tails differ at this point (z = ∓1), so neither
+    /// equality holds because the tails happen to agree.
+    #[test]
+    fn m3_logcdf_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| m3_logcdf(10.0, 12.0, 2.0, cens);
+        assert!(at(1).is_finite() && at(-1).is_finite());
+        assert_ne!(
+            at(1).to_bits(),
+            at(-1).to_bits(),
+            "the two tails differ here"
+        );
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                at(flag).to_bits(),
+                at(code).to_bits(),
+                "m3_logcdf: CENS={flag} must score as CENS={code}"
+            );
+        }
+    }
+
+    /// #1496: the two claims `W_CENS_UNEXPECTED` makes about the objective, checked
+    /// against the objective rather than restated. Under `m3` an out-of-domain flag
+    /// scores as its sign's code (`7` as `1`, `-2` as `-1`); under `drop` any flag
+    /// scores as the quantified row it is at `0`. Through the three Gaussian
+    /// objectives the message speaks for: the conditional `individual_nll`, and the
+    /// FOCE and FOCEI marginals of `foce_subject_nll`. The straddle is asserted, so
+    /// no equality holds because two arms agree: under `m3`, `1`, `-1` and `0` score
+    /// three different ways on this subject.
+    #[test]
+    fn an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop() {
+        let theta = [5.0, 50.0];
+        let eta = [0.1];
+        let omega = make_omega(0.09);
+        let sigma = [0.2];
+        let setup = |bloq: BloqMethod, flag: i8| {
+            let mut model = make_model();
+            model.bloq_method = bloq;
+            let mut subject = make_simple_subject();
+            // The last row, DV 25 against a prediction near 30: both tails are
+            // live and differ from the quantified term.
+            subject.cens[5] = flag;
+            (model, subject)
+        };
+        let conditional = |bloq: BloqMethod, flag: i8| {
+            let (model, subject) = setup(bloq, flag);
+            individual_nll(&model, &subject, &theta, &eta, &omega, &sigma)
+        };
+        let marginal = |bloq: BloqMethod, flag: i8, interaction: bool| {
+            let (model, subject) = setup(bloq, flag);
+            let eta_hat = DVector::from_vec(eta.to_vec());
+            let h = DMatrix::from_element(subject.obs_times.len(), 1, 4.0);
+            foce_subject_nll(
+                &model,
+                &subject,
+                &theta,
+                &eta_hat,
+                &h,
+                &omega,
+                &sigma,
+                &[],
+                interaction,
+            )
+        };
+        let objectives: [(&str, &dyn Fn(BloqMethod, i8) -> f64); 3] = [
+            ("individual_nll", &conditional),
+            ("FOCE", &|b: BloqMethod, c: i8| marginal(b, c, false)),
+            ("FOCEI", &|b: BloqMethod, c: i8| marginal(b, c, true)),
+        ];
+        for (name, nll) in objectives {
+            let m3 = |flag: i8| nll(BloqMethod::M3, flag);
+            let drop = |flag: i8| nll(BloqMethod::Drop, flag);
+            for flag in [0, 1, -1] {
+                assert!(m3(flag).is_finite(), "{name}: m3, CENS={flag}");
+                assert!(drop(flag).is_finite(), "{name}: drop, CENS={flag}");
+            }
+            assert_ne!(
+                m3(1).to_bits(),
+                m3(-1).to_bits(),
+                "{name}: the tails differ"
+            );
+            assert_ne!(
+                m3(1).to_bits(),
+                m3(0).to_bits(),
+                "{name}: the lower tail is live"
+            );
+            assert_ne!(
+                m3(-1).to_bits(),
+                m3(0).to_bits(),
+                "{name}: the upper tail is live"
+            );
+            // "under bloq_method = m3 a positive flag is scored on the lower tail, like
+            // CENS=1" — and the negative one on the upper tail, like CENS=-1.
+            assert_eq!(m3(7).to_bits(), m3(1).to_bits(), "{name}: m3, 7 as 1");
+            assert_eq!(m3(-2).to_bits(), m3(-1).to_bits(), "{name}: m3, -2 as -1");
+            // "under bloq_method = drop the row is scored as an ordinary observation".
+            for flag in [7, -2, 1, -1] {
+                assert_eq!(
+                    drop(flag).to_bits(),
+                    drop(0).to_bits(),
+                    "{name}: drop, CENS={flag} scores as the quantified row"
+                );
+            }
+        }
+    }
+
     #[test]
     fn prepared_inner_nll_reuse_is_bit_identical() {
         let model = make_model();

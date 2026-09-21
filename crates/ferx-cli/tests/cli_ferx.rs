@@ -75,6 +75,65 @@ fn check_with_data_runs_data_dependent_checks() {
     assert_ne!(out.status.code(), Some(2), "should not be a usage error");
 }
 
+/// #1496: a `CENS` cell that is not a whole number, on an observation row the fit
+/// scores, is a read error — so `ferx check --data` reports an error diagnostic and
+/// exits 1. It lands on `E_DATA`: the reader's `Err` carries neither covariate
+/// prefix `covariate_read_diagnostic` classifies, so it is relayed as a data-read
+/// failure with the reader's message inside. The twin, the same file with the cell
+/// corrected to `1`, exits 0 with no error, so the cell is what fails the check.
+#[test]
+fn check_rejects_a_cens_cell_that_is_not_a_whole_number() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let check = |cell: &str, name: &str| {
+        let data = dir.path().join(name);
+        std::fs::write(
+            &data,
+            format!(
+                "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
+                 1,0,.,1,100,1,1,0\n\
+                 1,1,9.0,0,.,1,0,0\n\
+                 1,2,8.2,0,.,1,0,{cell}\n"
+            ),
+        )
+        .expect("write data");
+        let out = ferx()
+            .args(["check", "examples/one_cpt_iv.ferx", "--data"])
+            .arg(&data)
+            .arg("--json")
+            .output()
+            .expect("run ferx check --data");
+        let report: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+        let errors: Vec<(String, String)> = report["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .filter(|d| d["severity"] == "error")
+            .map(|d| {
+                (
+                    d["code"].as_str().unwrap_or_default().to_string(),
+                    d["message"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        (out.status.code(), errors)
+    };
+
+    let (code, errors) = check("abc", "cens_abc.csv");
+    assert_eq!(code, Some(1), "an error diagnostic exits 1: {errors:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let (e_code, message) = &errors[0];
+    assert_eq!(e_code, "E_DATA", "{message}");
+    assert!(
+        message.contains("subject 1, time 2: CENS=\"abc\" is not a whole number"),
+        "the reader's message reaches the report: {message}"
+    );
+
+    let (code, errors) = check("1", "cens_one.csv");
+    assert_eq!(code, Some(0), "the corrected file is valid: {errors:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
 #[test]
 fn check_missing_model_is_usage_error() {
     let out = ferx().arg("check").output().expect("run ferx check");

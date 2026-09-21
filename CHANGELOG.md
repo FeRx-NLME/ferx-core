@@ -19,6 +19,25 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
+  As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)
+  units — during exploration γ = 1, so that is a full Newton step to a single draw's
+  score root with no Robbins–Monro averaging, and a log-scale blend is a geometric mean
+  of the σ sequence. On #1445's own sparse combined-error fixture (300 subjects, median
+  one observation each, truth `combined(0.13, 1.8)`) `score_sa` returned `ADD_ERR`
+  0.84 / 0.52 / 1.13 over three seeds where the default solver returns 1.33 / 1.83 /
+  2.17. The σ half of the step now produces a *target* that the same
+  `min(γ, 0.2, γ_mstep)` variance-scale blend the default solver uses moves σ part of
+  the way to: 1.90 / 1.86 / 2.11 on the same three seeds, with the cross-seed spread
+  down from 0.31 to 0.14. `mstep_damping` reaches σ under `score_sa` as a result. Fits
+  that do not set `mstep_solver = score_sa` are bit-identical to before, and on the
+  cefepime model `score_sa`'s objective is unchanged-to-better
+  ([#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480),
+  [#1475](https://github.com/FeRx-NLME/ferx-core/issues/1475)). `score_sa` remains
+  opt-in: it still converges more slowly than `bobyqa` on a no-ETA θ that starts far
+  from its optimum.
+
 ### Added
 - **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
   on being off target.** Under `scale_adaptation = robbins_monro` the step fires only
@@ -221,6 +240,53 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **The `covariance_regularized` warning is graded on magnitude, names the route it applies
+  to, and says how to get off it** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)).
+  Severity used to be a function of the clipped **count** alone, so a single badly-negative
+  eigenvalue — 1 of 13, 7 % — printed *"severity: minor. Standard errors are likely reliable."*
+  directly above a standard error inflated 4400× and a `%RSE` of 24982. It is now graded on
+  `|min eig| / max eig` and on the worst **variance inflation** the eigenvalue floor caused (how
+  much of a parameter's reported variance came out of the floor rather than out of the data),
+  both of which the message now reports. The inflation is measured on the covariance the fit
+  actually **returns** — after the selected estimator (so `covariance_method = rsr`'s sandwich
+  responds to `S`) and after the delta transform that produces a reported block-Ω standard
+  error — and which of the two magnitudes carried the grade decides what the message then says
+  about the standard errors, instead of one sentence being printed for both. The severity tiers
+  are calibrated against measured regularized fits with quoted reference errors rather than
+  picked. When the finite-difference stencil served the step, the message additionally names
+  **every** gate clause that declined the exact analytic covariance R-matrix (`obs_scale`,
+  `gradient = fd`, `method = laplace`, a mixture, a non-Gaussian endpoint, …) and promises a
+  route change only where the named one-line rewrite clears all of them; and — when the model,
+  *or a closed-form absorption model's ODE twin*, integrates looser than `ode_reltol = 1e-6` /
+  `ode_abstol = 1e-8` — names the tolerances and says that the stencil amplifies integration
+  noise by `1/h²`. No default tolerance changes.
+
+- **The "N of M subjects use finite-difference inner gradients" warning now names the ODE
+  tolerance** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). On an `[odes]` model
+  a finite-difference inner (EBE) gradient reads the integrator's noise directly — measured at
+  25–120 OFV of stall on the TMDD QSS fixture at the default tolerance — so the warning now
+  points at `ode_reltol` / `ode_abstol` (next step `1e-9` if the fit still stalls) and at moving
+  the model into the analytic sensitivity scope. It reads the route the subjects **actually**
+  take, so a closed-form transit / inverse-Gaussian model whose subjects reroute to their
+  absorption ODE twin (IOV, time-varying covariates, a `TIME` switch, a steady-state record or
+  an infusion) is told so too, naming the twin. A population where nothing reaches an
+  integrator is told nothing extra.
+
+- **A `CENS` cell that is not a whole number (`1.5`, `abc`, `inf`) is now an error on a
+  Gaussian observation row that carries a `DV` and that `[data_selection]` keeps**
+  ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It used to read as `0`
+  without a word, so under `bloq_method = m3` a row that may be below the LLOQ was scored as
+  a measurement at the LLOQ. The error names the subject, the row's time and the cell, and
+  says to correct the cell or, if the column is not a censoring flag, to rename it — in the
+  dataset, or aside in the model's `[data]` block. The fit reader and the simulation reader
+  reject the same rows. These rows never read the cell and are not affected: a dose row, a
+  time-to-event or categorical row, a row whose `DV` is missing, and a row that
+  `[data_selection]` removes. NONMEM 7.6.0 also rejects `abc` on an observation record and
+  accepts it on a record its `IGNORE` removes; unlike ferx, it rejects it on a dose record
+  too. `1.5` is rejected although NONMEM reads it as a number, because ferx gives `CENS` a
+  fixed meaning (`SS=1.5` is already an error). `ferx check --data` reports it as `E_DATA`,
+  and from R `ferx_fit()` stops with it. None of the committed datasets in ferx-core,
+  ferx-r, ferx-book, ferxtranslate or the site holds such a cell.
 - **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
   that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
   `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
@@ -368,6 +434,29 @@ section of the SDLC for the versioning policy).
   disagree again; `bloq_method = m3` is unchanged. Under `drop`, SAEM's closed-form σ
   M-step now also stays available on such a dataset instead of falling back to the
   numerical one.
+- **The covariance regularization warning no longer says "FD Hessian" on the exact analytic
+  route** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). Since #1291 most Gaussian
+  `[odes]` fits take the analytic R-matrix, which never second-differences the objective and has
+  no stencil and no step size; the message named the finite-difference Hessian on it anyway, so
+  the advice a user acted on was about a route their fit had not taken.
+- **FOCE fits with a near-zero typical prediction no longer stall on a wrong gradient**
+  ([#1498](https://github.com/FeRx-NLME/ferx-core/issues/1498)). The Woodbury form
+  introduced in #1486 for the Sheiner–Beal `R̃⁻¹` is a subtractive identity, and it
+  loses digits in proportion to how far the residual variance `R⁰` — frozen at the
+  *typical* individual, `η = 0` — sits below the random-effect variance `JΩJᵀ` taken at
+  the subject's own `η̂`. Where the typical prediction has decayed onto the
+  residual-variance floor while the subject's has not (a proportional error model at a
+  steady-state trough, for example), that ratio reaches `1e13` and the analytic FOCE
+  gradient came back with up to 27 % error in `R̃⁻¹` and, on one measured coordinate,
+  2 000× the true value. The outer L-BFGS then gave up after two evaluations and the fit
+  reported `converged = false` far from the optimum — on the `ss_oral_q24` regression
+  fixture, OFV 1012.75 instead of −54.16. The Woodbury path is now taken only where its
+  conditioning is bounded in advance; above that bound the observation-sized
+  factorization is used, which is stable there. It is also written in its Ω-normalised
+  form, so the matrix being factorized is the one that bound covers — previously a
+  `block_omega` whose correlation sits on its rail could degrade the inverse while the
+  bound stayed small, which affected no released version. Well-conditioned fits are
+  bit-identical and keep #1486's speedup.
 
 - **A whole number written with a decimal point (`1.0`) in an integer data column now
   reads as that number — `ADDL` and `MDV` used to drop it without a word**
@@ -394,7 +483,18 @@ section of the SDLC for the versioning policy).
   that is a defect of its own,
   [#1499](https://github.com/FeRx-NLME/ferx-core/issues/1499). A whole `CENS` value
   outside −128…127 now keeps its sign instead of reading as 0. What
-  a cell that is not a whole number (`1.5`, `abc`) means is unchanged.
+  a cell that is not a whole number (`1.5`, `abc`) means is unchanged, except in `CENS`,
+  where it is now an error (see **Changed**).
+- **`W_CENS_UNEXPECTED` named the wrong tail for a negative flag, and misquoted a large one**
+  ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It said every `CENS` value
+  other than `-1`, `0` or `1` was "treated as censored (left tail) under M3", but a negative
+  flag such as `-2` is scored on the upper tail, like `-1`. It also printed the flag after
+  saturation, so `200` was reported as `CENS=127`. It now quotes the cell as written, names
+  the tail by sign — lower for a positive flag, like `1`; upper for a negative one, like `-1`
+  — under `bloq_method = m3`, says that under `drop` the row is scored as an ordinary
+  observation, and is reported once per subject for each sign, so a subject holding both `7`
+  and `-2` hears about both. It is no longer raised on a simulation design row with no `DV`,
+  which is never scored. How such rows are scored is unchanged.
 - **`ferx check --data` reads the dataset through the model file's `[data_selection]`
   clauses, so it no longer rejects a model that fits**
   ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)). The check read the
