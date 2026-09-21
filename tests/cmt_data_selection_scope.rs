@@ -28,10 +28,13 @@
 //! other. Or it can make a clause *start* matching, so the row is wrongly deleted,
 //! and a deleted row hits the filter's `continue` long before that arm runs. The
 //! first version of this file tested only the first direction and used `ferx check`
-//! as its oracle; since `validate_model_file` reads with `filter: None`, that oracle
+//! as its oracle; `validate_model_file` then read with `filter: None`, so that oracle
 //! could not observe the second direction at all, and the mirror case passed green
 //! against a reader that counted nothing (CLAUDE.md, "a green test is not evidence
-//! that it can fail"). The oracle is now `fit()`.
+//! that it can fail"). The oracle is `fit()` and stays `fit()`: #1465 has since made
+//! check read through the same filter, so the two now agree — but an oracle that
+//! agrees *because it is the path under test* is no oracle, and it was exactly that
+//! coincidence going the other way which hid the defect the first time.
 //!
 //! Tier 2: `fit()` only at `outer_maxiter = 0` — one objective evaluation, no
 //! convergence loop — plus `stats::likelihood::individual_nll` summed over the
@@ -161,11 +164,13 @@ fn scored(src: &str, data: &str) -> (usize, f64) {
 /// `api::fit` applies to `population.warnings`.
 ///
 /// This, not [`warns`], is the oracle for anything the filter decides. `ferx check`
-/// reads with no filter at all (`validation.rs` passes `filter: None`), so it counts
-/// a row the fit never sees and reports the warning whether or not the fit does —
-/// which made the first version of the mirror case below pass green against a reader
-/// that counted nothing (CLAUDE.md: "a green test is not evidence that it can fail").
-/// The two entry points genuinely differ here; the last test in this file pins where.
+/// used to read with no filter at all (`validation.rs` passed `filter: None`), so it
+/// counted a row the fit never sees and reported the warning whether or not the fit
+/// did — which made the first version of the mirror case below pass green against a
+/// reader that counted nothing (CLAUDE.md: "a green test is not evidence that it can
+/// fail"). #1465 closed that gap, and the last test in this file pins the agreement;
+/// the oracle stays `fit()` because a check-side oracle would now be the path under
+/// test rather than an independent reading of it.
 ///
 /// Through `fit()` itself, at `outer_maxiter = 0` — one objective evaluation, no
 /// convergence loop — rather than through a re-spelling of the suppression predicate
@@ -203,24 +208,6 @@ fn warns_on_read(src: &str, data: &str) -> bool {
         .warnings
         .iter()
         .any(|w| w.starts_with("W_CMT_DEFAULTED"))
-}
-
-/// Whether `ferx check` raises `W_CMT_DEFAULTED`. Through the public entry point, so
-/// this exercises the filter `fit()` applies rather than a private predicate.
-fn warns(src: &str, data: &str) -> bool {
-    let m = temp(src, ".ferx");
-    let d = temp(data, ".csv");
-    let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
-    assert!(
-        report.diagnostics.iter().all(|x| !x.code.starts_with('E')),
-        "fixture must be a valid model + dataset, else the warning could be missing \
-         because the check stopped early: {:?}",
-        report.diagnostics
-    );
-    report
-        .diagnostics
-        .iter()
-        .any(|x| x.code == "W_CMT_DEFAULTED")
 }
 
 /// A `[data_selection]` block, or nothing at all.
@@ -489,29 +476,58 @@ fn a_deleted_evid_2_row_is_reported_even_though_a_kept_one_is_not() {
     );
 }
 
-#[test]
-fn ferx_check_reads_unfiltered_so_it_answers_a_different_question() {
-    // Recorded rather than asserted away. `validate_model_file` reads with
-    // `filter: None` (`api/validation.rs`), so on a dataset whose defaulted row the
-    // filter deletes, `ferx check` counts that row as a plain observation while
-    // `fit()` counts it as a deletion. Both report `W_CMT_DEFAULTED` — they agree on
-    // the finding — but not on the sentence, and a reader comparing the two should
-    // know why.
-    //
-    // This is also why `warns_on_read` exists: the first version of the mirror case
-    // above used `ferx check` as its oracle and passed green against a reader that
-    // counted nothing at all, because check never applied the filter that caused the
-    // defect.
-    let src = model_src(IGNORE_CMT1_AT_T4);
+/// The check-side `W_CMT_DEFAULTED` message, or `None` when `ferx check` reports no
+/// such warning. The twin of [`warning_text`], which reads the fit's.
+///
+/// Through the public entry point, so this exercises the filter `validate_model_file`
+/// actually applies rather than a private predicate re-spelled here.
+fn check_warning_text(src: &str, data: &str) -> Option<String> {
+    let m = temp(src, ".ferx");
+    let d = temp(data, ".csv");
+    let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
     assert!(
-        warns(&src, &csv("x")),
-        "ferx check reports it (having counted the row as a kept observation)"
+        report.diagnostics.iter().all(|x| !x.code.starts_with('E')),
+        "fixture must be a valid model + dataset, else the warning could be missing \
+         because the check stopped early: {:?}",
+        report.diagnostics
     );
+    report
+        .diagnostics
+        .into_iter()
+        .find(|x| x.code == "W_CMT_DEFAULTED")
+        .map(|x| x.message)
+}
+
+#[test]
+fn ferx_check_and_the_fit_report_the_same_defaulted_row_sentence() {
+    // This test used to be called `ferx_check_reads_unfiltered_so_it_answers_a_\
+    // different_question`, and recorded the disagreement rather than asserting it
+    // away: `validate_model_file` read with `filter: None` (`api/validation.rs`), so
+    // on a dataset whose defaulted row the filter deletes, `ferx check` counted that
+    // row as a plain observation while `fit()` counted it as a deletion. Both
+    // reported `W_CMT_DEFAULTED` — they agreed on the finding — but not on the
+    // sentence. #1465 made check read through the model file's own clauses, so the
+    // two sentences are now the same one, and this test says so.
+    //
+    // Note the shape of the old test: it stayed *green* through the fix while its
+    // name became false, which is why the rewrite is part of #1465 rather than a
+    // follow-up.
+    let src = model_src(IGNORE_CMT1_AT_T4);
+    let check_msg =
+        check_warning_text(&src, &csv("x")).expect("ferx check reports the defaulted row");
     let fit_msg = warning_text(&src, &csv("x")).expect("and fit() reports it too");
+    assert_eq!(
+        check_msg, fit_msg,
+        "both entry points describe the same read"
+    );
+    // The equality alone pins routing, not content: the same producer writes both,
+    // so two empty strings would satisfy it. This is the half the unfiltered read
+    // could not produce — before #1465 check's sentence said the row was *kept*.
     assert!(
-        fit_msg.contains("0 dose row(s) and 0 observation row(s)")
-            && fit_msg.contains("removed from the fit"),
-        "but fit()'s sentence is about a deletion: {fit_msg}"
+        check_msg.contains("0 dose row(s) and 0 observation row(s)")
+            && check_msg.contains("removed from the fit"),
+        "and that read is the filtered one — the row left by deletion, not by being \
+         counted: {check_msg}"
     );
 }
 

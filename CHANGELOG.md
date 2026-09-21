@@ -353,6 +353,34 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **`ferx check --data` reads the dataset through the model file's `[data_selection]`
+  clauses, so it no longer rejects a model that fits**
+  ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)). The check read the
+  **unfiltered** file, so every data-dependent finding described records the fit will
+  never score. Measured both ways: a model whose `[error_model]` covers only the
+  compartments left after `ignore = CMT == 2` was reported as
+  `error[E_PER_CMT_ERROR_MODEL]` with **exit code 1** — the damaging direction, since a
+  script or CI job branches on that code, and the advice was to add an error model for
+  records the user had deliberately excluded — while the fit of the same two files
+  evaluated cleanly. In the mirror direction the check under-reported, naming one dead
+  per-CMT entry where the fit names two and printing `observed: 1, 3` against the fit's
+  `observed: 1`. Note the new verdicts run both ways: a check that used to pass *because*
+  it read rows the filter drops (an endpoint with no records left, a subject with no
+  observations left) will now warn or fail — that is the fit's verdict arriving earlier.
+  Only the model file's own clauses apply: `ferx check` takes no fit options, so
+  conditions merged in by a caller (`fit_from_files`, `ferx_fit(settings = ...)`) remain
+  invisible to it.
+- **`ferx check` reports a reader warning under the reader's own code instead of the
+  generic `W_DATA`** ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)). The
+  code was picked from a hand-written list of three prefixes, so `W_MISSING_DV` — a code
+  the check-report reference documents by name — printed as `warning[W_DATA]:
+  W_MISSING_DV: …` and was unmatchable by a tool keying on the JSON `code` field.
+  Six codes are affected — `W_FILTER_COLUMN_ABSENT`, `W_MISSING_DV`, `W_AMT_NOT_DOSED`,
+  `W_NO_DOSES`, `W_ALL_DOSES_ZERO` and `W_CENS_UNEXPECTED` — and every one of them (plus
+  `W_IOV_OCC_MISSING`, which had the same gap) now has a row in the check-report code
+  tables. Two messages `[data_selection]` raises per subject while it runs state no code
+  of their own and so are still reported as `W_DATA`
+  ([#1495](https://github.com/FeRx-NLME/ferx-core/issues/1495)).
 - **`gradient = fd` (and `FERX_NO_ANALYTIC_INNER`) restore the unseeded inner solve again.** The analytic Hessian seed introduced in #1389 was still computed from the sensitivity provider under those escape hatches, so a model routed to finite-difference inner gradients could start BFGS from a provider-built metric. The seed now declines with the analytic gradient, and the `agq_eval_only` stage reconverges its EBEs with the same seed as the estimator stages so its OFV agrees with the preceding stage's at the same parameters. (follow-up to #1389)
 - **Compartment-free (`$PRED`-style) models get compartment-free diagnostics.** Dose records in such a model's dataset were silently dropped (the reader is model-blind, and `W_NO_DOSES` is suppressed for this class); they are now reported once with counts as `W_COMPARTMENT_FREE_DOSES`, and the dose-level checks that read a compartment topology are skipped for this class: a coded `RATE=-1` / `-2` row no longer demands a `D{n}` / `R{n}` parameter the model cannot consume, and a `CMT=2` row is no longer "out of range" for the one-compartment placeholder the parser installs (which `fit()` rejected before the warning could be reached, and `predict()` / `simulate()` panicked on). `[adaptive_dosing]` is rejected by name (it emits doses into compartments), instead of its `observe` check reading a parameter named `F1` as a dose attribute of a `pk(...)` model the user never wrote. The "computed but never used" census now covers compartment-free models, with its own wording (it used to skip them entirely). A per-`CMT` `[error_model]` on such a model is still rejected, but the reason names the model class rather than "analytical PK models". (#1443)
 - **A compartment-free (`$PRED`-style) model can name a parameter `F1`, `ALAG1`, `D2` or `R1`.** Such a model has no doses, so a dose-attribute-shaped name is an ordinary parameter there — but the parser ran the analytical modeled-dose loop against its placeholder `pk` model and rejected `F{n}`/`ALAG{n}` with the analytical dose-route error (about a `pk(...)` line the user never wrote), rejected a `D{n}`/`R{n}` off compartment 1 as non-infusable, and recorded a `D1`/`R1` as a modeled dose. The loop is now skipped for compartment-free models; analytical `pk(...)` models keep every reject. (#1358)

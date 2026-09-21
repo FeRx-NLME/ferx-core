@@ -186,6 +186,62 @@ fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
     }
 }
 
+/// The `[data_selection]` filter `ferx check`'s data read applies, compiled from
+/// the model file's own clauses by the **fit's** builder
+/// ([`crate::api::run::build_selection_filter`]) rather than a second spelling of
+/// it here (#1465).
+///
+/// `Err` is unreachable from a model file: the parser compiles every clause with
+/// the same `FilterClause::parse` this builder calls (`model_parser.rs`), so a
+/// clause that will not compile has already been reported as `E_PARSE` and
+/// `validate_model_file` returned long before this point. It is split out anyway,
+/// because it must exist, must not panic, and is only *testable* from a hand-built
+/// [`FitOptions`] — see `check_data_read_tests`. A data check run on the
+/// unfiltered dataset would describe records the fit will not score, which is the
+/// whole of #1465, so the `Err` arm skips the data checks rather than falling back
+/// to no filter.
+fn check_selection_filter(
+    opts: &FitOptions,
+) -> Result<Option<crate::io::datareader::SelectionFilter>, Diagnostic> {
+    crate::api::run::build_selection_filter(opts)
+        .map_err(|e| Diagnostic::error("E_PARSE", e).with_block("data_selection"))
+}
+
+/// The code a reader warning already carries, for the `ferx check` diagnostic that
+/// relays it — `W_DATA` only when the message states none.
+///
+/// The reader writes its own code at the head of every message it pushes onto
+/// `Population::warnings` (`W_MISSING_DV: …`, `W_ADDL_MISSING_II subject 3: …`), so
+/// this reads what is there rather than deciding it again. It replaces a list of
+/// three hand-written prefixes that relayed everything else as `W_DATA`: measured
+/// at `6cbf5dbd`, `ferx check` printed `warning[W_DATA]: W_MISSING_DV: …` for a code
+/// `check-report.qmd` documents by name, and #1465 made three more reader warnings
+/// reachable from check that the list did not know about either.
+///
+/// **Not a third taxonomy.** `types::classify_warning` maps fit-side warnings onto
+/// the `WarningCode` enum by substring; this reads a string the reader has already
+/// written and never invents one.
+///
+/// The code is the leading run of `[A-Z0-9_]`, which is what separates
+/// `W_ADDL_MISSING_II subject 3:` (no colon after the code) from `W_MISSING_DV:`.
+/// A message that does not open with one is relayed as `W_DATA`.
+fn reader_warning_code(w: &str) -> &str {
+    // Both arms are live: `None` is a message that is *nothing but* a code, which
+    // `a_reader_warning_is_relayed_under_the_code_it_states` covers. (An earlier
+    // `split(..).next().unwrap_or_default()` had a `None` arm `str::split` can
+    // never take — dead, and so unpinnable by any test.)
+    let end = w
+        .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        .unwrap_or(w.len());
+    let code = &w[..end];
+    // `W_` alone is a prefix, not a code.
+    if code.len() > 2 && code.starts_with("W_") {
+        code
+    } else {
+        "W_DATA"
+    }
+}
+
 /// Per-CMT scaling needs every observed CMT to have an entry in the
 /// `ScalingSpec::PerCmt` / `OdeReadout::PerCmt` map. Wraps the existing
 /// `pk::validate_per_cmt_scaling` (which the parser can't run — it doesn't see
@@ -6668,6 +6724,10 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 mod block_name_diagnostic_tests;
 
 #[cfg(test)]
+#[path = "tests/check_data_read_tests.rs"]
+mod check_data_read_tests;
+
+#[cfg(test)]
 #[path = "tests/model_name_report_tests.rs"]
 mod model_name_report_tests;
 
@@ -6896,21 +6956,31 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     }
 
     // 3. Data-dependent checks (only when a dataset is supplied). Read through
-    //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
-    //    `fit()` apply identical covariate validation (declared columns present
-    //    + numeric). A covariate-validation failure surfaces as the matching
+    //    the same covariate-aware chokepoint the fit uses, *and* through the same
+    //    `[data_selection]` filter, so `ferx check` and the CLI fit apply identical
+    //    covariate validation (declared columns present + numeric) to identical
+    //    records. A covariate-validation failure surfaces as the matching
     //    diagnostic rather than a generic read error.
+    //
+    //    The filter is the model file's own clauses and only those: this function
+    //    takes no `FitOptions`, so clauses a *caller* merges in (`fit_from_files`,
+    //    ferx-r's `ferx_fit(settings = ferx_selection(...))`) are invisible here
+    //    and a check cannot speak for them (#1465).
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
-        match read_population_for(
-            &parsed.model,
-            &parsed.covariate_decls,
-            path,
-            None,
-            iov_col,
-            None,
-            &parsed.column_map,
-        ) {
+        let read = check_selection_filter(&parsed.fit_options).and_then(|sel_filter| {
+            read_population_for(
+                &parsed.model,
+                &parsed.covariate_decls,
+                path,
+                None,
+                iov_col,
+                sel_filter.as_ref(),
+                &parsed.column_map,
+            )
+            .map_err(|e| covariate_read_diagnostic(&e, path))
+        });
+        match read {
             Ok((mut population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
                 // into the check report so `ferx check` sees the same findings as `fit()`.
@@ -6922,16 +6992,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     .iter()
                     .filter(|w| !reader_warning_suppressed(&parsed.model, &parsed.fit_options, w))
                 {
-                    let code = if w.starts_with("W_ADDL_MISSING_II") {
-                        "W_ADDL_MISSING_II"
-                    } else if w.starts_with("W_IOV_OCC_MISSING") {
-                        "W_IOV_OCC_MISSING"
-                    } else if w.starts_with("W_CMT_DEFAULTED") {
-                        "W_CMT_DEFAULTED"
-                    } else {
-                        "W_DATA"
-                    };
-                    diags.push(Diagnostic::warning(code, w.clone()));
+                    diags.push(Diagnostic::warning(reader_warning_code(w), w.clone()));
                 }
                 let binding = std::fs::read_to_string(model_path)
                     .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))
@@ -6987,8 +7048,8 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     }
                 }
             }
-            Err(e) => {
-                diags.push(covariate_read_diagnostic(&e, path));
+            Err(d) => {
+                diags.push(d);
             }
         }
     }

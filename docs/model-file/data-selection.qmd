@@ -190,6 +190,41 @@ by an earlier rule will not appear in the fired list.
 
 ---
 
+## `ferx check` applies the block
+
+`ferx check model.ferx --data data.csv` reads the dataset through these clauses,
+so every data-dependent finding it reports describes the records a fit of the
+same two files would score. A model whose `[error_model]` covers only the
+compartments left after an `ignore` is **valid** to the check, and a warning that
+names the observed compartments names the ones that survived the filter.
+
+Reader warnings the clauses cause reach the check too, and they arrive in two
+different shapes:
+
+- Raised while the clauses are **compiled**, against the dataset's headers:
+  `W_FILTER_COLUMN_ABSENT`, for a condition naming a column the file does not
+  have. It carries its own code in the
+  [check report](../file-formats/check-report.qmd).
+- Raised while the clauses **run**, per subject: `subject N: all dose records
+  were excluded … but observations remain` and `subject N: all observation
+  records were excluded … but dose records remain`. Both need the filter to have
+  removed something, so neither could appear from a check before the clauses were
+  applied at all. Neither states a code of its own, so both are reported under
+  the generic `W_DATA`; giving them real codes is
+  [#1495](https://github.com/FeRx-NLME/ferx-core/issues/1495).
+
+What it cannot see is conditions supplied by a **caller** rather than written in
+the model file: `ferx check` takes no fit options, so `ferx_selection()` passed
+through `ferx_fit(settings = ...)`, or a `FitOptions` handed to `fit_from_files`,
+are invisible to it. Those are merged into the fit's own read (see *Merging with
+R call conditions* below) and a check of the file alone is silent about them.
+
+Before [#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465) the check read
+the **unfiltered** file, so it could reject a model that fits — reporting an
+uncovered compartment that a clause deletes, with a non-zero exit code.
+
+---
+
 ## Limitations
 
 - `||` (OR) within a single expression is not supported. Use multiple lines
