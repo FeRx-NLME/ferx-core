@@ -3765,3 +3765,138 @@ fn a_non_whole_cens_cell_is_rejected_only_on_a_scored_observation_row() {
     assert!(err.contains("CENS=\"abc\""), "{err}");
     assert!(err.contains("subject 1"), "{err}");
 }
+
+/// B10. The **policy** axis (#1509 review, finding 1): `CENS` is read by the
+/// reading that will *score* the row, and only by it.
+///
+/// `read_population_for_simulation` reads the same file under
+/// `MissingDvPolicy::KeepAsDesign`, where every observation row is a design
+/// point the simulator is about to write a DV into. Nothing there consumes the
+/// flag, so a cell holding none is not an error — it reads back as `0`, exactly
+/// as it did before #1496. Rejecting it there would fail a simulation on a
+/// column the run never looks at, and would contradict what `bloq.qmd` and the
+/// changelog say the reject covers ("a row the fit scores").
+///
+/// Both sides in one test, on **one file**, so a gate stuck on either branch
+/// reddens it. Mutation that must redden it: drop `cens_is_scored` from the
+/// reject arm of `classify_row_cens`'s `Err` match.
+#[test]
+fn a_non_whole_cens_cell_is_rejected_only_by_a_read_that_scores_the_row() {
+    let f = write_csv(&cens_obs_csv("abc"));
+
+    // The fitting read (`MissingDvPolicy::Skip`, what `fit()` uses).
+    let err = read_nonmem_csv(f.path(), None, None)
+        .expect_err("the fitting read scores the row, so the cell is consumed");
+    assert!(err.contains("CENS=\"abc\""), "{err}");
+
+    // The simulation read of the *same file*: accepted, and the cell reads as 0.
+    let design = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &design)
+        .expect("a simulation read never consumes CENS, so it cannot reject a cell");
+    assert_eq!(
+        pop.subjects[0].cens,
+        vec![0, 0],
+        "an unreadable cell reads as 0 on the path that does not score it"
+    );
+    assert!(
+        cens_warnings(&pop).is_empty(),
+        "and it is not relayed as the out-of-domain warning either: {:?}",
+        pop.warnings
+    );
+
+    // The shape the simulation reader exists for — `DV = .` design points —
+    // reaches the same site: the row is *kept*, so the gate is what stops the
+    // reject, not `skip_missing_dv`'s `continue` one line above it. Under the
+    // fitting read the row is skipped instead, and is likewise not rejected.
+    let template = write_csv(
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,CENS\n\
+         1,0,.,1,100,1,1,0\n\
+         1,1,.,0,.,1,0,abc\n",
+    );
+    let sim = read_nonmem_csv_filtered_routed(template.path(), &design)
+        .expect("a design point is not scored, so its CENS cell is not read");
+    assert_eq!(
+        sim.subjects[0].obs_times,
+        vec![1.0],
+        "the design row must actually be kept, or the gate is untested"
+    );
+    assert_eq!(sim.subjects[0].cens, vec![0]);
+    let fit = read_nonmem_csv(template.path(), None, None)
+        .expect("under Skip the row is dropped before the cell is reached");
+    assert!(
+        fit.subjects[0].obs_times.is_empty(),
+        "…and dropped it is: {:?}",
+        fit.subjects[0].obs_times
+    );
+}
+
+/// B11. The same gate on `W_CENS_UNEXPECTED`, asserted separately from the
+/// reject so a gate lost from either one is localised (#1509 review, finding 1).
+///
+/// Both clauses of that sentence say how a `bloq_method` **scores** the row. A
+/// design point is not scored under either method, so on the simulation read
+/// both clauses would be false — the warning must not fire at all.
+///
+/// Mutation that must redden it: drop `cens_is_scored` from the `if` guarding
+/// the warning.
+#[test]
+fn an_out_of_domain_cens_is_warned_about_only_by_a_read_that_scores_the_row() {
+    let f = write_csv(&cens_obs_csv("7"));
+
+    let fitted = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(cens_warnings(&fitted).len(), 1, "{:?}", fitted.warnings);
+
+    let design = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let pop = read_nonmem_csv_filtered_routed(f.path(), &design).unwrap();
+    assert!(
+        cens_warnings(&pop).is_empty(),
+        "nothing scores a design point, so neither bloq_method clause is true: {:?}",
+        pop.warnings
+    );
+    // The flag itself is still carried through — the read is unchanged, only the
+    // message is withheld.
+    assert_eq!(pop.subjects[0].cens, vec![7, 0]);
+}
+
+/// B12. A whole `CENS` number outside `i8` **saturates** to `±127` before any
+/// engine sees it — that is deliberate, since every consumer routes on the sign
+/// and `200i64 as i8` would wrap to `-56` and flip the tail. But the message has
+/// to name the cell the user has to go and fix, so it quotes the text as
+/// written: `200`, not the `127` it is scored as (#1509 review, finding 2).
+///
+/// Mutation that must redden it: format the `i8` instead of the cell.
+#[test]
+fn an_out_of_range_cens_is_quoted_as_written_not_as_it_saturates() {
+    // (cell, the value it saturates to, the tail it is scored on, the other tail)
+    for (cell, saturated, tail, other) in [
+        ("200", "127", "lower", "upper"),
+        ("-200", "-128", "upper", "lower"),
+        // A float spelling of the same whole number reads as that number (#1502)
+        // and is quoted the way it is spelled.
+        ("200.0", "127", "lower", "upper"),
+    ] {
+        let f = write_csv(&cens_obs_csv(cell));
+        let pop = read_nonmem_csv(f.path(), None, None)
+            .unwrap_or_else(|e| panic!("{cell}: a whole number is not rejected: {e}"));
+        let w = cens_warnings(&pop);
+        assert_eq!(w.len(), 1, "{cell}: {w:?}");
+        let m = &w[0];
+        assert!(
+            m.starts_with(&format!("W_CENS_UNEXPECTED subject 1: CENS={cell} ")),
+            "{cell}: the cell as written, in the byte-stable prefix: {m}"
+        );
+        assert!(
+            !m.contains(saturated),
+            "{cell}: must not report the saturated {saturated}, which is in no cell of the file: {m}"
+        );
+        // The saturated flag is still what is scored, and the sign it keeps is
+        // what the tail clause names.
+        assert!(m.contains(&format!("{tail} tail")), "{cell}: {m}");
+        assert!(!m.contains(other), "{cell}: {m}");
+        assert_eq!(
+            pop.subjects[0].cens[0],
+            saturated.parse::<i8>().unwrap(),
+            "{cell}: the flag the engines score is the saturated one"
+        );
+    }
+}

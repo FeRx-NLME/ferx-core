@@ -35,10 +35,12 @@ Rows with `CENS != 0` and `MDV = 1` are skipped entirely (already excluded by `M
 |---|---|---|
 | `1`, `-1`, `0`, and any float spelling of them (`1.0`, `+1`, `-0.0`) | the flag itself | — |
 | blank, `.`, `NA`, `NaN` | `0` (quantified) | — |
-| another whole number (`7`, `-2`, `200`) | scored by its **sign**: a positive flag like `1` (the lower tail), a negative one like `-1` (the upper tail) | `W_CENS_UNEXPECTED`, once per sign per subject |
+| another whole number (`7`, `-2`, `200`) | scored by its **sign**: a positive flag like `1` (the lower tail), a negative one like `-1` (the upper tail) | `W_CENS_UNEXPECTED`, once per sign per subject, quoting the cell as written |
 | anything else (`1.5`, `abc`, `inf`) | **rejected** | an error naming the subject, the row's time and the cell |
 
-The reject applies only to a cell the fit would actually consume: an observation row that survives `[data_selection]`. A row a clause removes, and a dose row (where ferx never reads `CENS`), are not checked — as in NONMEM, which rejects a text cell only on a record its `IGNORE` statements keep. A whole number outside `i8` saturates to ±127 and keeps its sign.
+Both the reject and the warning apply only where the flag is actually consumed — that is, to a row a **fit** will score: a Gaussian observation row that survives `[data_selection]`. A row a clause removes, and a dose row (where ferx never reads `CENS`), are not checked — as in NONMEM, which rejects a text cell only on a record its `IGNORE` statements keep. Neither is a *simulation* input checked: a dataset read for `--simulate` carries design points whose `DV` the run is about to write, nothing there reads the flag, and a cell holding none reads as `0`.
+
+A whole number outside `i8` saturates to ±127 before any engine sees it — deliberately, since every consumer routes on the sign and wrapping would flip the tail. The warning still quotes the cell **as written**, so `200` is reported as `CENS=200`, not as the `127` it is scored as.
 
 Before ferx 0.4.0 a cell like `abc` or `1.5` read as `0`, so a possibly-censored row was silently scored as a quantified measurement at its own `DV` — under `bloq_method = m3` that is a measurement at the LOQ.
 

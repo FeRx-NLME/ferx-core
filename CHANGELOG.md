@@ -228,14 +228,18 @@ section of the SDLC for the versioning policy).
   `bloq_method = m3` that scores a possibly-censored row as a measurement at the LOQ. It is
   now rejected, naming the subject, the row's time, the cell and the accepted values
   (`-1` / `0` / `1`), in the shape `SS` and `RATE` already use. The check applies only where
-  the flag is consumed: a row a `[data_selection]` clause removes, and a dose row, are not
-  checked — as in NONMEM, which rejects a text cell only on a record its `IGNORE` statements
-  keep. A dataset written with `1.0` is unaffected, since a float-formatted whole number
-  reads as that number (also #1496). Separately, `W_CENS_UNEXPECTED` — for a whole number
-  outside the domain, such as `7` or `-2` — said "treated as censored (left tail)" for every
-  value it fired on, while every consumer routes on the flag's **sign**: `7` is scored like
-  `1` (lower tail) and `-2` like `-1` (upper tail). The message now names the right tail, and
-  is reported once per *sign* per subject, so a subject carrying both is told about both.
+  the flag is consumed — a row a **fit** will score: a row a `[data_selection]` clause
+  removes, a dose row, and a dataset read for *simulation* (whose rows are design points the
+  run writes a `DV` into) are not checked, as in NONMEM, which rejects a text cell only on a
+  record its `IGNORE` statements keep. A dataset written with `1.0` is unaffected, since a
+  float-formatted whole number reads as that number (also #1496). Separately,
+  `W_CENS_UNEXPECTED` — for a whole number outside the domain, such as `7` or `-2` — said
+  "treated as censored (left tail)" for every value it fired on, while every consumer routes
+  on the flag's **sign**: `7` is scored like `1` (lower tail) and `-2` like `-1` (upper
+  tail). The message now names the right tail, is reported once per *sign* per subject so a
+  subject carrying both is told about both, and quotes the cell **as written** — a value
+  outside `i8` saturates to ±127 before it is scored, so `200` is reported as `CENS=200`
+  rather than as the `CENS=127` it used to print.
 
 - **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
   that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,

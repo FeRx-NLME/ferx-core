@@ -1801,13 +1801,22 @@ fn parse_cens(s: &str) -> i8 {
     classify_cens(s).unwrap_or(0)
 }
 
-/// Classify a row's `CENS` cell. An absent column, or a row shorter than its
-/// header, is `Ok(0)` (quantified); a cell that is present but not a whole number
-/// is `Err`, carrying the cell as written so the caller can quote it (#1496).
-fn classify_row_cens(row: &[String], cens_col: Option<usize>) -> Result<i8, &str> {
+/// Classify a row's `CENS` cell, keeping **the cell as written** on both arms.
+///
+/// An absent column, or a row shorter than its header, is `Ok((0, ""))`
+/// (quantified); a whole number is `Ok((flag, cell))`; a cell that is present but
+/// not a whole number is `Err(cell)` (#1496).
+///
+/// The `Ok` arm carries the text because the flag alone cannot be quoted back: a
+/// whole number outside `i8` has already **saturated** by then, so `200` would be
+/// reported as `CENS=127` and `-200` as `CENS=-128` — the value the engines score
+/// it as, not the value the user has to go and find in the file.
+fn classify_row_cens(row: &[String], cens_col: Option<usize>) -> Result<(i8, &str), &str> {
     match cens_col.and_then(|c| row.get(c)) {
-        None => Ok(0),
-        Some(cell) => classify_cens(cell).map_err(|()| cell.as_str()),
+        None => Ok((0, "")),
+        Some(cell) => classify_cens(cell)
+            .map(|flag| (flag, cell.as_str()))
+            .map_err(|()| cell.as_str()),
     }
 }
 
@@ -1861,7 +1870,16 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
 /// Under the default `drop` the row is scored as an ordinary observation — not
 /// "ignored": `suggest_start` and the `[data_selection]` context read the flag
 /// whatever `bloq_method` is.
-fn cens_unexpected_warning(id: &str, cens: i8) -> String {
+///
+/// `cell` is the text **as written**, not the `i8`: a whole number outside `i8`
+/// saturates at `±127`, so the flag alone would report `200` as `CENS=127` and
+/// `-200` as `CENS=-128`, sending the reader to look for a cell that is not in
+/// the file. The saturated flag is still what is *scored*, and the tail it picks
+/// is what the rest of the sentence names — saturation keeps the sign, which is
+/// all four consumers read. It goes through [`truncate_example`] for the same
+/// reason [`cens_not_whole_error`] does: a mis-mapped column puts arbitrary text
+/// here.
+fn cens_unexpected_warning(id: &str, cens: i8, cell: &str) -> String {
     // The prefix through `CENS=` is byte-stable: `reader_warning_code` reads the
     // code off the head of the message, and the `ferx check` report quotes it.
     let (tail, scored_as) = if cens < 0 {
@@ -1870,9 +1888,10 @@ fn cens_unexpected_warning(id: &str, cens: i8) -> String {
         ("lower", 1)
     };
     format!(
-        "W_CENS_UNEXPECTED subject {id}: CENS={cens} is not -1, 0, or 1; under \
+        "W_CENS_UNEXPECTED subject {id}: CENS={} is not -1, 0, or 1; under \
          bloq_method = m3 the row is scored on the {tail} tail, as {scored_as}; \
-         under bloq_method = drop the row is scored as an ordinary observation"
+         under bloq_method = drop the row is scored as an ordinary observation",
+        truncate_example(cell)
     )
 }
 
@@ -2150,6 +2169,15 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+    // Whether this read produces rows a *likelihood* will score, which is the only
+    // reading that consumes `CENS` (#1496). True for the fitting read
+    // (`MissingDvPolicy::Skip`, `read_population_for`); false for
+    // `read_population_for_simulation`, whose `KeepAsDesign` rows are design
+    // points the simulator writes a DV into — nothing there reads the flag, and
+    // the two `bloq_method` clauses `cens_unexpected_warning` states are both
+    // about scoring, so neither the reject nor the warning applies. Such a cell
+    // reads back as `0`, exactly as it did before #1496.
+    let cens_is_scored = routing.missing_dv == MissingDvPolicy::Skip;
     // One `W_CENS_UNEXPECTED` per sign per subject: the sentence differs by sign
     // (which tail the flag is scored on), so a single latch would report one tail
     // for a subject whose cells span both.
@@ -2781,9 +2809,18 @@ fn parse_subject(
                 // `0`: it runs before the filter's `continue`, and a record the
                 // filter removes is never scored — NONMEM reports no error for a
                 // text cell on an `IGNORE`d record either.
-                let cens_flag = match classify_row_cens(row, cens_col) {
-                    Ok(flag) => flag,
-                    Err(cell) => return Err(cens_not_whole_error(id, raw_time, cell)),
+                //
+                // …and only under a reading that will score the row: see
+                // `cens_is_scored` above. Under `KeepAsDesign` the cell is read
+                // back to `0`, exactly as it did before #1496.
+                let (cens_flag, cens_cell) = match classify_row_cens(row, cens_col) {
+                    Ok(pair) => pair,
+                    Err(cell) if cens_is_scored => {
+                        return Err(cens_not_whole_error(id, raw_time, cell))
+                    }
+                    // The `parse_cens` collapse, spelled out: a cell holding no
+                    // flag is `0` for a read that never consumes it.
+                    Err(cell) => (0, cell),
                 };
                 obs_times.push(time);
                 obs_rec.push(row_seq);
@@ -2798,14 +2835,18 @@ fn parse_subject(
                 // row — and say which tail. Latched per sign: a subject holding
                 // both `7` and `-2` has two different coercions to report, and
                 // one latch would name only the first.
-                if !matches!(cens_flag, -1 | 0 | 1) {
+                // Gated on `cens_is_scored` for the same reason the reject is,
+                // and separately from it: both clauses of the sentence describe
+                // how a `bloq_method` *scores* the row, and a design row is not
+                // scored at all, so under `KeepAsDesign` both would be false.
+                if cens_is_scored && !matches!(cens_flag, -1 | 0 | 1) {
                     let warned = if cens_flag < 0 {
                         &mut cens_invalid_warned_upper
                     } else {
                         &mut cens_invalid_warned_lower
                     };
                     if !*warned {
-                        parse_warnings.push(cens_unexpected_warning(id, cens_flag));
+                        parse_warnings.push(cens_unexpected_warning(id, cens_flag, cens_cell));
                         *warned = true;
                     }
                 }
