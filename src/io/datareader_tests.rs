@@ -3774,6 +3774,33 @@ fn a_cens_cell_holding_no_flag_is_not_read_on_a_simulation_design_row() {
     assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
 }
 
+/// `W_CENS_UNEXPECTED` is not raised on a simulation design row (the Codex review of
+/// #1509, which applies here too). The warning says how the row is scored under `m3`
+/// and under `drop`, and a design row with no `DV` is scored under neither, so every
+/// claim would be false there. The same row with a real `DV`, under the same routing,
+/// still warns. The gate is asserted from both sides in one test.
+#[test]
+fn w_cens_unexpected_is_not_raised_on_a_simulation_design_row() {
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let warnings = |dv: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,{dv},0,0,.,1,7\n"
+        ));
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing)
+            .unwrap_or_else(|e| panic!("DV {dv:?}: {e}"));
+        assert_eq!(pop.subjects[0].obs_times, vec![1.0, 2.0], "DV {dv:?}");
+        pop.warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .count()
+    };
+    assert_eq!(warnings("."), 0, "a design row is never scored");
+    assert_eq!(warnings("4.0"), 1, "the same row with a DV is");
+}
+
 /// B6b, the time-to-event arm, which exists only under `survival`: a TTE row never
 /// reads `CENS` either, so the same `abc` cell reads without error there. Under the
 /// same routing the row on the Gaussian compartment is an error, so the endpoint is

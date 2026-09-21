@@ -1858,7 +1858,8 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
 /// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
 /// see `bloq_method`, so the message states both methods. `cell` is quoted as
 /// written, since a whole number outside `i8` has already saturated: `200` is not
-/// `127`.
+/// `127`. The caller raises it only on a row that carries a `DV`; a simulation
+/// design row is scored under neither method.
 fn cens_unexpected_warning(id: &str, flag: i8, cell: &str) -> String {
     let (sign, tail) = if flag < 0 {
         ("negative", "upper tail, like CENS=-1 (above the ULOQ)")
@@ -2775,10 +2776,12 @@ fn parse_subject(
                 // row, a non-Gaussian row, a row the filter removed and a row the
                 // fit reader skips for its missing DV never get here, and never read
                 // the cell. A design row with no DV, which the simulation reader
-                // keeps (`MissingDvPolicy::KeepAsDesign`), does get here, but it has
-                // no observation to censor, so it does not read the cell either. Both
-                // readers therefore accept the same rows, and a file that fits can
-                // be simulated from.
+                // keeps (`MissingDvPolicy::KeepAsDesign`), does get here. It has no
+                // observation to censor and is never scored, so a cell that holds
+                // no flag is read as 0 there rather than rejected, and an
+                // out-of-domain flag is not warned about below. Both readers
+                // therefore accept the same rows, and a file that fits can be
+                // simulated from.
                 let (cens_flag, cens_cell) = match resolve_row_cens(row, cens_col) {
                     CensCell::Flag(flag, cell) => (flag, cell),
                     CensCell::NotWhole(cell) if dv_missing => (0, cell),
@@ -2796,7 +2799,9 @@ fn parse_subject(
                 // alone — a positive flag on the lower tail, like 1, a negative one
                 // on the upper tail, like -1 — so say so rather than score the row
                 // silently. Once per subject for each sign, since the tails differ.
-                if !matches!(cens_flag, -1 | 0 | 1) {
+                // Not on a design row with no DV: nothing scores it, so every claim
+                // the warning makes about scoring would be false there.
+                if !dv_missing && !matches!(cens_flag, -1 | 0 | 1) {
                     let warned = &mut cens_unexpected_warned[usize::from(cens_flag < 0)];
                     if !*warned {
                         parse_warnings.push(cens_unexpected_warning(id, cens_flag, cens_cell));

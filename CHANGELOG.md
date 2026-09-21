@@ -403,7 +403,8 @@ section of the SDLC for the versioning policy).
   the tail by sign — lower for a positive flag, like `1`; upper for a negative one, like `-1`
   — under `bloq_method = m3`, says that under `drop` the row is scored as an ordinary
   observation, and is reported once per subject for each sign, so a subject holding both `7`
-  and `-2` hears about both. How such rows are scored is unchanged.
+  and `-2` hears about both. It is no longer raised on a simulation design row with no `DV`,
+  which is never scored. How such rows are scored is unchanged.
 - **`ferx check --data` reads the dataset through the model file's `[data_selection]`
   clauses, so it no longer rejects a model that fits**
   ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)). The check read the
