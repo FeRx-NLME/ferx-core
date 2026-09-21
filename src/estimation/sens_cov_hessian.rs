@@ -4883,4 +4883,28 @@ mod tests {
         // same limitation. The flip-flop reroute (finding 5) is likewise parameter-dependent
         // and lives in `subject_sensitivities_cov`, not in a model-level field.
     }
+
+    /// #1496, site `foce_tail_jet` (`cens < 0`): a `CENS` flag outside -1/0/1 is scored
+    /// by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — as
+    /// `W_CENS_UNEXPECTED` tells the user. `y ≠ μ`, so every partial carries the tail
+    /// sign and the two tails differ.
+    #[test]
+    fn foce_tail_jet_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| {
+            let j = foce_tail_jet(10.0, 12.0, 4.0, cens);
+            [j.mu, j.var, j.mumu, j.muvar, j.varvar].map(f64::to_bits)
+        };
+        assert!(at(1)
+            .iter()
+            .chain(at(-1).iter())
+            .all(|&b| f64::from_bits(b).is_finite()));
+        assert_ne!(at(1), at(-1), "the two tails differ here");
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                at(flag),
+                at(code),
+                "foce_tail_jet: CENS={flag} must score as CENS={code}"
+            );
+        }
+    }
 }
