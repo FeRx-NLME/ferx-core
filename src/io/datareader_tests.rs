@@ -3648,13 +3648,15 @@ fn a_cens_cell_that_is_not_a_whole_number_is_an_error_on_a_scored_row() {
 }
 
 /// B6b. The error is raised only where the flag is read: a Gaussian observation row
-/// that the `[data_selection]` filter keeps. The same `abc` cell on a dose row, on
-/// an observation row the filter removes, on a row the reader skips for its missing
-/// `DV`, and on a discrete-endpoint row reads without error; on the kept Gaussian
-/// row it is an error. One test, so moving the check across any of these
-/// boundaries reddens it: raised in the filter context, (ii) dies; raised on every
-/// row, (i) dies; raised before the missing-`DV` skip, (iv) dies; raised whatever
-/// the endpoint, (v) dies.
+/// that the `[data_selection]` filter keeps. The same `abc` cell on a dose row (with
+/// and without an active filter), on an observation row the filter removes, on a row
+/// the reader skips for its missing `DV`, and on a discrete-endpoint row reads without
+/// error; on the kept Gaussian row it is an error. One test, so moving the check
+/// across any of these boundaries reddens it: raised in the filter context, (ii)
+/// dies; raised on every row, (i) dies; raised on every row an active filter keeps,
+/// (i) under the filter dies; raised before the missing-`DV` skip, (iv) dies; raised
+/// whatever the endpoint, (v) dies. The simulation reader's side of (iv) is
+/// `a_cens_cell_holding_no_flag_is_not_read_on_a_simulation_design_row`.
 #[test]
 fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
     let csv = |dose: &str, dv: &str, cmt: &str, obs: &str| {
@@ -3692,6 +3694,19 @@ fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
         "the rule removes the row"
     );
 
+    // (i) again, under (ii)'s active filter. The filter keeps the dose row at TIME 0,
+    // and a kept dose row still never reads the cell. Raising the error on every row
+    // an active filter keeps survived every other test (#1506 review, finding 4).
+    let f = write_csv(&csv("abc", "4.0", "1", "0"));
+    let dose_filtered = read_nonmem_csv_filtered(f.path(), None, None, &filter)
+        .unwrap_or_else(|e| panic!("dose row under an active filter: {e}"));
+    assert_eq!(
+        dose_filtered.subjects[0].doses.len(),
+        1,
+        "the filter keeps the dose row"
+    );
+    assert_eq!(dose_filtered.subjects[0].observations, vec![5.0]);
+
     // (iv) On a row the reader skips because its `DV` is missing (#258).
     let skipped = plain(&csv("0", ".", "1", "abc")).unwrap_or_else(|e| panic!("missing DV: {e}"));
     assert_eq!(skipped.subjects[0].observations, vec![5.0]);
@@ -3721,6 +3736,42 @@ fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
         routed("1").is_err(),
         "the same row on the Gaussian compartment is scored, so it is rejected"
     );
+}
+
+/// B6b, the simulation reader (#1506 review, finding 1). Under
+/// `MissingDvPolicy::KeepAsDesign` a row whose `DV` is missing is kept as a design
+/// point instead of skipped. It has no observation to censor, so it does not read
+/// `CENS` either. Otherwise a file the fit reader accepts could not be simulated or
+/// predicted from. Two assertions keep the legs honest:
+/// - the `Ok` leg asserts the design row was **kept**, so it cannot pass because the
+///   row is absent;
+/// - the same row with a real `DV` is still an error under the same routing, so the
+///   missing `DV` is what exempts it.
+#[test]
+fn a_cens_cell_holding_no_flag_is_not_read_on_a_simulation_design_row() {
+    let routing = ObsRouting::default().with_missing_dv(MissingDvPolicy::KeepAsDesign);
+    let read = |dv: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,{dv},0,0,.,1,abc\n"
+        ));
+        read_nonmem_csv_filtered_routed(f.path(), &routing)
+    };
+    let design = read(".").unwrap_or_else(|e| panic!("design row: {e}"));
+    assert_eq!(
+        design.subjects[0].obs_times,
+        vec![1.0, 2.0],
+        "the design row is kept, not skipped"
+    );
+    assert!(
+        design.subjects[0].observations[1].is_nan(),
+        "a design point carries no DV"
+    );
+    assert_eq!(design.subjects[0].cens, vec![0, 0]);
+    let err = read("4.0").expect_err("the same row with a DV reads the flag");
+    assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
 }
 
 /// B6b, the time-to-event arm, which exists only under `survival`: a TTE row never

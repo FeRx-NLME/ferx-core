@@ -1828,15 +1828,17 @@ fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> CensCell<'_> {
 }
 
 /// The error for a `CENS` cell that is not a whole number, on an observation row
-/// the fit scores (#1496).
+/// that reads the flag (#1496).
 ///
 /// NONMEM 7.6.0 rejects `abc` on an observation record and accepts it on a record
-/// its `IGNORE` removes; ferx rejects it on the rows that read the flag — Gaussian
-/// observation rows the `[data_selection]` filter keeps. `1.5` is rejected too,
-/// although NONMEM reads it as a number: NONMEM leaves its meaning to the user's
-/// code, while ferx gives `CENS` a fixed meaning, and `SS=1.5` is already an error
-/// ([`validate_ss`]). The shape follows [`validate_ss`]; `time` is the row's
-/// `raw_time`, the value the user wrote.
+/// its `IGNORE` removes. ferx rejects it only on the rows that read the flag:
+/// Gaussian observation rows that carry a `DV` and that the `[data_selection]` filter
+/// keeps, whether the fit reader or the simulation reader reads the file. Unlike
+/// NONMEM, ferx therefore accepts `abc` on a dose record, since a dose row never reads
+/// the flag. `1.5` is rejected too, although NONMEM reads it as a number: NONMEM
+/// leaves its meaning to the user's code, while ferx gives `CENS` a fixed meaning,
+/// and `SS=1.5` is already an error ([`validate_ss`]). The shape follows
+/// [`validate_ss`]; `time` is the row's `raw_time`, the value the user wrote.
 fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
     format!(
         "subject {id}, time {time}: CENS=\"{}\" is not a whole number; expected -1 \
@@ -2770,10 +2772,16 @@ fn parse_subject(
                 let dv = if dv_missing { f64::NAN } else { dv };
                 // The row the filter kept and the likelihood scores, so the one
                 // place a `CENS` cell holding no flag is an error (#1496). A dose
-                // row, a non-Gaussian row, a row the filter removed and a row
-                // skipped for its missing DV never get here, and never read the cell.
+                // row, a non-Gaussian row, a row the filter removed and a row the
+                // fit reader skips for its missing DV never get here, and never read
+                // the cell. A design row with no DV, which the simulation reader
+                // keeps (`MissingDvPolicy::KeepAsDesign`), does get here, but it has
+                // no observation to censor, so it does not read the cell either. Both
+                // readers therefore accept the same rows, and a file that fits can
+                // be simulated from.
                 let (cens_flag, cens_cell) = match resolve_row_cens(row, cens_col) {
                     CensCell::Flag(flag, cell) => (flag, cell),
+                    CensCell::NotWhole(cell) if dv_missing => (0, cell),
                     CensCell::NotWhole(cell) => {
                         return Err(cens_not_whole_error(id, raw_time, cell));
                     }
