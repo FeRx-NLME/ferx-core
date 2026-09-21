@@ -1445,8 +1445,9 @@ fn parse_float_formatted_integer(t: &str) -> Option<f64> {
 /// `L2` (#830) and `CMT` (#1009) each had to learn on their own that an exporter
 /// float-formats a whole integer column. `CENS`, `EVID`, `MDV`, `ADDL`, the
 /// occasion column, `SS` in the `[data_selection]` context and `FREMTYPE` had not,
-/// and read `"1.0"` as 0 — `ADDL` and `MDV` without any warning (#1496). This is the
-/// classification they share; what each does with a class stays with the caller.
+/// and read `"1.0"` as 0 — all but `EVID` and the occasion column without any
+/// warning (#1496). This is the classification they share; what each does with a
+/// class stays with the caller.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WholeCell {
     /// A whole number, however it was spelled: `"1"`, `"+1"`, `"1.0"`, `"1e0"`,

@@ -3214,9 +3214,9 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
 // pandas and R float-format a whole integer column once any cell in it is blank,
 // and ferx's own sdtab writes `CENS` as `1.000000`. `L2` (#830) and `CMT` (#1009)
 // were each taught that alone; seven other integer sites went on reading `"1.0"`
-// as 0 — `ADDL` and `MDV` with no warning at all. They now share one
-// classification, `parse_whole_number_cell`; each caller keeps its own range and
-// its own fallback for a cell that is not a whole number.
+// as 0 — all but `EVID` and the occasion column with no warning at all. They now
+// share one classification, `parse_whole_number_cell`; each caller keeps its own
+// range and its own fallback for a cell that is not a whole number.
 
 /// A1. The cell table, through the shared classification and every cell-level
 /// reader. Each row is a spelling an exporter or a hand edit produces.
