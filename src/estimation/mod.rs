@@ -4,6 +4,7 @@ pub mod agq;
 // keeps its private intra-doc links from being rendered as broken by `cargo doc`.
 pub(crate) mod agq_cov_hessian;
 pub mod bayes;
+pub(crate) mod cov_diagnostics;
 pub(crate) mod covariance;
 pub(crate) mod covariate_mu_ref;
 pub(crate) mod fixed_eta_gradient;

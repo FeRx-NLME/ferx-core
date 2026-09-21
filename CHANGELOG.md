@@ -221,6 +221,38 @@ section of the SDLC for the versioning policy).
 
 ### Changed
 
+- **The `covariance_regularized` warning is graded on magnitude, names the route it applies
+  to, and says how to get off it** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)).
+  Severity used to be a function of the clipped **count** alone, so a single badly-negative
+  eigenvalue — 1 of 13, 7 % — printed *"severity: minor. Standard errors are likely reliable."*
+  directly above a standard error inflated 4400× and a `%RSE` of 24982. It is now graded on
+  `|min eig| / max eig` and on the worst **variance inflation** the eigenvalue floor caused (how
+  much of a parameter's reported variance came out of the floor rather than out of the data),
+  both of which the message now reports. The inflation is measured on the covariance the fit
+  actually **returns** — after the selected estimator (so `covariance_method = rsr`'s sandwich
+  responds to `S`) and after the delta transform that produces a reported block-Ω standard
+  error — and which of the two magnitudes carried the grade decides what the message then says
+  about the standard errors, instead of one sentence being printed for both. The severity tiers
+  are calibrated against measured regularized fits with quoted reference errors rather than
+  picked. When the finite-difference stencil served the step, the message additionally names
+  **every** gate clause that declined the exact analytic covariance R-matrix (`obs_scale`,
+  `gradient = fd`, `method = laplace`, a mixture, a non-Gaussian endpoint, …) and promises a
+  route change only where the named one-line rewrite clears all of them; and — when the model,
+  *or a closed-form absorption model's ODE twin*, integrates looser than `ode_reltol = 1e-6` /
+  `ode_abstol = 1e-8` — names the tolerances and says that the stencil amplifies integration
+  noise by `1/h²`. No default tolerance changes.
+
+- **The "N of M subjects use finite-difference inner gradients" warning now names the ODE
+  tolerance** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). On an `[odes]` model
+  a finite-difference inner (EBE) gradient reads the integrator's noise directly — measured at
+  25–120 OFV of stall on the TMDD QSS fixture at the default tolerance — so the warning now
+  points at `ode_reltol` / `ode_abstol` (next step `1e-9` if the fit still stalls) and at moving
+  the model into the analytic sensitivity scope. It reads the route the subjects **actually**
+  take, so a closed-form transit / inverse-Gaussian model whose subjects reroute to their
+  absorption ODE twin (IOV, time-varying covariates, a `TIME` switch, a steady-state record or
+  an infusion) is told so too, naming the twin. A population where nothing reaches an
+  integrator is told nothing extra.
+
 - **A `CENS` cell that is not a whole number (`1.5`, `abc`, `inf`) is now an error on a
   Gaussian observation row that carries a `DV` and that `[data_selection]` keeps**
   ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It used to read as `0`
@@ -368,6 +400,11 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **The covariance regularization warning no longer says "FD Hessian" on the exact analytic
+  route** ([#520](https://github.com/FeRx-NLME/ferx-core/issues/520)). Since #1291 most Gaussian
+  `[odes]` fits take the analytic R-matrix, which never second-differences the objective and has
+  no stencil and no step size; the message named the finite-difference Hessian on it anyway, so
+  the advice a user acted on was about a route their fit had not taken.
 - **FOCE fits with a near-zero typical prediction no longer stall on a wrong gradient**
   ([#1498](https://github.com/FeRx-NLME/ferx-core/issues/1498)). The Woodbury form
   introduced in #1486 for the Sheiner–Beal `R̃⁻¹` is a subtractive identity, and it
