@@ -1191,4 +1191,51 @@ mod tests {
             assert_relative_eq!(one_minus_erf.grad[0], q.grad[0], max_relative = 1e-9);
         }
     }
+
+    /// Bit patterns of a tuple, so `NaN` compares and `-0.0` is not `0.0`.
+    fn bits<const N: usize>(xs: [f64; N]) -> [u64; N] {
+        xs.map(f64::to_bits)
+    }
+
+    /// #1496, site `m3_censored_kernel` (`cens < 0`): a `CENS` flag outside -1/0/1
+    /// is scored by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — as
+    /// `W_CENS_UNEXPECTED` tells the user. `y ≠ f` and `dv_df ≠ 0`, so every output
+    /// carries the tail sign and the two tails differ.
+    #[test]
+    fn m3_censored_kernel_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| {
+            let (h, z, m) = m3_censored_kernel(10.0, 12.0, 4.0, 0.3, cens);
+            [h, z, m]
+        };
+        assert!(at(1).iter().chain(at(-1).iter()).all(|x| x.is_finite()));
+        assert_ne!(bits(at(1)), bits(at(-1)), "the two tails differ here");
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                bits(at(flag)),
+                bits(at(code)),
+                "m3_censored_kernel: CENS={flag} must score as CENS={code}"
+            );
+        }
+    }
+
+    /// #1496, site `m3_censored_outer` (its own `cens < 0`, which signs `∂m/∂f`): as
+    /// the kernel test above. The outer calls the kernel, so a kernel that tests
+    /// `cens == -1` reddens this test too; the reverse does not hold — with the
+    /// kernel intact, only this test sees the outer's own sign.
+    #[test]
+    fn m3_censored_outer_scores_an_out_of_domain_flag_by_its_sign() {
+        let at = |cens: i8| {
+            let (g1, g2, cz, cm) = m3_censored_outer(10.0, 12.0, 4.0, 0.3, 0.05, cens);
+            [g1, g2, cz, cm]
+        };
+        assert!(at(1).iter().chain(at(-1).iter()).all(|x| x.is_finite()));
+        assert_ne!(bits(at(1)), bits(at(-1)), "the two tails differ here");
+        for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
+            assert_eq!(
+                bits(at(flag)),
+                bits(at(code)),
+                "m3_censored_outer: CENS={flag} must score as CENS={code}"
+            );
+        }
+    }
 }
