@@ -19,6 +19,25 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
+  As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)
+  units — during exploration γ = 1, so that is a full Newton step to a single draw's
+  score root with no Robbins–Monro averaging, and a log-scale blend is a geometric mean
+  of the σ sequence. On #1445's own sparse combined-error fixture (300 subjects, median
+  one observation each, truth `combined(0.13, 1.8)`) `score_sa` returned `ADD_ERR`
+  0.84 / 0.52 / 1.13 over three seeds where the default solver returns 1.33 / 1.83 /
+  2.17. The σ half of the step now produces a *target* that the same
+  `min(γ, 0.2, γ_mstep)` variance-scale blend the default solver uses moves σ part of
+  the way to: 1.90 / 1.86 / 2.11 on the same three seeds, with the cross-seed spread
+  down from 0.31 to 0.14. `mstep_damping` reaches σ under `score_sa` as a result. Fits
+  that do not set `mstep_solver = score_sa` are bit-identical to before, and on the
+  cefepime model `score_sa`'s objective is unchanged-to-better
+  ([#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480),
+  [#1475](https://github.com/FeRx-NLME/ferx-core/issues/1475)). `score_sa` remains
+  opt-in: it still converges more slowly than `bobyqa` on a no-ETA θ that starts far
+  from its optimum.
+
 ### Added
 - **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
   on being off target.** Under `scale_adaptation = robbins_monro` the step fires only

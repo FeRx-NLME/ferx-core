@@ -324,6 +324,9 @@ fn run_score_sa(
                 &p.sigma_upper,
                 &p.mask,
                 gamma,
+                // `mstep_damping` off, which is the shipped default, so γ_σ is
+                // `min(γ, SIGMA_SA_MAX_STEP)` exactly as in a production fit.
+                1.0,
                 &[],
             );
         }
@@ -478,6 +481,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         1.0,
+        1.0,
         &[],
     );
     let i1 = sa.info.clone();
@@ -503,6 +507,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         1.0,
+        1.0,
         &[],
     );
     let fresh = sa_b.info.clone();
@@ -521,6 +526,7 @@ fn score_sa_information_is_a_robbins_monro_blend() {
         &p.sigma_upper,
         &p.mask,
         0.5,
+        1.0,
         &[],
     );
 
@@ -715,6 +721,7 @@ fn every_failure_route_is_counted() {
         &p.sigma_upper,
         &p.mask,
         1.0,
+        1.0,
         &[],
     );
     assert!(
@@ -746,6 +753,7 @@ fn every_failure_route_is_counted() {
         &p.sigma_upper,
         &p.mask,
         1.0,
+        1.0,
         &[],
     );
     assert_eq!(sa.failure_total(), 2, "the counter must accumulate");
@@ -768,6 +776,7 @@ fn every_failure_route_is_counted() {
         &q.sigma_lower,
         &q.sigma_upper,
         &q.mask,
+        1.0,
         1.0,
         &[],
     );
@@ -933,5 +942,201 @@ fn score_sa_failure_warning_reports_the_gate_bug_route() {
     assert!(
         w.contains("report it"),
         "the gate-bug route must ask for a report: {w}"
+    );
+}
+
+// ── #1480: σ takes the #1445 policy, θ does not ────────────────────────────
+
+/// One `step` from a fixed point, returning `(log θ, log σ)`.
+fn one_step(gamma: f64, gamma_mstep: f64) -> (Vec<f64>, Vec<f64>) {
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let mut sa = MstepScoreSa::new(4, 1);
+    let mut lt = p.log_theta.clone();
+    let mut ls = p.log_sigma.clone();
+    let moved = sa.step(
+        &model,
+        &population,
+        &draws[0],
+        &mut lt,
+        &mut ls,
+        &p.theta_lower,
+        &p.theta_upper,
+        &p.sigma_lower,
+        &p.sigma_upper,
+        &p.mask,
+        gamma,
+        gamma_mstep,
+        &[],
+    );
+    assert!(
+        moved,
+        "the fixture must take a step at γ = {gamma}, γ_mstep = {gamma_mstep}; \
+         failures: {:?}",
+        sa.failures()
+    );
+    (lt, ls)
+}
+
+/// σ's step size is [`sigma_mstep_sa_step`]'s, θ's is the shared γ (#1480).
+///
+/// **The regression this exists to catch** is the shipped #1462 form: σ scaled
+/// by the same `g_eff` as θ. During exploration `γ = 1`, so that is a *full*
+/// Newton step to one draw's score root — no Robbins-Monro averaging at all —
+/// and it re-opened the #1445 additive-σ collapse on #1445's own fixture
+/// (`ADD_ERR` 0.84 / 0.52 / 1.13 against a truth of 1.8). The smallest edit that
+/// restores it is replacing `g_sigma` with `g_eff` in the apply loop of
+/// [`MstepScoreSa::step`]; that edit makes both arms below identical and kills
+/// the ratio assertion.
+///
+/// **Why a ratio and not a value.** The two arms differ *only* in `gamma_mstep`,
+/// which reaches nothing but γ_σ: the per-subject score and information, the
+/// accumulator blend (`g_info` is γ, not γ_σ) and the Newton direction `d` are
+/// bit-identical, so the θ half must come back bit-identical and the σ half must
+/// differ by exactly the ratio of the two γ_σ. `sigma_mstep_sa_step(1, 1) = 0.2`
+/// and `sigma_mstep_sa_step(1, 0.05) = 0.05`, a ratio of 4 — on σ², since #1445's
+/// blend is on the variance scale, which is the second half of the fix and is
+/// what the closed form below reads.
+///
+/// The no-clamp preconditions are asserted rather than assumed: a σ target that
+/// hit [`SCORE_SA_MAX_STEP`] or a packed bound would make the closed form false
+/// and the test would then be measuring the clamp.
+#[test]
+fn score_sa_steps_sigma_on_the_1445_schedule_and_theta_on_gamma() {
+    let p = packed_start();
+    let (lt_a, ls_a) = one_step(1.0, 1.0); // γ_σ = min(1, 0.2, 1)    = 0.2
+    let (lt_b, ls_b) = one_step(1.0, 0.05); // γ_σ = min(1, 0.2, 0.05) = 0.05
+
+    // θ is untouched by γ_σ, bit-for-bit.
+    assert_eq!(
+        lt_a, lt_b,
+        "γ_mstep must not reach θ under score_sa: {lt_a:?} vs {lt_b:?}"
+    );
+    // ...and θ actually moved, or the equality above is an equality of two
+    // frozen vectors and cannot fail.
+    let theta_moved = worst_theta_gap(&lt_a, &p.log_theta).1;
+    assert!(
+        theta_moved > 1e-3,
+        "θ did not move ({theta_moved:.3e}) — the θ half of this test is vacuous"
+    );
+
+    // σ moved, in both arms, and by different amounts.
+    let (s0, sa_, sb) = (p.log_sigma[0].exp(), ls_a[0].exp(), ls_b[0].exp());
+    assert!(
+        sa_.is_finite() && sb.is_finite(),
+        "σ must stay finite: {sa_} / {sb}"
+    );
+    assert!(
+        (sa_ - s0).abs() > 1e-6 && (sb - s0).abs() > 1e-6,
+        "σ did not move from {s0}: {sa_} / {sb} — a frozen σ satisfies the \
+         ratio below trivially"
+    );
+
+    // The closed form. Both arms blend the SAME target σ_t on the variance
+    // scale, so σ² − σ₀² is linear in γ_σ and the ratio is exactly 0.2 / 0.05.
+    let num = sa_ * sa_ - s0 * s0;
+    let den = sb * sb - s0 * s0;
+    let ratio = num / den;
+    assert!(
+        (ratio - 4.0).abs() < 1e-9,
+        "σ² must move at γ_σ = min(γ, {SIGMA_SA_MAX_STEP}, γ_mstep): realised ratio \
+         {ratio:.9} against the closed-form 4.0 (σ₀ = {s0:.6}, γ_σ = 0.2 → {sa_:.6}, \
+         γ_σ = 0.05 → {sb:.6}). A ratio of 1 is σ riding θ's γ, which is the \
+         #1462 form this test exists to reject."
+    );
+
+    // Preconditions for that closed form: the shared target is inside the trust
+    // region and inside the packed bounds, so neither clamp bound it.
+    let target = s0 * s0 + (sa_ * sa_ - s0 * s0) / 0.2;
+    let log_target = 0.5 * target.ln();
+    assert!(
+        (log_target - p.log_sigma[0]).abs() < SCORE_SA_MAX_STEP,
+        "the σ target moved {:.4} log units, at or past the {SCORE_SA_MAX_STEP} trust \
+         region — the ratio above would then be measuring the clamp",
+        (log_target - p.log_sigma[0]).abs()
+    );
+    assert!(
+        log_target > p.sigma_lower[0] && log_target < p.sigma_upper[0],
+        "the σ target {log_target} is on a packed bound ({}, {})",
+        p.sigma_lower[0],
+        p.sigma_upper[0]
+    );
+}
+
+/// σ is blended on the **variance** scale under `score_sa` too (#1480), which is
+/// the larger half of the fix: #1445 measured the packed-log spelling at
+/// `ADD_ERR` 0.277 against a truth of 1.8, where the schedule alone left seed 1
+/// at 0.87, under the 0.9 gate.
+///
+/// **The regression this exists to catch**: re-spelling the σ half of the step
+/// as an in-place `ls[j] += γ_σ · step`, i.e. the pre-#1445
+/// `damp_mstep(&mut log_sigma, …)` written as a step. That edit leaves
+/// `score_sa_steps_sigma_on_the_1445_schedule_and_theta_on_gamma` **green** —
+/// the log blend is linear in γ_σ too, so that test's ratio would come back 4.0
+/// on `log σ` rather than on `σ²` — which is why the scale needs its own test.
+///
+/// **What is asserted, and why it is not the closed form.** Recovering the
+/// target from one arm and re-deriving σ with the same blend is an identity: it
+/// comes back green under either spelling, and under *any* spelling. So this
+/// test never names the target. It takes three arms whose only difference is
+/// γ_σ (0.05 / 0.10 / 0.15, set through `gamma_mstep`; everything upstream —
+/// score, information, Newton direction, target — is bit-identical) and asserts
+/// that **σ² is affine in γ_σ**, which is what a variance-scale blend
+/// `σ² = (1−γ)σ₀² + γσ_t²` is and what a log-scale blend
+/// `σ² = σ₀²·(σ_t²/σ₀²)^γ` is not. Equally spaced γ, so the statement is a zero
+/// second difference — analytically exact, so the bound is floating-point only.
+///
+/// Realised when written: σ = 0.104207 / 0.108251 / 0.112149 (σ starts at 0.10
+/// and the score pushes it *up* on this noise-free fixture), second difference
+/// **−1.041e-17** on a σ² of order 1.2e-2, against **6.307e-5** for the log
+/// spelling at the same two endpoints — a discriminator of 6e12×. The bound is
+/// 1e-9: 1e8× above the realised value and 6.3e4× below the spelling it
+/// rejects. The spread guard is what stops a frozen σ (every arm equal, second
+/// difference trivially zero) reading as a pass; that is exactly the state the
+/// `g_eff`-for-`g_sigma` mutation produces, since γ ≥ 1 makes
+/// `damp_mstep_sigma_variance` assign and the three arms collapse to one value
+/// — so this test dies under **both** halves of the #1462 form, and the
+/// realised spread is 7.6e-2 against the 1e-3 guard.
+#[test]
+fn score_sa_blends_sigma_on_the_variance_scale() {
+    // γ_σ = min(1, SIGMA_SA_MAX_STEP, γ_mstep) = γ_mstep for these three.
+    let gs = [0.05_f64, 0.10, 0.15];
+    let sig: Vec<f64> = gs.iter().map(|&g| one_step(1.0, g).1[0].exp()).collect();
+    for (g, s) in gs.iter().zip(sig.iter()) {
+        assert!(s.is_finite() && *s > 0.0, "σ at γ_σ = {g} is {s}");
+    }
+
+    // Vacuity guard: σ must actually move across the three arms, or a zero
+    // second difference says nothing. (A frozen σ is what the schedule mutation
+    // produces — γ ≥ 1 assigns, so all three arms would be the same number.)
+    let spread = (sig[2] - sig[0]).abs() / sig[0];
+    assert!(
+        spread > 1e-3,
+        "σ barely moved across γ_σ = {gs:?}: {sig:?} (relative spread {spread:.2e}) — the \
+         second difference below would be zero for either spelling"
+    );
+
+    // σ² is affine in γ_σ ⇔ its second difference over equally spaced γ_σ is
+    // zero. Exact for the variance blend; the log blend is exponential in γ_σ.
+    let v: Vec<f64> = sig.iter().map(|s| s * s).collect();
+    let second = v[0] - 2.0 * v[1] + v[2];
+    // Floating-point only: the statement is exact.
+    const SIGMA_AFFINE_TOL: f64 = 1e-9;
+    // What the packed-log spelling would have produced at these same three
+    // points, from the same endpoints: σ²(γ) = v0·(v2/v0)^((γ−γ0)/(γ2−γ0)).
+    let log_mid = v[0] * (v[2] / v[0]).sqrt();
+    let log_second = v[0] - 2.0 * log_mid + v[2];
+    assert!(
+        log_second.abs() > 1e3 * SIGMA_AFFINE_TOL,
+        "the two spellings are indistinguishable on this fixture (log-spelling second \
+         difference {log_second:.3e}) — this test is vacuous"
+    );
+    assert!(
+        second.abs() < SIGMA_AFFINE_TOL,
+        "σ² must be affine in γ_σ (a variance-scale blend): realised second difference \
+         {second:.3e} over γ_σ = {gs:?}, σ = {sig:?}. The packed-log spelling this test \
+         rejects would give {log_second:.3e} at the same points."
     );
 }
