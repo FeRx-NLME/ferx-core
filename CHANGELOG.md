@@ -253,6 +253,21 @@ section of the SDLC for the versioning policy).
   an infusion) is told so too, naming the twin. A population where nothing reaches an
   integrator is told nothing extra.
 
+- **A `CENS` cell that is not a whole number (`1.5`, `abc`, `inf`) is now an error on a
+  Gaussian observation row that carries a `DV` and that `[data_selection]` keeps**
+  ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It used to read as `0`
+  without a word, so under `bloq_method = m3` a row that may be below the LLOQ was scored as
+  a measurement at the LLOQ. The error names the subject, the row's time and the cell, and
+  says to correct the cell or, if the column is not a censoring flag, to rename it — in the
+  dataset, or aside in the model's `[data]` block. The fit reader and the simulation reader
+  reject the same rows. These rows never read the cell and are not affected: a dose row, a
+  time-to-event or categorical row, a row whose `DV` is missing, and a row that
+  `[data_selection]` removes. NONMEM 7.6.0 also rejects `abc` on an observation record and
+  accepts it on a record its `IGNORE` removes; unlike ferx, it rejects it on a dose record
+  too. `1.5` is rejected although NONMEM reads it as a number, because ferx gives `CENS` a
+  fixed meaning (`SS=1.5` is already an error). `ferx check --data` reports it as `E_DATA`,
+  and from R `ferx_fit()` stops with it. None of the committed datasets in ferx-core,
+  ferx-r, ferx-book, ferxtranslate or the site holds such a cell.
 - **Breaking: a failed model/data precondition is an `Err`, not a panic, on every entry point
   that returns `Result` (#898).** `predict_diag()`, `predict_survival()`,
   `predict_categorical()` and `inits_from_nca()` now return `Result<_, String>` (they
@@ -416,7 +431,18 @@ section of the SDLC for the versioning policy).
   that is a defect of its own,
   [#1499](https://github.com/FeRx-NLME/ferx-core/issues/1499). A whole `CENS` value
   outside −128…127 now keeps its sign instead of reading as 0. What
-  a cell that is not a whole number (`1.5`, `abc`) means is unchanged.
+  a cell that is not a whole number (`1.5`, `abc`) means is unchanged, except in `CENS`,
+  where it is now an error (see **Changed**).
+- **`W_CENS_UNEXPECTED` named the wrong tail for a negative flag, and misquoted a large one**
+  ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). It said every `CENS` value
+  other than `-1`, `0` or `1` was "treated as censored (left tail) under M3", but a negative
+  flag such as `-2` is scored on the upper tail, like `-1`. It also printed the flag after
+  saturation, so `200` was reported as `CENS=127`. It now quotes the cell as written, names
+  the tail by sign — lower for a positive flag, like `1`; upper for a negative one, like `-1`
+  — under `bloq_method = m3`, says that under `drop` the row is scored as an ordinary
+  observation, and is reported once per subject for each sign, so a subject holding both `7`
+  and `-2` hears about both. It is no longer raised on a simulation design row with no `DV`,
+  which is never scored. How such rows are scored is unchanged.
 - **`ferx check --data` reads the dataset through the model file's `[data_selection]`
   clauses, so it no longer rejects a model that fits**
   ([#1465](https://github.com/FeRx-NLME/ferx-core/issues/1465)). The check read the
