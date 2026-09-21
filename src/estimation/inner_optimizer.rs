@@ -338,7 +338,7 @@ pub(crate) fn fd_fallback_warning(
         // accuracy — measured at 25-120 OFV of stall on TMDD at the default. The note is
         // `None` on a closed-form model, where there is no integration noise to remove.
         let tolerance_note =
-            crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model)
+            crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model, population)
                 .unwrap_or_default();
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
@@ -380,7 +380,7 @@ fn iov_fd_fallback_warning(
     // Same #520 C2 note as the non-IOV twin: the tolerance clause is a property of the model
     // integrating ODEs, not of which of the two warnings reports it.
     let tolerance_note =
-        crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model)
+        crate::estimation::cov_diagnostics::fd_inner_gradient_tolerance_note(model, population)
             .unwrap_or_default();
     Some(format!(
         "{n_fd} of {n_total} subjects use finite-difference inner gradients \

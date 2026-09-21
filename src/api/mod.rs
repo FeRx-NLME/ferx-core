@@ -37,7 +37,7 @@ mod fit;
 mod levels;
 mod output_columns;
 mod pool;
-mod postfit;
+pub(crate) mod postfit;
 mod predict;
 mod run;
 mod simulate;

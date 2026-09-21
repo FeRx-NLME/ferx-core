@@ -1084,9 +1084,14 @@ Before 2026-09-16 this section carried a table showing ω² off by ~15 % at the 
 tightening `ode_reltol` / `ode_abstol` toward `1e-9`. That measurement was taken on 2026-06-17,
 two days after `transit()` landed, and it no longer reproduces: the exact analytic FOCE/FOCEI
 gradient (#367 / #381) and the analytic covariance R-matrix for `[odes]` models (#1291) both
-arrived after it, and the analytic route differentiates the trajectory consistently however
-loosely it is integrated. Standard errors on the **finite-difference** covariance route are a
-separate question — see the `ode_reltol` row in
+arrived after it, and the analytic route differentiates the trajectory rather than
+second-differencing the objective, so a loose tolerance no longer reaches the estimates through
+that `1/h²` mechanism — every quantity in the table above is flat across the sweep. That is a
+statement about one mechanism, not a claim that the analytic route is step-free: its third-order
+assembly still finite-differences the `Dual2` jet, and
+[#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505) records a lagged-dose arrival kink
+where that step measures `SE(TVLAG)` 27 % low. Standard errors on the **finite-difference**
+covariance route are a separate question again — see the `ode_reltol` row in
 [fit options](fit-options.qmd#ode-solver-tolerances) and issue #520.
 :::
 

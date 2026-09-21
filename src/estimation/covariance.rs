@@ -368,6 +368,29 @@ pub(crate) fn combine_covariance(
     }
 }
 
+/// [`combine_covariance`] applied to the returned inverse **and** to the eigen-floor's
+/// unclipped reference, so both go through the same estimator (#1508 review §1).
+///
+/// This is the wiring the regularization diagnostic depends on and the reason it is a function
+/// rather than two lines inside `compute_covariance`: under `covariance_method = rsr` the
+/// returned covariance is `R⁻¹ S R⁻¹`, so the *same* floored `R` yields a different reported
+/// inflation for a different `S` — `S` can suppress or concentrate the floored eigendirection.
+/// Combining the reference with `R⁻¹` instead of with the selected estimator would put the old,
+/// `S`-blind number back, and inside `compute_covariance` no Tier-1 test could reach it.
+///
+/// `None` propagates [`combine_covariance`]'s only failure (a rank-deficient `S` under
+/// `covariance_method = s`). The reference is `None` whenever the caller has nothing to compare
+/// — nothing clipped, or an estimator that never inverts `R`.
+pub(crate) fn combine_covariance_and_reference(
+    method: CovarianceMethod,
+    r_inv: DMatrix<f64>,
+    r_inv_ref: Option<DMatrix<f64>>,
+    s: &DMatrix<f64>,
+) -> Option<(DMatrix<f64>, Option<DMatrix<f64>>)> {
+    let reference = r_inv_ref.and_then(|ri| combine_covariance(method, ri, s));
+    Some((combine_covariance(method, r_inv, s)?, reference))
+}
+
 /// Assemble the per-subject score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free
 /// parameter block, where `gᵢ = ∂(−logLᵢ)/∂θ` is subject `i`'s contribution to
 /// the population score (the same per-subject gradient the Gauss–Newton optimizer
@@ -559,43 +582,57 @@ pub(crate) fn assemble_score_cross_product(
     Ok(s)
 }
 
-/// Which clause kept this fit off the exact analytic covariance R-matrix (#520 C2).
+/// **Every** clause that kept this fit off the exact analytic covariance R-matrix (#520 C2).
 ///
-/// Returns `None` only when the analytic route was in fact taken — so a caller that has already
-/// observed `analytic_cov_hessian(..) == None` and still gets `None` here has found a genuine
-/// drift between this walk and the assembly, and gets [`CovScopeDecline::PerSubjectBail`]
-/// instead of silence.
+/// All of them, not the first: the remedy sentence promises that an action "moves the fit onto
+/// the analytic route", and that is only true when the action clears every clause that
+/// declined. Dropping `gradient = fd` does not move a non-Gaussian model, and enabling
+/// `analytic_cov_hessian` does not move a mixture — both were promised unconditionally before
+/// (#1508 review §3). The three model-level gates are therefore collected side by side rather
+/// than short-circuited, and the per-subject walk uses
+/// [`crate::sens::provider::covariance_scope_declines`], the exhaustive half of the same gate
+/// the routing decision runs.
 ///
-/// The three model-level gates `compute_covariance` applies before the assembly are checked in
-/// the order it applies them; everything after that is [`covariance_scope_decline`], which **is**
-/// the gate rather than a description of it, so the named clause cannot drift from the clause
-/// that fired. `iov` is `n_kappa > 0` because the gate declines both of the other combinations
+/// Returns an empty vec only when the analytic route was in fact taken — so a caller that has
+/// already observed `analytic_cov_hessian(..) == None` and still finds nothing here has found a
+/// genuine drift between this walk and the assembly, and gets
+/// [`CovScopeDecline::PerSubjectBail`] instead of silence.
+///
+/// `iov` is `n_kappa > 0` because the gate declines both of the other combinations
 /// (`!iov && n_kappa > 0` and `iov && n_kappa == 0`), so it is the only value that can pass.
 ///
-/// Called only when a regularization warning is about to be emitted on the FD route.
-fn analytic_cov_decline_reason(
+/// Called only when a regularization warning is about to be emitted on the FD route, i.e. after
+/// a stencil that has just spent `2·n_free²` reconverged population objectives.
+fn analytic_cov_declines(
     model: &CompiledModel,
     population: &Population,
     options: &FitOptions,
     is_mixture: bool,
-) -> Option<CovScopeDecline> {
+) -> Vec<CovScopeDecline> {
+    let mut out: Vec<CovScopeDecline> = Vec::new();
     if !options.analytic_cov_hessian {
-        return Some(CovScopeDecline::Disabled);
+        out.push(CovScopeDecline::Disabled);
     }
     if is_mixture {
-        return Some(CovScopeDecline::Mixture);
+        out.push(CovScopeDecline::Mixture);
     }
     // Mirrors `analytic_cov_hessian`'s own first bail: an AGQ/Laplace fit anchored on the exact
     // `H` needs fourth-order sensitivities for `∂²H/∂x²`, which nothing computes.
     if options.agq_nodes().is_some() && options.hessian_anchor() != HessianAnchor::GaussNewton {
-        return Some(CovScopeDecline::ExactHessianAnchor);
+        out.push(CovScopeDecline::ExactHessianAnchor);
     }
     let iov = model.n_kappa > 0;
-    population
-        .subjects
-        .iter()
-        .find_map(|s| crate::sens::provider::covariance_scope_decline(model, s, iov))
-        .or(Some(CovScopeDecline::PerSubjectBail))
+    for subject in &population.subjects {
+        for decline in crate::sens::provider::covariance_scope_declines(model, subject, iov) {
+            if !out.contains(&decline) {
+                out.push(decline);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(CovScopeDecline::PerSubjectBail);
+    }
+    out
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -1294,7 +1331,16 @@ pub(crate) fn compute_covariance(
     // The FD Hessian is of the OFV = −2·logL. The asymptotic covariance is the
     // inverse observed Fisher information R = Hessian of −logL = ½·H_ofv, so
     // R⁻¹ = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
-    let r_inv = inv.inverse * 2.0;
+    let r_inv = inv.inverse.clone() * 2.0;
+    // The same `R⁻¹` with the floored directions dropped instead of floored — the covariance
+    // the data alone supports. Carried through the *same* estimator and the *same* reported
+    // -parameter transform as `r_inv`, so the inflation the message prints is the inflation of
+    // the numbers on the page (#1508 review §1). Built only when the floor actually fired and
+    // only when the warning can be emitted at all (the cross-product estimator never returns
+    // `R⁻¹`, so nothing there is inflated by this floor).
+    let r_inv_ref = (inv.n_clipped > 0
+        && options.covariance_method != CovarianceMethod::CrossProduct)
+        .then(|| inv.unclipped_inverse.clone() * 2.0);
 
     // Select the covariance estimator (NONMEM `$COV MATRIX=`). `R⁻¹` is the
     // model-based default; `S⁻¹` and `R⁻¹SR⁻¹` additionally need the per-subject
@@ -1302,8 +1348,8 @@ pub(crate) fn compute_covariance(
     // (`gᵢ = ∂(−logLᵢ)/∂θ`, no factor of 2), matching `R = ½·H_ofv`.
     // Anchored against NONMEM `$COV MATRIX=S`/`RSR` for both FOCEI (#266) and
     // FOCE (no-INTER) (#250): all SEs within ~10% of NONMEM.
-    let cov_free = if options.covariance_method == CovarianceMethod::Hessian {
-        r_inv
+    let (cov_free, cov_free_ref) = if options.covariance_method == CovarianceMethod::Hessian {
+        (r_inv, r_inv_ref)
     } else {
         let s_free = assemble_score_cross_product(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
@@ -1316,8 +1362,9 @@ pub(crate) fn compute_covariance(
             Ok(s) => s,
             Err(reason) => return CovarianceStepResult::Unusable(reason),
         };
-        match combine_covariance(options.covariance_method, r_inv, &s_free) {
-            Some(c) => c,
+        match combine_covariance_and_reference(options.covariance_method, r_inv, r_inv_ref, &s_free)
+        {
+            Some(pair) => pair,
             None => {
                 return CovarianceStepResult::Unusable(
                     "Covariance step failed: the score cross-product matrix S is singular or \
@@ -1356,6 +1403,15 @@ pub(crate) fn compute_covariance(
         } else {
             CovHessianSource::FdStencil
         };
+        // Resolved only on the FD route, and only here: the walk is one predicate sweep per
+        // subject, which is nothing against the stencil that has just run, but it is not free
+        // on a fit that had no complaint to make.
+        let declines = match source {
+            CovHessianSource::FdStencil => {
+                analytic_cov_declines(model, population, options, is_mixture)
+            }
+            CovHessianSource::AnalyticRMatrix => Vec::new(),
+        };
         let facts = CovRegularizationFacts {
             source,
             n_clipped: inv.n_clipped,
@@ -1363,17 +1419,15 @@ pub(crate) fn compute_covariance(
             min_eigenvalue: inv.min_eigenvalue,
             max_eigenvalue: inv.max_eigenvalue,
             floor: inv.floor,
-            variance_inflation: inv.variance_inflation,
-            // Resolved only on the FD route, and only here: the walk is one predicate sweep per
-            // subject, which is nothing against the stencil that has just run, but it is not
-            // free on a fit that had no complaint to make.
-            decline: match source {
-                CovHessianSource::FdStencil => {
-                    analytic_cov_decline_reason(model, population, options, is_mixture)
-                }
-                CovHessianSource::AnalyticRMatrix => None,
-            },
-            ode: OdeToleranceFacts::from_model(model),
+            variance_inflation: reported_variance_inflation(
+                &cov,
+                cov_free_ref.as_ref(),
+                &free_idx,
+                n,
+                template,
+            ),
+            declines: &declines,
+            ode: OdeToleranceFacts::from_route(model, population),
         };
         let msg = format_regularized_warning(&facts);
         if options.verbose {
@@ -1428,15 +1482,123 @@ pub(crate) struct RegularizedInverse {
     pub floor: f64,
     /// How many eigenvalues fell below the floor and were clipped.
     pub n_clipped: usize,
-    /// Worst, over free coordinates `k`, of
-    /// `inv[k,k] / Σ_{λᵢ ≥ floor} q[k,i]² / λᵢ` — the returned variance divided by the
-    /// variance the **unclipped** part of the spectrum alone supports (#520 C1).
+    /// `Q Λ⁻¹ Qᵀ` restricted to the directions the floor left alone — the Moore–Penrose
+    /// pseudo-inverse over the unclipped spectrum, with the clipped directions contributing
+    /// **nothing** instead of `1/floor` (#520 C1).
     ///
-    /// `1.0` when nothing was clipped. `f64::INFINITY` when some coordinate loads entirely on
-    /// floored directions, i.e. its whole reported variance was manufactured by the floor.
-    /// This is the quantity the old count-fraction grading had no access to: it is what turns
-    /// "1 of 13 eigenvalues clipped" into "this SE is inflated 4400×".
-    pub variance_inflation: f64,
+    /// This is the *reference* the regularization diagnostic is measured against: it is the
+    /// covariance the data alone supports, so running it through the same estimator and the
+    /// same reported-parameter delta transform as the returned inverse gives the inflation the
+    /// user's standard errors actually carry. Equal to `inverse` when `n_clipped == 0`.
+    ///
+    /// Kept as a matrix rather than collapsed to a per-coordinate ratio here because the two
+    /// steps that follow — the sandwich `R⁻¹ S R⁻¹` and the block-Ω Jacobian — both mix
+    /// coordinates, so a packed-space diagonal ratio is not the number a user reads (#1508
+    /// review §1).
+    pub unclipped_inverse: DMatrix<f64>,
+}
+
+/// Worst inflation of a variance caused by the eigenvalue floor: `max_k var[k] / var_ref[k]`,
+/// never below `1.0` (#520 C1).
+///
+/// `var` and `var_ref` are the **same** quantities computed two ways — the returned covariance
+/// and the same pipeline with the floored directions dropped instead of floored. Either
+/// diagonals of a covariance or squared reported standard errors; the caller decides which,
+/// and [`compute_covariance`] passes the reported ones.
+///
+/// Two guards, and both are load-bearing — each is killed by its own mutation, which is how
+/// they were cut down from three (the third rejected exactly the inputs the first already did,
+/// and deleting it left the suite green: CLAUDE.md's redundant-gate hole):
+///
+/// * **`var[k]` not positive** — the `FIX`ed-parameter cell. A pinned coordinate reports
+///   `SE = 0` on *both* sides, and `0 / 0` would fall into the `var_ref <= 0` arm below and
+///   report every `FIX`ed parameter as `unbounded`. Skipping is the right answer: the floor
+///   cannot have inflated a variance that is not there.
+/// * **`var[k]` not finite** — a diverged solve. Without it an `inf` reported variance divides
+///   to `inf` and the message reports an unbounded inflation for a covariance that is simply
+///   broken, where the caller's own non-finite handling should speak instead.
+///
+/// `var_ref[k] <= 0` with a positive `var[k]` is `f64::INFINITY` — the meaningful answer (that
+/// coordinate's entire variance came from floored directions), not an accident of division.
+/// The fold compares with `>` rather than folding through `f64::max`; both let a `NaN` fall
+/// through here, but the explicit comparison says so where a reader can see it.
+/// Every standard error the fit will **report**, flattened: θ on its natural scale, the Ω
+/// lower triangle through the multivariate Cholesky Jacobian, σ, Ω_IOV, and the `block_sigma`
+/// ρ's. Exactly the numbers `FitResult` carries, produced by the one function that produces
+/// them, so the diagnostic cannot measure a different transform than the user reads.
+fn reported_standard_errors(cov: &DMatrix<f64>, template: &ModelParameters) -> Vec<f64> {
+    let owned = Some(cov.clone());
+    let (se_theta, se_omega, se_sigma, se_kappa) =
+        crate::api::postfit::extract_standard_errors(&owned, template);
+    let rho = crate::api::postfit::extract_residual_correlation_se(&owned, template);
+    [se_theta, se_omega, se_sigma, se_kappa, rho]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect()
+}
+
+/// Worst inflation of a **reported** variance caused by the eigenvalue floor (#520 C1, reworked
+/// for #1508 review §1).
+///
+/// `cov` is the covariance the fit will return, already embedded in the full packed space;
+/// `cov_free_ref` is the same estimator's output with the floored directions dropped instead of
+/// floored, over the free block. Both are run through [`reported_standard_errors`], i.e.
+/// through the selected estimator **and** the reported-parameter delta transform, and compared
+/// as variances.
+///
+/// That is what makes the number responsive to the two things a packed-space `R⁻¹` diagonal
+/// could not see: the sandwich `R⁻¹ S R⁻¹`, where a different `S` concentrates or suppresses
+/// the floored eigendirection for the same `R`, and the block-Ω Jacobian, which mixes packed
+/// coordinates on its way to a reported `ω_ij`.
+///
+/// `1.0` when there is no reference, which is exactly the cells where nothing was floored into
+/// the returned covariance (`n_clipped == 0`, or `covariance_method = s`, which never inverts
+/// `R`) — and in those cells the caller does not emit the warning at all.
+fn reported_variance_inflation(
+    cov: &DMatrix<f64>,
+    cov_free_ref: Option<&DMatrix<f64>>,
+    free_idx: &[usize],
+    n: usize,
+    template: &ModelParameters,
+) -> f64 {
+    let Some(cov_free_ref) = cov_free_ref else {
+        return 1.0;
+    };
+    let mut cov_ref = DMatrix::zeros(n, n);
+    for (a, &i) in free_idx.iter().enumerate() {
+        for (b, &j) in free_idx.iter().enumerate() {
+            cov_ref[(i, j)] = cov_free_ref[(a, b)];
+        }
+    }
+    let se = reported_standard_errors(cov, template);
+    let se_ref = reported_standard_errors(&cov_ref, template);
+    let var: Vec<f64> = se.iter().map(|s| s * s).collect();
+    let var_ref: Vec<f64> = se_ref.iter().map(|s| s * s).collect();
+    worst_variance_inflation(&var, &var_ref)
+}
+
+pub(crate) fn worst_variance_inflation(var: &[f64], var_ref: &[f64]) -> f64 {
+    debug_assert_eq!(
+        var.len(),
+        var_ref.len(),
+        "worst_variance_inflation compares the same coordinates two ways"
+    );
+    let mut worst: f64 = 1.0;
+    for (&v, &v_ref) in var.iter().zip(var_ref.iter()) {
+        if !(v > 0.0) || !v.is_finite() {
+            continue;
+        }
+        let ratio = if v_ref > 0.0 {
+            v / v_ref
+        } else {
+            f64::INFINITY
+        };
+        if ratio > worst {
+            worst = ratio;
+        }
+    }
+    worst
 }
 
 /// Invert a symmetric matrix by clipping eigenvalues to a small positive floor.
@@ -1470,7 +1632,7 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
             max_eigenvalue: f64::NEG_INFINITY,
             floor: f64::INFINITY,
             n_clipped: 0,
-            variance_inflation: 1.0,
+            unclipped_inverse: DMatrix::zeros(0, 0),
         });
     }
 
@@ -1532,44 +1694,31 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
     let inv_t = inverse.transpose();
     inverse = (&inverse + &inv_t) * 0.5;
 
-    // Worst per-coordinate variance inflation caused by the floor (#520 C1). `inv[k,k]` is
-    // `Σᵢ q[k,i]² / λ̃ᵢ` over the *clipped* spectrum; the denominator is the same sum restricted
-    // to the directions the floor left alone. Their ratio answers the question the user is
-    // actually asking — "how much of this standard error came out of the floor rather than out
-    // of the data" — which the clipped **count** cannot.
+    // The reference the regularization diagnostic is graded against (#520 C1): the same
+    // spectral inverse with the floored directions contributing **nothing** rather than
+    // `1/floor`. Built here because it needs the eigenvectors, which do not survive this
+    // function; the ratio itself is taken downstream, after the estimator and the
+    // reported-parameter delta transform have both had their say (#1508 review §1).
     //
-    // Computed here rather than by the caller because it needs the eigenvectors, which do not
-    // survive this function. A coordinate whose unclipped mass is exactly zero yields
-    // `f64::INFINITY`, which is a meaningful answer and is formatted as "unbounded", not `inf`.
-    let variance_inflation = if n_clipped == 0 {
-        1.0
+    // Skipped when nothing was clipped: the two matrices are then equal by construction, and
+    // the caller's `n_clipped > 0` gate means it is never read.
+    let unclipped_inverse = if n_clipped == 0 {
+        inverse.clone()
     } else {
-        let mut worst: f64 = 1.0;
-        for k in 0..n {
-            let mut unclipped = 0.0;
-            for i in 0..n {
-                if lambdas[i] >= floor {
-                    unclipped += q[(k, i)] * q[(k, i)] / lambdas[i];
-                }
-            }
-            let total = inverse[(k, k)];
-            if !(total > 0.0) {
-                // A non-positive reconstructed variance is a numerical artefact of the
-                // eigendecomposition, not an inflation; skip rather than fold a negative or
-                // NaN ratio into the max (`f64::max` would silently discard the NaN and keep
-                // whatever the other coordinates produced — CLAUDE.md's fold trap).
-                continue;
-            }
-            let ratio = if unclipped > 0.0 {
-                total / unclipped
+        let mut q_unclipped = q.clone();
+        for j in 0..n {
+            let s = if lambdas[j] >= floor {
+                1.0 / lambdas[j]
             } else {
-                f64::INFINITY
+                0.0
             };
-            if ratio > worst {
-                worst = ratio;
+            for i in 0..n {
+                q_unclipped[(i, j)] *= s;
             }
         }
-        worst
+        let m = &q_unclipped * q.transpose();
+        let m_t = m.transpose();
+        (&m + &m_t) * 0.5
     };
 
     Some(RegularizedInverse {
@@ -1578,7 +1727,7 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
         max_eigenvalue: max_eig,
         floor,
         n_clipped,
-        variance_inflation,
+        unclipped_inverse,
     })
 }
 
@@ -1817,11 +1966,16 @@ mod tests {
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
 
+    /// The diagonal of a covariance, as the inflation metric consumes it.
+    fn diag(m: &DMatrix<f64>) -> Vec<f64> {
+        (0..m.nrows()).map(|k| m[(k, k)]).collect()
+    }
+
     #[test]
     fn invert_psd_with_floor_reports_the_spectrum_ends_and_no_inflation_when_clean() {
         // A positive-definite input is inverted exactly: nothing is clipped, so the floor
-        // manufactured no variance and the inflation must be exactly 1.0 — the value that
-        // grades `Minor` however many free parameters there are.
+        // manufactured no variance and the reference equals the inverse — an inflation of
+        // exactly 1.0, the value that grades `Minor` however many free parameters there are.
         let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![4.0, 1.0]));
         let inv = super::invert_psd_with_floor(&m).expect("PD input inverts");
         assert_eq!(inv.n_clipped, 0);
@@ -1835,7 +1989,10 @@ mod tests {
             "{}",
             inv.min_eigenvalue
         );
-        assert_eq!(inv.variance_inflation, 1.0);
+        assert_eq!(
+            super::worst_variance_inflation(&diag(&inv.inverse), &diag(&inv.unclipped_inverse)),
+            1.0
+        );
     }
 
     #[test]
@@ -1868,19 +2025,24 @@ mod tests {
             inv.min_eigenvalue
         );
         assert!((inv.floor - 1e-8).abs() < 1e-18, "{}", inv.floor);
-        let expected = (0.5 / 100.0 + 0.5 / 1e-8) / (0.5 / 100.0);
-        let rel = (inv.variance_inflation - expected).abs() / expected;
+        // The unclipped reference drops the floored direction entirely, so its diagonal is the
+        // hand-computed `0.5/100` and not `0.5/100 + 0.5/floor`.
+        let unclipped = diag(&inv.unclipped_inverse);
         assert!(
-            rel < 1e-6,
-            "variance_inflation {} vs hand-computed {expected}",
-            inv.variance_inflation
+            (unclipped[0] - 0.005).abs() / 0.005 < 1e-9,
+            "unclipped reference {unclipped:?}"
         );
+        let got = super::worst_variance_inflation(&diag(&inv.inverse), &unclipped);
+        let expected = (0.5 / 100.0 + 0.5 / 1e-8) / (0.5 / 100.0);
+        let rel = (got - expected).abs() / expected;
+        assert!(rel < 1e-6, "inflation {got} vs hand-computed {expected}");
         // And the grade that number produces, end to end.
         assert_eq!(
-            crate::estimation::cov_diagnostics::grade_severity(
+            crate::estimation::cov_diagnostics::grade(
                 inv.min_eigenvalue.abs() / inv.max_eigenvalue,
-                inv.variance_inflation,
-            ),
+                got,
+            )
+            .severity,
             crate::estimation::cov_diagnostics::CovSeverity::Severe,
         );
     }
@@ -1894,10 +2056,227 @@ mod tests {
         let m = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
         let inv = super::invert_psd_with_floor(&m).expect("has positive curvature");
         assert_eq!(inv.n_clipped, 1);
+        let got =
+            super::worst_variance_inflation(&diag(&inv.inverse), &diag(&inv.unclipped_inverse));
+        assert!(got.is_infinite(), "{got}");
+    }
+
+    #[test]
+    fn worst_variance_inflation_guards_each_kill_their_own_mutation() {
+        // Both guards, each asserted where **only** it can produce the right answer, so
+        // deleting either one reddens this test on its own line. The three-guard version this
+        // replaced had a third condition that rejected exactly the inputs the first already
+        // did — deleting it left the suite green, which is CLAUDE.md's redundant-gate hole and
+        // is why the guards were cut down rather than added to.
+        let live = 9.0;
+
+        // Guard 1 — the `FIX`ed-parameter cell. A pinned coordinate reports SE 0 on *both*
+        // sides. Without `!(v > 0.0)` the pair `(0.0, 0.0)` takes the `v_ref <= 0` arm and
+        // every fixed parameter in the model reports `unbounded`.
+        assert_eq!(
+            super::worst_variance_inflation(&[0.0, live], &[0.0, 3.0]),
+            3.0,
+            "a FIXed coordinate is zero on both sides and must not read as unbounded"
+        );
+
+        // Guard 2 — a diverged solve. Without `!v.is_finite()` this is `inf / 1.0 = inf`.
+        assert_eq!(
+            super::worst_variance_inflation(&[f64::INFINITY, live], &[1.0, 3.0]),
+            3.0,
+            "a non-finite returned variance is a broken covariance, not an inflation"
+        );
+
+        // What falls through on its own, with no guard: a NaN (every comparison against it is
+        // false) and a negative reconstructed variance.
+        assert_eq!(
+            super::worst_variance_inflation(&[f64::NAN, -1.0, live], &[1.0, 1.0, 3.0]),
+            3.0
+        );
+
+        // A zero reference against a live value is the meaningful unbounded answer — the cell
+        // guard 1 must not swallow.
+        assert!(super::worst_variance_inflation(&[1.0], &[0.0]).is_infinite());
+        // Never below 1: a floor cannot shrink a variance, and a ratio under 1 is noise.
+        assert_eq!(super::worst_variance_inflation(&[1.0], &[2.0]), 1.0);
+    }
+
+    #[test]
+    fn the_inflation_metric_moves_with_s_under_the_sandwich_estimator() {
+        // #1508 review §1. The metric used to be a diagonal of packed-space `R⁻¹`, so the same
+        // regularized `R` printed the same inflation for every `S` — even though the returned
+        // covariance under `covariance_method = rsr` is `R⁻¹ S R⁻¹` and `S` can suppress or
+        // concentrate the floored eigendirection. One `R`, two `S`, and the number must differ.
+        //
+        // `R` is axis-aligned with a floored second direction, so `R⁻¹ = diag(1/100, 1/floor)`
+        // and the floored direction is coordinate 1.
+        let r = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![100.0, -1e-3]));
+        let inv = super::invert_psd_with_floor(&r).expect("has positive curvature");
+        assert_eq!(inv.n_clipped, 1);
+        let r_inv = inv.inverse.clone() * 2.0;
+        let r_inv_ref = inv.unclipped_inverse.clone() * 2.0;
+
+        let inflation_for = |s: &DMatrix<f64>| {
+            // Through `combine_covariance_and_reference`, which is the wiring
+            // `compute_covariance` uses: both sides take the *selected* estimator. Calling
+            // `combine_covariance` twice here instead would test a second spelling of the
+            // thing under test rather than the thing itself.
+            let (cov, cov_ref) = super::combine_covariance_and_reference(
+                CovarianceMethod::Sandwich,
+                r_inv.clone(),
+                Some(r_inv_ref.clone()),
+                s,
+            )
+            .expect("sandwich never inverts S");
+            let cov_ref = cov_ref.expect("a reference was supplied");
+            super::worst_variance_inflation(&diag(&cov), &diag(&cov_ref))
+        };
+
+        // `s_blind` puts no score mass on the floored direction, so the sandwich's floored
+        // column is annihilated and the reported variance is not inflated at all.
+        let s_blind = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 0.0]));
+        // `s_loaded` puts mass there, so the floor's `1/floor` is squared into the answer.
+        let s_loaded = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1.0, 1.0]));
+
+        let blind = inflation_for(&s_blind);
+        let loaded = inflation_for(&s_loaded);
+        assert_eq!(
+            blind, 1.0,
+            "an S with no mass on the floored direction leaves the returned variance untouched"
+        );
         assert!(
-            inv.variance_inflation.is_infinite(),
-            "{}",
-            inv.variance_inflation
+            loaded > 1e12,
+            "an S loaded on the floored direction squares 1/floor into the answer: {loaded}"
+        );
+        assert_ne!(
+            blind, loaded,
+            "the metric must be a function of the returned covariance, not of R alone"
+        );
+
+        // And the metric the review rejected, computed here so the difference is on the
+        // record: the diagonals of packed `R⁻¹` against packed `R⁻¹_ref`. It does not take `S`
+        // at all, so it reports the same large inflation for both — including for the `S` that
+        // annihilates the floored direction entirely, where nothing the user reads moved.
+        let packed_only = super::worst_variance_inflation(&diag(&r_inv), &diag(&r_inv_ref));
+        assert!(packed_only.is_infinite(), "{packed_only}");
+        assert_ne!(
+            packed_only, blind,
+            "the packed-R metric cannot see that this S left the reported variance untouched"
+        );
+
+        // The reference's *shape*, asserted against a hand-written `R⁻¹_ref S R⁻¹_ref`. Without
+        // this, replacing the reference with a bare `R⁻¹_ref` passes everything above — the
+        // ratios above happen to land on the same side of every bound — so this is the
+        // assertion that actually pins "the reference goes through the same estimator".
+        // `S` is deliberately not the identity, so `R⁻¹_ref S R⁻¹_ref` differs from both
+        // `R⁻¹_ref` and `R⁻¹_ref R⁻¹_ref`.
+        let s_asym = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![3.0, 1.0]));
+        let (_, reference) = super::combine_covariance_and_reference(
+            CovarianceMethod::Sandwich,
+            r_inv.clone(),
+            Some(r_inv_ref.clone()),
+            &s_asym,
+        )
+        .expect("sandwich never inverts S");
+        let reference = reference.expect("a reference was supplied");
+        let want = &r_inv_ref * &s_asym * &r_inv_ref;
+        assert!(
+            (0..2).all(|k| (reference[(k, k)] - want[(k, k)]).abs() <= 1e-12 * want[(k, k)].abs()),
+            "reference {:?} is not R^-1_ref S R^-1_ref {:?}",
+            diag(&reference),
+            diag(&want)
+        );
+        assert_ne!(
+            diag(&reference),
+            diag(&r_inv_ref),
+            "a bare R^-1_ref reference is the spelling this test exists to reject"
+        );
+
+        // `None` reference means "nothing to compare", and must not invent one.
+        let (_, none_ref) = super::combine_covariance_and_reference(
+            CovarianceMethod::Sandwich,
+            r_inv.clone(),
+            None,
+            &s_loaded,
+        )
+        .expect("sandwich never inverts S");
+        assert!(none_ref.is_none());
+    }
+
+    #[test]
+    fn the_inflation_metric_passes_through_the_block_omega_jacobian() {
+        // #1508 review §1's second half. The reported standard error of a block-Ω element is
+        // `g^T C_ω g` over the packed Cholesky coordinates, so the transform **mixes**
+        // coordinates — a packed-space diagonal ratio is not the number the user reads.
+        //
+        // The fixture is built so the two metrics must disagree: `cov` and `cov_ref` have
+        // *identical* diagonals (a packed-diagonal metric reports exactly 1.0) and differ only
+        // in the off-diagonal coupling between the two packed coordinates that `ω₂₂ = L₂₁² +
+        // L₂₂²` loads on. Both halves are asserted in one test, so a formatter that drops the
+        // delta transform reddens rather than quietly agreeing.
+        let omega = crate::types::OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(2, 2, &[0.09, 0.03, 0.03, 0.04]),
+            vec!["E1".into(), "E2".into()],
+            false,
+        );
+        let template = crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega,
+            omega_fixed: vec![false; 2],
+            sigma: crate::types::SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        };
+        // Packed layout: theta(1) | omega lower triangle L₁₁, L₂₁, L₂₂ (3) | sigma(1).
+        let n = 5;
+        let free_idx: Vec<usize> = (0..n).collect();
+        let cov_ref = DMatrix::<f64>::identity(n, n);
+        let mut cov = cov_ref.clone();
+        // Couple the L₂₁ and L₂₂ coordinates, leaving every diagonal at 1.
+        cov[(2, 3)] = 0.5;
+        cov[(3, 2)] = 0.5;
+
+        // A packed-space diagonal metric is blind to this by construction.
+        assert_eq!(
+            super::worst_variance_inflation(&diag(&cov), &diag(&cov_ref)),
+            1.0,
+            "the fixture's packed diagonals are equal on purpose"
+        );
+
+        // Hand computation, not a second implementation. Ω = L Lᵀ with L₁₁ = 0.3,
+        // L₂₁ = 0.1, L₂₂ = √0.03; ω₂₂ = L₂₁² + L₂₂², and the packed coordinates are
+        // (L₂₁, log L₂₂), so g = (2·L₂₁, 2·L₂₂²) = (0.2, 0.06).
+        //   var_ref = g₁² + g₂²                    = 0.04 + 0.0036 = 0.0436
+        //   var     = var_ref + 2·g₁·g₂·cov[2,3]   = 0.0436 + 0.012 = 0.0556
+        let g1 = 2.0 * 0.1;
+        let g2 = 2.0 * 0.03;
+        let var_ref = g1 * g1 + g2 * g2;
+        let expected = (var_ref + 2.0 * g1 * g2 * 0.5) / var_ref;
+        let got = super::reported_variance_inflation(&cov, Some(&cov_ref), &free_idx, n, &template);
+        assert!(
+            (got - expected).abs() / expected < 1e-9,
+            "reported inflation {got} vs hand-computed {expected}"
+        );
+        assert!(
+            got > 1.0,
+            "the Jacobian must be able to see a coupling the diagonals hide"
+        );
+
+        // And the `None` reference — no floor fired, or `covariance_method = s`, which never
+        // inverts R — reports no inflation rather than dividing by nothing.
+        assert_eq!(
+            super::reported_variance_inflation(&cov, None, &free_idx, n, &template),
+            1.0
         );
     }
 
