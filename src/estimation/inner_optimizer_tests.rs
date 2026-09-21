@@ -1625,6 +1625,10 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
     );
     assert!(seed(&model, true).is_some(), "premise: exact seed in scope");
 
+    // Warm-started, off-mode: the seed is gated to genuinely warm-started solves since
+    // #1504, and a start already at the mode would converge identically under any metric,
+    // so the premise is exercised from a nonzero start away from the solution.
+    let warm = vec![0.5, -0.4, 0.6];
     let solve = |model: &CompiledModel, seed: InnerHessianSeed| {
         let r = find_ebe_cached(
             model,
@@ -1632,7 +1636,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             &params,
             100,
             1e-8,
-            None,
+            Some(&warm),
             None,
             0,
             None,
@@ -1668,6 +1672,60 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             "{kind:?} seed changed the `gradient = fd` inner solve"
         );
     }
+}
+
+/// The seed is a *local* model of the individual objective: it accelerates a solve
+/// started near the mode it describes, but from a cold start its Newton-scaled first
+/// step selects the eta basin — measured crossing into a prior-unlikely mode on a
+/// covariate-NN model (slow-tests red since #1389, #1474). Cold starts therefore keep
+/// the historical initialization: a cold solve under a seeded policy must reproduce
+/// the unseeded solve exactly, while a nonzero warm start under the same policy is
+/// seeded and takes a different (faster) path. Zero-vector "warm" starts are cold
+/// placeholders (`freeze_flat_thetas` passes zeros as `prev_etas`) and decline too.
+#[test]
+fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
+    let (model, subject) = wellidentified_oral_fixture();
+    let params = model.default_params.clone();
+    let solve = |eta_init: Option<&[f64]>, seed: InnerHessianSeed| {
+        let r = find_ebe_cached(
+            &model,
+            &subject,
+            &params,
+            100,
+            1e-8,
+            eta_init,
+            None,
+            0,
+            None,
+            InnerSolvePolicy {
+                seed,
+                capture_terminal_hessian: false,
+                accelerate_exact_outer: false,
+            },
+        );
+        (r.eta, r.h_matrix, r.grad_norm, r.nll)
+    };
+    let cold_unseeded = solve(None, InnerHessianSeed::None);
+    for kind in [InnerHessianSeed::GaussNewton, InnerHessianSeed::Exact] {
+        assert_eq!(
+            solve(None, kind),
+            cold_unseeded,
+            "{kind:?} seed changed the COLD solve — the warm-only gate is leaking"
+        );
+        assert_eq!(
+            solve(Some(&[0.0; 3]), kind),
+            cold_unseeded,
+            "{kind:?} seed changed a ZERO-placeholder warm start"
+        );
+    }
+    // Premise: a genuine warm start is seeded, so the trajectory (and its terminal
+    // point at this tolerance) differs from the unseeded one.
+    let warm = [0.5, -0.4, 0.6];
+    assert_ne!(
+        solve(Some(&warm), InnerHessianSeed::GaussNewton),
+        solve(Some(&warm), InnerHessianSeed::None),
+        "premise: the seed must change a warm-started solve, or the gate is vacuous"
+    );
 }
 
 /// `analytic_terminal_work`'s Hessian is trusted verbatim by the objective-only Laplace path in
