@@ -504,6 +504,18 @@ fn analytic_inner_seed_hessian(
     if analytic_inner_common_bail(model) {
         return None;
     }
+    // Covariate-NN models: decline the seed entirely. The Gauss–Newton metric is only a
+    // faithful local model of the individual objective while residuals are small; on an
+    // NN-modulated surface mid-descent (large residuals, highly non-convex individual
+    // likelihoods) its Newton-scaled steps — warm or cold — were measured pulling 23 of
+    // 30 subjects into prior-unlikely η̂ basins, stalling a FOCEI fit ~950 OFV above the
+    // unseeded optimum or parking it unconverged on a start-dependent point (slow-tests
+    // red since #1389, #1474). These models keep the historical solve; the seed's speedup
+    // was measured on PK surfaces and is retained there.
+    #[cfg(feature = "nn")]
+    if !model.covariate_nns.is_empty() {
+        return None;
+    }
     // The light path fuses the first BFGS gradient, so it must assemble exactly the
     // terms `analytic_eta_nll_gradient_with_schedule` does. Everything that routine
     // routes elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only
@@ -1368,7 +1380,7 @@ fn find_ebe_impl(
         }
     };
     // nlmixr2est's `warm="calc"` idea: seed dense BFGS from the conditional
-    // Gauss-Newton metric at the current warm EBE and population parameters.
+    // Gauss–Newton metric at the current warm EBE and population parameters.
     // The common path obtains that metric and the first gradient in one light
     // first-order sensitivity pass; special cases retain the full provider.
     // A failed/out-of-scope factorization falls through to the historical
@@ -1377,12 +1389,25 @@ fn find_ebe_impl(
     // Only the dense BFGS consumes the seed: skip the provider pass outright when the
     // stage routes this subject to Nelder–Mead or to L-BFGS (`inner_minimize_with_grad`),
     // where the matrix would be computed and dropped.
+    //
+    // The seed is additionally gated to *genuinely warm-started* solves. It is a
+    // local model of the individual objective: near the mode it describes (the
+    // previous outer iteration's η̂) its Newton-scaled first step is the speedup
+    // this seed exists for, but from a cold start that same full step can cross
+    // into a neighbouring η̂ basin on a rugged surface — measured on a
+    // covariate-NN model, where cold-seeded first evaluations put 23 of 30
+    // subjects into a prior-unlikely mode and the fit converged ~950 OFV above
+    // the unseeded optimum with `converged = true` (slow-tests red since #1389,
+    // #1474). Cold starts keep the historical metric, which picks the basin.
+    // An all-zero "warm" start is a placeholder for cold (`freeze_flat_thetas`
+    // passes zeros as `prev_etas`), so it is excluded too.
     let seed_kind = policy.seed;
     let dense_bfgs_route = !matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) && !inner_use_lbfgs(n_eta);
-    let seed = (seed_kind != InnerHessianSeed::None && dense_bfgs_route)
+    let warm_start = eta_init.is_some_and(|w| w.iter().any(|&v| v != 0.0));
+    let seed = (seed_kind != InnerHessianSeed::None && dense_bfgs_route && warm_start)
         .then(|| {
             analytic_inner_seed_hessian(
                 model,
