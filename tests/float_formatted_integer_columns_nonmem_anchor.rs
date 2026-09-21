@@ -7,9 +7,9 @@
 //! `tests/nonmem/warfarin_bloq_intcols.csv` and `warfarin_bloq_floatcols.csv` are
 //! the warfarin M3 BLOQ dataset of `examples/warfarin_bloq.ferx` with `II`/`ADDL`
 //! appended, identical but for how they spell four integer columns — `EVID`, `MDV`,
-//! `CENS`, `ADDL` — as `1` / `0` / `2` or as `1.0` / `0.0` / `2.0`. pandas and R
-//! write the second form for a whole integer column once any cell in it is blank,
-//! and ferx's own sdtab writes `CENS` that way. Before #1496 the reader took each of
+//! `CENS`, `ADDL` — as `1` / `0` / `2` or as `1.0` / `0.0` / `2.0`. pandas writes
+//! the second form for a whole integer column once any cell in it is blank, and
+//! ferx's own sdtab writes `CENS` that way. Before #1496 the reader took each of
 //! those cells as 0: every dose became an unscored observation, the `ADDL` train
 //! collapsed to its first dose, the `MDV=1` observation was scored, and the
 //! censored rows were scored as measurements at the LLOQ.

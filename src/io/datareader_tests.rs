@@ -1933,7 +1933,7 @@ fn test_parse_l2_id_accepts_integer_and_float_formats() {
     // Plain integer ids.
     assert_eq!(parse_l2_id("10"), Some(10));
     assert_eq!(parse_l2_id(" 11 "), Some(11));
-    // #830: pandas/R exports float-format the whole column when any row is
+    // #830: a pandas export float-formats the whole column when any row is
     // blank ("10.0"); a strict i64 parse would ungroup everything.
     assert_eq!(parse_l2_id("10.0"), Some(10));
     assert_eq!(parse_l2_id("11.0"), Some(11));
@@ -2569,7 +2569,7 @@ fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
 
 #[test]
 fn float_formatted_cmt_cell_reads_as_its_integer() {
-    // T1a. The #830 `L2` bug in a second column: pandas/R float-format a whole
+    // T1a. The #830 `L2` bug in a second column: pandas float-formats a whole
     // integer column once any cell in it is blank, so `2.0` is how a real export
     // spells compartment 2. Before the fix `parse::<usize>()` failed on it and
     // the dose landed in compartment 1 with no warning at all.
@@ -3211,8 +3211,8 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
 }
 
 // ── #1496: a float-formatted whole number in an integer column ──────────────
-// pandas and R float-format a whole integer column once any cell in it is blank,
-// and ferx's own sdtab writes `CENS` as `1.000000`. `L2` (#830) and `CMT` (#1009)
+// pandas float-formats a whole integer column once any cell in it is blank, and
+// ferx's own sdtab writes `CENS` as `1.000000`. `L2` (#830) and `CMT` (#1009)
 // were each taught that alone; seven other integer sites went on reading `"1.0"`
 // as 0 — all but `EVID` and the occasion column with no warning at all. They now
 // share one classification, `parse_whole_number_cell`; each caller keeps its own

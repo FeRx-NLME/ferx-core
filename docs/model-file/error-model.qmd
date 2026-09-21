@@ -709,7 +709,7 @@ Rules and restrictions:
   stay separate; grouping true replicates into one `L2` unit makes the dense `R`
   indefinite and fails the Cholesky loudly — the fit telling you the grouping is
   wrong. `L2` ids may be written as integers or float-formatted integers (`10` or
-  `10.0`, as pandas/R export a column that also carries blanks).
+  `10.0`, as pandas exports a column that also carries blanks).
 - **No `L2` column?** ferx falls back to grouping co-temporal rows by
   `(time, occasion)` and pairs them **one-to-one in row order** (first total with
   first unbound, and so on), so `R` still stays block-diagonal and

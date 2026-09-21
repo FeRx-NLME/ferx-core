@@ -1397,10 +1397,10 @@ fn parse_f64_or_nan(s: &str) -> f64 {
     }
 }
 
-/// Parse an `L2` grouping-id cell. NONMEM writes an integer, but pandas/R
-/// exports commonly float-format the whole column (`"10.0"`, `"11.0"`) once any
-/// row is blank — so a strict `i64` parse would silently ungroup every record
-/// and discard the user's block_sigma pairing (#830). Accept an integer literal
+/// Parse an `L2` grouping-id cell. NONMEM writes an integer, but a pandas export
+/// float-formats the whole column (`"10.0"`, `"11.0"`) once any row is blank — so a
+/// strict `i64` parse would silently ungroup every record and discard the user's
+/// block_sigma pairing (#830). Accept an integer literal
 /// or a *float-formatted integer* (fractional part exactly 0, within `i64`
 /// range). A genuinely non-integer value (`"2.4"`), an out-of-range magnitude, a
 /// blank, or an unparseable cell means "ungrouped" (`None` → 0) — left ungrouped
@@ -1425,8 +1425,8 @@ fn parse_l2_id(s: &str) -> Option<i64> {
 /// A cell that should hold an integer but was written with a fractional part by
 /// the exporter: `"10.0"`, `"2.0"`, `"2e0"`.
 ///
-/// pandas and R float-format a whole integer column once any cell in it is blank,
-/// which is why both [`parse_l2_id`] (#830) and [`parse_cmt_cell`] (#1009) need it.
+/// pandas float-formats a whole integer column once any cell in it is blank, which
+/// is why both [`parse_l2_id`] (#830) and [`parse_cmt_cell`] (#1009) need it.
 /// Those two grew the same parse independently and the second one was written
 /// *because* the first's lesson had not reached `CMT` — so it lives here once, and
 /// the next export quirk lands in one place. Returns the value as `f64`; each
