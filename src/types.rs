@@ -8452,6 +8452,26 @@ impl BloqMethod {
             BloqMethod::M3 => "m3",
         }
     }
+
+    /// Is a row carrying `CENS` flag `cens` censored **for this fit**?
+    ///
+    /// The single answer to that question. Under [`BloqMethod::Drop`] a
+    /// `CENS != 0` row is an ordinary quantified observation at its `DV` (see the
+    /// type doc), so only [`BloqMethod::M3`] scores one as censored. Every
+    /// consumer routes here — the likelihood's M3 branches, the IWRES / CWRES /
+    /// NPD / NPDE diagnostics, SAEM's closed-form-sigma gate — because
+    /// hand-spelled copies of `matches!(bloq_method, M3) && cens != 0` were what
+    /// let the diagnostics blank (and drop from the CWRES decorrelation) a row
+    /// the likelihood had scored as an ordinary observation (#1499).
+    pub fn is_censored_row(self, cens: i8) -> bool {
+        matches!(self, BloqMethod::M3) && cens != 0
+    }
+
+    /// Does any row of `cens` count as censored for this fit? An empty slice (a
+    /// dataset with no `CENS` column) never does.
+    pub fn has_censored_row(self, cens: &[i8]) -> bool {
+        cens.iter().any(|&c| self.is_censored_row(c))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

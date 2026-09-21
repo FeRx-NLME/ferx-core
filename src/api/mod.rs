@@ -330,6 +330,11 @@ mod zero_omega_tests;
 #[path = "tests/tests_sdtab_tv_cov.rs"]
 mod tests_sdtab_tv_cov;
 
+// #1499: IWRES/CWRES agree with the likelihood about which rows are censored.
+#[cfg(test)]
+#[path = "tests/cens_under_bloq_method_tests.rs"]
+mod cens_under_bloq_method_tests;
+
 #[cfg(test)]
 #[path = "tests/tests_derived_session_clock.rs"]
 mod tests_derived_session_clock;
