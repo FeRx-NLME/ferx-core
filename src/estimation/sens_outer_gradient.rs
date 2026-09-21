@@ -2229,14 +2229,68 @@ fn foce_low_rank_trace_quad(
     (trace, quad)
 }
 
-fn foce_rtilde_inverse(
+/// Largest Ω-normalised information trace at which the Woodbury form of `R̃⁻¹` is
+/// still used (#1498).
+///
+/// Woodbury needs `(Ω⁻¹ + JᵀD⁻¹J)⁻¹`. With `Ω = LLᵀ` that is `L(I + LᵀJᵀD⁻¹JL)Lᵀ`
+/// inverted, and [`foce_rtilde_inverse`] factors the bracket — `I + S` with
+/// `S = LᵀJᵀD⁻¹JL ⪰ 0` — rather than the unnormalised `M = Ω⁻¹ + JᵀD⁻¹J`. That matters
+/// because this constant bounds the conditioning of the bracket and of nothing else:
+/// `cond(I + S) ≤ 1 + λ_max(S) ≤ 1 + tr(S)`, while `cond(M) ≥ cond(Ω⁻¹)` carries the
+/// conditioning of Ω itself, which the bound says nothing about (a near-rail
+/// `block_omega`, `ρ → ±1`, makes `cond(M) ~ 1e12` at `tr(S) = O(10³)` — see
+/// `near_rail_block_omega_keeps_woodbury_and_matches_dense`).
+///
+/// `tr(S) = tr(ΩJᵀD⁻¹J) = Σᵢ (JᵢᵀΩJᵢ)/r0ᵢ` — a sum of per-observation
+/// signal-to-noise ratios that [`woodbury_terms`] gets for `n_eta²` flops from the
+/// `JᵀD⁻¹J` the form already builds, and it is basis-independent, so it can be read
+/// before `L` is formed. A Cholesky inverse at condition number `κ` keeps `≈ eps·κ`
+/// relative accuracy, so this is the one quantity available *before* the subtraction
+/// that says whether it has digits left.
+///
+/// Measured (macOS/arm64, debug) over every per-subject FOCE gradient call of a whole
+/// fit, realised as `‖dense⁻¹ − woodbury‖_max / ‖dense⁻¹‖_max`:
+///
+/// | fixture | worst `1 + tr(S)` | worst realised relative error |
+/// |---|---|---|
+/// | `examples/warfarin.ferx` FOCE, 1320 calls, `nq = 11` | `2.742e4` | `1.6e-12` |
+/// | `data/ss_oral_q24.csv` FOCE, `nq = 4` (smallest `1.2e11`) | `3.1e13` | `2.7e-1` |
+///
+/// `1e6` bounds the predicted error at `eps·1e6 ≈ 2.2e-10`, sits 36× above the worst
+/// well-conditioned trace measured and 1.2e5× below the *smallest* ill-conditioned one.
+/// Anywhere in `[1e5, 1e9]` separates the two populations, so the exact value is not
+/// load-bearing; `woodbury_info_trace_straddles_the_gate` pins both sides of it.
+///
+/// What puts the SS-oral fixture seven to nine orders away is structural, not exotic. `R̃`
+/// mixes a Jacobian taken at `η̂` with a residual variance frozen at `η = 0` (ferx's
+/// no-interaction FOCE semantics), so where the *typical* individual's prediction has
+/// decayed below `MIN_VARIANCE` (`1e-12`) but the *subject's* has not, one row enters
+/// `JᵀD⁻¹J` with weight `1e12` and an `O(1)` Jacobian against `Ω⁻¹ = 20·I`. Inverting
+/// that near-rank-one matrix is what destroys the correction term — not the diagonal
+/// subtraction, which is why the diagonal-only stability test this replaces never fired
+/// on it: on #1498 the outer L-BFGS quit after two evaluations on a gradient built from
+/// an `R̃⁻¹` carrying 16–27% error, and the fit reported `converged = false` at OFV
+/// 1012.75 instead of reaching −54.16.
+const WOODBURY_MAX_INFO_TRACE: f64 = 1e6;
+
+/// `D⁻¹J`, `info = JᵀD⁻¹J`, and the gate quantity `1 + tr(Ω·info)`, in one pass.
+///
+/// Single source for [`WOODBURY_MAX_INFO_TRACE`]: the production path below and the
+/// test that pins the threshold's separation read the same number, so the gate cannot
+/// drift from what was measured. `info` is symmetric and `tr(Ω·info) = Σ_ab Ω_ab info_ab`
+/// by the cyclic property, which is the elementwise dot product — no extra matrix
+/// product, and no dependence on `L`, since `tr(LᵀJᵀD⁻¹JL) = tr(ΩJᵀD⁻¹J)`.
+///
+/// A zero or non-finite `r0ᵢ` sends `info_trace` to `∞` (a non-zero Jacobian row over a
+/// zero variance) or to `NaN` (a zero one, from `0·∞`), and the gate is spelled
+/// `!(info_trace <= MAX)` so both fail it. That is the whole of the input-sanity check
+/// on this path — see `woodbury_gate_rejects_a_zero_residual_variance`, which is what
+/// dies if the predicate is respelled `info_trace > MAX`.
+fn woodbury_terms(
     jmat: &DMatrix<f64>,
     omega: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
     r0: &[f64],
-) -> Option<DMatrix<f64>> {
-    // Woodbury: (D + JΩJᵀ)⁻¹ = D⁻¹ − D⁻¹J(Ω⁻¹+JᵀD⁻¹J)⁻¹JᵀD⁻¹.
-    // The expensive factorisation is n_eta×n_eta instead of n_obs×n_obs.
+) -> (DMatrix<f64>, DMatrix<f64>, f64) {
     let mut dinv_j = jmat.clone();
     for i in 0..dinv_j.nrows() {
         let inv = 1.0 / r0[i];
@@ -2244,30 +2298,69 @@ fn foce_rtilde_inverse(
             dinv_j[(i, k)] *= inv;
         }
     }
-    let middle = omega_inv + jmat.transpose() * &dinv_j;
-    let middle_inv = middle.cholesky()?.inverse();
-    let mut out = -(&dinv_j * middle_inv * dinv_j.transpose());
-    let mut unstable = false;
-    for i in 0..out.nrows() {
-        let dinv = 1.0 / r0[i];
-        let correction = -out[(i, i)];
-        out[(i, i)] += dinv;
-        // Only the diagonal performs a subtraction. If its result is tiny relative to
-        // the two operands, Woodbury has lost useful digits and the dense form is safer.
-        unstable |= !out[(i, i)].is_finite()
-            || out[(i, i)] <= f64::EPSILON.sqrt() * (dinv + correction).abs();
-    }
-    if !unstable && out.iter().all(|v| v.is_finite()) {
-        return Some(out);
-    }
+    let info = jmat.transpose() * &dinv_j;
+    let info_trace = 1.0 + omega.dot(&info);
+    (dinv_j, info, info_trace)
+}
 
-    // The subtractive Woodbury form can lose all significant digits when D is tiny
-    // relative to JΩJᵀ. The original observation-sized Cholesky is the rare fallback.
-    let mut dense = jmat * omega * jmat.transpose();
-    for i in 0..dense.nrows() {
-        dense[(i, i)] += r0[i];
+/// `(D + JΩJᵀ)⁻¹` over the Sheiner–Beal quantified rows.
+///
+/// Woodbury factors `n_eta×n_eta` instead of `n_obs×n_obs`, but it is a subtractive
+/// identity and loses digits in proportion to the conditioning of the matrix it
+/// factors. So it is written in the **Ω-normalised** form — with `Ω = LLᵀ` and
+/// `B = D⁻¹JL`,
+///
+/// ```text
+/// R̃⁻¹ = D⁻¹ − B (I + LᵀJᵀD⁻¹JL)⁻¹ Bᵀ
+/// ```
+///
+/// which is the same identity (`(Ω⁻¹+JᵀD⁻¹J)⁻¹ = L(I + LᵀJᵀD⁻¹JL)⁻¹Lᵀ`) with the
+/// factored matrix replaced by the one [`WOODBURY_MAX_INFO_TRACE`] actually bounds.
+/// Factoring the unnormalised `Ω⁻¹ + JᵀD⁻¹J` instead inherits `cond(Ω)`, which the gate
+/// does not see: a near-rail `block_omega` degrades it while `1 + tr(S)` stays `O(10³)`.
+///
+/// Above the bound this assembles `R̃` and factors it at observation size, which is
+/// graded-SPD and componentwise stable there. A singular Ω — no Cholesky — takes the
+/// same route, since the dense form needs only `Ω` itself.
+fn foce_rtilde_inverse(
+    jmat: &DMatrix<f64>,
+    omega: &DMatrix<f64>,
+    r0: &[f64],
+) -> Option<DMatrix<f64>> {
+    let (dinv_j, info, info_trace) = woodbury_terms(jmat, omega, r0);
+    // One decision, two reasons to decline, no overlap between them: a conditioning
+    // bound the subtraction can be trusted under — `!(x <= MAX)`, so a non-finite or
+    // `NaN` trace fails it too — and a Cholesky factor of Ω to normalise by, which a
+    // random effect fixed to zero variance does not have. The dense form needs neither,
+    // only Ω itself.
+    let factor = if !(info_trace <= WOODBURY_MAX_INFO_TRACE) {
+        None
+    } else {
+        omega.clone().cholesky().map(|c| c.l())
+    };
+    let Some(l) = factor else {
+        let mut dense = jmat * omega * jmat.transpose();
+        for i in 0..dense.nrows() {
+            dense[(i, i)] += r0[i];
+        }
+        return dense.cholesky().map(|c| c.inverse());
+    };
+
+    let b = &dinv_j * &l;
+    let mut middle = l.transpose() * &info * &l;
+    for a in 0..middle.nrows() {
+        middle[(a, a)] += 1.0;
     }
-    Some(dense.cholesky()?.inverse())
+    // `I + S` is SPD by construction and finite because the trace gate admitted it, so
+    // this `?` is the library's signature rather than a second fallback with a story:
+    // the only way to reach it is to mutate the gate (measured —
+    // `woodbury_gate_rejects_a_zero_residual_variance` is what dies).
+    let middle_inv = middle.cholesky()?.inverse();
+    let mut out = -(&b * middle_inv * b.transpose());
+    for i in 0..out.nrows() {
+        out[(i, i)] += 1.0 / r0[i];
+    }
+    Some(out)
 }
 
 pub fn subject_packed_gradient_foce(
@@ -2418,7 +2511,7 @@ pub fn subject_packed_gradient_foce(
     }
 
     // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
-    let rtilde_inv = foce_rtilde_inverse(&jmat, omega, &params.omega.inv, &r0)?;
+    let rtilde_inv = foce_rtilde_inverse(&jmat, omega, &r0)?;
     let u = &rtilde_inv * &rho;
     let ojt = omega * jmat.transpose(); // Ω Jᵀ (n_eta×nq)
     let ojt_u = &ojt * &u;

@@ -405,6 +405,24 @@ section of the SDLC for the versioning policy).
   `[odes]` fits take the analytic R-matrix, which never second-differences the objective and has
   no stencil and no step size; the message named the finite-difference Hessian on it anyway, so
   the advice a user acted on was about a route their fit had not taken.
+- **FOCE fits with a near-zero typical prediction no longer stall on a wrong gradient**
+  ([#1498](https://github.com/FeRx-NLME/ferx-core/issues/1498)). The Woodbury form
+  introduced in #1486 for the Sheiner–Beal `R̃⁻¹` is a subtractive identity, and it
+  loses digits in proportion to how far the residual variance `R⁰` — frozen at the
+  *typical* individual, `η = 0` — sits below the random-effect variance `JΩJᵀ` taken at
+  the subject's own `η̂`. Where the typical prediction has decayed onto the
+  residual-variance floor while the subject's has not (a proportional error model at a
+  steady-state trough, for example), that ratio reaches `1e13` and the analytic FOCE
+  gradient came back with up to 27 % error in `R̃⁻¹` and, on one measured coordinate,
+  2 000× the true value. The outer L-BFGS then gave up after two evaluations and the fit
+  reported `converged = false` far from the optimum — on the `ss_oral_q24` regression
+  fixture, OFV 1012.75 instead of −54.16. The Woodbury path is now taken only where its
+  conditioning is bounded in advance; above that bound the observation-sized
+  factorization is used, which is stable there. It is also written in its Ω-normalised
+  form, so the matrix being factorized is the one that bound covers — previously a
+  `block_omega` whose correlation sits on its rail could degrade the inverse while the
+  bound stayed small, which affected no released version. Well-conditioned fits are
+  bit-identical and keep #1486's speedup.
 
 - **A whole number written with a decimal point (`1.0`) in an integer data column now
   reads as that number — `ADDL` and `MDV` used to drop it without a word**
