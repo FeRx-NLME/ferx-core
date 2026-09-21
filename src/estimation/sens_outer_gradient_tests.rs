@@ -5840,14 +5840,13 @@ fn power_exponent_with_tad_multiplier_outer_gradient_matches_fd() {
 fn foce_woodbury_inverse_matches_dense_rtilde() {
     let j = DMatrix::from_row_slice(5, 2, &[0.2, -0.1, 0.4, 0.3, -0.2, 0.5, 0.7, -0.4, 0.1, 0.6]);
     let omega = DMatrix::from_row_slice(2, 2, &[0.5, 0.08, 0.08, 0.3]);
-    let omega_inv = omega.clone().try_inverse().unwrap();
     let r0 = [0.4, 0.7, 0.2, 0.9, 0.6];
     let mut dense = &j * &omega * j.transpose();
     for i in 0..r0.len() {
         dense[(i, i)] += r0[i];
     }
     let dense_inv = dense.cholesky().unwrap().inverse();
-    let woodbury = foce_rtilde_inverse(&j, &omega, &omega_inv, &r0).unwrap();
+    let woodbury = foce_rtilde_inverse(&j, &omega, &r0).unwrap();
     assert!((&dense_inv - woodbury).amax() < 2e-14);
 }
 
@@ -5855,8 +5854,7 @@ fn foce_woodbury_inverse_matches_dense_rtilde() {
 fn foce_woodbury_inverse_falls_back_when_subtraction_is_unstable() {
     let j = DMatrix::from_element(1, 1, 100.0);
     let omega = DMatrix::identity(1, 1);
-    let omega_inv = DMatrix::identity(1, 1);
-    let actual = foce_rtilde_inverse(&j, &omega, &omega_inv, &[1e-12]).unwrap();
+    let actual = foce_rtilde_inverse(&j, &omega, &[1e-12]).unwrap();
     let expected = 1.0 / (10000.0 + 1e-12);
     assert!((actual[(0, 0)] - expected).abs() < expected * 1e-12);
 }
@@ -6065,7 +6063,7 @@ fn foce_rtilde_inverse_declines_woodbury_on_a_variance_floored_row() {
          the regression below would pass vacuously"
     );
 
-    let actual = foce_rtilde_inverse(&j, &omega, &omega_inv, &r0).expect("R̃⁻¹ available");
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
     assert_eq!(
         actual, reference,
         "a variance-floored row must take the dense factorization"
@@ -6202,4 +6200,281 @@ fn ss_oral_floored_r0_foce_packed_gradient_matches_fd() {
         marginal_nll_foce(&model, &subject, &p)
     };
     assert_grad_matches_richardson_fd(&x, &analytic, ofv, 1e-3, 1e-5);
+}
+
+/// The `SS_ORAL_Q24` model with the CL/V random effects moved into a **near-rail**
+/// `block_omega`: `ω²_CL = ω²_V = 0.05` with covariance `0.05·(1 − 1e-12)`, i.e. a
+/// correlation one part in `1e12` short of +1.
+///
+/// That is the regime the [`WOODBURY_MAX_INFO_TRACE`] bound does *not* cover. It bounds
+/// `cond(I + LᵀJᵀD⁻¹JL)`; `cond(Ω)` is a free parameter of the fixture, and an IIV
+/// correlation driven onto its rail — the ordinary way a `block_omega` fails to be
+/// identified — sends `cond(Ω⁻¹ + JᵀD⁻¹J)` with it while the gate quantity stays
+/// `O(10⁴)`. Measured here: `cond(Ω) = 2.000e12`, `cond(M) = 2.006e11`, `1 + tr(S) =
+/// 1.0719e4`.
+const SS_ORAL_Q24_RAIL_BLOCK: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
+  block_omega (ETA_CL, ETA_V) = [0.05, 0.04999999999995, 0.05]
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `(J, Ω, Ω⁻¹, R⁰)` as a real FOCE gradient call builds them, for subject 3 of
+/// `data/ss_oral_q24.csv` truncated to `times` and fitted under
+/// [`SS_ORAL_Q24_RAIL_BLOCK`] at the model file's own initial θ.
+///
+/// `J` is taken at the EBE and `R⁰` at η = 0 through the production providers, so which
+/// observations are kept decides whether `R⁰` reaches the `MIN_VARIANCE` floor — the two
+/// callers below use that to sit on opposite sides of the gate with one Ω.
+fn ss_oral_rail_block_rtilde_inputs(
+    times: &[f64],
+) -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>, Vec<f64>) {
+    let model = parse_model_string(SS_ORAL_Q24_RAIL_BLOCK).expect("parse");
+    let full_times = [1.0, 4.0, 12.0, 23.0];
+    let full_obs = [4.048116, 4.014245, 2.184979, 0.872772];
+    let keep: Vec<usize> = (0..4).filter(|&i| times.contains(&full_times[i])).collect();
+    assert_eq!(
+        keep.len(),
+        times.len(),
+        "unknown observation time requested"
+    );
+    let mut subject = ss_oral_q24_subject();
+    subject.obs_times = keep.iter().map(|&i| full_times[i]).collect();
+    subject.observations = keep.iter().map(|&i| full_obs[i]).collect();
+    subject.obs_cmts = vec![1; keep.len()];
+    subject.cens = vec![0; keep.len()];
+    subject.occasions = vec![1; keep.len()];
+
+    let template = model.default_params.clone();
+    let params = unpack_params(&pack_params(&template), &template);
+    let eta_hat = precise_ebe(&model, &subject, &params);
+    let sens =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta_hat)
+            .expect("analytic sensitivities in scope");
+    let zeros = vec![0.0; model.n_eta];
+    let sens0 =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &zeros)
+            .expect("analytic sensitivities at eta = 0");
+    let jmat = DMatrix::from_fn(keep.len(), model.n_eta, |i, k| sens.obs[i].df_deta[k]);
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let r0: Vec<f64> = sens0
+        .obs
+        .iter()
+        .enumerate()
+        .map(|(j, o)| {
+            residual_rd(
+                &model.error_spec,
+                err_keys[j],
+                o.f,
+                &params.sigma.values,
+                None,
+            )
+            .0
+        })
+        .collect();
+    (
+        jmat,
+        params.omega.matrix.clone(),
+        params.omega.inv.clone(),
+        r0,
+    )
+}
+
+/// `λ_max/λ_min` of a symmetric matrix, for the conditioning assertions below.
+fn symmetric_condition_number(m: &DMatrix<f64>) -> f64 {
+    let ev = m.clone().symmetric_eigenvalues();
+    ev.amax() / ev.amin()
+}
+
+/// #1498 review: the Woodbury path must factor the matrix whose conditioning the gate
+/// actually bounds.
+///
+/// [`WOODBURY_MAX_INFO_TRACE`] bounds `cond(I + LᵀJᵀD⁻¹JL)`. Factoring the unnormalised
+/// `M = Ω⁻¹ + JᵀD⁻¹J` instead — which is what the first cut of #1498 did — inherits
+/// `cond(Ω)`, and the gate cannot see that: here `1 + tr(S) = 1.0719e4`, two orders
+/// *below* the threshold, while `cond(Ω) = 2.000e12` and `cond(M) = 2.006e11`. So this
+/// input takes the fast path in both spellings and only the returned matrix can tell
+/// them apart — which is why the assertion is parity against the dense factorization
+/// rather than a branch predicate.
+///
+/// Measured (macOS/arm64, debug), as `‖dense⁻¹ − woodbury‖_max / ‖dense⁻¹‖_max`:
+///
+/// | spelling | realised |
+/// |---|---|
+/// | unnormalised `Ω⁻¹ + JᵀD⁻¹J` (the defect) | `2.258e-5` |
+/// | normalised `I + LᵀJᵀD⁻¹JL` (production) | `7.118e-11` |
+///
+/// The bound is `1e-8`: 140× above the realised error and 2 260× below the failure it
+/// exists to catch, with the whole of that 3.2e5× separation coming from `cond(Ω)`, a
+/// property of the model file rather than of the EBE solve, so it does not move with
+/// libm. The first assertion certifies the fixture still *has* that separation, so a
+/// future Ω that drifts off the rail fails here instead of passing vacuously.
+#[test]
+fn near_rail_block_omega_keeps_woodbury_and_matches_dense() {
+    let (j, omega, omega_inv, r0) = ss_oral_rail_block_rtilde_inputs(&[1.0, 4.0]);
+    let (dinv_j, info, info_trace) = woodbury_terms(&j, &omega, &r0);
+
+    // The fixture's defining property: ill-conditioned Ω, well-conditioned gate.
+    let cond_omega = symmetric_condition_number(&omega);
+    let cond_unnormalised = symmetric_condition_number(&(&omega_inv + &info));
+    assert!(
+        cond_omega > 1e11,
+        "block Ω must stay near its correlation rail: cond(Ω) = {cond_omega:e}"
+    );
+    assert!(
+        cond_unnormalised > 1e10,
+        "the unnormalised middle matrix must be the ill-conditioned one: {cond_unnormalised:e}"
+    );
+    assert!(
+        info_trace <= WOODBURY_MAX_INFO_TRACE,
+        "the gate must still admit this input (1 + tr(S) = {info_trace:e})"
+    );
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().expect("R̃ is SPD").inverse();
+    let scale = reference.amax();
+    assert!(scale.is_finite() && scale > 0.0, "reference must be usable");
+
+    // The unnormalised spelling, written out so the test states what it protects
+    // against rather than trusting a production branch to still contain it.
+    let mut unnormalised =
+        -(&dinv_j * (&omega_inv + &info).cholesky().unwrap().inverse() * dinv_j.transpose());
+    for i in 0..r0.len() {
+        unnormalised[(i, i)] += 1.0 / r0[i];
+    }
+    let unnormalised_err = (&reference - &unnormalised).amax() / scale;
+    assert!(
+        unnormalised_err.is_finite() && unnormalised_err > 1e-7,
+        "fixture no longer exposes the unnormalised loss (realised {unnormalised_err:e}); \
+         the parity assertion below would pass vacuously"
+    );
+
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    let err = (&reference - &actual).amax() / scale;
+    assert!(
+        err.is_finite() && err < 1e-8,
+        "normalised Woodbury must match the dense factorization: realised {err:e}"
+    );
+}
+
+/// The twin of the test above on the other side of the gate: same near-rail block Ω,
+/// one more observation.
+///
+/// Keeping the `t = 12 h` sample puts `R⁰` within `1e-11` of the `MIN_VARIANCE` floor,
+/// which sends `1 + tr(S)` to `2.633e10` — so the *normalised* matrix is now the
+/// ill-conditioned one and the dense fallback has to fire. Measured: the un-gated
+/// Woodbury (either spelling) is `1.928e-1` off, and the production result is
+/// bit-identical to the dense factorization. Without this arm the block-Ω fixture would
+/// only ever exercise the fast path, and a gate stuck open would pass half the pair.
+#[test]
+fn near_rail_block_omega_with_floored_row_falls_back_to_dense() {
+    let (j, omega, _, r0) = ss_oral_rail_block_rtilde_inputs(&[1.0, 4.0, 12.0]);
+    let (_, _, info_trace) = woodbury_terms(&j, &omega, &r0);
+    assert!(
+        symmetric_condition_number(&omega) > 1e11,
+        "the twin must keep the same near-rail Ω"
+    );
+    assert!(
+        info_trace > WOODBURY_MAX_INFO_TRACE,
+        "the floored row must push this arm over the gate (1 + tr(S) = {info_trace:e})"
+    );
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().expect("R̃ is SPD").inverse();
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    assert_eq!(
+        actual, reference,
+        "over the gate, R̃⁻¹ must be the dense factorization"
+    );
+}
+
+/// #1498 review: the gate is what keeps a non-finite Woodbury result from escaping.
+///
+/// The predicate is spelled `!(info_trace <= MAX)`, so a `NaN` trace fails it. That is
+/// the whole guard: `r0ᵢ = 0` makes `1/r0ᵢ` infinite, and `0·∞` in the `JᵀD⁻¹J` product
+/// makes `info` — and with it the trace — `NaN`, before any Cholesky is attempted.
+/// Measured on this input: the un-gated Woodbury returns `NaN` in every entry, and
+/// `foce_rtilde_inverse` returns the finite dense inverse `diag(2/3, 1)`.
+///
+/// This replaces the `out.iter().all(is_finite)` post-check the first cut of #1498 kept.
+/// With `R⁰` floored at `MIN_VARIANCE = 1e-12` and the trace bounded by `1e6`, the
+/// Woodbury correction is bounded by `‖D⁻¹‖·(1 + tr(S)) ≤ 1e18` — it cannot overflow —
+/// so that check had no reachable input and no test could kill it; the reachable
+/// non-finite cases all arrive through a non-finite or `NaN` trace and are rejected here.
+#[test]
+fn woodbury_gate_rejects_a_zero_residual_variance() {
+    let j = DMatrix::identity(2, 2);
+    let omega = DMatrix::identity(2, 2);
+    let r0 = [0.5, 0.0];
+
+    let (dinv_j, info, info_trace) = woodbury_terms(&j, &omega, &r0);
+    assert!(
+        info_trace.is_nan(),
+        "a zero R⁰ must poison the gate quantity: {info_trace:e}"
+    );
+    // Certify that an un-gated Woodbury really would hand back garbage here.
+    let ungated = -(&dinv_j * &info * dinv_j.transpose());
+    assert!(
+        ungated.iter().all(|v| v.is_nan()),
+        "fixture no longer produces a non-finite Woodbury: {ungated}"
+    );
+
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("dense R̃⁻¹ available");
+    let expected = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0 / 1.5, 1.0]));
+    assert!(
+        (&actual - &expected).amax() < 1e-15,
+        "a zero R⁰ must take the dense factorization, got {actual}"
+    );
+}
+
+/// A random effect fixed to zero variance makes Ω singular: no Cholesky factor exists,
+/// so there is no normalised Woodbury form to take and the dense factorization — which
+/// needs only Ω itself — is the answer.
+///
+/// The unnormalised spelling had no such edge: it consumed a precomputed `Ω⁻¹`, which on
+/// a singular Ω is whatever the pseudo-inverse produced. Measured: `Ω = diag(0.5, 0)`
+/// leaves `1 + tr(S) = 1.227` (well inside the gate) and `R̃ = JΩJᵀ + diag(R⁰)` SPD, and
+/// the returned matrix is bit-identical to that dense inverse.
+#[test]
+fn singular_omega_takes_the_dense_factorization() {
+    let j = DMatrix::from_row_slice(2, 2, &[0.3, 0.7, -0.4, 0.2]);
+    let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.5, 0.0]));
+    let r0 = [0.4, 0.7];
+    let (_, _, info_trace) = woodbury_terms(&j, &omega, &r0);
+    assert!(
+        info_trace <= WOODBURY_MAX_INFO_TRACE,
+        "the gate must admit this input, so the Ω-Cholesky is what declines it: {info_trace:e}"
+    );
+    assert!(
+        omega.clone().cholesky().is_none(),
+        "fixture must actually be singular"
+    );
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().expect("R̃ is SPD").inverse();
+    let actual = foce_rtilde_inverse(&j, &omega, &r0).expect("R̃⁻¹ available");
+    assert_eq!(
+        actual, reference,
+        "a singular Ω must take the dense factorization"
+    );
 }

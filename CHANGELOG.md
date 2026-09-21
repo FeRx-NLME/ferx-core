@@ -366,8 +366,11 @@ section of the SDLC for the versioning policy).
   reported `converged = false` far from the optimum — on the `ss_oral_q24` regression
   fixture, OFV 1012.75 instead of −54.16. The Woodbury path is now taken only where its
   conditioning is bounded in advance; above that bound the observation-sized
-  factorization is used, which is stable there. Well-conditioned fits are bit-identical
-  and keep #1486's speedup.
+  factorization is used, which is stable there. It is also written in its Ω-normalised
+  form, so the matrix being factorized is the one that bound covers — previously a
+  `block_omega` whose correlation sits on its rail could degrade the inverse while the
+  bound stayed small, which affected no released version. Well-conditioned fits are
+  bit-identical and keep #1486's speedup.
 
 - **A whole number written with a decimal point (`1.0`) in an integer data column now
   reads as that number — `ADDL` and `MDV` used to drop it without a word**

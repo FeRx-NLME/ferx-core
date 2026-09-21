@@ -265,6 +265,33 @@ the weight and makes the objective multimodal with an indefinite covariance. $f(
 is always physically sensible, so FOCE+proportional converges deterministically and matches
 NONMEM FOCE. Additive error is unaffected ($R$ does not depend on $f$).
 
+#### How $\tilde{R}^{-1}$ is formed
+
+$\tilde{R}$ is $n_{obs} \times n_{obs}$ but its random-effect part $H\Omega H^T$ has rank
+$n_{eta}$, so the inverse is normally taken in the low-rank (Woodbury) form, which
+factorizes an $n_{eta} \times n_{eta}$ matrix instead. That identity is *subtractive*, and it
+loses significant digits in proportion to how far $R(f(\eta{=}0))$ sits below $H\Omega H^T$.
+The two are evaluated at different points — $R$ at the typical individual, $H$ at the
+subject's own $\hat\eta$ — so a subject whose typical prediction has decayed onto the
+residual-variance floor ($10^{-12}$; a proportional error model at a steady-state trough, for
+instance) while its own prediction has not can drive that ratio past $10^{13}$, at which point
+the low-rank inverse has no accurate digits left and the analytic FOCE gradient it feeds is
+wrong rather than merely imprecise.
+
+ferx therefore bounds the conditioning *before* inverting, from a quantity the low-rank form
+already computes ($1 + \mathrm{tr}(\Omega H^T D^{-1} H)$, $D = \mathrm{diag}(R)$), and falls
+back to the observation-sized factorization of $\tilde{R}$ itself — stable in exactly that
+regime — whenever the bound is exceeded. The choice is per subject and per evaluation, affects
+only floating-point accuracy and not the model, and well-conditioned subjects keep the fast
+path. There is no user-facing setting: the switch is automatic.
+
+The low-rank form is written in its $\Omega$-normalized spelling ($\Omega = LL^T$, factorize
+$I + L^T H^T D^{-1} H L$) so that the matrix actually factorized is the one the bound covers;
+factorizing $\Omega^{-1} + H^T D^{-1} H$ instead would inherit the conditioning of $\Omega$,
+which a near-rail `block_omega` correlation degrades independently of the bound. Without the
+check a fit reaching that regime stalls far from the optimum and reports `converged = false`
+([#1498](https://github.com/FeRx-NLME/ferx-core/issues/1498)).
+
 ### FOCEI (Interaction)
 
 Uses individual predictions directly without linearization. ferx-core implements the Laplace approximation form from Almquist et al. (2015):
