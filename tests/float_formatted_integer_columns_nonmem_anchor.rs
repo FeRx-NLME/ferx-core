@@ -62,6 +62,68 @@ fn intcols_lines() -> Vec<String> {
         .collect()
 }
 
+/// The four columns the float file spells as `1.0` / `0.0` / `2.0`.
+const FLOAT_SPELLED: [&str; 4] = ["EVID", "MDV", "CENS", "ADDL"];
+
+/// The float file is the integer file with exactly those four columns float-spelled.
+///
+/// It is an external file, so without this the twin can quietly become integer
+/// against integer while every assertion below stays green and their messages go
+/// on naming all four columns. Review round 1 of #1502 measured exactly that: the
+/// float file with its 120 `MDV` cells rewritten as integers left both tests green,
+/// and so does the same rewrite of any one of the four columns.
+fn assert_float_file_is_the_integer_file_float_spelled() {
+    let int_lines = intcols_lines();
+    let float_lines: Vec<String> =
+        std::fs::read_to_string(repo("tests/nonmem/warfarin_bloq_floatcols.csv"))
+            .expect("the float anchor dataset is committed")
+            .lines()
+            .map(str::to_string)
+            .collect();
+    assert_eq!(
+        float_lines[0], int_lines[0],
+        "the two files share one header"
+    );
+    assert_eq!(float_lines.len(), int_lines.len(), "and the same rows");
+    let header: Vec<&str> = int_lines[0].split(',').collect();
+    for name in FLOAT_SPELLED {
+        assert!(header.contains(&name), "the header carries {name}");
+    }
+    let rows = float_lines[1..].iter().zip(&int_lines[1..]);
+    for (row, (float_line, int_line)) in rows.enumerate() {
+        let f: Vec<&str> = float_line.split(',').collect();
+        let i: Vec<&str> = int_line.split(',').collect();
+        assert_eq!(f.len(), header.len(), "float file, data row {row}");
+        assert_eq!(i.len(), header.len(), "integer file, data row {row}");
+        for (k, &name) in header.iter().enumerate() {
+            if FLOAT_SPELLED.contains(&name) {
+                assert!(
+                    i[k].parse::<i64>().is_ok(),
+                    "{name}, data row {row}: the integer file spells `{}`, not an integer",
+                    i[k]
+                );
+                assert!(
+                    f[k].parse::<i64>().is_err(),
+                    "{name}, data row {row}: the float file spells `{}` as an integer",
+                    f[k]
+                );
+                assert_eq!(
+                    f[k].parse::<f64>().ok(),
+                    i[k].parse::<f64>().ok(),
+                    "{name}, data row {row}: `{}` and `{}` must be the same number",
+                    f[k],
+                    i[k]
+                );
+            } else {
+                assert_eq!(
+                    f[k], i[k],
+                    "{name}, data row {row}: every other column is byte-identical"
+                );
+            }
+        }
+    }
+}
+
 /// Rewrite one column of every data row of the integer file.
 fn with_column(col: usize, cell: impl Fn(&[&str]) -> String) -> String {
     let lines = intcols_lines();
@@ -139,6 +201,7 @@ fn fingerprint(population: &Population) -> Vec<String> {
 /// statement about all four, not about the three that happened to matter.
 #[test]
 fn float_formatted_integer_columns_fit_like_the_integer_spelling() {
+    assert_float_file_is_the_integer_file_float_spelled();
     let integer = read_committed("warfarin_bloq_intcols.csv");
     let float = read_committed("warfarin_bloq_floatcols.csv");
 
@@ -242,7 +305,21 @@ fn the_committed_nonmem_runs_read_both_files_alike() {
     };
     let integer = read("intcols");
     let float = read("floatcols");
-    assert_eq!(integer.0, "109", "NONMEM excludes the MDV=1 observation");
+    // The dataset holds 110 observation records, so NONMEM's 109 is exactly the one
+    // `MDV=1` observation excluded — the straddle stated in the test, not only in its
+    // message.
+    let lines = intcols_lines();
+    let evid = lines[0].split(',').position(|h| h == "EVID").expect("EVID");
+    let n_evid0 = lines[1..]
+        .iter()
+        .filter(|l| l.split(',').nth(evid) == Some("0"))
+        .count();
+    assert_eq!(n_evid0, 110, "observation records in the committed dataset");
+    assert_eq!(
+        integer.0,
+        (n_evid0 - 1).to_string(),
+        "NONMEM excludes exactly the MDV=1 observation"
+    );
     assert_eq!(integer.1, "279.35595553971399");
     assert_eq!(
         float, integer,
