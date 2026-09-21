@@ -2229,14 +2229,55 @@ fn foce_low_rank_trace_quad(
     (trace, quad)
 }
 
-fn foce_rtilde_inverse(
+/// Largest Ω-normalised information trace at which the Woodbury form of `R̃⁻¹` is
+/// still used (#1498).
+///
+/// Woodbury factors `M = Ω⁻¹ + JᵀD⁻¹J`. Normalising it, `Ω^½MΩ^½ = I + S` with
+/// `S = Ω^½JᵀD⁻¹JΩ^½ ⪰ 0`, so `cond(Ω^½MΩ^½) ≤ 1 + λ_max(S) ≤ 1 + tr(S)` and
+/// `tr(S) = Σᵢ (JᵢᵀΩJᵢ)/r0ᵢ` — a sum of per-observation signal-to-noise ratios that
+/// [`woodbury_terms`] gets for `n_eta²` flops from the `JᵀD⁻¹J` the form already
+/// builds. A Cholesky inverse at condition number `κ` keeps `≈ eps·κ` relative
+/// accuracy, so this is the one quantity available *before* the subtraction that says
+/// whether it has digits left.
+///
+/// Measured (macOS/arm64, debug) over every per-subject FOCE gradient call of a whole
+/// fit, realised as `‖dense⁻¹ − woodbury‖_max / ‖dense⁻¹‖_max`:
+///
+/// | fixture | worst `1 + tr(S)` | worst realised relative error |
+/// |---|---|---|
+/// | `examples/warfarin.ferx` FOCE, 1320 calls, `nq = 11` | `2.742e4` | `1.6e-12` |
+/// | `data/ss_oral_q24.csv` FOCE, `nq = 4` (smallest `1.2e11`) | `3.1e13` | `2.7e-1` |
+///
+/// `1e6` bounds the predicted error at `eps·1e6 ≈ 2.2e-10`, sits 36× above the worst
+/// well-conditioned trace measured and 1.2e5× below the *smallest* ill-conditioned one.
+/// Anywhere in `[1e5, 1e9]` separates the two populations, so the exact value is not
+/// load-bearing; `woodbury_info_trace_straddles_the_gate` pins both sides of it.
+///
+/// What puts the SS-oral fixture seven to nine orders away is structural, not exotic. `R̃`
+/// mixes a Jacobian taken at `η̂` with a residual variance frozen at `η = 0` (ferx's
+/// no-interaction FOCE semantics), so where the *typical* individual's prediction has
+/// decayed below `MIN_VARIANCE` (`1e-12`) but the *subject's* has not, one row enters
+/// `JᵀD⁻¹J` with weight `1e12` and an `O(1)` Jacobian against `Ω⁻¹ = 20·I`. Inverting
+/// that near-rank-one matrix is what destroys the correction term — not the diagonal
+/// subtraction, which is why the diagonal-only stability test this replaces never fired
+/// on it: on #1498 the outer L-BFGS quit after two evaluations on a gradient built from
+/// an `R̃⁻¹` carrying 16–27% error, and the fit reported `converged = false` at OFV
+/// 1012.75 instead of reaching −54.16.
+const WOODBURY_MAX_INFO_TRACE: f64 = 1e6;
+
+/// `D⁻¹J`, `info = JᵀD⁻¹J`, and the gate quantity `1 + tr(Ω·info)`, in one pass.
+///
+/// Single source for [`WOODBURY_MAX_INFO_TRACE`]: the production path below and the
+/// test that pins the threshold's separation read the same number, so the gate cannot
+/// drift from what was measured. `info` is symmetric and `tr(Ω·info) = Σ_ab Ω_ab info_ab`
+/// by the cyclic property, which is the elementwise dot product — no extra matrix
+/// product. A zero `r0ᵢ` makes the trace non-finite, which fails the bound exactly as
+/// an overflowing one does.
+fn woodbury_terms(
     jmat: &DMatrix<f64>,
     omega: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
     r0: &[f64],
-) -> Option<DMatrix<f64>> {
-    // Woodbury: (D + JΩJᵀ)⁻¹ = D⁻¹ − D⁻¹J(Ω⁻¹+JᵀD⁻¹J)⁻¹JᵀD⁻¹.
-    // The expensive factorisation is n_eta×n_eta instead of n_obs×n_obs.
+) -> (DMatrix<f64>, DMatrix<f64>, f64) {
     let mut dinv_j = jmat.clone();
     for i in 0..dinv_j.nrows() {
         let inv = 1.0 / r0[i];
@@ -2244,30 +2285,51 @@ fn foce_rtilde_inverse(
             dinv_j[(i, k)] *= inv;
         }
     }
-    let middle = omega_inv + jmat.transpose() * &dinv_j;
-    let middle_inv = middle.cholesky()?.inverse();
-    let mut out = -(&dinv_j * middle_inv * dinv_j.transpose());
-    let mut unstable = false;
-    for i in 0..out.nrows() {
-        let dinv = 1.0 / r0[i];
-        let correction = -out[(i, i)];
-        out[(i, i)] += dinv;
-        // Only the diagonal performs a subtraction. If its result is tiny relative to
-        // the two operands, Woodbury has lost useful digits and the dense form is safer.
-        unstable |= !out[(i, i)].is_finite()
-            || out[(i, i)] <= f64::EPSILON.sqrt() * (dinv + correction).abs();
-    }
-    if !unstable && out.iter().all(|v| v.is_finite()) {
-        return Some(out);
+    let info = jmat.transpose() * &dinv_j;
+    let info_trace = 1.0 + omega.dot(&info);
+    (dinv_j, info, info_trace)
+}
+
+/// `(D + JΩJᵀ)⁻¹` over the Sheiner–Beal quantified rows.
+///
+/// Woodbury — `D⁻¹ − D⁻¹J(Ω⁻¹+JᵀD⁻¹J)⁻¹JᵀD⁻¹` — factors `n_eta×n_eta` instead of
+/// `n_obs×n_obs`, but it is a subtractive identity and loses digits in proportion to
+/// the conditioning of its middle matrix. [`WOODBURY_MAX_INFO_TRACE`] is that
+/// conditioning, bounded before the subtraction runs; above it this assembles `R̃` and
+/// factors it at observation size, which is graded-SPD and componentwise stable there.
+fn foce_rtilde_inverse(
+    jmat: &DMatrix<f64>,
+    omega: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    r0: &[f64],
+) -> Option<DMatrix<f64>> {
+    let dense_rtilde_inverse = || {
+        let mut dense = jmat * omega * jmat.transpose();
+        for i in 0..dense.nrows() {
+            dense[(i, i)] += r0[i];
+        }
+        dense.cholesky().map(|c| c.inverse())
+    };
+
+    let (dinv_j, info, info_trace) = woodbury_terms(jmat, omega, r0);
+    if !(info_trace <= WOODBURY_MAX_INFO_TRACE) {
+        return dense_rtilde_inverse();
     }
 
-    // The subtractive Woodbury form can lose all significant digits when D is tiny
-    // relative to JΩJᵀ. The original observation-sized Cholesky is the rare fallback.
-    let mut dense = jmat * omega * jmat.transpose();
-    for i in 0..dense.nrows() {
-        dense[(i, i)] += r0[i];
+    let middle = omega_inv + &info;
+    let middle_inv = middle.cholesky()?.inverse();
+    let mut out = -(&dinv_j * middle_inv * dinv_j.transpose());
+    for i in 0..out.nrows() {
+        out[(i, i)] += 1.0 / r0[i];
     }
-    Some(dense.cholesky()?.inverse())
+    // The conditioning bound governs *accuracy*; it does not rule out an intermediate
+    // that overflows outright (a subnormal `r0ᵢ` makes `D⁻¹J` infinite while `tr(S)`
+    // stays `O(1)`). A non-finite entry has no digits at all, so it takes the dense
+    // form regardless of what the bound said.
+    if out.iter().all(|v| v.is_finite()) {
+        return Some(out);
+    }
+    dense_rtilde_inverse()
 }
 
 pub fn subject_packed_gradient_foce(

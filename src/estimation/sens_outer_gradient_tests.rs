@@ -5881,3 +5881,325 @@ fn foce_low_rank_contractions_match_dense_products() {
     assert!((trace - expected_trace).abs() < 2e-15);
     assert!((quad - expected_quad).abs() < 2e-15);
 }
+
+/// The `(J, Ω, R⁰)` a real FOCE gradient call handed [`foce_rtilde_inverse`] on the
+/// `data/ss_oral_q24.csv` fixture, dumped at subject 3 at the model file's own initial
+/// θ = (5, 5, 4.5) — so this is the configuration the Tier-3 `fit_runs_on_ss_oral_dataset`
+/// starts from, not a constructed corner. `R⁰` is frozen at η = 0 where the typical
+/// prediction at t = 23 h has decayed to 2.6e-9, flooring its variance at `MIN_VARIANCE`;
+/// `J` is taken at η̂, where that subject's own prediction is 0.87, so the row's Jacobian
+/// is `O(1)` against a `1e-12` weight.
+fn ss_oral_floored_rtilde_inputs() -> (DMatrix<f64>, DMatrix<f64>, DMatrix<f64>, [f64; 4]) {
+    let j = DMatrix::from_row_slice(
+        4,
+        3,
+        &[
+            -1.5313758494073593,
+            -2.917595844077402,
+            1.2651231043521114,
+            -2.269596126975547,
+            -1.6188717881200112,
+            -0.19721862814667576,
+            -2.417774604713124,
+            0.6712103959581526,
+            -0.09824892371360211,
+            -1.4430209456103265,
+            0.862519044763247,
+            -0.03265479601364912,
+        ],
+    );
+    let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[
+        0.05073482640308105,
+        0.05008066147006033,
+        0.10050958737301485,
+    ]));
+    let omega_inv = DMatrix::from_diagonal(&DVector::from_row_slice(&[
+        19.710326631555624,
+        19.967787378324243,
+        9.94929962540552,
+    ]));
+    let r0 = [
+        0.03986272442615777,
+        0.00016143847027510905,
+        5.752051802992527e-11,
+        1e-12,
+    ];
+    (j, omega, omega_inv, r0)
+}
+
+/// The same triple from a well-conditioned call: `examples/warfarin.ferx` FOCE, subject
+/// 5 at the *worst* `1 + tr(S)` of the whole fit (1320 calls), so the "warfarin stays on
+/// the fast path" half of the gate is pinned at its tightest measured point rather than a
+/// typical one.
+fn warfarin_worst_conditioned_rtilde_inputs() -> (DMatrix<f64>, DMatrix<f64>, [f64; 11]) {
+    let j = DMatrix::from_row_slice(
+        11,
+        3,
+        &[
+            -0.029768931129810137,
+            -6.967924539254377,
+            4.948975469097907,
+            -0.09834765015472043,
+            -10.477360973395433,
+            5.097453089206971,
+            -0.283380786374917,
+            -12.979377390496529,
+            2.656085094787825,
+            -0.6906556891846249,
+            -13.132714326972927,
+            0.24428222979695602,
+            -1.4521833322862439,
+            -11.619779914262153,
+            -0.1506542223968367,
+            -2.121258659600906,
+            -10.171744881463317,
+            -0.14568186444914416,
+            -3.6492253975027307,
+            -6.573556304446947,
+            -0.12117627939102063,
+            -5.131024467108725,
+            -1.938514541873553,
+            -0.0837991516560111,
+            -5.351496170043617,
+            0.46257422524763575,
+            -0.05795109284577438,
+            -4.947776957313305,
+            1.5668552661055273,
+            -0.040075932699239,
+            -4.283957011756255,
+            1.9458891082081913,
+            -0.0277144105977118,
+        ],
+    );
+    let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[
+        0.09464681933668215,
+        0.039659050909063874,
+        0.30601883946029784,
+    ]));
+    let r0 = [
+        0.0047609751837289,
+        0.010226527496192303,
+        0.014884535426780098,
+        0.015250502002621628,
+        0.013086701037493128,
+        0.011166844996535755,
+        0.006937622277129466,
+        0.002677755605861964,
+        0.0010335493629226537,
+        0.0003989252354693375,
+        0.00015397556150027446,
+    ];
+    (j, omega, r0)
+}
+
+/// Both sides of [`WOODBURY_MAX_INFO_TRACE`] in one test, on measured inputs.
+///
+/// Split across two tests, a threshold stuck on one branch still passes half of them; a
+/// mutation moving the constant far enough in either direction has to redden something
+/// here. The assertions are on the gate quantity itself rather than on which value comes
+/// back, because on the warfarin triple the two branches agree to ~1e-12 — the returned
+/// matrix cannot distinguish them, so only the predicate can say the fast path is still
+/// taken.
+#[test]
+fn woodbury_info_trace_straddles_the_gate() {
+    let (wj, womega, wr0) = warfarin_worst_conditioned_rtilde_inputs();
+    let (_, _, warfarin_trace) = woodbury_terms(&wj, &womega, &wr0);
+    let (sj, somega, _, sr0) = ss_oral_floored_rtilde_inputs();
+    let (_, _, ss_trace) = woodbury_terms(&sj, &somega, &sr0);
+
+    // Measured: 2.742e4 and 1.4857e11. Pinned to 3 figures so a change in either
+    // fixture's conditioning shows up as a failure here rather than silently moving
+    // one of them across the threshold.
+    assert!(
+        (warfarin_trace - 2.742e4).abs() < 0.001 * 2.742e4,
+        "warfarin worst trace drifted: {warfarin_trace:e}"
+    );
+    assert!(
+        (ss_trace - 1.4857e11).abs() < 0.001 * 1.4857e11,
+        "SS-oral trace drifted: {ss_trace:e}"
+    );
+    assert!(
+        warfarin_trace <= WOODBURY_MAX_INFO_TRACE,
+        "warfarin must keep the Woodbury fast path: {warfarin_trace:e} > {WOODBURY_MAX_INFO_TRACE:e}"
+    );
+    assert!(
+        ss_trace > WOODBURY_MAX_INFO_TRACE,
+        "the variance-floored SS-oral row must decline Woodbury: {ss_trace:e}"
+    );
+}
+
+/// #1498: on the SS-oral inputs the Woodbury identity loses essentially every digit, and
+/// [`foce_rtilde_inverse`] must not return it.
+///
+/// Two assertions, deliberately: the first certifies that this input *can* expose the
+/// defect (an un-gated Woodbury is 16% off here — without it the second assertion would
+/// pass on any input, including one where both branches agree), the second is the
+/// regression. Realised errors: un-gated `1.592e-1`, gated `0.0` exactly — the gate routes
+/// to the same dense factorization the reference computes, so the only bound that means
+/// anything is "bit-identical", and a mutation raising `WOODBURY_MAX_INFO_TRACE` past
+/// 1.49e11 moves it to 1.592e-1.
+#[test]
+fn foce_rtilde_inverse_declines_woodbury_on_a_variance_floored_row() {
+    let (j, omega, omega_inv, r0) = ss_oral_floored_rtilde_inputs();
+
+    let mut dense = &j * &omega * j.transpose();
+    for i in 0..r0.len() {
+        dense[(i, i)] += r0[i];
+    }
+    let reference = dense.cholesky().unwrap().inverse();
+    let scale = reference.amax();
+    assert!(scale.is_finite() && scale > 0.0, "reference must be usable");
+
+    // The un-gated Woodbury identity on the same input, spelled out here so the test
+    // states what it is protecting against rather than trusting the production branch.
+    let (dinv_j, info, _) = woodbury_terms(&j, &omega, &r0);
+    let mut ungated =
+        -(&dinv_j * (&omega_inv + &info).cholesky().unwrap().inverse() * dinv_j.transpose());
+    for i in 0..r0.len() {
+        ungated[(i, i)] += 1.0 / r0[i];
+    }
+    let ungated_err = (&reference - &ungated).amax() / scale;
+    assert!(
+        ungated_err > 1e-2,
+        "fixture no longer exposes the Woodbury loss (realised {ungated_err:e}); \
+         the regression below would pass vacuously"
+    );
+
+    let actual = foce_rtilde_inverse(&j, &omega, &omega_inv, &r0).expect("R̃⁻¹ available");
+    assert_eq!(
+        actual, reference,
+        "a variance-floored row must take the dense factorization"
+    );
+}
+
+/// The `tests/ss_fit_smoke.rs` model, as a Tier-1 fixture.
+///
+/// 1-cpt oral with an `SS = 1` q24 dose and a proportional error model: at the initial
+/// θ the typical (η = 0) prediction at t = 23 h is 2.6e-9, so `R⁰` there is on the
+/// `MIN_VARIANCE` floor while the subject's own η̂ prediction is 0.87 — the
+/// frozen-`R⁰`-vs-`J(η̂)` mismatch that drives `1 + tr(S)` to 1.5e11.
+const SS_ORAL_Q24: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 50.0)
+  theta TVV(5.0, 0.5, 200.0)
+  theta TVKA(4.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.05
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.1
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// Subject 3 of `data/ss_oral_q24.csv`, verbatim.
+fn ss_oral_q24_subject() -> Subject {
+    let times = vec![1.0, 4.0, 12.0, 23.0];
+    Subject {
+        id: "3".to_string(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+        obs_times: times.clone(),
+        obs_raw_times: Vec::new(),
+        observations: vec![4.048116, 4.014245, 2.184979, 0.872772],
+        obs_cmts: vec![1; 4],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1; 4],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// #1498, at the level the optimizer actually consumes: the analytic FOCE packed
+/// gradient must match a reconverged central-difference of ferx's own FOCE marginal on
+/// a subject whose `R⁰` sits on the variance floor.
+///
+/// This is the assertion `foce_rtilde_inverse`'s unit tests cannot make — they compare
+/// two spellings of one matrix, and #1486 shipped with both of them green. The FD here
+/// goes through `foce_subject_nll`, which assembles `R̃` densely and never calls
+/// `foce_rtilde_inverse`, so it is an independent reference for the whole gradient.
+///
+/// Measured: worst realised relative error across the 7 packed coordinates is `8.91e-6`
+/// (the `ω_ETA_V` coordinate) with the fix. With the gate deleted — the smallest edit
+/// that removes it — the *first* coordinate already reads `1663764.7` against an FD of
+/// `795.5`, a relative error of `2.09e3`. So the `1e-3` bound sits 112× above the
+/// realised error and 2.1e6× below the failure it exists to catch; anything in between
+/// would do, and the test does not depend on the exact value. The `epsilon` floor is for
+/// the ω coordinates, whose FD is `O(1)` against θ gradients of `O(100)`.
+#[test]
+fn ss_oral_floored_r0_foce_packed_gradient_matches_fd() {
+    let model = parse_model_string(SS_ORAL_Q24).expect("parse");
+    let subject = ss_oral_q24_subject();
+    let template = model.default_params.clone();
+    let x = pack_params(&template);
+    let params = unpack_params(&x, &template);
+
+    // Certify the fixture reaches the ill-conditioned branch at all: without this a
+    // future change to the initial θ could move it onto the fast path, and the parity
+    // assertion below would then pass while testing nothing about #1498.
+    let eta_hat = precise_ebe(&model, &subject, &params);
+    let sens =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta_hat)
+            .expect("analytic sensitivities in scope");
+    let zeros = vec![0.0; model.n_eta];
+    let sens0 =
+        crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &zeros)
+            .expect("analytic sensitivities at eta = 0");
+    let jmat = DMatrix::from_fn(subject.obs_times.len(), model.n_eta, |i, k| {
+        sens.obs[i].df_deta[k]
+    });
+    let err_keys = model.error_spec.obs_keys(&subject);
+    let r0: Vec<f64> = sens0
+        .obs
+        .iter()
+        .enumerate()
+        .map(|(j, o)| {
+            residual_rd(
+                &model.error_spec,
+                err_keys[j],
+                o.f,
+                &params.sigma.values,
+                None,
+            )
+            .0
+        })
+        .collect();
+    // The floor is what makes this fixture what it is; say so, so a change to
+    // `MIN_VARIANCE` or to the SS closed form surfaces here rather than as a silent
+    // move onto the fast path.
+    assert_eq!(
+        r0[3], 1e-12,
+        "t = 23 h must sit on the residual-variance floor: {r0:?}"
+    );
+    let (_, _, info_trace) = woodbury_terms(&jmat, &params.omega.matrix, &r0);
+    assert!(
+        info_trace > WOODBURY_MAX_INFO_TRACE,
+        "fixture must still decline Woodbury (1 + tr(S) = {info_trace:e})"
+    );
+
+    let analytic = subject_packed_gradient_foce(&model, &subject, &template, &x, &eta_hat)
+        .expect("FOCE packed gradient supported");
+    assert!(
+        analytic.iter().all(|v| v.is_finite()),
+        "FOCE packed gradient must be finite: {analytic:?}"
+    );
+    let ofv = |xv: &[f64]| -> f64 {
+        let p = unpack_params(xv, &template);
+        marginal_nll_foce(&model, &subject, &p)
+    };
+    assert_grad_matches_richardson_fd(&x, &analytic, ofv, 1e-3, 1e-5);
+}
