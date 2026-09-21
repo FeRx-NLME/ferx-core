@@ -2167,6 +2167,34 @@ fn subject_has_censored_observation_reflects_cens_flags() {
     assert!(s.has_censored_observation());
 }
 
+/// #1499: the one predicate the likelihood and the residual diagnostics share.
+/// `Drop` keeps a flagged row as an ordinary observation — the documented
+/// meaning of the default — so only `M3` reads the flag at all. Both sides of
+/// the gate in one body: a predicate stuck on either branch reddens it.
+#[test]
+fn bloq_method_reads_the_cens_flag_only_under_m3() {
+    for &flag in &[1_i8, -1, 7] {
+        assert!(
+            BloqMethod::M3.is_censored_row(flag),
+            "m3 must treat CENS={flag} as censored (m3_logcdf reads the sign)"
+        );
+        assert!(
+            !BloqMethod::Drop.is_censored_row(flag),
+            "drop must treat CENS={flag} as an ordinary observation"
+        );
+    }
+    assert!(!BloqMethod::M3.is_censored_row(0));
+    assert!(!BloqMethod::Drop.is_censored_row(0));
+
+    // The subject-level form follows the row-level one, and an empty `cens`
+    // (a dataset with no CENS column) is never censored.
+    assert!(BloqMethod::M3.has_censored_row(&[0, 1]));
+    assert!(!BloqMethod::M3.has_censored_row(&[0, 0]));
+    assert!(!BloqMethod::Drop.has_censored_row(&[0, 1]));
+    assert!(!BloqMethod::M3.has_censored_row(&[]));
+    assert!(!BloqMethod::Drop.has_censored_row(&[]));
+}
+
 #[test]
 fn time_varying_covariate_names_detects_only_varying_covariates() {
     let mut s = bare_subject("1");

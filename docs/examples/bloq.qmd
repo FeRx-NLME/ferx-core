@@ -105,7 +105,10 @@ comparable (the MLE is).
 
 The diagnostic table (`warfarin_bloq-sdtab.csv`) gains a `CENS` column, and the
 `IWRES` / `CWRES` cells for censored rows are written as empty (a weighted
-Gaussian residual is undefined when the observed value is censored).
+Gaussian residual is undefined when the observed value is censored). This blanking
+follows `bloq_method`, not the column: under the default `drop` the same row is
+fitted as an ordinary observation at its `DV` and keeps its residuals, so the
+diagnostics always describe the likelihood that was actually fitted (#1499).
 
 ## Method Notes
 

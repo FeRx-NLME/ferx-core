@@ -353,6 +353,22 @@ section of the SDLC for the versioning policy).
 
 ### Fixed
 
+- **Under `bloq_method = drop` (the default), a nonzero `CENS` row now keeps its IWRES,
+  CWRES, NPD and NPDE — the residual diagnostics no longer treat a row the fit scored as
+  an ordinary observation as if it were censored**
+  ([#1499](https://github.com/FeRx-NLME/ferx-core/issues/1499)). `drop` keeps a `CENS != 0`
+  row as a quantified observation at its `DV`, and the likelihood always did; three
+  diagnostics keyed on the raw flag instead, so a dataset carrying a stray `CENS` column —
+  one left over from another analysis, or the out-of-range values `W_CENS_UNEXPECTED`
+  reports — got blank `IWRES`/`CWRES`/`NPD` cells, a whole subject's `NPDE` blanked, and an
+  ε-shrinkage computed without those rows, with no warning. Because CWRES decorrelates
+  within a subject, excluding one row also shifted **every other** CWRES of that subject
+  (measured on the issue: −0.053139 → −0.052511). All consumers now route through one
+  predicate that reads `bloq_method` as well as the flag, so the two halves of a fit cannot
+  disagree again; `bloq_method = m3` is unchanged. Under `drop`, SAEM's closed-form σ
+  M-step now also stays available on such a dataset instead of falling back to the
+  numerical one.
+
 - **A whole number written with a decimal point (`1.0`) in an integer data column now
   reads as that number — `ADDL` and `MDV` used to drop it without a word**
   ([#1496](https://github.com/FeRx-NLME/ferx-core/issues/1496)). pandas writes a whole

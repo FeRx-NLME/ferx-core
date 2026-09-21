@@ -23,13 +23,18 @@
 //!
 //! ## Censored / degenerate observations
 //!
-//! Censored (`CENS != 0`) observations are emitted as `NaN`, mirroring the
-//! IWRES/CWRES convention (see `compute_subject_results`): their `DV` carries the
-//! LLOQ under M3, not a real measurement, so an empirical-CDF score would be
-//! meaningless. NPD is masked per row; for NPDE the entire subject is `NaN` when
-//! it has any censored row, because the within-subject decorrelation would
-//! otherwise mix the LLOQ value into the *un*censored rows' scores. M3/BLQ needs
-//! the predictive-CDF variant and is out of scope here (issue #260).
+//! Observations censored **for this fit** — `CENS != 0` *and*
+//! `bloq_method = m3`, the [`BloqMethod::is_censored_row`] predicate the
+//! likelihood itself uses — are emitted as `NaN`, mirroring the IWRES/CWRES
+//! convention (see `compute_subject_results`): their `DV` carries the LLOQ under
+//! M3, not a real measurement, so an empirical-CDF score would be meaningless.
+//! NPD is masked per row; for NPDE the entire subject is `NaN` when it has any
+//! such row, because the within-subject decorrelation would otherwise mix the
+//! LLOQ value into the *un*censored rows' scores. Under the default
+//! `bloq_method = drop` a flagged row was fitted as an ordinary observation at
+//! its `DV`, so it is scored as one and does not void its subject's NPDE
+//! (#1499). M3/BLQ needs the predictive-CDF variant and is out of scope here
+//! (issue #260).
 //!
 //! NPDE also requires `K > n_obs` replicates per subject for a full-rank
 //! simulated covariance; with too few replicates the covariance is singular and
@@ -47,7 +52,7 @@
 //! draw no extra randoms, so their scores are byte-identical.
 
 use crate::stats::special::normal_inv_cdf;
-use crate::types::{CompiledModel, ModelParameters, Population};
+use crate::types::{BloqMethod, CompiledModel, ModelParameters, Population};
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -205,20 +210,38 @@ pub fn compute_npde_npd(
                     }
                 }
 
-                let npd = npd_scores(&subject.observations, &subject.cens, &sims);
-                let npde = npde_scores(&subject.observations, &subject.cens, &sims);
+                let npd = npd_scores(
+                    &subject.observations,
+                    &subject.cens,
+                    &sims,
+                    model.bloq_method,
+                );
+                let npde = npde_scores(
+                    &subject.observations,
+                    &subject.cens,
+                    &sims,
+                    model.bloq_method,
+                );
                 SubjectNpde { npd, npde }
             })
             .collect()
     })
 }
 
-/// Per-observation empirical-CDF normal scores, without decorrelation. Censored
-/// rows and rows with a non-finite observed value yield `NaN`.
-fn npd_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
+/// Per-observation empirical-CDF normal scores, without decorrelation. Rows
+/// censored *for this fit* (`CENS != 0` under `bloq_method = m3` only, see
+/// [`BloqMethod::is_censored_row`]) and rows with a non-finite observed value
+/// yield `NaN`. Under `drop` a flagged row was fitted as an ordinary observation
+/// and is scored like one (#1499).
+fn npd_scores(
+    observed: &[f64],
+    cens: &[i8],
+    sims: &DMatrix<f64>,
+    bloq_method: BloqMethod,
+) -> Vec<f64> {
     (0..observed.len())
         .map(|j| {
-            if cens.get(j).copied().unwrap_or(0) != 0 {
+            if bloq_method.is_censored_row(cens.get(j).copied().unwrap_or(0)) {
                 return f64::NAN;
             }
             empirical_score(observed[j], sims.row(j).iter().copied())
@@ -230,9 +253,16 @@ fn npd_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
 /// and simulated vectors with the empirical mean and Cholesky factor of the
 /// simulated covariance. Returns an all-`NaN` vector when the covariance is
 /// rank-deficient (`K <= n_obs`), when it stays non-PD after jitter, or when the
-/// subject has any censored observation (decorrelation would mix the LLOQ into
-/// the uncensored rows).
-fn npde_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
+/// subject has an observation censored *for this fit* (decorrelation would mix
+/// the LLOQ into the uncensored rows). Under `bloq_method = drop` a `CENS != 0`
+/// row is not censored for the fit, so it neither loses its own score nor voids
+/// the subject's (#1499).
+fn npde_scores(
+    observed: &[f64],
+    cens: &[i8],
+    sims: &DMatrix<f64>,
+    bloq_method: BloqMethod,
+) -> Vec<f64> {
     let n = observed.len();
     let k = sims.ncols();
     if n == 0 {
@@ -240,7 +270,7 @@ fn npde_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
     }
     // Need K > n_obs for a full-rank empirical covariance; censoring invalidates
     // the within-subject decorrelation entirely.
-    if k <= n || cens.iter().any(|&c| c != 0) {
+    if k <= n || bloq_method.has_censored_row(cens) {
         return vec![f64::NAN; n];
     }
 
@@ -391,7 +421,7 @@ mod tests {
     fn npd_scores_median_is_zero() {
         // Observed equals the simulated median → pd = 0.5 → Φ⁻¹(0.5) = 0.
         let sims = sims_matrix(&(0..=100).map(|v| vec![v as f64]).collect::<Vec<_>>());
-        let scores = npd_scores(&[50.0], &[0], &sims);
+        let scores = npd_scores(&[50.0], &[0], &sims, BloqMethod::Drop);
         assert_relative_eq!(scores[0], 0.0, epsilon = 0.02);
     }
 
@@ -399,24 +429,39 @@ mod tests {
     fn npd_scores_clamps_below_all_sims() {
         // Observed below every simulated value → pd = 0 → clamped, finite, negative.
         let sims = sims_matrix(&(1..=100).map(|v| vec![v as f64]).collect::<Vec<_>>());
-        let scores = npd_scores(&[-10.0], &[0], &sims);
+        let scores = npd_scores(&[-10.0], &[0], &sims, BloqMethod::Drop);
         assert!(scores[0].is_finite());
         assert!(scores[0] < 0.0);
         // pd clamped to 1/200 → Φ⁻¹(0.005) ≈ -2.576.
         assert_relative_eq!(scores[0], normal_inv_cdf(0.005), epsilon = 1e-9);
     }
 
+    /// #1499 straddle: a `CENS = 1` row is blanked under `m3`, where the fit
+    /// scored it as censored, and scored like any other row under `drop`, where
+    /// the fit scored it as an ordinary observation at its `DV`. Both legs live
+    /// in one test on one fixture, so a predicate stuck on either branch reddens
+    /// it (a per-branch pair would leave half of it green).
     #[test]
-    fn npd_scores_nan_on_censored_row() {
-        // Two observations, second censored → its NPD is NaN, the first is finite.
+    fn npd_scores_blank_a_censored_row_only_under_m3() {
+        // Two observations, second flagged.
         let sims = sims_matrix(
             &(0..=100)
                 .map(|v| vec![v as f64, v as f64])
                 .collect::<Vec<_>>(),
         );
-        let scores = npd_scores(&[50.0, 50.0], &[0, 1], &sims);
-        assert!(scores[0].is_finite());
-        assert!(scores[1].is_nan());
+        let m3 = npd_scores(&[50.0, 50.0], &[0, 1], &sims, BloqMethod::M3);
+        assert!(m3[0].is_finite());
+        assert!(m3[1].is_nan(), "M3 must blank the flagged row");
+
+        let drop = npd_scores(&[50.0, 50.0], &[0, 1], &sims, BloqMethod::Drop);
+        assert!(
+            drop[1].is_finite(),
+            "under `drop` the flagged row is an ordinary observation, got {:?}",
+            drop[1]
+        );
+        // And it scores exactly as the same row would with no flag at all.
+        let unflagged = npd_scores(&[50.0, 50.0], &[0, 0], &sims, BloqMethod::Drop);
+        assert_eq!(drop, unflagged);
     }
 
     #[test]
@@ -459,8 +504,8 @@ mod tests {
             .collect();
         let sims = sims_matrix(&rows);
         let observed = [0.3, -0.4];
-        let raw = npd_scores(&observed, &[0, 0], &sims);
-        let dec = npde_scores(&observed, &[0, 0], &sims);
+        let raw = npd_scores(&observed, &[0, 0], &sims, BloqMethod::Drop);
+        let dec = npde_scores(&observed, &[0, 0], &sims, BloqMethod::Drop);
         assert!(dec.iter().all(|v| v.is_finite()));
         assert_relative_eq!(dec[0], raw[0], epsilon = 0.15);
         assert_relative_eq!(dec[1], raw[1], epsilon = 0.15);
@@ -470,7 +515,7 @@ mod tests {
     fn npde_scores_nan_when_rank_deficient() {
         // K = 2 replicates but n_obs = 2 → K <= n_obs → singular covariance → NaN.
         let sims = sims_matrix(&[vec![1.0, 2.0], vec![1.5, 2.5]]);
-        let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims);
+        let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims, BloqMethod::Drop);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|v| v.is_nan()));
     }
@@ -478,7 +523,7 @@ mod tests {
     #[test]
     fn npde_scores_empty_for_zero_observations() {
         let sims = DMatrix::<f64>::zeros(0, 10);
-        assert!(npde_scores(&[], &[], &sims).is_empty());
+        assert!(npde_scores(&[], &[], &sims, BloqMethod::Drop).is_empty());
     }
 
     #[test]
@@ -491,7 +536,7 @@ mod tests {
             .map(|i| vec![5.0, i as f64]) // row 0 constant, row 1 varies
             .collect();
         let sims = sims_matrix(&rows);
-        let out = npde_scores(&[5.0, 10.0], &[0, 0], &sims);
+        let out = npde_scores(&[5.0, 10.0], &[0, 0], &sims, BloqMethod::Drop);
         assert_eq!(out.len(), 2);
         assert!(
             out.iter().all(|v| v.is_finite()),
@@ -507,18 +552,34 @@ mod tests {
         let mut rows: Vec<Vec<f64>> = (0..k).map(|i| vec![i as f64, (k - i) as f64]).collect();
         rows[3][0] = f64::NAN;
         let sims = sims_matrix(&rows);
-        let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims);
+        let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims, BloqMethod::Drop);
         assert!(out.iter().all(|v| v.is_nan()));
     }
 
+    /// #1499 straddle, subject level: one flagged row voids the whole subject's
+    /// NPDE under `m3` (the decorrelation would mix the LLOQ into the rest) and
+    /// voids nothing under `drop`, where no row is censored for the fit. The
+    /// `drop` leg also pins the *other* row against the unflagged twin, which is
+    /// the part a per-row check cannot see: decorrelation mixes rows, so
+    /// excluding one moves every other score.
     #[test]
-    fn npde_scores_nan_for_subject_with_any_censoring() {
+    fn npde_scores_void_a_subject_with_a_flagged_row_only_under_m3() {
         let k = 50;
         let rows: Vec<Vec<f64>> = (0..k).map(|i| vec![i as f64, (k - i) as f64]).collect();
         let sims = sims_matrix(&rows);
-        // Second row censored → whole subject's NPDE is NaN (decorrelation invalid).
-        let out = npde_scores(&[10.0, 20.0], &[0, 1], &sims);
-        assert!(out.iter().all(|v| v.is_nan()));
+        let m3 = npde_scores(&[10.0, 20.0], &[0, 1], &sims, BloqMethod::M3);
+        assert!(
+            m3.iter().all(|v| v.is_nan()),
+            "M3: a censored row voids the subject's NPDE, got {m3:?}"
+        );
+
+        let drop = npde_scores(&[10.0, 20.0], &[0, 1], &sims, BloqMethod::Drop);
+        assert!(
+            drop.iter().all(|v| v.is_finite()),
+            "under `drop` nothing is censored for the fit, got {drop:?}"
+        );
+        let unflagged = npde_scores(&[10.0, 20.0], &[0, 0], &sims, BloqMethod::Drop);
+        assert_eq!(drop, unflagged);
     }
 
     /// Log-scale SD of the one-row reference distribution in

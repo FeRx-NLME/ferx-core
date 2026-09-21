@@ -749,8 +749,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     // this factor is applied) or the EKF process noise `p_obs`.
     let ruv_scale = model.residual_var_scale(eta);
     let mut data_ll = 0.0;
-    let has_censored_m3 =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let has_censored_m3 = model.bloq_method.has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
@@ -807,7 +806,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
             ) * ruv_scale;
             let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+            if model.bloq_method.is_censored_row(cens) {
                 data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
             } else {
                 let resid = y - f_pred;
@@ -1116,7 +1115,7 @@ fn obs_nll_subject_from_preds_with_semantics(
                 }
             };
             let cens = subject.cens.get(j).copied().unwrap_or(0);
-            if m3 && cens != 0 {
+            if model.bloq_method.is_censored_row(cens) {
                 nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
@@ -1648,10 +1647,10 @@ pub fn foce_subject_nll_standard(
     // the censored curvature into `H̃` (see `cens_hess`, #486) — the same conditional
     // treatment NONMEM's LAPLACE M3 uses, at FOCEI Gauss-Newton order (dropping the
     // `∂²f/∂η²` term full Laplace keeps).
-    let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let m3 = bloq_method.has_censored_row(&subject.cens);
     let quant: Vec<usize> = if m3 {
         (0..n_obs)
-            .filter(|&j| subject.cens.get(j).copied().unwrap_or(0) == 0)
+            .filter(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)))
             .collect()
     } else {
         (0..n_obs).collect()
@@ -2077,9 +2076,8 @@ fn gaussian_foce_accum(
     let err_keys = error_spec.obs_keys(subject);
 
     // Partition observation indices into quantified vs censored (M3 only).
-    let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
-        !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
-    });
+    let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs)
+        .partition(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)));
 
     // Accumulate data_ll at η̂ and the conditional Hessian pieces over the
     // quantified rows.  For SDE the EKF process-noise variance `p_obs` inflates
@@ -2565,9 +2563,13 @@ pub fn foce_population_nll(
 /// change which residual-error form a CWRES-based screen (ruvsearch's) picks.
 /// A model with no η has `R̃` diagonal, so every recipe agrees there.
 ///
-/// Censored observations get `NaN` since a weighted Gaussian residual is
-/// undefined when the observed value is censored; they are left out of the
-/// decorrelation.
+/// Rows censored **for this fit** — `CENS != 0` under `bloq_method = m3`, never
+/// under `drop`, see [`BloqMethod::is_censored_row`] — get `NaN`, since a
+/// weighted Gaussian residual is undefined when the observed value is censored,
+/// and are left out of the decorrelation. Under `drop` a `CENS != 0` row is an
+/// ordinary observation the likelihood scored at its `DV`, so it stays in the
+/// system: gating on the raw flag instead blanked it *and* shifted every other
+/// CWRES of that subject, because the decorrelation mixes rows (#1499).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
@@ -2591,6 +2593,10 @@ pub fn compute_cwres(
     // fit, `f(η = 0)` under FOCE — NONMEM's `CWRES`. `None` evaluates `R` at
     // the linearized `f0`.
     r_preds: Option<&[f64]>,
+    // How the fit scored `CENS` rows. Only `M3` makes a flagged row censored;
+    // under `Drop` the likelihood kept it as an ordinary observation and so does
+    // this (#1499).
+    bloq_method: BloqMethod,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -2641,11 +2647,12 @@ pub fn compute_cwres(
     // decorrelation NONMEM's `CWRES` applies (see the doc comment); a Cholesky
     // factor decorrelates too but yields a different vector, and the marginal
     // `(y − f0)ⱼ / √R̃ⱼⱼ` a third — the three agree only when `H·Ω·Hᵀ` has no
-    // off-diagonals, i.e. with no η. Censored rows are left out of the system
-    // and reported as NaN; a non-positive eigenvalue (a hand-built pathological
-    // input) falls back to the marginal standardisation rather than panicking.
+    // off-diagonals, i.e. with no η. Rows censored for this fit are left out of
+    // the system and reported as NaN; a non-positive eigenvalue (a hand-built
+    // pathological input) falls back to the marginal standardisation rather than
+    // panicking.
     let live: Vec<usize> = (0..n_obs)
-        .filter(|&j| subject.cens.get(j).copied().unwrap_or(0) == 0)
+        .filter(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)))
         .collect();
     let mut out = vec![f64::NAN; n_obs];
     if live.is_empty() {
@@ -2937,7 +2944,7 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
             }
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+        if model.bloq_method.is_censored_row(cens) {
             data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
         } else {
             let resid = y - f_pred;
@@ -4037,6 +4044,7 @@ mod tests {
             Some(0),
             None,
             None,
+            BloqMethod::Drop,
         );
 
         let pk_expected = 1.0 / (sigma[0] * eta_hat[0].exp());
@@ -4081,6 +4089,7 @@ mod tests {
             None,
             None,
             None,
+            BloqMethod::Drop,
         );
         // R̃ = H Ω Hᵀ + σ²I = [[0.5, 0.5], [0.5, 1.25]]; resid = (2, 3).
         let r_tilde = DMatrix::from_row_slice(2, 2, &[0.5, 0.5, 0.5, 1.25]);
@@ -4101,8 +4110,8 @@ mod tests {
         assert!((cwres[1] - 3.0 / 1.25f64.sqrt()).abs() > 0.1);
         assert!((cwres[0] - 2.0 / 0.5f64.sqrt()).abs() > 0.1);
 
-        // A censored first row is NaN and leaves the second row standardised
-        // on its own: 3/√1.25.
+        // A first row censored *for this fit* (`CENS != 0` under M3) is NaN and
+        // leaves the second row standardised on its own: 3/√1.25.
         let mut censored = subject.clone();
         censored.cens = vec![1, 0];
         let cw = compute_cwres(
@@ -4118,6 +4127,7 @@ mod tests {
             None,
             None,
             None,
+            BloqMethod::M3,
         );
         assert!(cw[0].is_nan());
         assert_relative_eq!(cw[1], 3.0 / 1.25f64.sqrt(), epsilon = 1e-12);
@@ -4147,6 +4157,7 @@ mod tests {
             None,
             None,
             Some(&[4.0]),
+            BloqMethod::Drop,
         );
         assert_relative_eq!(
             cw[0],
@@ -4166,6 +4177,7 @@ mod tests {
             None,
             None,
             None,
+            BloqMethod::Drop,
         );
         assert_relative_eq!(
             cw_f0[0],
@@ -4222,6 +4234,7 @@ mod tests {
             None,
             Some(&mult),
             None,
+            BloqMethod::Drop,
         );
         assert_relative_eq!(cwres[0], 2.0 / (1.0 * 2.0), epsilon = 1e-12);
         assert_relative_eq!(cwres[1], 2.0 / (3.0 * 2.0), epsilon = 1e-12);

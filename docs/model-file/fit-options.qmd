@@ -347,10 +347,13 @@ well-specified model.
 ### Limitations
 
 M3/BLQ censored observations need the predictive-CDF variant and
-are out of scope: censored rows (`CENS != 0`) are emitted as empty/`NaN` (matching
-the CWRES/IWRES convention), and a subject's NPDE is `NaN` as a whole when it has
-any censored row, since the within-subject decorrelation would otherwise mix the
-LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
+are out of scope: rows the fit scores as censored — `CENS != 0` **under
+`bloq_method = m3`** — are emitted as empty/`NaN` (matching the CWRES/IWRES
+convention), and a subject's NPDE is `NaN` as a whole when it has any such row,
+since the within-subject decorrelation would otherwise mix the LLOQ into the
+uncensored rows. Under the default `bloq_method = drop` a `CENS != 0` row is
+fitted as an ordinary observation at its `DV`, so it is also scored as one here
+and does not void its subject's NPDE (#1499). NPDE also requires more replicates than a subject
 has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
 otherwise that subject's NPDE is `NaN` (NPD is still computed).
 

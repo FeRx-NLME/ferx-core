@@ -1362,8 +1362,13 @@ fn scalar_residual_mstep_model(
         mu_ref_pairs,
     ) && (use_closed_form_mstep
         || init_params.theta_fixed.iter().all(|&fixed| fixed));
+    // "Plain Gaussian" is a question about the *fit*, not the raw `CENS` column:
+    // under `bloq_method = drop` a flagged row is scored as an ordinary Gaussian
+    // observation at its `DV`, so it does not disqualify the closed-form σ
+    // M-step. Same predicate as the likelihood and the residual diagnostics
+    // (#1499); the `M3` case is additionally rejected outright above.
     let plain_gaussian_rows = population.subjects.iter().all(|subject| {
-        !subject.has_censored_observation()
+        !model.bloq_method.has_censored_row(&subject.cens)
             && subject.obs_records.is_empty()
             && !subject.observations.is_empty()
     });
@@ -7843,6 +7848,40 @@ DV ~ proportional(EPS)
         assert_eq!(
             scalar_residual_mstep_model(&model, &pop, &params, 0, false, true, &pairs),
             None,
+        );
+    }
+
+    /// #1499: "plain Gaussian rows" is a question about the *fit*. A `CENS != 0`
+    /// row under the default `bloq_method = drop` was scored as an ordinary
+    /// Gaussian observation at its `DV`, so it does not disqualify the
+    /// closed-form sigma M-step; under `m3` it contributes a normal-tail term
+    /// instead and does. Both legs on one fixture.
+    #[test]
+    fn scalar_residual_mstep_gate_reads_a_cens_row_through_bloq_method() {
+        let mut model = noeta_model("TVV * exp(ETA_V)");
+        let mut pop = mix996_pop(2);
+        let mut params = model.default_params.clone();
+        params.sigma_fixed[0] = false;
+        let pairs = get_mu_ref_pairs(&model, &model.default_params.theta_lower);
+
+        // Flag one row of the first subject.
+        let n = pop.subjects[0].observations.len();
+        assert!(n > 0, "fixture must have an observation to flag");
+        pop.subjects[0].cens = vec![0; n];
+        pop.subjects[0].cens[0] = 1;
+
+        model.bloq_method = BloqMethod::Drop;
+        assert_eq!(
+            scalar_residual_mstep_model(&model, &pop, &params, 0, false, true, &pairs),
+            Some(ScalarResidualModel::Proportional),
+            "under `drop` a flagged row is an ordinary Gaussian observation",
+        );
+
+        model.bloq_method = BloqMethod::M3;
+        assert_eq!(
+            scalar_residual_mstep_model(&model, &pop, &params, 0, false, true, &pairs),
+            None,
+            "under `m3` the row is a normal-tail term, not a Gaussian residual",
         );
     }
 

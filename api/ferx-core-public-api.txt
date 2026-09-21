@@ -2048,7 +2048,7 @@ pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::stats::likelihood::build_frem_r_override(frem_config: core::option::Option<&ferx_core::FremConfig>, fremtype: &[u16], sigma_values: &[f64]) -> core::option::Option<alloc::vec::Vec<core::option::Option<f64>>>
-pub fn ferx_core::stats::likelihood::compute_cwres(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, residual_correlations: &[ferx_core::ResidualCorrelation], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, residual_error_eta: core::option::Option<usize>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>, r_preds: core::option::Option<&[f64]>) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::likelihood::compute_cwres(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, residual_correlations: &[ferx_core::ResidualCorrelation], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, residual_error_eta: core::option::Option<usize>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>, r_preds: core::option::Option<&[f64]>, bloq_method: ferx_core::BloqMethod) -> alloc::vec::Vec<f64>
 pub fn ferx_core::stats::likelihood::foce_population_nll(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], interaction: bool) -> f64
 pub fn ferx_core::stats::likelihood::foce_population_nll_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], kappas_per_subject: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], omega_bsv: &ferx_core::OmegaMatrix, omega_iov: &ferx_core::OmegaMatrix, sigma_values: &[f64], interaction: bool) -> f64
 pub fn ferx_core::stats::likelihood::foce_subject_nll(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], interaction: bool) -> f64
@@ -2149,6 +2149,8 @@ pub enum ferx_core::types::BloqMethod
 pub ferx_core::types::BloqMethod::Drop
 pub ferx_core::types::BloqMethod::M3
 impl ferx_core::BloqMethod
+pub fn ferx_core::BloqMethod::has_censored_row(self, cens: &[i8]) -> bool
+pub fn ferx_core::BloqMethod::is_censored_row(self, cens: i8) -> bool
 pub fn ferx_core::BloqMethod::label(self) -> &'static str
 pub enum ferx_core::types::CovarianceFallback
 pub ferx_core::types::CovarianceFallback::None
@@ -3437,6 +3439,8 @@ pub enum ferx_core::BloqMethod
 pub ferx_core::BloqMethod::Drop
 pub ferx_core::BloqMethod::M3
 impl ferx_core::BloqMethod
+pub fn ferx_core::BloqMethod::has_censored_row(self, cens: &[i8]) -> bool
+pub fn ferx_core::BloqMethod::is_censored_row(self, cens: i8) -> bool
 pub fn ferx_core::BloqMethod::label(self) -> &'static str
 pub enum ferx_core::Comparison
 pub ferx_core::Comparison::Eq
