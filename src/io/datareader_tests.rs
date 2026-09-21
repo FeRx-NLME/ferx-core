@@ -190,9 +190,10 @@ fn unparseable_iov_occasion_values_warn_not_fail() {
 #[test]
 fn test_obs_cmt_dot_defaults_to_compartment_one() {
     // Regression: a "." (missing) CMT on an observation row must default to
-    // compartment 1, not 0. `parse_usize(".")` yields 0 — an invalid
-    // compartment — so the observation path must guard "." / blank exactly
-    // like the dose path does.
+    // compartment 1, not 0. The observation arm once read the cell with a bare
+    // `parse::<usize>()` falling back to 0 — an invalid compartment — so it must
+    // guard "." / blank exactly like the dose arm does; both now share
+    // `resolve_row_cmt`.
     let csv = "ID,TIME,DV,EVID,AMT,CMT\n\
                    1,0,.,1,100,1\n\
                    1,1,5.0,0,.,.\n";
@@ -1918,8 +1919,8 @@ fn test_covariate_declared_column_missing_errors() {
 
 #[test]
 fn test_parse_evid_defaults_to_observation() {
-    // parse_usize defaults to 1; parse_evid must default to 0 (observation)
-    // for blank / missing / unparseable cells.
+    // A blank / missing / unparseable EVID cell is 0 (observation), NONMEM's
+    // default.
     assert_eq!(parse_evid("1"), 1);
     assert_eq!(parse_evid("0"), 0);
     assert_eq!(parse_evid(""), 0);
@@ -1953,8 +1954,8 @@ fn test_parse_l2_id_accepts_integer_and_float_formats() {
 
 #[test]
 fn test_covtab_blank_evid_is_observation_not_dose() {
-    // A blank EVID cell on an observation row must be EVID=0 in the covtab,
-    // not 1 (which parse_usize would have produced).
+    // A blank EVID cell on an observation row must be EVID=0 in the covtab, as
+    // it is in the population: both read the cell through `effective_evid`.
     let csv = "ID,TIME,DV,EVID,AMT,WT\n\
                    1,0,.,1,100,70\n\
                    1,1,5.0,,.,70\n";
@@ -2731,11 +2732,11 @@ fn explicit_integer_cmt_column_including_zero_warns_nothing() {
 
 #[test]
 fn filter_context_cmt_resolves_like_the_dose_site() {
-    // T1e. The `[data]` selection filter built its `RowContext.cmt` with
-    // `parse_usize`, which maps both `.` and `2.0` to **0** — so `ignore = CMT ==
-    // 1` failed to drop a dotted row the dose arm assigns to compartment 1. One
-    // resolver now serves both, so the filter sees the compartment the row is
-    // actually given.
+    // T1e. The `[data]` selection filter built its `RowContext.cmt` with a bare
+    // `parse::<usize>()` falling back to 0, which maps both `.` and `2.0` to **0**
+    // — so `ignore = CMT == 1` failed to drop a dotted row the dose arm assigns to
+    // compartment 1. One resolver now serves both, so the filter sees the
+    // compartment the row is actually given.
     // The ignore clause is narrowed to dose rows (`EVID == 1 && CMT == 1`) so a
     // dotted *observation* survives — without a surviving defaulted row the warning never
     // fires at all and any assertion about its wording passes by absence. The
@@ -3223,7 +3224,8 @@ fn the_ellipsis_marks_a_withheld_spelling_not_a_repeated_one() {
 #[test]
 fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
     use WholeCell::{Missing, NotWhole, Value};
-    // (cell, class, CENS, EVID, OCC, MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
+    // (cell, class, CENS as a `[data_selection]` rule compares it, EVID, OCC,
+    // MDV/ADDL/filter-SS as usize, FREMTYPE as u16)
     #[allow(clippy::type_complexity)]
     let table: &[(
         &str,
@@ -3257,7 +3259,9 @@ fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
             Some(200),
         ),
         ("-200", Value(-200.0), -128, 0, None, None, None),
-        // Not a whole number: the old fallback at every site, untouched here.
+        // Not a whole number: the old fallback at every site. For `CENS` that is
+        // now only the `[data_selection]` context; an observation row the fit
+        // scores rejects the cell (#1496 PR B, see `a_cens_cell_that_is_not_a_whole_number_*`).
         ("1.5", NotWhole, 0, 0, None, None, None),
         ("abc", NotWhole, 0, 0, None, None, None),
         ("inf", NotWhole, 0, 0, None, None, None),
@@ -3269,7 +3273,7 @@ fn integer_columns_read_a_float_formatted_whole_number_as_that_number() {
     ];
     for &(cell, class, cens, evid, occ, count, fremtype) in table {
         assert_eq!(parse_whole_number_cell(cell), class, "class of {cell:?}");
-        assert_eq!(parse_cens(cell), cens, "CENS {cell:?}");
+        assert_eq!(parse_cens(cell).selection_flag(), cens, "CENS {cell:?}");
         assert_eq!(parse_evid(cell), evid, "EVID {cell:?}");
         assert_eq!(parse_occ(cell), occ, "OCC {cell:?}");
         assert_eq!(parse_unsigned_cell::<usize>(cell), count, "usize {cell:?}");
@@ -3541,4 +3545,317 @@ fn a_float_formatted_fremtype_column_reads_like_its_integer_twin() {
     let float = read("0.0", "1.0", "2.0");
     assert_eq!(integer.subjects[0].fremtype, vec![0, 1, 2]);
     assert_eq!(float.subjects[0].fremtype, integer.subjects[0].fremtype);
+}
+
+// ── #1496 PR B: a `CENS` cell that holds no flag, and one outside -1/0/1 ──────
+// A cell that is not a whole number (`1.5`, `abc`, `inf`) on an observation row
+// the fit scores is an error: NONMEM 7.6.0 rejects `abc` there too, and the old
+// silent 0 scored a possibly below-LLOQ row as a measurement at the LLOQ. A whole
+// number other than -1, 0 or 1 stays a warning, which now quotes the cell and
+// names the tail its sign is scored on.
+
+/// Subject 7: a dose row with a blank `CENS`, a quantified row, and the row under
+/// test at `TIME 2.5` carrying `cell`.
+fn cens_cell_csv(cell: &str) -> String {
+    format!(
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+         7,0,.,1,1,100,1,\n\
+         7,1,5.0,0,0,.,1,0\n\
+         7,2.5,4.0,0,0,.,1,{cell}\n"
+    )
+}
+
+/// The whole error for subject 7's cell, as the user reads it. A literal rather
+/// than a second call to the producer: an equality between two outputs of
+/// `cens_not_whole_error` would pin the routing and none of the text.
+fn cens_not_whole_message(time: &str, quoted: &str) -> String {
+    format!(
+        "subject 7, time {time}: CENS=\"{quoted}\" is not a whole number; expected -1 \
+         (above the ULOQ), 0 (quantified) or 1 (below the LLOQ), and a blank or \".\" \
+         cell reads as 0. Correct the cell, or, if this column is not a censoring flag, \
+         rename it in the dataset or in the model's [data] block."
+    )
+}
+
+/// B6. A `CENS` cell that is not a whole number, on an observation row the fit
+/// scores, is an error. The message is asserted whole, so deleting any part of it —
+/// the subject and written time, the cell, the accepted values, the remedy —
+/// reddens this test. Each claim the message makes is checked against the reader
+/// here as well: a blank or `.` cell reads as 0, and a column renamed in the dataset
+/// or aside in `[data]` is no longer read as the flag. The time is the one the user
+/// wrote: an `EVID=4` restart shifts the engine's clock under the second fixture.
+#[test]
+fn a_cens_cell_that_is_not_a_whole_number_is_an_error_on_a_scored_row() {
+    let read = |csv: &str| {
+        let f = write_csv(csv);
+        read_nonmem_csv(f.path(), None, None)
+    };
+    for cell in ["abc", "1.5", "inf"] {
+        let err = read(&cens_cell_csv(cell)).expect_err(cell);
+        assert_eq!(err, cens_not_whole_message("2.5", cell));
+        // A cell that holds no flag is scored on no tail, under any method.
+        for word in ["tail", "m3", "M3"] {
+            assert!(
+                !err.contains(word),
+                "{cell}: the error says {word:?}: {err}"
+            );
+        }
+    }
+
+    // The cell is quoted safely: a quote inside it cannot close the quote.
+    let err = read(&cens_cell_csv("\"ab\"\"c\"")).unwrap_err();
+    assert_eq!(err, cens_not_whole_message("2.5", "ab\u{fffd}c"));
+
+    // The time as written. The `EVID=4` restart at `TIME 0` moves every later row
+    // past the first segment on the engine's clock; the error still says 2.5.
+    let restarted = |cell: &str| {
+        format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             7,0,.,1,1,100,1,\n\
+             7,1,5.0,0,0,.,1,0\n\
+             7,0,.,4,1,100,1,\n\
+             7,2.5,4.0,0,0,.,1,{cell}\n"
+        )
+    };
+    let shifted = read(&restarted("0")).unwrap();
+    assert_eq!(shifted.subjects[0].obs_raw_times, vec![1.0, 2.5]);
+    assert!(
+        shifted.subjects[0].obs_times[1] > 2.5,
+        "the restart must shift the row, or this leg tests nothing: {:?}",
+        shifted.subjects[0].obs_times
+    );
+    assert_eq!(
+        read(&restarted("abc")).unwrap_err(),
+        cens_not_whole_message("2.5", "abc")
+    );
+
+    // "a blank or "." cell reads as 0".
+    for missing in ["", "."] {
+        let pop = read(&cens_cell_csv(missing)).unwrap_or_else(|e| panic!("{missing:?}: {e}"));
+        assert_eq!(pop.subjects[0].cens, vec![0, 0], "{missing:?}");
+    }
+
+    // "rename it in the dataset or in the model's [data] block": either way the
+    // column is no longer the flag, and the same file reads.
+    let renamed = cens_cell_csv("abc").replacen("CENS", "CENSNOTE", 1);
+    let pop = read(&renamed).unwrap_or_else(|e| panic!("renamed in the dataset: {e}"));
+    assert_eq!(pop.subjects[0].cens, vec![0, 0]);
+    let f = write_csv(&cens_cell_csv("abc"));
+    let aside = [("CENSNOTE".to_string(), "CENS".to_string())];
+    let pop = read_nonmem_csv_mapped(f.path(), None, None, &aside)
+        .unwrap_or_else(|e| panic!("renamed aside in [data]: {e}"));
+    assert_eq!(pop.subjects[0].cens, vec![0, 0]);
+}
+
+/// B6b. The error is raised only where the flag is read: a Gaussian observation row
+/// that the `[data_selection]` filter keeps. The same `abc` cell on a dose row, on
+/// an observation row the filter removes, on a row the reader skips for its missing
+/// `DV`, and on a discrete-endpoint row reads without error; on the kept Gaussian
+/// row it is an error. One test, so moving the check across any of these
+/// boundaries reddens it: raised in the filter context, (ii) dies; raised on every
+/// row, (i) dies; raised before the missing-`DV` skip, (iv) dies; raised whatever
+/// the endpoint, (v) dies.
+#[test]
+fn a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it() {
+    let csv = |dose: &str, dv: &str, cmt: &str, obs: &str| {
+        format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,{dose}\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,{dv},0,0,.,{cmt},{obs}\n"
+        )
+    };
+    let plain = |csv: &str| {
+        let f = write_csv(csv);
+        read_nonmem_csv(f.path(), None, None)
+    };
+
+    // (iii) The kept Gaussian observation row: an error. Every other leg is this
+    // fixture with one thing changed.
+    let err = plain(&csv("0", "4.0", "1", "abc")).expect_err("the scored row rejects `abc`");
+    assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
+
+    // (i) On the dose row, which never reads the cell.
+    let dose = plain(&csv("abc", "4.0", "1", "0")).unwrap_or_else(|e| panic!("dose row: {e}"));
+    assert_eq!(dose.subjects[0].observations, vec![5.0, 4.0]);
+
+    // (ii) On the row `ignore = TIME == 2` removes. NONMEM likewise accepts `abc` on
+    // a record its `IGNORE` removes.
+    let f = write_csv(&csv("0", "4.0", "1", "abc"));
+    let filter = SelectionFilter::from_opts(&["TIME == 2".to_string()], &[], &[])
+        .unwrap_or_else(|e| panic!("filter: {e}"));
+    let removed = read_nonmem_csv_filtered(f.path(), None, None, &filter)
+        .unwrap_or_else(|e| panic!("removed row: {e}"));
+    assert_eq!(
+        removed.subjects[0].observations,
+        vec![5.0],
+        "the rule removes the row"
+    );
+
+    // (iv) On a row the reader skips because its `DV` is missing (#258).
+    let skipped = plain(&csv("0", ".", "1", "abc")).unwrap_or_else(|e| panic!("missing DV: {e}"));
+    assert_eq!(skipped.subjects[0].observations, vec![5.0]);
+    assert!(
+        skipped
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_MISSING_DV")),
+        "the row was skipped as a missing DV: {:?}",
+        skipped.warnings
+    );
+
+    // (v) On a discrete-endpoint row: the non-Gaussian arms never read `CENS`. Under
+    // the same routing the row on the Gaussian compartment is an error, so the
+    // endpoint is what decides it.
+    let routing = ObsRouting {
+        discrete: [3].into_iter().collect(),
+        ..Default::default()
+    };
+    let routed = |cmt: &str| {
+        let f = write_csv(&csv("0", "1", cmt, "abc"));
+        read_nonmem_csv_filtered_routed(f.path(), &routing)
+    };
+    let discrete = routed("3").unwrap_or_else(|e| panic!("discrete row: {e}"));
+    assert_eq!(discrete.subjects[0].obs_records.len(), 1);
+    assert!(
+        routed("1").is_err(),
+        "the same row on the Gaussian compartment is scored, so it is rejected"
+    );
+}
+
+/// B6b, the time-to-event arm, which exists only under `survival`: a TTE row never
+/// reads `CENS` either, so the same `abc` cell reads without error there. Under the
+/// same routing the row on the Gaussian compartment is an error, so the endpoint is
+/// what decides it.
+#[cfg(feature = "survival")]
+#[test]
+fn a_cens_cell_holding_no_flag_is_not_read_on_a_time_to_event_row() {
+    use crate::types::ObsRecord;
+    let routing = ObsRouting::tte_and_discrete(&[2].into_iter().collect(), &HashSet::new());
+    let read = |cmt: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,5,1,0,0,.,{cmt},abc\n"
+        ));
+        read_nonmem_csv_filtered_routed(f.path(), &routing)
+    };
+    let tte = read("2").unwrap_or_else(|e| panic!("TTE row: {e}"));
+    assert!(
+        matches!(
+            tte.subjects[0].obs_records.as_slice(),
+            [ObsRecord::Event { .. }]
+        ),
+        "{:?}",
+        tte.subjects[0].obs_records
+    );
+    assert!(
+        read("1").is_err(),
+        "the same row on the Gaussian compartment is scored, so it is rejected"
+    );
+}
+
+/// B4 + B5. `W_CENS_UNEXPECTED` quotes the cell as written and names the tail the
+/// engines score it on. Every engine routes on `cens < 0` alone — pinned per site
+/// by `m3_logcdf_scores_an_out_of_domain_flag_by_its_sign` and its three siblings
+/// in `stats::special` and `estimation::sens_cov_hessian`, and on the objective by
+/// `an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop`
+/// — so a positive flag is the lower tail, like 1, and a negative one the upper
+/// tail, like -1. Both signs in one test, so a sign gate stuck on either branch
+/// reddens it; the line is asserted whole, so deleting any clause reddens it too.
+/// Before #1496 PR B, `200` was reported as `CENS=127` and every negative flag as
+/// "(left tail)".
+#[test]
+fn w_cens_unexpected_quotes_the_cell_and_names_the_tail_its_sign_is_scored_on() {
+    let positive = |cell: &str| {
+        format!(
+            "W_CENS_UNEXPECTED subject 1: CENS={cell} is not -1, 0, or 1; under \
+             bloq_method = m3 a positive flag is scored on the lower tail, like CENS=1 \
+             (below the LLOQ), and under bloq_method = drop the row is scored as an \
+             ordinary observation"
+        )
+    };
+    let negative = |cell: &str| {
+        format!(
+            "W_CENS_UNEXPECTED subject 1: CENS={cell} is not -1, 0, or 1; under \
+             bloq_method = m3 a negative flag is scored on the upper tail, like CENS=-1 \
+             (above the ULOQ), and under bloq_method = drop the row is scored as an \
+             ordinary observation"
+        )
+    };
+    // The flag as read, and the one `W_CENS_UNEXPECTED` line.
+    let read = |cell: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,5.0,0,0,.,1,{cell}\n"
+        ));
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let lines: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{cell}: {:?}", pop.warnings);
+        (pop.subjects[0].cens[0], lines[0].clone())
+    };
+    // `200` saturates to 127 in the flag, and the line still says 200.
+    for (cell, flag) in [("7", 7), ("7.0", 7), ("+7", 7), ("200", i8::MAX)] {
+        let (read_flag, line) = read(cell);
+        assert_eq!(read_flag, flag, "{cell}");
+        assert_eq!(line, positive(cell));
+        assert!(!line.contains("upper"), "{line}");
+    }
+    for (cell, flag) in [("-2", -2), ("-2.0", -2), ("-200", i8::MIN)] {
+        let (read_flag, line) = read(cell);
+        assert_eq!(read_flag, flag, "{cell}");
+        assert_eq!(line, negative(cell));
+        assert!(!line.contains("lower") && !line.contains("left"), "{line}");
+    }
+    // Under `drop` the flag is still read — by `[data_selection]` and
+    // `suggest_start` — so the line must not call it ignored.
+    for line in [read("7").1, read("-2").1] {
+        assert!(!line.contains("ignor"), "{line}");
+    }
+    // Quoted as every cell a message quotes is: a whole number written with 30
+    // leading zeros is cut after 24 characters rather than copied whole.
+    let long = format!("{}7", "0".repeat(30));
+    assert_eq!(read(&long).1, positive(&format!("{}…", "0".repeat(24))));
+}
+
+/// B7. One `W_CENS_UNEXPECTED` per subject for each sign: the two signs are scored
+/// on different tails, so a subject holding `7` and then `-2` hears about both,
+/// each line quoting that sign's first cell. Same-sign repeats (`8`, `-3`) add
+/// nothing — which is why `test_cens_unexpected_value_warns_once` (`2` then `3`)
+/// still sees one.
+#[test]
+fn w_cens_unexpected_is_reported_once_per_subject_for_each_sign() {
+    let f = write_csv(
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+         1,0,.,1,1,100,1,\n\
+         1,1,5.0,0,0,.,1,7\n\
+         1,2,4.0,0,0,.,1,-2\n\
+         1,3,3.0,0,0,.,1,8\n\
+         1,4,2.0,0,0,.,1,-3\n",
+    );
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(pop.subjects[0].cens, vec![7, -2, 8, -3]);
+    let lines: Vec<&String> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+        .collect();
+    assert_eq!(lines.len(), 2, "one line per sign: {lines:?}");
+    assert!(
+        lines[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 ")
+            && lines[0].contains("lower tail"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("W_CENS_UNEXPECTED subject 1: CENS=-2 ")
+            && lines[1].contains("upper tail"),
+        "{}",
+        lines[1]
+    );
 }
