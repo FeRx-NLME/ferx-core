@@ -1163,12 +1163,10 @@ struct NloptState {
     /// gradient so SLSQP/L-BFGS xtol/ftol fires in microseconds instead
     /// of grinding through `maxeval` at full inner-loop cost.
     stagnation_stopped: bool,
-    /// The incumbent the #1520 salvage guard measures a trial point against: the
-    /// optimizer-facing objective and the per-subject `2·nllᵢ` of the best evaluation
-    /// adopted as a warm start so far (`adopt_warm_start`), i.e. the best non-guarded
-    /// one. `None` until one exists. Kept here rather than read off `best_ofv`, which a
-    /// guard-rejected evaluation's sentinel can also write.
-    incumbent: Option<(f64, Vec<f64>)>,
+    /// The #1520 salvage guard's bookkeeping: which point a trial is measured against is
+    /// decided per optimizer by [`SalvageGuardPolicy`], and the state remembers the
+    /// candidates (best evaluation, last gradient point, previous `xs`).
+    salvage_guard: SalvageGuardState,
 }
 
 /// Latches `stagnation_stopped` once recent evals show no OFV progress.
@@ -1289,7 +1287,12 @@ fn adopt_warm_start(guarded: bool, ofv: f64, best_ofv: f64) -> bool {
     !guarded && ofv < best_ofv
 }
 
-fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
+fn new_nlopt_state(
+    n_subj: usize,
+    n_eta: usize,
+    x0: &[f64],
+    salvage_guard: SalvageGuardPolicy,
+) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
         cached_h_mats: Vec::new(),
@@ -1297,7 +1300,7 @@ fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
         best_ofv: f64::INFINITY,
         n_evals: 0,
         n_grad_evals: 0,
-        incumbent: None,
+        salvage_guard: SalvageGuardState::new(salvage_guard),
         prev_x: x0.to_vec(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
@@ -1410,7 +1413,8 @@ fn run_global_presearch(
         );
     }
 
-    let pre_state = new_nlopt_state(n_subj, n_eta, x0);
+    // Derivative-free pre-search: no gradient is ever formed, so no salvage guard.
+    let pre_state = new_nlopt_state(n_subj, n_eta, x0, SalvageGuardPolicy::Off);
 
     let pre_objective = |xs: &[f64], _grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -2557,7 +2561,12 @@ fn optimize_nlopt_once(
         }
     }
 
-    let state = new_nlopt_state(n_subj, n_eta, &x0);
+    let state = new_nlopt_state(
+        n_subj,
+        n_eta,
+        &x0,
+        SalvageGuardPolicy::for_optimizer(options.optimizer),
+    );
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
     // back after `opt.optimize()`, so we need an Arc to read the final
@@ -2828,6 +2837,9 @@ fn optimize_nlopt_once(
         // penalty is on; a guarded eval carries its sentinel in both.
         let ofv_clean = if guarded { ofv } else { clean_ofv };
 
+        // #1520: whether a population gradient is formed at this point (recorded for the
+        // salvage guard after the evaluation, below).
+        let gradient_requested = grad.is_some() && !guarded;
         // Compute gradient if requested (central FD with fixed EBEs)
         let mut grad_norm_for_trace: Option<f64> = None;
         // Per-coordinate scaled gradient for the trace (#640); only populated
@@ -2848,6 +2860,9 @@ fn optimize_nlopt_once(
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
                 // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
                 // FD fallback when out of analytic scope.
+                // #1520: per the optimizer's own acceptance test (`SalvageGuardPolicy`),
+                // the incumbent the salvage guard may measure this gradient point against.
+                let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
                     crate::estimation::mixture::mixture_gradient(
                         model, population, &params, options, mev,
@@ -2883,7 +2898,7 @@ fn optimize_nlopt_once(
                         OuterTrial {
                             ofv: raw_ofv,
                             contribs: &contribs,
-                            incumbent: state.incumbent.as_ref().map(|(f, c)| (*f, c.as_slice())),
+                            incumbent: guard_reference,
                         },
                         declines,
                     )
@@ -2959,15 +2974,19 @@ fn optimize_nlopt_once(
             });
             state.cached_h_mats = hms;
             state.cached_etas = ehs;
-            // #1520: this evaluation is the new incumbent the salvage guard measures
-            // later trial points against — the same adoption rule as the warm start.
-            state.incumbent = Some((ofv, contribs));
         } else {
             state.cached_h_mats = hms;
             if let Some(prev) = warm_start_by_class {
                 state.cached_etas_by_class = prev;
             }
         }
+        // #1520: record this evaluation for the salvage guard — the objective the
+        // optimizer saw (`ofv`, the sentinel for a guarded evaluation, which the state
+        // ignores because neither flag is set then), its per-subject decomposition, and
+        // whether it was adopted as the fit's incumbent on the warm-start rule.
+        state
+            .salvage_guard
+            .observe(xs, ofv, contribs, gradient_requested, warm_start_improved);
         state.n_evals += 1;
         n_evals_cl.fetch_add(1, Ordering::Relaxed);
         if ofv < state.best_ofv {
@@ -4578,6 +4597,138 @@ impl OuterTrial<'static> {
     }
 }
 
+/// Which incumbent the #1520 salvage guard measures a trial point against, per NLopt
+/// algorithm — because "this point cannot be accepted" is a property of each optimizer's
+/// **acceptance test**, not of the objective values alone (PR #1525 review, P1).
+///
+/// The guard's population gate is only a rejected-trial guarantee when the reference it
+/// compares against is the point the optimizer's own acceptance test compares against.
+/// That point is not, in general, the best evaluation seen: a rejected trial can undercut
+/// the current iterate without passing sufficient decrease, and SLSQP's inexact line
+/// search accepts its eleventh trial **without** sufficient decrease (`slsqp.c`, `L200`:
+/// `if (h1 <= h3 / ten || line > 10) goto L240`), after which `L240` requests the
+/// gradient at that point as the new iterate. Measured against the best evaluation, a
+/// guard could then drop a subject's term at an accepted point and feed the hole into
+/// SLSQP's BFGS update. So each algorithm gets the reference its own test justifies, or
+/// none:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SalvageGuardPolicy {
+    /// Never fire. NLopt L-BFGS (Luksan `plis`): its line search requests a gradient at
+    /// every trial and accepts relative to the *current iterate*, which ferx cannot
+    /// observe — a trial that satisfies sufficient decrease but fails the curvature
+    /// condition is rejected yet can be the best evaluation seen, and the eventually
+    /// accepted point can sit any distance above it. No reference ferx can form gives a
+    /// rejected-trial guarantee there, so the salvage is always bought. Also the
+    /// derivative-free pre-search and BOBYQA, which never form a gradient.
+    Off,
+    /// NLopt SLSQP: fire only at a **fresh** point (one whose `xs` differs bitwise from
+    /// the previous evaluation's) and measure it against the **last point at which a
+    /// gradient was requested**. With bounds only (ferx adds no nonlinear constraints)
+    /// SLSQP requests a gradient in exactly two situations: `mode = −2`, the *first*
+    /// trial of a line search, before its sufficient-decrease test; and `mode = −1`, the
+    /// accepted iterate — which was evaluated objective-only (`mode = 1`) at the same
+    /// `xs` immediately before, unless it *was* the first trial, in which case its
+    /// gradient is already in hand and no `−1` follows. Hence a gradient request at a
+    /// fresh point is a first trial, the previous gradient point is the current iterate
+    /// (either the accepted `−1` re-evaluation or an accepted first trial), and a first
+    /// trial worse than the iterate fails `h1 <= h3/10` and is rejected — the guarantee.
+    /// The `line > 10` acceptance is a `−1` re-evaluation at a non-fresh point, where the
+    /// guard is off by construction.
+    LastGradientPointIfFresh,
+    /// NLopt MMA: measure against the **best evaluation** seen. MMA copies a candidate's
+    /// gradient into its model only inside `if (fcur < *minf …)` (`mma.c`), and with
+    /// bounds only every improving evaluation is accepted, so the best evaluation *is*
+    /// the acceptance reference and a point worse than it is never accepted.
+    BestEvaluation,
+}
+
+impl SalvageGuardPolicy {
+    /// The policy for the outer optimizer a fit resolved to. `Auto` is resolved before
+    /// dispatch; if it ever reached here it would map to `Off`, the safe default.
+    pub(crate) fn for_optimizer(optimizer: Optimizer) -> Self {
+        match optimizer {
+            Optimizer::Slsqp => Self::LastGradientPointIfFresh,
+            Optimizer::Mma => Self::BestEvaluation,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// The per-fit bookkeeping behind [`SalvageGuardPolicy`]: what the NLopt objective
+/// closure has to remember between evaluations to hand the mixed assemblies an
+/// [`OuterTrial`] whose incumbent carries a rejected-trial guarantee. Fed by
+/// [`SalvageGuardState::observe`] after every evaluation, read by
+/// [`SalvageGuardState::reference`] before the gradient is formed. Pure bookkeeping, so
+/// the optimizer sequences it exists for — SLSQP's `line > 10` acceptance among them —
+/// can be scripted in a unit test without NLopt.
+#[derive(Debug)]
+pub(crate) struct SalvageGuardState {
+    policy: SalvageGuardPolicy,
+    /// Optimizer-facing objective and per-subject `2·nllᵢ` of the best non-guarded
+    /// evaluation so far (the same adoption rule as the EBE warm start).
+    best: Option<(f64, Vec<f64>)>,
+    /// The same pair at the last evaluation whose gradient was actually formed.
+    last_gradient: Option<(f64, Vec<f64>)>,
+    /// `xs` of the previous evaluation of any kind, for the freshness test.
+    prev_xs: Option<Vec<f64>>,
+}
+
+impl SalvageGuardState {
+    pub(crate) fn new(policy: SalvageGuardPolicy) -> Self {
+        Self {
+            policy,
+            best: None,
+            last_gradient: None,
+            prev_xs: None,
+        }
+    }
+
+    /// The incumbent to measure the gradient evaluation at `xs` against, or `None` when
+    /// the policy gives no rejected-trial guarantee for it. Asked only where a gradient is
+    /// actually formed — the closure's non-guarded gradient arm — since without one there
+    /// is nothing to guard.
+    pub(crate) fn reference(&self, xs: &[f64]) -> Option<(f64, &[f64])> {
+        let pair = match self.policy {
+            SalvageGuardPolicy::Off => None,
+            SalvageGuardPolicy::LastGradientPointIfFresh => {
+                let fresh = self.prev_xs.as_ref().is_none_or(|p| {
+                    p.len() != xs.len() || p.iter().zip(xs).any(|(a, b)| a.to_bits() != b.to_bits())
+                });
+                if fresh {
+                    self.last_gradient.as_ref()
+                } else {
+                    None
+                }
+            }
+            SalvageGuardPolicy::BestEvaluation => self.best.as_ref(),
+        };
+        pair.map(|(f, c)| (*f, c.as_slice()))
+    }
+
+    /// Record an evaluation: `ofv` and `contribs` are its optimizer-facing objective and
+    /// per-subject `2·nllᵢ` (empty when the objective has no per-subject decomposition),
+    /// `gradient_requested` whether a gradient was actually formed there (the optimizer
+    /// asked for one and the EBE guard did not reject the point), and `improved` whether
+    /// the evaluation was adopted as the fit's incumbent (`adopt_warm_start`). A guarded
+    /// evaluation passes `false` for both and only advances the freshness record.
+    pub(crate) fn observe(
+        &mut self,
+        xs: &[f64],
+        ofv: f64,
+        contribs: Vec<f64>,
+        gradient_requested: bool,
+        improved: bool,
+    ) {
+        if gradient_requested {
+            self.last_gradient = Some((ofv, contribs.clone()));
+        }
+        if improved {
+            self.best = Some((ofv, contribs));
+        }
+        self.prev_xs = Some(xs.to_vec());
+    }
+}
+
 /// Excess of an objective over its incumbent value, **per observation**, above which the
 /// point counts as blown up (#1520). Applied to a subject (`2·nllᵢ` against its own
 /// incumbent contribution, over that subject's observations) and to the population (the
@@ -4621,15 +4772,13 @@ fn blown_up(excess: f64, n_obs: usize) -> bool {
 ///
 /// 1. **The population is blown up**: the optimizer-facing objective exceeds the
 ///    incumbent's by more than [`BLOWN_UP_EXCESS_PER_OBS`] per observation, over every
-///    observation in the population. Every gradient-based outer optimizer ferx runs rejects
-///    a point worse than its incumbent on sufficient decrease alone — SLSQP's L1-merit
-///    Armijo test, Luksan L-BFGS's Armijo/Goldstein test, MMA's `fcur < minf`, the built-in
-///    BFGS's backtracking — so nothing served at such a point can become an accepted
-///    iterate or a curvature pair. What it *can* still touch is one thing, on one
-///    optimizer: Luksan's `pnint1` reads the rejected trial's directional derivative when it
-///    interpolates the next step length, and the `pnint1` interpolant is dominated by the
-///    excess itself once that excess dwarfs the predicted decrease, so the gate is set
-///    where the point is already out of the regime in which any gradient is informative.
+///    observation in the population. This is a rejected-trial guarantee only when
+///    `incumbent` is the point the optimizer's own acceptance test compares against —
+///    which is what [`SalvageGuardPolicy`] supplies, per optimizer, and why NLopt L-BFGS
+///    gets no incumbent at all. With that reference, a point over this line fails the
+///    optimizer's sufficient-decrease test and is never an accepted iterate; the guard
+///    cannot touch a curvature pair or a search direction. The built-in BFGS passes its
+///    last accepted iterate, which its Armijo backtracking makes exact too.
 /// 2. **The subject is blown up**: its `2·nllᵢ` exceeds its incumbent contribution by more
 ///    than the same line per observation of its own. This keeps the salvage for a subject
 ///    that is merely along for the ride at a bad point, and it is what makes the guard
@@ -4671,12 +4820,11 @@ pub(crate) fn skip_fd_salvage(
 /// norm 60 … 180 while the fixed-EBE one has norm 1e3 … 1e4 (relative error 10 … 188): the
 /// profiled objective the outer loop minimises is far flatter there than the fixed-`η̂`
 /// one, because the re-solved EBEs absorb most of the blow-up. Zero is therefore the closer
-/// stand-in for what the salvage would have returned, and it is the one consumer that can
-/// tell — Luksan L-BFGS's step-length interpolation — that decides: on `warfarin_if` the
-/// zero substitute moved the search from 51 to 58 evaluations where the fixed-EBE one moved
-/// it to 68, and on `two_cpt_oral_cov` zero left the fit byte-identical where fixed-EBE
-/// changed its path (75 → 79). Every other consumer discards the gradient at such a point
-/// (see [`skip_fd_salvage`]), so for them the choice is moot and zero is also the cheapest.
+/// stand-in for what the salvage would have returned. Where the guard fires — SLSQP and
+/// MMA, see [`SalvageGuardPolicy`] — the optimizer discards the gradient at such a point
+/// anyway, so the choice is moot there and zero is also the cheapest; under Luksan L-BFGS,
+/// whose line search would have read it (measured: 51 → 58 evaluations on `warfarin_if`
+/// with the term dropped, 68 with the fixed-EBE stand-in), the guard is off.
 fn declined_subject_gradient(
     np: usize,
     population: &Population,

@@ -837,7 +837,7 @@ fn fresh_state() -> NloptState {
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
         stagnation_stopped: false,
-        incumbent: None,
+        salvage_guard: SalvageGuardState::new(SalvageGuardPolicy::Off),
     }
 }
 
@@ -5195,5 +5195,152 @@ mod outer_fd_fallback {
 
     fn bits(v: &[f64]) -> Vec<u64> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    // ── #1520 review: the per-optimizer reference ──────────────────────────────────
+
+    /// One scripted NLopt SLSQP evaluation sequence, exactly as `slsqp.c` drives ferx's
+    /// objective closure with bounds only, including the review's case — the eleventh
+    /// line-search trial accepted **without** sufficient decrease (`L200`: `line > 10`,
+    /// then `L240` requests `mode = −1` at that point). What the bookkeeping must return:
+    ///
+    /// | evaluation | `mode` | gradient | fresh | reference |
+    /// |---|---|---|---|---|
+    /// | `x0` | 0 → 1, then −1 at the same `x0` | yes, twice | yes / no | `None` (nothing yet) / `None` (not fresh) |
+    /// | first trial `x1`, blown up, rejected | −2 | yes | yes | **`x0`**, the iterate |
+    /// | trials `x2 … x11`, all rejected on `h1 <= h3/10` | 1 | no | — | `None` (no gradient) |
+    /// | `x11` again, accepted on `line > 10`, worse than `x0` | −1 | yes | **no** | **`None`** — the review's hole, closed |
+    /// | next line search's first trial `x12` | −2 | yes | yes | **`x11`**, the new iterate — not `x0`, which is the *best evaluation* |
+    ///
+    /// The last row is the one a "best evaluation" reference gets wrong, and the fourth
+    /// is the one a reference that ignores freshness gets wrong; each is asserted
+    /// against the value the other policy would have produced, so either mutation
+    /// reddens this on its own row.
+    #[test]
+    fn slsqp_reference_is_the_iterate_and_only_at_a_fresh_first_trial() {
+        let mut st = SalvageGuardState::new(SalvageGuardPolicy::LastGradientPointIfFresh);
+        let x0 = [1.0, 2.0];
+        let c0 = vec![40.0, 60.0];
+        // mode 0 → 1: first evaluation, gradient formed (`want_grad` starts at 1).
+        assert!(st.reference(&x0).is_none(), "nothing seen yet");
+        st.observe(&x0, 100.0, c0.clone(), true, true);
+        // mode −1 at the same x0: SLSQP re-requests f and g at the start point.
+        assert!(
+            st.reference(&x0).is_none(),
+            "same xs as the previous evaluation"
+        );
+        st.observe(&x0, 100.0, c0.clone(), true, false);
+        // mode −2: first trial, blown up, rejected. Reference must be the iterate x0.
+        let x1 = [1.5, 2.5];
+        let r = st
+            .reference(&x1)
+            .expect("fresh first trial gets a reference");
+        assert_eq!(r.0, 100.0);
+        assert_eq!(r.1, &c0[..]);
+        st.observe(&x1, 1.0e5, vec![5.0e4, 5.0e4], true, false);
+        // mode 1 ×10: objective-only backtracking trials — no gradient is formed, so the
+        // closure never asks for a reference there; they are only recorded.
+        let mut x = x1;
+        for k in 2..=11 {
+            x = [1.0 + 0.5 / k as f64, 2.0 + 0.5 / k as f64];
+            st.observe(&x, 100.0 + 30.0 / k as f64, vec![55.0, 45.0], false, false);
+        }
+        let x11 = x;
+        // mode −1 at x11: accepted on `line > 10` although worse than x0 (102.7 > 100),
+        // and also worse than the best evaluation. The gradient here feeds SLSQP's BFGS
+        // update — the guard must be off. A reference ignoring freshness would return
+        // x0's (100.0), and the population gate would then be live at an accepted point.
+        assert!(
+            st.reference(&x11).is_none(),
+            "a gradient request at the previous evaluation's xs is the accepted iterate"
+        );
+        st.observe(&x11, 100.0 + 30.0 / 11.0, vec![55.0, 45.0], true, false);
+        // mode −2 of the next line search: fresh, so a reference — and it must be x11,
+        // the iterate SLSQP's merit test compares against, not x0, the best evaluation.
+        let x12 = [3.0, 3.0];
+        let r = st.reference(&x12).expect("fresh first trial");
+        assert_eq!(
+            r.0,
+            100.0 + 30.0 / 11.0,
+            "the last gradient point, i.e. the iterate"
+        );
+        assert_ne!(r.0, 100.0, "not the best evaluation");
+        assert_eq!(r.1, &[55.0, 45.0][..]);
+    }
+
+    /// The other two policies on the same kind of sequence: MMA measures against the best
+    /// evaluation whether or not the point is fresh (its acceptance test is `fcur < minf`),
+    /// and L-BFGS never gets a reference. Both asserted on the row where they differ from
+    /// the SLSQP policy, so a `for_optimizer` mutation that swaps policies dies here.
+    #[test]
+    fn mma_measures_against_the_best_evaluation_and_lbfgs_never_fires() {
+        let mut mma = SalvageGuardState::new(SalvageGuardPolicy::BestEvaluation);
+        let mut lbfgs = SalvageGuardState::new(SalvageGuardPolicy::Off);
+        let x0 = [1.0];
+        for st in [&mut mma, &mut lbfgs] {
+            st.observe(&x0, 100.0, vec![100.0], true, true);
+            st.observe(&[1.5], 500.0, vec![500.0], true, false); // rejected, worse
+            st.observe(&[1.2], 90.0, vec![90.0], true, true); // accepted, new best
+            st.observe(&[1.4], 95.0, vec![95.0], true, false); // rejected but better than x0
+        }
+        // MMA: the best evaluation (90), at a fresh point and at a repeated one alike.
+        let r = mma
+            .reference(&[1.9])
+            .expect("MMA always has a reference once seen");
+        assert_eq!(
+            r.0, 90.0,
+            "best evaluation, not the last gradient point (95)"
+        );
+        let r = mma
+            .reference(&[1.4])
+            .expect("freshness is irrelevant to MMA");
+        assert_eq!(r.0, 90.0);
+        // L-BFGS: nothing, ever.
+        assert!(lbfgs.reference(&[1.9]).is_none());
+        assert!(lbfgs.reference(&[1.4]).is_none());
+    }
+
+    /// A guard-rejected evaluation (EBE guard, non-finite objective) forms no gradient
+    /// and is not adopted: it must neither become the last gradient point nor the best,
+    /// but it *is* the previous evaluation for the freshness test.
+    #[test]
+    fn a_guarded_evaluation_advances_freshness_only() {
+        let mut st = SalvageGuardState::new(SalvageGuardPolicy::LastGradientPointIfFresh);
+        st.observe(&[1.0], 100.0, vec![100.0], true, true);
+        st.observe(&[2.0], 1e12, Vec::new(), false, false); // guarded: sentinel, no gradient
+        let r = st.reference(&[3.0]).expect("fresh");
+        assert_eq!(
+            r.0, 100.0,
+            "the sentinel evaluation is not a gradient point"
+        );
+        assert!(
+            st.reference(&[2.0]).is_none(),
+            "but it was an evaluation, so its xs is not fresh"
+        );
+    }
+
+    /// `for_optimizer` maps each outer optimizer to the policy its acceptance test
+    /// justifies; everything not listed is `Off`.
+    #[test]
+    fn policy_per_optimizer() {
+        use SalvageGuardPolicy::*;
+        assert_eq!(
+            SalvageGuardPolicy::for_optimizer(Optimizer::Slsqp),
+            LastGradientPointIfFresh
+        );
+        assert_eq!(
+            SalvageGuardPolicy::for_optimizer(Optimizer::Mma),
+            BestEvaluation
+        );
+        for o in [
+            Optimizer::NloptLbfgs,
+            Optimizer::Bobyqa,
+            Optimizer::Auto,
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::TrustRegion,
+        ] {
+            assert_eq!(SalvageGuardPolicy::for_optimizer(o), Off, "{o:?}");
+        }
     }
 }
