@@ -124,15 +124,14 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
     }
 }
 
-/// Fast guard: a typo in `adaptive_vanco_iov.ferx` — which exercises the #701 IOV
-/// adaptive surface — fails here, by name, rather than as a mismatch in the
-/// cross-engine check below.
-/// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, so a
-/// successful parse plus these spot-checks pin the scenario the anchor relies on:
-/// exactly one κ (the IOV effect), the trough control law, and that `auc_target` is
-/// **absent** (it is a typed error for an IOV subject, #701). A short seeded run of
-/// the reactive driver then confirms it is `Ok` — the default frozen-replay verifier
-/// validating the realized run — before the cross-engine check runs.
+/// Fast guard: a typo in `adaptive_vanco_iov.ferx` — which exercises the #701 IOV adaptive
+/// surface — fails here, by name, rather than as a mismatch in the cross-engine check below.
+/// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, so a successful
+/// parse plus these spot-checks pin the scenario the anchor relies on: exactly one κ (the IOV
+/// effect), the trough control law, and that `auc_target` is **absent** (it is a typed error
+/// for an IOV subject, #701). A short seeded run of the reactive driver then confirms it is
+/// `Ok` — the default frozen-replay verifier validating the realized run — before the
+/// cross-engine check runs.
 #[test]
 fn vanco_iov_example_parses_and_runs_the_verifier() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))

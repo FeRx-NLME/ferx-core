@@ -56,9 +56,10 @@ const SIGNAL_TOL: f64 = 0.01;
 /// The pre-scheduled loading dose (mg), carried on the subject, not in the ledger.
 const LOADING_DOSE_MG: f64 = 1500.0;
 
-/// Fast guard: a typo in `adaptive_vanco_loading.ferx` or the loading-dose subject CSV
-/// fails here, by name, rather than as a mismatch in the cross-engine check below. `parse_full_model_file` runs the full
-/// `[adaptive_dosing]` `validate()`, and loading the CSV pins the base regimen.
+/// Fast guard: a typo in `adaptive_vanco_loading.ferx` or the loading-dose subject CSV fails
+/// here, by name, rather than as a mismatch in the cross-engine check below.
+/// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, and loading the CSV
+/// pins the base regimen.
 #[test]
 fn vanco_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_loading.ferx"))

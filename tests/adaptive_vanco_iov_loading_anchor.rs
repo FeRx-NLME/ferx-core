@@ -93,10 +93,10 @@ const SIGNAL_TOL: f64 = 2e-3;
 
 /// Fast guard: a typo in `adaptive_vanco_iov_loading.ferx` or its subject CSV — which exercise
 /// the #931 base-regimen × IOV surface — fails here, by name, rather than as a mismatch in the
-/// cross-engine check below. `parse_full_model_file`
-/// runs the full `[adaptive_dosing]` `validate()`, and loading the CSV pins the base regimen; a
-/// short seeded run then confirms the reactive driver is `Ok` (the default-on frozen-replay +
-/// #748 snapshot verifiers validating the realized run) before the cross-engine check runs.
+/// cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
+/// `validate()`, and loading the CSV pins the base regimen; a short seeded run then confirms
+/// the reactive driver is `Ok` (the default-on frozen-replay + #748 snapshot verifiers
+/// validating the realized run) before the cross-engine check runs.
 #[test]
 fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov_loading.ferx"))

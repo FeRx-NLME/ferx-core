@@ -106,11 +106,11 @@ const N_DOSE_DECREASES: usize = 3;
 const SIGNAL_TOL: f64 = 0.02;
 
 /// Fast guard: a typo in `adaptive_vanco_renal.ferx` — which exercises the #700
-/// time-varying-covariate adaptive surface — fails here, by name, rather than as a
-/// mismatch in the cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
-/// `validate()`, so a successful parse plus these spot-checks pin the scenario the
-/// anchor relies on. In particular it pins that `auc_target` is **absent** (it is
-/// a typed error for a time-varying-covariate subject, #700).
+/// time-varying-covariate adaptive surface — fails here, by name, rather than as a mismatch in
+/// the cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
+/// `validate()`, so a successful parse plus these spot-checks pin the scenario the anchor
+/// relies on. In particular it pins that `auc_target` is **absent** (it is a typed error for a
+/// time-varying-covariate subject, #700).
 #[test]
 fn vanco_renal_example_parses_and_pins_the_ladder() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal.ferx"))

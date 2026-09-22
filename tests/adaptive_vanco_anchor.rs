@@ -80,11 +80,11 @@ const SIGNAL_TOL: f64 = 0.02;
 const REF_AUC_IN_BAND: usize = 8;
 const REF_AUC_WINDOWS: usize = 13;
 
-/// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL
-/// surface, notably the `auc_target` key — fails here, by name, rather than as a
-/// mismatch in the cross-engine check below.
-/// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, so a
-/// successful parse plus these spot-checks pin the scenario the anchor relies on.
+/// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL surface,
+/// notably the `auc_target` key — fails here, by name, rather than as a mismatch in the
+/// cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
+/// `validate()`, so a successful parse plus these spot-checks pin the scenario the
+/// anchor relies on.
 #[test]
 fn vanco_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))

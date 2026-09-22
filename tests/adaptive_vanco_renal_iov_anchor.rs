@@ -164,11 +164,10 @@ fn print_coordination() {
     }
 }
 
-/// Fast guard: a typo in the composed example fails here, by name, rather than as a
-/// mismatch in the cross-engine check below. Parses the model (full `[adaptive_dosing]` validate), pins the
-/// scenario (one κ, the CRCL covariate referenced, trough control law, `auc_target`
-/// absent), and runs a short seeded reactive run through the default frozen-replay
-/// verifier.
+/// Fast guard: a typo in the composed example fails here, by name, rather than as a mismatch in
+/// the cross-engine check below. Parses the model (full `[adaptive_dosing]` validate), pins the
+/// scenario (one κ, the CRCL covariate referenced, trough control law, `auc_target` absent),
+/// and runs a short seeded reactive run through the default frozen-replay verifier.
 #[test]
 fn vanco_renal_iov_example_parses_and_runs_the_verifier() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_iov.ferx"))
