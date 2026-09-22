@@ -19,6 +19,29 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **The covariance step no longer abandons the exact analytic R-matrix for the whole
+  population when one subject is out of scope.** The observed information is the sum
+  `Σᵢ Rᵢ`, and each term is the second derivative of one subject's own marginal, so a
+  subject outside the analytic scope is now finite-differenced **on its own** — from the
+  same objective, at the same converged point, warm-started from the same modes — while
+  every other subject keeps its exact term. On a 55-subject 2-state ODE FOCEI fit with 13
+  free parameters where one subject declined, the covariance step went from 23.4 s to
+  2.0 s (**11.5×**, −38 % total wall) with estimates and OFV identical to every printed
+  digit. Standard errors move 8.4e-5 relative when one subject in ten is salvaged — 3.2×
+  below the gap between the whole-population FD and whole-population analytic routes that
+  ferx already ships as interchangeable. Model-level exclusions (`method = laplace`, a
+  mixture, `gradient = fd`, `analytic_cov_hessian = false`) are unchanged, and a
+  population where at least half the subjects decline still takes the whole-population
+  stencil ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
+### Changed
+- **New informational warning `W_COV_ANALYTIC_SALVAGE`,** emitted when the covariance step
+  assembled the analytic R-matrix for most of the population and finite-differenced the
+  rest. It names the salvaged subject ids (deduplicated, capped at ten with a count of the
+  remainder) and the split. `severity = info`, `code = covariance_step`; the estimates and
+  the covariance are unaffected ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
 ### Fixed
 - **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
   As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)

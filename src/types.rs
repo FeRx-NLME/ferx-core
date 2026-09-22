@@ -6460,6 +6460,18 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // claim on substrings like "shrinkage" (`eta_shrinkage`, whose category drives
         // a different user action entirely) and "converge".
         (WarningSeverity::Warning, WarningCode::EbeStartDependent)
+    } else if lower.contains("w_cov_analytic_salvage") {
+        // #1514: the covariance step assembled the exact analytic R-matrix for most of the
+        // population and finite-differenced the terms of the subjects outside its scope.
+        // Informational — the matrix is complete and the estimates are unchanged — so it
+        // shares `CovarianceStep` with the other cost/route notes rather than claiming
+        // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
+        //
+        // Matched on its own `W_` token and placed with the other token arms, ahead of every
+        // prose one: the message says "covariance step" and names a subject count, which the
+        // `covariance step:` + `parameters` arm far below would otherwise claim only by
+        // accident of wording.
+        (WarningSeverity::Info, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
