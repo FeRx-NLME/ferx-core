@@ -111,10 +111,14 @@
 //!
 //! Tier 2: ODE evaluations over eight subjects at fixed parameters (`maxiter = 0`), not
 //! a convergence loop. D, B and C run on every PR (#1132; ~2 s locally under `ci-cov`).
-//! A stays nightly: it alone is 10 s locally and ~60 s in the instrumented CI job, and
-//! it is the degenerate single-dose case — reintroducing #1060 (post-arrival side read
-//! from the dose row) also reddens D, by 5.07 OFV against the 0.5 tolerance, and 17
-//! `sens::` unit tests, so the per-PR set still sees the defect it was written for.
+//! A stays nightly: it alone is 10 s locally and ~35 s in the instrumented CI job (the
+//! four-test binary measured 61.2 s with A and 26.2 s without it, PR #1518). It is the
+//! degenerate single-dose case, and D subsumes its geometry: D's FIRST dose is A's
+//! record for record — dose row `t = 0`, `WT = 70`, next record `WT = 140` — so the
+//! crossing A isolates is inside D, whose later doses add the residual-drug side A
+//! cannot have. Measured with it: reintroducing #1060 (post-arrival side read from the
+//! dose row) reddens D by 5.07 OFV against the 0.5 tolerance, plus 17 `sens::` unit
+//! tests, so the per-PR set still sees the defect A was written for.
 
 use std::path::PathBuf;
 
@@ -153,7 +157,7 @@ const NM_OBJV_MULTIDOSE: f64 = -459.772_591_872_574_08;
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "~60 s in the instrumented CI job; #1060 is also caught per-PR by the multi-dose control (#1132): opt in with --features slow-tests"
+    ignore = "~35 s in the instrumented CI job; D contains this geometry as its first dose and #1060 reddens D too (#1132): opt in with --features slow-tests"
 )]
 fn ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change() {
     let ofv = ferx_ofv("tvcov_lag_saltation.csv");

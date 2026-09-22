@@ -96,7 +96,7 @@ const SIGNAL_TOL: f64 = 2e-3;
 /// cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
 /// `validate()`, and loading the CSV pins the base regimen; a short seeded run then confirms
 /// the reactive driver is `Ok` (the default-on frozen-replay + #748 snapshot verifiers
-/// validating the realized run) before the cross-engine check runs.
+/// validating the realized run).
 #[test]
 fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov_loading.ferx"))

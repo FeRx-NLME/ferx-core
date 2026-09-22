@@ -33,8 +33,10 @@ fn tests_dir() -> PathBuf {
 /// The NONMEM anchor **tests** that evaluate at fixed parameters and run on every PR,
 /// by `(binary, fn)`. Measured 2026-09-22 (#1132, PR #1518): each test alone, locally
 /// under `--no-default-features --features ci --profile ci-cov`; and the binary in the
-/// llvm-instrumented `Tests + coverage (core)` job, which is 6–22x the local time and
-/// is what costs PR time.
+/// `Tests + coverage (core)` job, which is what costs PR time. The two differ by 6–22x
+/// on these binaries (runner cores, thread oversubscription and llvm-cov instrumentation
+/// all differ, and the ratio was not attributed to any one of them; the adaptive row is
+/// 0.8x, i.e. faster in CI), so a local number cannot stand in for the CI one.
 ///
 /// | binary | local, per test | why it is one evaluation |
 /// |---|---|---|
@@ -42,9 +44,11 @@ fn tests_dir() -> PathBuf {
 /// | `tvcov_lag_saltation_nonmem_anchor` | 1.22 s, 0.91 s, 0.1 s | `maxiter = 0` in the `.ferx` |
 ///
 /// Kept nightly on purpose, each with the measurement behind it: `tvcov_lag_saltation`'s
-/// single-dose A (10.04 s alone, 61 s in CI; reintroducing #1060 also reddens the control
-/// D and 17 `sens::` unit tests), and `ss_lagtime_edge`'s two objective anchors (45 s in
-/// CI; its nine pointwise PRED anchors run per-PR on the same convention). Add a test
+/// single-dose A (10.04 s alone, ~35 s in CI — the binary measured 61.2 s with it and
+/// 26.2 s without; reintroducing #1060 also reddens the control D and 17 `sens::` unit
+/// tests), and `ss_lagtime_edge`'s two objective anchors (45 s in CI; the `lag >= II`
+/// dual-walk defect they caught is now pinned per-PR by
+/// `ode_provider_ss_lagtime_at_or_past_the_interval_matches_production`). Add a test
 /// here only with its measured CI time. A NONMEM anchor that runs real fits
 /// (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
 const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 5] = [
@@ -192,11 +196,21 @@ fn cheap_nonmem_anchor_tests_are_not_ignored() {
              PER_PR_NONMEM_ANCHOR_TESTS with a fresh CI measurement (#1132)"
         );
         let attrs = &blocks[0].1;
+        // Three ways to take a test out of the per-PR run, not one. `ignore` covers the
+        // `#[ignore]` and `cfg_attr(…, ignore = …)` spellings; `cfg` covers
+        // `#[cfg(feature = "slow-tests")]`, which compiles the function away entirely and
+        // is invisible to an "is it ignored" check — the binary simply reports one test
+        // fewer (PR #1518 review, finding 2). That spelling is in use in this repo
+        // (`src/nn/mod.rs`, and `tests/preflight_owns_the_fast_gates.rs` names it), so it
+        // is a live way to undo #1132 by habit rather than a hypothetical.
         assert!(
-            attrs.contains("#[test]") && !attrs.contains("ignore"),
+            attrs.contains("#[test]")
+                && !attrs.contains("ignore")
+                && !attrs.contains("cfg")
+                && !attrs.contains("slow-tests"),
             "{path:?}: `{test}` evaluates at fixed parameters and runs on every PR (#1132; \
-             measured time in PER_PR_NONMEM_ANCHOR_TESTS), but it is not an un-ignored \
-             `#[test]` (attributes: {attrs:?})"
+             measured time in PER_PR_NONMEM_ANCHOR_TESTS), but it is not a plain, \
+             un-ignored, unconditional `#[test]` (attributes: {attrs:?})"
         );
     }
 }
@@ -221,4 +235,11 @@ fn detectors_see_the_gate_shapes_they_exist_to_catch() {
     let clean = "}\n\n/// doc\n#[test]\nfn z_matches_mrgsolve() {}\n";
     let blocks = attribute_blocks_of(clean, "_matches_mrgsolve");
     assert_eq!(blocks[0].1, "#[test]");
+
+    // The compile-out spelling: no `ignore` anywhere, so only the `cfg` / `slow-tests`
+    // halves of T2's predicate reject it (PR #1518 review, finding 2).
+    let compiled_out = "#[cfg(feature = \"slow-tests\")]\n#[test]\nfn w_matches_nonmem() {}\n";
+    let attrs = &attribute_blocks_of(compiled_out, "w_matches_nonmem")[0].1;
+    assert!(!attrs.contains("ignore"), "the hole this case exists for");
+    assert!(attrs.contains("cfg") && attrs.contains("slow-tests"));
 }
