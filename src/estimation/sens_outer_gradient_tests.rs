@@ -6528,6 +6528,50 @@ const HINNER_INDEFINITE_ETA: [f64; 3] = [0.9, 0.0, 1.2];
 /// The same subject at an eta where `h_inner` is **PD**, for the fast-path twin.
 const HINNER_PD_ETA: [f64; 3] = [0.1, -0.05, 0.15];
 
+/// `max|λ| / min|λ|` over every eigenvalue — the **spectral** condition number of a
+/// symmetric matrix.
+///
+/// Extracted and separately tested because the obvious spelling is wrong on exactly the
+/// spectra this is used to screen: a ratio of the *algebraic* extremes
+/// (`max(λ)/|min(λ)|`) agrees with this one whenever the largest-magnitude eigenvalue is
+/// also the algebraic extreme, which is the well-conditioned case, and diverges without
+/// bound on a spectrum straddling zero — the near-singular case. See
+/// [`spectral_condition_is_not_the_algebraic_extreme_ratio`].
+fn spectral_condition(ev: &[f64]) -> f64 {
+    let abs_max = ev.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    let abs_min = ev.iter().fold(f64::INFINITY, |a, v| a.min(v.abs()));
+    abs_max / abs_min
+}
+
+/// The regression [`spectral_condition`] exists to prevent, on the spectrum that exposes
+/// it. `[-10, -1e-12, 1]` is near-singular: `max|λ|/min|λ| = 1e13`. The algebraic-extreme
+/// ratio reports `10` — well inside any sane bound — so a conditioning guard written that
+/// way passes on precisely the fixture it is supposed to reject.
+#[test]
+fn spectral_condition_is_not_the_algebraic_extreme_ratio() {
+    let ev = [-10.0f64, -1e-12, 1.0];
+    approx::assert_relative_eq!(spectral_condition(&ev), 1e13, max_relative = 1e-12);
+
+    let algebraic_max = ev.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let algebraic_min = ev.iter().cloned().fold(f64::INFINITY, f64::min);
+    let wrong =
+        (algebraic_max.abs() / algebraic_min.abs()).max(algebraic_min.abs() / algebraic_max.abs());
+    approx::assert_relative_eq!(wrong, 10.0, max_relative = 1e-12);
+    assert!(
+        wrong < 1e6 && spectral_condition(&ev) > 1e6,
+        "the two spellings must straddle a 1e6 guard, or this test pins nothing"
+    );
+
+    // Where the largest-magnitude eigenvalue *is* the algebraic extreme the two agree —
+    // which is why the bug survived review on the real fixture.
+    let benign = [199.77f64, 87.05, -0.1495];
+    approx::assert_relative_eq!(
+        spectral_condition(&benign),
+        199.77 / 0.1495,
+        max_relative = 1e-12
+    );
+}
+
 /// The gate this change moves, asserted as a straddle rather than assumed: the two
 /// fixture etas must land on **opposite** sides of `h_inner.cholesky()`. Without this,
 /// the pair below silently degenerates to two copies of the same case — the
@@ -6540,12 +6584,11 @@ fn hinner_fixture_etas_straddle_the_cholesky_gate() {
 
     let indef = hinner_at(&model, &params, &subject, &HINNER_INDEFINITE_ETA);
     let ev = indef.clone().symmetric_eigenvalues();
-    let min_ev = ev.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_ev = ev.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     assert!(
         ev.iter().all(|v| v.is_finite()),
         "eigenvalues must be finite before they are compared: {ev:?}"
     );
+    let min_ev = ev.iter().cloned().fold(f64::INFINITY, f64::min);
     assert!(
         min_ev < 0.0,
         "the indefinite fixture must have a negative eigenvalue, got min {min_ev:.6e}"
@@ -6554,10 +6597,14 @@ fn hinner_fixture_etas_straddle_the_cholesky_gate() {
         indef.clone().cholesky().is_none(),
         "an indefinite h_inner must fail the Cholesky — that is the gate under test"
     );
-    // Nonsingular and well-conditioned: the LU fallback is being asked for an ordinary
-    // inverse, not to paper over a rank deficiency. Measured 1.336e3; 1e6 is three decades
-    // of headroom against fixture drift, and still fails if the matrix goes near-singular.
-    let cond = (max_ev.abs() / min_ev.abs()).max(min_ev.abs() / max_ev.abs());
+    // Well-conditioned, so the fixture exercises the gate on an ordinary matrix rather
+    // than on a rank deficiency. This is the **spectral** condition number
+    // `max|λ| / min|λ|` over every eigenvalue, not a ratio of the algebraic extremes: on
+    // a spectrum straddling zero the two differ without bound (`[-10, -1e-12, 1]` gives
+    // 10 against a true 1e13), so the algebraic form would pass on exactly the
+    // near-singular fixture this assertion exists to exclude. Measured 1.336e3; 1e6 is
+    // three decades of headroom against fixture drift.
+    let cond = spectral_condition(ev.as_slice());
     assert!(
         cond < 1e6,
         "indefinite fixture must stay well-conditioned, got condition number {cond:.3e}"
@@ -6570,117 +6617,132 @@ fn hinner_fixture_etas_straddle_the_cholesky_gate() {
     );
 }
 
-/// The regression #1513 exists to catch: `prepare_stacked` used to return `None` for
-/// **every** indefinite `h_inner`, sending the subject to `subject_reconverged_fd_gradient`
-/// (`2·n_free` warm EBE re-solves — measured 0.786 s against 0.0054 s for an entire
-/// 55-subject analytic population gradient). `−H⁻¹M` needs `H` nonsingular; the Cholesky
-/// tested a strictly stronger property.
+/// The gate itself, pinned so that widening it is a deliberate act with a red test rather
+/// than a one-line edit that looks like tidying: an **indefinite** `h_inner` must make
+/// `prepare` decline, sending the subject to `subject_reconverged_fd_gradient`.
 ///
-/// The assertion is `H⁻¹H = I`, which is a closed form, not a tolerance against a second
-/// engine — and it is what kills each rejected variant as well as the no-fallback
-/// mutation: `abseig`, `clip` and `htilde` all substitute a *different* matrix for `H`, so
-/// none of them reproduces the identity.
+/// This reads like a gate one degree too strict — `−H⁻¹M` needs `H` nonsingular, and this
+/// fixture's `H` *is* nonsingular (`det = −2.60e3`, spectral condition number 1.3e3). #1513
+/// proposed exactly that widening, via a full-pivot LU fallback. The reason it is wrong is
+/// that at an unconstrained local minimum a nonsingular Hessian must be PD, so a failed
+/// Cholesky here is a **proof that `eta_hat` is not the minimizing EBE** the assembly's
+/// contract requires — and `−H⁻¹M` differentiates the stationarity condition
+/// `∂l/∂η|η̂ = 0`, which therefore does not hold. Measured on the 16 decline events of a
+/// full `one_cpt_transit` fit, an LU here disagreed with the reconverged-FD gradient by a
+/// median relative 0.378 against a 1.4e-3 noise floor on the same fit's PD subjects, with
+/// the direction near-orthogonal (cosine 0.032) at the worst event. See
+/// [`invert_inner_hessian`] for the full table.
+///
+/// So the assertion is `is_none()`, and the thing it protects is a *precondition*, not a
+/// matrix shape.
 #[test]
-fn hinner_indefinite_is_inverted_exactly() {
+fn indefinite_hinner_declines_to_the_fd_salvage() {
     let (model, params, subject) = hinner_fixture();
     let eta = HINNER_INDEFINITE_ETA;
     let h = hinner_at(&model, &params, &subject, &eta);
 
+    // The fixture is nonsingular — so this test cannot be satisfied by a "singular matrix
+    // declines" reading, which is the whole distinction #1513 turned on.
+    let det = h.clone().determinant();
+    assert!(
+        det.is_finite() && det.abs() > 1.0,
+        "the fixture must be comfortably nonsingular, got det = {det:.4e}"
+    );
+    assert!(
+        h.clone().cholesky().is_none(),
+        "the fixture must be indefinite, or this test pins nothing"
+    );
+
     let sens = crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta)
         .expect("warfarin is in analytic scope");
-    let prep = prepare(&model, &subject, &params, &sens, &eta)
-        .expect("an indefinite-but-nonsingular h_inner must not decline the subject (#1513)");
-
-    let resid = &prep.h_inner_inv * &h - DMatrix::<f64>::identity(model.n_eta, model.n_eta);
-    let worst = resid.iter().fold(0.0f64, |acc, v| {
-        assert!(v.is_finite(), "H⁻¹H must be finite, got {v}");
-        acc.max(v.abs())
-    });
-    // Measured worst |(H⁻¹H − I)| = 1.78e-15 on this fixture (n_eta = 3, condition number
-    // 1.3e3). 1e-10 is that with five decades of headroom; a substituted matrix — the
-    // rejected `abseig`/`clip`/`htilde` variants — misses by O(1) along the flipped
-    // eigenvector, so the bound discriminates by 10 orders of magnitude, not by tuning.
     assert!(
-        worst < 1e-10,
-        "the LU fallback must invert h_inner exactly; worst |H⁻¹H − I| = {worst:.3e}"
+        prepare(&model, &subject, &params, &sens, &eta).is_none(),
+        "an indefinite h_inner proves eta_hat is not the EBE, so the analytic outer \
+         gradient must decline rather than differentiate a broken stationarity condition \
+         (#1513)"
     );
 }
 
-/// The fast path is unchanged, **bit for bit**. A model whose subjects are all PD at their
-/// EBEs — which is the common case, and the reason the cyclophosphamide/clofarabine
-/// measurements in #1513 show one model moving and the other byte-identical — must produce
-/// the same `h_inner_inv` as before the fallback existed. Inverting unconditionally by LU
-/// would pass every tolerance-based check in this file and redden only this one.
+/// The other side of the same gate: a PD `h_inner` is served, and served through the
+/// Cholesky. Without this, [`indefinite_hinner_declines_to_the_fd_salvage`] is satisfied by
+/// an assembly that declines *everything*.
 #[test]
-fn hinner_pd_fast_path_is_bit_identical() {
+fn pd_hinner_is_served_through_the_cholesky() {
     let (model, params, subject) = hinner_fixture();
-    let h = hinner_at(&model, &params, &subject, &HINNER_PD_ETA);
+    let eta = HINNER_PD_ETA;
+    let h = hinner_at(&model, &params, &subject, &eta);
     let reference = h
         .clone()
         .cholesky()
         .expect("the PD fixture passes the Cholesky")
         .inverse();
 
-    let actual = invert_inner_hessian(&h).expect("a PD h_inner is invertible");
-    for (a, r) in actual.iter().zip(reference.iter()) {
+    let sens = crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta)
+        .expect("warfarin is in analytic scope");
+    let prep = prepare(&model, &subject, &params, &sens, &eta)
+        .expect("a PD h_inner must be served analytically");
+
+    for (a, r) in prep.h_inner_inv.iter().zip(reference.iter()) {
+        assert!(a.is_finite(), "H⁻¹ must be finite, got {a}");
         assert_eq!(
             a.to_bits(),
             r.to_bits(),
-            "the PD fast path must stay bit-identical to the plain Cholesky inverse"
+            "the served inverse must be the plain Cholesky inverse, bit for bit"
         );
     }
 }
 
-/// The fallback inverts against arithmetic, not against itself: a hand-written indefinite
-/// matrix with a closed-form inverse. `H = [[1, 2], [2, 1]]` has eigenvalues `3` and `−1`
-/// (so no Cholesky) and `det = −3`, giving `H⁻¹ = [[−1, 2], [2, −1]]/3` exactly.
-#[test]
-fn invert_inner_hessian_matches_the_closed_form_on_an_indefinite_matrix() {
-    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
-    assert!(
-        h.clone().cholesky().is_none(),
-        "this fixture must fail the Cholesky, or it exercises the fast path instead"
-    );
-    let inv = invert_inner_hessian(&h).expect("det = −3 ≠ 0, so H is invertible");
-    let third = 1.0 / 3.0;
-    let expected = DMatrix::from_row_slice(2, 2, &[-third, 2.0 * third, 2.0 * third, -third]);
-    for (a, e) in inv.iter().zip(expected.iter()) {
-        assert!(a.is_finite(), "the LU inverse must be finite, got {a}");
-        approx::assert_relative_eq!(a, e, max_relative = 1e-14);
-    }
-}
-
-/// A **singular** `H` still declines. The LU fallback widens the gate from
-/// positive-definite to nonsingular and no further — `−H⁻¹M` does not exist here, so the
-/// subject must keep routing to the FD salvage rather than being handed an inverse that
-/// does not exist.
+/// A **singular** `h_inner` declines too. Distinct from
+/// [`indefinite_hinner_declines_to_the_fd_salvage`] in what it rules out: an implementation
+/// that widened the gate to "nonsingular" would still decline this one, so without it the
+/// pair could not tell a correct gate from that widening.
 #[test]
 fn invert_inner_hessian_declines_a_singular_matrix() {
-    // Rank 1: row 2 = 2·row 1. Symmetric, det = 0, and not PD either — so a Cholesky-only
-    // gate and a nonsingularity gate agree on this one, which is the point.
+    // Rank 1: row 2 = 2·row 1. Symmetric, det = 0.
     let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 4.0]);
-    assert!(h.clone().cholesky().is_none(), "singular is not PD");
+    assert_eq!(h.clone().determinant(), 0.0, "the fixture must be singular");
     assert!(
-        invert_inner_hessian(&h).is_none(),
-        "a singular h_inner must still decline to the FD salvage"
+        invert_inner_hessian(h.clone()).is_none(),
+        "a singular h_inner must decline"
     );
 }
 
-/// The same widening, reached through the production `prepare` entry point on the bundled
-/// `examples/warfarin.ferx` + `data/warfarin.csv` rather than on a hand-placed eta — the
-/// population-level twin of [`hinner_indefinite_is_inverted_exactly`].
+/// `invert_inner_hessian` declines an indefinite matrix **although it is invertible** —
+/// the property asserted directly on the helper, on arithmetic rather than on a fixture.
+/// `[[1, 2], [2, 1]]` has eigenvalues `3` and `−1` and `det = −3`; `H⁻¹ = [[−1, 2],
+/// [2, −1]]/3` exists and is perfectly well-conditioned, and the helper must still say no.
 ///
-/// `outer_optimizer`'s `outer_fd_fallback_warning` records this exact configuration:
-/// subjects 2, 4, 7 and 10 fail `h_inner.cholesky()` at `η = 0` (they are PD at their
-/// EBEs), and before #1513 each of the four declined the analytic assembly there and cost a
-/// `subject_reconverged_fd_gradient`. All four are indefinite, none is singular, so all
-/// four must now be served.
-///
-/// The straddle is asserted, not assumed: the test fails if no subject fails the Cholesky
-/// (the fixture would then be exercising the fast path and could not observe the change) as
-/// well as if any subject still declines.
+/// This is the mutation target for the #1513 proposal in its smallest form: a one-line LU
+/// fallback reddens exactly this test and
+/// [`indefinite_hinner_declines_to_the_fd_salvage`], and nothing else in the suite.
 #[test]
-fn warfarin_zero_eta_non_pd_subjects_are_served_analytically() {
+fn invert_inner_hessian_declines_an_invertible_indefinite_matrix() {
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    let det = h.clone().determinant();
+    approx::assert_relative_eq!(det, -3.0, max_relative = 1e-14);
+    assert!(
+        h.clone().full_piv_lu().try_inverse().is_some(),
+        "the fixture must be invertible, or 'declines although invertible' is vacuous"
+    );
+    assert!(
+        invert_inner_hessian(h.clone()).is_none(),
+        "positive-definiteness is the gate, not invertibility (#1513)"
+    );
+}
+
+/// The population-level statement of the same thing, on the bundled
+/// `examples/warfarin.ferx` + `data/warfarin.csv`: subjects 2, 4, 7 and 10 have an
+/// indefinite `h_inner` at `η = 0` while all 10 are PD at their EBEs. This is the
+/// configuration `outer_optimizer`'s `outer_fd_fallback_warning` cites for why a decline is
+/// *recorded* as the fit runs rather than *probed* at a chosen parameter point — a zero-η
+/// probe would announce four fallbacks that a fit serving these subjects at their EBEs
+/// never takes.
+///
+/// It also measures the premise of #1513's rejection at population scale: the assembly's
+/// declines away from the mode are common, and they are common precisely because `η = 0` is
+/// not the EBE.
+#[test]
+fn warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not() {
     let src = std::fs::read_to_string("examples/warfarin.ferx").expect("bundled example");
     let model = parse_model_string(&src).expect("parse");
     let pop = crate::io::datareader::read_nonmem_csv(
@@ -6690,12 +6752,12 @@ fn warfarin_zero_eta_non_pd_subjects_are_served_analytically() {
     )
     .expect("bundled dataset");
     let params = model.default_params.clone();
-    let eta = vec![0.0; model.n_eta];
+    let zero = vec![0.0; model.n_eta];
 
     let mut non_pd = Vec::new();
     let mut declined = Vec::new();
     for s in &pop.subjects {
-        let sens = crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &eta)
+        let sens = crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &zero)
             .expect("warfarin is in analytic scope for every subject");
         let h = score_core(
             &model,
@@ -6704,19 +6766,18 @@ fn warfarin_zero_eta_non_pd_subjects_are_served_analytically() {
             &sens,
             model.n_eta,
             &params.omega.inv,
-            &eta,
+            &zero,
             model.residual_error_eta,
         )
         .expect("score_core serves every warfarin subject")
         .h_inner;
+        let ev = h.clone().symmetric_eigenvalues();
+        assert!(
+            ev.iter().all(|v| v.is_finite()),
+            "subject {} has a non-finite h_inner eigenvalue: {ev:?}",
+            s.id
+        );
         if h.clone().cholesky().is_none() {
-            let ev = h.symmetric_eigenvalues();
-            assert!(
-                ev.iter().all(|v| v.is_finite()),
-                "subject {} has a non-finite h_inner eigenvalue: {ev:?}",
-                s.id
-            );
-            // Indefinite, not singular — the distinction the whole change rests on.
             assert!(
                 ev.iter().cloned().fold(f64::INFINITY, f64::min) < 0.0,
                 "subject {}: a failed Cholesky here must mean a negative eigenvalue",
@@ -6724,7 +6785,7 @@ fn warfarin_zero_eta_non_pd_subjects_are_served_analytically() {
             );
             non_pd.push(s.id.clone());
         }
-        if prepare(&model, s, &params, &sens, &eta).is_none() {
+        if prepare(&model, s, &params, &sens, &zero).is_none() {
             declined.push(s.id.clone());
         }
     }
@@ -6732,11 +6793,26 @@ fn warfarin_zero_eta_non_pd_subjects_are_served_analytically() {
     assert_eq!(
         non_pd,
         ["2", "4", "7", "10"],
-        "the fixture must still reach a non-PD h_inner, or it cannot observe #1513"
+        "the fixture must still reach a non-PD h_inner at η = 0, or it pins nothing"
     );
-    assert!(
-        declined.is_empty(),
-        "an indefinite h_inner must no longer decline the analytic outer gradient (#1513); \
-         declined: {declined:?}"
+    assert_eq!(
+        declined, non_pd,
+        "every non-PD subject declines, and only those — the gate is the Cholesky and \
+         nothing else"
     );
+
+    // The other half of the claim, and the reason the gate is not merely conservative:
+    // at their **EBEs** all 10 are PD and analytic. If this half failed, declining at
+    // η = 0 would be costing the fit its analytic gradient everywhere, not just off-mode.
+    for s in &pop.subjects {
+        let eh = find_ebe(&model, s, &params, 200, 1e-10, None, None, 0);
+        let eta = eh.eta.as_slice();
+        let sens = crate::sens::provider::subject_sensitivities(&model, s, &params.theta, eta)
+            .expect("in scope at the EBE too");
+        assert!(
+            prepare(&model, s, &params, &sens, eta).is_some(),
+            "subject {} must be served analytically at its EBE",
+            s.id
+        );
+    }
 }

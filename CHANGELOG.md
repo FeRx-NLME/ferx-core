@@ -38,24 +38,6 @@ section of the SDLC for the versioning policy).
   opt-in: it still converges more slowly than `bobyqa` on a no-ETA θ that starts far
   from its optimum.
 
-### Performance
-- **FOCE/FOCEI: a subject whose exact inner Hessian is merely *indefinite* no longer drops
-  to a finite-difference outer gradient.** The analytic outer assembly inverts `H` for
-  `dη̂/dζ = −H⁻¹M`, which needs `H` nonsingular; it was testing the strictly stronger
-  positive-definiteness by inverting through a Cholesky, so every indefinite `H` declined
-  the subject and cost a reconverged finite-difference salvage (`2·n_free` warm EBE
-  re-solves for that one subject). `H` carries the residual × prediction-curvature term
-  the Gauss-Newton `H̃` drops, so indefiniteness away from the EBE is routine — 4 of the
-  10 subjects on the bundled warfarin example are indefinite at `η = 0`. The Cholesky
-  stays the fast path, and an indefinite `H` now falls back to a full-pivot LU; a
-  genuinely singular `H` still declines to finite differences. On `examples/one_cpt_transit.ferx`
-  (100 subjects) the fit reported 16 declines and ran 197.9 s, and now reports none and
-  runs 176.7 s at the same optimum (ΔOFV 2.1e-5); on a 55-subject parent→metabolite ODE
-  model with 21 declines the fit went 29.6 s → 7.1 s and its covariance step 21.1 s →
-  0.16 s, within 0.03 OFV. A model with no declines is byte-identical, because the
-  fallback is only reachable after the Cholesky fails
-  ([#1513](https://github.com/FeRx-NLME/ferx-core/issues/1513)).
-
 ### Added
 - **SAEM: `scale_deadband = <lo>,<hi>` makes the Robbins–Monro step-scale rule conditional
   on being off target.** Under `scale_adaptation = robbins_monro` the step fires only

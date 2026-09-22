@@ -387,8 +387,8 @@ pub(crate) struct Prep {
     /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
     pub(crate) htilde_inv: DMatrix<f64>,
     /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
-    /// Cholesky when `H` is PD, full-pivot LU when it is only nonsingular — see
-    /// [`invert_inner_hessian`].
+    /// Built by `invert_inner_hessian`, whose Cholesky is a **precondition** gate and
+    /// not merely a matrix-shape one — see there before widening it.
     pub(crate) h_inner_inv: DMatrix<f64>,
     /// `wⱼ = H̃⁻¹aⱼ`.
     pub(crate) w: Vec<DVector<f64>>,
@@ -1125,44 +1125,59 @@ pub(crate) fn score_core(
 }
 
 /// Invert the exact inner Hessian `H` for the implicit-function derivative
-/// `dη̂/dζ = −H⁻¹M` (#1513).
+/// `dη̂/dζ = −H⁻¹M` — **by Cholesky, deliberately** (#1513).
 ///
-/// Cholesky first. It is the cheaper factorization, it is the one every well-behaved
-/// subject takes, and taking it unchanged is what keeps a model with no declines
-/// bit-identical to the pre-fallback engine.
+/// A Cholesky tests positive-definiteness, and `−H⁻¹M` needs only nonsingularity, so this
+/// reads like a gate that is one degree too strict. It is not, and the gap is load-bearing:
+/// at an unconstrained local minimum a nonsingular Hessian *must* be PD, so a failed
+/// Cholesky on a nonsingular `H` is a proof that the `eta_hat` handed to this assembly is
+/// **not the minimizing EBE** the `subject_*_gradient` contract requires. `H` carries the
+/// `∂L/∂f · ∂²f/∂η²` curvature term that the Gauss-Newton `H̃` drops, which is exactly why
+/// it — and not `H̃` — can notice.
 ///
-/// When it fails, `H` is **indefinite**, which is not the same as singular. `−H⁻¹M` is the
-/// derivative of the inner stationarity condition `∂l/∂η|η̂ = 0`; it needs `H` nonsingular,
-/// nothing more. The Cholesky was testing a strictly stronger property than the formula
-/// requires, and `H` carries the `∂L/∂f · ∂²f/∂η²` curvature term that the Gauss-Newton `H̃`
-/// drops, so indefiniteness at a sparse subject is routine rather than pathological. Each
-/// spurious decline cost one `subject_reconverged_fd_gradient` — `2·n_free` warm EBE
-/// re-solves for a single subject, measured at 0.786 s against 0.0054 s for an entire
-/// 55-subject analytic population gradient (#1513's cyclophosphamide profile, where 21 of
-/// 55 subjects declined and the fit ran 29.6 s → 7.1 s). Reproducible on a bundled model:
-/// `examples/one_cpt_transit.ferx` + `data/datsim_oral.csv` reported "16 of 100 subjects
-/// fell outside the analytic sensitivity provider's scope" and took 82 iterations / 197.9 s;
-/// with the fallback it declines none, takes 70 iterations / 176.7 s, and lands at
-/// OFV 1215.977131 against 1215.977110 (ΔOFV 2.1e-5).
+/// The identity `dη̂/dζ = −H⁻¹M` differentiates the inner stationarity condition
+/// `∂l/∂η|η̂ = 0`. Where that condition does not hold the formula is inverting a real
+/// matrix and returning a derivative of nothing: it follows a saddle or non-stationary
+/// branch rather than the profiled minimum the outer objective is defined by. So the
+/// Cholesky is not a matrix-shape check that happens to be conservative — it is the
+/// precondition detector, and it is the only one in this path.
 ///
-/// So fall back to a full-pivot LU, which inverts exactly wherever the identity holds:
-/// nothing is approximated, nothing is substituted for `H`, and there is no second copy of
-/// the formula. A genuinely singular `H` still declines (`try_inverse` returns `None`) and
-/// still routes to the FD salvage.
+/// **This was tried.** #1513 proposed falling back to a full-pivot LU here, on the
+/// reasoning above ("exact where the identity holds, nothing substituted"), with a
+/// measured 4.1× fit speedup on a 55-subject ODE model. Measured against
+/// `subject_reconverged_fd_gradient` over the 16 decline events of a full
+/// `examples/one_cpt_transit.ferx` + `data/datsim_oral.csv` fit, with the PD subjects of
+/// the same fit as the noise floor:
 ///
-/// **What this does not fix.** `−H⁻¹M` also assumes `∂l/∂η|η̂ = 0`, and a subject whose `H`
-/// is indefinite is by definition not at a minimum, so the precondition is generally
-/// violated wherever this fallback fires — most often at a blown-up line-search point. The
-/// FD salvage it replaces is no better there (measured: neither reproduces the other, and
-/// the disagreement tracks `‖∂l/∂η‖` subject by subject). The argument for the fallback is
-/// that it is exact where the identity holds and cheap where it does not, not that it
-/// rescues a broken precondition. `subject_analytic_outer_gradient`'s finiteness check
-/// remains the guard on what reaches the outer optimizer.
-fn invert_inner_hessian(h_inner: &DMatrix<f64>) -> Option<DMatrix<f64>> {
-    if let Some(chol) = h_inner.clone().cholesky() {
-        return Some(chol.inverse());
-    }
-    h_inner.clone().full_piv_lu().try_inverse()
+/// | | `‖∂l/∂η‖∞` median | `‖g−g_fd‖₂/‖g_fd‖₂` median | cos(g, g_fd) median / min |
+/// |---|---|---|---|
+/// | PD subjects (this path), n = 904 | 3.9e-6 | 1.4e-3 (max 0.25) | 0.999999 / 0.970 |
+/// | LU-served non-PD, n = 16 | 1.7e-2 | **0.378** | **0.933 / 0.032** |
+///
+/// 10 of the 16 were worse than the *worst* PD subject, and the direction was near
+/// orthogonal to the reconverged-FD gradient at a quarter of them. The `H` matrices were
+/// well-conditioned throughout (spectral condition number 1.2 … 1.7e2), so this is the
+/// broken precondition and not a conditioning artifact. The speedup was bought by
+/// replacing correct-but-slow gradients with fast wrong ones; the fit still landed at the
+/// same optimum, which is why an OFV comparison cannot be the acceptance criterion here.
+///
+/// Two consequences worth keeping in mind before reopening this:
+///
+/// * **A magnitude guard is not a substitute either.** `FullPivLU::is_invertible` tests
+///   the final pivot against *exact* zero, so an LU here would also admit a
+///   condition-1e19 `H` as a huge finite inverse, which
+///   `subject_analytic_outer_gradient`'s `is_finite` backstop accepts into the L-BFGS
+///   memory. The Cholesky declines that case today.
+/// * **The cost is real and belongs elsewhere.** Each decline buys a
+///   `subject_reconverged_fd_gradient` — `2·n_free` warm EBE re-solves for one subject,
+///   0.786 s against 0.0054 s for an entire 55-subject analytic population gradient. The
+///   fix for that is at the policy layer (not spending the salvage at a trial point whose
+///   objective has already blown up) and upstream (the 16 subjects above sit at
+///   `‖∂l/∂η‖∞ ≈ 1.7e-2` while their PD peers reach 3.9e-6 in the same fit, at the same
+///   `inner_tol` — an inner solve that converged would be PD and analytic for free), not
+///   by widening this gate.
+fn invert_inner_hessian(h_inner: DMatrix<f64>) -> Option<DMatrix<f64>> {
+    Some(h_inner.cholesky()?.inverse())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,7 +1210,7 @@ pub(crate) fn prepare_stacked(
     )?;
 
     let htilde_inv = htilde.cholesky()?.inverse();
-    let h_inner_inv = invert_inner_hessian(&h_inner)?;
+    let h_inner_inv = invert_inner_hessian(h_inner)?;
 
     let mut w: Vec<DVector<f64>> = Vec::with_capacity(n_obs);
     let mut q = vec![0.0f64; n_obs];
