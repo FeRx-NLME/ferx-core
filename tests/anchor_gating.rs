@@ -5,7 +5,7 @@
 //! mrgsolve table, or a NONMEM objective at `maxiter = 0` — meets the Tier-2 contract in
 //! `CLAUDE.md` and is not gated, however slow its oracle was to produce. Before #1132
 //! the adaptive mrgsolve anchors and three NONMEM anchors carried
-//! `ignore = "slow: …"` on tests that take a second, so a PR that broke them turned the
+//! `ignore = "slow: …"` on tests that evaluate once, so a PR that broke them turned the
 //! nightly red instead of itself.
 //!
 //! The gate is a run-time `#[ignore]` only: `Tests + coverage (core)` already builds
