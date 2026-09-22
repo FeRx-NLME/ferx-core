@@ -5149,8 +5149,224 @@ pub fn subject_sensitivities(
 /// applies directly to a closed-form `Dual2` jet. An ODE jet also carries integration error,
 /// so its effective noise floor is the configured relative tolerance; capping the resulting
 /// step at 1% limits truncation error at loose solver tolerances.
-fn third_order_fd_step(x: f64, jet_noise: f64) -> f64 {
+///
+/// This is the step *before* the kink bound. Where the axis moves a dose event — a lagged
+/// arrival, an infusion end, a `zero_order` window edge — the sweep in
+/// [`covariance_sensitivities`] shrinks it further so that no observation changes sides of
+/// the event between the two points of the pair ([`kink_step_bound`], #1505); at the shipping
+/// default the cap binds and this returns `1e-2·(1 + |x|)`, a `TVLAG` step that shifts every
+/// arrival by ~1.5 % of an hour on a 0.5 h lag, which is wider than the observation-to-arrival
+/// gap of any dense early sample.
+///
+/// Two questions #1291's review raised about this policy — the cap converting a loose
+/// `ode_reltol` into `noise/h` amplification, and `ode_abstol` never being consulted — are
+/// **deferred on evidence**, not on a story: measured on the #1505 fixture at the default
+/// tolerances, the central difference of the jet is stable to six significant figures from a
+/// relative step of `1e-3` down to `1e-8` (see [`THIRD_ORDER_STEP_FLOOR_REL`]), so neither
+/// tolerance produces a noise floor this step could be balanced against. A model on which
+/// one does would be the measurement to reopen them with.
+pub(crate) fn third_order_fd_step(x: f64, jet_noise: f64) -> f64 {
     jet_noise.max(f64::EPSILON).cbrt().min(1e-2) * (1.0 + x.abs())
+}
+
+/// Floor, relative to `1 + |x|`, under which the kink bound declines the subject instead of
+/// shrinking the step any further (#1505).
+///
+/// Measured, not derived. On the two-state depot + `ALAG1`-with-IIV fixture behind #1505, at
+/// the **default** `ode_reltol = 1e-4` / `ode_abstol = 1e-6`, the central difference of the
+/// `Dual2` second-order jet along the `TVLAG`, `ETA_LAG` and `TVCL` axes agrees with itself
+/// to six significant figures from a relative step of `1e-3` all the way down to `1e-8`, and
+/// the last digit first moves at `1e-9` (the same on `∂²f/∂η²` and on `∂²f/∂η∂θ`, on every
+/// observation). The `noise/h` argument in [`third_order_fd_step`]'s docs has no measurable
+/// floor here: the step sequence is fixed by the value part of the jet alone
+/// (`Stepper::attempt` scores values only), so the integration error rides smoothly along a
+/// parameter perturbation instead of jumping with it. `1e-6` sits three decades above where
+/// round-off first shows.
+///
+/// A subject whose observation-to-event gap needs a step below this cannot be differenced at
+/// all: at that distance the EBE *is* on the kink to within the inner optimizer's
+/// resolution — a corner minimum, which for a lagged arrival is not measure-zero: the inner
+/// objective is V-shaped there and BFGS stops on the vertex (measured on that fixture, two
+/// subjects in forty, with `η̂_lag = -4e-9` and the objective higher on *both* sides at
+/// `±1e-5`). The third-order blocks are one-sided there, and the honest term for such a
+/// subject is the finite-difference-of-marginal salvage (#1514), whose reconverged mode tracks
+/// the corner as the population parameters move.
+pub(crate) const THIRD_ORDER_STEP_FLOOR_REL: f64 = 1e-6;
+
+/// Fraction of the observation-to-event gap a bounded step may consume. A step shrunk by
+/// [`kink_step_bound`] moves every event by at most half its gap, so a mildly nonlinear
+/// event-time dependence (a lag on `exp(η)`) cannot carry the re-check back over the anchor.
+const KINK_GAP_FRACTION: f64 = 0.5;
+
+/// Rounds of shrink-and-recheck before the sweep gives up on an axis and declines the subject.
+/// One round suffices for an event time linear in the axis; the loop exists for the nonlinear
+/// ones and is bounded so a pathological dependence cannot spin.
+const KINK_SHRINK_ROUNDS: usize = 8;
+
+/// What [`kink_step_bound`] found for one central pair.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum KinkStepBound {
+    /// No anchor lies between any moving event's two perturbed positions: both points of the
+    /// pair sit on the same smooth piece of every observation's prediction.
+    Clear,
+    /// Some moving event straddles an anchor. Multiply the step by this factor — always in
+    /// `(0, 1)` — and re-check.
+    Shrink(f64),
+    /// No step can avoid the kink: an anchor sits exactly on a moving event at the base point
+    /// (the EBE is on the corner), or a break appeared or vanished under the perturbation.
+    Decline,
+}
+
+/// The per-axis kink bound of the third-order sweep (#1505).
+///
+/// `base`, `plus` and `minus` are the subject's dose-event times
+/// ([`crate::ode::predictions::dose_break_times_per_dose`]) at the sweep's base point and at
+/// `x ± h` along one axis, entry-aligned. `anchors` are the fixed times at which the
+/// prediction is read or the timeline changes governance — observation, `EVID=2`, reset and
+/// dose-record times. An event whose perturbed positions bracket an anchor (closed interval)
+/// has that anchor's prediction on different smooth pieces at the two points of the pair, so
+/// the difference is `jump / 2h` rather than a derivative; the shrink factor brings the
+/// event's excursion down to [`KINK_GAP_FRACTION`] of its gap to the nearest anchor.
+///
+/// An event that did not move (`plus == minus == base`) is skipped: an unlagged arrival sits
+/// *on* its own dose record by construction and is not a kink in any parameter. Lengths are
+/// compared first because the builder pushes some breaks conditionally (`SS` seeding);
+/// a break that exists at one point and not the other is a discontinuity no step resolves.
+pub(crate) fn kink_step_bound(
+    anchors: &[f64],
+    base: &[f64],
+    plus: &[f64],
+    minus: &[f64],
+) -> KinkStepBound {
+    if plus.len() != base.len() || minus.len() != base.len() {
+        return KinkStepBound::Decline;
+    }
+    let mut factor = 1.0f64;
+    for ((&b, &p), &m) in base.iter().zip(plus).zip(minus) {
+        if !(b.is_finite() && p.is_finite() && m.is_finite()) {
+            return KinkStepBound::Decline;
+        }
+        let shift = (p - b).abs().max((m - b).abs());
+        if shift == 0.0 {
+            continue;
+        }
+        let (lo, hi) = (p.min(m), p.max(m));
+        if !anchors.iter().any(|&a| lo <= a && a <= hi) {
+            continue;
+        }
+        let gap = anchors
+            .iter()
+            .map(|&a| (a - b).abs())
+            .fold(f64::INFINITY, f64::min);
+        if gap <= 0.0 {
+            return KinkStepBound::Decline;
+        }
+        factor = factor.min(KINK_GAP_FRACTION * gap / shift);
+    }
+    if factor < 1.0 {
+        KinkStepBound::Shrink(factor)
+    } else {
+        KinkStepBound::Clear
+    }
+}
+
+/// The fixed timeline points the kink bound protects: every time a prediction is read or
+/// the walk's governing record changes — observations, `EVID=2` rows, resets and dose
+/// records. A moving event crossing any of these changes which smooth piece some prediction
+/// is on; crossing anything else (another moving event) does not.
+fn kink_anchor_times(subject: &Subject) -> Vec<f64> {
+    subject
+        .obs_times
+        .iter()
+        .chain(subject.pk_only_times.iter())
+        .chain(subject.reset_times.iter())
+        .chain(subject.doses.iter().map(|d| &d.time))
+        .copied()
+        .collect()
+}
+
+/// The model whose provider serves `(theta, b)` for this subject: the model itself for an
+/// `[odes]` model, the subject's IOV twin under `iov`, else the parameter-selected closed-form
+/// / ODE-twin dispatch. One function so the route-switch guard, the tolerance lookup and the
+/// kink bound in [`covariance_sensitivities`] all read the same answer.
+fn effective_provider_model<'a>(
+    model: &'a CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    b: &[f64],
+    iov: bool,
+) -> &'a CompiledModel {
+    if model.ode_spec.is_some() {
+        model
+    } else if iov {
+        model.effective_for(subject)
+    } else {
+        crate::pk::effective_model_for_eval(model, subject, theta, b)
+    }
+}
+
+/// Per-dose PK snapshot at `(theta, b)`, in the layout the sweep perturbs: `b` is `η` for a
+/// non-IOV subject and the joint `[η, κ₁, κ₂, …]` vector under `iov`, with the occasions in
+/// [`crate::stats::likelihood::iov_occasion_groups`] order — the same assembly
+/// `predict_iov` makes, so dose `k` reads the κ of its own occasion (a dose row without an
+/// occasion label reads κ = 0, as there). Each dose is evaluated under its own record
+/// covariates at its own time, which is what the event-driven walk's `pk_at_dose[k]` is.
+fn dose_pk_snapshots(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    b: &[f64],
+    iov: bool,
+) -> Vec<crate::types::PkParams> {
+    if !iov {
+        return subject
+            .doses
+            .iter()
+            .enumerate()
+            .map(|(k, d)| (model.pk_param_fn)(theta, b, subject.dose_cov(k), d.time))
+            .collect();
+    }
+    let (n_eta, n_kappa) = (model.n_eta, model.n_kappa);
+    let eta_bsv = &b[..n_eta.min(b.len())];
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+    subject
+        .doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            let occ = subject.dose_occasions.get(k).copied().unwrap_or(0);
+            let mut combined = Vec::with_capacity(n_eta + n_kappa);
+            combined.extend_from_slice(eta_bsv);
+            let slot = occ_groups.iter().position(|(o, _)| *o == occ);
+            match slot {
+                Some(g) if n_eta + (g + 1) * n_kappa <= b.len() => {
+                    combined.extend_from_slice(&b[n_eta + g * n_kappa..n_eta + (g + 1) * n_kappa]);
+                }
+                _ => combined.extend(std::iter::repeat_n(0.0, n_kappa)),
+            }
+            (model.pk_param_fn)(theta, &combined, subject.dose_cov(k), d.time)
+        })
+        .collect()
+}
+
+/// The subject's dose-event times at `(theta, b)` — the moving-event side of the kink bound.
+/// Empty for a closed-form provider (its lag subjects are declined by the covariance scope
+/// gate before the sweep, so there is nothing to bound) and for a dose-free subject.
+fn moving_event_times(
+    effective: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    b: &[f64],
+    iov: bool,
+) -> Vec<f64> {
+    let Some(ode) = effective.ode_spec.as_ref() else {
+        return Vec::new();
+    };
+    if subject.doses.is_empty() {
+        return Vec::new();
+    }
+    let snaps = dose_pk_snapshots(effective, subject, theta, b, iov);
+    crate::ode::predictions::dose_break_times_per_dose(ode, subject, |k| &snaps[k].values[..])
 }
 
 /// Third-order sensitivities for the analytic covariance Hessian (#436), obtained by
@@ -5519,37 +5735,28 @@ fn covariance_sensitivities(
     // may switch a closed-form absorption model to its ODE twin. Differencing across that
     // representation boundary is not a derivative of either route, so decline there.
     let ode_at = |t: &[f64], e: &[f64]| -> bool {
-        if model.ode_spec.is_some() {
-            true
-        } else if iov {
-            model.effective_for(subject).ode_spec.is_some()
-        } else {
-            crate::pk::effective_model_for_eval(model, subject, t, e)
-                .ode_spec
-                .is_some()
-        }
+        effective_provider_model(model, subject, t, e, iov)
+            .ode_spec
+            .is_some()
     };
-    let base_is_ode = ode_at(theta, eta);
-    let jet_noise = if base_is_ode {
-        if let Some(ode) = model.ode_spec.as_ref() {
-            ode.effective_solver_opts().reltol
-        } else if !iov {
-            crate::pk::effective_model_for_eval(model, subject, theta, eta)
-                .ode_spec
-                .as_ref()?
-                .effective_solver_opts()
-                .reltol
-        } else {
-            model
-                .effective_for(subject)
-                .ode_spec
-                .as_ref()?
-                .effective_solver_opts()
-                .reltol
-        }
-    } else {
-        f64::EPSILON
+    let base_effective = effective_provider_model(model, subject, theta, eta, iov);
+    let base_is_ode = base_effective.ode_spec.is_some();
+    let jet_noise = match base_effective.ode_spec.as_ref() {
+        Some(ode) => ode.effective_solver_opts().reltol,
+        None => f64::EPSILON,
     };
+    // #1505: the kink bound. An axis that moves a dose event — `TVLAG`, `ETA_LAG`, a
+    // `zero_order` duration, `F` on an infusion — shifts that event by `∂t_event/∂x · h`,
+    // and every observation inside that shift of the event reads a *different smooth piece*
+    // of the prediction at the two points of the pair (pre- vs post-arrival). The difference
+    // is then `jump / 2h`, not a third derivative, and which observations are inside changes
+    // with `h` — measured on a depot + `ALAG1` fixture as `SE(TVLAG)` moving 0.0139 → 0.0097 →
+    // 0.0142 → 0.0191 across four step sizes, non-monotone. The events are enumerated by the
+    // engines' own break-time builder at the base point and at both perturbed points, and the
+    // pair is shrunk until no anchor lies between an event's two positions.
+    let anchors = kink_anchor_times(subject);
+    let base_events = moving_event_times(base_effective, subject, theta, eta, iov);
+    let events_at = |t: &[f64], b: &[f64]| moving_event_times(base_effective, subject, t, b, iov);
 
     let n_theta = theta.len();
     let n_eta = eta.len();
@@ -5609,19 +5816,53 @@ fn covariance_sensitivities(
     let mut minus: Vec<SubjectSens> = Vec::with_capacity(n_axes);
     let mut steps: Vec<f64> = Vec::with_capacity(n_axes);
     for c in 0..n_axes {
-        let (mut tp, mut ep) = (theta.to_vec(), eta.to_vec());
-        let (mut tm, mut em) = (theta.to_vec(), eta.to_vec());
-        let h = if c < eta_base {
-            let h = third_order_fd_step(theta[c], jet_noise);
-            tp[c] += h;
-            tm[c] -= h;
-            h
+        let x = if c < eta_base {
+            theta[c]
         } else {
-            let k = c - eta_base;
-            let h = third_order_fd_step(eta[k], jet_noise);
-            ep[k] += h;
-            em[k] -= h;
-            h
+            eta[c - eta_base]
+        };
+        let perturb = |h: f64| -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+            let (mut tp, mut ep) = (theta.to_vec(), eta.to_vec());
+            let (mut tm, mut em) = (theta.to_vec(), eta.to_vec());
+            if c < eta_base {
+                tp[c] += h;
+                tm[c] -= h;
+            } else {
+                ep[c - eta_base] += h;
+                em[c - eta_base] -= h;
+            }
+            (tp, ep, tm, em)
+        };
+        let mut h = third_order_fd_step(x, jet_noise);
+        let (tp, ep, tm, em) = {
+            let mut rounds = 0usize;
+            loop {
+                let pts = perturb(h);
+                if base_events.is_empty() {
+                    break pts;
+                }
+                match kink_step_bound(
+                    &anchors,
+                    &base_events,
+                    &events_at(&pts.0, &pts.1),
+                    &events_at(&pts.2, &pts.3),
+                ) {
+                    KinkStepBound::Clear => break pts,
+                    // The EBE sits on a moving event (a corner minimum), or a break came or
+                    // went under the perturbation: no step differences a derivative here.
+                    // The subject's term comes from the FD-of-marginal salvage (#1514).
+                    KinkStepBound::Decline => return None,
+                    KinkStepBound::Shrink(factor) => {
+                        h *= factor;
+                        rounds += 1;
+                        if h < THIRD_ORDER_STEP_FLOOR_REL * (1.0 + x.abs())
+                            || rounds > KINK_SHRINK_ROUNDS
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
         };
         // Do not difference across a parameter-dependent closed-form/ODE dispatch
         // boundary: the two providers use different numerical representations and
@@ -5722,6 +5963,58 @@ fn covariance_sensitivities(
                     }
                     for mm in 0..n_theta {
                         d3f_deta2_dtheta[(k * n_eta + l) * n_theta + mm] *= 0.5;
+                    }
+                }
+            }
+        } else {
+            // The θ-swept blocks hold two FD estimates of every mixed θ pair — `∂/∂θ_c` of
+            // `∂f/∂θ_m` from axis `c` and `∂/∂θ_m` of `∂f/∂θ_c` from axis `m` — which differ
+            // by their truncation error, and by more once the kink bound (#1505) has shrunk
+            // one axis's step and not the other's (measured 1.9e-7 on a 316-scale Hessian:
+            // harmless to the numbers, but the natural Hessian is symmetric by definition and
+            // its consumers assume it). Average them, exactly as the `EtaOnly` arm does for
+            // η pairs.
+            for mm in 0..n_theta {
+                for c in (mm + 1)..n_theta {
+                    let (i1, i2) = (mm * n_theta + c, c * n_theta + mm);
+                    let avg = 0.5 * (d2f_dtheta2[i1] + d2f_dtheta2[i2]);
+                    d2f_dtheta2[i1] = avg;
+                    d2f_dtheta2[i2] = avg;
+                    for k in 0..n_eta {
+                        let (i1, i2) = (
+                            (k * n_theta + mm) * n_theta + c,
+                            (k * n_theta + c) * n_theta + mm,
+                        );
+                        let avg = 0.5 * (d3f_deta_dtheta2[i1] + d3f_deta_dtheta2[i2]);
+                        d3f_deta_dtheta2[i1] = avg;
+                        d3f_deta_dtheta2[i2] = avg;
+                    }
+                }
+            }
+        }
+        // `∂³f/∂η_k∂η_l∂η_c` is estimated once per axis position — from axis `c` as
+        // `∂/∂η_c` of the exact `∂²f/∂η_k∂η_l`, and likewise from axes `k` and `l` — so the
+        // three estimates are averaged over every index permutation. Both arms sweep every η
+        // axis, so this applies to both.
+        for k in 0..n_eta {
+            for l in k..n_eta {
+                for c in l..n_eta {
+                    let idx = |a: usize, b: usize, d: usize| (a * n_eta + b) * n_eta + d;
+                    let perms = [
+                        (k, l, c),
+                        (k, c, l),
+                        (l, k, c),
+                        (l, c, k),
+                        (c, k, l),
+                        (c, l, k),
+                    ];
+                    let avg = perms
+                        .iter()
+                        .map(|&(a, b, d)| d3f_deta3[idx(a, b, d)])
+                        .sum::<f64>()
+                        / 6.0;
+                    for &(a, b, d) in &perms {
+                        d3f_deta3[idx(a, b, d)] = avg;
                     }
                 }
             }

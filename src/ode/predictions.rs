@@ -1984,9 +1984,10 @@ fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderW
 
 /// Push a break at every per-route absorption onset `d.time + lag_cmt + lag_route`
 /// (`fn(..., lag=L)`) — for each input-rate forcing carrying a `lag_slot`, over every
-/// positive-amount dose feeding that forcing's compartment. `route_lag_of` reads the
-/// forcing's lag from the caller's PK snapshot (a single subject snapshot on the dense
-/// path; per-forcing over the event-driven walk's snapshot). A route lag delays that
+/// positive-amount dose feeding that forcing's compartment. `route_lag_of(forcing, k)`
+/// reads the forcing's lag from the PK snapshot dose `k` is evaluated under (a single
+/// subject snapshot on the dense path, so the index is ignored there; the per-dose
+/// `pk_at_dose[k]` for a caller that has one, #1505). A route lag delays that
 /// route's onset PAST the dose's `d.time + lag_cmt` break, so without this break the
 /// smooth routes' onset kink is unresolved and a lagged `zero_order` window's start is
 /// unbracketed (never fully contained in a segment → no mass delivered). A no-op when
@@ -1996,13 +1997,16 @@ fn push_route_lag_break_times(
     ode: &OdeSpec,
     subject: &Subject,
     dose_lagtimes: &[f64],
-    route_lag_of: impl Fn(&crate::pk::absorption::InputRateForcing) -> f64,
+    route_lag_of: impl Fn(&crate::pk::absorption::InputRateForcing, usize) -> f64,
 ) {
     for forcing in ode.input_rate.iter().filter(|f| f.lag_slot.is_some()) {
-        let route_lag = route_lag_of(forcing);
         for (k, d) in subject.doses.iter().enumerate() {
             if d.amt > 0.0 && d.cmt_idx() == forcing.cmt {
-                break_times.push(d.time + dose_lagtimes.get(k).copied().unwrap_or(0.0) + route_lag);
+                break_times.push(
+                    d.time
+                        + dose_lagtimes.get(k).copied().unwrap_or(0.0)
+                        + route_lag_of(forcing, k),
+                );
             }
         }
     }
@@ -2598,15 +2602,29 @@ fn subject_dose_attrs(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
 ) -> (Vec<f64>, Vec<f64>) {
+    subject_dose_attrs_with(subject, ode, |_| pk_params_flat)
+}
+
+/// [`subject_dose_attrs`] with a per-dose PK snapshot: dose `k`'s lag and `F` are read
+/// from `pk_for_dose(k)`. The dense path's uniform-snapshot form above is the
+/// `|_| pk_params_flat` instance of this.
+#[inline]
+fn subject_dose_attrs_with<'a>(
+    subject: &Subject,
+    ode: &OdeSpec,
+    pk_for_dose: impl Fn(usize) -> &'a [f64],
+) -> (Vec<f64>, Vec<f64>) {
     let dose_lagtimes: Vec<f64> = subject
         .doses
         .iter()
-        .map(|d| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_params_flat))
+        .enumerate()
+        .map(|(k, d)| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_for_dose(k)))
         .collect();
     let dose_f_bio: Vec<f64> = subject
         .doses
         .iter()
-        .map(|d| ode.dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
+        .enumerate()
+        .map(|(k, d)| ode.dose_attr_map.f_bio(d.cmt_raw(), pk_for_dose(k)))
         .collect();
     (dose_lagtimes, dose_f_bio)
 }
@@ -3176,13 +3194,19 @@ pub(crate) fn ode_predictions_with_extra_breaks(
 /// reactive driver's pre-scheduled base regimen (#702) builds the **identical**
 /// segmentation — a hand-copied second walk would silently drift (cf. #798, where
 /// three parallel break-walking loops diverged on dose handling).
-fn collect_dose_break_times(
+///
+/// `pk_for_dose(k)` is the PK snapshot dose `k`'s route lag and zero-order window are read
+/// from. Every prediction engine that calls this has one subject-wide snapshot and passes
+/// `|_| pk_params_flat`; the covariance step's kink bound ([`dose_break_times_per_dose`],
+/// #1505) passes the per-record snapshot so a time-varying-covariate subject's events land
+/// where its own event-driven walk puts them.
+fn collect_dose_break_times<'a>(
     break_times: &mut Vec<f64>,
     ode: &OdeSpec,
     subject: &Subject,
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
-    pk_params_flat: &[f64],
+    pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) {
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
@@ -3208,15 +3232,51 @@ fn collect_dose_break_times(
     }
     // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
     // on past the dose's compartment-lag break, so add a break at each route onset.
-    push_route_lag_break_times(break_times, ode, subject, dose_lagtimes, |f| {
-        f.route_lag(pk_params_flat)
+    push_route_lag_break_times(break_times, ode, subject, dose_lagtimes, |f, k| {
+        f.route_lag(pk_for_dose(k))
     });
     // Zero-order windows (#504): break at each window end so segments align with the
     // cutoff (the same windows `integrate_segment` recomputes for the injection).
-    let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |_, d| {
-        zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
+    let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |k, d| {
+        zero_order_dur_and_frac_for_dose(ode, d, pk_for_dose(k))
     });
     push_zero_order_break_times(break_times, &zo_windows);
+}
+
+/// Every timeline break the subject's pre-scheduled doses contribute under the per-dose PK
+/// snapshots `pk_for_dose(k)`, in the deterministic per-dose order
+/// [`collect_dose_break_times`] pushes them — **unsorted and undeduplicated**, so two calls
+/// at nearby parameter points can be compared entry by entry.
+///
+/// This is the moving-event enumerator behind the covariance step's kink bound (#1505):
+/// every entry that depends on an estimated quantity — a lagged arrival `t + ALAG`, an
+/// infusion end `t + ALAG + F·dur`, a per-route onset `t + ALAG + lag_route`, a
+/// `zero_order` window edge — moves when that parameter is perturbed, and an entry that does
+/// not (a dose record time under `SS`, an unlagged arrival) comes back bit-identical, so the
+/// caller finds the moving ones by differencing the two lists rather than by re-spelling
+/// which break depends on what. Reusing the engines' own builder is what keeps the bound
+/// honest: a new kind of moving break added there is seen here without a second edit.
+///
+/// Modeled-`RATE` doses (`RATE=-1/-2`) are read as coded — the covariance scope declines
+/// them before this runs (`ode_analytical_supported`'s `all_doses_fixed` gate), and a
+/// caller that admits them must resolve the doses first
+/// ([`crate::dosing::resolve_subject_doses`]).
+pub(crate) fn dose_break_times_per_dose<'a>(
+    ode: &OdeSpec,
+    subject: &Subject,
+    pk_for_dose: impl Fn(usize) -> &'a [f64] + Copy,
+) -> Vec<f64> {
+    let (dose_lagtimes, dose_f_bio) = subject_dose_attrs_with(subject, ode, pk_for_dose);
+    let mut out = Vec::with_capacity(2 * subject.doses.len());
+    collect_dose_break_times(
+        &mut out,
+        ode,
+        subject,
+        &dose_lagtimes,
+        &dose_f_bio,
+        pk_for_dose,
+    );
+    out
 }
 
 /// Re-seed the state `u` for every pre-scheduled **steady-state** dose landing at
@@ -3461,7 +3521,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
         subject,
         &dose_lagtimes,
         &dose_f_bio,
-        pk_params_flat,
+        |_| pk_params_flat,
     );
     break_times.push(t_last);
     // System-reset times (EVID=3/4): each is a segment boundary where the state
@@ -4510,7 +4570,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &shadow,
             &base_lagtimes,
             &base_f_bio,
-            pk_params_flat,
+            |_| pk_params_flat,
         );
         // #1073: a base dose's own **record** is a parameter source — NONMEM runs `$PK`
         // at the dose row and ADVANs to it — so the segment ending there must end there.
@@ -5545,7 +5605,7 @@ fn adaptive_frozen_replay_tv(
         subject,
         &dose_lagtimes,
         dose_f,
-        pk_params_flat,
+        |_| pk_params_flat,
     );
     break_times.extend(subject.obs_times.iter().cloned());
     break_times.extend(subject.pk_only_times.iter().cloned());
@@ -6676,7 +6736,7 @@ pub fn ode_predictions_with_states(
     // `tad <= 0`, i.e. a step at the onset, and `weibull` (β < 1) and `transit` (n = 0)
     // likewise. `sens/ode_provider.rs` emits `K_ROUTE_ONSET` for every lagged kind and
     // is pinned bit-identical to this break (#859), so it stays unconditional.
-    push_route_lag_break_times(&mut break_times, ode, subject, &dose_lagtimes, |f| {
+    push_route_lag_break_times(&mut break_times, ode, subject, &dose_lagtimes, |f, _| {
         f.route_lag(pk_params_flat)
     });
     // Zero-order windows for this subject (#504): the dense paths have a single
@@ -7025,7 +7085,7 @@ fn build_segment_break_times(
     // `tad <= 0`, i.e. a step at the onset, and `weibull` (β < 1) and `transit` (n = 0)
     // likewise. `sens/ode_provider.rs` emits `K_ROUTE_ONSET` for every lagged kind and
     // is pinned bit-identical to this break (#859), so it stays unconditional.
-    push_route_lag_break_times(&mut break_times, ode, subject, dose_lagtimes, |f| {
+    push_route_lag_break_times(&mut break_times, ode, subject, dose_lagtimes, |f, _| {
         f.route_lag(pk_params_flat)
     });
     push_zero_order_break_times(&mut break_times, zo_windows);
