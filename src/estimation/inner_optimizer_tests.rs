@@ -2577,3 +2577,207 @@ fn cached_schedule_inner_loop_matches_uncached() {
     assert_eq!(uncached.2.n_fallback, cached.2.n_fallback);
     assert_eq!(uncached.2.n_start_rejected, cached.2.n_start_rejected);
 }
+
+// ── #1519: the flip-flop reroute must switch the inner stall stop on ────────────────
+//
+// A transit closed form is rerouted to its ODE twin whenever `ke = CL/V` reaches the
+// tilting abscissa `KTR = (n+1)/MTT` (`crate::pk::effective_model_for_eval`). That reroute
+// is decided per `(θ, η)`, so `CompiledModel::effective_for` — which sees only the
+// subject-static reroutes — cannot see it, and the objective-stall stop was left off for
+// exactly the subjects whose objective had become an RK45 integration.
+
+/// A transit model whose `[parameters]` block is spelled by the caller, so the only thing
+/// that differs between the two sides of the flip-flop gate is `(TVCL, TVV, TVMTT, TVN)`.
+fn flip_flop_transit_model(cl: f64, v: f64, mtt: f64, n: f64) -> CompiledModel {
+    let src = format!(
+        "[parameters]
+  theta TVCL({cl}, 0.1, 100.0)
+  theta TVV({v}, 5.0, 500.0)
+  theta TVMTT({mtt}, 0.05, 24.0)
+  theta TVN({n}, 0.0, 30.0)
+  omega ETA_CL ~ 0.307804
+  omega ETA_V  ~ 0.00001
+  sigma PROP_ERR ~ 1.161107 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"
+    );
+    crate::parser::model_parser::parse_model_string(&src)
+        .expect("1-cpt transit model with a proportional error parses")
+}
+
+/// Subject 2 of `data/datsim_oral.csv`, verbatim — one of the 16 subjects that #1519
+/// measured declining to the FD outer-gradient salvage on `examples/one_cpt_transit.ferx`.
+fn flip_flop_transit_subject() -> Subject {
+    let rows: &[(f64, f64)] = &[
+        (1.1, 4.843084),
+        (4.29, 3.051025),
+        (15.06, -3.107715),
+        (27.78, -12.149598),
+    ];
+    let n = rows.len();
+    Subject {
+        id: "2".into(),
+        doses: vec![DoseEvent::new(0.0, 10000.0, 1, 0.0, false, 0.0)],
+        obs_times: rows.iter().map(|r| r.0).collect(),
+        obs_raw_times: Vec::new(),
+        observations: rows.iter().map(|r| r.1).collect(),
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+    }
+}
+
+/// The gate itself, asserted on **both** sides in one test so forcing either branch reddens
+/// it — and with the straddle asserted on the underlying predicate, so the pair cannot
+/// silently drift onto one side of the abscissa and become a tautology.
+///
+/// The regression: `inner_stall_enabled` keys on `CompiledModel::effective_for`, which is
+/// blind to the parameter-dependent flip-flop reroute. That blindness is asserted directly
+/// (it reads `false` on *both* sides), so a reader cannot mistake the old spelling for one
+/// that merely needed different parameters.
+#[test]
+fn inner_stall_enabled_at_straddles_the_flip_flop_abscissa() {
+    // ke = 5/50 = 0.1 against KTR = (3+1)/1 = 4 — in domain, closed form.
+    let in_domain = flip_flop_transit_model(5.0, 50.0, 1.0, 3.0);
+    // ke = 80/110 = 0.727 against KTR = (0+1)/24 = 0.0417 — flip-flop, ODE twin.
+    let flipped = flip_flop_transit_model(80.0, 110.0, 24.0, 0.0);
+    let subject = flip_flop_transit_subject();
+    let eta = [0.0, 0.0];
+
+    // The straddle, on the predicate the reroute is built from.
+    assert!(
+        !crate::pk::absorption_flip_flop_at(
+            &in_domain,
+            &subject,
+            &in_domain.default_params.theta,
+            &eta
+        ),
+        "fixture drift: the in-domain arm must satisfy ke < KTR"
+    );
+    assert!(
+        crate::pk::absorption_flip_flop_at(&flipped, &subject, &flipped.default_params.theta, &eta),
+        "fixture drift: the flipped arm must violate ke < KTR"
+    );
+
+    // Neither model carries an `[odes]` block, and the subject has no TV covariate and no
+    // occasion, so the subject-static reroute reads `false` on both sides — it is not that it
+    // needed better parameters, it cannot see this reroute at all.
+    assert!(!inner_stall_enabled(&in_domain, &subject));
+    assert!(!inner_stall_enabled(&flipped, &subject));
+
+    // Both sides of the gate under test.
+    assert!(
+        !inner_stall_enabled_at(&in_domain, &subject, &in_domain.default_params.theta, &eta),
+        "an in-domain closed-form subject has an exact objective and must keep `gnorm < tol`"
+    );
+    assert!(
+        inner_stall_enabled_at(&flipped, &subject, &flipped.default_params.theta, &eta),
+        "a flip-flop subject's objective is an RK45 solve and must get the stall stop"
+    );
+}
+
+/// The behavioural regression, on the same subject and parameters the measurement used: a
+/// flip-flop-rerouted subject's inner solve must terminate on the objective-stall stop
+/// rather than exhausting its budget and buying the Nelder-Mead recovery -- which does not
+/// merely cost time, it *moves* the returned eta_hat to a worse point.
+///
+/// Measured on this fixture, cold start, `inner_tol = 1e-6`:
+///
+/// | | `used_fallback` | gradient L2 norm at the returned eta_hat |
+/// |---|---|---|
+/// | with the flip-flop-aware gate | `false` | **1.106e-4** |
+/// | gate reverted to `effective_for` | `true` | **2.368e-1** (2100x worse) |
+///
+/// so the bound below is set at `1e-3` -- 9x headroom over the realised 1.106e-4, and 236x
+/// below the 2.368e-1 the mutation produces. `used_fallback` is asserted as well because it
+/// names the mechanism; the norm is asserted because a future recovery that happened not to
+/// set that flag would still have to land somewhere sane.
+///
+/// The in-domain arm is asserted in the same test so a mutation that switches the stall stop
+/// on *unconditionally* -- which would silence the flipped arm just as well -- reddens it
+/// too: an exact closed-form objective must still stop on `gnorm < tol`, not on a plateau.
+#[test]
+fn a_flip_flop_subject_stops_instead_of_falling_back_to_nelder_mead() {
+    let subject = flip_flop_transit_subject();
+    let gnorm_at = |m: &CompiledModel, p: &crate::types::ModelParameters, eta: &[f64]| -> f64 {
+        let g = analytic_eta_nll_gradient(m, &subject, &p.theta, eta, &p.omega, &p.sigma.values)
+            .expect("the analytic eta-gradient is in scope for a 1-cpt transit subject");
+        let n = grad_norm_metric(&g, None);
+        assert!(
+            n.is_finite(),
+            "the gradient at the returned eta_hat must be finite"
+        );
+        n
+    };
+
+    let flipped = flip_flop_transit_model(80.0, 110.0, 24.0, 0.0);
+    let flipped_params = flipped.default_params.clone();
+    let res = find_ebe(
+        &flipped,
+        &subject,
+        &flipped_params,
+        200,
+        1e-6,
+        None,
+        None,
+        0,
+    );
+    assert!(
+        !res.used_fallback,
+        "the flip-flop subject's inner solve ran out of budget and recovered with \
+         Nelder-Mead (eta_hat = {:?}); the stall stop did not fire",
+        res.eta.as_slice()
+    );
+    assert!(
+        res.converged,
+        "the stall stop must report a terminated solve"
+    );
+    let flipped_gnorm = gnorm_at(&flipped, &flipped_params, res.eta.as_slice());
+    assert!(
+        flipped_gnorm < 1e-3,
+        "the stall stop must return the BFGS descent point, not a Nelder-Mead excursion \
+         (norm = {flipped_gnorm:e}, realised with the fix: 1.106e-4)"
+    );
+
+    // The other side of the gate: an in-domain closed-form subject is exact, reaches
+    // `gnorm < tol`, and must not be handed the stall stop by this change.
+    let in_domain = flip_flop_transit_model(5.0, 50.0, 1.0, 3.0);
+    let in_params = in_domain.default_params.clone();
+    let exact = find_ebe(&in_domain, &subject, &in_params, 200, 1e-6, None, None, 0);
+    assert!(
+        exact.converged && !exact.used_fallback,
+        "an in-domain closed-form subject must still converge on the exact `gnorm < tol` test"
+    );
+    let exact_gnorm = gnorm_at(&in_domain, &in_params, exact.eta.as_slice());
+    assert!(
+        exact_gnorm < 1e-6,
+        "the in-domain arm must still stop on stationarity, not on a plateau \
+         (norm = {exact_gnorm:e})"
+    );
+}

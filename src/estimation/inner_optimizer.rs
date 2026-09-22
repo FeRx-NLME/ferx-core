@@ -960,8 +960,63 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 /// model, or a purely analytic model — keeps the exact `gnorm < tol` behaviour and stays
 /// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
 /// those, so this adds no cost on the common path.)
+///
+/// **This is the subject-static half only** — [`inner_stall_enabled_at`] is what the non-IOV
+/// inner solve calls. This entry point remains for the IOV solve, where it is already exact:
+/// `n_kappa > 0` routes *every* transit/IG subject to its twin subject-statically (#814), so
+/// `effective_for` already returns an `ode_spec`-carrying model and the parameter-dependent
+/// reroute below cannot add one.
 fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
     model.effective_for(subject).ode_spec.is_some()
+}
+
+/// [`inner_stall_enabled`] extended with the **parameter-dependent** flip-flop reroute
+/// (#1519).
+///
+/// `effective_for` sees only the subject-static reroutes. A transit / IG closed form is *also*
+/// rerouted to its ODE twin whenever the individual parameters leave the exponential-tilting
+/// domain (`ke ≥ KTR` for transit, `ke ≥ 1/(2·MAT·CV²)` for IG) — the flip-flop regime, decided
+/// per `(θ, η)` by [`crate::pk::effective_model_for_eval`]. That reroute is the one the outer
+/// loop walks into: the fit starts in-domain and closed form, then `θ` drifts across the
+/// abscissa and every likelihood evaluation for the subject becomes an RK45 solve.
+///
+/// Keying the stall stop on `effective_for` alone left it `false` for exactly those subjects, so
+/// they were held to the exact `gnorm < tol` criterion against an objective carrying the RK45
+/// noise floor — a target they cannot reach. Measured on `examples/one_cpt_transit.ferx` +
+/// `data/datsim_oral.csv` (100 subjects, FOCEI, `inner_tol = 1e-5`), instrumenting every one of
+/// the fit's 19,924 inner solves:
+///
+/// | | n | exits on `gnorm < tol` | ‖∂l/∂η‖ median | analytic-vs-FD gradient |
+/// |---|---|---|---|---|
+/// | closed form (in domain) | 1,529 | **1,529 (100%)** | 1.3e-6 | 6.9e-9 |
+/// | flip-flop → ODE twin | 18,395 | 9,626 (52%) | up to 3.5e0 | 1.2e-4 … 4.0e-4 |
+///
+/// **Every** non-converged exit in the fit — 4,957 that exhausted `inner_maxiter = 200` and
+/// 3,812 whose line search found no representable decrease — was a flip-flop-rerouted solve, and
+/// none of the in-domain closed-form solves failed. Each of those 8,769 failures then bought a
+/// Nelder–Mead recovery of up to `5 · inner_maxiter` iterations, which is where the fit's wall
+/// clock went: 142.6 s before, 3.5 s after (41×), OFV 1215.9771 → 1215.9777.
+///
+/// `eta` is the solve's **start** point. The flip-flop predicate is η-dependent and the search
+/// moves η, so no single evaluation of it is exact for the whole solve; the start point is the
+/// same one every other per-solve policy here keys off, and the regime is a property of the
+/// current `θ` far more than of one subject's η (`ke` moves by `e^{η_CL}`, the abscissa not at
+/// all).
+///
+/// Bit-identical wherever the flip-flop reroute cannot fire: `effective_model_for_eval` returns
+/// the structural model unchanged when the model has no `absorption_ode_equivalent` (every
+/// non-transit/IG model), when the subject is already on an ODE twin, and when the parameters
+/// are in domain — so only a subject that *is* being integrated numerically changes behaviour,
+/// which is the whole point.
+fn inner_stall_enabled_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> bool {
+    crate::pk::effective_model_for_eval(model, subject, theta, eta)
+        .ode_spec
+        .is_some()
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -1328,7 +1383,7 @@ fn find_ebe_impl(
     // model for this subject is ODE, which includes a closed-form transit/IG subject rerouted to
     // its ODE twin (TV-cov / `TIME`; #719/#814). Analytical/event-driven objectives are exact, so
     // they keep the pure `gnorm < tol` criterion and stay bit-identical to prior releases.
-    let enable_stall = inner_stall_enabled(model, subject);
+    let enable_stall = inner_stall_enabled_at(model, subject, &params.theta, &eta);
     // Single gradient closure used by *both* the optimizer and the fallback's stationarity
     // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
     // one provider eval per step) when in scope with a per-point FD fallback, else FD

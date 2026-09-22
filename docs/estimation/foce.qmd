@@ -94,6 +94,23 @@ This was measured rather than assumed ([#1513](https://github.com/FeRx-NLME/ferx
 
 The practical reading for a user: a `gradient:` banner of `analytic (Dual2)` together with a per-subject fallback warning means some subjects' inner loops are finishing away from their optimum, not that ferx is being needlessly cautious. Those fits are correct and slower.
 
+#### Why an inner loop finishes away from its optimum {#inner-loop-noise-floor}
+
+"Finishing away from the optimum" has a specific, fixable cause on closed-form absorption models, found by instrumenting every one of the 19,924 inner solves in the fit above ([#1519](https://github.com/FeRx-NLME/ferx-core/issues/1519)).
+
+A transit or inverse-Gaussian closed form is valid only while absorption outruns elimination ($k_e < K_{tr}$ for transit, $k_e < 1/(2\,\mathrm{MAT}\,\mathrm{CV}^2)$ for IG). Outside that domain — the flip-flop regime — ferx reroutes the subject to the model's ODE twin, which is valid in both regimes. The reroute is a function of $(\theta, \eta)$, not of the subject's records: a fit can start in-domain and closed-form, and walk across the abscissa as $\theta$ moves. From that point on, that subject's individual objective is an adaptive RK45 integration, and so carries the solver's local-error noise floor.
+
+The inner loop already has the right response to a noisy objective — the objective-stall stop, which accepts a point whose objective has flattened and whose gradient has stopped improving, instead of chasing a `gnorm < inner_tol` target that solver noise makes unreachable. Until #1519 that stop was keyed on the *subject-static* reroutes only (a time-varying covariate, a `TIME` reference, IOV), so it stayed off for every flip-flop-rerouted subject. The measured consequence, on `examples/one_cpt_transit.ferx` + `data/datsim_oral.csv`:
+
+| inner solves | exit on `gnorm < tol` | analytic vs. FD $\partial l/\partial\eta$ |
+|---|---|---|
+| closed form, in domain (1,529) | 1,529 (100%) | $6.9 \times 10^{-9}$ |
+| flip-flop, on the ODE twin (18,395) | 9,626 (52%) | $1.2\!-\!4.0 \times 10^{-4}$ |
+
+Every one of the fit's 8,769 non-converged inner exits — 4,957 that exhausted `inner_maxiter`, 3,812 whose line search found no representable decrease — was a flip-flop-rerouted solve, and none of the in-domain closed-form solves failed. Each failure then bought a Nelder-Mead recovery of up to $5 \times$ `inner_maxiter` iterations, which is where the wall clock went: **142.6 s before, 3.5 s after**, OFV 1215.9771 → 1215.9777. The recovery is not free in accuracy either — on the worst single-subject case measured, it returned an $\hat\eta$ whose gradient norm was $2.4 \times 10^{-1}$ where the stalled BFGS point read $1.1 \times 10^{-4}$.
+
+What this does **not** do is make the declines go away: 16 decline events before, 15 after. A subject whose objective is an RK45 solve at default tolerances cannot resolve its gradient below roughly $3 \times 10^{-4}$, so its exact $H$ can still be indefinite at the point it stops. The gradient those subjects *are* served agrees with the reconverged finite-difference reference at the same $1.2 \times 10^{-3}$ median relative error as the fit's own positive-definite subjects, measured the way #1513's table was — so the change buys time, not accuracy, and does not spend accuracy to get it.
+
 ### Analytic scope: models and readouts {#analytic-scope-models-and-readouts}
 
 The analytic route serves the analytical 1-/2-/3-cpt PK models and — since #410 — in-scope user-`[odes]` models (via a lighter `Dual1` forward walk over the ODE solver), including multi-endpoint **per-CMT** Form-C readouts (`y[CMT=N] = …`, since #439) and Form-C readouts that reference a θ/η **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`, since #486 — each bare θ/η in the readout is desugared into a hidden individual parameter so its `∂y/∂θ`/`∂y/∂η` rides the same individual-parameter sensitivity chain; a readout referencing a neural-network output still falls back to FD).
