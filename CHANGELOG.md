@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **A transit / inverse-Gaussian absorption fit that leaves the closed form's domain no
+  longer grinds its inner EBE loop.** When the estimates drive `ke` past the absorption
+  abscissa (`ke ≥ KTR`, the flip-flop regime) ferx reroutes the subject to the model's ODE
+  twin, so its individual objective picks up the adaptive solver's noise floor — but the
+  inner loop's objective-stall stop, which exists for exactly that situation, was keyed
+  only on the subject-static reroutes (time-varying covariate / `TIME` / IOV) and stayed
+  off. Those subjects were held to an exact `gnorm < inner_tol` they cannot reach, ran out
+  of iterations or line-search steps, and each bought a Nelder-Mead recovery of up to
+  `5 × inner_maxiter` iterations. On `examples/one_cpt_transit.ferx` +
+  `data/datsim_oral.csv` (100 subjects, FOCEI) every one of the fit's 8,769 failed inner
+  solves was such a subject and none of its 1,529 in-domain closed-form solves failed;
+  the fit goes from **142.6 s to 3.5 s (41×)** with the OFV moving 6e-4 (1215.9771 →
+  1215.9777). Subjects that were never rerouted — every non-transit/IG model, and any
+  transit/IG fit that stays in domain — are bit-identical
+  ([#1519](https://github.com/FeRx-NLME/ferx-core/issues/1519)).
 - **The covariance step no longer abandons the exact analytic R-matrix for the whole
   population when one subject is out of scope.** The observed information is the sum
   `Σᵢ Rᵢ`, and each term is the second derivative of one subject's own marginal, so a
