@@ -3863,6 +3863,64 @@ fn ode_provider_ss_lagtime_infusion_matches_production() {
     check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
 
+/// **SS × a lagtime at or past the dosing interval, both sides of the clamp (#1132).**
+///
+/// The `K_SS_SEED` handler seeds the pre-arrival window at `phase = ss_seed_phase = (II −
+/// lag).max(0)`. The dual walk spells that clamp out itself (`if ss_seed_phase(…) > 0.0`),
+/// and until #1132 **no `sens::` fixture put a subject on the `lag ≥ II` side of it** —
+/// every SS-lagtime fixture above has `lag ≈ 0.5` against `II = 12`. Wrapping the phase
+/// into `[0, II)` instead of clamping (#1121's defect, confined to the dual walk) was
+/// therefore invisible to the whole `--lib` suite: measured on PR #1518, the only tests
+/// that reddened were the two `ss_lagtime_edge_nonmem_anchor` objective anchors — which
+/// cost 45 s in the instrumented CI job, so the cheap guard has to live here.
+///
+/// Both sides of the gate are in **one** test on purpose: a fixture on the `lag ≥ II` side
+/// alone passes for a walk that clamps everywhere, and one on the `lag < II` side alone is
+/// what the suite already had. The straddle is asserted, not assumed, so it cannot decay
+/// into a tautology if `TVLAG` or `II` is edited later.
+///
+/// `check_vs_production` sees the wrap through the **value** as well as the derivative:
+/// production reaches the phase through `crate::dosing::ss_seed_phase`, so a dual-only
+/// change makes the two disagree on the predicted concentration in the pre-arrival window.
+#[test]
+fn ode_provider_ss_lagtime_at_or_past_the_interval_matches_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_INF_ODE).expect("parse lag ODE");
+    // θ = [TVCL, TVV, TVLAG]; η = [ETA_CL, ETA_LAG] ⇒ lag = 4.5·exp(0.05) ≈ 4.731.
+    let theta = [1.0, 10.0, 4.5];
+    let eta = [0.1, 0.05];
+    let lag: f64 = theta[2] * f64::exp(eta[1]);
+
+    // (a) `lag < II`: the clamp is inactive and the seed advances by `II − lag ≈ 7.3`.
+    let mut inside = bolus_subject(&[0.3, 3.0, 8.0, 11.0]);
+    inside.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    // (b) `lag ≥ II`: the arrival is a whole interval away, the phase clamps to 0 and its
+    // jet dies with it. Observations at 0.3 / 2.0 / 3.5 are all pre-arrival (arrival ≈ 4.73).
+    let mut past = bolus_subject(&[0.3, 2.0, 3.5, 6.0]);
+    past.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 4.0)];
+
+    // The straddle itself: one subject each side of `ss_seed_phase > 0`.
+    assert!(
+        crate::dosing::ss_seed_phase(&inside.doses[0], lag) > 0.0,
+        "subject (a) must sit on the un-clamped side (lag {lag} < II 12)"
+    );
+    assert_eq!(
+        crate::dosing::ss_seed_phase(&past.doses[0], lag),
+        0.0,
+        "subject (b) must sit on the clamped side (lag {lag} ≥ II 4)"
+    );
+
+    for subject in [&inside, &past] {
+        assert!(subject.doses[0].ss && model.has_lagtime());
+        assert!(
+            ode_tvcov_supported(&model, subject),
+            "SS + lagtime routes to the event-driven dual walk, not FD (#486)"
+        );
+        check_vs_production(&model, subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, subject, &theta, &eta);
+    }
+}
+
 /// **Rate-defined SS infusion under `F ≠ 1` is now analytic (#486, PR3 sub-case (b)).**
 /// `equilibrate_ss_state_g` reads the caller's `inf_eff` jet (window `F·duration`, rate
 /// held) instead of the raw fixed `dose.duration`, and injects the same per-cycle

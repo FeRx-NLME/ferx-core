@@ -105,13 +105,12 @@ const N_DOSE_DECREASES: usize = 3;
 /// mismatch from a broken covariate hand-off would blow far past it.
 const SIGNAL_TOL: f64 = 0.02;
 
-/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs
-/// nightly, so without this a typo in `adaptive_vanco_renal.ferx` — which
-/// exercises the #700 time-varying-covariate adaptive surface — would slip past
-/// the per-PR job. `parse_full_model_file` runs the full `[adaptive_dosing]`
-/// `validate()`, so a successful parse plus these spot-checks pin the scenario the
-/// anchor relies on. In particular it pins that `auc_target` is **absent** (it is
-/// a typed error for a time-varying-covariate subject, #700).
+/// Fast guard: a typo in `adaptive_vanco_renal.ferx` — which exercises the #700
+/// time-varying-covariate adaptive surface — fails here, by name, rather than as a mismatch in
+/// the cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
+/// `validate()`, so a successful parse plus these spot-checks pin the scenario the anchor
+/// relies on. In particular it pins that `auc_target` is **absent** (it is a typed error for a
+/// time-varying-covariate subject, #700).
 #[test]
 fn vanco_renal_example_parses_and_pins_the_ladder() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal.ferx"))
@@ -143,10 +142,6 @@ fn vanco_renal_example_parses_and_pins_the_ladder() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + mrgsolve-anchored vanco renal-decline TDM titration (#700): opt in with --features slow-tests"
-)]
 fn vanco_renal_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal.ferx"))
         .expect("vanco renal model must parse");

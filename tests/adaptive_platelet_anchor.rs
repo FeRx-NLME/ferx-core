@@ -56,12 +56,11 @@ const REF_LADDER: [(f64, f64, f64); 10] = [
 /// Cross-solver platelet-signal band (x10^9/L); see the module note.
 const SIGNAL_TOL: f64 = 0.5;
 
-/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs
-/// nightly, so without this a typo in `adaptive_platelet_ladder.ferx` — which
-/// exercises new DSL surface, notably the one-sided `target_window = [100, inf]`
-/// — would slip past the per-PR job. `parse_full_model_file` runs the full
-/// `[adaptive_dosing]` `validate()`, so a successful parse plus these spot-checks
-/// pin the ladder the anchor relies on.
+/// Fast guard: a typo in `adaptive_platelet_ladder.ferx` — which exercises new DSL surface,
+/// notably the one-sided `target_window = [100, inf]` — fails here, by name, rather than as a
+/// mismatch in the cross-engine check below. `parse_full_model_file` runs the full
+/// `[adaptive_dosing]` `validate()`, so a successful parse plus these spot-checks pin the
+/// ladder the anchor relies on.
 #[test]
 fn platelet_example_parses_and_pins_the_ladder() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_platelet_ladder.ferx"))
@@ -85,10 +84,6 @@ fn platelet_example_parses_and_pins_the_ladder() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + mrgsolve-anchored platelet ladder (#391 S2.5a): opt in with --features slow-tests"
-)]
 fn platelet_ladder_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_platelet_ladder.ferx"))
         .expect("platelet model must parse");

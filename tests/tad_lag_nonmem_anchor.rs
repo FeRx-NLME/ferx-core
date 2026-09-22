@@ -218,10 +218,6 @@ fn run_anchor(data: &str, nonmem_ofv: f64, tolerance: f64) {
 /// dose-event saltation — the gradient is already wrong at the first observation,
 /// before any second dose exists — so one dose genuinely exercises it.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored TAD×lagtime (#1070) acceptance: opt in with --features slow-tests"
-)]
 fn tad_lag_single_dose_matches_nonmem() {
     // A has no `MTIME`; 1e-3 still rejects its pre-#1070 delta of 0.176 by 100x.
     run_anchor("data/tad_lag_A.csv", -271.990, 1e-3);
@@ -231,10 +227,6 @@ fn tad_lag_single_dose_matches_nonmem() {
 /// behaviour from the single-dose case, and one that lands strictly inside a
 /// record-to-record interval.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored TAD×lagtime (#1070) acceptance: opt in with --features slow-tests"
-)]
 fn tad_lag_two_dose_matches_nonmem() {
     // B carries the control stream's systematic 0.032; 0.06 rejects its pre-#1070
     // delta of 0.107 while leaving room for unrelated numerical drift.
