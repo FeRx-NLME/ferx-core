@@ -4491,11 +4491,16 @@ fn subject_analytic_outer_gradient_iov(
 ///   and is served at its EBE, where they no longer coincide — so a zero-η probe reports
 ///   an FD fallback for a subject that never took one (PR #1418 review, finding 1).
 /// - **The outer *assembly* declines away from the mode for a second reason.**
-///   `prepare_stacked` needs the true inner Hessian to be positive-definite
-///   (`h_inner.cholesky()?`), which holds at the EBE and routinely fails elsewhere:
+///   `prepare_stacked` needs the true inner Hessian `H` to be positive-definite
+///   (`invert_inner_hessian`), which holds at the EBE and routinely fails elsewhere:
 ///   measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv`, 4 of the 10
 ///   subjects (ids 2, 4, 7, 10) fail exactly that Cholesky at `η = 0` while the provider
-///   serves all 10 and all 10 are analytic at their EBEs.
+///   serves all 10 and all 10 are analytic at their EBEs. That gate is a *precondition*
+///   detector rather than a matrix-shape check — see `invert_inner_hessian` for why
+///   widening it to nonsingular (#1513) is wrong and what it measures — but for this
+///   function's purposes the consequence is the same: a zero-η probe would announce four
+///   fallbacks that a fit serving these subjects at their EBEs never takes. Pinned by
+///   `sens_outer_gradient::tests::warfarin_zero_eta_non_pd_subjects_decline_and_their_ebes_do_not`.
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
