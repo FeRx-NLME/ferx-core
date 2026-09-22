@@ -726,6 +726,45 @@ pub(crate) fn format_regularized_warning(facts: &CovRegularizationFacts) -> Stri
     msg
 }
 
+/// The note for cross-partial stencils that returned `NaN`/`Inf`, worded for the route that
+/// produced the Hessian (#1514 review §1).
+///
+/// What survives in the matrix is route-dependent, and the difference is the whole content of
+/// the sentence:
+///
+/// * **Whole-population stencil** — the cross-partial *is* the stencil, so a non-finite result
+///   leaves the entry at its zero initialisation. Correlation between the named parameters is
+///   wholly absent.
+/// * **Hybrid** (#1514) — the entry already holds the in-scope subjects' cross-partial,
+///   assembled analytically, and the stencil's contribution is added to it. Only the declined
+///   subjects' share of that cross-partial is missing. Saying "set to 0" there overstates the
+///   damage and points the reader at the wrong quantity.
+///
+/// Both wordings keep the `off-diagonal FD stencil` token that `classify_warning` keys
+/// `WarningCode::CovarianceRegularized` on, and both keep the `fd_hessian_step` advice, which
+/// is the actionable half and is true on either route — the stencil that failed is a stencil
+/// either way.
+///
+/// [`CovHessianSource::AnalyticRMatrix`] shares the whole-population wording and is
+/// unreachable: no stencil runs on that route, so there are no non-finite cross-partials to
+/// name. It is written out rather than left to a catch-all so that a future fourth route has
+/// to choose.
+pub(crate) fn format_offdiag_nan_warning(names: &str, source: CovHessianSource) -> String {
+    match source {
+        CovHessianSource::HybridRMatrix => format!(
+            "Covariance step: off-diagonal FD stencil(s) non-finite for {names}. \
+             Those cross-partials keep only the analytically assembled subjects' \
+             contribution — the finite-differenced subjects' share of them is missing — so \
+             SE for these parameter(s) may be over-optimistic. Try tuning fd_hessian_step."
+        ),
+        CovHessianSource::FdStencil | CovHessianSource::AnalyticRMatrix => format!(
+            "Covariance step: off-diagonal FD stencil(s) non-finite for {names}. \
+             Cross-partial correlation set to 0; SE for these parameter(s) \
+             may be over-optimistic. Try tuning fd_hessian_step."
+        ),
+    }
+}
+
 /// How many salvaged subject ids the message prints before it summarises the rest.
 ///
 /// The list is a *pointer*, not a record: a user who wants all of them reads the model's scope

@@ -6463,9 +6463,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("w_cov_analytic_salvage") {
         // #1514: the covariance step assembled the exact analytic R-matrix for most of the
         // population and finite-differenced the terms of the subjects outside its scope.
-        // Informational — the matrix is complete and the estimates are unchanged — so it
-        // shares `CovarianceStep` with the other cost/route notes rather than claiming
-        // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
+        // Informational — the information matrix is complete and the estimates and OFV are
+        // unchanged — so it shares `CovarianceStep` with the other cost/route notes rather
+        // than claiming `CovarianceRegularized`, which asserts the eigenvalue floor fired.
+        // Not "nothing changed": the salvaged subjects' terms come off a different estimator,
+        // so the standard errors move slightly, which is the reason the note is emitted.
         //
         // Matched on its own `W_` token and placed with the other token arms, ahead of every
         // prose one: the message says "covariance step" and names a subject count, which the

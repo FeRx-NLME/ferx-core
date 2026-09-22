@@ -6,8 +6,8 @@
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
 use crate::estimation::cov_diagnostics::{
-    format_regularized_warning, format_salvage_note, CovHessianSource, CovRegularizationFacts,
-    CovScopeDecline, OdeToleranceFacts,
+    format_offdiag_nan_warning, format_regularized_warning, format_salvage_note, CovHessianSource,
+    CovRegularizationFacts, CovScopeDecline, OdeToleranceFacts,
 };
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -1500,15 +1500,19 @@ pub(crate) fn compute_covariance(
     let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
     cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
 
-    // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate
-    // cause labels — post-hoc checks on `hess` would always read 0 (finite) because
-    // non-finite FD results are never stored (only the zero initialisation remains).
+    // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate cause labels:
+    // a non-finite stencil result is never stored, so the entry keeps whatever was already
+    // there — the zero initialisation on the population-stencil route, the in-scope subjects'
+    // analytic term on the hybrid one — and a post-hoc check on `hess` would read that as
+    // genuine curvature (or, on the FD route, as a flat objective) either way.
     let mut problem_params: Vec<String> = Vec::new();
     for &i in &free_idx {
         let diag = hess[(i, i)];
         if fd_diag_nan.contains(&i) {
-            // Diagonal FD stencil overflowed; zero stored value does not mean flat
-            // objective. Adjust fd_hessian_step or check for model overflow.
+            // The diagonal stencil overflowed, so this coordinate's curvature is incomplete
+            // whatever `hess` now reads. Fatal on both routes — reported here and turned into
+            // an `Unusable` below — because a diagonal is what every SE divides through.
+            // Adjust fd_hessian_step or check for model overflow.
             problem_params.push(format!(
                 "{} (FD stencil non-finite; model may overflow at perturbation — \
                  try tuning fd_hessian_step)",
@@ -1724,9 +1728,11 @@ pub(crate) fn compute_covariance(
         eprintln!("  Covariance step successful");
     }
 
-    // Soft warning: cross-partial FD stencils that returned NaN/Inf were stored as 0,
-    // so off-diagonal correlation is missing for these parameters. SEs for the named
-    // parameters may be over-optimistic (correlation with other parameters is absent).
+    // Soft warning: cross-partial stencils that returned NaN/Inf contributed nothing, so some
+    // off-diagonal correlation is missing for these parameters and their SEs may be
+    // over-optimistic. *How much* is missing depends on the route — the whole cross-partial on
+    // the population stencil, only the declined subjects' share of it on the hybrid — so the
+    // sentence is built from `source` rather than stated once (#1514 review §1).
     if !fd_offdiag_nan.is_empty() {
         // Sort by packed index so the warning message is deterministic regardless
         // of HashSet iteration order.
@@ -1736,12 +1742,7 @@ pub(crate) fn compute_covariance(
             .iter()
             .map(|&i| packed_param_label(i, template))
             .collect();
-        let msg = format!(
-            "Covariance step: off-diagonal FD stencil(s) non-finite for {}. \
-             Cross-partial correlation set to 0; SE for these parameter(s) \
-             may be over-optimistic. Try tuning fd_hessian_step.",
-            names.join(", ")
-        );
+        let msg = format_offdiag_nan_warning(&names.join(", "), source);
         if options.verbose {
             eprintln!("  {}", msg);
         }

@@ -4759,6 +4759,62 @@ mod tests {
         worst
     }
 
+    /// The premise the off-diagonal warning describes (#1514 review §1): `fd_ofv_stencil`
+    /// never *stores* a non-finite result, so that entry keeps whatever the caller already had
+    /// there — the zero initialisation on the whole-population route, the in-scope subjects'
+    /// analytic cross-partial on the hybrid one. "Cross-partial correlation set to 0" is
+    /// therefore true on the first and false on the second, which is why the message is now
+    /// built from the route.
+    ///
+    /// Driven through the stencil directly with a synthetic objective, because no end-to-end
+    /// fixture overflows a *cross-partial* without also overflowing a diagonal — and a
+    /// non-finite diagonal is caught earlier and reported differently (`select_fd_step` halves
+    /// first, then `problem_params` makes it a hard `Unusable`). The objective here is
+    /// separately quadratic in each coordinate and `NaN` only when both are perturbed at once,
+    /// which is exactly that cell and nothing else.
+    #[test]
+    fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
+        use crate::estimation::covariance::fd_ofv_stencil;
+        use crate::types::FitOptions;
+
+        let ofv = |xv: &[f64]| -> f64 {
+            if xv[0] != 0.0 && xv[1] != 0.0 {
+                f64::NAN
+            } else {
+                xv[0] * xv[0] + 2.0 * xv[1] * xv[1]
+            }
+        };
+        let x = [0.0, 0.0];
+        let opts = FitOptions::default();
+        let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, &ofv, &opts)
+            .expect("nothing cancels in a test");
+
+        // The diagonals are unaffected — the fixture must fail the cross-partial *only*, or it
+        // would be testing the `Unusable` path instead of this one.
+        assert!(
+            stencil.diag_nan.is_empty(),
+            "the fixture must keep both diagonals finite: {:?}",
+            stencil.diag_nan
+        );
+        assert!(
+            (stencil.hess[(0, 0)] - 2.0).abs() < 1e-6,
+            "{}",
+            stencil.hess[(0, 0)]
+        );
+        assert!(
+            (stencil.hess[(1, 1)] - 4.0).abs() < 1e-6,
+            "{}",
+            stencil.hess[(1, 1)]
+        );
+
+        // Both coordinates are named, and the entry is left at its initial value rather than
+        // at some `NaN` that would poison the whole inverse.
+        let named: std::collections::HashSet<usize> = [0, 1].into_iter().collect();
+        assert_eq!(stencil.offdiag_nan, named);
+        assert_eq!(stencil.hess[(0, 1)], 0.0);
+        assert_eq!(stencil.hess[(1, 0)], 0.0);
+    }
+
     /// The premise the whole salvage rests on: the population's covariance stencil **is** the
     /// sum of the per-subject stencils. Only if that holds is a declining subject's term
     /// something that can be computed separately without changing any other subject's.

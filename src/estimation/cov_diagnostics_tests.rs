@@ -1084,6 +1084,50 @@ fn the_ode_tolerance_sentence_reaches_the_hybrid_route_too() {
 }
 
 #[test]
+fn the_offdiag_nan_warning_says_what_each_route_actually_lost() {
+    // #1514 review §1. `hess += stencil.hess` means a non-finite cross-partial leaves behind
+    // whatever was already in the entry, and that differs by route: the zero initialisation on
+    // the population stencil (correlation wholly absent), the in-scope subjects' analytic term
+    // on the hybrid (only the declined subjects' share missing). Both sides of the gate in one
+    // test, with each asserted *not* to carry the other's claim — split across two tests, a
+    // gate stuck on one branch would still pass half.
+    let names = "TVCL, TVV";
+    let fd = format_offdiag_nan_warning(names, CovHessianSource::FdStencil);
+    let hybrid = format_offdiag_nan_warning(names, CovHessianSource::HybridRMatrix);
+
+    assert!(fd.contains("Cross-partial correlation set to 0"), "{fd}");
+    assert!(!fd.contains("analytically assembled"), "{fd}");
+
+    assert!(
+        hybrid.contains("keep only the analytically assembled subjects' contribution"),
+        "{hybrid}"
+    );
+    assert!(
+        hybrid.contains("the finite-differenced subjects' share of them is missing"),
+        "{hybrid}"
+    );
+    // The false claim this fix exists to remove. On the hybrid route the entry is not zero.
+    assert!(!hybrid.contains("set to 0"), "{hybrid}");
+
+    // What both routes must keep, because it is true on both and it is the actionable half:
+    // the named parameters, the over-optimism, and the knob. Deleting any of the three from
+    // either arm reddens here.
+    for (label, msg) in [("fd", &fd), ("hybrid", &hybrid)] {
+        assert!(msg.contains(names), "{label}: {msg}");
+        assert!(msg.contains("may be over-optimistic"), "{label}: {msg}");
+        assert!(msg.contains("Try tuning fd_hessian_step"), "{label}: {msg}");
+        // The token `classify_warning` keys on — a reworded message that dropped it would
+        // silently demote the warning out of `covariance_regularized`.
+        let entry = classify_warning(msg);
+        assert_eq!(
+            entry.category,
+            WarningCode::CovarianceRegularized,
+            "{label}: {msg}"
+        );
+    }
+}
+
+#[test]
 fn the_salvage_note_is_absent_when_nothing_was_salvaged() {
     // The note's *presence* is the whole statement that the hybrid route ran, so the empty
     // cell has to be silent rather than say "0 of 10". Both degenerate inputs, because either
@@ -1168,10 +1212,12 @@ fn the_salvage_note_dedupes_ids_and_caps_the_list() {
 
 #[test]
 fn the_salvage_note_classifies_as_an_informational_covariance_note() {
-    // The note is a route report, not a degradation: the estimates and the covariance are the
-    // same object they would have been. `CovarianceRegularized` asserts the eigenvalue floor
-    // fired and would put a `Warning` next to numbers nothing is wrong with, so the
-    // classification is pinned here, next to the text it is keyed on.
+    // The note is a route report, not a degradation: the information matrix is complete and
+    // the estimates and OFV are untouched. (The covariance itself does move a little — the
+    // salvaged subjects' terms come off a different estimator — which is why the note exists
+    // at all.) `CovarianceRegularized` asserts the eigenvalue floor fired, which is a
+    // different and more serious claim, so the classification is pinned here, next to the text
+    // it is keyed on.
     let note = format_salvage_note(&["3"], 10).expect("one salvaged subject");
     let entry = classify_warning(&note);
     assert_eq!(entry.category, WarningCode::CovarianceStep);
