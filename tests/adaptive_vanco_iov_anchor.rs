@@ -124,15 +124,15 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
     }
 }
 
-/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs
-/// nightly, so without this a typo in `adaptive_vanco_iov.ferx` — which exercises
-/// the #701 IOV adaptive surface — would slip past the per-PR job.
+/// Fast guard: a typo in `adaptive_vanco_iov.ferx` — which exercises the #701 IOV
+/// adaptive surface — fails here, by name, rather than as a mismatch in the
+/// cross-engine check below.
 /// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, so a
 /// successful parse plus these spot-checks pin the scenario the anchor relies on:
 /// exactly one κ (the IOV effect), the trough control law, and that `auc_target` is
 /// **absent** (it is a typed error for an IOV subject, #701). A short seeded run of
 /// the reactive driver then confirms it is `Ok` — the default frozen-replay verifier
-/// validating the realized run — without waiting for the nightly cross-check.
+/// validating the realized run — before the cross-engine check runs.
 #[test]
 fn vanco_iov_example_parses_and_runs_the_verifier() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
@@ -190,16 +190,12 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
     assert_eq!(res.ledger.len(), 14, "every decision issued a dose");
 }
 
-/// Slow + mrgsolve-anchored. Runs the ferx reactive driver live at `ANCHOR_SEED`
+/// mrgsolve-anchored, on every PR (#1132). Runs the ferx reactive driver live at `ANCHOR_SEED`
 /// (which draws the exact per-occasion κ the R kit injects), then asserts every
 /// per-decision trough matches the frozen mrgsolve trough within the cross-solver
 /// band and every realized dose matches the frozen ladder — the dose-for-dose IOV
 /// occasion → CL → trajectory cross-check against an independent engine.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + mrgsolve-anchored vanco IOV (per-occasion κ) TDM titration (#701): opt in with --features slow-tests"
-)]
 fn vanco_iov_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
         .expect("vanco IOV model must parse");

@@ -80,9 +80,9 @@ const SIGNAL_TOL: f64 = 0.02;
 const REF_AUC_IN_BAND: usize = 8;
 const REF_AUC_WINDOWS: usize = 13;
 
-/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs
-/// nightly, so without this a typo in `adaptive_vanco_auc.ferx` — which exercises
-/// new DSL surface, notably the `auc_target` key — would slip past the per-PR job.
+/// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL
+/// surface, notably the `auc_target` key — fails here, by name, rather than as a
+/// mismatch in the cross-engine check below.
 /// `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, so a
 /// successful parse plus these spot-checks pin the scenario the anchor relies on.
 #[test]
@@ -112,10 +112,6 @@ fn vanco_example_parses_and_pins_the_scenario() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + mrgsolve-anchored vanco AUC-TDM titration (#391 S2.5b): opt in with --features slow-tests"
-)]
 fn vanco_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))
         .expect("vanco model must parse");

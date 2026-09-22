@@ -109,8 +109,8 @@
 //! C's own `#OBJV` is not comparable: its injected `t = 6.5` row carries a
 //! placeholder `DV`, so the stream exists for the `PRED` comparison, not a fit.
 //!
-//! Tier 3: an ODE evaluation over eight subjects; gated for **runtime**, not because
-//! it runs a convergence loop (`maxiter = 0`).
+//! Tier 2: an ODE evaluation over eight subjects at fixed parameters (`maxiter = 0`),
+//! not a convergence loop, so it runs on every PR (~10 s under `ci-cov`, #1132).
 
 use std::path::PathBuf;
 
@@ -147,10 +147,6 @@ const NM_OBJV_CONTROL: f64 = -415.644_109_023_425_07;
 const NM_OBJV_MULTIDOSE: f64 = -459.772_591_872_574_08;
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
 fn ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change() {
     let ofv = ferx_ofv("tvcov_lag_saltation.csv");
     let delta = (ofv - NM_OBJV_SINGLE).abs();
@@ -162,10 +158,6 @@ fn ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
 fn ferx_matches_nonmem_when_the_dose_row_and_the_next_record_agree() {
     // The control for the B/C divergence documented above: same multi-dose geometry,
     // but the dose row carries the next record's covariate value, so the interval
@@ -201,10 +193,6 @@ fn ferx_pred_at(data: &str, subject_id: &str, time: f64) -> f64 {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
 fn ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change_mid_regimen() {
     // #1073: the discriminating cell. One number apart from the control above — the
     // `t = 6` dose row carries `WT = 150` while the record after it carries 75 — so
@@ -225,10 +213,6 @@ fn ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change_mid_regi
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
 fn a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction() {
     // C, asserted as an invariance rather than against its own `#OBJV` (the injected
     // `t = 6.5` row carries a placeholder `DV`, so that number is meaningless).

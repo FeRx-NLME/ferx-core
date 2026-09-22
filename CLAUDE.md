@@ -232,6 +232,8 @@ fn test_my_new_estimator() { ... }
 
 These run nightly via `slow-tests.yml` and on any push to `main` that touches estimation code. Fast-failing tests (those that call `fit()` but expect an immediate `Err`) do not need gating.
 
+**The gate marks a fit to convergence, not a test that looks like one.** An anchor that evaluates once — a ferx run compared against a frozen mrgsolve table, a NONMEM objective at `maxiter = 0` — is Tier 2 and is **not** gated, however slow its oracle was to produce. The adaptive mrgsolve anchors and the `tad_lag` / `ss_lagtime_edge` / `tvcov_lag_saltation` NONMEM anchors run on every PR for this reason (#1132, 16.9 s total under `ci-cov`), and `tests/anchor_gating.rs` fails if a gate comes back.
+
 **Every new feature requires a test** at the appropriate tier. When adding a new parser pattern, fit option, estimator, or any public behaviour, add a corresponding test before considering the change done. Bug fixes should add a regression test that fails without the fix.
 
 **Every new feature requires a comparison with NONMEM output.** When adding an estimator, error model, structural model, or any behaviour that produces numerical results (estimates, OFV, residuals, diagnostics), validate it against equivalent NONMEM output and include the comparison — either in the feature's docs page (e.g. `docs/faq.qmd` or the relevant `docs/estimation/*.qmd`) or in the PR description.
