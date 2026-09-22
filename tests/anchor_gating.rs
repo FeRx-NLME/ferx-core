@@ -18,9 +18,9 @@
 //!   each has a `*_matches_mrgsolve` test with no `ignore` of any spelling on it — the
 //!   second half is what stops the first from being defeated by swapping the feature
 //!   gate for a plain `#[ignore]`;
-//! - **NONMEM family, by hand list** — the rule there is *runtime*, which a static test
-//!   cannot measure, so the list is sealed by the measured seconds next to each name
-//!   and grows only with a new measurement.
+//! - **NONMEM family, by hand list of tests** — the rule there is *runtime*, which a
+//!   static test cannot measure, so the list names individual tests, is sealed by the
+//!   measured seconds next to it, and grows only with a new measurement.
 
 use std::path::{Path, PathBuf};
 
@@ -30,24 +30,41 @@ fn tests_dir() -> PathBuf {
     p
 }
 
-/// The NONMEM anchors that evaluate at fixed parameters and run on every PR. Wall time
-/// of the whole binary, measured two ways on 2026-09-22 (#1132): locally under
-/// `--no-default-features --features ci --profile ci-cov`, idle macOS; and in the
-/// `Tests + coverage (core)` job of PR #1518 (ubuntu runner, llvm-cov instrumented).
-/// The CI column is the one that costs PR time — it is 6–22x the local one.
+/// The NONMEM anchor **tests** that evaluate at fixed parameters and run on every PR,
+/// by `(binary, fn)`. Measured 2026-09-22 (#1132, PR #1518): each test alone, locally
+/// under `--no-default-features --features ci --profile ci-cov`; and the binary in the
+/// llvm-instrumented `Tests + coverage (core)` job, which is 6–22x the local time and
+/// is what costs PR time.
 ///
-/// | binary | local | CI | why it is one evaluation |
-/// |---|---|---|---|
-/// | `tad_lag_nonmem_anchor` | 1.0 s | 21.1 s | `outer_maxiter: 0` in the test's `FitOptions` |
-/// | `ss_lagtime_edge_nonmem_anchor` | 5.2 s | 45.2 s | `maxiter = 0` in `ss_lag_iv_fit.ferx` |
-/// | `tvcov_lag_saltation_nonmem_anchor` | 10.4 s | 61.2 s | `maxiter = 0` in `tvcov_lag_saltation_fit.ferx` |
+/// | binary | local, per test | why it is one evaluation |
+/// |---|---|---|
+/// | `tad_lag_nonmem_anchor` | 0.52 s, 0.59 s (CI 21 s) | `outer_maxiter: 0` in `FitOptions` |
+/// | `tvcov_lag_saltation_nonmem_anchor` | 1.22 s, 0.91 s, 0.1 s | `maxiter = 0` in the `.ferx` |
 ///
-/// Add a name here only with its measured CI time. A NONMEM anchor that runs real
-/// fits (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
-const PER_PR_NONMEM_ANCHORS: [&str; 3] = [
-    "tad_lag_nonmem_anchor",
-    "ss_lagtime_edge_nonmem_anchor",
-    "tvcov_lag_saltation_nonmem_anchor",
+/// Kept nightly on purpose, each with the measurement behind it: `tvcov_lag_saltation`'s
+/// single-dose A (10.04 s alone, 61 s in CI; reintroducing #1060 also reddens the control
+/// D and 17 `sens::` unit tests), and `ss_lagtime_edge`'s two objective anchors (45 s in
+/// CI; its nine pointwise PRED anchors run per-PR on the same convention). Add a test
+/// here only with its measured CI time. A NONMEM anchor that runs real fits
+/// (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
+const PER_PR_NONMEM_ANCHOR_TESTS: [(&str, &str); 5] = [
+    (
+        "tad_lag_nonmem_anchor",
+        "tad_lag_single_dose_matches_nonmem",
+    ),
+    ("tad_lag_nonmem_anchor", "tad_lag_two_dose_matches_nonmem"),
+    (
+        "tvcov_lag_saltation_nonmem_anchor",
+        "ferx_matches_nonmem_when_the_dose_row_and_the_next_record_agree",
+    ),
+    (
+        "tvcov_lag_saltation_nonmem_anchor",
+        "ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change_mid_regimen",
+    ),
+    (
+        "tvcov_lag_saltation_nonmem_anchor",
+        "a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction",
+    ),
 ];
 
 /// Source with `//` lines removed: a file that *describes* a cfg does not compile one.
@@ -161,13 +178,25 @@ fn adaptive_anchors_have_an_unignored_mrgsolve_comparison() {
 }
 
 #[test]
-fn cheap_nonmem_anchors_compile_no_slow_tests_gate() {
-    for stem in PER_PR_NONMEM_ANCHORS {
+fn cheap_nonmem_anchor_tests_are_not_ignored() {
+    for (stem, test) in PER_PR_NONMEM_ANCHOR_TESTS {
         let path = tests_dir().join(format!("{stem}.rs"));
+        let blocks: Vec<_> = attribute_blocks_of(&read(&path), test)
+            .into_iter()
+            .filter(|(name, _)| name == test)
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "{path:?}: expected exactly one `fn {test}` — renamed or removed? Update \
+             PER_PR_NONMEM_ANCHOR_TESTS with a fresh CI measurement (#1132)"
+        );
+        let attrs = &blocks[0].1;
         assert!(
-            !uses_slow_tests_cfg(&read(&path)),
-            "{path:?} evaluates at fixed parameters and runs on every PR (#1132; measured \
-             time in PER_PR_NONMEM_ANCHORS); it carries a `slow-tests` gate"
+            attrs.contains("#[test]") && !attrs.contains("ignore"),
+            "{path:?}: `{test}` evaluates at fixed parameters and runs on every PR (#1132; \
+             measured time in PER_PR_NONMEM_ANCHOR_TESTS), but it is not an un-ignored \
+             `#[test]` (attributes: {attrs:?})"
         );
     }
 }

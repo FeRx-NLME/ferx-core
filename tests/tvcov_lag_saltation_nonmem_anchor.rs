@@ -109,8 +109,12 @@
 //! C's own `#OBJV` is not comparable: its injected `t = 6.5` row carries a
 //! placeholder `DV`, so the stream exists for the `PRED` comparison, not a fit.
 //!
-//! Tier 2: an ODE evaluation over eight subjects at fixed parameters (`maxiter = 0`),
-//! not a convergence loop, so it runs on every PR (#1132; ~10 s locally under `ci-cov`, 61 s in the instrumented CI job).
+//! Tier 2: ODE evaluations over eight subjects at fixed parameters (`maxiter = 0`), not
+//! a convergence loop. D, B and C run on every PR (#1132; ~2 s locally under `ci-cov`).
+//! A stays nightly: it alone is 10 s locally and ~60 s in the instrumented CI job, and
+//! it is the degenerate single-dose case — reintroducing #1060 (post-arrival side read
+//! from the dose row) also reddens D, by 5.07 OFV against the 0.5 tolerance, and 17
+//! `sens::` unit tests, so the per-PR set still sees the defect it was written for.
 
 use std::path::PathBuf;
 
@@ -147,6 +151,10 @@ const NM_OBJV_CONTROL: f64 = -415.644_109_023_425_07;
 const NM_OBJV_MULTIDOSE: f64 = -459.772_591_872_574_08;
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "~60 s in the instrumented CI job; #1060 is also caught per-PR by the multi-dose control (#1132): opt in with --features slow-tests"
+)]
 fn ferx_matches_nonmem_when_a_lagged_arrival_crosses_a_covariate_change() {
     let ofv = ferx_ofv("tvcov_lag_saltation.csv");
     let delta = (ofv - NM_OBJV_SINGLE).abs();

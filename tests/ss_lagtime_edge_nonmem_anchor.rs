@@ -87,8 +87,9 @@
 //!
 //! Tier 1/2 by construction: these are `predict()` evaluations at fixed
 //! parameters, ~0.5 s in total, so they run on every PR and carry the diff's
-//! coverage. The objective anchors below evaluate once at `maxiter = 0` and run on every
-//! PR too (#1132; ~5 s locally under `ci-cov`, 45 s in the instrumented CI job).
+//! coverage. The two objective anchors below also evaluate once (`maxiter = 0`), but
+//! cost 45 s in the instrumented CI job (~5 s locally) for no convention the pointwise
+//! checks above do not already pin per-PR, so they stay nightly (#1132).
 
 use std::path::PathBuf;
 
@@ -377,6 +378,10 @@ const NM_OBJV_GE_II_FLATWT: f64 = -50.236_960_368_462_199;
 /// bolus geometry is anchored this way — the infusion dataset's ID 3 has no
 /// NONMEM-comparable answer, so its objective is not comparable either.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "45 s in the instrumented CI job; the pointwise PRED anchors above run per-PR on the same convention (#1132): opt in with --features slow-tests"
+)]
 fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_dosing_interval() {
     let ofv = ferx_ofv("ss_lag_iv_fit.ferx", "ss_lag_ge_ii.csv");
     assert!(
@@ -387,6 +392,10 @@ fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_dosing_interval() {
 
 /// The static-route twin of the above.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "45 s in the instrumented CI job; the pointwise PRED anchors above run per-PR on the same convention (#1132): opt in with --features slow-tests"
+)]
 fn ferx_objective_matches_nonmem_for_a_lagtime_past_the_interval_under_flat_covariates() {
     let ofv = ferx_ofv("ss_lag_iv_fit.ferx", "ss_lag_ge_ii_flatwt.csv");
     assert!(
