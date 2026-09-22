@@ -387,6 +387,8 @@ pub(crate) struct Prep {
     /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
     pub(crate) htilde_inv: DMatrix<f64>,
     /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
+    /// Cholesky when `H` is PD, full-pivot LU when it is only nonsingular — see
+    /// [`invert_inner_hessian`].
     pub(crate) h_inner_inv: DMatrix<f64>,
     /// `wⱼ = H̃⁻¹aⱼ`.
     pub(crate) w: Vec<DVector<f64>>,
@@ -1122,6 +1124,47 @@ pub(crate) fn score_core(
     })
 }
 
+/// Invert the exact inner Hessian `H` for the implicit-function derivative
+/// `dη̂/dζ = −H⁻¹M` (#1513).
+///
+/// Cholesky first. It is the cheaper factorization, it is the one every well-behaved
+/// subject takes, and taking it unchanged is what keeps a model with no declines
+/// bit-identical to the pre-fallback engine.
+///
+/// When it fails, `H` is **indefinite**, which is not the same as singular. `−H⁻¹M` is the
+/// derivative of the inner stationarity condition `∂l/∂η|η̂ = 0`; it needs `H` nonsingular,
+/// nothing more. The Cholesky was testing a strictly stronger property than the formula
+/// requires, and `H` carries the `∂L/∂f · ∂²f/∂η²` curvature term that the Gauss-Newton `H̃`
+/// drops, so indefiniteness at a sparse subject is routine rather than pathological. Each
+/// spurious decline cost one `subject_reconverged_fd_gradient` — `2·n_free` warm EBE
+/// re-solves for a single subject, measured at 0.786 s against 0.0054 s for an entire
+/// 55-subject analytic population gradient (#1513's cyclophosphamide profile, where 21 of
+/// 55 subjects declined and the fit ran 29.6 s → 7.1 s). Reproducible on a bundled model:
+/// `examples/one_cpt_transit.ferx` + `data/datsim_oral.csv` reported "16 of 100 subjects
+/// fell outside the analytic sensitivity provider's scope" and took 82 iterations / 197.9 s;
+/// with the fallback it declines none, takes 70 iterations / 176.7 s, and lands at
+/// OFV 1215.977131 against 1215.977110 (ΔOFV 2.1e-5).
+///
+/// So fall back to a full-pivot LU, which inverts exactly wherever the identity holds:
+/// nothing is approximated, nothing is substituted for `H`, and there is no second copy of
+/// the formula. A genuinely singular `H` still declines (`try_inverse` returns `None`) and
+/// still routes to the FD salvage.
+///
+/// **What this does not fix.** `−H⁻¹M` also assumes `∂l/∂η|η̂ = 0`, and a subject whose `H`
+/// is indefinite is by definition not at a minimum, so the precondition is generally
+/// violated wherever this fallback fires — most often at a blown-up line-search point. The
+/// FD salvage it replaces is no better there (measured: neither reproduces the other, and
+/// the disagreement tracks `‖∂l/∂η‖` subject by subject). The argument for the fallback is
+/// that it is exact where the identity holds and cheap where it does not, not that it
+/// rescues a broken precondition. `subject_analytic_outer_gradient`'s finiteness check
+/// remains the guard on what reaches the outer optimizer.
+fn invert_inner_hessian(h_inner: &DMatrix<f64>) -> Option<DMatrix<f64>> {
+    if let Some(chol) = h_inner.clone().cholesky() {
+        return Some(chol.inverse());
+    }
+    h_inner.clone().full_piv_lu().try_inverse()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_stacked(
     model: &CompiledModel,
@@ -1152,7 +1195,7 @@ pub(crate) fn prepare_stacked(
     )?;
 
     let htilde_inv = htilde.cholesky()?.inverse();
-    let h_inner_inv = h_inner.cholesky()?.inverse();
+    let h_inner_inv = invert_inner_hessian(&h_inner)?;
 
     let mut w: Vec<DVector<f64>> = Vec::with_capacity(n_obs);
     let mut q = vec![0.0f64; n_obs];
@@ -2097,8 +2140,9 @@ fn population_sum(
 /// [`per_subject_packed_gradients`] / [`per_subject_packed_gradients_iov`] via
 /// `population_gradient_sens_mixed`, which keeps the exact analytic gradient for
 /// in-scope, finite subjects and fills only the `None`/non-finite ones with a
-/// per-subject reconverged FD. So a transiently non-PD inner Hessian (e.g. a
-/// degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose `h_inner` cholesky fails)
+/// per-subject reconverged FD. So a subject the analytic path declines (e.g. a
+/// degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose `h_inner` is singular —
+/// merely indefinite is handled by `invert_inner_hessian`'s LU fallback, #1513)
 /// degrades **that subject** to FD, not the whole population.
 pub fn population_gradient_sens(
     model: &CompiledModel,

@@ -6478,3 +6478,265 @@ fn singular_omega_takes_the_dense_factorization() {
         "a singular Ω must take the dense factorization"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1513 — the inner-Hessian inverse needs `H` nonsingular, not positive-definite.
+// ---------------------------------------------------------------------------
+
+/// The `(model, params, subject)` triple the #1513 fixtures share: the bundled warfarin
+/// one-compartment oral model, three diagonal etas, five observation times.
+///
+/// `h_inner = Ω⁻¹ + Σⱼ (∂²L/∂f² aⱼaⱼᵀ + ∂L/∂f Aⱼ)` carries the second term — the residual
+/// times the prediction curvature — that the Gauss-Newton `H̃` drops. Away from the EBE
+/// that term can dominate and flip an eigenvalue negative; the etas below are chosen to
+/// straddle exactly that, and each fixture asserts which side it is on rather than
+/// assuming it.
+fn hinner_fixture() -> (CompiledModel, ModelParameters, Subject) {
+    let model = parse_model_string(WARFARIN).expect("parse");
+    let theta = model.default_params.theta.clone();
+    let params = params_with_omega(&model, &theta, &[0.09, 0.04, 0.30]);
+    let subject = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 6.0, 24.0]);
+    (model, params, subject)
+}
+
+/// `h_inner` at `eta`, via the production assembly.
+fn hinner_at(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    subject: &Subject,
+    eta: &[f64],
+) -> DMatrix<f64> {
+    let sens = crate::sens::provider::subject_sensitivities(model, subject, &params.theta, eta)
+        .expect("warfarin is in analytic scope");
+    score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta,
+        model.residual_error_eta,
+    )
+    .expect("score_core serves this subject")
+    .h_inner
+}
+
+/// The eta with an **indefinite** `h_inner` (min eigenvalue −0.1495, det −2.60e3,
+/// symmetric condition number 1.3e3 — nonsingular and well-conditioned, just not PD).
+const HINNER_INDEFINITE_ETA: [f64; 3] = [0.9, 0.0, 1.2];
+/// The same subject at an eta where `h_inner` is **PD**, for the fast-path twin.
+const HINNER_PD_ETA: [f64; 3] = [0.1, -0.05, 0.15];
+
+/// The gate this change moves, asserted as a straddle rather than assumed: the two
+/// fixture etas must land on **opposite** sides of `h_inner.cholesky()`. Without this,
+/// the pair below silently degenerates to two copies of the same case — the
+/// [`hinner_indefinite_is_inverted_exactly`] "reaches the fallback" claim and the
+/// [`hinner_pd_fast_path_is_bit_identical`] "takes the Cholesky" claim would both be
+/// vacuous if the fixture drifted onto one side.
+#[test]
+fn hinner_fixture_etas_straddle_the_cholesky_gate() {
+    let (model, params, subject) = hinner_fixture();
+
+    let indef = hinner_at(&model, &params, &subject, &HINNER_INDEFINITE_ETA);
+    let ev = indef.clone().symmetric_eigenvalues();
+    let min_ev = ev.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_ev = ev.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        ev.iter().all(|v| v.is_finite()),
+        "eigenvalues must be finite before they are compared: {ev:?}"
+    );
+    assert!(
+        min_ev < 0.0,
+        "the indefinite fixture must have a negative eigenvalue, got min {min_ev:.6e}"
+    );
+    assert!(
+        indef.clone().cholesky().is_none(),
+        "an indefinite h_inner must fail the Cholesky — that is the gate under test"
+    );
+    // Nonsingular and well-conditioned: the LU fallback is being asked for an ordinary
+    // inverse, not to paper over a rank deficiency. Measured 1.336e3; 1e6 is three decades
+    // of headroom against fixture drift, and still fails if the matrix goes near-singular.
+    let cond = (max_ev.abs() / min_ev.abs()).max(min_ev.abs() / max_ev.abs());
+    assert!(
+        cond < 1e6,
+        "indefinite fixture must stay well-conditioned, got condition number {cond:.3e}"
+    );
+
+    let pd = hinner_at(&model, &params, &subject, &HINNER_PD_ETA);
+    assert!(
+        pd.clone().cholesky().is_some(),
+        "the PD fixture must pass the Cholesky — that is the other side of the gate"
+    );
+}
+
+/// The regression #1513 exists to catch: `prepare_stacked` used to return `None` for
+/// **every** indefinite `h_inner`, sending the subject to `subject_reconverged_fd_gradient`
+/// (`2·n_free` warm EBE re-solves — measured 0.786 s against 0.0054 s for an entire
+/// 55-subject analytic population gradient). `−H⁻¹M` needs `H` nonsingular; the Cholesky
+/// tested a strictly stronger property.
+///
+/// The assertion is `H⁻¹H = I`, which is a closed form, not a tolerance against a second
+/// engine — and it is what kills each rejected variant as well as the no-fallback
+/// mutation: `abseig`, `clip` and `htilde` all substitute a *different* matrix for `H`, so
+/// none of them reproduces the identity.
+#[test]
+fn hinner_indefinite_is_inverted_exactly() {
+    let (model, params, subject) = hinner_fixture();
+    let eta = HINNER_INDEFINITE_ETA;
+    let h = hinner_at(&model, &params, &subject, &eta);
+
+    let sens = crate::sens::provider::subject_sensitivities(&model, &subject, &params.theta, &eta)
+        .expect("warfarin is in analytic scope");
+    let prep = prepare(&model, &subject, &params, &sens, &eta)
+        .expect("an indefinite-but-nonsingular h_inner must not decline the subject (#1513)");
+
+    let resid = &prep.h_inner_inv * &h - DMatrix::<f64>::identity(model.n_eta, model.n_eta);
+    let worst = resid.iter().fold(0.0f64, |acc, v| {
+        assert!(v.is_finite(), "H⁻¹H must be finite, got {v}");
+        acc.max(v.abs())
+    });
+    // Measured worst |(H⁻¹H − I)| = 1.78e-15 on this fixture (n_eta = 3, condition number
+    // 1.3e3). 1e-10 is that with five decades of headroom; a substituted matrix — the
+    // rejected `abseig`/`clip`/`htilde` variants — misses by O(1) along the flipped
+    // eigenvector, so the bound discriminates by 10 orders of magnitude, not by tuning.
+    assert!(
+        worst < 1e-10,
+        "the LU fallback must invert h_inner exactly; worst |H⁻¹H − I| = {worst:.3e}"
+    );
+}
+
+/// The fast path is unchanged, **bit for bit**. A model whose subjects are all PD at their
+/// EBEs — which is the common case, and the reason the cyclophosphamide/clofarabine
+/// measurements in #1513 show one model moving and the other byte-identical — must produce
+/// the same `h_inner_inv` as before the fallback existed. Inverting unconditionally by LU
+/// would pass every tolerance-based check in this file and redden only this one.
+#[test]
+fn hinner_pd_fast_path_is_bit_identical() {
+    let (model, params, subject) = hinner_fixture();
+    let h = hinner_at(&model, &params, &subject, &HINNER_PD_ETA);
+    let reference = h
+        .clone()
+        .cholesky()
+        .expect("the PD fixture passes the Cholesky")
+        .inverse();
+
+    let actual = invert_inner_hessian(&h).expect("a PD h_inner is invertible");
+    for (a, r) in actual.iter().zip(reference.iter()) {
+        assert_eq!(
+            a.to_bits(),
+            r.to_bits(),
+            "the PD fast path must stay bit-identical to the plain Cholesky inverse"
+        );
+    }
+}
+
+/// The fallback inverts against arithmetic, not against itself: a hand-written indefinite
+/// matrix with a closed-form inverse. `H = [[1, 2], [2, 1]]` has eigenvalues `3` and `−1`
+/// (so no Cholesky) and `det = −3`, giving `H⁻¹ = [[−1, 2], [2, −1]]/3` exactly.
+#[test]
+fn invert_inner_hessian_matches_the_closed_form_on_an_indefinite_matrix() {
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
+    assert!(
+        h.clone().cholesky().is_none(),
+        "this fixture must fail the Cholesky, or it exercises the fast path instead"
+    );
+    let inv = invert_inner_hessian(&h).expect("det = −3 ≠ 0, so H is invertible");
+    let third = 1.0 / 3.0;
+    let expected = DMatrix::from_row_slice(2, 2, &[-third, 2.0 * third, 2.0 * third, -third]);
+    for (a, e) in inv.iter().zip(expected.iter()) {
+        assert!(a.is_finite(), "the LU inverse must be finite, got {a}");
+        approx::assert_relative_eq!(a, e, max_relative = 1e-14);
+    }
+}
+
+/// A **singular** `H` still declines. The LU fallback widens the gate from
+/// positive-definite to nonsingular and no further — `−H⁻¹M` does not exist here, so the
+/// subject must keep routing to the FD salvage rather than being handed an inverse that
+/// does not exist.
+#[test]
+fn invert_inner_hessian_declines_a_singular_matrix() {
+    // Rank 1: row 2 = 2·row 1. Symmetric, det = 0, and not PD either — so a Cholesky-only
+    // gate and a nonsingularity gate agree on this one, which is the point.
+    let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 4.0]);
+    assert!(h.clone().cholesky().is_none(), "singular is not PD");
+    assert!(
+        invert_inner_hessian(&h).is_none(),
+        "a singular h_inner must still decline to the FD salvage"
+    );
+}
+
+/// The same widening, reached through the production `prepare` entry point on the bundled
+/// `examples/warfarin.ferx` + `data/warfarin.csv` rather than on a hand-placed eta — the
+/// population-level twin of [`hinner_indefinite_is_inverted_exactly`].
+///
+/// `outer_optimizer`'s `outer_fd_fallback_warning` records this exact configuration:
+/// subjects 2, 4, 7 and 10 fail `h_inner.cholesky()` at `η = 0` (they are PD at their
+/// EBEs), and before #1513 each of the four declined the analytic assembly there and cost a
+/// `subject_reconverged_fd_gradient`. All four are indefinite, none is singular, so all
+/// four must now be served.
+///
+/// The straddle is asserted, not assumed: the test fails if no subject fails the Cholesky
+/// (the fixture would then be exercising the fast path and could not observe the change) as
+/// well as if any subject still declines.
+#[test]
+fn warfarin_zero_eta_non_pd_subjects_are_served_analytically() {
+    let src = std::fs::read_to_string("examples/warfarin.ferx").expect("bundled example");
+    let model = parse_model_string(&src).expect("parse");
+    let pop = crate::io::datareader::read_nonmem_csv(
+        std::path::Path::new("data/warfarin.csv"),
+        None,
+        None,
+    )
+    .expect("bundled dataset");
+    let params = model.default_params.clone();
+    let eta = vec![0.0; model.n_eta];
+
+    let mut non_pd = Vec::new();
+    let mut declined = Vec::new();
+    for s in &pop.subjects {
+        let sens = crate::sens::provider::subject_sensitivities(&model, s, &params.theta, &eta)
+            .expect("warfarin is in analytic scope for every subject");
+        let h = score_core(
+            &model,
+            s,
+            &params,
+            &sens,
+            model.n_eta,
+            &params.omega.inv,
+            &eta,
+            model.residual_error_eta,
+        )
+        .expect("score_core serves every warfarin subject")
+        .h_inner;
+        if h.clone().cholesky().is_none() {
+            let ev = h.symmetric_eigenvalues();
+            assert!(
+                ev.iter().all(|v| v.is_finite()),
+                "subject {} has a non-finite h_inner eigenvalue: {ev:?}",
+                s.id
+            );
+            // Indefinite, not singular — the distinction the whole change rests on.
+            assert!(
+                ev.iter().cloned().fold(f64::INFINITY, f64::min) < 0.0,
+                "subject {}: a failed Cholesky here must mean a negative eigenvalue",
+                s.id
+            );
+            non_pd.push(s.id.clone());
+        }
+        if prepare(&model, s, &params, &sens, &eta).is_none() {
+            declined.push(s.id.clone());
+        }
+    }
+
+    assert_eq!(
+        non_pd,
+        ["2", "4", "7", "10"],
+        "the fixture must still reach a non-PD h_inner, or it cannot observe #1513"
+    );
+    assert!(
+        declined.is_empty(),
+        "an indefinite h_inner must no longer decline the analytic outer gradient (#1513); \
+         declined: {declined:?}"
+    );
+}
