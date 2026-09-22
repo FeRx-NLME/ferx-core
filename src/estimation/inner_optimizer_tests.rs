@@ -1,6 +1,13 @@
 #![allow(unexpected_cfgs)]
 
 use super::*;
+
+/// The objective-stall predicate for a test that exercises an *exact* objective: the
+/// historical `enable_stall = false`, spelled as the predicate the cores now take. A test
+/// that wants the stop on passes its own closure.
+fn never_stall(_: &[f64]) -> bool {
+    false
+}
 use approx::assert_relative_eq;
 use std::collections::HashMap;
 #[cfg(profiling_allocations)]
@@ -889,11 +896,33 @@ fn inner_solver_scaling_bench() {
         };
         let t_dense = time_it(&|x| {
             dense_bfgs_core(
-                &obj, &grad, x, n, 2000, 1e-8, None, None, None, false, false,
+                &obj,
+                &grad,
+                x,
+                n,
+                2000,
+                1e-8,
+                None,
+                None,
+                None,
+                &never_stall,
+                false,
             )
         });
-        let t_lbfgs =
-            time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false, false));
+        let t_lbfgs = time_it(&|x| {
+            lbfgs_core(
+                &obj,
+                &grad,
+                x,
+                n,
+                2000,
+                1e-8,
+                None,
+                None,
+                &never_stall,
+                false,
+            )
+        });
         eprintln!(
             "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
             t_dense / t_lbfgs
@@ -1138,7 +1167,17 @@ fn run_dense_scratch_fixture(n: usize, legacy: bool) -> (bool, Vec<u64>, u64, us
         legacy_dense_bfgs(&obj, &grad, &mut x, n, 200, 1e-10)
     } else {
         dense_bfgs_core(
-            &obj, &grad, &mut x, n, 200, 1e-10, None, None, None, false, false,
+            &obj,
+            &grad,
+            &mut x,
+            n,
+            200,
+            1e-10,
+            None,
+            None,
+            None,
+            &never_stall,
+            false,
         )
     };
     let final_objective = obj(&x).to_bits();
@@ -1341,7 +1380,17 @@ fn dense_bfgs_converges_on_quadratic() {
     let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
     let mut x = vec![0.0, 0.0];
     let ok = dense_bfgs_core(
-        &obj, &grad, &mut x, 2, 200, 1e-10, None, None, None, false, false,
+        &obj,
+        &grad,
+        &mut x,
+        2,
+        200,
+        1e-10,
+        None,
+        None,
+        None,
+        &never_stall,
+        false,
     );
     assert!(ok, "BFGS should report convergence");
     assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
@@ -1493,7 +1542,17 @@ fn rejected_hessian_seed_reproduces_the_unseeded_solve() {
         n_obj.set(0);
         let mut x = vec![0.0, 0.0];
         let ok = dense_bfgs_core(
-            &obj, &grad, &mut x, 2, 200, 1e-10, None, seed, None, false, false,
+            &obj,
+            &grad,
+            &mut x,
+            2,
+            200,
+            1e-10,
+            None,
+            seed,
+            None,
+            &never_stall,
+            false,
         );
         assert!(ok);
         (x, n_obj.get())
@@ -2780,4 +2839,112 @@ fn a_flip_flop_subject_stops_instead_of_falling_back_to_nelder_mead() {
         "the in-domain arm must still stop on stationarity, not on a plateau \
          (norm = {exact_gnorm:e})"
     );
+}
+
+/// The crossing case, found in review of PR #1521: a solve that **starts in domain and
+/// enters the flip-flop regime partway through the search**.
+///
+/// The first cut of this fix read the reroute once, at the solve's start point, so a
+/// subject whose `eta` walks across the abscissa mid-search kept the exact `gnorm < tol`
+/// criterion against an objective that had already become an RK45 integration — the very
+/// thing the fix exists to stop. Both of the earlier tests use cold starts that stay on
+/// their initial side of the boundary, so neither could see it.
+///
+/// Fixture: `KTR = (0+1)/24 = 0.041667`. At `TVCL = 4.0` the start point sits at
+/// `ke = 4.0/110 = 0.0364` — in domain — and the search walks `ETA_CL` to `+0.255`, where
+/// `ke = 0.0364 e^{0.255} = 0.0470 > KTR`. `TVCL = 4.5` (`ke_0 = 0.0409`, within 2% of the
+/// abscissa) is the tighter of the pair. Both were the reviewer's own reproduction.
+///
+/// | | `used_fallback` | returned `ETA_CL` |
+/// |---|---|---|
+/// | latched per-iterate gate (`TVCL = 4.0` / `4.5`) | `false` / `false` | 0.25499040 / 0.27412893 |
+/// | start-point gate only | **`true`** / **`true`** | 0.25499040 / 0.27412893 |
+///
+/// **`used_fallback` is the assertion that dies under that mutation; the `eta` bound does
+/// not** — the Nelder-Mead recovery returns the same point here, to 2e-16. The `eta` bound
+/// is therefore not a second kill but a guard on the cheaper exit: it pins that stopping on
+/// the stall instead of grinding to the budget did not move the answer, measured against a
+/// forced-stall-on reference. That reference is the same production `find_ebe` on the same
+/// model and theta, warm-started at `eta = [0.40, 0]` — already past the abscissa, asserted
+/// below — so its start-point gate is on from iteration 0 whatever the latch does.
+///
+/// Realised max-abs agreement against that reference: **3.708e-7** (`TVCL = 4.0`) and
+/// **2.660e-6** (`TVCL = 4.5`). The bound is `1e-5`: 3.8x headroom over the worse of the
+/// two. The residual is the two solves' different start points, not the stall policy.
+#[test]
+fn a_solve_that_crosses_the_flip_flop_abscissa_mid_search_still_stalls() {
+    let subject = flip_flop_transit_subject();
+    // Already past the abscissa at every `TVCL` below, so the reference solve has the stall
+    // stop on from its own start point.
+    let past_the_boundary = [0.40_f64, 0.0];
+
+    for tvcl in [4.0_f64, 4.5] {
+        let m = flip_flop_transit_model(tvcl, 110.0, 24.0, 0.0);
+        let p = m.default_params.clone();
+        let cold = vec![0.0; m.n_eta];
+
+        let res = find_ebe(&m, &subject, &p, 200, 1e-6, None, None, 0);
+
+        // The straddle, asserted so the fixture cannot silently stop crossing.
+        assert!(
+            !crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, &cold),
+            "TVCL = {tvcl}: fixture drift, the start point must be *in* the closed form's \
+             domain or this is not the crossing case"
+        );
+        assert!(
+            crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, res.eta.as_slice()),
+            "TVCL = {tvcl}: fixture drift, the solve must end *past* the abscissa \
+             (eta_hat = {:?})",
+            res.eta.as_slice()
+        );
+
+        assert!(
+            !res.used_fallback,
+            "TVCL = {tvcl}: a solve that entered the ODE regime mid-search still ran out of \
+             budget and recovered with Nelder-Mead; the stall policy did not follow the \
+             iterate (eta_hat = {:?})",
+            res.eta.as_slice()
+        );
+        assert!(
+            res.converged,
+            "TVCL = {tvcl}: the stall stop must terminate the solve"
+        );
+
+        // Forced-stall-on reference: same model, same theta, start already rerouted.
+        assert!(
+            crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, &past_the_boundary),
+            "TVCL = {tvcl}: fixture drift, the reference start must itself be rerouted or it \
+             is not a forced-stall-on run"
+        );
+        let forced = find_ebe(
+            &m,
+            &subject,
+            &p,
+            200,
+            1e-6,
+            Some(&past_the_boundary),
+            None,
+            0,
+        );
+        assert!(
+            !forced.used_fallback,
+            "TVCL = {tvcl}: the reference run is supposed to have the stall stop on throughout"
+        );
+        let worst = res
+            .eta
+            .iter()
+            .zip(forced.eta.iter())
+            .fold(0.0f64, |acc, (a, b)| {
+                assert!(
+                    a.is_finite() && b.is_finite(),
+                    "TVCL = {tvcl}: a non-finite eta cannot be folded into a max"
+                );
+                acc.max((a - b).abs())
+            });
+        assert!(
+            worst < 1e-5,
+            "TVCL = {tvcl}: the crossing solve landed {worst:e} from the forced-stall-on \
+             reference (realised on this fixture: 3.708e-7 and 2.660e-6)"
+        );
+    }
 }
