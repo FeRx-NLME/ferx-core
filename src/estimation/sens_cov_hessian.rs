@@ -2805,7 +2805,7 @@ mod tests {
     fn iov_cov_hessian_dispatch_preserves_joint_modes_and_method() {
         use crate::estimation::agq::{gauss_hermite, subject_grid_and_weights};
         use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
-        use crate::estimation::covariance::analytic_cov_hessian;
+        use crate::estimation::covariance::{analytic_cov_assembly, AnalyticCovAssembly};
         use crate::types::{EstimationMethod, FitOptions, Population};
         let (model, s2) = iov_cov_fixture(2, false);
         let (_, mut s1) = iov_cov_fixture(1, false);
@@ -2850,7 +2850,8 @@ mod tests {
                 interaction,
                 ..FitOptions::default()
             };
-            let actual = analytic_cov_hessian(&model, &pop, p, &x, &eta, &kap, &opts)
+            let actual = analytic_cov_assembly(&model, &pop, p, &x, &eta, &kap, &opts)
+                .full()
                 .expect("IOV route must be used");
             let mut expected = DMatrix::zeros(x.len(), x.len());
             for (s, b) in pop.subjects.iter().zip(&modes) {
@@ -2871,8 +2872,14 @@ mod tests {
                 actual, expected,
                 "the population route must sum the selected NLL Hessians with OFV scaling"
             );
+            // Every subject declines (no κ at all), so the full-decline short-circuit
+            // reports `Unavailable` — not `Partial` with both subjects salvaged. Asserted on
+            // the variant rather than through `full()`, which cannot tell the two apart.
             assert!(
-                analytic_cov_hessian(&model, &pop, p, &x, &eta, &[], &opts).is_none(),
+                matches!(
+                    analytic_cov_assembly(&model, &pop, p, &x, &eta, &[], &opts),
+                    AnalyticCovAssembly::Unavailable
+                ),
                 "missing joint modes must decline"
             );
         }
@@ -2882,8 +2889,14 @@ mod tests {
                 n_agq,
                 ..FitOptions::default()
             };
+            // `Unavailable`, specifically: the objective itself is the wrong one, so there
+            // is nothing here to salvage per subject. Distinguishing this from a
+            // per-subject decline is what the assembly enum bought (#1514).
             assert!(
-                analytic_cov_hessian(&model, &pop, p, &x, &eta, &kap, &opts).is_none(),
+                matches!(
+                    analytic_cov_assembly(&model, &pop, p, &x, &eta, &kap, &opts),
+                    AnalyticCovAssembly::Unavailable
+                ),
                 "IOV must not admit the exact-anchor Laplace covariance"
             );
         }
@@ -3355,7 +3368,7 @@ mod tests {
     /// multi-node FOCEI-AGQ. Exact-anchor Laplace remains a separate fourth-order problem.
     #[test]
     fn ode_cov_iov_m3_dispatch_matrix() {
-        use crate::estimation::covariance::analytic_cov_hessian;
+        use crate::estimation::covariance::{analytic_cov_assembly, AnalyticCovAssembly};
         use crate::types::{EstimationMethod, FitOptions, Population};
 
         let mut model = parse_model_string(ODE_IV_IOV_COV).expect("parse ODE IOV fixture");
@@ -3400,9 +3413,10 @@ mod tests {
                 interaction,
                 ..FitOptions::default()
             };
-            let h = analytic_cov_hessian(&model, &population, p, &x, &eta, &kappas, &opts)
+            let h = analytic_cov_assembly(&model, &population, p, &x, &eta, &kappas, &opts)
+                .full()
                 .expect("ODE IOV + M3 must stay on the analytic covariance route");
-            let h_reference = analytic_cov_hessian(
+            let h_reference = analytic_cov_assembly(
                 &reference,
                 &population,
                 &reference.default_params,
@@ -3411,6 +3425,7 @@ mod tests {
                 &reference_kappas,
                 &opts,
             )
+            .full()
             .expect("closed-form IOV + M3 reference must be analytic");
             assert_eq!((h.nrows(), h.ncols()), (x.len(), x.len()));
             assert!(h.iter().all(|v| v.is_finite()));
@@ -3430,7 +3445,10 @@ mod tests {
             ..FitOptions::default()
         };
         assert!(
-            analytic_cov_hessian(&model, &population, p, &x, &eta, &kappas, &laplace).is_none(),
+            matches!(
+                analytic_cov_assembly(&model, &population, p, &x, &eta, &kappas, &laplace),
+                AnalyticCovAssembly::Unavailable
+            ),
             "exact-anchor Laplace still needs fourth-order prediction derivatives"
         );
     }
@@ -3712,7 +3730,7 @@ mod tests {
 
     #[test]
     fn agq_cov_hessian_parallel_reduction_is_bit_identical() {
-        use crate::estimation::covariance::analytic_cov_hessian;
+        use crate::estimation::covariance::analytic_cov_assembly;
         use crate::types::{EstimationMethod, FitOptions, Population};
         let model = parse_model_string(WARFARIN).unwrap();
         let p = &model.default_params;
@@ -3749,7 +3767,11 @@ mod tests {
                 .num_threads(n)
                 .build()
                 .unwrap()
-                .install(|| analytic_cov_hessian(&model, &pop, p, &x, &eta, &[], &opts).unwrap())
+                .install(|| {
+                    analytic_cov_assembly(&model, &pop, p, &x, &eta, &[], &opts)
+                        .full()
+                        .unwrap()
+                })
         };
         assert_eq!(run(1), run(3));
     }
@@ -4491,7 +4513,7 @@ mod tests {
     #[test]
     fn analytic_cov_matches_the_fd_stencil_through_compute_covariance() {
         use crate::estimation::covariance::{
-            analytic_cov_hessian, compute_covariance, CovarianceStepResult,
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
         };
         use crate::types::{EstimationMethod, FitOptions, Population};
 
@@ -4532,16 +4554,10 @@ mod tests {
                 n_agq,
                 ..FitOptions::default()
             };
-            assert!(analytic_cov_hessian(
-                &model,
-                &population,
-                &params,
-                &x_hat,
-                &eta_hats,
-                &[],
-                &opts
-            )
-            .is_none());
+            assert!(matches!(
+                analytic_cov_assembly(&model, &population, &params, &x_hat, &eta_hats, &[], &opts),
+                AnalyticCovAssembly::Unavailable
+            ));
         }
         // M3 subjects remain on the analytic AGQ route.
         let mut censored_model = parse_model_string(WARFARIN).expect("parse");
@@ -4553,7 +4569,7 @@ mod tests {
             n_agq: 3,
             ..FitOptions::default()
         };
-        assert!(analytic_cov_hessian(
+        assert!(analytic_cov_assembly(
             &censored_model,
             &censored_population,
             &params,
@@ -4562,6 +4578,7 @@ mod tests {
             &[],
             &agq_opts
         )
+        .full()
         .is_some());
 
         let run = |analytic: bool, interaction: bool, n_agq: usize| -> DMatrix<f64> {
@@ -4578,7 +4595,7 @@ mod tests {
             };
             opts.verbose = false;
             if analytic {
-                assert!(analytic_cov_hessian(&model, &population, &params, &x_hat, &eta_hats, &[], &opts).is_some(),
+                assert!(analytic_cov_assembly(&model, &population, &params, &x_hat, &eta_hats, &[], &opts).full().is_some(),
                     "production dispatch must select analytic covariance: interaction={interaction}, n_agq={n_agq}");
             }
             match compute_covariance(
@@ -4660,6 +4677,757 @@ mod tests {
                  {worst:.3e}\nfd = {se_fd:?}\nan = {se_an:?}"
             );
         }
+    }
+
+    // ── #1514: the per-subject salvage ──────────────────────────────────────────────────
+
+    /// A population of `n` warfarin subjects whose observations differ, so no subject's
+    /// covariance term is a copy of another's — without that, "the sum equals the whole" is
+    /// satisfied by any implementation that multiplies one subject's term by `n`.
+    fn salvage_population(
+        model: &CompiledModel,
+        params: &ModelParameters,
+        n: usize,
+    ) -> crate::types::Population {
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0];
+        let subjects: Vec<Subject> = (0..n)
+            .map(|k| {
+                let mut s = warfarin_subject(model, &params.theta, &times);
+                s.id = format!("{k}");
+                for (j, y) in s.observations.iter_mut().enumerate() {
+                    *y *= 1.0 + 0.03 * k as f64 - 0.01 * (j % 3) as f64;
+                }
+                s
+            })
+            .collect();
+        crate::types::Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Force a **per-subject** analytic-covariance decline without touching the model: a
+    /// constant per-observation covariate snapshot makes `Subject::has_tv_covariates` true,
+    /// which routes the subject onto the event-driven walk and trips
+    /// [`CovScopeDecline::EventWalkSubject`] — one of the structural per-subject scope gates
+    /// #1514 exists for (and the family clofarabine's all-56 decline belongs to).
+    ///
+    /// The covariate is not referenced by the model and never varies, so the subject's
+    /// predictions — and therefore every reference value this is compared against — are
+    /// unchanged. The tests below assert that rather than assuming it.
+    fn force_per_subject_decline(subject: &mut Subject) {
+        let snap: HashMap<String, f64> = [("UNUSED_WT".to_string(), 70.0)].into_iter().collect();
+        subject.obs_covariates = vec![snap; subject.obs_times.len()];
+    }
+
+    /// Standard errors from a packed covariance, as a user reads them.
+    fn se_of(cov: &DMatrix<f64>) -> Vec<f64> {
+        (0..cov.nrows())
+            .map(|i| cov[(i, i)].max(0.0).sqrt())
+            .collect()
+    }
+
+    /// Worst relative difference between two SE vectors, over the coordinates that carry an SE.
+    ///
+    /// Asserts finiteness **before** folding rather than after: `f64::max` discards `NaN`
+    /// (`0.0f64.max(f64::NAN) == 0.0`), so a regression that made one coordinate's SE `NaN` —
+    /// the likeliest way to break a covariance route — would otherwise pass on the strength of
+    /// the coordinates that still worked.
+    fn worst_relative_se_diff(a: &[f64], b: &[f64], label: &str) -> f64 {
+        assert_eq!(a.len(), b.len(), "{label}: SE vectors must be comparable");
+        assert!(
+            a.iter().chain(b.iter()).all(|v| v.is_finite()),
+            "{label}: every SE must be finite before any of them are compared\na = {a:?}\nb = {b:?}"
+        );
+        let mut worst = 0.0f64;
+        let mut compared = 0usize;
+        for (x, y) in a.iter().zip(b.iter()) {
+            if *x > 1e-12 {
+                compared += 1;
+                worst = worst.max(((y - x) / x).abs());
+            }
+        }
+        assert!(
+            compared >= 3,
+            "{label}: only {compared} coordinate(s) carried a comparable SE — the bound below \
+             would be asserting almost nothing"
+        );
+        worst
+    }
+
+    /// The premise the off-diagonal warning describes (#1514 review §1): `fd_ofv_stencil`
+    /// never *stores* a non-finite result, so that entry keeps whatever the caller already had
+    /// there — the zero initialisation on the whole-population route, the in-scope subjects'
+    /// analytic cross-partial on the hybrid one. "Cross-partial correlation set to 0" is
+    /// therefore true on the first and false on the second, which is why the message is now
+    /// built from the route.
+    ///
+    /// Driven through the stencil directly with a synthetic objective, because no end-to-end
+    /// fixture overflows a *cross-partial* without also overflowing a diagonal — and a
+    /// non-finite diagonal is caught earlier and reported differently (`select_fd_step` halves
+    /// first, then `problem_params` makes it a hard `Unusable`). The objective here is
+    /// separately quadratic in each coordinate and `NaN` only when both are perturbed at once,
+    /// which is exactly that cell and nothing else.
+    #[test]
+    fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
+        use crate::estimation::covariance::fd_ofv_stencil;
+        use crate::types::FitOptions;
+
+        let ofv = |xv: &[f64]| -> f64 {
+            if xv[0] != 0.0 && xv[1] != 0.0 {
+                f64::NAN
+            } else {
+                xv[0] * xv[0] + 2.0 * xv[1] * xv[1]
+            }
+        };
+        let x = [0.0, 0.0];
+        let opts = FitOptions::default();
+        let stencil = fd_ofv_stencil(2, &x, &[0, 1], 1e-2, 0.0, &ofv, &opts)
+            .expect("nothing cancels in a test");
+
+        // The diagonals are unaffected — the fixture must fail the cross-partial *only*, or it
+        // would be testing the `Unusable` path instead of this one.
+        assert!(
+            stencil.diag_nan.is_empty(),
+            "the fixture must keep both diagonals finite: {:?}",
+            stencil.diag_nan
+        );
+        assert!(
+            (stencil.hess[(0, 0)] - 2.0).abs() < 1e-6,
+            "{}",
+            stencil.hess[(0, 0)]
+        );
+        assert!(
+            (stencil.hess[(1, 1)] - 4.0).abs() < 1e-6,
+            "{}",
+            stencil.hess[(1, 1)]
+        );
+
+        // Both coordinates are named, and the entry is left at its initial value rather than
+        // at some `NaN` that would poison the whole inverse.
+        let named: std::collections::HashSet<usize> = [0, 1].into_iter().collect();
+        assert_eq!(stencil.offdiag_nan, named);
+        assert_eq!(stencil.hess[(0, 1)], 0.0);
+        assert_eq!(stencil.hess[(1, 0)], 0.0);
+    }
+
+    /// The premise the whole salvage rests on: the population's covariance stencil **is** the
+    /// sum of the per-subject stencils. Only if that holds is a declining subject's term
+    /// something that can be computed separately without changing any other subject's.
+    ///
+    /// Run through the production pieces — `subset_population`, `reconverge_population`,
+    /// `fd_ofv_stencil` — and not a re-derivation of the difference formulas, so this compares
+    /// one formula on two inputs rather than two copies of a formula.
+    ///
+    /// Four objectives, because `pop_nll_opts` dispatches and the salvage rides that same
+    /// dispatcher: FOCE's Sheiner–Beal marginal, FOCEI's Almquist–Laplace one, the AGQ
+    /// quadrature marginal, and the IOV joint (η, κ) marginal. If any of them were not a
+    /// per-subject sum, a declined subject's stencil would not be its own term.
+    #[test]
+    fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
+        use crate::estimation::covariance::{
+            fd_ofv_stencil, reconverge_population, subset_population,
+        };
+        use crate::estimation::outer_optimizer::pop_nll_opts;
+        use crate::estimation::parameterization::pack_with_bounds;
+        use crate::types::{EstimationMethod, FitOptions, Population};
+
+        let plain = parse_model_string(WARFARIN).expect("parse");
+        let mut plain_params = plain.default_params.clone();
+        plain_params.theta = vec![0.2, 10.0, 1.5];
+        let plain_pop = salvage_population(&plain, &plain_params, 4);
+
+        // IOV: three subjects with different occasion counts, so the κ block is genuinely
+        // ragged across subjects and a per-occasion bookkeeping error cannot cancel.
+        let (iov_model, s3) = iov_cov_fixture(3, false);
+        let (_, mut s2) = iov_cov_fixture(2, false);
+        s2.id = "two-occasions".into();
+        let (_, mut s1) = iov_cov_fixture(1, false);
+        s1.id = "one-occasion".into();
+        let iov_params = iov_model.default_params.clone();
+        let iov_pop = Population {
+            subjects: vec![s1, s2, s3],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let cases: [(
+            &str,
+            &CompiledModel,
+            &Population,
+            &ModelParameters,
+            FitOptions,
+        ); 4] = [
+            (
+                "FOCE",
+                &plain,
+                &plain_pop,
+                &plain_params,
+                FitOptions {
+                    method: EstimationMethod::Foce,
+                    interaction: false,
+                    ..FitOptions::default()
+                },
+            ),
+            (
+                "FOCEI",
+                &plain,
+                &plain_pop,
+                &plain_params,
+                FitOptions {
+                    method: EstimationMethod::FoceI,
+                    interaction: true,
+                    ..FitOptions::default()
+                },
+            ),
+            (
+                "AGQ-FOCEI",
+                &plain,
+                &plain_pop,
+                &plain_params,
+                FitOptions {
+                    method: EstimationMethod::FoceI,
+                    interaction: true,
+                    n_agq: 3,
+                    ..FitOptions::default()
+                },
+            ),
+            (
+                "IOV-FOCEI",
+                &iov_model,
+                &iov_pop,
+                &iov_params,
+                FitOptions {
+                    method: EstimationMethod::FoceI,
+                    interaction: true,
+                    ..FitOptions::default()
+                },
+            ),
+        ];
+
+        for (label, model, pop, params, opts) in cases {
+            let x_hat = pack_params(params);
+            let n = x_hat.len();
+            let etas: Vec<DVector<f64>> = pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    DVector::from_iterator(
+                        model.n_eta,
+                        find_ebe(model, s, params, 200, 1e-10, None, None, 0)
+                            .eta
+                            .iter()
+                            .copied(),
+                    )
+                })
+                .collect();
+            let free_idx: Vec<usize> = {
+                let packed = pack_with_bounds(params);
+                (0..n).filter(|&i| !packed.fixed[i]).collect()
+            };
+            let tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+
+            let stencil_over = |idx: &[usize]| -> DMatrix<f64> {
+                let (sub, warm) = subset_population(pop, &etas, idx);
+                let ofv = |xv: &[f64]| -> f64 {
+                    let (p, e, h, k) =
+                        reconverge_population(xv, model, &sub, params, &warm, &opts, tol);
+                    2.0 * pop_nll_opts(model, &sub, &p, &e, &h, &k, &opts)
+                };
+                let f0 = ofv(&x_hat);
+                assert!(
+                    f0.is_finite(),
+                    "{label}: subset {idx:?} has a non-finite base OFV"
+                );
+                fd_ofv_stencil(n, &x_hat, &free_idx, opts.fd_hessian_step, f0, &ofv, &opts)
+                    .expect("nothing cancels in a test")
+                    .hess
+            };
+
+            let all: Vec<usize> = (0..pop.subjects.len()).collect();
+            let whole = stencil_over(&all);
+            let per_subject: Vec<DMatrix<f64>> = all.iter().map(|&i| stencil_over(&[i])).collect();
+            let mut summed = DMatrix::<f64>::zeros(n, n);
+            for h in &per_subject {
+                summed += h;
+            }
+            assert!(
+                whole.iter().chain(summed.iter()).all(|v| v.is_finite()),
+                "{label}: both sides must be finite before they are differenced"
+            );
+
+            // Realised worst entry difference, measured 2026-09-21: 3.461e-11 (FOCE),
+            // 1.799e-11 (FOCEI), 3.597e-11 (AGQ-FOCEI), 3.461e-11 (IOV-FOCEI), against matrix
+            // scales of 6.8e1–1.5e2 — i.e. at the ULP of the entries themselves. The bound is
+            // four orders above the worst of those. It is not a statement about the
+            // derivative's accuracy (both sides are the *same* stencil), only about the
+            // reassociation of a floating-point sum.
+            const SUM_RULE_TOL: f64 = 1e-6;
+            let worst = (&whole - &summed).amax();
+            assert!(
+                worst < SUM_RULE_TOL,
+                "{label}: the population stencil must equal the sum of the per-subject \
+                 stencils; worst entry Δ = {worst:.3e}"
+            );
+
+            // Two mutations, each reaching something the other cannot.
+            //
+            // (a) Drop subject 0 from the summed side. If the fixture's subjects contributed
+            //     nothing, the agreement above would hold for any implementation at all, so
+            //     this has to move the comparison by orders of magnitude. Realised
+            //     2026-09-21: 3.209e1 (FOCE), 3.752e1 (FOCEI), 3.709e1 (AGQ-FOCEI), 1.904e1
+            //     (IOV-FOCEI) — nine orders over `SUM_RULE_TOL`.
+            //
+            // (b) Re-run the *population* stencil over subjects 1.. and require it to equal
+            //     the sum over subjects 1.. to the same tight bound. This is the leg that
+            //     kills a `stencil_over` which ignored `idx` and always evaluated the whole
+            //     population: such an implementation passes (a) — it would still differ from
+            //     the mutilated sum — and returns `whole` here, failing by exactly the margin
+            //     (a) measures. Checking only `stencil_over(&all[1..]) != summed` would be the
+            //     same assertion as (a) numerically (both reduce to ±subject 0's term), which
+            //     is a redundant gate rather than a second one.
+            let sum_without_0 = &summed - &per_subject[0];
+            let contribution = (&whole - &sum_without_0).amax();
+            assert!(
+                contribution.is_finite() && contribution > 1e3 * SUM_RULE_TOL,
+                "{label}: subject 0 must contribute something, else the sum rule above is a \
+                 tautology; got {contribution:.3e}"
+            );
+            let whole_without_0 = stencil_over(&all[1..]);
+            assert!(
+                whole_without_0.iter().all(|v| v.is_finite()),
+                "{label}: the subset stencil must be finite before it is differenced"
+            );
+            let subset_worst = (&whole_without_0 - &sum_without_0).amax();
+            assert!(
+                subset_worst < SUM_RULE_TOL,
+                "{label}: the sum rule must hold on a proper subset too — a stencil that \
+                 ignored its subject list would fail here by ~{contribution:.3e}; \
+                 got {subset_worst:.3e}"
+            );
+        }
+    }
+
+    /// End to end through `compute_covariance`: one subject in ten declining reproduces the
+    /// covariance the pure-analytic route gives on the same data.
+    ///
+    /// The decline is created by a constant, unreferenced per-observation covariate, which
+    /// changes the subject's *route* and not its predictions — asserted, not assumed, by
+    /// requiring the two populations' covariance OFVs to agree at the same point. Without
+    /// that check the reference would be a different fit and the bound would be measuring
+    /// two things at once.
+    ///
+    /// Both objectives that reach the salvage with a different marginal are run: the FOCEI
+    /// Almquist–Laplace one and the AGQ quadrature one (`n_agq = 3`). The salvage evaluates
+    /// its subset through `pop_nll_opts`, the same dispatcher the whole-population stencil
+    /// uses, so the AGQ marginal *should* dispatch identically — this is the fixture that
+    /// says it does.
+    #[test]
+    fn one_declining_subject_reproduces_the_pure_analytic_covariance() {
+        use crate::estimation::cov_diagnostics::CovScopeDecline;
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::sens::provider::covariance_scope_declines;
+        use crate::types::{EstimationMethod, FitOptions};
+
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta = vec![0.2, 10.0, 1.5];
+
+        let plain_pop = salvage_population(&model, &params, 10);
+        let mut tv_pop = plain_pop.clone();
+        force_per_subject_decline(&mut tv_pop.subjects[3]);
+
+        let x_hat = pack_params(&params);
+        let eta_hats: Vec<DVector<f64>> = plain_pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); plain_pop.subjects.len()];
+        let kappas = vec![vec![]; plain_pop.subjects.len()];
+
+        // Premise 1: the scope gate declines subject 3 of `tv_pop` and nobody else, and
+        // declines nobody at all in `plain_pop`. If it declined everyone, the short-circuit
+        // would take the population stencil and this test would compare FD against FD.
+        for (i, s) in tv_pop.subjects.iter().enumerate() {
+            let declines = covariance_scope_declines(&model, s, false);
+            if i == 3 {
+                assert_eq!(
+                    declines,
+                    vec![CovScopeDecline::EventWalkSubject],
+                    "the fixture must decline subject 3, and for the reason it claims"
+                );
+            } else {
+                assert!(
+                    declines.is_empty(),
+                    "subject {i} must stay in analytic scope"
+                );
+            }
+        }
+        for s in &plain_pop.subjects {
+            assert!(covariance_scope_declines(&model, s, false).is_empty());
+        }
+
+        for (label, n_agq) in [("FOCEI", 1), ("AGQ-FOCEI", 3)] {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceI,
+                interaction: true,
+                n_agq,
+                analytic_cov_hessian: true,
+                verbose: false,
+                ..FitOptions::default()
+            };
+
+            // Premise 2: the two runs really are the two routes under test — a complete
+            // analytic assembly on one population and a one-subject salvage on the other.
+            assert!(
+                matches!(
+                    analytic_cov_assembly(
+                        &model,
+                        &plain_pop,
+                        &params,
+                        &x_hat,
+                        &eta_hats,
+                        &[],
+                        &opts
+                    ),
+                    AnalyticCovAssembly::Full(_)
+                ),
+                "{label}: the reference must be the pure analytic route"
+            );
+            match analytic_cov_assembly(&model, &tv_pop, &params, &x_hat, &eta_hats, &[], &opts) {
+                AnalyticCovAssembly::Partial { declined, .. } => {
+                    assert_eq!(declined, vec![3], "{label}: exactly subject 3 is salvaged")
+                }
+                _ => panic!("{label}: the salvage route must be taken, not Full or Unavailable"),
+            }
+
+            let run_with = |pop: &crate::types::Population, o: &FitOptions| match compute_covariance(
+                &x_hat, &params, &model, pop, &eta_hats, &h_mats, &kappas, o,
+            ) {
+                CovarianceStepResult::Success(out) => out,
+                other => panic!(
+                    "{label}: covariance step must succeed; got {}",
+                    match other {
+                        CovarianceStepResult::Unusable(m) => m,
+                        CovarianceStepResult::FailedNonPd { reason, .. } => reason,
+                        _ => unreachable!(),
+                    }
+                ),
+            };
+            let reference = run_with(&plain_pop, &opts);
+            let hybrid = run_with(&tv_pop, &opts);
+
+            // Premise 3: the covariate changed the route, not the data. The declining subject
+            // now goes through the event-driven walk instead of the t=0 superposition, and
+            // only if that leaves its predictions alone is `plain_pop` a reference for
+            // `tv_pop` rather than a second, different fit. Checked at the salvaged subject
+            // and at an untouched one, so a mechanism that moved *every* prediction would
+            // show up too. Realised worst relative Δ: 0.000e0 on both.
+            let preds = |pop: &crate::types::Population, i: usize| {
+                crate::pk::compute_predictions_with_tv(
+                    &model,
+                    &pop.subjects[i],
+                    &params.theta,
+                    eta_hats[i].as_slice(),
+                )
+            };
+            for i in [3usize, 0] {
+                let (a, b) = (preds(&plain_pop, i), preds(&tv_pop, i));
+                assert_eq!(a.len(), b.len(), "{label}: subject {i} prediction count");
+                assert!(
+                    a.iter().chain(b.iter()).all(|v| v.is_finite()),
+                    "{label}: subject {i} predictions must be finite"
+                );
+                let worst_pred = a
+                    .iter()
+                    .zip(b.iter())
+                    .fold(0.0f64, |m, (x, y)| m.max(((y - x) / x).abs()));
+                assert!(
+                    worst_pred < 1e-12,
+                    "{label}: the forced decline must not move subject {i}'s predictions; \
+                     worst relative Δ = {worst_pred:.3e}"
+                );
+            }
+
+            // The yardstick, computed rather than quoted: the same population run through the
+            // *whole-population* FD stencil. ferx already ships that and the pure analytic
+            // R-matrix as interchangeable estimators of one matrix, so the gap between them is
+            // the difference a user is already expected to tolerate — and routing one subject
+            // in ten through the FD estimator *for its own term* has to be a fraction of it.
+            let population_fd = run_with(
+                &plain_pop,
+                &FitOptions {
+                    analytic_cov_hessian: false,
+                    ..opts.clone()
+                },
+            );
+            let reference_se = se_of(&reference.matrix);
+            let estimator_gap = worst_relative_se_diff(
+                &reference_se,
+                &se_of(&population_fd.matrix),
+                &format!("{label} (analytic vs population FD)"),
+            );
+
+            // Realised worst relative SE difference, measured 2026-09-21: 3.699e-4 (FOCEI),
+            // 2.599e-4 (AGQ-FOCEI), against estimator gaps of 3.364e-3 and 2.510e-3 — the
+            // salvage costs 11.00 % and 10.36 % of swapping the whole population's estimator,
+            // which is what one subject in ten should cost. Both bounds are asserted: the
+            // absolute one so a regression that inflates the error while also inflating the
+            // FD gap cannot hide behind the ratio, and the relative one so the number stays
+            // anchored to something with a meaning rather than to a round constant.
+            let worst = worst_relative_se_diff(&reference_se, &se_of(&hybrid.matrix), label);
+            assert!(
+                worst < 1e-3,
+                "{label}: salvaging one subject in ten must reproduce the pure-analytic \
+                 standard errors; worst relative Δ = {worst:.3e}"
+            );
+            assert!(
+                estimator_gap > 0.0 && worst < 0.25 * estimator_gap,
+                "{label}: salvaging one subject of ten must cost a fraction of swapping the \
+                 whole population's estimator; salvage Δ = {worst:.3e}, analytic-vs-FD \
+                 Δ = {estimator_gap:.3e}"
+            );
+
+            // The informational note is emitted on the salvage route and on neither pure one.
+            let note = |o: &crate::estimation::covariance::CovarianceOutput| {
+                o.warnings
+                    .iter()
+                    .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+            };
+            assert!(note(&hybrid), "{label}: the salvage must be reported");
+            assert!(
+                !note(&reference),
+                "{label}: a fully analytic run must say nothing about salvaging"
+            );
+            let msg = hybrid
+                .warnings
+                .iter()
+                .find(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+                .unwrap();
+            assert!(
+                msg.contains("1 of 10 subjects") && msg.contains("ID 3"),
+                "{label}: the note must name the count and the subject: {msg}"
+            );
+        }
+    }
+
+    /// The salvage note describes the numbers on the page, so it is gated on the estimator
+    /// that produced them (#1516 review §1).
+    ///
+    /// Under `covariance_method = s` the returned covariance is `S⁻¹` from the score
+    /// cross-product alone and `R` is discarded — hybrid or not — so nothing about the salvage
+    /// route reaches the reported standard errors, and the note's closing claim ("only the
+    /// named subjects' terms use a different estimator") would be a statement about a matrix
+    /// this step threw away. `rsr` is the other side of that gate and must keep the note: it
+    /// returns `R⁻¹ S R⁻¹`, so the salvaged terms are in the numbers. Asserted in one test, so
+    /// a gate stuck on either branch reddens rather than passing half.
+    #[test]
+    fn the_salvage_note_is_gated_on_the_estimator_that_uses_the_r_matrix() {
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::types::{CovarianceMethod, EstimationMethod, FitOptions};
+
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta = vec![0.2, 10.0, 1.5];
+
+        let mut pop = salvage_population(&model, &params, 30);
+        // `salvage_population` scales every subject's curve by one factor, which makes the
+        // per-subject scores collinear and `S = Σᵢ gᵢgᵢᵀ` rank-deficient — the cross-product
+        // estimator then refuses outright and the arm under test never runs. A deterministic
+        // per-(subject, observation) wobble breaks that collinearity without touching the
+        // scope gate, which reads route and structure, not values.
+        for (k, s) in pop.subjects.iter_mut().enumerate() {
+            for (j, y) in s.observations.iter_mut().enumerate() {
+                *y *= 1.0 + 0.12 * (1.7 * k as f64 + 0.9 * j as f64).sin();
+            }
+        }
+        force_per_subject_decline(&mut pop.subjects[3]);
+
+        let x_hat = pack_params(&params);
+        let eta_hats: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        // Real `a = ∂f/∂η` matrices (`n_obs × n_eta`), not the zero placeholders the
+        // Hessian-only fixtures above can get away with: `s` and `rsr` route through
+        // `assemble_score_cross_product`, which reads `h_matrix.row(j)` for every observation.
+        let h_mats: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let eta = eta_hats[i].as_slice().to_vec();
+                let n_obs = s.observations.len();
+                let mut a = DMatrix::zeros(n_obs, model.n_eta);
+                for m in 0..model.n_eta {
+                    let step = 1e-5;
+                    let (mut up, mut down) = (eta.clone(), eta.clone());
+                    up[m] += step;
+                    down[m] -= step;
+                    let f_up =
+                        crate::pk::compute_predictions_with_tv(&model, s, &params.theta, &up);
+                    let f_down =
+                        crate::pk::compute_predictions_with_tv(&model, s, &params.theta, &down);
+                    for j in 0..n_obs {
+                        a[(j, m)] = (f_up[j] - f_down[j]) / (2.0 * step);
+                    }
+                }
+                a
+            })
+            .collect();
+        let kappas = vec![vec![]; pop.subjects.len()];
+
+        let base = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            analytic_cov_hessian: true,
+            verbose: false,
+            ..FitOptions::default()
+        };
+
+        // Premise: the hybrid route is actually taken. Without this the "silent" arm below is
+        // satisfied by a population that never salvaged anything.
+        match analytic_cov_assembly(&model, &pop, &params, &x_hat, &eta_hats, &[], &base) {
+            AnalyticCovAssembly::Partial { declined, .. } => {
+                assert_eq!(declined, vec![3], "exactly subject 3 is salvaged")
+            }
+            _ => panic!("the salvage route must be taken, not Full or Unavailable"),
+        }
+
+        let run = |method: CovarianceMethod| {
+            let opts = FitOptions {
+                covariance_method: method,
+                ..base.clone()
+            };
+            match compute_covariance(
+                &x_hat, &params, &model, &pop, &eta_hats, &h_mats, &kappas, &opts,
+            ) {
+                CovarianceStepResult::Success(out) => out,
+                other => panic!(
+                    "{method:?}: covariance step must succeed; got {}",
+                    match other {
+                        CovarianceStepResult::Unusable(m) => m,
+                        CovarianceStepResult::FailedNonPd { reason, .. } => reason,
+                        _ => unreachable!(),
+                    }
+                ),
+            }
+        };
+        let note = |o: &crate::estimation::covariance::CovarianceOutput| {
+            o.warnings
+                .iter()
+                .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+        };
+
+        for method in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
+            let out = run(method);
+            assert!(
+                note(&out),
+                "{method:?} reports R⁻¹, so the salvaged terms are in the numbers and the note \
+                 must be emitted: {:?}",
+                out.warnings
+            );
+        }
+        let cross = run(CovarianceMethod::CrossProduct);
+        assert!(
+            !note(&cross),
+            "covariance_method = s returns S⁻¹ and discards R, so nothing may claim the \
+             salvage moved these standard errors: {:?}",
+            cross.warnings
+        );
+    }
+
+    /// The full-decline short-circuit. When every subject is outside the analytic scope there
+    /// is no analytic majority to carry the salvage's cost, so the whole-population stencil is
+    /// taken — the same matrix, one route fewer, and no note claiming a hybrid that did not
+    /// happen. Measured on clofarabine (56/56 declining): the salvage rebuilt it as 56
+    /// per-subject stencils for +4 % wall and cells identical to 7 significant figures.
+    #[test]
+    fn a_fully_declining_population_takes_the_population_stencil() {
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::types::{EstimationMethod, FitOptions};
+
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta = vec![0.2, 10.0, 1.5];
+        let mut pop = salvage_population(&model, &params, 4);
+        for s in &mut pop.subjects {
+            force_per_subject_decline(s);
+        }
+        let x_hat = pack_params(&params);
+        let eta_hats: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); pop.subjects.len()];
+        let kappas = vec![vec![]; pop.subjects.len()];
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            analytic_cov_hessian: true,
+            verbose: false,
+            ..FitOptions::default()
+        };
+
+        assert!(
+            matches!(
+                analytic_cov_assembly(&model, &pop, &params, &x_hat, &eta_hats, &[], &opts),
+                AnalyticCovAssembly::Unavailable
+            ),
+            "a fully declining population must short-circuit, not return a Partial with every \
+             subject salvaged"
+        );
+
+        let run = |o: &FitOptions| match compute_covariance(
+            &x_hat, &params, &model, &pop, &eta_hats, &h_mats, &kappas, o,
+        ) {
+            CovarianceStepResult::Success(out) => out,
+            other => panic!(
+                "covariance step must succeed; got {}",
+                match other {
+                    CovarianceStepResult::Unusable(m) => m,
+                    CovarianceStepResult::FailedNonPd { reason, .. } => reason,
+                    _ => unreachable!(),
+                }
+            ),
+        };
+        let with_analytic = run(&opts);
+        let forced_fd = run(&FitOptions {
+            analytic_cov_hessian: false,
+            ..opts.clone()
+        });
+
+        // Bit-identical, not merely close: the short-circuit is supposed to take the *same*
+        // route `analytic_cov_hessian = false` takes, so any difference at all means it took
+        // some third thing.
+        assert_eq!(
+            with_analytic.matrix, forced_fd.matrix,
+            "the short-circuit must be the population stencil, bit for bit"
+        );
+        assert!(
+            !with_analytic
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
+            "nothing was salvaged, so nothing may be reported as salvaged: {:?}",
+            with_analytic.warnings
+        );
     }
 
     #[test]
@@ -4792,9 +5560,11 @@ mod tests {
 
     /// Safety gate: the per-subject analytic covariance Hessian (both FOCEI and
     /// FOCE entry points) must return `None` for out-of-derivation-scope models, so
-    /// `compute_covariance` drops the whole population back to the finite-difference
-    /// covariance. A `None` from any subject is what makes the fallback total. Here
-    /// LTBS (`log_transform`) is exercised as an exclusion; M3/BLOQ is checked as
+    /// `compute_covariance` finite-differences that subject's own term instead of
+    /// assembling a wrong one for it. Since #1514 a `None` is a *route* for that subject
+    /// rather than a fallback for the whole population — and `log_transform` here is a
+    /// model-level exclusion, so it declines every subject and the short-circuit takes the
+    /// population stencil. Here LTBS is exercised as an exclusion; M3/BLOQ is checked as
     /// an admitted path with separate FOCE and FOCEI assemblies.
     #[test]
     fn analytic_cov_hessian_gates_out_of_scope() {

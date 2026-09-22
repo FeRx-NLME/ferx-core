@@ -1711,10 +1711,21 @@ fn test_compute_covariance_reconverged_matches_scalar_fd_with_factor_two() {
     };
 
     // (a) No eigenvalue clipping on this well-conditioned surface.
+    //
+    // Asserted on the regularization warning specifically, not on "no warnings at all"
+    // (#1514). The two are not the same claim, and the difference is not hypothetical: the
+    // covariance step also emits purely informational notes — the per-subject salvage note is
+    // one — and an `is_empty()` written under a message about *regularization* turns any of
+    // those into a failure of this test, which is a factor-of-two check whose numeric
+    // assertions sit below this line and would never be reached.
+    let regularizations: Vec<&String> = out
+        .warnings
+        .iter()
+        .filter(|w| w.contains("Covariance step regularized"))
+        .collect();
     assert!(
-        out.warnings.is_empty(),
-        "unexpected covariance regularization: {:?}",
-        out.warnings
+        regularizations.is_empty(),
+        "unexpected covariance regularization: {regularizations:?}"
     );
 
     let fixed = packed_fixed_mask(template);

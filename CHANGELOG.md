@@ -19,6 +19,35 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **The covariance step no longer abandons the exact analytic R-matrix for the whole
+  population when one subject is out of scope.** The observed information is the sum
+  `Σᵢ Rᵢ`, and each term is the second derivative of one subject's own marginal, so a
+  subject outside the analytic scope is now finite-differenced **on its own** — from the
+  same objective, at the same converged point, warm-started from the same modes — while
+  every other subject keeps its exact term. On a 55-subject 2-state ODE FOCEI fit with 13
+  free parameters where one subject declined, the covariance step went from 23.4 s to
+  2.0 s (**11.5×**, −38 % total wall) with estimates and OFV identical to every printed
+  digit. Standard errors move 8.4e-5 relative when one subject in ten is salvaged — 3.2×
+  below the gap between the whole-population FD and whole-population analytic routes that
+  ferx already ships as interchangeable. Model-level exclusions (`method = laplace`, a
+  mixture, `gradient = fd`, `analytic_cov_hessian = false`) are unchanged, and a
+  population where at least half the subjects decline still takes the whole-population
+  stencil ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
+### Changed
+- **New informational warning `W_COV_ANALYTIC_SALVAGE`,** emitted when the covariance step
+  assembled the analytic R-matrix for most of the population and finite-differenced the
+  rest. It names the salvaged subjects (the printed id list is deduplicated and capped at ten
+  with a count of the remainder; the counts are per subject) and the split.
+  `severity = info`, `code = covariance_step`: the parameter estimates and the OFV are
+  unaffected and the information matrix is complete, but the standard errors do move slightly,
+  because the salvaged subjects' terms come off a different estimator — measured at 3.7e-4
+  relative for one subject in ten, about a tenth of the gap between the two whole-population
+  estimators ferx already ships as interchangeable. That is what the note is for. It is not
+  emitted under `covariance_method = s`, which reports `S⁻¹` and never uses the R-matrix the
+  salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
 ### Fixed
 - **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
   As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)
