@@ -1061,10 +1061,108 @@ fn the_message_names_the_hybrid_route_and_keeps_its_stencil_guidance() {
     assert!(!m_analytic.contains("hybrid"), "{m_analytic}");
     assert!(!m_fd.contains("hybrid"), "{m_fd}");
 
-    // The tail: present on FD and hybrid, absent on the pure analytic route.
+    // The tail: present on FD and hybrid, absent on the pure analytic route. The two routes
+    // word it differently (`the_decline_sentence_names_the_subjects_that_declined_not_the_
+    // whole_fit` owns that distinction), so the token asserted here is the clause itself —
+    // the part that is common to both and is the reason the tail exists.
+    let clause = "[scaling] obs_scale = ... is in use";
     assert!(m_fd.contains("declined because"), "{m_fd}");
-    assert!(m_hybrid.contains("declined because"), "{m_hybrid}");
-    assert!(!m_analytic.contains("declined because"), "{m_analytic}");
+    assert!(m_fd.contains(clause), "{m_fd}");
+    assert!(m_hybrid.contains(clause), "{m_hybrid}");
+    assert!(!m_analytic.contains(clause), "{m_analytic}");
+    assert!(!m_analytic.contains("declined"), "{m_analytic}");
+}
+
+#[test]
+fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
+    // #1516 review §2. The tail is *present* on both routes (asserted above), but its subject
+    // is not the same: on the population stencil the fit declined, on the hybrid route only the
+    // salvaged minority did. A 100-subject fit with three event-walk subjects told "the exact
+    // analytic covariance R-matrix was declined" reads it as a statement about all 100.
+    //
+    // Both routes in one test, and each asserts the *other* route's wording is absent, so a
+    // gate stuck on either branch reddens here rather than passing half.
+    let mut fd = measured_severe_facts();
+    fd.declines = &[CovScopeDecline::EventWalkSubject];
+    fd.source = CovHessianSource::FdStencil;
+    let mut hybrid = fd;
+    hybrid.source = CovHessianSource::HybridRMatrix;
+
+    let (m_fd, m_hybrid) = (
+        format_regularized_warning(&fd),
+        format_regularized_warning(&hybrid),
+    );
+    assert!(
+        m_fd.contains(
+            "The exact analytic covariance R-matrix was declined because at least one subject \
+             routes to the event-driven walk."
+        ),
+        "{m_fd}"
+    );
+    assert!(
+        m_hybrid.contains(
+            "The finite-differenced subjects declined the exact analytic covariance R-matrix \
+             because at least one subject routes to the event-driven walk."
+        ),
+        "{m_hybrid}"
+    );
+    assert!(
+        !m_hybrid.contains("R-matrix was declined"),
+        "the whole-fit wording must not survive on the hybrid route: {m_hybrid}"
+    );
+    assert!(
+        !m_fd.contains("The finite-differenced subjects declined"),
+        "the per-subject wording must not leak onto the population stencil: {m_fd}"
+    );
+}
+
+#[test]
+fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
+    // The other two sentences of the same tail, both cells, both routes. The promise ("moves
+    // X onto the analytic route") and the residual blocker ("so X stays on the finite-
+    // difference route") each name who X is, and on the hybrid route X is the salvaged
+    // subjects — the rest of the population is already analytic.
+    let mut hybrid = measured_severe_facts();
+    hybrid.declines = &[CovScopeDecline::GradientFd];
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    let mut fd = hybrid;
+    fd.source = CovHessianSource::FdStencil;
+
+    let m_hybrid = format_regularized_warning(&hybrid);
+    let m_fd = format_regularized_warning(&fd);
+    assert!(
+        m_hybrid.contains("Dropping gradient = fd moves those subjects onto the analytic route."),
+        "{m_hybrid}"
+    );
+    assert!(
+        m_fd.contains("Dropping gradient = fd moves the fit onto the analytic route."),
+        "{m_fd}"
+    );
+
+    // The unremedied cell: one action, one blocker with none.
+    let mut hybrid_mixed = hybrid;
+    hybrid_mixed.declines = &[
+        CovScopeDecline::GradientFd,
+        CovScopeDecline::EventWalkSubject,
+    ];
+    let mut fd_mixed = hybrid_mixed;
+    fd_mixed.source = CovHessianSource::FdStencil;
+
+    let m_hybrid_mixed = format_regularized_warning(&hybrid_mixed);
+    let m_fd_mixed = format_regularized_warning(&fd_mixed);
+    assert!(
+        m_hybrid_mixed.contains(
+            "so those subjects stay on the finite-difference route until all of them are cleared"
+        ),
+        "{m_hybrid_mixed}"
+    );
+    assert!(
+        m_fd_mixed.contains(
+            "so the fit stays on the finite-difference route until all of them are \
+                      cleared"
+        ),
+        "{m_fd_mixed}"
+    );
 }
 
 #[test]
@@ -1185,10 +1283,18 @@ fn the_salvage_note_dedupes_ids_and_caps_the_list() {
     // Two independent reductions of the id list, asserted separately because each can be
     // deleted without the other reddening.
     //
-    // Dedupe: a repeated id reads as two subjects and would also inflate the printed count,
-    // so the count is checked as well as the list.
-    let dup = format_salvage_note(&["4", "4", "9"], 20).expect("two distinct ids");
-    assert!(dup.contains("2 of 20 subjects (IDs 4 and 9)"), "{dup}");
+    // Dedupe is a *printing* reduction only (#1516 review §3). The caller passes one id per
+    // population index, and each index carries its own information term, so three salvaged
+    // subjects two of which share an id string are still three salvaged terms and seventeen
+    // analytic ones. Deriving the count from the deduped list instead printed "2 of 20 … the
+    // remaining 18", under-reporting the salvage and over-reporting the analytic remainder by
+    // the same one subject — so both counts are asserted next to the list they disagree with.
+    let dup = format_salvage_note(&["4", "4", "9"], 20).expect("three salvaged subjects");
+    assert!(dup.contains("3 of 20 subjects (IDs 4 and 9)"), "{dup}");
+    assert!(
+        dup.contains("the remaining 17 subjects were assembled analytically"),
+        "{dup}"
+    );
 
     // Cap: twelve ids print ten and summarise the rest, while the count stays the true one.
     let ids: Vec<String> = (0..12).map(|i| i.to_string()).collect();

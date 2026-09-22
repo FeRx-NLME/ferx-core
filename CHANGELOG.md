@@ -38,13 +38,15 @@ section of the SDLC for the versioning policy).
 ### Changed
 - **New informational warning `W_COV_ANALYTIC_SALVAGE`,** emitted when the covariance step
   assembled the analytic R-matrix for most of the population and finite-differenced the
-  rest. It names the salvaged subject ids (deduplicated, capped at ten with a count of the
-  remainder) and the split. `severity = info`, `code = covariance_step`: the parameter
-  estimates and the OFV are unaffected and the information matrix is complete, but the
-  standard errors do move slightly, because the salvaged subjects' terms come off a different
-  estimator — measured at 3.7e-4 relative for one subject in ten, about a tenth of the gap
-  between the two whole-population estimators ferx already ships as interchangeable. That is
-  what the note is for ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+  rest. It names the salvaged subjects (the printed id list is deduplicated and capped at ten
+  with a count of the remainder; the counts are per subject) and the split.
+  `severity = info`, `code = covariance_step`: the parameter estimates and the OFV are
+  unaffected and the information matrix is complete, but the standard errors do move slightly,
+  because the salvaged subjects' terms come off a different estimator — measured at 3.7e-4
+  relative for one subject in ten, about a tenth of the gap between the two whole-population
+  estimators ferx already ships as interchangeable. That is what the note is for. It is not
+  emitted under `covariance_method = s`, which reports `S⁻¹` and never uses the R-matrix the
+  salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
 - **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**

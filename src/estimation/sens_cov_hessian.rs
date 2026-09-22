@@ -5221,6 +5221,135 @@ mod tests {
         }
     }
 
+    /// The salvage note describes the numbers on the page, so it is gated on the estimator
+    /// that produced them (#1516 review §1).
+    ///
+    /// Under `covariance_method = s` the returned covariance is `S⁻¹` from the score
+    /// cross-product alone and `R` is discarded — hybrid or not — so nothing about the salvage
+    /// route reaches the reported standard errors, and the note's closing claim ("only the
+    /// named subjects' terms use a different estimator") would be a statement about a matrix
+    /// this step threw away. `rsr` is the other side of that gate and must keep the note: it
+    /// returns `R⁻¹ S R⁻¹`, so the salvaged terms are in the numbers. Asserted in one test, so
+    /// a gate stuck on either branch reddens rather than passing half.
+    #[test]
+    fn the_salvage_note_is_gated_on_the_estimator_that_uses_the_r_matrix() {
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::types::{CovarianceMethod, EstimationMethod, FitOptions};
+
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta = vec![0.2, 10.0, 1.5];
+
+        let mut pop = salvage_population(&model, &params, 30);
+        // `salvage_population` scales every subject's curve by one factor, which makes the
+        // per-subject scores collinear and `S = Σᵢ gᵢgᵢᵀ` rank-deficient — the cross-product
+        // estimator then refuses outright and the arm under test never runs. A deterministic
+        // per-(subject, observation) wobble breaks that collinearity without touching the
+        // scope gate, which reads route and structure, not values.
+        for (k, s) in pop.subjects.iter_mut().enumerate() {
+            for (j, y) in s.observations.iter_mut().enumerate() {
+                *y *= 1.0 + 0.12 * (1.7 * k as f64 + 0.9 * j as f64).sin();
+            }
+        }
+        force_per_subject_decline(&mut pop.subjects[3]);
+
+        let x_hat = pack_params(&params);
+        let eta_hats: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        // Real `a = ∂f/∂η` matrices (`n_obs × n_eta`), not the zero placeholders the
+        // Hessian-only fixtures above can get away with: `s` and `rsr` route through
+        // `assemble_score_cross_product`, which reads `h_matrix.row(j)` for every observation.
+        let h_mats: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let eta = eta_hats[i].as_slice().to_vec();
+                let n_obs = s.observations.len();
+                let mut a = DMatrix::zeros(n_obs, model.n_eta);
+                for m in 0..model.n_eta {
+                    let step = 1e-5;
+                    let (mut up, mut down) = (eta.clone(), eta.clone());
+                    up[m] += step;
+                    down[m] -= step;
+                    let f_up =
+                        crate::pk::compute_predictions_with_tv(&model, s, &params.theta, &up);
+                    let f_down =
+                        crate::pk::compute_predictions_with_tv(&model, s, &params.theta, &down);
+                    for j in 0..n_obs {
+                        a[(j, m)] = (f_up[j] - f_down[j]) / (2.0 * step);
+                    }
+                }
+                a
+            })
+            .collect();
+        let kappas = vec![vec![]; pop.subjects.len()];
+
+        let base = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            analytic_cov_hessian: true,
+            verbose: false,
+            ..FitOptions::default()
+        };
+
+        // Premise: the hybrid route is actually taken. Without this the "silent" arm below is
+        // satisfied by a population that never salvaged anything.
+        match analytic_cov_assembly(&model, &pop, &params, &x_hat, &eta_hats, &[], &base) {
+            AnalyticCovAssembly::Partial { declined, .. } => {
+                assert_eq!(declined, vec![3], "exactly subject 3 is salvaged")
+            }
+            _ => panic!("the salvage route must be taken, not Full or Unavailable"),
+        }
+
+        let run = |method: CovarianceMethod| {
+            let opts = FitOptions {
+                covariance_method: method,
+                ..base.clone()
+            };
+            match compute_covariance(
+                &x_hat, &params, &model, &pop, &eta_hats, &h_mats, &kappas, &opts,
+            ) {
+                CovarianceStepResult::Success(out) => out,
+                other => panic!(
+                    "{method:?}: covariance step must succeed; got {}",
+                    match other {
+                        CovarianceStepResult::Unusable(m) => m,
+                        CovarianceStepResult::FailedNonPd { reason, .. } => reason,
+                        _ => unreachable!(),
+                    }
+                ),
+            }
+        };
+        let note = |o: &crate::estimation::covariance::CovarianceOutput| {
+            o.warnings
+                .iter()
+                .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+        };
+
+        for method in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
+            let out = run(method);
+            assert!(
+                note(&out),
+                "{method:?} reports R⁻¹, so the salvaged terms are in the numbers and the note \
+                 must be emitted: {:?}",
+                out.warnings
+            );
+        }
+        let cross = run(CovarianceMethod::CrossProduct);
+        assert!(
+            !note(&cross),
+            "covariance_method = s returns S⁻¹ and discards R, so nothing may claim the \
+             salvage moved these standard errors: {:?}",
+            cross.warnings
+        );
+    }
+
     /// The full-decline short-circuit. When every subject is outside the analytic scope there
     /// is no analytic majority to carry the salvage's cost, so the whole-population stencil is
     /// taken — the same matrix, one route fewer, and no note claiming a hybrid that did not

@@ -623,15 +623,37 @@ fn sentence_case(s: String) -> String {
     }
 }
 
-fn decline_sentences(declines: &[CovScopeDecline]) -> String {
+/// Who declined, and what a remedy moves — the second truth condition of these sentences,
+/// added with #1514's hybrid route (#1516 review §2).
+///
+/// On [`CovHessianSource::FdStencil`] the decline is the whole fit's: no subject took the
+/// analytic route, so "the exact analytic covariance R-matrix was declined" and "the fit stays
+/// on the finite-difference route" are both true of the fit. On
+/// [`CovHessianSource::HybridRMatrix`] they are false — the *majority* of subjects were
+/// assembled analytically and only the salvaged minority was second-differenced — so the
+/// subject of every sentence becomes those subjects. Telling a 100-subject fit with three
+/// event-walk subjects that it "is on the finite-difference route" misnames 97 of them.
+///
+/// One `match`, read by all three sentences, so a future fourth route cannot leave one of them
+/// true and another false.
+fn decline_sentences(declines: &[CovScopeDecline], source: CovHessianSource) -> String {
     if declines.is_empty() {
         return String::new();
     }
+    let hybrid = matches!(source, CovHessianSource::HybridRMatrix);
     let clauses: Vec<&str> = declines.iter().map(|d| d.clause()).collect();
-    let mut out = format!(
-        " The exact analytic covariance R-matrix was declined because {}.",
-        join_and(&clauses)
-    );
+    let mut out = if hybrid {
+        format!(
+            " The finite-differenced subjects declined the exact analytic covariance R-matrix \
+             because {}.",
+            join_and(&clauses)
+        )
+    } else {
+        format!(
+            " The exact analytic covariance R-matrix was declined because {}.",
+            join_and(&clauses)
+        )
+    };
 
     let actions: Vec<&str> = declines.iter().filter_map(|d| d.remedy()).collect();
     if actions.is_empty() {
@@ -648,8 +670,9 @@ fn decline_sentences(declines: &[CovScopeDecline]) -> String {
         } else {
             "together move"
         };
+        let moved = if hybrid { "those subjects" } else { "the fit" };
         out.push_str(&format!(
-            " {} {verb} the fit onto the analytic route.",
+            " {} {verb} {moved} onto the analytic route.",
             sentence_case(join_and(&actions)),
         ));
     } else {
@@ -667,8 +690,13 @@ fn decline_sentences(declines: &[CovScopeDecline]) -> String {
         } else {
             "the remaining clauses have"
         };
+        let stays = if hybrid {
+            "those subjects stay"
+        } else {
+            "the fit stays"
+        };
         out.push_str(&format!(
-            " {} {cleared}, but {remaining} no one-line remedy, so the fit stays on the \
+            " {} {cleared}, but {remaining} no one-line remedy, so {stays} on the \
              finite-difference route until all of them are cleared.",
             sentence_case(join_and(&actions)),
         ));
@@ -706,7 +734,7 @@ pub(crate) fn format_regularized_warning(facts: &CovRegularizationFacts) -> Stri
         return msg;
     }
 
-    msg.push_str(&decline_sentences(facts.declines));
+    msg.push_str(&decline_sentences(facts.declines, facts.source));
 
     if let Some(ode) = facts.ode {
         if ode.looser_than_cov_plateau() {
@@ -776,9 +804,8 @@ const SALVAGE_ID_LIST_CAP: usize = 10;
 /// The informational note naming the subjects whose covariance terms were finite-differenced
 /// while the rest of the population used the exact analytic R-matrix (#1514).
 ///
-/// `ids` are the salvaged subjects' ids in population order; duplicates are dropped (a dataset
-/// may repeat an id across stacked occasions, and the same id printed twice reads as two
-/// subjects). `n_total` is the whole population.
+/// `ids` are the salvaged subjects' ids in population order — **one per population index**,
+/// which is what `n` counts. `n_total` is the whole population.
 ///
 /// Returns `None` when nothing was salvaged — the pure-analytic and pure-FD routes both say
 /// nothing here, so the note's presence *is* the statement that the hybrid route ran.
@@ -787,20 +814,34 @@ const SALVAGE_ID_LIST_CAP: usize = 10;
 /// agreement come from `ids.len()` and `n_total`, and the "remaining" clause is only reachable
 /// with at least one analytically-assembled subject, which the caller's short-circuit
 /// guarantees (a full decline takes the population stencil instead).
+///
+/// Counting and *printing* are deliberately two different things here (#1516 review §3). A
+/// dataset may repeat an id across stacked occasions, and the same id printed twice reads as
+/// two subjects — so the printed list drops duplicates. It must not drop them from the counts:
+/// each population index carries its own information term, so two salvaged subjects sharing an
+/// id string are two salvaged terms, and deriving `n` (and with it `remaining`) from the
+/// deduped list under-reported the salvage and over-reported the analytic remainder by the
+/// same amount. On the usual unique-id population the dedupe is a no-op and nothing moves.
 pub(crate) fn format_salvage_note(ids: &[&str], n_total: usize) -> Option<String> {
-    let mut seen: Vec<&str> = Vec::with_capacity(ids.len());
+    let n = ids.len();
+    if n == 0 || n_total == 0 {
+        return None;
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(n);
     for id in ids {
         if !seen.contains(id) {
             seen.push(id);
         }
     }
-    let n = seen.len();
-    if n == 0 || n_total == 0 {
-        return None;
-    }
     let listed: Vec<&str> = seen.iter().take(SALVAGE_ID_LIST_CAP).copied().collect();
-    let id_list = if n > listed.len() {
-        format!("{} and {} more", listed.join(", "), n - listed.len())
+    // The "and N more" tail counts the ids the list did *not* print, so it is keyed off the
+    // distinct ids the list is drawn from — not off `n`, which may exceed them.
+    let id_list = if seen.len() > listed.len() {
+        format!(
+            "{} and {} more",
+            listed.join(", "),
+            seen.len() - listed.len()
+        )
     } else {
         join_and(&listed)
     };

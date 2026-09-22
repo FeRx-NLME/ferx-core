@@ -1666,12 +1666,25 @@ pub(crate) fn compute_covariance(
     // killed nothing before this line, and kills `one_declining_subject_reproduces_the_pure_
     // analytic_covariance` after). `format_salvage_note`'s own emptiness guard is what makes
     // it total for the two non-hybrid arms, not a second gate on the same fact.
+    //
+    // Gated on the estimator for the same reason the eigen-floor warning twelve lines below is
+    // (#1516 review §1): under `covariance_method = s` the returned covariance is `S⁻¹` from
+    // `assemble_score_cross_product` alone and `R` is discarded, so *nothing* about the route
+    // that assembled `R` reaches the numbers on the page. The note's closing claim — that the
+    // named subjects' terms use a different estimator than the rest — would then be a
+    // statement about a matrix this step threw away.
     let salvaged_ids: Vec<&str> = match source {
-        CovHessianSource::HybridRMatrix => salvaged
-            .iter()
-            .map(|&i| population.subjects[i].id.as_str())
-            .collect(),
-        CovHessianSource::AnalyticRMatrix | CovHessianSource::FdStencil => Vec::new(),
+        CovHessianSource::HybridRMatrix
+            if options.covariance_method != CovarianceMethod::CrossProduct =>
+        {
+            salvaged
+                .iter()
+                .map(|&i| population.subjects[i].id.as_str())
+                .collect()
+        }
+        CovHessianSource::HybridRMatrix
+        | CovHessianSource::AnalyticRMatrix
+        | CovHessianSource::FdStencil => Vec::new(),
     };
     if let Some(note) = format_salvage_note(&salvaged_ids, population.subjects.len()) {
         if options.verbose {
