@@ -1398,11 +1398,16 @@ pub(crate) fn compute_covariance(
                     declined.len(),
                 );
             }
-            // The **fit's** modes, exactly what the whole-population stencil warm-starts
-            // from — not `base_eta_hats`, which the analytic assembly needs for stationarity.
-            // Warm-starting this subject from somewhere else would make its term differ from
-            // the term the population stencil computes for it, which is the one property the
-            // salvage rests on.
+            // The **fit's** modes, exactly what the whole-population stencil warm-starts from
+            // — not `base_eta_hats`, which the analytic assembly needs for its stationarity
+            // assumption. The two agree wherever the EBE is start-independent, which is why
+            // swapping them here kills no test in this PR's mutation sweep (cell `M16`), and
+            // the choice is not made on a measured difference: it is made so that subject `i`
+            // enters `find_ebe` with the same warm start on both routes *by construction*,
+            // rather than by an argument about how close two starts are. A start-dependent
+            // subject is a real thing here — `W_EBE_START_DEPENDENT` exists — and on one of
+            // those the salvaged term would otherwise stop being the term the population
+            // stencil computes for it.
             let (pop, warm) = subset_population(population, eta_hats, &declined);
             let scope = FdScope::Subset { pop, warm };
             salvaged = declined;
@@ -1648,10 +1653,22 @@ pub(crate) fn compute_covariance(
     // other way to see that one subject's term came off a different estimator. Emitted here,
     // after the estimator has been assembled, so a covariance step that failed earlier says
     // nothing about a route whose result was discarded.
-    let salvaged_ids: Vec<&str> = salvaged
-        .iter()
-        .map(|&i| population.subjects[i].id.as_str())
-        .collect();
+    //
+    // Read off `source` rather than off `salvaged` directly, so the note and the
+    // regularization message's route label are **one** derived value with two consumers. That
+    // is not decoration: the label is only *observable* on a fit whose eigenvalue floor fired,
+    // so a mutation of the three-way derivation above went undetected by the whole suite until
+    // the note was routed through it (measured — the `M5` cell of this PR's mutation sweep
+    // killed nothing before this line, and kills `one_declining_subject_reproduces_the_pure_
+    // analytic_covariance` after). `format_salvage_note`'s own emptiness guard is what makes
+    // it total for the two non-hybrid arms, not a second gate on the same fact.
+    let salvaged_ids: Vec<&str> = match source {
+        CovHessianSource::HybridRMatrix => salvaged
+            .iter()
+            .map(|&i| population.subjects[i].id.as_str())
+            .collect(),
+        CovHessianSource::AnalyticRMatrix | CovHessianSource::FdStencil => Vec::new(),
+    };
     if let Some(note) = format_salvage_note(&salvaged_ids, population.subjects.len()) {
         if options.verbose {
             eprintln!("  {}", note);
