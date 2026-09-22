@@ -30,18 +30,20 @@ fn tests_dir() -> PathBuf {
     p
 }
 
-/// The NONMEM anchors that evaluate at fixed parameters and run on every PR. The wall
-/// time is the whole binary under `--no-default-features --features ci --profile
-/// ci-cov -- --include-ignored`, idle macOS, 2026-09-22 at `2e04abba`:
+/// The NONMEM anchors that evaluate at fixed parameters and run on every PR. Wall time
+/// of the whole binary, measured two ways on 2026-09-22 (#1132): locally under
+/// `--no-default-features --features ci --profile ci-cov`, idle macOS; and in the
+/// `Tests + coverage (core)` job of PR #1518 (ubuntu runner, llvm-cov instrumented).
+/// The CI column is the one that costs PR time — it is 6–22x the local one.
 ///
-/// | binary | time | why it is one evaluation |
-/// |---|---|---|
-/// | `tad_lag_nonmem_anchor` | 1.0 s | `outer_maxiter: 0` in the test's `FitOptions` |
-/// | `ss_lagtime_edge_nonmem_anchor` | 5.2 s | `maxiter = 0` in `nonmem_anchor/ss_lag_iv_fit.ferx` |
-/// | `tvcov_lag_saltation_nonmem_anchor` | 10.4 s | `maxiter = 0` in `nonmem_anchor/tvcov_lag_saltation_fit.ferx` |
+/// | binary | local | CI | why it is one evaluation |
+/// |---|---|---|---|
+/// | `tad_lag_nonmem_anchor` | 1.0 s | 21.1 s | `outer_maxiter: 0` in the test's `FitOptions` |
+/// | `ss_lagtime_edge_nonmem_anchor` | 5.2 s | 45.2 s | `maxiter = 0` in `ss_lag_iv_fit.ferx` |
+/// | `tvcov_lag_saltation_nonmem_anchor` | 10.4 s | 61.2 s | `maxiter = 0` in `tvcov_lag_saltation_fit.ferx` |
 ///
-/// Add a name here only with its measured time under that same profile. A NONMEM
-/// anchor that runs real fits (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
+/// Add a name here only with its measured CI time. A NONMEM anchor that runs real
+/// fits (`dose_form_lag_nonmem_anchor`, ~15 min) stays gated.
 const PER_PR_NONMEM_ANCHORS: [&str; 3] = [
     "tad_lag_nonmem_anchor",
     "ss_lagtime_edge_nonmem_anchor",

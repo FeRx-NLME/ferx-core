@@ -110,7 +110,7 @@
 //! placeholder `DV`, so the stream exists for the `PRED` comparison, not a fit.
 //!
 //! Tier 2: an ODE evaluation over eight subjects at fixed parameters (`maxiter = 0`),
-//! not a convergence loop, so it runs on every PR (~10 s under `ci-cov`, #1132).
+//! not a convergence loop, so it runs on every PR (#1132; ~10 s locally under `ci-cov`, 61 s in the instrumented CI job).
 
 use std::path::PathBuf;
 

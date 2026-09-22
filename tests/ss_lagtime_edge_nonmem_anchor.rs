@@ -87,8 +87,8 @@
 //!
 //! Tier 1/2 by construction: these are `predict()` evaluations at fixed
 //! parameters, ~0.5 s in total, so they run on every PR and carry the diff's
-//! coverage. The objective anchors below evaluate once at `maxiter = 0` (~5 s under
-//! `ci-cov`) and run on every PR too (#1132).
+//! coverage. The objective anchors below evaluate once at `maxiter = 0` and run on every
+//! PR too (#1132; ~5 s locally under `ci-cov`, 45 s in the instrumented CI job).
 
 use std::path::PathBuf;
 
