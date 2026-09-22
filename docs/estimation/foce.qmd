@@ -111,6 +111,29 @@ Every one of the fit's 8,769 non-converged inner exits — 4,957 that exhausted 
 
 What this does **not** do is make the declines go away: 16 decline events before, 15 after. A subject whose objective is an RK45 solve at default tolerances cannot resolve its gradient below roughly $3 \times 10^{-4}$, so its exact $H$ can still be indefinite at the point it stops. The gradient those subjects *are* served agrees with the reconverged finite-difference reference at the same $1.2 \times 10^{-3}$ median relative error as the fit's own positive-definite subjects, measured the way #1513's table was — so the change buys time, not accuracy, and does not spend accuracy to get it.
 
+#### The salvage is not bought at a blown-up trial point {#blown-up-trial-salvage}
+
+Each per-subject salvage above costs `2·n_free` warm EBE re-solves for one subject, and much of that spend used to land on trial points the optimizer was about to reject anyway — line-search steps whose objective sits thousands to $10^{15}$ units above the incumbent ([#1520](https://github.com/FeRx-NLME/ferx-core/issues/1520)). Since #1520 a declined subject at such a point contributes nothing to the outer gradient there instead of buying the salvage, and the warning above says how many salvages were skipped.
+
+Two gates, both required, both in the same units — excess of a `−2LL` over its value at the incumbent, per observation:
+
+- the **population** is worse than the incumbent by more than 12 per observation, and
+- the **subject's** own contribution is worse than its incumbent value by more than 12 per observation of its own.
+
+The line is measured, not chosen. Every salvage of every gradient-based fit of the bundled examples was instrumented (118 decline events at points worse than the incumbent, default L-BFGS and SLSQP, 13 example–optimizer pairs): at ordinary rejected trials the subject excess tops out at 6.0 and the population excess at 4.5 per observation; at blown-up ones they start at 21.8 and 36.4 and run to $10^{19}$. Twelve sits in that gap, the widest in either distribution. It is an excess and not a ratio because a `−2LL` difference is unit-free and a `−2LL` is not — the incumbent objective is negative on 9 of the 13 pairs — and per observation because a rich subject legitimately moves by tens of units between ordinary trials.
+
+What the missing term can touch was answered per optimizer, from the sources, before a policy was picked. Every gradient-based outer optimizer rejects a point worse than its incumbent on sufficient decrease alone, so nothing served at such a point becomes an accepted iterate or a curvature pair. Beyond that:
+
+| outer optimizer | gradient at a rejected trial point |
+|---|---|
+| NLopt SLSQP | requested only at the first trial of a line search (`mode = −2`) and discarded when that trial fails the L1-merit test; later trials request no gradient at all |
+| NLopt MMA | requested at every inner candidate, copied only on acceptance |
+| built-in BFGS / L-BFGS | never requested: the backtracking line search evaluates the objective alone, so the guard is unreachable there |
+| Gauss-Newton, trust region | never reach the per-subject assembly |
+| NLopt L-BFGS (Luksan) | requested at every trial and **read**: `pnint1` interpolates the next step length from the rejected trial's directional derivative as well as its value |
+
+So for SLSQP and MMA the guard is free, and measured as such: across the 10 bundled examples with skipped salvages under SLSQP every estimate, standard error, OFV, iteration count and sdtab is byte-identical to the unguarded run. For NLopt L-BFGS it is a trade, and the trade decided the policy. The issue ranked the fixed-EBE gradient first as the stand-in, but at the instrumented blown-up events that gradient has norm $10^3$–$10^4$ against 60–180 for the reconverged one — the profiled objective is far flatter there, because the re-solved EBEs absorb most of the blow-up — so dropping the subject's term is the closer stand-in for what the salvage would have returned. Measured on the three L-BFGS examples where the guard fires: with the fixed-EBE stand-in `warfarin_if` went from 51 to 68 evaluations and `two_cpt_oral_cov` from 75 to 79; with the term dropped, `two_cpt_oral_cov` and `warfarin_ode_lagtime` are byte-identical to the unguarded run and `warfarin_if` takes 58 evaluations to the same optimum, estimates agreeing to $6 \times 10^{-6}$ relative. The bundled reproducer `examples/one_cpt_transit.ferx` + `data/datsim_oral.csv` is unchanged to the byte: after #1519 its 15 remaining declines all sit at one trial whose excess over the incumbent is 33 units on 1,200 observations, and its subjects within 1.6 units of their incumbent values — nothing there is blown up, so nothing is skipped.
+
 ### Analytic scope: models and readouts {#analytic-scope-models-and-readouts}
 
 The analytic route serves the analytical 1-/2-/3-cpt PK models and — since #410 — in-scope user-`[odes]` models (via a lighter `Dual1` forward walk over the ODE solver), including multi-endpoint **per-CMT** Form-C readouts (`y[CMT=N] = …`, since #439) and Form-C readouts that reference a θ/η **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`, since #486 — each bare θ/η in the readout is desugared into a hidden individual parameter so its `∂y/∂θ`/`∂y/∂η` rides the same individual-parameter sensitivity chain; a readout referencing a neural-network output still falls back to FD).

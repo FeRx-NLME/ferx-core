@@ -2121,7 +2121,15 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
     let bounds = compute_bounds(&template);
     let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
     let mixed = population_gradient_sens_mixed(
-        &x, &template, &model, &pop, &ehs, &bounds, &options, &declines,
+        &x,
+        &template,
+        &model,
+        &pop,
+        &ehs,
+        &bounds,
+        &options,
+        crate::estimation::outer_optimizer::OuterTrial::unknown(),
+        &declines,
     );
 
     // FD reference, per subject mirroring the mixed assembly: in-scope
