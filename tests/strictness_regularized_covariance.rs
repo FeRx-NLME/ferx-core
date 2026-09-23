@@ -15,8 +15,8 @@
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{
-    check_strictness, fit, max_abs_correlation, read_nonmem_csv, EstimationMethod, FitOptions,
-    Strictness, WarningCode,
+    check_strictness, fit, max_abs_correlation, read_nonmem_csv, run_covariance, CovarianceMethod,
+    EstimationMethod, FitOptions, Strictness, WarningCode,
 };
 use std::path::Path;
 
@@ -102,5 +102,69 @@ fn a_collapsed_peripheral_fails_strictness_on_its_regularized_covariance() {
             .iter()
             .any(|f| f.starts_with("covariance matrix regularized:")),
         "{v:?}"
+    );
+}
+
+fn cites_regularization(r: &ferx_core::FitResult) -> bool {
+    check_strictness(r, &Strictness::default())
+        .failures
+        .iter()
+        .any(|f| f.starts_with("covariance matrix regularized:"))
+}
+
+/// The gate follows the covariance step that produced the fit's matrix.
+///
+/// `rsr` reports `R⁻¹ S R⁻¹`, which uses the floored `R`, so it must be cited as `r` is.
+///
+/// The second leg is `run_covariance` re-running the `r` fit under `s`: the incoming fit
+/// carries the floor warning, and a re-run that kept it would have the gate exclude the fit
+/// over a step that no longer exists. On this fixture the `s` step itself *fails* ("the score
+/// cross-product matrix S is singular or rank-deficient", measured), so the re-run stores no
+/// matrix. That is why there is no
+/// fresh-`s`-fit leg here: it would pass by skipping (no matrix, nothing to read), whatever
+/// the estimator gating did — measured, making the floor warning fire under `s` too left such
+/// a leg green. The re-run leg is live regardless, since the stale warning is carried in on
+/// `r`: dropping `CovarianceRegularized` from `run_covariance`'s superseded set reddens it.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn the_regularization_failure_follows_the_covariance_step() {
+    let model = parse_model_string(WARFARIN_ONE_PERIPHERAL).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let opts = |m: CovarianceMethod| FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        outer_maxiter: 300,
+        run_covariance_step: true,
+        covariance_method: m,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit_under = |m| fit(&model, &pop, &model.default_params, &opts(m)).expect("fit runs");
+
+    let r = fit_under(CovarianceMethod::Hessian);
+    assert!(cites_regularization(&r), "r: {:?}", r.warnings);
+    let rsr = fit_under(CovarianceMethod::Sandwich);
+    assert!(cites_regularization(&rsr), "rsr: {:?}", rsr.warnings);
+
+    let rerun = run_covariance(
+        &r,
+        Some(&model),
+        Some(&pop),
+        &opts(CovarianceMethod::CrossProduct),
+    )
+    .expect("s re-run");
+    assert!(
+        rerun.covariance_matrix.is_none(),
+        "the premise changed: `s` now succeeds on this fixture, so add a fresh-`s`-fit leg \
+         and update the doc comment"
+    );
+    assert!(
+        !cites_regularization(&rerun),
+        "r -> s re-run kept a stale floor warning: {:?}",
+        rerun.warnings
     );
 }

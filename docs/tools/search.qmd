@@ -282,7 +282,7 @@ a structural search) is the tool's, and omitting it leaves the tool's default.
 (#1177): `require_converged`, `require_covariance`, `max_condition_number`,
 `max_correlation`, `reject_on_boundary`, `reject_init_stall`. Every key is
 optional; an unstated key keeps the engine default. While either threshold
-key is set, a candidate whose covariance step had to floor a Hessian
+is enabled (both are by default), a candidate whose covariance step had to floor a Hessian
 eigenvalue is excluded too, since the floor hides exactly the collapse the
 thresholds look for (#1512; see
 [Strictness](../api/fitting.qmd#strictness-check_strictness)). Under automation an init

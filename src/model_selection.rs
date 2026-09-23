@@ -401,9 +401,17 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
     // collapsed compartment — V2 → 0 with Q free — leaves no |r| = 1 and no large
     // condition number behind for the thresholds to find: measured on warfarin's one-
     // peripheral candidate, correlation-matrix condition number 2.98 and max |r| 0.35 next to
-    // a TVQ RSE of 293519%. A floored Hessian is NONMEM's "R matrix algorithmically singular",
+    // a TVQ RSE of 293519%. The floor fires only on an indefinite Hessian or one with
+    // `λ_min < max(1e-10·λ_max, 1e-12)` (`invert_psd_with_floor`) — the analogue of NONMEM's "R matrix algorithmically singular" —
     // so it fails here whenever either matrix-reading gate is enabled, rather than passing on
     // numbers the floor manufactured.
+    //
+    // At every severity, `minor` included: the grade measures how far the floor moved the
+    // *reported* variances, not whether the Hessian is singular. A `minor` grade needs a
+    // variance inflation ≤ 1.02, i.e. the floored direction's `q_k²/floor` is ≤ 2% of every
+    // reported variance it loads on. With the relative `floor = 1e-10·λ_max` and some `q_k² ≥ 1/n_free`,
+    // that puts a reported variance ≥ ~5e11/(n_free·λ_max) — a parameter determined ~1e10×
+    // worse than the best direction — so even a `minor` floor sits on a non-identified model.
     if (s.max_condition_number.is_some() || s.max_correlation.is_some())
         && covariance_regularized(result)
     {

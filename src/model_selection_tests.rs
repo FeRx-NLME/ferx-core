@@ -951,17 +951,38 @@ fn strictness_serde_fills_missing_keys_from_default() {
 
 /// The `covariance_regularized` entry the covariance step leaves on a fit whose Hessian
 /// eigenvalue floor fired.
+///
+/// Built the way a real fit builds it, not by hand: the covariance step's own formatter
+/// (with warfarin `run1`'s measured spectrum), behind the `[FOCEI]` prefix a chained fit adds,
+/// through `classify_warning` — the function `fit()`, `run_covariance`'s rebuild and a
+/// `.fitrx` reload all use to turn the stored message back into an entry. So the gate is
+/// tested against the emitter, the chain prefix and the classifier together.
 fn regularized_warning() -> WarningEntry {
-    WarningEntry {
-        severity: WarningSeverity::Warning,
-        category: WarningCode::CovarianceRegularized,
-        message: "Covariance step regularized: eigenvalue floor applied to the analytic \
-                  R-matrix (1 of 9 free-block eigenvalues clipped; ...)."
-            .into(),
-        source_method: None,
-        details: None,
-    }
+    use crate::estimation::cov_diagnostics::{
+        format_regularized_warning, CovHessianSource, CovRegularizationFacts,
+    };
+    let msg = format_regularized_warning(&CovRegularizationFacts {
+        source: CovHessianSource::AnalyticRMatrix,
+        n_clipped: 1,
+        n_free: 9,
+        min_eigenvalue: 2.028e-7,
+        max_eigenvalue: 2.285e3,
+        floor: 2.285e-7,
+        variance_inflation: 1.190e3,
+        declines: &[],
+        ode: None,
+    });
+    let entry = crate::types::classify_warning(&format!("[FOCEI] {msg}"));
+    assert_eq!(entry.category, WarningCode::CovarianceRegularized);
+    assert_eq!(entry.source_method.as_deref(), Some("FOCEI"));
+    entry
 }
+
+/// The failure reason, pinned whole: every clause of it is a claim a search report prints.
+const REGULARIZED_FAILURE: &str = "covariance matrix regularized: the Hessian had a direction \
+     of negative or near-zero curvature that the covariance step's eigenvalue floor replaced, \
+     so the condition number and correlations read from it describe the floored matrix, not \
+     the fit (see the `covariance_regularized` warning)";
 
 /// #1512: a collapsed peripheral compartment (V2 → 0, Q free) leaves one flat Hessian
 /// direction, the eigenvalue floor replaces it, and the matrix the condition-number and
@@ -1019,10 +1040,7 @@ fn a_regularized_covariance_fails_the_matrix_reading_gates() {
         let v = check_strictness(&r, s);
         assert!(!v.passed, "{label} enabled: {v:?}");
         assert_eq!(v.failures.len(), 1, "{label}: {v:?}");
-        assert!(
-            v.failures[0].starts_with("covariance matrix regularized:"),
-            "{label}: {v:?}"
-        );
+        assert_eq!(v.failures[0], REGULARIZED_FAILURE, "{label}");
     }
 
     // Neither matrix-reading gate enabled: nothing reads the floored matrix.
