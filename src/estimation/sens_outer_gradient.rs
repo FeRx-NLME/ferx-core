@@ -2119,7 +2119,7 @@ pub fn population_gradient_sens(
 /// which short-circuits the *whole* population to `None` on the first
 /// out-of-scope subject, this exposes the per-subject result so the caller can
 /// keep the exact analytic gradient for the in-scope subjects and fill only the
-/// out-of-scope ones with a reconverged-FD gradient. One out-of-scope subject no
+/// out-of-scope ones with a per-subject held-EBE gradient (#1529). One out-of-scope subject no
 /// longer disables the exact gradient for the other thousands — the all-or-
 /// nothing fallback dropped to the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block stalled SLSQP/L-BFGS/MMA well above the derivative-free optimum

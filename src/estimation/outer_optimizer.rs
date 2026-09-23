@@ -4622,9 +4622,9 @@ fn subject_analytic_outer_gradient_iov(
     g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
-/// Which subjects actually took the per-subject **reconverged-FD** outer gradient during
-/// this fit, because [`subject_analytic_outer_gradient`] (or its IOV twin) declined them
-/// (#1154).
+/// Which subjects actually took a per-subject salvage outer gradient during this fit —
+/// held-EBE for non-IOV ([`declined_subject_gradient`], #1529), reconverged FD under IOV —
+/// because [`subject_analytic_outer_gradient`] (or its IOV twin) declined them (#1154).
 ///
 /// One `AtomicBool` per subject, set on the fallback arm of the mixed assemblies. Recorded
 /// at the point the gradient is evaluated, so it says what *ran* rather than what a probe
