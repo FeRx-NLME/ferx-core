@@ -79,6 +79,16 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **A data cell that is not a number is an error instead of a silent `0`.** `DV = abc` used
+  to be scored as a measured `0.0`, `EVID = abc` turned a dose into an observation, and
+  `ADDL = abc` dropped the additional doses, all without a warning. A present cell that is
+  not a number in `TIME`, `EVID`, `MDV`, `AMT`, `RATE`, `II`, `SS`, `ADDL`, `DV`, `TENTRY`
+  or `FREMTYPE` (or a fraction in a whole-number column) is now rejected on a record that
+  reads the column and that `[data_selection]` keeps, naming the subject, time, column and
+  cell — as NONMEM rejects it. A `[data_selection]` rule that would decide a record on such
+  a cell (`ignore = CENS == 0` on `CENS = abc`) is an error naming the rule. Missing cells
+  (`.`, blank, `NA`) keep their defaults, and `CMT`, the occasion column and `L2` keep their
+  existing handling (#1501).
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every

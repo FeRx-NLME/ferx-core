@@ -69,6 +69,60 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 > statement that the row is not an observation. Such a population is for
 > simulation only: passing it to `fit()` is rejected with `E_NONFINITE_DV`.
 
+## A cell that is not a number
+
+A cell ferx cannot read — `abc`, a stray unit (`5 mg`), or a fraction in a
+whole-number column (`EVID=1.5`) — is an **error** on a record that reads that
+column, as it is in NONMEM. Measured on NONMEM 7.5.1: `abc` in any of the columns
+below stops NM-TRAN with `(DATA ERROR) … ITEM IS NOT A NUMBER`, `MDV=1.5` with
+`INVALID MDV FIELD`, and `EVID=1.5`, `EVID=-1` and `ADDL=1.5` stop the run with
+`EVENT IDENTIFICATION DATA ITEM HAS INAPPROPRIATE VALUE` /
+`ADDITIONAL DOSES DATA ITEM MUST BE A NON-NEGATIVE INTEGER`. One difference:
+NONMEM rejects `abc` on **every** record it keeps, a dose record's `DV` included,
+while ferx rejects it only on a record that reads the column. Before
+[#1501](https://github.com/FeRx-NLME/ferx-core/issues/1501) ferx read such a
+cell as `0` without a warning: `DV = abc` was scored as a measured `0.0`,
+`EVID = abc` turned a dose into an observation, `ADDL = abc` dropped the
+additional doses.
+
+| Column | Must be | Read on |
+|--------|---------|---------|
+| `TIME`, `EVID` | a number; a non-negative whole number for `EVID` | every record |
+| `AMT` | a number | a dose record — and every record when the dataset has no `EVID` column, since the record type is then [inferred from `AMT`](#inferring-doses-without-an-evid-column) |
+| `MDV` | a non-negative whole number | an `EVID=0` record |
+| `RATE`, `II`, `SS` | a number | a dose record (`SS` other than 0 or 1 is rejected as before) |
+| `ADDL` | a non-negative whole number | a dose record |
+| `DV` | a number | an observation record (`EVID=0`, `MDV=0`), every endpoint |
+| `TENTRY` | a number | a time-to-event observation record |
+| `FREMTYPE` | a whole number from 0 to 65535 | a Gaussian observation record |
+| `CENS` | a whole number | a Gaussian observation record — see [out-of-domain values](model-file/bloq.qmd#out-of-domain-values) |
+
+The message names the subject, the record's `TIME` (or its position among the
+subject's records, when `TIME` is the unreadable cell), the column and the cell.
+Three things are unchanged:
+
+- **A missing cell** (`.`, blank, `NA`, `NaN`) keeps the column's default in the
+  table above; only a present cell that is not a number is an error.
+- **A record the `[data_selection]` block removes is not read**, so a cell on it
+  is not checked — NONMEM behaves the same way with `IGNORE`. The rule that
+  removes the record must not read the unreadable column itself: `ignore = CENS
+  == 0` on `CENS = abc` would decide the record on a value the dataset does not
+  hold, so it is an error too, naming the rule. The same holds for a rule that
+  reads the column and keeps the record. NONMEM 7.5.1 agrees on both sides:
+  `IGNORE=(TIME.EQ.2)` removes a `CENS = abc` record without error, while
+  `IGNORE=(CENS.EQ.0)` on it is a `(DATA ERROR)`. See
+  [missing and unreadable cells](model-file/data-selection.qmd#missing-and-unreadable-cells).
+- **`CMT`, the occasion column and `L2` keep their own handling**: an unreadable
+  `CMT` falls back to compartment 1 and is counted in `W_CMT_DEFAULTED`, an
+  unreadable occasion is counted in `W_IOV_OCC_MISSING`, and an unreadable `L2`
+  is ungrouped.
+
+Why an unknown whole number is an error in `SS` but a warning in `CENS`:
+`SS=2` has a NONMEM meaning (superimpose the steady state) that ferx would run
+as something else (`SS=1`, reset), so the fit would be wrong; a `CENS` flag is
+only ever read by its sign, so under `bloq_method = m3` `CENS=7` is fitted as
+`CENS=1`, and the `W_CENS_UNEXPECTED` warning says how each method reads it.
+
 ## Inferring doses without an `EVID` column
 
 `EVID` is optional. When the column is **absent**, ferx infers the record type

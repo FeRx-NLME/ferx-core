@@ -4005,3 +4005,343 @@ fn a_cens_cell_is_still_read_on_an_observation_row_an_active_filter_keeps() {
         warned[0]
     );
 }
+
+// ── #1501: a present cell that is not a number is an error, where it is read ──
+
+/// One row of [`an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it`].
+struct UnreadableCase {
+    /// Column the cell sits in.
+    col: &'static str,
+    /// 0-based record the cell poisons: 0 = the dose at TIME 0, 2 = the
+    /// observation at TIME 2.
+    rec: usize,
+    /// A record that does **not** read the column, to carry the same cell. `None`
+    /// when every record reads it.
+    unread_rec: Option<usize>,
+    /// The cell under test.
+    cell: &'static str,
+    /// Expected `is not …` phrase on the record.
+    what: &'static str,
+    /// The row label the message opens with.
+    at: &'static str,
+    /// A clause that removes `rec` without reading `col`.
+    remove: &'static str,
+}
+
+const UNREADABLE_HEADER: [&str; 12] = [
+    "ID", "TIME", "DV", "EVID", "MDV", "AMT", "CMT", "RATE", "II", "SS", "ADDL", "FREMTYPE",
+];
+
+/// A dose, then two Gaussian observations, with `cell` written into `(rec, col)`.
+fn unreadable_fixture(col: &str, rec: usize, cell: &str) -> String {
+    let mut rows = [
+        ["1", "0", ".", "1", "1", "100", "1", "0", "0", "0", "0", "."],
+        ["1", "1", "5.0", "0", "0", ".", "1", ".", ".", ".", ".", "0"],
+        ["1", "2", "4.0", "0", "0", ".", "1", ".", ".", ".", ".", "0"],
+    ];
+    let c = UNREADABLE_HEADER
+        .iter()
+        .position(|h| *h == col)
+        .unwrap_or_else(|| panic!("no column {col}"));
+    rows[rec][c] = cell;
+    let mut s = UNREADABLE_HEADER.join(",");
+    for r in rows {
+        s.push('\n');
+        s.push_str(&r.join(","));
+    }
+    s.push('\n');
+    s
+}
+
+fn read_unreadable(csv: &str, clause: Option<&str>) -> Result<Population, String> {
+    let f = write_csv(csv);
+    match clause {
+        None => read_nonmem_csv(f.path(), None, None),
+        Some(c) => {
+            let filter = SelectionFilter::from_opts(&[c.to_string()], &[], &[])
+                .unwrap_or_else(|e| panic!("filter {c:?}: {e}"));
+            read_nonmem_csv_filtered(f.path(), None, None, &filter)
+        }
+    }
+}
+
+/// #1501. Each column that used to read an unparseable cell as `0`, silently, on
+/// the record that reads it. Per case, five legs of one fixture, so the check
+/// cannot move across a boundary unseen:
+///
+/// 1. the cell on a kept record that reads it is an error, with the exact message;
+/// 2. a missing cell (`.`) in the same place keeps its documented default;
+/// 3. a `[data_selection]` clause that removes the record without reading the
+///    column removes it without error — NONMEM 7.6.0 only checks the records its
+///    `IGNORE` keeps — which is what the message's second sentence promises;
+/// 4. a clause that reads the column, and keeps the record, is refused by name: it
+///    decided the record on the reader's fallback;
+/// 5. where one exists, a record that does not read the column accepts the cell.
+#[test]
+fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
+    use UnreadableCase as C;
+    let num = "a number";
+    let count = "a non-negative whole number";
+    #[rustfmt::skip]
+    let cases = [
+        C { col: "TIME", rec: 2, unread_rec: None, cell: "abc", what: num, at: "record 3 of the subject", remove: "DV == 4" },
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "abc", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "1.5", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "-1", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "MDV", rec: 2, unread_rec: Some(0), cell: "abc", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "MDV", rec: 2, unread_rec: Some(0), cell: "1.5", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "DV", rec: 2, unread_rec: Some(0), cell: "abc", what: num, at: "time 2", remove: "TIME == 2" },
+        C { col: "FREMTYPE", rec: 2, unread_rec: Some(0), cell: "abc", what: count, at: "time 2", remove: "TIME == 2" },
+        // Past `u16`, which FREMTYPE is read as: a whole number that read as 0.
+        C { col: "FREMTYPE", rec: 2, unread_rec: Some(0), cell: "70000", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "AMT", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
+        C { col: "RATE", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
+        C { col: "II", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
+        C { col: "SS", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
+        C { col: "ADDL", rec: 0, unread_rec: Some(2), cell: "abc", what: count, at: "time 0", remove: "TIME == 0" },
+        C { col: "ADDL", rec: 0, unread_rec: Some(2), cell: "1.5", what: count, at: "time 0", remove: "TIME == 0" },
+    ];
+    for case in &cases {
+        let UnreadableCase { col, rec, cell, .. } = *case;
+        let tag = format!("{col}={cell:?} on record {rec}");
+        let csv = unreadable_fixture(col, rec, cell);
+
+        // 1. Rejected, word for word.
+        let err = read_unreadable(&csv, None).expect_err(&tag);
+        assert_eq!(
+            err,
+            format!(
+                "subject 1, {}: {col}=\"{cell}\" is not {}. Correct the cell, or remove the \
+                 record with a [data_selection] rule that does not read {col}.",
+                case.at, case.what
+            ),
+            "{tag}"
+        );
+
+        // 2. A missing cell keeps its default.
+        read_unreadable(&unreadable_fixture(col, rec, "."), None)
+            .unwrap_or_else(|e| panic!("{tag}: `.` must read as missing: {e}"));
+
+        // 3. Removed by a clause that does not read the column: no error, and the
+        //    record really went.
+        let pop = read_unreadable(&csv, Some(case.remove))
+            .unwrap_or_else(|e| panic!("{tag} under `ignore = {}`: {e}", case.remove));
+        let s = &pop.subjects[0];
+        if rec == 0 {
+            assert!(s.doses.is_empty(), "{tag}: the dose must be removed");
+        } else {
+            assert_eq!(s.observations, vec![5.0], "{tag}: record 3 must be removed");
+        }
+
+        // 5. A record that does not read the column accepts the cell.
+        if let Some(other) = case.unread_rec {
+            read_unreadable(&unreadable_fixture(col, other, cell), None)
+                .unwrap_or_else(|e| panic!("{col}={cell:?} on record {other} is not read: {e}"));
+        }
+
+        // 4. A clause that reads the column and keeps the record decided it on the
+        //    fallback. `SS` in the filter context is read as a count, where the dose
+        //    record leaves `1.5` / `2` to `validate_ss`. `ADDL` and `FREMTYPE` are
+        //    not columns the filter context knows: a clause on either reads it as a
+        //    covariate.
+        if matches!(col, "ADDL" | "FREMTYPE") {
+            continue;
+        }
+        let clause = format!("{col} == 12345");
+        let err = read_unreadable(&csv, Some(&clause)).expect_err(&tag);
+        assert_eq!(
+            err,
+            format!(
+                "subject 1, {}: the [data_selection] rule \"ignore: {clause}\" decides \
+                 this record on {col}=\"{cell}\", which is not {}. Correct the cell.",
+                case.at,
+                if col == "SS" { count } else { case.what }
+            ),
+            "{tag}"
+        );
+    }
+}
+
+/// #1501, the discussion's table: a `[data_selection]` rule about a `CENS` cell
+/// that holds no flag. Before, the filter context read `abc` as 0, so `ignore =
+/// CENS == 0` removed the record as an ordinary exclusion. Both branches of the
+/// decider are pinned — a rule that *removes* the record (`ignore = CENS == 0`) and
+/// one that *keeps* it (`accept = CENS == 0`) — plus the straddle (`1`, a real flag,
+/// kept) and a removal decided by another column while a `CENS` clause sits beside
+/// it: only the rule that fired is asked, so the record goes without error.
+#[test]
+fn a_data_selection_rule_does_not_decide_a_record_on_an_unreadable_cell() {
+    let read = |cell: &str, ignore: &[&str], accept: &[&str]| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,0\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,4.0,0,0,.,1,{cell}\n"
+        ));
+        let own = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let filter = SelectionFilter::from_opts(&own(ignore), &own(accept), &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter)
+    };
+    let refused = |rule: &str| {
+        format!(
+            "subject 1, time 2: the [data_selection] rule \"{rule}\" decides this record on \
+             CENS=\"abc\", which is not a whole number. Correct the cell."
+        )
+    };
+
+    // The rule fires on the fallback 0.
+    assert_eq!(
+        read("abc", &["CENS == 0"], &[]).unwrap_err(),
+        refused("ignore: CENS == 0")
+    );
+    // The rule keeps the record on the fallback 0.
+    assert_eq!(
+        read("abc", &[], &["CENS == 0"]).unwrap_err(),
+        refused("accept: CENS == 0")
+    );
+    // `1.5` is a number but not a flag: the filter context reads it as 0 too.
+    assert_eq!(
+        read("1.5", &["CENS == 0"], &[]).unwrap_err(),
+        refused("ignore: CENS == 0").replace("\"abc\"", "\"1.5\"")
+    );
+    // Straddle: a real flag of 1 is kept by `ignore = CENS == 0`, and read.
+    let kept = read("1", &["CENS == 0"], &[]).unwrap_or_else(|e| panic!("CENS=1: {e}"));
+    assert_eq!(kept.subjects[0].cens, vec![1]);
+    // `TIME == 2` fires first and reads no CENS.
+    let removed = read("abc", &["TIME == 2", "CENS == 1"], &[])
+        .unwrap_or_else(|e| panic!("removed by TIME: {e}"));
+    assert_eq!(removed.subjects[0].observations, vec![5.0]);
+    // Reversed: `CENS == 1` is evaluated first and does not fire on the fallback,
+    // then `TIME == 2` removes the record. The record would have gone whatever the
+    // cell held, so it goes without error.
+    let removed = read("abc", &["CENS == 1", "TIME == 2"], &[])
+        .unwrap_or_else(|e| panic!("removed by TIME after CENS: {e}"));
+    assert_eq!(removed.subjects[0].observations, vec![5.0]);
+}
+
+/// #1501, `SS` in the `[data_selection]` context, which reads it as a count: `1.5`
+/// read there as 0 (not steady state). On an observation record, which never
+/// reads `SS`, the cell is accepted; a clause that reads `SS` is refused.
+#[test]
+fn a_fractional_ss_is_not_decided_on_by_a_data_selection_rule() {
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,SS\n\
+               1,0,.,1,1,100,1,0\n\
+               1,1,5.0,0,0,.,1,1.5\n";
+    let pop = read_unreadable(csv, None).unwrap_or_else(|e| panic!("unfiltered: {e}"));
+    assert_eq!(pop.subjects[0].observations, vec![5.0]);
+    assert_eq!(
+        read_unreadable(csv, Some("SS == 1")).unwrap_err(),
+        "subject 1, time 1: the [data_selection] rule \"ignore: SS == 1\" decides this \
+         record on SS=\"1.5\", which is not a non-negative whole number. Correct the cell."
+    );
+}
+
+/// #1501 review of #1502: `data-selection.qmd` claimed a missing cell "never matches
+/// a comparison on that column". True for `DV`, `AMT`, `RATE` and `II`, which the
+/// filter context reads as `NaN`; false for `TIME`, `EVID`, `MDV`, `SS` and `CENS`,
+/// which read a missing cell as their default `0`. Pinned both ways, per column, on
+/// the observation record at TIME 2, so the corrected page cannot drift: each clause
+/// `COL == 0` removes the record when the cell is `.` for the second group, and
+/// keeps it for the first.
+#[test]
+fn missing_cells_in_defaulted_columns_match_a_zero_clause() {
+    for (col, matches) in [
+        ("TIME", true),
+        ("EVID", true),
+        ("MDV", true),
+        ("SS", true),
+        ("CENS", true),
+        ("DV", false),
+        ("AMT", false),
+        ("RATE", false),
+        ("II", false),
+    ] {
+        let mut header: Vec<&str> = UNREADABLE_HEADER.to_vec();
+        header.push("CENS");
+        let mut csv = header.join(",");
+        // The dose sits at TIME 1 so a `TIME == 0` clause can only match the
+        // record under test.
+        csv.push_str("\n1,1,.,1,1,100,1,0,0,0,0,.,0");
+        csv.push_str("\n1,2,5.0,0,0,.,1,.,.,.,.,0,0");
+        csv.push_str("\n1,3,4.0,0,0,.,1,.,.,.,.,0,0\n");
+        // Blank the column on the record at TIME 2 (the third line).
+        let c = header.iter().position(|h| *h == col).unwrap();
+        let mut lines: Vec<String> = csv.lines().map(str::to_string).collect();
+        let mut cells: Vec<&str> = lines[2].split(',').collect();
+        cells[c] = ".";
+        lines[2] = cells.join(",");
+        let csv = lines.join("\n") + "\n";
+
+        let clause = format!("{col} == 0");
+        let pop = read_unreadable(&csv, Some(&clause)).unwrap_or_else(|e| panic!("{col}: {e}"));
+        // Counted as the filter excluded them, not as observations left: a blank DV
+        // row is skipped by the reader (`W_MISSING_DV`) whether or not a clause
+        // matched it. For EVID/MDV/SS/CENS the clause also matches the other
+        // observation's written `0`.
+        let excluded = pop.exclusions.as_ref().map_or(0, |e| e.n_obs_excluded);
+        let want = match (matches, matches!(col, "EVID" | "MDV" | "SS" | "CENS")) {
+            (true, true) => 2,
+            (true, false) => 1,
+            (false, _) => 0,
+        };
+        assert_eq!(excluded, want, "{col}: `{clause}` on a missing cell");
+    }
+}
+
+/// #1501, a dataset with no `EVID` column: the record type is inferred from `AMT`
+/// (#262), so every record reads `AMT`, and a clause on `EVID` reads it too. The
+/// straddle is the `EVID`-carrying twin, where only a dose record reads `AMT` and
+/// the same cell on an observation record is accepted.
+#[test]
+fn an_unreadable_amt_is_read_by_every_record_when_evid_is_inferred_from_it() {
+    let no_evid = "ID,TIME,DV,MDV,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,abc\n\
+                   1,2,4.0,0,.\n";
+    assert_eq!(
+        read_unreadable(no_evid, None).unwrap_err(),
+        "subject 1, time 1: AMT=\"abc\" is not a number. Correct the cell, or remove the \
+         record with a [data_selection] rule that does not read AMT or EVID (inferred from \
+         AMT, as this dataset has no EVID column)."
+    );
+    assert_eq!(
+        read_unreadable(no_evid, Some("EVID == 1")).unwrap_err(),
+        "subject 1, time 1: the [data_selection] rule \"ignore: EVID == 1\" decides this \
+         record on AMT=\"abc\", which is not a number. Correct the cell."
+    );
+    let pop =
+        read_unreadable(no_evid, Some("TIME == 1")).unwrap_or_else(|e| panic!("removed: {e}"));
+    assert_eq!(pop.subjects[0].observations, vec![4.0]);
+
+    let with_evid = "ID,TIME,DV,EVID,MDV,AMT\n\
+                     1,0,.,1,1,100\n\
+                     1,1,5.0,0,0,abc\n\
+                     1,2,4.0,0,0,.\n";
+    let pop = read_unreadable(with_evid, None).unwrap_or_else(|e| panic!("with EVID: {e}"));
+    assert_eq!(pop.subjects[0].observations, vec![5.0, 4.0]);
+}
+
+/// #1501, `TENTRY` on a TTE row: an unparseable cell read as 0 — no left
+/// truncation. A missing cell still does.
+#[cfg(feature = "survival")]
+#[test]
+fn an_unreadable_tentry_is_an_error_on_a_tte_row() {
+    use std::collections::HashSet;
+    let tte: HashSet<usize> = [1].into_iter().collect();
+    let routing = ObsRouting::tte_and_discrete(&tte, &HashSet::new());
+    let read = |tentry: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,AMT,CMT,MDV,TENTRY\n\
+             1,20,1,0,.,1,0,{tentry}\n"
+        ));
+        read_nonmem_csv_routed(f.path(), None, None, &[], None, None, &routing, &[])
+            .map(|(pop, _)| pop)
+    };
+    assert_eq!(
+        read("abc").unwrap_err(),
+        "subject 1, time 20: TENTRY=\"abc\" is not a number. Correct the cell, or remove \
+         the record with a [data_selection] rule that does not read TENTRY."
+    );
+    read(".").unwrap_or_else(|e| panic!("missing TENTRY: {e}"));
+}
