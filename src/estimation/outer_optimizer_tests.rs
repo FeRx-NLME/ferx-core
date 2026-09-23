@@ -4684,8 +4684,13 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         let log = record_one_gradient_eval(&model, &pop);
         let w =
-            outer_fd_fallback_warning(&pop, &log, false).expect("a declining subject must warn");
+            outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
+        assert!(
+            w.contains("could not be given the exact analytic outer gradient")
+                && w.contains("a trial point where it could not be formed"),
+            "must not attribute every decline to the provider's scope; got: {w}"
+        );
         assert!(
             w.contains("OUT_OF_SCOPE"),
             "must name the declining subject, not the in-scope one; got: {w}"
@@ -4707,8 +4712,24 @@ mod outer_fd_fallback {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = record_one_gradient_eval(&model, &pop);
+        // The IOV twin of the fixture model: same subjects, one `kappa` on CL. The route is
+        // read from the model inside the warning, so pairing the same log with each model
+        // is what exercises it — an `iov` hard-coded at the call site would redden one leg.
+        let iov_model = crate::parser::model_parser::parse_model_string(
+            &WARFARIN_F
+                .replace(
+                    "omega ETA_KA ~ 0.30",
+                    "omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02",
+                )
+                .replace("TVCL * exp(ETA_CL)", "TVCL * exp(ETA_CL + KAPPA_CL)"),
+        )
+        .expect("IOV twin parses");
+        assert!(
+            iov_model.n_kappa > 0 && model.n_kappa == 0,
+            "fixture precondition: the two models must straddle the IOV gate"
+        );
 
-        let non_iov = outer_fd_fallback_warning(&pop, &log, false).expect("must warn");
+        let non_iov = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
         assert!(
             non_iov.contains("used fixed-EBE outer gradients")
                 && non_iov.contains("omit the EBE-response term"),
@@ -4720,7 +4741,7 @@ mod outer_fd_fallback {
         );
         assert!(!non_iov.contains("correct but slower"), "got: {non_iov}");
 
-        let iov = outer_fd_fallback_warning(&pop, &log, true).expect("must warn");
+        let iov = outer_fd_fallback_warning(&iov_model, &pop, &log).expect("must warn");
         assert!(
             iov.contains("reconverged finite-difference outer gradients")
                 && iov.contains("correct but slower"),
@@ -4738,7 +4759,7 @@ mod outer_fd_fallback {
         let (model, analytic, _) = analytic_and_declining();
         let pop = mk_pop(vec![analytic]);
         let log = record_one_gradient_eval(&model, &pop);
-        assert!(outer_fd_fallback_warning(&pop, &log, false).is_none());
+        assert!(outer_fd_fallback_warning(&model, &pop, &log).is_none());
     }
 
     /// The case the *inner* warning deliberately suppresses and this one must not: a
@@ -4761,7 +4782,7 @@ mod outer_fd_fallback {
         );
         let pop = mk_pop(vec![declining.clone(), declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w = outer_fd_fallback_warning(&pop, &log, false)
+        let w = outer_fd_fallback_warning(&model, &pop, &log)
             .expect("an all-FD in-scope population must warn");
         assert!(w.contains("2 of 2"), "got: {w}");
     }
@@ -4772,14 +4793,43 @@ mod outer_fd_fallback {
     /// without touching the analytic branch, so there is nothing to report.
     #[test]
     fn an_untouched_log_says_nothing() {
-        let (_, analytic, declining) = analytic_and_declining();
+        let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         assert!(
-            outer_fd_fallback_warning(&pop, &log, false).is_none(),
+            outer_fd_fallback_warning(&model, &pop, &log).is_none(),
             "a fit that never evaluated an analytic outer gradient must not warn — even \
              with a subject the provider would decline"
         );
+    }
+
+    /// #1529 review: the three fills of `declined_subject_gradient`, keyed on the held-EBE
+    /// objective and gradient. A repelled subject (the `1e20` sentinel, or NaN/∞) must
+    /// contribute zero rather than a sentinel-driven FD number *or* a reconverge — the
+    /// latter is the #1529 cost at blown-up trials; a usable objective with a non-finite
+    /// gradient must go to the reconverged fallback rather than leak `NaN` into the sum.
+    /// Each arm is pinned both ways so collapsing any two reddens it.
+    #[test]
+    fn declined_fill_keys_on_the_held_ebe_objective_and_gradient() {
+        let finite = [0.5, -1.0];
+        let nan = [0.5, f64::NAN];
+        assert_eq!(declined_fill(12.3, &finite), DeclinedFill::HeldEbe);
+        assert_eq!(declined_fill(12.3, &nan), DeclinedFill::Reconverge);
+        assert_eq!(
+            declined_fill(12.3, &[f64::INFINITY, 0.0]),
+            DeclinedFill::Reconverge
+        );
+        // Sentinel and non-finite objectives are repelled whatever the gradient says.
+        for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
+            assert_eq!(
+                declined_fill(nll, &finite),
+                DeclinedFill::Zero,
+                "nll = {nll}"
+            );
+            assert_eq!(declined_fill(nll, &nan), DeclinedFill::Zero, "nll = {nll}");
+        }
+        // Just under the sentinel is a real objective.
+        assert_eq!(declined_fill(9.99e19, &finite), DeclinedFill::HeldEbe);
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`

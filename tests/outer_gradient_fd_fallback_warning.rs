@@ -94,7 +94,7 @@ const MIXTURE_F: &str = r#"
 fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
     warnings
         .iter()
-        .find(|w| w.contains("fell outside the analytic sensitivity provider's scope"))
+        .find(|w| w.contains("could not be given the exact analytic outer gradient"))
 }
 
 /// The same population with subject 0's bolus replaced by a rate-defined infusion — the
@@ -277,6 +277,32 @@ fn forcing_the_reconverged_gradient_does_not_warn_about_scope() {
         outer_fd_warning(&result.warnings).is_none(),
         "`reconverge_gradient_interval = 1` bypasses the analytic branch for every \
          subject, which is not a provider scope gap; got {:?}",
+        result.warnings
+    );
+}
+
+/// #1529 review. The flat-theta pre-flight (#826) evaluates one outer gradient for
+/// **every** non-mixture fit, including derivative-free BOBYQA. It used to write to the
+/// same decline log, so a BOBYQA fit with a declining subject warned — and advised
+/// `reconverge_gradient_interval` — about a gradient its optimizer never used. The
+/// pre-flight now keeps its own log. `out_of_scope_subject_warns_while_the_report_still_says_analytic`
+/// is the other side of this gate: the same population on a gradient-driven optimizer
+/// does warn.
+#[test]
+fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "a BOBYQA fit's only outer gradient is the flat-theta pre-flight, which must not \
+         be reported; got {:?}",
         result.warnings
     );
 }

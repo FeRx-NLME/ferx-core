@@ -246,17 +246,8 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &bounds,
                             &opts,
                         ),
-                        _ => subject_fixed_ebe_gradient(
-                            &x,
-                            params,
-                            &model,
-                            &pop,
-                            i,
-                            &etas[i],
-                            &hms[i],
-                            &[],
-                            &bounds,
-                            &opts,
+                        _ => declined_subject_gradient(
+                            &x, params, &model, &pop, i, &etas[i], &hms[i], &bounds, &opts,
                         ),
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {
