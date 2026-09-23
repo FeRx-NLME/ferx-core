@@ -79,6 +79,18 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
+  gets the reconverged outer gradient again.** Such a subject (for example, total and
+  unbound assays paired at one time) is outside the analytic outer gradient at every
+  parameter point. Since #1529 it had been given the held-EBE gradient, which omits the
+  EBE-response term, and on a model where every subject is paired that was the only
+  gradient the fit had. The 31-subject `fluconazole_radboudumc` model (FOCEI, L-BFGS)
+  stalled at OFV 810.28 instead of 738.05 (NONMEM: 734.64). It now reaches 738.05 again, in
+  16.5 s against 20.8 s before #1529. Declines that depend on the trial point still follow
+  `reconverge_gradient_interval`. The fallback warning now says how many subjects got each
+  gradient. The analytic path also declines a paired subject whose cross-covariance is
+  momentarily zero (ρ = 0, or `f = 0` on a proportional row), because the derivative terms
+  it would drop are not zero there (#1536).
 - **Analytic ODE covariance: the third-order sweep no longer differences across a
   lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
   R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and

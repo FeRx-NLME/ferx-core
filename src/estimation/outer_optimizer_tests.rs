@@ -5348,6 +5348,82 @@ mod outer_fd_fallback {
         );
     }
 
+    /// #1536: a non-IOV decline takes one of two salvages — reconverged for a structural
+    /// decline, held-EBE otherwise — and the warning must describe each subject by the one
+    /// it got. The input space is the (structural, held-EBE) split of the declined set,
+    /// three non-empty cells; all three are asserted here, each on the sentence that must
+    /// appear *and* the one that must not, so forcing any branch reddens the test.
+    #[test]
+    fn consequence_sentence_names_each_non_iov_salvage_group() {
+        let (model, analytic, declining) = analytic_and_declining();
+        assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
+        let pop = mk_pop(vec![analytic, declining]);
+        // Whole sentences, so deleting any clause of either one reddens a cell.
+        const STRUCT: &str = "used reconverged finite-difference outer gradients because \
+             their `block_sigma` residuals are correlated across observation rows (paired \
+             endpoints in one residual block), which the analytic outer gradient does not \
+             cover; those gradients include the EBE-response term but are slower.";
+        const CORRECT: &str = "include the EBE-response term but are slower";
+        const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
+             term the analytic gradient carries. If the fit stalls, \
+             `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
+             evaluation.";
+        const REMEDY: &str = "`reconverge_gradient_interval = N`";
+        const SKIPPED: &str = "1 of their salvage gradients were skipped";
+        let warn_with = |structural: &[usize], skipped: bool| {
+            let log = OuterFdDeclineLog::new(2);
+            log.record(0);
+            log.record(1);
+            for &i in structural {
+                log.record_structural(i);
+            }
+            if skipped {
+                log.record_skipped_salvage();
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("declines warn")
+        };
+        let warn = |structural: &[usize]| warn_with(structural, false);
+
+        let held_only = warn(&[]);
+        assert!(
+            held_only.contains(HELD) && held_only.contains(REMEDY),
+            "got: {held_only}"
+        );
+        assert!(
+            !held_only.contains(STRUCT) && !held_only.contains(CORRECT),
+            "got: {held_only}"
+        );
+
+        let structural_only = warn(&[0, 1]);
+        assert!(
+            structural_only.contains(STRUCT) && structural_only.contains(CORRECT),
+            "got: {structural_only}"
+        );
+        assert!(
+            !structural_only.contains(HELD) && !structural_only.contains(REMEDY),
+            "a reconverged subject must not be pointed at the interval knob; got: \
+             {structural_only}"
+        );
+
+        let split = warn(&[1]);
+        assert!(
+            split.contains(&format!("of these, 1 {STRUCT}"))
+                && split.contains(CORRECT)
+                && split.contains(&format!("The other 1 {HELD}"))
+                && split.contains(REMEDY),
+            "a split population must name both groups with their counts; got: {split}"
+        );
+        assert!(!split.contains(SKIPPED), "no skip recorded; got: {split}");
+
+        // A #1520 skip on a structural fit appends its own sentence without disturbing
+        // the structural one.
+        let skipped = warn_with(&[0, 1], true);
+        assert!(
+            skipped.contains(STRUCT) && skipped.contains(SKIPPED) && !skipped.contains(HELD),
+            "got: {skipped}"
+        );
+    }
+
     /// An all-analytic population is silent.
     #[test]
     fn silent_when_every_subject_is_analytic() {
@@ -5425,6 +5501,111 @@ mod outer_fd_fallback {
         }
         // Just under the sentinel is a real objective.
         assert_eq!(declined_fill(9.99e19, &finite), DeclinedFill::HeldEbe);
+    }
+
+    /// #1537 review: a structural decline keys on the held-EBE objective exactly as the
+    /// held-EBE salvage does — zero when repelled — but its usable arm is the reconverged
+    /// gradient, never the held-EBE one it exists to replace. Both arms pinned, and the
+    /// sentinel boundary on both sides.
+    #[test]
+    fn structural_fill_zeroes_a_repelled_subject_and_reconverges_a_real_one() {
+        for nll in [12.3, 9.99e19] {
+            assert_eq!(
+                structural_fill(nll),
+                DeclinedFill::Reconverge,
+                "nll = {nll}"
+            );
+        }
+        for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
+            assert_eq!(structural_fill(nll), DeclinedFill::Zero, "nll = {nll}");
+        }
+    }
+
+    /// #1537 review, end to end through [`non_iov_declined_salvage`]: a structural subject
+    /// whose held-EBE objective is the `1e20` sentinel contributes zero, while the
+    /// unguarded reconverged gradient it used to take is large and non-zero at the very
+    /// same inputs. A NaN held Jacobian is what repels the subject here: it poisons `R̃`,
+    /// whose failed Cholesky returns the sentinel (asserted, not assumed). The usable twin
+    /// — same subject, same point, a finite Jacobian — must still take the reconverged
+    /// gradient bit-for-bit, so a guard that zeroes every structural subject also reddens.
+    #[test]
+    fn structural_salvage_zeroes_a_repelled_subject() {
+        let (model, _analytic, declining) = analytic_and_declining();
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let pop = mk_pop(vec![declining.clone()]);
+        let n_obs = declining.observations.len();
+        let eta = DVector::from_element(model.n_eta, 0.1);
+        let h_repelled = DMatrix::from_element(n_obs, model.n_eta, f64::NAN);
+        let h_usable = DMatrix::zeros(n_obs, model.n_eta);
+
+        let p = unpack_params(&x, params);
+        let nll_at = |h: &DMatrix<f64>| {
+            crate::stats::likelihood::foce_subject_nll(
+                &model,
+                &declining,
+                &p.theta,
+                &eta,
+                h,
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                true,
+            )
+        };
+        assert_eq!(nll_at(&h_repelled), 1e20, "fixture must hit the sentinel");
+        assert!(
+            crate::estimation::gauss_newton::is_usable_subject_nll(nll_at(&h_usable)),
+            "twin must be a real objective"
+        );
+
+        // The straddle: what the unguarded structural branch returned at these inputs.
+        let unguarded =
+            subject_reconverged_fd_gradient(&x, params, &model, &declining, &eta, &bounds, &opts);
+        assert!(
+            unguarded.iter().any(|g| g.abs() > 1.0),
+            "unguarded reconverge must be non-trivial here, else the zero below is vacuous: \
+             {unguarded:?}"
+        );
+
+        let salvage = |h: &DMatrix<f64>| {
+            non_iov_declined_salvage(true, &x, params, &model, &pop, 0, &eta, h, &bounds, &opts)
+        };
+        assert_eq!(salvage(&h_repelled), vec![0.0; x.len()]);
+        assert_eq!(salvage(&h_usable), unguarded);
+    }
+
+    /// #1537 review: the sentinel is finite, so a central difference with one repelled side
+    /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
+    /// [`fd_masked_subject_nll`] that coordinate drops to zero; the unmasked control pins
+    /// that the fixture really straddles the sentinel, and a coordinate with both sides
+    /// usable keeps its true derivative.
+    #[test]
+    fn fd_masked_subject_nll_drops_a_sentinel_straddle() {
+        let x = [0.0, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        // Repelled for x0 > 0; otherwise a smooth objective with d/dx1 = 3.
+        let raw = |v: &[f64]| if v[0] > 0.0 { 1e20 } else { 3.0 * v[1] };
+        let unmasked = central_diff_packed(&x, &fixed, &bounds, raw);
+        assert!(unmasked[0] > 1e20, "fixture must straddle: {unmasked:?}");
+        let masked = central_diff_packed(&x, &fixed, &bounds, |v| fd_masked_subject_nll(raw(v)));
+        assert_eq!(masked[0], 0.0);
+        assert!((masked[1] - 3.0).abs() < 1e-8, "{masked:?}");
+        for nll in [1e20, f64::INFINITY] {
+            assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
+        }
+        assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`

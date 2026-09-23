@@ -458,12 +458,16 @@ fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
 /// the objective bit-for-bit.
 ///
 /// A genuine cross-endpoint off-diagonal `R` (paired total/unbound rows) would need
-/// the full dense `M_k`/`B_{kl}` assembly, but such models require a per-CMT / Form-C
-/// or covariate-selected (#669) multi-endpoint readout that is out of analytic scope
-/// (they run FD). The off-diagonal check is a defensive guard: if one ever reaches
-/// here, bail to FD rather than silently drop the off-diagonals. The endpoint keys are
-/// resolved via `ErrorSpec::obs_keys` so a `Selected` spec's per-row branch — not the
-/// raw CMT column — drives the diagonal variance builders.
+/// the full dense `M_k`/`B_{kl}` assembly, which this path does not have, so such a
+/// subject is declined. That is **not** a rare defensive case: a covariate-selected
+/// (#669) `block_sigma` model with paired rows (`fluconazole_radboudumc`) routes to the
+/// analytic outer gradient at model level, and every paired subject declines here at
+/// every evaluation. The decline is keyed on
+/// [`crate::stats::residual_error::has_cross_observation_residual`] — the same predicate
+/// the outer assembly reads to give these subjects a reconverged gradient rather than the
+/// held-EBE one (#1536) — so the two cannot disagree about which subjects they are. The
+/// endpoint keys are resolved via `ErrorSpec::obs_keys` so a `Selected` spec's per-row
+/// branch — not the raw CMT column — drives the diagonal variance builders.
 fn corr_residual_diag(
     model: &CompiledModel,
     subject: &Subject,
@@ -475,6 +479,13 @@ fn corr_residual_diag(
         compute_d2r_df2_matrices, compute_dr_df_matrices, compute_r_matrix_with_correlations,
     };
     let es = &model.error_spec;
+    // Only diagonal R is served by the scalar reduction (see the doc above). Keyed on the
+    // pairing itself rather than on `|R_jk| > 0`, so a paired row whose value covariance
+    // is momentarily zero still declines: at `f = 0` on a proportional row its `∂R_jk/∂f`
+    // is not zero, and at ρ = 0 its `∂R_jk/∂ρ` is not — both terms this path would drop.
+    if crate::stats::residual_error::has_cross_observation_residual(es, subject, sigma, corr) {
+        return None;
+    }
     // #669: per-observation endpoint keys must come from the covariate selector
     // (`obs_keys`), not the raw CMT column — a `Selected` spec keys endpoints by
     // branch index, decoupled from `obs_cmts` (typically all-1 on an analytical
@@ -495,14 +506,6 @@ fn corr_residual_diag(
         sigma,
         corr,
     );
-    // Guard: only diagonal R is served by the scalar reduction (see the doc above).
-    for a in 0..n {
-        for b in 0..n {
-            if a != b && r[(a, b)].abs() > 1e-12 {
-                return None;
-            }
-        }
-    }
     let dr = compute_dr_df_matrices(
         es,
         &ipreds,
