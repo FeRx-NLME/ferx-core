@@ -4669,6 +4669,13 @@ fn is_structural_decline(
 /// ([`declined_subject_gradient`]): at a blown-up SLSQP/MMA trial the subject contributes
 /// zero and this function is not called — the same precedence every other salvage has,
 /// at points those optimizers reject anyway.
+///
+/// Where that guard is off (Luksan L-BFGS, or no incumbent yet) a structural subject can
+/// still arrive **repelled** — its objective at `x`, read at the held EBE, is NaN/∞ or the
+/// `1e20` sentinel. It then contributes zero, exactly as [`held_ebe_salvage`] does
+/// ([`structural_fill`]): a `2·n_free`-solve central difference across a sentinel is a
+/// ~1e24 component, not a derivative, and the re-solves are the #1529 cost at the very
+/// points subjects get repelled (#1537 review).
 #[allow(clippy::too_many_arguments)]
 fn non_iov_declined_salvage(
     structural: bool,
@@ -4683,15 +4690,31 @@ fn non_iov_declined_salvage(
     options: &FitOptions,
 ) -> Vec<f64> {
     if structural {
-        subject_reconverged_fd_gradient(
-            x,
-            init_params,
+        let subject = &population.subjects[subj_idx];
+        let params = unpack_params(x, init_params);
+        let nll = crate::stats::likelihood::foce_subject_nll(
             model,
-            &population.subjects[subj_idx],
+            subject,
+            &params.theta,
             eta_hat,
-            bounds,
-            options,
-        )
+            h_matrix,
+            &params.omega,
+            &params.sigma.values,
+            &params.residual_correlations,
+            options.interaction,
+        );
+        match structural_fill(nll) {
+            DeclinedFill::Zero => vec![0.0; x.len()],
+            _ => subject_reconverged_fd_gradient(
+                x,
+                init_params,
+                model,
+                subject,
+                eta_hat,
+                bounds,
+                options,
+            ),
+        }
     } else {
         held_ebe_salvage(
             x,
@@ -4772,6 +4795,30 @@ enum DeclinedFill {
     Reconverge,
 }
 
+/// The fill for a **structural** decline ([`non_iov_declined_salvage`]), keyed on the
+/// subject's held-EBE objective at `x`: [`DeclinedFill::Zero`] when it is repelled,
+/// otherwise [`DeclinedFill::Reconverge`]. Never [`DeclinedFill::HeldEbe`] — the held-EBE
+/// gradient is what a structural decline exists to avoid (#1536).
+fn structural_fill(nll: f64) -> DeclinedFill {
+    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+        DeclinedFill::Reconverge
+    } else {
+        DeclinedFill::Zero
+    }
+}
+
+/// A per-subject objective as [`central_diff_packed`] must see it: the `1e20` sentinel is
+/// finite, so without this a difference with one repelled side is a finite ~1e24 that
+/// passes its `is_finite()` filter. Mapping it to NaN drops that coordinate to zero, the
+/// same as a genuinely non-finite side (#1537 review).
+fn fd_masked_subject_nll(nll: f64) -> f64 {
+    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+        nll
+    } else {
+        f64::NAN
+    }
+}
+
 fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
     if !crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
         DeclinedFill::Zero
@@ -4800,8 +4847,8 @@ fn subject_reconverged_fd_gradient(
     let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
-    // difference drops to zero for that coordinate.
+    // (`foce_subject_nll`, summed by `pop_nll`); non-finite or sentinel → NaN so the
+    // central difference drops to zero for that coordinate.
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -4815,7 +4862,7 @@ fn subject_reconverged_fd_gradient(
             Some(&mu_k),
             0,
         );
-        crate::stats::likelihood::foce_subject_nll(
+        fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll(
             model,
             subject,
             &params.theta,
@@ -4825,7 +4872,7 @@ fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             &params.residual_correlations,
             options.interaction,
-        )
+        ))
     };
     central_diff_packed(x, &fixed, bounds, eval)
 }
