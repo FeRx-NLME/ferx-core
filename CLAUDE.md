@@ -478,7 +478,7 @@ Two things to know before you fight it:
 
 The estimation engine uses a nested optimization structure:
 
-- **Outer loop** (`estimation/outer_optimizer.rs`): Optimizes population parameters (theta, omega, sigma) using `optimizer = auto` (default: NLopt L-BFGS when the analytic gradient is available, BOBYQA otherwise), or an explicit BOBYQA, SLSQP, L-BFGS, MMA, built-in BFGS, or trust-region. Parameters are log-transformed for theta/sigma, Cholesky-factored for omega.
+- **Outer loop** (`estimation/outer_optimizer.rs`): Optimizes population parameters (theta, omega, sigma) using `optimizer = auto` by default — NLopt L-BFGS when the analytic gradient is available or the model has more than 64 free parameters, BOBYQA otherwise and for mixture models (`Optimizer::resolve_auto_given_analytic`, `outer_optimizer::resolve_outer_optimizer`) — or an explicit BOBYQA, SLSQP, L-BFGS, MMA, or trust-region. Parameters are log-transformed for theta/sigma, Cholesky-factored for omega.
 - **Inner loop** (`estimation/inner_optimizer.rs`): For each subject, finds empirical Bayes estimates (EBEs) of random effects (eta) by minimizing individual negative log-likelihood. Uses BFGS with warm-start from prior iteration; falls back to Nelder-Mead on failure.
 
 ### Gauss-Newton (BHHH) Optimizer

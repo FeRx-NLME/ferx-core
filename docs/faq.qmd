@@ -129,11 +129,12 @@ Leave the default, `optimizer = auto`, in place for most models. It picks
 per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is
 available, and `bobyqa` (derivative-free quadratic trust-region, robust to
 noisy FD gradients) when the outer loop has to fall back to finite
-differences — ODE/PD models, LTBS, SDE, or `gradient_method = fd`. Mixture
-models also resolve `auto` to `bobyqa`. The fit output reports which
-optimizer `auto` chose; see
-[Outer Optimizers](estimation/optimizers.qmd#the-auto-default) for the rules
-and the benchmarks behind them. To pin one, set `optimizer = ...` in
+differences — a model outside the analytic scope, or `gradient = fd`. Models
+with more than 64 free parameters take `nlopt_lbfgs` regardless, and mixture
+models take `bobyqa` regardless. A FOCE/FOCEI fit reports the pick as
+`auto (<resolved>)`; see
+[Outer Optimizers](estimation/optimizers.qmd#the-auto-default) for the rules,
+their exceptions, and the benchmarks behind them. To pin one, set `optimizer = ...` in
 `[fit_options]`.
 
 Reach for a different optimizer when the default misbehaves:
@@ -148,7 +149,8 @@ Reach for a different optimizer when the default misbehaves:
   `ceil(sqrt(n_params))` (~5 for standard NLME models), but you can pin
   it with `steihaug_max_iters` if you have many packed parameters and
   want more aggressive sub-problem solves.
-- **`lbfgs` / `bfgs`** — fall back to these only when NLopt is unavailable.
+- **`nlopt_lbfgs`** — gradient-based L-BFGS; what `auto` already picks when the
+  analytic gradient is available. `lbfgs` and `bfgs` are deprecated aliases for it.
 
 See [Fit Options](model-file/fit-options.qmd#optimizer-choices) for the full
 list.
@@ -300,13 +302,13 @@ Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with
 
 ## Which outer optimizer should I use?
 
-**Default (`bobyqa`)** works well for most models — including ODE/PD models, sparse data, and Hill-ridge problems where gradient-based optimizers stall. If you're unsure, start here.
+**Default (`auto`)** works well for most models: it takes `nlopt_lbfgs` when the exact analytic gradient is available and `bobyqa` — robust on FD-only ODE/PD models, sparse data, and Hill-ridge problems where gradient-based optimizers stall — when it is not. If you're unsure, start here.
 
 **`slsqp`** is the right pick when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can take many quadratic-interpolation samples to triangulate a high-dimensional surface). Pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
 
 **`trust_region`** shines on high-parameter-count models (many thetas/omegas) or when combined with `inits_from_nca` — the second-order curvature helps when starting values are good. Set `steihaug_max_iters` if you want to pin the CG budget.
 
-**`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness; that polish stage runs with `bobyqa` by default and inherits any `optimizer` override.
+**`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness; that polish stage uses the configured `optimizer` (default `auto`).
 
 **Gradient-based (`lbfgs`, `mma`)** are rarely needed; prefer `bobyqa` or `slsqp`. See [FOCE/FOCEI — Optimizer Options](estimation/foce.qmd#optimizer-options) for a full comparison.
 

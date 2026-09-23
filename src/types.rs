@@ -8179,7 +8179,7 @@ pub struct FitOptions {
     /// and substantially improves cold-start convergence (see
     /// [`ParameterScaling`]). **Default: `Auto`** — applies `Rescale2` to the
     /// gradient-based optimizers that benefit (`Bfgs`/`Lbfgs`/`NloptLbfgs`/`Slsqp`)
-    /// and leaves the derivative-free default `Bobyqa` unscaled (where `Rescale2`
+    /// and leaves the derivative-free `Bobyqa` unscaled (where `Rescale2`
     /// distorts its trust-region model). Set via `[fit_options]` key
     /// `parameter_scaling = none|abs|rescale2` to override.
     pub parameter_scaling: ParameterScaling,
@@ -8214,7 +8214,7 @@ pub struct FitOptions {
     ///
     /// **Opt-in (default `false`).** Warm-starting moves the fallback subjects'
     /// EBEs, which perturbs the outer optimiser's trajectory: harmless for the
-    /// derivative-free BOBYQA default, but it can derail a gradient-based outer
+    /// derivative-free BOBYQA, but it can derail a gradient-based outer
     /// optimiser (e.g. MMA) into a worse basin on some models. Enable it only
     /// after validating the OFV/estimates on your model + outer optimiser; leave
     /// it `false` for the historical (cold-restart) behaviour.
@@ -8496,9 +8496,11 @@ pub enum Optimizer {
     /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
     /// gradient is available (the model is in the sensitivity provider's scope
     /// and the user did not force `gradient_method = fd`), and to
-    /// [`Optimizer::Bobyqa`] otherwise (ODE/PD models, LTBS, SDE, or
+    /// [`Optimizer::Bobyqa`] otherwise (a model outside the analytic scope, or
     /// `gradient_method = fd`, where the outer loop must fall back to finite
-    /// differences). Benchmarking across ~10 real FOCEI datasets (#490) found
+    /// differences). Above [`BOBYQA_MAX_DIM`] free packed parameters it takes
+    /// `NloptLbfgs` even on an FD gradient, and mixture models always take
+    /// `Bobyqa` (that override lives in the outer optimizer's dispatch, not here). Benchmarking across ~10 real FOCEI datasets (#490) found
     /// NLopt L-BFGS fastest-to-optimum on every analytic-gradient problem, while
     /// BOBYQA was both fastest and most reliable when only finite differences
     /// are available. See [`Optimizer::resolve_auto`].
@@ -8664,7 +8666,7 @@ pub enum InnerOptimizer {
 /// nlmixr2's finding that parameter scaling, not gradient exactness, is the
 /// lever for cold-start robustness of *gradient-based* optimizers.
 ///
-/// Crucially, `Rescale2` is **harmful to the derivative-free default `Bobyqa`**
+/// Crucially, `Rescale2` is **harmful to the derivative-free `Bobyqa`**
 /// (e.g. it drops `emax_pkpd` from OFV −36.76 to −13.51 and `three_cpt_iv` from
 /// −730.6 to −715.9): rescaling the trust region of a gradient-free optimizer
 /// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto),
@@ -8673,7 +8675,7 @@ pub enum InnerOptimizer {
 pub enum ParameterScaling {
     /// **Default.** Apply `Rescale2` for the gradient-based optimizers that
     /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling
-    /// otherwise — so the derivative-free `Bobyqa` default (where `Rescale2` is
+    /// otherwise — so the derivative-free `Bobyqa` (where `Rescale2` is
     /// harmful) and `Mma`/`TrustRegion` are left unscaled, with the legacy
     /// `scale_params` / IOV-auto-enable still applying in that unscaled branch.
     /// `Slsqp` is scaled because the bound-half-width rescaling fixes its
