@@ -5358,20 +5358,31 @@ mod outer_fd_fallback {
         let (model, analytic, declining) = analytic_and_declining();
         assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
         let pop = mk_pop(vec![analytic, declining]);
+        // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             their `block_sigma` residuals are correlated across observation rows";
-        const CORRECT: &str = "correct but slower";
-        const HELD: &str = "used fixed-EBE outer gradients";
+             their `block_sigma` residuals are correlated across observation rows (paired \
+             endpoints in one residual block), which the analytic outer gradient does not \
+             cover; those gradients include the EBE-response term but are slower.";
+        const CORRECT: &str = "include the EBE-response term but are slower";
+        const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
+             term the analytic gradient carries. If the fit stalls, \
+             `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
+             evaluation.";
         const REMEDY: &str = "`reconverge_gradient_interval = N`";
-        let warn = |structural: &[usize]| {
+        const SKIPPED: &str = "1 of their salvage gradients were skipped";
+        let warn_with = |structural: &[usize], skipped: bool| {
             let log = OuterFdDeclineLog::new(2);
             log.record(0);
             log.record(1);
             for &i in structural {
                 log.record_structural(i);
             }
+            if skipped {
+                log.record_skipped_salvage();
+            }
             outer_fd_fallback_warning(&model, &pop, &log).expect("declines warn")
         };
+        let warn = |structural: &[usize]| warn_with(structural, false);
 
         let held_only = warn(&[]);
         assert!(
@@ -5401,6 +5412,15 @@ mod outer_fd_fallback {
                 && split.contains(&format!("The other 1 {HELD}"))
                 && split.contains(REMEDY),
             "a split population must name both groups with their counts; got: {split}"
+        );
+        assert!(!split.contains(SKIPPED), "no skip recorded; got: {split}");
+
+        // A #1520 skip on a structural fit appends its own sentence without disturbing
+        // the structural one.
+        let skipped = warn_with(&[0, 1], true);
+        assert!(
+            skipped.contains(STRUCT) && skipped.contains(SKIPPED) && !skipped.contains(HELD),
+            "got: {skipped}"
         );
     }
 

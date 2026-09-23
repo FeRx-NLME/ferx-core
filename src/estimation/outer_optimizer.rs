@@ -4661,11 +4661,14 @@ fn is_structural_decline(
 /// the reconverged [`subject_reconverged_fd_gradient`] for a structural decline
 /// ([`is_structural_decline`], #1536), otherwise [`held_ebe_salvage`] (#1529).
 ///
-/// A structural decline gets the reconverged gradient on every evaluation, whatever
+/// A structural decline gets the reconverged gradient whatever
 /// `reconverge_gradient_interval` says — the pre-#1529 behaviour, and the correct one:
 /// the interval exists to amortise a gradient that is *usually* exact between
 /// reconvergences, and a subject that is never analytic has no exact evaluations to
-/// amortise over.
+/// amortise over. It is still subject to the #1520 guard, which runs first
+/// ([`declined_subject_gradient`]): at a blown-up SLSQP/MMA trial the subject contributes
+/// zero and this function is not called — the same precedence every other salvage has,
+/// at points those optimizers reject anyway.
 #[allow(clippy::too_many_arguments)]
 fn non_iov_declined_salvage(
     structural: bool,
@@ -5375,7 +5378,7 @@ pub(crate) fn outer_fd_fallback_warning(
     const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
          their `block_sigma` residuals are correlated across observation rows (paired \
          endpoints in one residual block), which the analytic outer gradient does not \
-         cover; their results are correct but slower.";
+         cover; those gradients include the EBE-response term but are slower.";
     // #1536: a non-IOV decline takes one of two salvages, so the sentence names each
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.

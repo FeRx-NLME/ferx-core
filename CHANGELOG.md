@@ -87,7 +87,7 @@ section of the SDLC for the versioning policy).
   gradient the fit had. The 31-subject `fluconazole_radboudumc` model (FOCEI, L-BFGS)
   stalled at OFV 810.28 instead of 738.05 (NONMEM: 734.64). It now reaches 738.05 again, in
   16.5 s against 20.8 s before #1529. Declines that depend on the trial point still follow
-  `reconverge_gradient_interval`. The fallback warning now says which subjects got which
+  `reconverge_gradient_interval`. The fallback warning now says how many subjects got each
   gradient. The analytic path also declines a paired subject whose cross-covariance is
   momentarily zero (ρ = 0, or `f = 0` on a proportional row), because the derivative terms
   it would drop are not zero there (#1536).
