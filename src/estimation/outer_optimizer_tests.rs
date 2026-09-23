@@ -5348,6 +5348,62 @@ mod outer_fd_fallback {
         );
     }
 
+    /// #1536: a non-IOV decline takes one of two salvages — reconverged for a structural
+    /// decline, held-EBE otherwise — and the warning must describe each subject by the one
+    /// it got. The input space is the (structural, held-EBE) split of the declined set,
+    /// three non-empty cells; all three are asserted here, each on the sentence that must
+    /// appear *and* the one that must not, so forcing any branch reddens the test.
+    #[test]
+    fn consequence_sentence_names_each_non_iov_salvage_group() {
+        let (model, analytic, declining) = analytic_and_declining();
+        assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
+        let pop = mk_pop(vec![analytic, declining]);
+        const STRUCT: &str = "used reconverged finite-difference outer gradients because \
+             their `block_sigma` residuals are correlated across observation rows";
+        const CORRECT: &str = "correct but slower";
+        const HELD: &str = "used fixed-EBE outer gradients";
+        const REMEDY: &str = "`reconverge_gradient_interval = N`";
+        let warn = |structural: &[usize]| {
+            let log = OuterFdDeclineLog::new(2);
+            log.record(0);
+            log.record(1);
+            for &i in structural {
+                log.record_structural(i);
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("declines warn")
+        };
+
+        let held_only = warn(&[]);
+        assert!(
+            held_only.contains(HELD) && held_only.contains(REMEDY),
+            "got: {held_only}"
+        );
+        assert!(
+            !held_only.contains(STRUCT) && !held_only.contains(CORRECT),
+            "got: {held_only}"
+        );
+
+        let structural_only = warn(&[0, 1]);
+        assert!(
+            structural_only.contains(STRUCT) && structural_only.contains(CORRECT),
+            "got: {structural_only}"
+        );
+        assert!(
+            !structural_only.contains(HELD) && !structural_only.contains(REMEDY),
+            "a reconverged subject must not be pointed at the interval knob; got: \
+             {structural_only}"
+        );
+
+        let split = warn(&[1]);
+        assert!(
+            split.contains(&format!("of these, 1 {STRUCT}"))
+                && split.contains(CORRECT)
+                && split.contains(&format!("The other 1 {HELD}"))
+                && split.contains(REMEDY),
+            "a split population must name both groups with their counts; got: {split}"
+        );
+    }
+
     /// An all-analytic population is silent.
     #[test]
     fn silent_when_every_subject_is_analytic() {

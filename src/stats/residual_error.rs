@@ -1073,6 +1073,45 @@ fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
     }
 }
 
+/// Does this subject's residual covariance `R` couple two different observation rows?
+///
+/// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
+/// `block_sigma` correlation links the sigmas of two rows in one residual block (paired
+/// total/unbound assays at one time and occasion, or one explicit `L2` group). This is the
+/// pairing [`compute_r_matrix_with_correlations`] and the derivative builders fill, found
+/// by the same function, so the predicate cannot disagree with the `R` the objective uses.
+///
+/// The answer depends on the **data and the correlation structure only**, never on `f` or
+/// θ: pairing is decided by the rows' residual block and by which sigma slots they occupy
+/// ([`loadings_share_correlation`]), and slot presence does not depend on the prediction —
+/// which is why `f = 1` stands in for it. A subject this is true for therefore keeps an
+/// off-diagonal `R` at every parameter point of a fit (#1536).
+pub(crate) fn has_cross_observation_residual(
+    error_spec: &ErrorSpec,
+    subject: &Subject,
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> bool {
+    if correlations.is_empty() {
+        return false;
+    }
+    let loadings: Vec<Vec<(usize, f64)>> = error_spec
+        .obs_keys(subject)
+        .iter()
+        .map(|&cmt| error_spec.sigma_loadings(cmt, 1.0, sigma_values.len()))
+        .collect();
+    !match_partners(
+        &loadings,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        sigma_values,
+        correlations,
+    )
+    .is_empty()
+}
+
 /// Build the subject-level residual covariance matrix `R`.
 ///
 /// The diagonal is the existing per-observation residual variance, including
