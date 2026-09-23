@@ -12748,3 +12748,87 @@ fn frozen_replay_segments_a_route_lag_apart_from_a_zero_order_edge() {
         replay[4]
     );
 }
+
+/// A 1-cpt IV ODE whose RHS reads BOTH dose clocks, compiled through the parser so the
+/// resulting [`OdeSpec`] carries a real `rhs_program` (#1151). The hand-built specs in this
+/// file set `rhs_program: None`, which is exactly the "no program ⇒ nothing to refuse" arm.
+fn tad_and_tafd_ode_spec() -> OdeSpec {
+    let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + 1e-3 * TAD + 1e-3 * TAFD)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+    crate::parser::model_parser::parse_model_string(src)
+        .expect("parse TAD+TAFD ODE model")
+        .ode_spec
+        .expect("the model is an ODE model")
+}
+
+#[test]
+fn unanchored_dose_clock_error_names_both_spellings_when_the_rhs_reads_both() {
+    // #1151. `TAD` and `TAFD` are unanchored by the same fact — no dose has been given — so a
+    // RHS reading both must be told about both. The driver-level tests exercise one spelling
+    // each (`ODE_TAD_NO_IIV`, `ODE_TAFD`), which leaves this arm of the message unreachable
+    // from there.
+    let ode = tad_and_tafd_ode_spec();
+    let subject = make_subject(vec![], vec![6.0]);
+    // Both anchors as the driver holds them before the first dose: the TAD anchor is
+    // recomputed per segment (NaN over an empty dose list) and the TAFD slot is NaN until
+    // `update_tafd_anchor` lowers it at the first realized dose.
+    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+
+    let msg = unanchored_dose_clock_error(&ode, &subject, &[], &ext_params, 0.0, 12.0)
+        .expect("a dose-free window on a TAD+TAFD RHS is refused");
+    assert!(
+        msg.contains("`TAD` and `TAFD`"),
+        "both unanchored spellings must be named: {msg}"
+    );
+    assert!(
+        msg.contains("The observation at t=6 is read off that segment"),
+        "the read in the window is still named: {msg}"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_ignores_a_zero_length_segment() {
+    // #1151. `integrate_segment` returns before it writes the TAD anchor when the segment has
+    // no length, so such a break integrates nothing and cannot be poisoned — refusing it would
+    // reject a run over a window that is never solved. Same inputs as the test above, with
+    // `t_end == t_start`.
+    let ode = tad_and_tafd_ode_spec();
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &[], &ext_params, 12.0, 12.0).is_none(),
+        "a zero-length segment integrates nothing and must not be refused"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_is_silent_without_a_compiled_rhs_program() {
+    // #1151. A hand-built `OdeSpec` (the EKF's, the test scaffolding here) carries
+    // `rhs_program: None`, so there is no statement list to ask about `TAD` / `TAFD` and
+    // nothing can be unanchored. Pins the early `?` rather than leaving it to a panic.
+    let ode = one_cpt_ode_spec();
+    let subject = make_subject(vec![], vec![6.0]);
+    let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &[], &ext_params, 0.0, 12.0).is_none(),
+        "no compiled RHS program ⇒ no dose clock to refuse"
+    );
+}

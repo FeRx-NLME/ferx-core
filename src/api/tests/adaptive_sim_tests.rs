@@ -341,11 +341,19 @@ fn hold_all() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
 }
 
 #[test]
-fn degenerate_oracle_matches_static_predict_bit_for_bit() {
+fn degenerate_oracle_matches_static_predict() {
     // A controller that doses at every decision must reproduce the static
     // engine on the same realized schedule. Last obs (54) is the global max
-    // and a dose lands at every decision, so the segment structures align and
-    // agreement is exact (the verifier, on by default, also passes).
+    // and a dose lands at every decision, so the segment structures align
+    // (the verifier, on by default, also passes).
+    //
+    // The assertion below is a **1e-9 relative band, not bit equality** — the name said
+    // `_bit_for_bit` until #1151 measured what it actually pins. On a model-time-reading RHS
+    // the same comparison at default solver tolerances is 1.3e-6 apart from solver noise
+    // alone, so the band is what this fixture can honestly claim. The bit-equality property
+    // does hold for a read taken ON a boundary with no integration in between, and is
+    // asserted there instead:
+    // `degenerate_oracle_tad_rhs_observation_on_a_decision_boundary_is_bit_identical`.
     let model = parse_model_string(ODE_NO_IIV).expect("parse no-IIV ODE model");
     let decisions = vec![0.0, 24.0, 48.0];
     let obs = vec![6.0, 30.0, 54.0];
@@ -3004,12 +3012,13 @@ fn simple_titration_spec() -> AdaptiveDosingSpec {
 }
 
 #[test]
-fn from_spec_degenerate_oracle_matches_static_predict_bit_for_bit() {
+fn from_spec_degenerate_oracle_matches_static_predict() {
     // The declarative path's degenerate oracle: a block that never titrates
     // re-issues a fixed 100 mg bolus at every decision, so it must reproduce the
     // static engine on that same realized schedule. A dose lands at every
-    // decision and the last obs (54) is the global max ⇒ bit-exact agreement,
-    // and the frozen-replay verifier (on by default) also passes.
+    // decision and the last obs (54) is the global max, and the frozen-replay
+    // verifier (on by default) also passes. Like its programmatic twin above, the
+    // assertion is a 1e-9 relative band, not bit equality (#1151).
     let parsed = parse_full_model(SPEC_DEGENERATE).expect("parse model + block");
     let spec = parsed
         .adaptive_dosing
@@ -4505,5 +4514,547 @@ fn simulate_adaptive_carries_the_solver_diagnostics_of_its_own_run() {
         clean.warnings[0].contains("not referenced in any model expression"),
         "{:?}",
         clean.warnings
+    );
+}
+
+// ===================== #1151: a model-time-reading [odes] RHS =====================
+//
+// The #391 degenerate oracle below (`degenerate_oracle_matches_static_predict`) runs on
+// `ODE_NO_IIV`, whose RHS is **autonomous** — so it cannot see the one thing that split the
+// reactive driver from the static engine in #1124: a RHS that reads model time. These are
+// that missing half.
+//
+// The tolerances here are not decoration. Measured at `a6b67de5` on this model, the adaptive
+// driver and `predict()` agree to **rel 8.6e-16** at `ode_reltol = 1e-12 / ode_abstol =
+// 1e-14`, and both sit within 1.7e-13 of the closed form; at DEFAULT solver tolerances they
+// are **1.3e-6** apart — solver noise that reads exactly like an anchoring defect. A fixture
+// at default tolerances could therefore assert nothing sharper than ~1e-5, which a driver
+// whose anchor was a whole segment stale would still pass.
+
+/// 1-cpt IV ODE whose RHS reads `TAD`: `d/dt(central) = -(CL/V)·central·(1 + KT·TAD)`. The
+/// `KT·TAD` factor makes the decay rate depend on time *since the last dose*, so an anchor
+/// taken at the wrong instant (the segment start, the previous dose, a decision that did not
+/// dose) integrates a different forcing and moves the trajectory.
+///
+/// `ETA_CL ~ 1e-10` is declared but unused by `CL`, so a drawn η leaves the trajectory at the
+/// η=0 value and the adaptive IPRED is comparable to the static PRED. The tight solver
+/// tolerances are what let the oracle assert at 1e-12 (see the module note above).
+///
+/// It has an exact closed form — on a segment after a dose at `t_d`, `TAD = t − t_d`, so
+/// `C(t) = C(t_d⁺)·exp(−k[(t−t_d) + κ(t−t_d)²/2])` with `k = CL/V` and `κ = KT`. That is a
+/// **third** reference, outside both engines: `tad_closed_form` below walks it.
+const ODE_TAD_NO_IIV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKT(0.01, 1e-4, 1.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+  KT = TVKT
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + KT * TAD)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-12
+  ode_abstol = 1e-14
+"#;
+
+/// 1-cpt IV ODE whose RHS reads `TIME` — the **solver axis**, not a dose clock. It is the
+/// control for #1151's refusal: `TIME` is anchored at the origin of the integration and is
+/// finite everywhere, so a dose-free window carries no `NaN` and must NOT be refused. A guard
+/// keyed on `pk_reads_model_time` (which unions `TAD`, `TAFD`, `T`/`TIME`) rejects this model.
+const ODE_TIME_NO_IIV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central * (1.0 + 1e-3 * TIME)
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// A controller that doses 100 mg into cmt 1 at the listed decision **indices** and holds at
+/// every other one. `fixed_bolus` (dose at every decision) is the `idx = all` instance; the
+/// interesting cells are the ones where a decision passes without a dose.
+fn dose_at_decisions(idx: Vec<usize>) -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+    move |ctx: &ControllerCtx| {
+        if idx.contains(&ctx.decision_index) {
+            vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+        } else {
+            vec![DoseAction::Hold]
+        }
+    }
+}
+
+/// The closed form of `ODE_TAD_NO_IIV`, walked outside both engines (#1151).
+///
+/// The equation is linear in `central` with a decay rate that depends only on `t`, so the
+/// whole compartment shares one factor per dosing interval: on `(t_d, t']` with the anchor at
+/// `t_d`, `C(t') = C(t_d⁺)·exp(−k[(t'−t_d) + κ(t'−t_d)²/2])`. This walks the realized bolus
+/// schedule and reports the state at each requested time. `doses` and `obs` must be sorted
+/// ascending, and every `obs` must be at or after the first dose (before it the closed form
+/// has no anchor either — which is the whole of #1151's refusal).
+fn tad_closed_form(doses: &[f64], obs: &[f64]) -> Vec<f64> {
+    let k = 5.0 / 50.0;
+    let kappa = 0.01;
+    let decay = |dt: f64| (-k * (dt + kappa * dt * dt / 2.0)).exp();
+
+    let mut points: Vec<f64> = doses.iter().chain(obs.iter()).copied().collect();
+    points.sort_by(f64::total_cmp);
+    points.dedup();
+
+    let mut c = 0.0f64;
+    let mut anchor = f64::NAN;
+    let mut prev = 0.0f64;
+    let mut out: Vec<f64> = Vec::with_capacity(obs.len());
+    for t in points {
+        if t > prev {
+            assert!(
+                anchor.is_finite(),
+                "the closed form has no anchor before the first dose either (t={t})"
+            );
+            // One factor for the whole compartment: advance from `prev` to `t` under the
+            // anchor in force, as a ratio of the two elapsed-time factors.
+            c = c * decay(t - anchor) / decay(prev - anchor);
+            prev = t;
+        }
+        if doses.contains(&t) {
+            c += 100.0;
+            anchor = t;
+        }
+        if obs.contains(&t) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `(adaptive IPRED, static PRED)` for one degenerate-oracle cell: the controller doses at
+/// `dose_idx`, and the same realized schedule (plus any base regimen) is pre-scheduled through
+/// `predict()`. The frozen-replay verifier runs too (default `verify: true`), so its `Ok` is
+/// part of every caller's assertion.
+fn tad_oracle_cell(
+    src: &str,
+    decisions: &[f64],
+    dose_idx: Vec<usize>,
+    obs: &[f64],
+    base: Vec<DoseEvent>,
+) -> (Vec<f64>, Vec<f64>) {
+    let model = parse_model_string(src).expect("parse model-time-reading ODE model");
+    let pop = population(vec![subj("1", obs.to_vec(), base.clone())]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.to_vec(),
+        ..Default::default()
+    };
+    let res = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(dose_idx.clone()),
+        &opts,
+    )
+    .expect("adaptive sim runs (the frozen-replay verifier passes too)");
+
+    let mut static_doses = base;
+    for i in &dose_idx {
+        static_doses.push(DoseEvent::new(decisions[*i], 100.0, 1, 0.0, false, 0.0));
+    }
+    static_doses.sort_by(|x, y| x.time.total_cmp(&y.time));
+    let static_pop = population(vec![subj("1", obs.to_vec(), static_doses)]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    (
+        res.trajectories.iter().map(|t| t.ipred).collect(),
+        preds.iter().map(|p| p.pred).collect(),
+    )
+}
+
+/// The `Err` from a `simulate_adaptive` run that must be refused (#1151). `verify: false`, so
+/// the error can only come from the driver's own guard — with the verifier on, a `NaN`
+/// trajectory would be caught by the replay instead and the message would be the verifier's.
+fn tad_refusal_error(
+    src: &str,
+    decisions: &[f64],
+    dose_idx: Vec<usize>,
+    obs: &[f64],
+    base: Vec<DoseEvent>,
+) -> String {
+    let model = parse_model_string(src).expect("parse model-time-reading ODE model");
+    let pop = population(vec![subj("1", obs.to_vec(), base)]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: decisions.to_vec(),
+        verify: false,
+        ..Default::default()
+    };
+    let err = simulate_adaptive(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        || dose_at_decisions(dose_idx.clone()),
+        &opts,
+    )
+    .expect_err("an unanchored dose clock must be refused, not returned as NaN");
+    format!("{err}")
+}
+
+/// Every prediction is finite, with the worst relative gap against `want` reported.
+///
+/// `f64::max` returns the *other* operand on a `NaN`, so folding `worst` over a run that
+/// produced `NaN` would report whatever the finite records produced and pass — the exact hole
+/// CLAUDE.md names. The finiteness of both sides is asserted per element, before the fold.
+fn worst_rel(got: &[f64], want: &[f64], what: &str) -> f64 {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let mut worst = 0.0f64;
+    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(g.is_finite(), "{what}: got[{i}] = {g} is not finite");
+        assert!(w.is_finite(), "{what}: want[{i}] = {w} is not finite");
+        let rel = if w == 0.0 {
+            g.abs()
+        } else {
+            (g - w).abs() / w.abs()
+        };
+        worst = worst.max(rel);
+    }
+    worst
+}
+
+#[test]
+fn degenerate_oracle_tad_rhs_matches_static_predict_and_the_closed_form() {
+    // T1 (#1151). The #391 degenerate oracle on a TAD-reading RHS: a controller re-emitting a
+    // fixed regimen must equal `predict()` on that regimen — and both must equal the closed
+    // form, which is computed outside either engine.
+    //
+    // Mutation that reddens it: anchor the driver's TAD at the FIRST dose
+    // (`earliest_dose_time`, i.e. TAFD semantics) instead of the most recent one. Measured:
+    // kills this test, T2, T3 and T4, plus seven pre-existing `TAD` tests.
+    //
+    // Note what does NOT redden it: anchoring at the segment start (`t_start`). A dose lands
+    // at every decision here and the decisions are the breaks, so the segment start *is* the
+    // last dose time and that mutation is invisible to this cell — measured, it kills only
+    // the hold cell below. That asymmetry is why T2 exists.
+    let decisions = [0.0, 24.0, 48.0];
+    let obs = [6.0, 30.0, 54.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1, 2], &obs, vec![]);
+    let closed = tad_closed_form(&decisions, &obs);
+
+    // Measured at `a6b67de5`: 8.6e-16 against `predict()`, 1.4e-13 against the closed form.
+    // The bounds carry three orders of headroom over each.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "adaptive vs predict(): worst rel {vs_static:e} > 1e-12 \
+         (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+    let vs_closed = worst_rel(&adaptive, &closed, "adaptive vs closed form");
+    assert!(
+        vs_closed <= 1e-10,
+        "adaptive vs closed form: worst rel {vs_closed:e} > 1e-10 \
+         (adaptive={adaptive:?}, closed={closed:?})"
+    );
+}
+
+#[test]
+fn degenerate_oracle_tad_rhs_holds_do_not_move_the_anchor() {
+    // T2 (#1151). Decisions at 0/12/24/36, doses only at 0 and 24 — so two decisions pass
+    // with no dose. `TAD` must stay anchored at the last DOSE across them.
+    //
+    // Mutation that reddens it: advance the anchor at every break — `tad_anchor(...)` replaced
+    // by `t_start` — so a decision that did not dose moves it. The obs at 30 and 45 sit in the
+    // window opened at 24; at 45 the mutated anchor would be 36, understating the elapsed time
+    // by 12 h. Measured: this cell is the only one of the four oracle cells that mutation
+    // kills, because it is the only one with a break that is not a dose.
+    let decisions = [0.0, 12.0, 24.0, 36.0];
+    let obs = [6.0, 30.0, 45.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 2], &obs, vec![]);
+    let closed = tad_closed_form(&[0.0, 24.0], &obs);
+
+    // Measured: 4.2e-15 against `predict()`, 4.5e-14 against the closed form.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "adaptive vs predict() across two hold decisions: worst rel {vs_static:e} > 1e-12 \
+         (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+    let vs_closed = worst_rel(&adaptive, &closed, "adaptive vs closed form");
+    assert!(
+        vs_closed <= 1e-10,
+        "adaptive vs closed form across two hold decisions: worst rel {vs_closed:e} > 1e-10 \
+         (adaptive={adaptive:?}, closed={closed:?})"
+    );
+}
+
+#[test]
+fn degenerate_oracle_tad_rhs_observation_on_a_decision_boundary_is_bit_identical() {
+    // T3 (#1151). An observation lands exactly ON a decision that doses: the read is taken
+    // post-dose at the segment's left boundary, so it is a pure state readout with no
+    // integration between the dose and the read — and the two engines must agree to the BIT,
+    // not to a tolerance.
+    //
+    // Mutation that reddens it: take the boundary read from the pre-dose side, or off the
+    // previous segment's integration. Either moves the value by the whole 100 mg bolus.
+    let decisions = [0.0, 24.0, 48.0];
+    let obs = [24.0, 48.0];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1, 2], &obs, vec![]);
+
+    for (i, (&a, &s)) in adaptive.iter().zip(static_pred.iter()).enumerate() {
+        assert!(a.is_finite(), "adaptive[{i}] = {a} is not finite");
+        assert_eq!(
+            a.to_bits(),
+            s.to_bits(),
+            "observation on a decision boundary must be bit-identical: \
+             adaptive={a} static={s} at t={}",
+            obs[i]
+        );
+    }
+}
+
+#[test]
+fn adaptive_tad_rhs_base_dose_anchors_the_window_before_the_first_dose() {
+    // T4 (#1151) — and message-table row 3's silence check. A pre-scheduled base dose at
+    // t=10 is known to the driver up front, so `tad_anchor_for`'s first-arrival fallback gives
+    // the pre-dose window a FINITE (negative) `TAD`, exactly as `predict()` does. The window
+    // must not be refused, and the run must match the static engine.
+    //
+    // The read at t=6 is in that pre-dose window and is 0.0 — its job is to pin "not NaN",
+    // since `0.0 * NaN` is what poisons the unanchored case. The reads at 20 and 40 carry the
+    // trajectory, so the cell is not degenerate: a mis-anchored window moves them.
+    //
+    // Mutation that reddens it: make the refusal fire whenever an observation precedes the
+    // first REALIZED dose, ignoring base doses.
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let base = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)];
+    let (adaptive, static_pred) =
+        tad_oracle_cell(ODE_TAD_NO_IIV, &decisions, vec![0, 1], &obs, base);
+
+    assert_eq!(
+        adaptive[0], 0.0,
+        "the pre-dose read is the empty compartment, not NaN (got {})",
+        adaptive[0]
+    );
+    // Measured: 1.5e-15.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-12,
+        "a base-dose-anchored pre-dose window must match predict(): worst rel \
+         {vs_static:e} > 1e-12 (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_the_window_before_the_first_dose() {
+    // T5 (#1151). Dose-free base, first dose realized at the decision at t=12, an observation
+    // at t=6 inside the unanchored window. `TAD` has no referent there in a causal run, and
+    // the driver must say so rather than integrate `0.0 * NaN`.
+    //
+    // Mutation that reddens it: delete the guard — the call then returns `Ok` with
+    // `[NaN, NaN, NaN]` (measured at `a6b67de5`), with no warning naming `TAD`.
+    //
+    // Every sentence of the message is asserted below, so deleting any one of them reddens
+    // this test (CLAUDE.md: a sentence no test can kill is a claim nobody has checked).
+    let err = tad_refusal_error(
+        ODE_TAD_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    // Sentence 1 — the fact: which spelling, and which window.
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("no dose has been given yet in this run"),
+        "must say why the clock is unanchored: {err}"
+    );
+    assert!(
+        err.contains("(0, 12]"),
+        "must name the refused window: {err}"
+    );
+    // Sentence 2 — which read is affected.
+    assert!(
+        err.contains("The observation at t=6 is read off that segment"),
+        "must name the observation in the window: {err}"
+    );
+    // Sentence 3 — why the static engines' answer is not copied.
+    assert!(
+        err.contains("has not been decided yet"),
+        "must say the anchoring dose is undecided in a reactive run: {err}"
+    );
+    // Sentence 4 — the two fixes.
+    assert!(
+        err.contains("pre-scheduled base regimen"),
+        "must offer the base-regimen fix: {err}"
+    );
+    assert!(
+        err.contains("decision placed at the start of the horizon"),
+        "must offer the earlier-decision fix: {err}"
+    );
+    // The must-nots: the model is fine and the controller is not at fault.
+    assert!(
+        !err.contains("unsupported"),
+        "the model is supported — only this window is refused: {err}"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refusal_tracks_the_first_dose_not_the_first_decision() {
+    // T6 (#1151), cell 8. The first decision is at t=0 and HOLDS; the dose lands at the
+    // second, t=24. The window `(0, 24]` is therefore after the run's start AND after the
+    // first decision, yet still before any dose — so it must be refused, and the message must
+    // name that window, not `(0, 12]`-style "before the first decision".
+    //
+    // Mutation that reddens it: key the guard on the decision schedule — run it only while
+    // `t_end <= decision_times[0]`. That still refuses T5's window `(0, 12]` (whose `t_end` is
+    // the first decision) but lets this one through, returning NaN. Measured: it kills this
+    // test and nothing else.
+    //
+    // Measured NOT to redden it: keying on `t_start == 0.0`. Unanchored segments are a prefix
+    // of the walk — a dose is only ever appended — and `break_times` is seeded with 0.0, so
+    // the first refused segment always starts at the origin. That mutation is equivalent, not
+    // uncaught; this test pins the `t_end` side, which is the half that can differ.
+    let err = tad_refusal_error(ODE_TAD_NO_IIV, &[0.0, 24.0], vec![1], &[10.0, 30.0], vec![]);
+
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 24]"),
+        "the refused window runs to the first DOSE (24), not to the first decision (0): {err}"
+    );
+    assert!(
+        err.contains("The observation at t=10 is read off that segment"),
+        "must name the observation inside that window: {err}"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_a_dose_free_window_with_no_observation_in_it() {
+    // #1151, the measured correction to the plan's message table (row 4). The plan expected
+    // this cell to be SILENT — dose-free base, but every observation at or after the first
+    // realized dose. Measured at `a6b67de5` it returns `[NaN, NaN]`: the `NaN` anchor enters
+    // the *state* in the observation-free window `(0, 12]`, and the reads at 20 and 40 — both
+    // after the dose at 12 — inherit it. So the refusal is keyed on the segment being
+    // integrated, not on it carrying a read, and this cell must error too.
+    //
+    // Mutation that reddens it: gate the guard on the segment containing an observation. The
+    // run then returns `Ok` with `[NaN, NaN]`.
+    let err = tad_refusal_error(
+        ODE_TAD_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[20.0, 40.0],
+        vec![],
+    );
+
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("(0, 12]"),
+        "must name the refused window: {err}"
+    );
+    assert!(
+        err.contains(
+            "No observation is read off that segment, but the state integrated there \
+                      carries into every later read"
+        ),
+        "must say the poisoned state — not a readout — is what is refused: {err}"
+    );
+}
+
+#[test]
+fn adaptive_tafd_rhs_refuses_the_window_before_the_first_dose() {
+    // T7 (#1151). The same defect on `TAFD`, on the file's existing TAFD fixture — whose
+    // working case (`adaptive_base_regimen_controller_dose_before_base_anchors_tafd_globally`)
+    // carries a base regimen and is T4's shape. The message must name `TAFD`, the spelling
+    // that is actually unanchored.
+    //
+    // Mutation that reddens it: key the guard on `TAD` alone. `ODE_TAFD`'s RHS never reads
+    // `TAD`, so the run returns `Ok` with `[NaN, NaN, NaN]` (measured).
+    let err = tad_refusal_error(
+        ODE_TAFD,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    assert!(err.contains("`TAFD`"), "must name TAFD: {err}");
+    assert!(
+        !err.contains("`TAD`"),
+        "TAD is anchored here — it is not the unanchored slot: {err}"
+    );
+    assert!(
+        err.contains("(0, 12]"),
+        "must name the refused window: {err}"
+    );
+}
+
+#[test]
+fn adaptive_time_reading_rhs_is_not_refused_before_the_first_dose() {
+    // #1151, message-table row 6 — the over-refusal control. `TIME` is the integration axis,
+    // not a dose clock: it is finite in the pre-dose window, so a dose-free run on a
+    // TIME-reading RHS integrates correctly and must be left alone.
+    //
+    // Mutation that reddens it: key the guard on `pk_reads_model_time()`, which unions `TAD`,
+    // `TAFD` and `T`/`TIME` — this run is then refused although nothing is unanchored.
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_TIME_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    // Default solver tolerances on this fixture (the point is the absence of a refusal, not a
+    // sharp oracle), so the bound is the two engines' measured noise floor: worst rel 5.2e-7.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-5,
+        "a TIME-reading RHS must run, and agree with predict(): worst rel {vs_static:e} \
+         (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_autonomous_rhs_is_not_refused_before_the_first_dose() {
+    // #1151, message-table row 5 — the other over-refusal control. `ODE_NO_IIV`'s RHS reads no
+    // clock at all, so a dose-free window is ordinary integration of an empty compartment.
+    //
+    // Mutation that reddens it: drop the `rhs_program` spelling checks and refuse on the
+    // anchor alone — the TAD anchor slot is `NaN` here too, it is simply never read.
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_NO_IIV,
+        &[12.0, 36.0],
+        vec![0, 1],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-9,
+        "an autonomous RHS must run unrefused: worst rel {vs_static:e} \
+         (adaptive={adaptive:?}, static={static_pred:?})"
     );
 }

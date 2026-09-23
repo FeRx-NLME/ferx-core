@@ -79,6 +79,17 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **Adaptive dosing on a `TAD` / `TAFD`-reading `[odes]` RHS no longer returns a silent
+  `NaN` trajectory.** With no pre-scheduled base regimen, the reactive driver's dose clock
+  has no referent before the controller's first dose — and that `NaN` entered the
+  integrated *state*, so every later prediction came back `NaN` too, including reads taken
+  after the first dose landed. With the frozen-replay verifier on (the default) the run
+  failed with the verifier's message, which never named the cause; with `verify: false` it
+  returned `Ok` with `NaN` rows and no warning at all. `simulate_adaptive()` now refuses
+  that window with a typed error naming the segment, the spelling (`TAD` or `TAFD`) and the
+  two fixes — a pre-scheduled base regimen, or a first decision at the start of the horizon
+  that doses. Runs with a base regimen, with all reads anchored, or on a RHS reading only
+  `TIME` / `T` are unaffected (#1151).
 - **Analytic ODE covariance: the third-order sweep no longer differences across a
   lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
   R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and

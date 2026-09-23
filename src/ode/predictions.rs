@@ -2682,6 +2682,86 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
     doses.iter().map(|d| d.time).fold(f64::INFINITY, f64::min)
 }
 
+/// #1151: the reactive driver's refusal of a **dose-clock window with no referent**.
+///
+/// `TAD` and `TAFD` are anchored at a dose. In a *causal* run the driver's shadow subject
+/// carries only the doses realized so far, so before the first one it is dose-free and both
+/// anchors are `NaN` ([`tad_anchor_for`]'s empty fold, and the `NaN` seed of
+/// `ext_params[MAX_PK_PARAMS]` that [`update_tafd_anchor`] lowers at the first realized
+/// dose). The static engines have no such window — `predict()` sees the whole record, so its
+/// fallback returns the first *future* arrival and `TAD` comes back finite and negative —
+/// which is exactly the peek a controller has not earned: the dose anchoring it has not been
+/// decided yet.
+///
+/// Returns `Some(message)` when the segment `(t_start, t_end]` must be refused. Measured at
+/// `a6b67de5`, this is not a readout defect but a state one: with `u = 0` and a `NaN` anchor
+/// the RHS evaluates `0.0 * NaN = NaN`, the integrator carries it, and **every later
+/// observation is `NaN` too — including reads after the first dose lands**. So the refusal is
+/// keyed on the segment being integrated, not on it carrying an observation: a dose-free
+/// window with no observation in it still poisons the run (`[NaN, NaN]` for obs at 20/40 with
+/// the first dose at 12, measured).
+///
+/// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
+/// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
+/// integrates correctly and must not be refused (measured: it agrees with `predict()`).
+///
+/// Zero-length segments return `None` — [`integrate_segment`] returns before touching the
+/// anchor there, so refusing one would reject a window that is never integrated.
+fn unanchored_dose_clock_error(
+    ode: &OdeSpec,
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    ext_params: &[f64],
+    t_start: f64,
+    t_end: f64,
+) -> Option<String> {
+    // [`integrate_segment`]'s own no-op test, spelled the same way.
+    if (t_end - t_start).abs() < 1e-15 {
+        return None;
+    }
+    let prog = ode.rhs_program.as_ref()?;
+    // The anchors exactly as the segment would receive them: the `TAD` one is what
+    // `integrate_segment` is about to write into `ext_params`, and the `TAFD` one is the
+    // slot it inherits. Reading the quantity itself — rather than re-deriving "is the
+    // shadow dose-free?" — keeps the diagnostic gated on its own mechanism.
+    let tad_unanchored =
+        prog.pk_reads_tad() && tad_anchor_for(&subject.doses, dose_lagtimes, t_start).is_nan();
+    let tafd_unanchored = prog.pk_reads_tafd() && ext_params[crate::types::MAX_PK_PARAMS].is_nan();
+    if !tad_unanchored && !tafd_unanchored {
+        return None;
+    }
+    let slot = match (tad_unanchored, tafd_unanchored) {
+        (true, true) => "`TAD` and `TAFD`",
+        (true, false) => "`TAD`",
+        _ => "`TAFD`",
+    };
+    // The reads taken off this segment, resolved with the same predicate
+    // [`integrate_segment`] builds its `saveat` from, so the two cannot disagree about
+    // which observations belong to the window.
+    let first_obs = subject
+        .obs_times
+        .iter()
+        .copied()
+        .filter(|&t| reads_in_segment(t, t_start, t_end))
+        .fold(f64::INFINITY, f64::min);
+    let reads = if first_obs.is_finite() {
+        format!("The observation at t={first_obs} is read off that segment.")
+    } else {
+        "No observation is read off that segment, but the state integrated there carries \
+         into every later read."
+            .to_string()
+    };
+    Some(format!(
+        "ode_predictions_adaptive: the [odes] RHS reads {slot}, and no dose has been given \
+         yet in this run, so {slot} has no referent on the segment ({t_start}, {t_end}]. \
+         {reads} The static engines anchor such a window at the first dose in the whole \
+         record, which in a reactive run has not been decided yet — so this driver refuses \
+         the window rather than read a dose out of the future. Give the subject a \
+         pre-scheduled base regimen, or have the controller dose at a decision placed at the \
+         start of the horizon, so the clock is anchored before this segment."
+    ))
+}
+
 /// Lower the reactive driver's TAFD anchor (`ext_params[MAX_PK_PARAMS]`) to `t` if `t`
 /// precedes the current anchor, or set it when none is (`NaN`). #934: a base regimen
 /// pre-seeds the anchor to the earliest *base* dose, but a controller dose scheduled
@@ -5204,6 +5284,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
             if tv {
                 ext_params[..crate::types::MAX_PK_PARAMS]
                     .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
+            }
+
+            // #1151: refuse a segment whose dose clock has no referent — a window before the
+            // first realized (or base) dose on a `TAD`/`TAFD`-reading RHS. `NaN` there enters
+            // the *state*, not just the readout, so it is caught before integrating rather
+            // than left to the (default-on, but opt-out) frozen-replay verifier.
+            if let Some(msg) = unanchored_dose_clock_error(
+                ode,
+                &shadow,
+                &dose_lagtimes,
+                &ext_params,
+                t_start,
+                t_end,
+            ) {
+                return Err(msg);
             }
 
             // Per-dose lagtimes for the segment (computed once above for the bolus pass and

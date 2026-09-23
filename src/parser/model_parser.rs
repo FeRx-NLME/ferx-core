@@ -13018,11 +13018,15 @@ fn build_ode_spec(
     let pk_reads_time_builtin = stmts_read_time_builtin(pk_view);
     let pk_reads_tafd = stmts_read_slots(pk_view, &[tafd_slot]);
     let pk_reads_solver_time = stmts_read_slots(pk_view, &[time_slot]) || pk_reads_time_builtin;
+    // The `TAD` half, bound rather than folded inline so a diagnostic can name the slot
+    // that is unanchored (#1151): the reactive driver refuses a pre-first-dose window per
+    // slot, and "the RHS reads `TAD`" and "the RHS reads `TAFD`" are different sentences
+    // with different fixes.
+    let pk_reads_tad = stmts_read_slots(pk_view, &[tad_slot]);
     // Composed, not re-walked: `pk_reads_model_time` is exactly the union above widened by
     // `TAD`, which is the containment relation `pk_reads_absolute_time`'s doc comment states.
     // Spelling it as a fourth walk let the two drift; spelling it this way cannot.
-    let pk_reads_model_time =
-        pk_reads_tafd || pk_reads_solver_time || stmts_read_slots(pk_view, &[tad_slot]);
+    let pk_reads_model_time = pk_reads_tafd || pk_reads_solver_time || pk_reads_tad;
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -13036,6 +13040,7 @@ fn build_ode_spec(
         reads_time_builtin: rhs_reads_time_builtin,
         pk_reads_model_time,
         pk_reads_tafd,
+        pk_reads_tad,
         pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
     };
@@ -23138,6 +23143,13 @@ pub struct OdeRhsProgram {
     /// which is the predicate a gate should ask; this one exists so a *message* can name
     /// the spelling, since the two absolute-clock spellings fail differently (#1139 T3).
     pk_reads_tafd: bool,
+    /// Does the **PK block** read `TAD`? The `TAD` half of [`Self::pk_reads_model_time`],
+    /// bound separately for the same reason as [`Self::pk_reads_tafd`]: a *message* has to
+    /// name the spelling. The reactive adaptive driver is the consumer (#1151) — before the
+    /// first dose of a causal run `TAD` and `TAFD` are both unanchored, while `T`/`TIME` are
+    /// not, so refusing that window is a per-spelling question, not a
+    /// [`Self::pk_reads_model_time`] one.
+    pk_reads_tad: bool,
     /// Does the **PK block** read the raw solver time axis — `T`/`t`/`time` through
     /// `time_slot`, or the bare `TIME` built-in through `Op::PushTime`? Both disjuncts are
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
@@ -23218,6 +23230,13 @@ impl OdeRhsProgram {
     /// anything; ask this only to phrase a message about `TAFD` specifically.
     pub(crate) fn pk_reads_tafd(&self) -> bool {
         self.pk_reads_tafd
+    }
+
+    /// See [`OdeRhsProgram::pk_reads_tad`]. Ask [`Self::pk_reads_model_time`] to decide
+    /// whether the system is autonomous; ask this only to decide something about `TAD`
+    /// specifically, or to phrase a message about it.
+    pub(crate) fn pk_reads_tad(&self) -> bool {
+        self.pk_reads_tad
     }
 
     /// See [`OdeRhsProgram::pk_reads_solver_time`]. Ask [`Self::pk_reads_absolute_time`] to
