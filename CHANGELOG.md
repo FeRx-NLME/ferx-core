@@ -686,6 +686,19 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **FOCE/FOCEI gradient fits stop spinning once the objective is flat.** The
+  `stagnation_guard` window is now `(n+1).max(10)` evals instead of `3*(n+1).max(50)`
+  for a gradient-based outer optimizer (L-BFGS — the usual default — SLSQP, MMA)
+  that has improved on its first evaluation, unless its steps are growing (two
+  consecutive ×1.5 expansions, the signature of a fit creeping off a saddle). Such a
+  fit's outer gradient can plateau at a non-zero norm on a flat objective, so its own
+  stopping test never fires. Estimation time, single-threaded: `clofarabine_brooks`
+  5.3 → 4.1 s (61 → 40 evaluations), `busulfan_shukla` 97 → 61 s, `thiotepa_brooks`
+  104 → 71 s; objectives within 1.3e-3 of before, and unchanged to 2e-6 on 18
+  `examples/` models. A stop forced by the guard now gets the same plateau and
+  cold-restart self-consistency check a bare NLopt `Failure` does, instead of being
+  reported converged unconditionally
+  ([#1530](https://github.com/FeRx-NLME/ferx-core/issues/1530)).
 - **Laplace reuses its prepared Hessian factor and no longer allocates one-element grid
   vectors.** The objective hands the regularized Cholesky factor directly to the matching
   gradient, and the one-node rule reads its mode and unit weight without heap-backed node

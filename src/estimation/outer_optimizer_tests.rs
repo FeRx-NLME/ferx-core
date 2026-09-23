@@ -836,6 +836,7 @@ fn fresh_state() -> NloptState {
         prev_x: Vec::new(),
         last_improvement_eval: 0,
         best_at_last_improvement: f64::INFINITY,
+        recent_steps: std::collections::VecDeque::new(),
         stagnation_stopped: false,
     }
 }
@@ -858,7 +859,7 @@ fn test_detect_stagnation_disabled_never_fires() {
     for n_evals in 0..200 {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, 7, false),
+            !detect_stagnation(&mut state, 7, false, false),
             "enabled=false must never fire (n_evals={n_evals})"
         );
     }
@@ -884,7 +885,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     for n_evals in 1..window {
         state.n_evals = n_evals;
         assert!(
-            !detect_stagnation(&mut state, n, true),
+            !detect_stagnation(&mut state, n, true, false),
             "must not fire inside window (n_evals={n_evals}, window={window})"
         );
         assert!(!state.stagnation_stopped);
@@ -893,7 +894,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // At the window, fires and latches.
     state.n_evals = window;
     assert!(
-        detect_stagnation(&mut state, n, true),
+        detect_stagnation(&mut state, n, true, false),
         "must fire at window (n_evals={window})"
     );
     assert!(
@@ -906,7 +907,7 @@ fn test_detect_stagnation_enabled_fires_at_window_and_latches() {
     // the short-circuit is on `stagnation_stopped`, not on the counter.
     state.n_evals = 1;
     assert!(
-        detect_stagnation(&mut state, n, true),
+        detect_stagnation(&mut state, n, true, false),
         "latched state must stay sticky-true regardless of n_evals"
     );
 }
@@ -924,14 +925,14 @@ fn test_detect_stagnation_resets_on_improvement() {
     let n = 7usize;
     // Walk almost up to the window with zero improvement…
     state.n_evals = 49;
-    assert!(!detect_stagnation(&mut state, n, true));
+    assert!(!detect_stagnation(&mut state, n, true, false));
 
     // …then improve OFV by > 1e-3.  Improvement must reset the
     // last-improvement counter so the next 50 evals start fresh.
     state.best_ofv = -100.5;
     state.n_evals = 50;
     assert!(
-        !detect_stagnation(&mut state, n, true),
+        !detect_stagnation(&mut state, n, true, false),
         "improvement must reset the counter"
     );
     assert_eq!(
@@ -945,9 +946,9 @@ fn test_detect_stagnation_resets_on_improvement() {
 
     // Now we need another full window of zero improvement before firing.
     state.n_evals = 99;
-    assert!(!detect_stagnation(&mut state, n, true));
+    assert!(!detect_stagnation(&mut state, n, true, false));
     state.n_evals = 100;
-    assert!(detect_stagnation(&mut state, n, true));
+    assert!(detect_stagnation(&mut state, n, true, false));
 }
 
 /// Improvement *below* the 1e-3 threshold counts as stagnation — the
@@ -966,7 +967,7 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
     // NOT reset.
     state.best_ofv = -100.0005;
     state.n_evals = 25;
-    assert!(!detect_stagnation(&mut state, n, true));
+    assert!(!detect_stagnation(&mut state, n, true, false));
     assert_eq!(
         state.last_improvement_eval, 0,
         "sub-threshold improvement must not advance the counter"
@@ -974,7 +975,471 @@ fn test_detect_stagnation_subthreshold_improvement_does_not_reset() {
 
     // 50 evals after the original last_improvement_eval (= 0), it fires.
     state.n_evals = 50;
-    assert!(detect_stagnation(&mut state, n, true));
+    assert!(detect_stagnation(&mut state, n, true, false));
+}
+
+/// Both windows, on both sides of each floor (#1530).
+#[test]
+fn test_stagnation_window_sizes() {
+    // Long: 3*(n+1) floored at 50.
+    assert_eq!(stagnation_window(7, false), 50);
+    assert_eq!(stagnation_window(20, false), 63);
+    // Short: n+1 floored at 10.
+    assert_eq!(stagnation_window(7, true), 10);
+    assert_eq!(stagnation_window(20, true), 21);
+}
+
+/// The short window needs both halves of its gate: a gradient optimizer, and a
+/// significant feasible improvement *after* the first feasible eval (#1530).
+#[test]
+fn test_use_short_stagnation_window_gate() {
+    for algo in [
+        nlopt::Algorithm::Lbfgs,
+        nlopt::Algorithm::Slsqp,
+        nlopt::Algorithm::Mma,
+    ] {
+        assert!(
+            use_short_stagnation_window(algo, 2),
+            "{algo:?} after descent"
+        );
+        // Feasible eval 1 only sets the baseline; 0 = no feasible eval yet.
+        assert!(!use_short_stagnation_window(algo, 1), "{algo:?} at init");
+        assert!(!use_short_stagnation_window(algo, 0), "{algo:?} before any");
+    }
+    // BOBYQA's interpolation rebuilds legitimately run flat: never short.
+    assert!(!use_short_stagnation_window(nlopt::Algorithm::Bobyqa, 30));
+}
+
+/// With the short window, `detect_stagnation` fires at `last_improvement + (n+1).max(10)`,
+/// not one eval sooner, while the long window is still open (#1530).
+#[test]
+fn test_detect_stagnation_short_window_fires_early() {
+    let n = 9usize; // clofarabine_brooks: 9 packed parameters → short window 10
+    let mut short = fresh_state();
+    short.best_ofv = -100.0;
+    short.best_at_last_improvement = -100.0;
+    short.last_improvement_eval = 30;
+    let mut long = fresh_state();
+    long.best_ofv = -100.0;
+    long.best_at_last_improvement = -100.0;
+    long.last_improvement_eval = 30;
+
+    short.n_evals = 39;
+    assert!(!detect_stagnation(&mut short, n, true, true));
+    short.n_evals = 40;
+    assert!(detect_stagnation(&mut short, n, true, true));
+    assert!(short.stagnation_stopped);
+
+    long.n_evals = 40;
+    assert!(!detect_stagnation(&mut long, n, true, false));
+    assert!(!long.stagnation_stopped);
+}
+
+/// `(ofv, scaled step norm)` per eval of the `clofarabine_brooks` FOCEI / `nlopt_lbfgs`
+/// fit from #1530, read from its `optimizer_trace` on main `2e04abba` (`NA` steps as 0).
+/// 61 evals, every one feasible, 9 packed parameters. Flat to 0.0014 from eval 30; the
+/// fit ran to eval 61 and an NLopt line-search failure.
+const CLOFARABINE_TRACE: [(f64, f64); 61] = [
+    (17990.667633, 0.0),
+    (18459.283108, 1.134849),
+    (17976.589768, 1.123500),
+    (19157.512025, 1.869058),
+    (18113.645072, 1.480319),
+    (17920.132433, 0.290089),
+    (17894.007167, 0.044576),
+    (17832.506699, 0.275337),
+    (17808.607629, 0.048530),
+    (17792.214995, 0.113916),
+    (17790.841382, 0.031535),
+    (17793.521502, 0.105289),
+    (17789.336208, 0.063489),
+    (17787.553795, 0.040820),
+    (17786.172738, 0.041357),
+    (17784.412186, 0.073424),
+    (17925.745383, 0.539693),
+    (17783.614723, 0.485724),
+    (17781.381487, 0.074410),
+    (17783.518788, 0.070670),
+    (17780.778915, 0.048350),
+    (17780.429143, 0.040987),
+    (17780.226663, 0.013838),
+    (17779.413337, 0.113517),
+    (17778.970408, 0.072937),
+    (17778.742839, 0.031301),
+    (17778.314832, 0.124304),
+    (17777.781459, 0.075016),
+    (17777.286086, 0.175438),
+    (17777.280048, 0.011104),
+    (17777.280108, 0.000798),
+    (17777.280081, 0.000694),
+    (17777.280028, 0.000099),
+    (17777.282205, 0.010758),
+    (17777.280067, 0.009100),
+    (17777.280070, 0.001300),
+    (17777.280014, 0.000326),
+    (17777.280091, 0.001059),
+    (17777.280049, 0.000860),
+    (17777.279989, 0.000177),
+    (17777.279942, 0.000751),
+    (17777.279791, 0.001947),
+    (17777.279493, 0.004020),
+    (17777.279269, 0.001119),
+    (17777.278695, 0.002336),
+    (17777.279003, 0.001471),
+    (17777.278885, 0.001410),
+    (17777.278700, 0.000060),
+    (17777.278695, 0.000001),
+    (17777.278695, 0.000000),
+    (25802.815749, 1.088310),
+    (17777.994920, 1.077427),
+    (17777.279024, 0.010774),
+    (17777.279008, 0.000103),
+    (17777.278707, 0.000006),
+    (17777.278696, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.000000),
+    (17777.278695, 0.0),
+];
+
+/// As [`CLOFARABINE_TRACE`], for `examples/bioavailability.ferx` on
+/// `data/bioavailability.csv` (7 packed parameters, 126 evals). Evals 71–83 sit at
+/// 648.8203 while the L-BFGS line search expands off a saddle (step 3e-6 → 1.4,
+/// ×2.7 per eval); eval 84 then starts a 1.48-unit descent to 647.3434.
+const BIOAVAILABILITY_TRACE: [(f64, f64); 126] = [
+    (7194954.375378, 0.0),
+    (24603.218200, 0.651129),
+    (2388.845089, 3.387715),
+    (4405.265301, 1.256067),
+    (1250.926264, 0.492779),
+    (1254.062244, 0.157309),
+    (1234.682589, 0.077346),
+    (1218.987599, 0.078114),
+    (1195.982797, 0.353085),
+    (1192.868004, 0.069534),
+    (1192.535864, 0.008502),
+    (1191.571728, 0.053948),
+    (1189.392841, 0.063636),
+    (1175.039467, 0.818094),
+    (1174.712194, 0.721230),
+    (1164.380941, 0.099467),
+    (1157.766975, 0.603248),
+    (1107.699257, 2.729534),
+    (28751.057789, 1.437420),
+    (2283.534362, 0.756844),
+    (1131.131055, 0.536730),
+    (1104.543113, 0.109858),
+    (1103.546663, 0.012976),
+    (1103.261876, 0.006934),
+    (1101.605027, 0.048923),
+    (1097.969187, 0.121442),
+    (1085.897735, 0.422991),
+    (1067.307502, 0.605056),
+    (56964667.362342, 1.640905),
+    (313533.178793, 0.643596),
+    (8735.498316, 0.442285),
+    (1260.760855, 0.308131),
+    (1024.330384, 0.145518),
+    (1020.377795, 0.021776),
+    (1016.926778, 0.067611),
+    (1013.793945, 0.020275),
+    (1009.515136, 0.040843),
+    (993.491882, 0.176862),
+    (988.073641, 0.199732),
+    (981.293780, 0.222371),
+    (889.391145, 2.144753),
+    (815.389083, 1.103504),
+    (229143.294360, 2.347156),
+    (8842.837808, 1.103094),
+    (1070.502832, 0.814383),
+    (811.613393, 0.365302),
+    (808.445836, 0.031705),
+    (772.984511, 1.130481),
+    (52214533.142078, 1.482683),
+    (363943.632393, 0.588146),
+    (10873.786644, 0.404851),
+    (1068.795239, 0.284761),
+    (739.921721, 0.135451),
+    (736.163907, 0.015004),
+    (720.307787, 0.077882),
+    (9185.797556, 1.062082),
+    (969.430221, 0.653822),
+    (700.981181, 0.291883),
+    (696.966697, 0.032153),
+    (696.372999, 0.005170),
+    (670.746106, 0.254412),
+    (656.239799, 0.389544),
+    (970110.895780, 1.661986),
+    (1904.154253, 0.942657),
+    (692.914624, 0.321838),
+    (653.596792, 0.223161),
+    (651.402145, 0.077124),
+    (649.231194, 0.035006),
+    (648.832486, 0.015209),
+    (648.820380, 0.007231),
+    (648.820316, 0.000349),
+    (648.820316, 0.000003),
+    (648.820316, 0.000006),
+    (648.820316, 0.000027),
+    (648.820316, 0.000068),
+    (648.820316, 0.000200),
+    (648.820314, 0.000535),
+    (648.820311, 0.001449),
+    (648.820302, 0.003866),
+    (648.820278, 0.010420),
+    (648.820211, 0.028893),
+    (648.819996, 0.088876),
+    (648.817903, 0.459542),
+    (648.671826, 1.378626),
+    (801.662790, 5.514505),
+    (648.370057, 4.963054),
+    (20817.263104, 3.522368),
+    (648.218840, 3.487144),
+    (648.299335, 0.015971),
+    (648.174996, 0.009979),
+    (648.167436, 0.006270),
+    (648.165116, 0.001905),
+    (648.089218, 0.208349),
+    (647.837089, 0.128936),
+    (647.440696, 0.444675),
+    (647.503860, 0.294599),
+    (647.353521, 0.177406),
+    (647.344261, 0.018511),
+    (647.343451, 0.002370),
+    (647.343445, 0.000415),
+    (647.343445, 0.000040),
+    (647.343445, 0.000004),
+    (647.343446, 0.000001),
+    (647.343445, 0.000001),
+    (647.343445, 0.000000),
+    (647.343445, 0.000000),
+    (647.343445, 0.000000),
+    (647.343445, 0.000000),
+    (647.343446, 0.000025),
+    (647.343444, 0.000025),
+    (647.343445, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343794, 0.000431),
+    (647.343445, 0.000427),
+    (647.343445, 0.000004),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.000000),
+    (647.343444, 0.0),
+    (647.343444, 0.0),
+];
+
+/// As [`CLOFARABINE_TRACE`], for `ferx-testdata/busulfan_shukla/ferx/run1.ferx` (FOCEI with
+/// IOV, 13 packed parameters, 84 evals). The last significant improvement is at eval
+/// 34; the fit then alternates between two points 1.6e-5 apart with steady steps of
+/// ~1e-4 until the long window latched it at eval 84.
+const BUSULFAN_TRACE: [(f64, f64); 84] = [
+    (39620.376276, 0.0),
+    (50582.252303, 1.480839),
+    (39727.117463, 0.651783),
+    (39154.501232, 0.298220),
+    (39615.247888, 0.528136),
+    (39117.746573, 0.443170),
+    (38960.778761, 0.162857),
+    (38568.649254, 0.697336),
+    (38456.381201, 0.312746),
+    (38307.613137, 0.293622),
+    (38383.101434, 0.877396),
+    (38196.180863, 0.444121),
+    (38146.355340, 0.314339),
+    (38126.319009, 0.054384),
+    (38115.734341, 0.100069),
+    (38066.478737, 0.326709),
+    (38064.253253, 0.219353),
+    (38049.587441, 0.080372),
+    (38044.755060, 0.041977),
+    (38038.193804, 0.127458),
+    (38037.504646, 0.060224),
+    (38036.938234, 0.024123),
+    (38036.484800, 0.011203),
+    (38036.282389, 0.010758),
+    (38035.829021, 0.039463),
+    (38035.319956, 0.038455),
+    (38034.539306, 0.099171),
+    (38034.271978, 0.037982),
+    (38034.079359, 0.036486),
+    (38033.913445, 0.028963),
+    (38033.626548, 0.054934),
+    (38033.466518, 0.046241),
+    (38033.450479, 0.011248),
+    (38033.448854, 0.002655),
+    (38033.448380, 0.000860),
+    (38033.448411, 0.000204),
+    (38033.448375, 0.000188),
+    (38033.448394, 0.000380),
+    (38033.448369, 0.000307),
+    (38033.448388, 0.000200),
+    (38033.448366, 0.000184),
+    (38033.448382, 0.000225),
+    (38033.448363, 0.000202),
+    (38033.448382, 0.000182),
+    (38033.448362, 0.000169),
+    (38033.448380, 0.000179),
+    (38033.448361, 0.000166),
+    (38033.448378, 0.000167),
+    (38033.448359, 0.000156),
+    (38033.448376, 0.000160),
+    (38033.448358, 0.000150),
+    (38033.448374, 0.000159),
+    (38033.448357, 0.000149),
+    (38033.448373, 0.000146),
+    (38033.448356, 0.000138),
+    (38033.448371, 0.000140),
+    (38033.448355, 0.000133),
+    (38033.448370, 0.000134),
+    (38033.448354, 0.000127),
+    (38033.448369, 0.000129),
+    (38033.448353, 0.000123),
+    (38033.448368, 0.000124),
+    (38033.448352, 0.000118),
+    (38033.448368, 0.000119),
+    (38033.448351, 0.000114),
+    (38033.448367, 0.000115),
+    (38033.448351, 0.000111),
+    (38033.448367, 0.000111),
+    (38033.448350, 0.000107),
+    (38033.448366, 0.000107),
+    (38033.448349, 0.000104),
+    (38033.448366, 0.000104),
+    (38033.448349, 0.000101),
+    (38033.448366, 0.000101),
+    (38033.448349, 0.000098),
+    (38033.448365, 0.000098),
+    (38033.448348, 0.000096),
+    (38033.448365, 0.000096),
+    (38033.448348, 0.000094),
+    (38033.448365, 0.000094),
+    (38033.448347, 0.000091),
+    (38033.448365, 0.000092),
+    (38033.448347, 0.000090),
+    (38033.448365, 0.000089),
+];
+
+/// Drive the guard through a recorded trace exactly as the objective closure does —
+/// running best, the feasible plateau tracker, the step history, then
+/// `detect_stagnation` — and return `(eval, incumbent)` at the latch, if any.
+fn replay_stagnation(
+    trace: &[(f64, f64)],
+    n: usize,
+    algo: nlopt::Algorithm,
+) -> Option<(usize, f64)> {
+    let mut state = fresh_state();
+    state.best_ofv = f64::INFINITY;
+    // (baseline OFV, last significant feasible eval) — the plateau tracker.
+    let (mut pt_ofv, mut pt_idx) = (f64::INFINITY, 0usize);
+    for (i, &(ofv, step)) in trace.iter().enumerate() {
+        let k = i + 1;
+        state.n_evals = k;
+        state.best_ofv = state.best_ofv.min(ofv);
+        if k == 1 || pt_ofv - ofv > PLATEAU_OFV_THRESHOLD {
+            pt_ofv = ofv;
+            pt_idx = k;
+        }
+        if stagnation_after_eval(&mut state, n, true, algo, pt_idx, step) {
+            return Some((k, state.best_ofv));
+        }
+    }
+    None
+}
+
+/// The short window stops the spinning `clofarabine_brooks` fit at eval 40, 21 evals
+/// early, on an incumbent 0.0013 above the eventual best-seen — the 1e-3 improvement
+/// threshold's own resolution. The long window (what BOBYQA gets, and every optimizer
+/// got before #1530) does not close inside the recording.
+#[test]
+fn test_detect_stagnation_replays_clofarabine_plateau() {
+    let (at, best) = replay_stagnation(&CLOFARABINE_TRACE, 9, nlopt::Algorithm::Lbfgs)
+        .expect("short window must latch");
+    assert_eq!(at, 40, "L-BFGS latched at eval {at}");
+    let final_best = CLOFARABINE_TRACE
+        .iter()
+        .map(|t| t.0)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        best - final_best < 2e-3,
+        "latched incumbent {best} vs eventual best {final_best}"
+    );
+    assert_eq!(
+        replay_stagnation(&CLOFARABINE_TRACE, 9, nlopt::Algorithm::Bobyqa),
+        None
+    );
+}
+
+/// The expansion veto is what keeps the short window off a fit creeping off a
+/// saddle. Without it the guard latched `bioavailability` at eval 80 on 648.820 — 1.48
+/// OFV units above the optimum it went on to find (measured end to end before the
+/// veto existed). With it, the latch waits for the real plateau at 647.3434.
+#[test]
+fn test_detect_stagnation_replay_does_not_cut_off_saddle_escape() {
+    let (at, best) = replay_stagnation(&BIOAVAILABILITY_TRACE, 7, nlopt::Algorithm::Lbfgs)
+        .expect("the final plateau must still latch");
+    assert!(
+        at > 100,
+        "latched at eval {at}, before the descent that starts at eval 84"
+    );
+    assert!((best - 647.343444).abs() < 1e-5, "latched incumbent {best}");
+}
+
+/// A steady-step tail is not an expansion, so the short window takes it: busulfan
+/// latches at eval 48 instead of 84, on an incumbent within 2e-5 of the eventual best.
+#[test]
+fn test_detect_stagnation_replays_busulfan_steady_tail() {
+    let (at, best) = replay_stagnation(&BUSULFAN_TRACE, 13, nlopt::Algorithm::Lbfgs)
+        .expect("short window must latch");
+    assert_eq!(at, 48, "L-BFGS latched at eval {at}");
+    let final_best = BUSULFAN_TRACE
+        .iter()
+        .map(|t| t.0)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        best - final_best < 2e-5,
+        "latched incumbent {best} vs eventual best {final_best}"
+    );
+}
+
+/// Two consecutive ×1.5 growths are an expansion; one, a steady or shrinking tail,
+/// or an erratic one is not; nor is a short history, a run of zero steps, or a `NaN`.
+#[test]
+fn test_step_is_expanding() {
+    use std::collections::VecDeque;
+    let h = |v: &[f64]| v.iter().copied().collect::<VecDeque<f64>>();
+    // bioavailability evals 76–78: 2.00e-4, 5.35e-4, 1.449e-3.
+    assert!(step_is_expanding(&h(&[2.00e-4, 5.35e-4, 1.449e-3])));
+    // Exactly at the ratio counts; just under it does not, on either ratio.
+    assert!(step_is_expanding(&h(&[1.0, 1.5, 2.25])));
+    assert!(!step_is_expanding(&h(&[1.0, 1.49, 2.25])));
+    assert!(!step_is_expanding(&h(&[1.0, 1.5, 2.24])));
+    // busulfan_shukla evals 82–84: steady.
+    assert!(!step_is_expanding(&h(&[9.2e-5, 9.0e-5, 8.9e-5])));
+    // clofarabine_brooks evals 38–40: erratic.
+    assert!(!step_is_expanding(&h(&[1.059e-3, 8.60e-4, 1.77e-4])));
+    // From a zero step, growth to a positive one counts; zero to zero does not.
+    assert!(step_is_expanding(&h(&[0.0, 1e-6, 1e-5])));
+    assert!(!step_is_expanding(&h(&[0.0, 0.0, 0.0])));
+    assert!(!step_is_expanding(&h(&[1e-6, 1e-5])));
+    assert!(!step_is_expanding(&h(&[1e-6, 1e-5, f64::NAN])));
+}
+
+/// Only a `Success` the stagnation guard forced is re-examined; one NLopt reached on
+/// its own stands, and a non-converged verdict is never upgraded here (#1530).
+#[test]
+fn test_latched_success_needs_plateau_check() {
+    assert!(latched_success_needs_plateau_check(true, true));
+    assert!(!latched_success_needs_plateau_check(true, false));
+    assert!(!latched_success_needs_plateau_check(false, true));
+    assert!(!latched_success_needs_plateau_check(false, false));
 }
 
 #[test]
