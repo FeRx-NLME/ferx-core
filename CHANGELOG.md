@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **The per-subject finite-difference outer-gradient salvage is no longer bought at a
+  blown-up line-search trial.** A subject the analytic outer gradient declines is salvaged
+  with `2·n_free` warm EBE re-solves — and most of that cost went to trial points the
+  optimizer was about to reject, with individual objectives thousands to `1e15` units above
+  the incumbent. Under NLopt SLSQP and MMA such a subject now contributes nothing to the
+  outer gradient there instead, at points those optimizers' own acceptance tests reject —
+  the guard measures a trial against the point each test compares against, and stays off
+  where no such point is observable (NLopt L-BFGS, the default for analytic models, is
+  unchanged). At every other point the salvage runs exactly as before, and every bundled
+  SLSQP fit the guard fires on keeps its estimates, OFV, iteration count and sdtab
+  byte-identical. The "blown up" line is measured, not chosen: both the subject's and the
+  population's objective must exceed the reference by more than 12 units per observation,
+  which sits in the gap between the largest ordinary rejected trial (6.0) and the smallest
+  blown-up one (21.8) across the bundled examples. The per-subject FD-fallback warning now
+  says how many salvages were skipped (#1520).
 - **A transit / inverse-Gaussian absorption fit that leaves the closed form's domain no
   longer grinds its inner EBE loop.** When the estimates drive `ke` past the absorption
   abscissa (`ke ≥ KTR`, the flip-flop regime) ferx reroutes the subject to the model's ODE
