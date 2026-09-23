@@ -8194,8 +8194,10 @@ pub struct FitOptions {
     pub min_obs_for_convergence_check: u32,
     /// Enable the outer-loop stagnation guard. When `true` (default), the
     /// NLopt-based outer optimizers short-circuit once recent evals show
-    /// no OFV improvement above 1e-3 over a window of `3*(n+1).max(50)`
-    /// evals — letting SLSQP / L-BFGS terminate in microseconds via their
+    /// no OFV improvement above 1e-3 over a window of `max(3·(n+1), 50)`
+    /// evals — `max(n+1, 10)` for a FOCE/FOCEI gradient-based optimizer once the fit has
+    /// improved on its first evaluation and its steps are not growing (#1530) —
+    /// letting SLSQP / L-BFGS terminate in microseconds via their
     /// own xtol/ftol instead of burning through the remaining maxeval
     /// budget at full inner-loop cost. Set to `false` to disable when
     /// you want the optimizer to run to its natural termination criterion
