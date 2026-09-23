@@ -705,14 +705,21 @@ fn decline_sentences(declines: &[CovScopeDecline], source: CovHessianSource) -> 
     out
 }
 
+/// The token every eigenvalue-floor message opens with, and nothing else does.
+///
+/// Load-bearing twice: `classify_warning` (`types.rs`) keys `WarningCode::CovarianceRegularized`
+/// on it, and — because that code is shared with the non-finite cross-partial note, which is
+/// not a floored Hessian — the model-selection strictness gate tells the two apart by it
+/// (#1512). One constant, so the emitter and the reader cannot drift.
+pub(crate) const REGULARIZED_PREFIX: &str = "Covariance step regularized:";
+
 /// Assemble the `covariance_regularized` message.
 ///
-/// The leading `Covariance step regularized:` token is load-bearing — `classify_warning`
-/// (`types.rs`) keys `WarningCode::CovarianceRegularized` on it — and is pinned by a test.
+/// The leading [`REGULARIZED_PREFIX`] is load-bearing (see there) and is pinned by a test.
 pub(crate) fn format_regularized_warning(facts: &CovRegularizationFacts) -> String {
     let grade = facts.grade();
     let mut msg = format!(
-        "Covariance step regularized: eigenvalue floor applied to {} ({} of {} free-block \
+        "{REGULARIZED_PREFIX} eigenvalue floor applied to {} ({} of {} free-block \
          eigenvalues clipped; min eig = {:.3e}, max eig = {:.3e}, |min eig|/max eig = {:.2e}, \
          floor = {:.3e}; worst inflation of a reported variance = {}; severity: {}). {}",
         facts.source.label(),

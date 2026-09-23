@@ -79,6 +79,13 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
+  The floor replaces a direction of negative or near-zero curvature with a finite one, so the
+  condition number and correlations the `max_condition_number` / `max_correlation` gates read
+  no longer showed the problem: on warfarin, `modelsearch`'s collapsed one-peripheral
+  candidate (V2 → 0, Q free, TVQ RSE 293519 %) read a condition number of 2.98 and passed.
+  While either gate is enabled, the `Covariance step regularized: eigenvalue floor applied`
+  warning now fails the fit with its own reason (#1512).
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every

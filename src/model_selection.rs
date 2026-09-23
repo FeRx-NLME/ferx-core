@@ -244,10 +244,18 @@ pub struct Strictness {
     /// Fail when `FitResult::cov_condition_number` (largest over smallest
     /// eigenvalue of the free-parameter correlation matrix) exceeds this.
     /// pyDarwin's default is 1000.
+    ///
+    /// While this gate or [`max_correlation`](Self::max_correlation) is
+    /// enabled, a fit whose covariance step had to floor a Hessian eigenvalue
+    /// (the `covariance_regularized` warning) also fails: the floor replaces
+    /// the very direction these thresholds exist to find, so the matrix they
+    /// would read no longer shows it (#1512).
     pub max_condition_number: Option<f64>,
     /// Fail when any off-diagonal of the covariance matrix's correlation form
     /// exceeds this in absolute value ([`max_abs_correlation`]: the whole
     /// matrix, on the natural θ / Ω / σ scale). pyDarwin's default is 0.95.
+    /// Also fails a regularized covariance step — see
+    /// [`max_condition_number`](Self::max_condition_number).
     pub max_correlation: Option<f64>,
     /// Fail a fit with a θ pinned to a declared bound — the predicate
     /// `bootstrap`'s `skip_estimate_near_boundary` applies
@@ -387,6 +395,27 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
         }
     }
 
+    // #1512: both gates above read the covariance matrix, and on a fit whose Hessian
+    // eigenvalue floor fired that matrix is not the inverse of the fit's Hessian. The floor
+    // replaces a direction of near-zero (or negative) curvature with a finite one, so a
+    // collapsed compartment — V2 → 0 with Q free — leaves no |r| = 1 and no large
+    // condition number behind for the thresholds to find: measured on warfarin's one-
+    // peripheral candidate, correlation-matrix condition number 2.98 and max |r| 0.35 next to
+    // a TVQ RSE of 293519%. A floored Hessian is NONMEM's "R matrix algorithmically singular",
+    // so it fails here whenever either matrix-reading gate is enabled, rather than passing on
+    // numbers the floor manufactured.
+    if (s.max_condition_number.is_some() || s.max_correlation.is_some())
+        && covariance_regularized(result)
+    {
+        v.failures.push(
+            "covariance matrix regularized: the Hessian had a direction of negative or \
+             near-zero curvature that the covariance step's eigenvalue floor replaced, so the \
+             condition number and correlations read from it describe the floored matrix, not \
+             the fit (see the `covariance_regularized` warning)"
+                .to_string(),
+        );
+    }
+
     if s.reject_on_boundary {
         if let Some(entry) = result
             .warnings_structured
@@ -448,6 +477,21 @@ pub fn estimate_near_boundary(result: &FitResult) -> bool {
         .warnings_structured
         .iter()
         .any(|w| w.category == WarningCode::BoundaryEstimate)
+}
+
+/// Whether the covariance step's Hessian eigenvalue floor fired on this fit (#1512).
+///
+/// Reads the fit's own eigenvalue-floor warning, which the covariance step emits exactly
+/// when it clipped an eigenvalue (and never under `covariance_method = s`, whose `S⁻¹` does
+/// not use the floored `R`), so it agrees with what the user was told. The category alone is
+/// not enough: `CovarianceRegularized` also carries the non-finite cross-partial note, which
+/// floors nothing, so the floor message is recognised by its pinned opening token.
+fn covariance_regularized(result: &FitResult) -> bool {
+    result.warnings_structured.iter().any(|w| {
+        w.category == WarningCode::CovarianceRegularized
+            && w.message
+                .starts_with(crate::estimation::cov_diagnostics::REGULARIZED_PREFIX)
+    })
 }
 
 /// Kish effective sample size below which a SIR *fallback* counts as having
