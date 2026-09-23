@@ -90,14 +90,20 @@ section of the SDLC for the versioning policy).
   two fixes — a pre-scheduled base regimen, or a first decision at the start of the horizon
   that doses. The check is gated on the outcome, not on the text of the model: it runs after
   each segment and fires only when that segment integrated to a non-finite state under an
-  unanchored clock **and** re-solving it with the clock anchored comes back finite. So a
-  `TAD` in a branch the pre-dose window never takes, or read only inside a condition, still
-  runs — and a compartment that diverges for its own reasons is neither refused nor blamed
-  on the clock. Runs with a base regimen, with all reads anchored, or on a RHS reading only
-  `TIME` / `T` are likewise unaffected. One shape stays outside it: an unanchored clock
-  consumed by a comparison (`if (TAD < 5)`, `min(TAD, 24)`) leaves the state finite and
-  silently picks a branch, and the default-on frozen-schedule replay verifier is what
-  catches the resulting divergence (#1151).
+  unanchored clock **and** re-solving it with the clock anchored repairs some state that had
+  gone non-finite. So a `TAD` in a branch the pre-dose window never takes, or read only
+  inside a condition, still runs — and a compartment that diverges for its own reasons is
+  not refused, and not blamed on the clock. Runs with a base regimen, with all reads
+  anchored, or on a RHS reading only `TIME` / `T` are likewise unaffected. One shape stays
+  outside it: an unanchored clock consumed by a comparison (`if (TAD < 5)`, `min(TAD, 24)`)
+  leaves the state finite and silently picks a branch, and the default-on frozen-schedule
+  replay verifier is what catches the resulting divergence (#1151).
+- **Note on the diverging-compartment case above**: not being refused is not the same as
+  being correct. When any state goes non-finite the solver stops advancing every state, so
+  the other compartments freeze and come back as finite predictions — from `predict()` as
+  much as from the reactive driver, which is why the replay verifier agrees with them. That
+  is an engine defect in its own right and is tracked separately (#1539); nothing in #1151
+  changes it either way.
 - **Analytic ODE covariance: the third-order sweep no longer differences across a
   lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
   R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and

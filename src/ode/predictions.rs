@@ -2703,18 +2703,50 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// window with no observation in it still poisons the run (`[NaN, NaN]` for obs at 20/40 with
 /// the first dose at 12, measured).
 ///
-/// **Called *after* [`integrate_segment`], and gated on the outcome.** An earlier form ran
-/// before the solve and refused on `pk_reads_tad() && anchor.is_nan()` alone — but
-/// `pk_reads_tad` is a *syntactic* walk (`stmts_read_slots`) that recurses into `if` arms and
-/// into conditions, so it is true whenever `TAD` appears anywhere in the `[odes]` body. That
-/// refused two shapes whose state never sees the `NaN`, both measured returning finite
-/// trajectories — and passing the frozen-replay verifier — with the guard removed: a `TAD`
-/// term inside a branch the unanchored window does not take, and a `TAD` read that occurs
-/// only in a *condition* (`NaN > 5.0` is `false`, so the else arm runs). Input present is not
-/// path ran (#1278). The three-way conjunction used here — the segment's state came back
-/// non-finite, **and** the anchor the RHS was handed is `NaN`, **and** the RHS reads that
-/// slot — has no such false positive by construction: a segment that never evaluates the
-/// slot cannot be poisoned by it.
+/// **Called *after* [`integrate_segment`], and gated on what actually happened.** Two earlier
+/// forms each shipped a "no false positive by construction" claim that measurement falsified,
+/// which is why the current one confirms rather than asserts:
+///
+/// - **Before the solve, on `pk_reads_tad() && anchor.is_nan()`** (round 1 of the #1534
+///   review). `pk_reads_tad` is a *syntactic* walk (`stmts_read_slots`) that recurses into `if`
+///   arms and into conditions, so it is true whenever `TAD` appears anywhere in the `[odes]`
+///   body. It refused a `TAD` term in a branch the unanchored window does not take, and a
+///   `TAD` read that occurs only in a *condition* — both measured returning finite
+///   trajectories with the guard removed. Input present is not path ran (#1278).
+/// - **After the solve, on "state non-finite **and** anchor `NaN` **and** RHS reads the slot"**
+///   (round 2). `u.iter().all(is_finite)` looks at *every* compartment while the third
+///   conjunct is still a parse walk, so nothing tied them together: a second state blowing up
+///   on its own (`X' = 0.5·X²`) with `TAD` in an untaken branch of the first satisfied all
+///   three, and the run was refused. Worse, the advice it gave — add a base regimen —
+///   silences the message while the divergence stays.
+///
+/// So the refusal **confirms causation**. `resolve_with_finite_clock` re-integrates this same
+/// segment from `u_start` with the unanchored slot(s) set to a finite stand-in, and the
+/// message is returned only if that run repairs the state. Otherwise this returns `None` and
+/// the caller carries on. The extra solves cost one segment each, on a path that has already
+/// failed.
+///
+/// Two details of that comparison are load-bearing, both measured on #1534 round 3:
+///
+/// - **Component by component, not whole-state.** A segment can have *two* causes: the clock
+///   and something else. With `central' = …·(1 + 0.01·TAD)` alongside `X' = 0.5·X²`, the
+///   counterfactual still has `X = inf`, so a whole-state finiteness test cleared the clock
+///   and the run went silent although `TAD` was genuinely one of the causes. The rule is
+///   therefore: refuse if **some component** that is non-finite in the real solve comes back
+///   finite under an anchored clock.
+/// - **Two stand-ins, `t_start` and `t_end`.** A single stand-in is not arbitrary: `t_start`
+///   puts `TAD` in `[0, L]` for a window of length `L`, which can exceed anything the model
+///   ever sees after a dose — and anything `predict()` sees, whose pre-dose `TAD` is ≤ 0. A
+///   RHS that is finite where `predict()` evaluates it but overflows on `[0, L]`
+///   (`exp(TAD)` over a 600 h pre-treatment baseline, measured) made the counterfactual itself
+///   diverge, so the clock was cleared. `t_end` gives `TAD ∈ [t_start − t_end, 0]`, the same
+///   sign as the static convention. Either stand-in repairing a component is enough: a
+///   different anchor can only repair the state if the clock was load-bearing, so adding one
+///   cannot add a false positive.
+///
+/// `u_start` must itself be finite: a state that arrived non-finite (from `init(...)`, or a
+/// `NaN` bolus applied at the break) was not broken here. Non-finiteness **alone** is never
+/// reported either — that would misattribute every diverging solve.
 ///
 /// `ext_params` must be the array [`integrate_segment`] just used, so the `TAD` slot holds
 /// the anchor that segment actually integrated under rather than a recomputed twin, and `u`
@@ -2722,32 +2754,11 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// returns before touching either, so `u` is whatever the previous segment left — finite,
 /// or the run would already have stopped there.
 ///
-/// The remaining imprecision is attribution, not scope: a segment can go non-finite for an
-/// unrelated reason (a stiff blow-up) while the clock happens to be unanchored — and
-/// `pk_reads_tad()` is a *parse* walk, so the slot may be mentioned in a line that had
-/// nothing to do with the divergence. That combination is not hypothetical: measured on a
-/// two-state model whose second state blows up on its own (`X' = 0.5·X²`) with `TAD` in an
-/// untaken branch of the first, the three conjuncts above all held and the run was refused
-/// although every observed prediction was finite and verifier-clean (#1534 review). Worse,
-/// the advice it gave — add a base regimen — silences the message while the divergence
-/// stays.
-///
-/// So the refusal now **confirms causation** rather than asserting it. `resolve_with_finite_clock`
-/// re-integrates this same segment from `u_start` with the unanchored slot(s) set to a finite
-/// value; the message is returned only if that run comes back finite, i.e. only if the `NaN`
-/// clock is demonstrably what broke it. Otherwise this returns `None` and the caller carries
-/// on, so an unrelated blow-up reaches whatever diagnostic owns it. The extra solve costs one
-/// segment, on a path that has already failed.
-///
-/// `u_start` must itself be finite for the same reason: a state that arrived non-finite
-/// (from `init(...)`, or a `NaN` bolus applied at the break) was not broken here.
-///
-/// Non-finiteness **alone** is never reported here either — that would swap a false positive
-/// for a misattribution on every diverging solve.
-///
 /// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
-/// integrates correctly and must not be refused (measured: it agrees with `predict()`).
+/// integrates correctly and must not be refused. (The fixture that pins this starts from an
+/// empty compartment, so what it can see is "not `NaN`", not the value of `TIME` in the
+/// window — `adaptive_time_reading_rhs_is_not_refused_before_the_first_dose`.)
 ///
 /// **What it still does not see**: a `NaN` clock consumed by a *comparison* rather than by
 /// arithmetic. `min`/`max` desugar to `if (a <= b) …`, and every comparison against `NaN` is
@@ -2755,9 +2766,16 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// arm. The state stays finite, so the first conjunct blocks this function and the run
 /// returns a number that depends on which way the comparison fell. The default-on
 /// frozen-replay verifier is the net there — it reports the divergence as a symptom, without
-/// naming the clock. Measured and documented as row 8b of the message table; gating on
-/// *evaluation* instead (a per-segment "slot was loaded" flag in the RHS evaluator) is the
-/// mechanism all of this approximates, and is filed separately (#1535).
+/// naming the clock, and only when the effect exceeds its band. Measured and documented as
+/// row 8b of the message table; gating on *evaluation* instead (a per-segment "slot was
+/// loaded" flag in the RHS evaluator) is the mechanism all of this approximates, and is filed
+/// separately (#1535).
+///
+/// **And what nothing here sees**: once any state goes non-finite the solve stops advancing
+/// *every* state, so a run that survives this function can still return frozen, finite, wrong
+/// numbers — `predict()` included, which is why the frozen-replay verifier agrees with the
+/// driver on them. That is an engine defect, filed as #1539, and it is the reason a silent
+/// row of the message table is not the same as a correct one.
 fn unanchored_dose_clock_error(
     ode: &OdeSpec,
     subject: &Subject,
@@ -2767,11 +2785,12 @@ fn unanchored_dose_clock_error(
     t_start: f64,
     t_end: f64,
     // Re-integrate this segment from `u_start` with the unanchored clock set to the supplied
-    // finite value, and return the resulting state. Called at most once, only when every
-    // cheaper conjunct already holds. Taking it as a closure — rather than leaving the caller
-    // to check causation after the fact — is what keeps the rule in one place: a future caller
-    // cannot obtain the message without supplying the counterfactual.
-    resolve_with_finite_clock: impl FnOnce(f64) -> Vec<f64>,
+    // finite value, and return the resulting state. Called at most twice (the two stand-ins),
+    // and only when every cheaper conjunct already holds. Taking it as a closure — rather than
+    // leaving the caller to check causation after the fact — is what keeps the rule in one
+    // place: a future caller cannot obtain the message without supplying the counterfactual.
+    // `FnMut`, not `FnOnce`, precisely so the second stand-in is available.
+    mut resolve_with_finite_clock: impl FnMut(f64) -> Vec<f64>,
 ) -> Option<String> {
     // The outcome, checked first: a finite segment is never refused, however the RHS is
     // spelled. This is the conjunct that makes the syntactic `pk_reads_*` walk safe to use.
@@ -2793,12 +2812,20 @@ fn unanchored_dose_clock_error(
     if !tad_unanchored && !tafd_unanchored {
         return None;
     }
-    // Causation, the last and only expensive conjunct: would this segment have been finite
-    // under an anchored clock? `t_start` is an arbitrary finite stand-in — the question is
-    // whether the `NaN` was load-bearing, not what the right anchor would have been.
-    if !resolve_with_finite_clock(t_start)
-        .iter()
-        .all(|x| x.is_finite())
+    // Causation, the last and only expensive conjunct: under an anchored clock, does some
+    // component that broke here come back? Per component, because a segment can have two
+    // causes; over two stand-ins, because one stand-in's `TAD` range can break the
+    // counterfactual by itself. Both traps were measured — see the doc comment.
+    let repairs_a_broken_component = |cf: &[f64]| {
+        u.iter()
+            .zip(cf.iter())
+            .any(|(real, alt)| !real.is_finite() && alt.is_finite())
+    };
+    // `t_start` gives `TAD ∈ [0, L]`, `t_end` gives `TAD ∈ [-L, 0]` — the sign the static
+    // engines use. Short-circuits on the first that repairs something.
+    if ![t_start, t_end]
+        .into_iter()
+        .any(|stand_in| repairs_a_broken_component(&resolve_with_finite_clock(stand_in)))
     {
         return None;
     }
@@ -3116,8 +3143,9 @@ fn integrate_segment(
     // #1151 / #1534 review: force the TAD anchor slot to this value instead of folding it
     // from the dose list. The **only** caller that passes `Some` is the reactive driver's
     // causation check, which re-runs a segment that came back non-finite with a finite clock
-    // to find out whether the unanchored clock was the cause. Every production path passes
-    // `None` and is byte-identical to before.
+    // to find out whether the unanchored clock was the cause. Every solve whose result is
+    // *kept* passes `None` and is byte-identical to before — the causation check also runs in
+    // production, but on a failing path, and it throws its state away.
     tad_anchor_override: Option<f64>,
 ) -> Vec<Vec<f64>> {
     let opts = ode.effective_solver_opts();
@@ -5422,12 +5450,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // under, so the helper re-folds nothing.
             //
             // The closure is the causation check: the same segment, from the same starting
-            // state, with the unanchored slot(s) given a finite value. It runs at most once
-            // per subject — only when every cheaper conjunct already holds, on a segment that
-            // has already come back non-finite — and its state is discarded. A fresh
-            // `OdeAutoSwitchState` and a throwaway `predictions` buffer keep it from
-            // perturbing the real walk, which continues unchanged when the counterfactual is
-            // also non-finite (i.e. when the clock was not the cause).
+            // state, with the unanchored slot(s) given a finite value. The helper calls it
+            // once per stand-in (at most twice), only when every cheaper conjunct already
+            // holds, on a segment that has already come back non-finite — and throws the state
+            // away. So the cost is at most two extra segment solves per *non-finite episode*,
+            // not per subject: the driver is reset-aware (#716), and an EVID=3/4 reset that
+            // restores a finite state re-arms this. A fresh `OdeAutoSwitchState` and a
+            // throwaway `predictions` buffer keep it from perturbing the real walk, which
+            // continues unchanged when no counterfactual repairs anything (i.e. when the clock
+            // was not a cause).
             let refusal = {
                 let shadow_ref = &shadow;
                 let lagtimes_ref = &dose_lagtimes;
