@@ -183,15 +183,17 @@ pub fn fit_from_files(
     Ok(result)
 }
 
-/// The outer optimizer reported on `FitResult::optimizer`.
+/// The outer optimizer reported on `FitResult::optimizer`: the one that actually ran.
 ///
-/// For the FOCE/FOCEI path with the default `auto`, surface the concrete optimizer
-/// `auto` resolved to (e.g. `auto (nlopt_lbfgs)`) so the output records what actually
-/// ran (#490). The resolution is read off
+/// For the FOCE/FOCEI path the requested optimizer is resolved through
 /// `estimation::outer_optimizer::resolve_outer_optimizer` — the function the outer loop
-/// itself dispatches on — and not a second copy of the rule: a mixture model downgrades
-/// `auto` to BOBYQA there, which `Optimizer::resolve_auto` alone does not know about
-/// (#1540). `has_mixture` is the same `init_params.mixture.is_some()` the outer loop keys on.
+/// itself dispatches on — and not a second copy of the rule (#1540). `auto` is reported
+/// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model sends
+/// `auto` to BOBYQA, which `Optimizer::resolve_auto` alone does not know about, and it
+/// replaces an explicit optimizer that cannot carry the mixture objective (built-in
+/// BFGS/L-BFGS, trust-region) with BOBYQA too; that replacement is reported as `bobyqa`,
+/// and the outer loop's downgrade warning says why. `has_mixture` is the same
+/// `init_params.mixture.is_some()` the outer loop keys on.
 pub(crate) fn reported_optimizer_label(
     method: EstimationMethod,
     options: &FitOptions,
@@ -208,19 +210,19 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
-            if options.optimizer == Optimizer::Auto {
-                let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
-                    Optimizer::Auto,
+            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                options.optimizer,
+                model,
+                has_mixture,
+                crate::sens::provider::analytic_outer_gradient_for_interaction(
                     model,
-                    has_mixture,
-                    crate::sens::provider::analytic_outer_gradient_for_interaction(
-                        model,
-                        options.interaction,
-                    ),
-                );
+                    options.interaction,
+                ),
+            );
+            if options.optimizer == Optimizer::Auto {
                 format!("auto ({})", resolved.label())
             } else {
-                options.optimizer.label().to_string()
+                resolved.label().to_string()
             }
         }
     }

@@ -7081,9 +7081,12 @@ pub struct FitResult {
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
     /// `optimizer = auto` default resolved the choice, the label is the compound
     /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
-    /// the setting and what actually ran. SAEM/GN/IMP report their own fixed
-    /// labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa"). Always populated;
-    /// the label is the same regardless of method chain length. Consumers that
+    /// the setting and what actually ran. An explicit choice is reported as what
+    /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
+    /// mixture objective with BOBYQA, reported `"bobyqa"` (#1540). SAEM/GN/IMP
+    /// report their own fixed labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa").
+    /// Always populated; the label is the same regardless of method chain length.
+    /// Consumers that
     /// match on the label should accept the `auto (...)` prefix (#490).
     pub optimizer: String,
     /// Number of random multi-starts attempted. 1 means a single fit from
@@ -8496,9 +8499,11 @@ pub enum Optimizer {
     /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
     /// gradient is available (the model is in the sensitivity provider's scope
     /// and the user did not force `gradient_method = fd`), and to
-    /// [`Optimizer::Bobyqa`] otherwise (ODE/PD models, LTBS, SDE, or
+    /// [`Optimizer::Bobyqa`] otherwise (out-of-scope ODE/PD models, SDE, or
     /// `gradient_method = fd`, where the outer loop must fall back to finite
-    /// differences). Benchmarking across ~10 real FOCEI datasets (#490) found
+    /// differences). The outer loop also sends every `[mixture]` model on `auto` to
+    /// BOBYQA (`estimation::outer_optimizer::resolve_outer_optimizer`, which
+    /// [`Optimizer::resolve_auto`] alone does not model). Benchmarking across ~10 real FOCEI datasets (#490) found
     /// NLopt L-BFGS fastest-to-optimum on every analytic-gradient problem, while
     /// BOBYQA was both fastest and most reliable when only finite differences
     /// are available. See [`Optimizer::resolve_auto`].

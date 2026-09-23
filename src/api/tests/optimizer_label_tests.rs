@@ -113,20 +113,52 @@ fn auto_label_follows_the_mixture_downgrade() {
     }
 }
 
-/// An explicit optimizer is reported as given; the mixture replacement of an
-/// unsupported explicit choice is surfaced by the outer loop's downgrade warning,
-/// not by rewriting the label.
+/// An explicit optimizer is reported as the one that ran. Under a mixture an NLopt
+/// gradient optimizer is honoured, while one that cannot carry the mixture objective
+/// is replaced by BOBYQA and must be reported as `bobyqa`. Each replaced choice is
+/// paired with the same choice on the non-mixture side of the gate, where it runs as
+/// requested.
+///
+/// Mutation that must redden this: reporting `options.optimizer.label()` for an
+/// explicit choice (the pre-#1540 code), which reads `bfgs` for a fit that ran BOBYQA.
 #[test]
-fn explicit_optimizer_label_is_unchanged() {
+fn explicit_optimizer_label_reports_the_mixture_replacement() {
     let model = parse(MIXTURE);
-    let opts = FitOptions {
-        optimizer: Optimizer::NloptLbfgs,
-        ..Default::default()
+    let label = |optimizer, has_mixture| {
+        let opts = FitOptions {
+            optimizer,
+            ..Default::default()
+        };
+        reported_optimizer_label(EstimationMethod::FoceI, &opts, &model, has_mixture)
     };
-    assert_eq!(
-        reported_optimizer_label(EstimationMethod::FoceI, &opts, &model, true),
-        "nlopt_lbfgs"
-    );
+    for (optimizer, own) in [
+        (Optimizer::Bfgs, "bfgs"),
+        (Optimizer::Lbfgs, "lbfgs"),
+        (Optimizer::TrustRegion, "trust_region"),
+    ] {
+        assert_eq!(
+            label(optimizer, true),
+            "bobyqa",
+            "{optimizer:?} under a mixture"
+        );
+        assert_eq!(
+            label(optimizer, false),
+            own,
+            "{optimizer:?} without a mixture"
+        );
+    }
+    for (optimizer, own) in [
+        (Optimizer::NloptLbfgs, "nlopt_lbfgs"),
+        (Optimizer::Slsqp, "slsqp"),
+        (Optimizer::Mma, "mma"),
+        (Optimizer::Bobyqa, "bobyqa"),
+    ] {
+        assert_eq!(
+            label(optimizer, true),
+            own,
+            "{optimizer:?} is honoured under a mixture"
+        );
+    }
 }
 
 fn subject(id: &str, cl: f64) -> Subject {
