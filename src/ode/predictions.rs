@@ -2723,25 +2723,63 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// or the run would already have stopped there.
 ///
 /// The remaining imprecision is attribution, not scope: a segment can go non-finite for an
-/// unrelated reason (a stiff blow-up) while the clock happens to be unanchored. The message
-/// therefore states the two facts it observed and does not claim to have proved the link
-/// between them. Non-finiteness **alone** is never reported here — that would swap a false
-/// positive for a misattribution on every diverging solve.
+/// unrelated reason (a stiff blow-up) while the clock happens to be unanchored — and
+/// `pk_reads_tad()` is a *parse* walk, so the slot may be mentioned in a line that had
+/// nothing to do with the divergence. That combination is not hypothetical: measured on a
+/// two-state model whose second state blows up on its own (`X' = 0.5·X²`) with `TAD` in an
+/// untaken branch of the first, the three conjuncts above all held and the run was refused
+/// although every observed prediction was finite and verifier-clean (#1534 review). Worse,
+/// the advice it gave — add a base regimen — silences the message while the divergence
+/// stays.
+///
+/// So the refusal now **confirms causation** rather than asserting it. `resolve_with_finite_clock`
+/// re-integrates this same segment from `u_start` with the unanchored slot(s) set to a finite
+/// value; the message is returned only if that run comes back finite, i.e. only if the `NaN`
+/// clock is demonstrably what broke it. Otherwise this returns `None` and the caller carries
+/// on, so an unrelated blow-up reaches whatever diagnostic owns it. The extra solve costs one
+/// segment, on a path that has already failed.
+///
+/// `u_start` must itself be finite for the same reason: a state that arrived non-finite
+/// (from `init(...)`, or a `NaN` bolus applied at the break) was not broken here.
+///
+/// Non-finiteness **alone** is never reported here either — that would swap a false positive
+/// for a misattribution on every diverging solve.
 ///
 /// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
 /// integrates correctly and must not be refused (measured: it agrees with `predict()`).
+///
+/// **What it still does not see**: a `NaN` clock consumed by a *comparison* rather than by
+/// arithmetic. `min`/`max` desugar to `if (a <= b) …`, and every comparison against `NaN` is
+/// false, so `min(TAD, 24)` silently yields `24` and `if (TAD < 5)` silently takes the else
+/// arm. The state stays finite, so the first conjunct blocks this function and the run
+/// returns a number that depends on which way the comparison fell. The default-on
+/// frozen-replay verifier is the net there — it reports the divergence as a symptom, without
+/// naming the clock. Measured and documented as row 8b of the message table; gating on
+/// *evaluation* instead (a per-segment "slot was loaded" flag in the RHS evaluator) is the
+/// mechanism all of this approximates, and is filed separately (#1535).
 fn unanchored_dose_clock_error(
     ode: &OdeSpec,
     subject: &Subject,
+    u_start: &[f64],
     u: &[f64],
     ext_params: &[f64],
     t_start: f64,
     t_end: f64,
+    // Re-integrate this segment from `u_start` with the unanchored clock set to the supplied
+    // finite value, and return the resulting state. Called at most once, only when every
+    // cheaper conjunct already holds. Taking it as a closure — rather than leaving the caller
+    // to check causation after the fact — is what keeps the rule in one place: a future caller
+    // cannot obtain the message without supplying the counterfactual.
+    resolve_with_finite_clock: impl FnOnce(f64) -> Vec<f64>,
 ) -> Option<String> {
     // The outcome, checked first: a finite segment is never refused, however the RHS is
     // spelled. This is the conjunct that makes the syntactic `pk_reads_*` walk safe to use.
     if u.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    // ... and it has to have gone non-finite HERE.
+    if !u_start.iter().all(|x| x.is_finite()) {
         return None;
     }
     let prog = ode.rhs_program.as_ref()?;
@@ -2755,19 +2793,33 @@ fn unanchored_dose_clock_error(
     if !tad_unanchored && !tafd_unanchored {
         return None;
     }
+    // Causation, the last and only expensive conjunct: would this segment have been finite
+    // under an anchored clock? `t_start` is an arbitrary finite stand-in — the question is
+    // whether the `NaN` was load-bearing, not what the right anchor would have been.
+    if !resolve_with_finite_clock(t_start)
+        .iter()
+        .all(|x| x.is_finite())
+    {
+        return None;
+    }
     let slot = match (tad_unanchored, tafd_unanchored) {
         (true, true) => "`TAD` and `TAFD`",
         (true, false) => "`TAD`",
         _ => "`TAFD`",
     };
     // The reads taken off this segment, resolved with the same predicate
-    // [`integrate_segment`] builds its `saveat` from, so the two cannot disagree about
-    // which observations belong to the window.
+    // [`integrate_segment`] builds its `saveat` from — minus `t_end`'s own band. A record
+    // there IS sampled pre-dose into `saveat`, but the value finally reported for it is the
+    // POST-dose boundary read the next break takes (pinned by
+    // `degenerate_oracle_tad_rhs_observation_on_a_decision_boundary_is_bit_identical`), so
+    // naming it as "read off that segment" points the reader at the wrong record. Such a
+    // record is poisoned the way the no-observation branch below describes: through the
+    // state carried into the dose (#1534 review, row 9).
     let first_obs = subject
         .obs_times
         .iter()
         .copied()
-        .filter(|&t| reads_in_segment(t, t_start, t_end))
+        .filter(|&t| reads_in_segment(t, t_start, t_end) && (t_end - t).abs() > EVENT_MATCH_TOL)
         .fold(f64::INFINITY, f64::min);
     let reads = if first_obs.is_finite() {
         format!("The observation at t={first_obs} is read off that segment.")
@@ -3061,6 +3113,12 @@ fn integrate_segment(
     // the advanced `u` are therefore bit-identical to a `chz_times = &[]` call.
     // Must be sorted ascending and lie in `(t_start, t_end]`; the caller filters.
     chz_times: &[f64],
+    // #1151 / #1534 review: force the TAD anchor slot to this value instead of folding it
+    // from the dose list. The **only** caller that passes `Some` is the reactive driver's
+    // causation check, which re-runs a segment that came back non-finite with a finite clock
+    // to find out whether the unanchored clock was the cause. Every production path passes
+    // `None` and is byte-identical to before.
+    tad_anchor_override: Option<f64>,
 ) -> Vec<Vec<f64>> {
     let opts = ode.effective_solver_opts();
 
@@ -3086,8 +3144,10 @@ fn integrate_segment(
     }
 
     // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
-    // before this segment, SS-aware (gives TAD = t - last_dose_eff).
-    ext_params[crate::types::MAX_PK_PARAMS + 1] = tad_anchor(subject, dose_lagtimes, t_start);
+    // before this segment, SS-aware (gives TAD = t - last_dose_eff). An override
+    // (#1534 review) replaces the fold; see the parameter's note.
+    ext_params[crate::types::MAX_PK_PARAMS + 1] =
+        tad_anchor_override.unwrap_or_else(|| tad_anchor(subject, dose_lagtimes, t_start));
 
     // Integrate. If any infusions are active in this segment, wrap
     // the user RHS so it adds `+rate` to each infusion's compartment.
@@ -3826,6 +3886,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
                 stats.as_deref_mut(),
                 &mut auto_state,
                 &seg_chz,
+                None,
             );
             // Place each soft sample at its global `chz_times` index (NaN slots left for
             // any time no segment covered).
@@ -5322,6 +5383,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // `integrate_segment`'s `active_infusions` over any segment they fully span (the
             // base + dynamic injected infusion-end breaks guarantee full containment). On the
             // dose-free path this is all-zeros and `injected_f` empty, byte-identical to before.
+            //
+            // The pre-segment state is kept for the #1151 causation check below: it is both
+            // the "did it go non-finite HERE?" reference and the starting point the
+            // counterfactual re-solve replays from. One `n_states` copy per segment.
+            let u_start = u.clone();
             integrate_segment(
                 ode,
                 &mut u,
@@ -5340,6 +5406,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 None,
                 &mut auto_state,
                 &[],
+                None,
             );
 
             // #1151: a segment whose dose clock had no referent — a window before the first
@@ -5353,9 +5420,60 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // untaken branch or in a condition — shapes whose state stays finite. See the
             // helper's doc comment. `ext_params` now carries the anchors this segment ran
             // under, so the helper re-folds nothing.
-            if let Some(msg) =
-                unanchored_dose_clock_error(ode, &shadow, &u, &ext_params, t_start, t_end)
-            {
+            //
+            // The closure is the causation check: the same segment, from the same starting
+            // state, with the unanchored slot(s) given a finite value. It runs at most once
+            // per subject — only when every cheaper conjunct already holds, on a segment that
+            // has already come back non-finite — and its state is discarded. A fresh
+            // `OdeAutoSwitchState` and a throwaway `predictions` buffer keep it from
+            // perturbing the real walk, which continues unchanged when the counterfactual is
+            // also non-finite (i.e. when the clock was not the cause).
+            let refusal = {
+                let shadow_ref = &shadow;
+                let lagtimes_ref = &dose_lagtimes;
+                let injected_ref = &injected_f;
+                let u_start_ref = &u_start;
+                unanchored_dose_clock_error(
+                    ode,
+                    shadow_ref,
+                    u_start_ref,
+                    &u,
+                    &ext_params,
+                    t_start,
+                    t_end,
+                    |finite_anchor| {
+                        let mut u_cf = u_start_ref.clone();
+                        let mut ext_cf = ext_params;
+                        if ext_cf[crate::types::MAX_PK_PARAMS].is_nan() {
+                            ext_cf[crate::types::MAX_PK_PARAMS] = finite_anchor;
+                        }
+                        let mut preds_cf = vec![f64::NAN; 0];
+                        let mut auto_cf = crate::ode::solver::OdeAutoSwitchState::default();
+                        integrate_segment(
+                            ode,
+                            &mut u_cf,
+                            t_start,
+                            t_end,
+                            shadow_ref,
+                            lagtimes_ref,
+                            injected_ref,
+                            reset_floor,
+                            &mut ext_cf,
+                            seg_pk_values,
+                            theta,
+                            seg_eta,
+                            &HashMap::new(),
+                            &mut preds_cf,
+                            None,
+                            &mut auto_cf,
+                            &[],
+                            Some(finite_anchor),
+                        );
+                        u_cf
+                    },
+                )
+            };
+            if let Some(msg) = refusal {
                 return Err(msg);
             }
 
@@ -5905,6 +6023,7 @@ fn adaptive_frozen_replay_tv(
                 None,
                 &mut auto_state,
                 &[],
+                None,
             );
 
             // Advance the LOCF carry only at an actual record — the identical rule the

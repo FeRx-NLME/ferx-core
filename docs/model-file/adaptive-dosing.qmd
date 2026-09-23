@@ -421,12 +421,28 @@ unanchored clock enters the integrated **state**, so a read taken later — even
 the first dose has landed — would inherit it.
 
 **It is gated on the outcome, not on the text of your model.** The check runs after
-each segment is integrated and fires only when that segment's state came back
-non-finite *and* the clock the RHS reads was unanchored there. A `TAD` that appears
-in a branch the pre-dose window does not take, or only inside a condition, is
-therefore left alone — such a run integrates normally and is not refused. A RHS that
-reads only `TIME` / `T` is unaffected in every case, since that clock is the
-integration axis and is anchored everywhere.
+each segment is integrated and fires only when three things hold together: the
+segment's state came back non-finite, the clock the RHS reads was unanchored there,
+and re-solving that same segment with the clock anchored comes back *finite*. The
+third one is a counterfactual, and it is what makes the message's claim true rather
+than plausible — a compartment that diverges for its own reasons, on a model that
+merely mentions `TAD` somewhere, is not refused and not blamed on the clock. A `TAD`
+that appears in a branch the pre-dose window does not take, or only inside a
+condition, is likewise left alone. A RHS that reads only `TIME` / `T` is unaffected
+in every case, since that clock is the integration axis and is anchored everywhere.
+
+**One shape it cannot see.** If the unanchored clock is consumed by a *comparison*
+rather than by arithmetic, nothing goes non-finite and the check stays quiet. Every
+comparison against `NaN` is false, and `min` / `max` are built from comparisons — so
+in the pre-dose window `if (TAD < 5)` silently takes the else arm and
+`min(TAD, 24)` silently yields `24`. The run then returns a number that depends on
+which way that comparison fell, and it will not match `predict()` on the realized
+schedule. The **frozen-schedule replay verifier**, which is on by default, is what
+catches this: it reports the divergence between the reactive walk and the replay,
+without naming the clock as the cause. Turning it off (`verify: false`) on a model
+that reads `TAD` or `TAFD` inside a comparison removes the only net there. Gating on
+*evaluation* instead — a per-segment "this slot was loaded" flag inside the RHS
+evaluator — would cover this shape too, and is tracked separately.
 
 ## Current scope and limits
 

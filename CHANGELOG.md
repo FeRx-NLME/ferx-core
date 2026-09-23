@@ -90,9 +90,14 @@ section of the SDLC for the versioning policy).
   two fixes — a pre-scheduled base regimen, or a first decision at the start of the horizon
   that doses. The check is gated on the outcome, not on the text of the model: it runs after
   each segment and fires only when that segment integrated to a non-finite state under an
-  unanchored clock, so a `TAD` in a branch the pre-dose window never takes, or read only
-  inside a condition, still runs. Runs with a base regimen, with all reads anchored, or on a
-  RHS reading only `TIME` / `T` are likewise unaffected (#1151).
+  unanchored clock **and** re-solving it with the clock anchored comes back finite. So a
+  `TAD` in a branch the pre-dose window never takes, or read only inside a condition, still
+  runs — and a compartment that diverges for its own reasons is neither refused nor blamed
+  on the clock. Runs with a base regimen, with all reads anchored, or on a RHS reading only
+  `TIME` / `T` are likewise unaffected. One shape stays outside it: an unanchored clock
+  consumed by a comparison (`if (TAD < 5)`, `min(TAD, 24)`) leaves the state finite and
+  silently picks a branch, and the default-on frozen-schedule replay verifier is what
+  catches the resulting divergence (#1151).
 - **Analytic ODE covariance: the third-order sweep no longer differences across a
   lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
   R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and
