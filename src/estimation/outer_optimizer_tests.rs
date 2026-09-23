@@ -226,7 +226,7 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
 
 /// `resolve_scaling` maps `Auto` to `Abs` (magnitude scaling) for the
 /// gradient-based optimizers (incl. `Slsqp`) and to `None` for the
-/// derivative-free `Bobyqa` default (and `Mma`/`TrustRegion`); explicit
+/// derivative-free `Bobyqa` (and `Mma`/`TrustRegion`); explicit
 /// non-`Auto` values pass through unchanged. Guards the gradient-optimizer
 /// preconditioner routing (Rescale2 → Abs, the fix that recovers warfarin /
 /// tvcov / two_cpt_oral_cov convergence while preserving #335).

@@ -162,11 +162,16 @@ generous enough that the good start is allowed to settle.
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
 - **`nlopt_lbfgs`** — when the **exact analytic FOCE/FOCEI gradient** is available: an analytical PK model (or an in-scope user-`[odes]` model, see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) that is in the sensitivity provider's scope and is **not** forced onto finite differences via `gradient = fd`.
-- **`bobyqa`** — otherwise: out-of-scope ODE/PD models, log-transform-both-sides (LTBS), SDE models, or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+- **`bobyqa`** — otherwise: any model outside the analytic scope (for example an out-of-scope ODE/PD model or an SDE model), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+
+Two cases override that rule:
+
+- **More than 64 free packed parameters** (`BOBYQA_MAX_DIM`) → `nlopt_lbfgs` even on a finite-difference gradient. BOBYQA's interpolation set grows quadratically with the parameter count, so above that size O(n) FD passes are cheaper (#1064).
+- **Mixture models** (`[mixture]`) → `bobyqa` regardless of gradient availability, as the robust choice against label-switching multimodality (#977).
 
 The choice mirrors the analytic-vs-FD decision the outer loop already makes, so `auto` lands on the gradient-based optimizer exactly when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin).
 
-The resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed. Two exceptions: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer, and a mixture model's label currently ignores the mixture override, so it can read `auto (nlopt_lbfgs)` while BOBYQA ran ([#1540](https://github.com/FeRx-NLME/ferx-core/issues/1540)). These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 
@@ -297,11 +302,11 @@ Set `reconverge_gradient_interval = 1` to re-solve the inner loop at every gradi
 | `slsqp` (fixed-EBE) | 68,252 | 390 s |
 | `slsqp` + `interval = 10` | 66,118 | 633 s |
 | `slsqp` + `interval = 1` | **65,485** | 1,871 s |
-| `bobyqa` (derivative-free, **default**) | 65,598 | 315 s |
+| `bobyqa` (derivative-free) | 65,598 | 315 s |
 
 On this cefepime 2-compartment dataset `bobyqa` reaches a near-optimal solution faster than any reconverged `slsqp` setting. The reconverged gradient is most useful when derivative-free search is too slow (high parameter count) or when a gradient optimizer is required for other reasons.
 
-IOV models (`kappa`/`block_kappa`) always reconverge regardless of this setting. Even so, a *pure* `slsqp` cold-start on an IOV model can terminate a few OFV units above the minimum, and the exact stopping point is platform-dependent (the re-converged FD gradient's summation order differs across architectures — issue #160). Prefer the default `bobyqa` or a `methods = [saem, focei]` chain for IOV fits; both reach the minimum platform-independently. See [Inter-Occasion Variability](../model-file/iov.qmd#limitations).
+IOV models (`kappa`/`block_kappa`) always reconverge regardless of this setting. Even so, a *pure* `slsqp` cold-start on an IOV model can terminate a few OFV units above the minimum, and the exact stopping point is platform-dependent (the re-converged FD gradient's summation order differs across architectures — issue #160). Prefer `optimizer = bobyqa` or a `methods = [saem, focei]` chain for IOV fits; both reach the minimum platform-independently. See [Inter-Occasion Variability](../model-file/iov.qmd#limitations).
 
 ---
 
@@ -309,7 +314,7 @@ IOV models (`kappa`/`block_kappa`) always reconverge regardless of this setting.
 
 For **analytical 1-, 2-, and 3-compartment models** (IV bolus/infusion, oral, and steady state) under **FOCE or FOCEI**, the gradient-based optimizers (`bfgs`, `lbfgs`, `nlopt_lbfgs`, `slsqp`) automatically switch from the finite-difference gradient to an **exact closed-form marginal gradient** (Almquist et al. 2015). FOCEI differentiates the Laplace marginal; FOCE differentiates ferx's Sheiner–Beal linearized marginal. Both are computed analytically through second-order dual numbers and *include the full EBE response* (the term `reconverge_gradient_interval` recovers by brute force) — so they do **not** carry the fixed-EBE bias described above, at no extra cost. There is nothing to configure: the `method` and `optimizer` choices are the switch, and any model outside the analytical scope falls back to the finite-difference gradient transparently. A model *inside* the scope can still have individual subjects the provider declines; those subjects alone take the fixed-EBE gradient, and the fit reports them in a warning (see [the outer-loop route](foce.qmd#outer-loop-fd-fallback)).
 
-Because the gradient is both exact and bias-free here, `lbfgs` / `nlopt_lbfgs` are strong choices on these models: each gradient evaluation is a closed form rather than an `O(n)` finite-difference sweep, and — unlike the FD gradient — it carries no fixed-EBE bias, so the optimizer reaches the true optimum. Wall-time versus the derivative-free `bobyqa` default is model-dependent and roughly comparable (e.g. warfarin FOCEI: `lbfgs` ≈ 0.29 s vs `bobyqa` ≈ 0.43 s; on a 2-cpt fit `bobyqa` is faster but can stop short of the optimum), and both are several times faster than the now-deprecated built-in BFGS.
+Because the gradient is both exact and bias-free here, `lbfgs` / `nlopt_lbfgs` are strong choices on these models: each gradient evaluation is a closed form rather than an `O(n)` finite-difference sweep, and — unlike the FD gradient — it carries no fixed-EBE bias, so the optimizer reaches the true optimum. Wall-time versus the derivative-free `bobyqa` is model-dependent and roughly comparable (e.g. warfarin FOCEI: `lbfgs` ≈ 0.29 s vs `bobyqa` ≈ 0.43 s; on a 2-cpt fit `bobyqa` is faster but can stop short of the optimum), and both are several times faster than the now-deprecated built-in BFGS.
 
 The exact gradient lands on the same optimum as the underlying objective, validated against NONMEM on the warfarin 1-cpt oral model: FOCE reaches OFV −280.36 (NONMEM −280.36; TVCL 0.1330, TVKA 0.7252, ω²: 0.0286 / 0.00958 / 0.349) and FOCEI reaches −286.00 (NONMEM −286.00) — both agreeing to ~4–5 significant figures across θ, Ω, and σ.
 
