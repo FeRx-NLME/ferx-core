@@ -2691,7 +2691,9 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// dose). The static engines have no such window — `predict()` sees the whole record, so its
 /// fallback returns the first *future* arrival and `TAD` comes back finite and negative —
 /// which is exactly the peek a controller has not earned: the dose anchoring it has not been
-/// decided yet.
+/// decided yet, and may never be. (With no dose anywhere in the record `predict()` returns
+/// `NaN` there too, measured — so the anchoring claim is conditional on the record carrying
+/// one, and the message says so.)
 ///
 /// Returns `Some(message)` when the segment `(t_start, t_end]` must be refused. Measured at
 /// `a6b67de5`, this is not a readout defect but a state one: with `u = 0` and a `NaN` anchor
@@ -2701,31 +2703,54 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// window with no observation in it still poisons the run (`[NaN, NaN]` for obs at 20/40 with
 /// the first dose at 12, measured).
 ///
+/// **Called *after* [`integrate_segment`], and gated on the outcome.** An earlier form ran
+/// before the solve and refused on `pk_reads_tad() && anchor.is_nan()` alone — but
+/// `pk_reads_tad` is a *syntactic* walk (`stmts_read_slots`) that recurses into `if` arms and
+/// into conditions, so it is true whenever `TAD` appears anywhere in the `[odes]` body. That
+/// refused two shapes whose state never sees the `NaN`, both measured returning finite
+/// trajectories — and passing the frozen-replay verifier — with the guard removed: a `TAD`
+/// term inside a branch the unanchored window does not take, and a `TAD` read that occurs
+/// only in a *condition* (`NaN > 5.0` is `false`, so the else arm runs). Input present is not
+/// path ran (#1278). The three-way conjunction used here — the segment's state came back
+/// non-finite, **and** the anchor the RHS was handed is `NaN`, **and** the RHS reads that
+/// slot — has no such false positive by construction: a segment that never evaluates the
+/// slot cannot be poisoned by it.
+///
+/// `ext_params` must be the array [`integrate_segment`] just used, so the `TAD` slot holds
+/// the anchor that segment actually integrated under rather than a recomputed twin, and `u`
+/// its advanced state. A zero-length segment needs no special case: [`integrate_segment`]
+/// returns before touching either, so `u` is whatever the previous segment left — finite,
+/// or the run would already have stopped there.
+///
+/// The remaining imprecision is attribution, not scope: a segment can go non-finite for an
+/// unrelated reason (a stiff blow-up) while the clock happens to be unanchored. The message
+/// therefore states the two facts it observed and does not claim to have proved the link
+/// between them. Non-finiteness **alone** is never reported here — that would swap a false
+/// positive for a misattribution on every diverging solve.
+///
 /// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
 /// integrates correctly and must not be refused (measured: it agrees with `predict()`).
-///
-/// Zero-length segments return `None` — [`integrate_segment`] returns before touching the
-/// anchor there, so refusing one would reject a window that is never integrated.
 fn unanchored_dose_clock_error(
     ode: &OdeSpec,
     subject: &Subject,
-    dose_lagtimes: &[f64],
+    u: &[f64],
     ext_params: &[f64],
     t_start: f64,
     t_end: f64,
 ) -> Option<String> {
-    // [`integrate_segment`]'s own no-op test, spelled the same way.
-    if (t_end - t_start).abs() < 1e-15 {
+    // The outcome, checked first: a finite segment is never refused, however the RHS is
+    // spelled. This is the conjunct that makes the syntactic `pk_reads_*` walk safe to use.
+    if u.iter().all(|x| x.is_finite()) {
         return None;
     }
     let prog = ode.rhs_program.as_ref()?;
-    // The anchors exactly as the segment would receive them: the `TAD` one is what
-    // `integrate_segment` is about to write into `ext_params`, and the `TAFD` one is the
-    // slot it inherits. Reading the quantity itself — rather than re-deriving "is the
-    // shadow dose-free?" — keeps the diagnostic gated on its own mechanism.
+    // The anchors exactly as the segment received them: `integrate_segment` wrote the `TAD`
+    // slot itself, and the `TAFD` slot is the one it inherited. Reading the quantities the
+    // RHS was handed — rather than re-deriving "is the shadow dose-free?" — keeps the
+    // diagnostic gated on its own mechanism, and costs no second fold of the dose list.
     let tad_unanchored =
-        prog.pk_reads_tad() && tad_anchor_for(&subject.doses, dose_lagtimes, t_start).is_nan();
+        prog.pk_reads_tad() && ext_params[crate::types::MAX_PK_PARAMS + 1].is_nan();
     let tafd_unanchored = prog.pk_reads_tafd() && ext_params[crate::types::MAX_PK_PARAMS].is_nan();
     if !tad_unanchored && !tafd_unanchored {
         return None;
@@ -2752,13 +2777,15 @@ fn unanchored_dose_clock_error(
             .to_string()
     };
     Some(format!(
-        "ode_predictions_adaptive: the [odes] RHS reads {slot}, and no dose has been given \
-         yet in this run, so {slot} has no referent on the segment ({t_start}, {t_end}]. \
-         {reads} The static engines anchor such a window at the first dose in the whole \
-         record, which in a reactive run has not been decided yet — so this driver refuses \
-         the window rather than read a dose out of the future. Give the subject a \
-         pre-scheduled base regimen, or have the controller dose at a decision placed at the \
-         start of the horizon, so the clock is anchored before this segment."
+        "ode_predictions_adaptive: the segment ({t_start}, {t_end}] integrated to a \
+         non-finite state, and the [odes] RHS reads {slot}, which has no referent there: no \
+         dose has been given in this run. {reads} Where the record contains a dose, the \
+         static engines anchor such a window at the first one — a dose a reactive run has \
+         not decided yet, and may never decide — so this driver refuses the window rather \
+         than read one out of the future. Give the subject a pre-scheduled base regimen, or \
+         have the controller dose at a decision placed at the start of the horizon; a \
+         controller that never doses leaves a model reading {slot} unanchored for the whole \
+         run."
     ))
 }
 
@@ -5286,21 +5313,6 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
             }
 
-            // #1151: refuse a segment whose dose clock has no referent — a window before the
-            // first realized (or base) dose on a `TAD`/`TAFD`-reading RHS. `NaN` there enters
-            // the *state*, not just the readout, so it is caught before integrating rather
-            // than left to the (default-on, but opt-out) frozen-replay verifier.
-            if let Some(msg) = unanchored_dose_clock_error(
-                ode,
-                &shadow,
-                &dose_lagtimes,
-                &ext_params,
-                t_start,
-                t_end,
-            ) {
-                return Err(msg);
-            }
-
             // Per-dose lagtimes for the segment (computed once above for the bolus pass and
             // reused here). Base doses (indices `0..n_base`, #702) carry their resolved
             // lagtime; controller-injected doses (`n_base..`) are lag-0 (a nonzero lag is
@@ -5329,6 +5341,23 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &mut auto_state,
                 &[],
             );
+
+            // #1151: a segment whose dose clock had no referent — a window before the first
+            // realized (or base) dose on a `TAD`/`TAFD`-reading RHS — integrates `0.0 * NaN`
+            // into the *state*, not just the readout, so every later read inherits it. Refuse
+            // it here rather than leave it to the (default-on, but opt-out) frozen-replay
+            // verifier, whose message names the symptom and not the cause.
+            //
+            // Placed AFTER the solve on purpose: the cheaper pre-integration form refused on
+            // `pk_reads_tad()` alone, which is a syntactic walk and true for a `TAD` in an
+            // untaken branch or in a condition — shapes whose state stays finite. See the
+            // helper's doc comment. `ext_params` now carries the anchors this segment ran
+            // under, so the helper re-folds nothing.
+            if let Some(msg) =
+                unanchored_dose_clock_error(ode, &shadow, &u, &ext_params, t_start, t_end)
+            {
+                return Err(msg);
+            }
 
             // Advance the LOCF carry: after integrating into `t_end`, the record there
             // — **if `t_end` is one** — is the most-recent PK. `last_occ` advances in

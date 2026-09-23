@@ -88,8 +88,11 @@ section of the SDLC for the versioning policy).
   returned `Ok` with `NaN` rows and no warning at all. `simulate_adaptive()` now refuses
   that window with a typed error naming the segment, the spelling (`TAD` or `TAFD`) and the
   two fixes — a pre-scheduled base regimen, or a first decision at the start of the horizon
-  that doses. Runs with a base regimen, with all reads anchored, or on a RHS reading only
-  `TIME` / `T` are unaffected (#1151).
+  that doses. The check is gated on the outcome, not on the text of the model: it runs after
+  each segment and fires only when that segment integrated to a non-finite state under an
+  unanchored clock, so a `TAD` in a branch the pre-dose window never takes, or read only
+  inside a condition, still runs. Runs with a base regimen, with all reads anchored, or on a
+  RHS reading only `TIME` / `T` are likewise unaffected (#1151).
 - **Analytic ODE covariance: the third-order sweep no longer differences across a
   lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
   R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and

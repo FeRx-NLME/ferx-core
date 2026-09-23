@@ -12783,14 +12783,18 @@ fn unanchored_dose_clock_error_names_both_spellings_when_the_rhs_reads_both() {
     // RHS reading both must be told about both. The driver-level tests exercise one spelling
     // each (`ODE_TAD_NO_IIV`, `ODE_TAFD`), which leaves this arm of the message unreachable
     // from there.
+    //
+    // Mutation that reddens it: collapse the slot match to a bare "`TAD`".
     let ode = tad_and_tafd_ode_spec();
     let subject = make_subject(vec![], vec![6.0]);
-    // Both anchors as the driver holds them before the first dose: the TAD anchor is
-    // recomputed per segment (NaN over an empty dose list) and the TAFD slot is NaN until
+    // Both anchors as the driver holds them before the first dose: `integrate_segment` writes
+    // the TAD slot from an empty dose list (NaN), and the TAFD slot stays NaN until
     // `update_tafd_anchor` lowers it at the first realized dose.
     let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    // The segment's advanced state — the conjunct the guard keys on first.
+    let u = [f64::NAN];
 
-    let msg = unanchored_dose_clock_error(&ode, &subject, &[], &ext_params, 0.0, 12.0)
+    let msg = unanchored_dose_clock_error(&ode, &subject, &u, &ext_params, 0.0, 12.0)
         .expect("a dose-free window on a TAD+TAFD RHS is refused");
     assert!(
         msg.contains("`TAD` and `TAFD`"),
@@ -12803,18 +12807,48 @@ fn unanchored_dose_clock_error_names_both_spellings_when_the_rhs_reads_both() {
 }
 
 #[test]
-fn unanchored_dose_clock_error_ignores_a_zero_length_segment() {
-    // #1151. `integrate_segment` returns before it writes the TAD anchor when the segment has
-    // no length, so such a break integrates nothing and cannot be poisoned — refusing it would
-    // reject a run over a window that is never solved. Same inputs as the test above, with
-    // `t_end == t_start`.
+fn unanchored_dose_clock_error_ignores_a_segment_that_stayed_finite() {
+    // #1151 (PR #1534 review, finding 1). The outcome conjunct, isolated: identical inputs to
+    // the test above — unanchored `TAD` and `TAFD` slots, a RHS that reads both — except that
+    // the segment's state came back finite. Nothing is refused.
+    //
+    // This is what makes the syntactic `pk_reads_tad()` / `pk_reads_tafd()` walk safe to ask.
+    // `stmts_read_slots` recurses into `if` arms and into conditions, so it is true for a
+    // `TAD` the unanchored window never evaluates; the driver-level twins
+    // (`adaptive_tad_in_an_untaken_branch_is_not_refused`,
+    // `adaptive_tad_read_only_in_a_condition_is_not_refused`) run those shapes end to end.
+    //
+    // Mutation that reddens it: drop the `u.iter().all(is_finite)` early return — the guard
+    // then refuses on the anchor and the parse walk alone, which is the pre-review behaviour.
     let ode = tad_and_tafd_ode_spec();
     let subject = make_subject(vec![], vec![6.0]);
     let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let u = [42.0];
 
     assert!(
-        unanchored_dose_clock_error(&ode, &subject, &[], &ext_params, 12.0, 12.0).is_none(),
-        "a zero-length segment integrates nothing and must not be refused"
+        unanchored_dose_clock_error(&ode, &subject, &u, &ext_params, 0.0, 12.0).is_none(),
+        "a segment whose state stayed finite never evaluated the unanchored slot"
+    );
+}
+
+#[test]
+fn unanchored_dose_clock_error_is_silent_when_the_anchor_is_finite() {
+    // #1151 (PR #1534 review, finding 1). The other half of the conjunction: a non-finite
+    // state under an ANCHORED clock is somebody else's problem — a stiff blow-up, a bad
+    // parameter draw — and reporting it here would misattribute it. Same RHS, both anchors
+    // finite, state NaN.
+    //
+    // Mutation that reddens it: report on non-finiteness alone.
+    let ode = tad_and_tafd_ode_spec();
+    let subject = make_subject(vec![], vec![6.0]);
+    let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+    ext_params[crate::types::MAX_PK_PARAMS] = 0.0; // TAFD anchored at the first dose
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = 0.0; // TAD anchored at the last dose
+    let u = [f64::NAN];
+
+    assert!(
+        unanchored_dose_clock_error(&ode, &subject, &u, &ext_params, 0.0, 12.0).is_none(),
+        "a diverged solve under an anchored clock must not be blamed on TAD/TAFD"
     );
 }
 
@@ -12826,9 +12860,10 @@ fn unanchored_dose_clock_error_is_silent_without_a_compiled_rhs_program() {
     let ode = one_cpt_ode_spec();
     let subject = make_subject(vec![], vec![6.0]);
     let ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let u = [f64::NAN];
 
     assert!(
-        unanchored_dose_clock_error(&ode, &subject, &[], &ext_params, 0.0, 12.0).is_none(),
+        unanchored_dose_clock_error(&ode, &subject, &u, &ext_params, 0.0, 12.0).is_none(),
         "no compiled RHS program ⇒ no dose clock to refuse"
     );
 }

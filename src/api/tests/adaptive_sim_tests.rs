@@ -4723,6 +4723,14 @@ fn tad_refusal_error(
 /// `f64::max` returns the *other* operand on a `NaN`, so folding `worst` over a run that
 /// produced `NaN` would report whatever the finite records produced and pass — the exact hole
 /// CLAUDE.md names. The finiteness of both sides is asserted per element, before the fold.
+///
+/// **A zero reference contributes an ABSOLUTE error** (`|got|`), since no relative one exists
+/// there — so a caller's bound is read as absolute for those elements and relative for the
+/// rest, two scales under one constant (#1534 review, nit 4). Every zero element in this file
+/// is an empty compartment before the first dose, and the cells that have one
+/// (`..._base_dose_anchors_the_window_before_the_first_dose`, the two finding-1 controls) pin
+/// it exactly with `assert_eq!(adaptive[0], 0.0)` of their own; this fold is then only
+/// guarding the non-zero elements, which is where the stated bound was measured.
 fn worst_rel(got: &[f64], want: &[f64], what: &str) -> f64 {
     assert_eq!(got.len(), want.len(), "{what}: length");
     let mut worst = 0.0f64;
@@ -4884,10 +4892,14 @@ fn adaptive_tad_rhs_refuses_the_window_before_the_first_dose() {
         vec![],
     );
 
-    // Sentence 1 — the fact: which spelling, and which window.
+    // Sentence 1 — the two observed facts, and the window they were observed on.
     assert!(err.contains("`TAD`"), "must name the slot: {err}");
     assert!(
-        err.contains("no dose has been given yet in this run"),
+        err.contains("integrated to a non-finite state"),
+        "must report the outcome it actually observed: {err}"
+    );
+    assert!(
+        err.contains("no dose has been given in this run"),
         "must say why the clock is unanchored: {err}"
     );
     assert!(
@@ -4899,12 +4911,18 @@ fn adaptive_tad_rhs_refuses_the_window_before_the_first_dose() {
         err.contains("The observation at t=6 is read off that segment"),
         "must name the observation in the window: {err}"
     );
-    // Sentence 3 — why the static engines' answer is not copied.
+    // Sentence 3 — why the static engines' answer is not copied. The leading condition is
+    // load-bearing: on a record with no dose at all, `predict()` returns NaN here too, which
+    // `adaptive_tad_rhs_refuses_when_the_controller_never_doses` pins.
     assert!(
-        err.contains("has not been decided yet"),
-        "must say the anchoring dose is undecided in a reactive run: {err}"
+        err.contains("Where the record contains a dose"),
+        "the anchoring claim must be conditional on the record carrying a dose: {err}"
     );
-    // Sentence 4 — the two fixes.
+    assert!(
+        err.contains("not decided yet, and may never decide"),
+        "must say the anchoring dose is undecided, and may never be decided: {err}"
+    );
+    // Sentence 4 — the fixes, and the case neither fix covers.
     assert!(
         err.contains("pre-scheduled base regimen"),
         "must offer the base-regimen fix: {err}"
@@ -4912,6 +4930,10 @@ fn adaptive_tad_rhs_refuses_the_window_before_the_first_dose() {
     assert!(
         err.contains("decision placed at the start of the horizon"),
         "must offer the earlier-decision fix: {err}"
+    );
+    assert!(
+        err.contains("a controller that never doses leaves a model reading `TAD` unanchored"),
+        "must name the never-dosing case, which neither fix addresses: {err}"
     );
     // The must-nots: the model is fine and the controller is not at fault.
     assert!(
@@ -5016,8 +5038,11 @@ fn adaptive_time_reading_rhs_is_not_refused_before_the_first_dose() {
     // not a dose clock: it is finite in the pre-dose window, so a dose-free run on a
     // TIME-reading RHS integrates correctly and must be left alone.
     //
-    // Mutation that reddens it: key the guard on `pk_reads_model_time()`, which unions `TAD`,
-    // `TAFD` and `T`/`TIME` — this run is then refused although nothing is unanchored.
+    // Mutation that reddens it: key the guard on `pk_reads_model_time()` — which unions `TAD`,
+    // `TAFD` and `T`/`TIME` — AND drop the outcome conjunct. As with the autonomous control
+    // below, after the #1534 review moved the guard after the solve neither half alone
+    // suffices: this cell's state stays finite. Before that move, the `pk_reads_model_time()`
+    // mutation alone killed this test, which is how the per-spelling split was pinned.
     let (adaptive, static_pred) = tad_oracle_cell(
         ODE_TIME_NO_IIV,
         &[12.0, 36.0],
@@ -5041,8 +5066,13 @@ fn adaptive_autonomous_rhs_is_not_refused_before_the_first_dose() {
     // #1151, message-table row 5 — the other over-refusal control. `ODE_NO_IIV`'s RHS reads no
     // clock at all, so a dose-free window is ordinary integration of an empty compartment.
     //
-    // Mutation that reddens it: drop the `rhs_program` spelling checks and refuse on the
-    // anchor alone — the TAD anchor slot is `NaN` here too, it is simply never read.
+    // Mutation that reddens it: drop the `rhs_program` spelling checks AND the outcome
+    // conjunct — i.e. refuse on the `NaN` anchor alone, which is `NaN` here too, simply never
+    // read. Measured after the #1534 review moved the guard after the solve, neither half
+    // alone is enough: this cell's state stays finite, so the outcome conjunct already blocks
+    // the refusal, and the spelling check alone already did before it. That redundancy is
+    // deliberate — it is the "belt" a future narrowing of either half would land on — but it
+    // means this test's guarantee is "a working run keeps working", not a single-mutation kill.
     let (adaptive, static_pred) = tad_oracle_cell(
         ODE_NO_IIV,
         &[12.0, 36.0],
@@ -5051,10 +5081,201 @@ fn adaptive_autonomous_rhs_is_not_refused_before_the_first_dose() {
         vec![],
     );
 
+    // Measured worst rel: 0e0 — the two engines are BIT-identical here, so the bound is bit
+    // equality rather than a band whose every order would be decoration (#1534 review,
+    // finding 3). Structural, not luck: the autonomous RHS is the same function on both
+    // sides, and the two walks share a break set (doses 12/36 are the driver's decisions, and
+    // `t_last = 40` on both), so the step sequences coincide. The same argument as T3.
+    for (i, (&a, &s)) in adaptive.iter().zip(static_pred.iter()).enumerate() {
+        assert!(a.is_finite(), "adaptive[{i}] = {a} is not finite");
+        assert_eq!(
+            a.to_bits(),
+            s.to_bits(),
+            "an autonomous RHS must run unrefused, and match predict() exactly: \
+             adaptive={adaptive:?}, static={static_pred:?}"
+        );
+    }
+}
+
+// ============ #1534 review, finding 1: a SYNTACTIC TAD read is not a TAD evaluation ============
+//
+// `OdeRhsProgram::pk_reads_tad()` is `stmts_read_slots`, which recurses into `if` arms and into
+// conditions. It is therefore true whenever `TAD` appears anywhere in the `[odes]` body —
+// including where the unanchored window never evaluates it. The two fixtures below are those
+// shapes. Before the guard was moved after `integrate_segment`, both were refused although each
+// returns a finite trajectory (and passes the frozen-replay verifier) with the guard removed.
+
+/// `TAD` read only inside a branch the unanchored window does not take. Over `(0, 12]` the
+/// `TIME > 20` test is false, so the else arm integrates and the `NaN` anchor never reaches the
+/// state; the `TAD` term switches on only at t=20, by which point the dose at 12 has anchored it.
+const ODE_TAD_IN_UNTAKEN_BRANCH: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  if (TIME > 20.0) {
+    d/dt(central) = -(CL / V) * central * (1.0 + 0.01 * TAD)
+  } else {
+    d/dt(central) = -(CL / V) * central
+  }
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `TAD` read only in a *condition*. `NaN > 5.0` is `false` (IEEE: every comparison against NaN
+/// is false, verified by this test's green run, not recalled), so the unanchored window takes the
+/// else arm and the state never sees the `NaN` — while `pk_reads_tad()` is still true.
+const ODE_TAD_IN_CONDITION_ONLY: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  if (TAD > 5.0) { d/dt(central) = -(CL / V) * central * 2.0 }
+  else           { d/dt(central) = -(CL / V) * central }
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn adaptive_tad_in_an_untaken_branch_is_not_refused() {
+    // #1534 review, finding 1. Dose-free base, first dose realized at t=12 — the same schedule
+    // T5 refuses — but this RHS only evaluates `TAD` after t=20, when the clock is anchored.
+    // The run must complete and match `predict()` on the realized schedule.
+    //
+    // Mutation that reddens it: move the guard back before `integrate_segment` (equivalently,
+    // drop its `u.iter().all(is_finite)` conjunct). The run is then refused, although the
+    // trajectory it would have produced is finite and verifier-clean.
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_TAD_IN_UNTAKEN_BRANCH,
+        &decisions,
+        vec![0, 1],
+        &obs,
+        vec![],
+    );
+
+    assert_eq!(
+        adaptive[0], 0.0,
+        "the pre-dose read is the empty compartment, not NaN (got {})",
+        adaptive[0]
+    );
+    // Default solver tolerances, and the RHS steps across a discontinuity at t=20 that neither
+    // engine breaks on, so this is the two engines' noise floor rather than an oracle bound.
+    // Measured worst rel: 1.937e-4.
     let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
     assert!(
-        vs_static <= 1e-9,
-        "an autonomous RHS must run unrefused: worst rel {vs_static:e} \
-         (adaptive={adaptive:?}, static={static_pred:?})"
+        vs_static <= 1e-3,
+        "a TAD read in an untaken branch must run, and track predict(): worst rel \
+         {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_tad_read_only_in_a_condition_is_not_refused() {
+    // #1534 review, finding 1. Here `TAD` reaches nothing but a comparison. In the unanchored
+    // window the driver tests `NaN > 5.0` and the static engine tests `-6 > 5.0`; both are
+    // false, both take the else arm, and the two agree — the `NaN` is consumed by the predicate
+    // and never enters the state.
+    //
+    // Mutation that reddens it: the same one as the test above.
+    let decisions = [12.0, 36.0];
+    let obs = [6.0, 20.0, 40.0];
+    let (adaptive, static_pred) = tad_oracle_cell(
+        ODE_TAD_IN_CONDITION_ONLY,
+        &decisions,
+        vec![0, 1],
+        &obs,
+        vec![],
+    );
+
+    assert_eq!(
+        adaptive[0], 0.0,
+        "the pre-dose read is the empty compartment, not NaN (got {})",
+        adaptive[0]
+    );
+    // Default tolerances again; the RHS switches arms at TAD = 5 in both engines, and neither
+    // breaks on that switch. Measured worst rel: 4.750e-8.
+    let vs_static = worst_rel(&adaptive, &static_pred, "adaptive vs predict()");
+    assert!(
+        vs_static <= 1e-6,
+        "a TAD read confined to a condition must run, and track predict(): worst rel \
+         {vs_static:e} (adaptive={adaptive:?}, static={static_pred:?})"
+    );
+}
+
+#[test]
+fn adaptive_tad_rhs_refuses_when_the_controller_never_doses() {
+    // #1534 review, finding 2 — message-table row 7, the cell the first six rows all assumed
+    // away. Every decision holds, so no dose is ever given and the clock is never anchored.
+    //
+    // The refusal is right, but two of the message's claims are only true BECAUSE they are
+    // stated conditionally, and this test is what pins that:
+    //
+    //   * `predict()` on the very same record returns `[0.0, NaN, NaN]` — measured below rather
+    //     than asserted from the doc comment. So "the static engines anchor such a window at
+    //     the first dose in the whole record" is FALSE here; the message says "Where the record
+    //     contains a dose, …", and that qualifier is load-bearing.
+    //   * "has not been decided yet" would imply a dose is coming. None is. The message says
+    //     "not decided yet, and may never decide".
+    //
+    // The driver cannot distinguish the two cases: the guard fires on the FIRST segment, before
+    // any decision has been observed. So the repair is in the wording, and this test asserts the
+    // wording holds on the cell that falsifies the unconditional version.
+    //
+    // Mutation that reddens it: restore either unconditional sentence.
+    let err = tad_refusal_error(
+        ODE_TAD_NO_IIV,
+        &[12.0, 36.0],
+        vec![],
+        &[6.0, 20.0, 40.0],
+        vec![],
+    );
+
+    assert!(err.contains("`TAD`"), "must name the slot: {err}");
+    assert!(
+        err.contains("Where the record contains a dose"),
+        "the anchoring claim must be conditional — this record has no dose at all: {err}"
+    );
+    assert!(
+        err.contains("not decided yet, and may never decide"),
+        "must not imply a dose is still coming: {err}"
+    );
+    assert!(
+        err.contains("a controller that never doses leaves a model reading `TAD` unanchored"),
+        "must name this very case: {err}"
+    );
+
+    // The measurement the conditional rests on: the static engine has no anchor here either.
+    let model = parse_model_string(ODE_TAD_NO_IIV).expect("parse TAD-reading ODE model");
+    let static_pop = population(vec![subj("1", vec![6.0, 20.0, 40.0], vec![])]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+    let static_pred: Vec<f64> = preds.iter().map(|p| p.pred).collect();
+    assert_eq!(
+        static_pred[0], 0.0,
+        "the t=0 read is the empty compartment: {static_pred:?}"
+    );
+    assert!(
+        static_pred[1..].iter().all(|v| v.is_nan()),
+        "predict() has no anchor on a dose-free record either, so the message must not claim \
+         it does: {static_pred:?}"
     );
 }

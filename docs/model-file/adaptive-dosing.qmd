@@ -398,12 +398,14 @@ the last dose drives an effect compartment. Both are supported reactively and ma
 
 They are anchored **at a dose**, which is the one thing a reactive run does not know
 in advance. Before the controller's first dose — and with no pre-scheduled base
-regimen to anchor them — `TAD` and `TAFD` have no referent at all. `predict()` fills
-that window by looking ahead to the first dose in the whole record, which is a peek a
-causal simulation has not earned: the dose in question has not been decided yet.
+regimen to anchor them — `TAD` and `TAFD` have no referent at all. Where the record
+*does* contain a dose, `predict()` fills that window by looking ahead to the first
+one, which is a peek a causal simulation has not earned: that dose has not been
+decided yet, and may never be. (On a record with no dose anywhere, `predict()` has no
+anchor either and returns `NaN` in that window too.)
 
-So `simulate_adaptive()` **refuses the window with a typed error** rather than
-integrate an unanchored clock. The message names the segment, the spelling that is
+So `simulate_adaptive()` **refuses the window with a typed error** rather than hand
+you an unanchored trajectory. The message names the segment, the spelling that is
 unanchored (`TAD` or `TAFD`), and the two fixes:
 
 - give the subject a **pre-scheduled base regimen** — base dose times *are* known up
@@ -411,10 +413,20 @@ unanchored (`TAD` or `TAFD`), and the two fixes:
 - place the **first decision at the start of the horizon** and dose there, so no
   segment is integrated before the first dose.
 
+Neither fix helps a controller that *never* doses: such a run has no anchor at any
+point, and the message says so.
+
 The refusal covers the whole pre-dose window, not only the observations inside it: an
 unanchored clock enters the integrated **state**, so a read taken later — even after
-the first dose has landed — would inherit it. A RHS that reads only `TIME` / `T` is
-unaffected, since that clock is the integration axis and is anchored everywhere.
+the first dose has landed — would inherit it.
+
+**It is gated on the outcome, not on the text of your model.** The check runs after
+each segment is integrated and fires only when that segment's state came back
+non-finite *and* the clock the RHS reads was unanchored there. A `TAD` that appears
+in a branch the pre-dose window does not take, or only inside a condition, is
+therefore left alone — such a run integrates normally and is not refused. A RHS that
+reads only `TIME` / `T` is unaffected in every case, since that clock is the
+integration axis and is anchored everywhere.
 
 ## Current scope and limits
 
