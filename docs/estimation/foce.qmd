@@ -376,7 +376,7 @@ Set via `[fit_options]`:
 ```
 [fit_options]
   method    = focei
-  optimizer = slsqp    # override the default (bobyqa)
+  optimizer = slsqp    # override the default (auto)
 ```
 
 ## Global Search

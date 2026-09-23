@@ -125,12 +125,16 @@ prefer a bracketed comparison (`WT >= 70 && WT < 80`) over `WT == 75`.
 
 ## Which outer optimizer should I pick?
 
-`bobyqa` (the default) is the right choice for most models —
-derivative-free quadratic trust-region, robust to noisy FD gradients, and
-consistently reaches a lower OFV than `slsqp` on ODE/PD models, sparse data,
-and Hill-ridge identifiability problems. Previously the default was `slsqp`;
-the change is one line away if you need the old behaviour
-(`optimizer = slsqp` in `[fit_options]`).
+Leave the default, `optimizer = auto`, in place for most models. It picks
+per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is
+available, and `bobyqa` (derivative-free quadratic trust-region, robust to
+noisy FD gradients) when the outer loop has to fall back to finite
+differences — ODE/PD models, LTBS, SDE, or `gradient_method = fd`. Mixture
+models also resolve `auto` to `bobyqa`. The fit output reports which
+optimizer `auto` chose; see
+[Outer Optimizers](estimation/optimizers.qmd#the-auto-default) for the rules
+and the benchmarks behind them. To pin one, set `optimizer = ...` in
+`[fit_options]`.
 
 Reach for a different optimizer when the default misbehaves:
 

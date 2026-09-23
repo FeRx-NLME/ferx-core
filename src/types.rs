@@ -8511,22 +8511,22 @@ pub enum Optimizer {
     /// gradient. On ill-conditioned fits (ODE/PD models, sparse data, Hill-ridge
     /// identifiability) the fixed-EBE bias can drive SLSQP to declare convergence
     /// hundreds of OFV units above the true minimum — pair with
-    /// `reconverge_gradient_interval = 1` if it stalls, or switch to `Bobyqa`
-    /// (the default; see `FitOptions::default`).
+    /// `reconverge_gradient_interval = 1` if it stalls, or switch to `Bobyqa`.
     Slsqp,
     /// NLopt LD_LBFGS
     NloptLbfgs,
     /// NLopt LD_MMA — Method of Moving Asymptotes
     Mma,
-    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation, default outer
-    /// optimizer. Re-evaluates the FOCE objective (and the inner EBE loop) at
+    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation; what
+    /// [`Optimizer::Auto`] resolves to when only finite-difference gradients are
+    /// available. Re-evaluates the FOCE objective (and the inner EBE loop) at
     /// every trial point, so it never sees the fixed-EBE gradient bias that can
     /// stall gradient-based optimizers; consistently reaches a lower OFV than
     /// SLSQP on ODE/PD models, sparse data, and Hill-ridge problems. Needs more
     /// outer evaluations than SLSQP to triangulate a quadratic from scratch, but
     /// each evaluation is cheap (no FD gradient sweep). See
     /// `docs/estimation/optimizers.qmd` for the cefepime and Emax PKPD
-    /// validations behind the default choice.
+    /// validations behind that choice.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
