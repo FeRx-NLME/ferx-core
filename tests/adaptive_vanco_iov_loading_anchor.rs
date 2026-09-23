@@ -91,12 +91,12 @@ const N_DOSE_DECREASES: usize = 1;
 /// blow far past it.
 const SIGNAL_TOL: f64 = 2e-3;
 
-/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs nightly, so
-/// without this a typo in `adaptive_vanco_iov_loading.ferx` or its subject CSV — which exercise
-/// the #931 base-regimen × IOV surface — would slip past the per-PR job. `parse_full_model_file`
-/// runs the full `[adaptive_dosing]` `validate()`, and loading the CSV pins the base regimen; a
-/// short seeded run then confirms the reactive driver is `Ok` (the default-on frozen-replay +
-/// #748 snapshot verifiers validating the realized run) without waiting for the nightly check.
+/// Fast guard: a typo in `adaptive_vanco_iov_loading.ferx` or its subject CSV — which exercise
+/// the #931 base-regimen × IOV surface — fails here, by name, rather than as a mismatch in the
+/// cross-engine check below. `parse_full_model_file` runs the full `[adaptive_dosing]`
+/// `validate()`, and loading the CSV pins the base regimen; a short seeded run then confirms
+/// the reactive driver is `Ok` (the default-on frozen-replay + #748 snapshot verifiers
+/// validating the realized run).
 #[test]
 fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov_loading.ferx"))
@@ -166,10 +166,6 @@ fn vanco_iov_loading_example_parses_and_pins_the_scenario() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + mrgsolve-anchored vanco per-occasion-IOV loading-dose base regimen (#931): opt in with --features slow-tests"
-)]
 fn vanco_iov_loading_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov_loading.ferx"))
         .expect("vanco IOV-loading model must parse");

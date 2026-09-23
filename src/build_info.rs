@@ -97,9 +97,9 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// optimizer-resolution rule.** The scope predicates it reads take only `&CompiledModel`,
 /// so they answer "may this model use the analytic outer gradient", not "did it":
 ///
-/// - A subject the provider declines at runtime is salvaged onto a per-subject
-///   reconverged-FD gradient (`population_gradient_sens_mixed` / `_iov_mixed`) while this
-///   keeps reporting `Analytic` — correctly, for the model.
+/// - A subject the provider declines at runtime is salvaged onto a per-subject gradient —
+///   held-EBE in `population_gradient_sens_mixed` (#1529), reconverged FD in `_iov_mixed` —
+///   while this keeps reporting `Analytic` — correctly, for the model.
 /// - The `optimizer` argument is resolved through [`Optimizer::resolve_auto`], which has no
 ///   `[mixture]` branch. `estimation::outer_optimizer::resolve_outer_optimizer` downgrades
 ///   `Auto` to derivative-free BOBYQA for a mixture model, so a mixture fit left on `auto`
