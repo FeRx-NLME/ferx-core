@@ -1784,8 +1784,8 @@ fn accumulate_fixed_eta_packed_gradient_with_sens(
     // answers by dropping the **entire population** onto `reconverged_fd_gradient` — the
     // `2·n_free` full-objective, every-subject-inner-resolve fallback this module exists to
     // avoid. FOCE/FOCEI stopped doing that population-wide bail for exactly this cost
-    // (`population_gradient_sens_mixed`'s per-subject `subject_reconverged_fd_gradient`
-    // salvage); AGQ's fixed-b FD score is this function's own equivalent per-subject
+    // (`population_gradient_sens_mixed`'s per-subject salvage — held-EBE since #1529);
+    // AGQ's fixed-b FD score is this function's own equivalent per-subject
     // salvage, and it is already right here — the Ω/Ω_iov block above is unaffected by
     // which θ/σ path runs, so falling back for just this subject is exactly the state
     // `accumulate_fixed_b_packed_gradient_fd`'s own docs assume it's called in (#251

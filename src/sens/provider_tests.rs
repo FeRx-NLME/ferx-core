@@ -13084,3 +13084,81 @@ fn iov_zero_theta_model_walks_one_empty_chunk() {
     );
     check_iov_provider_vs_fd(&model, &subject, &[], &[0.1, -0.05, 0.04, -0.03]);
 }
+
+// ------------------------------------------------------------------------------------------
+// #1505 — the kink bound of the third-order sweep, on hand-built event lists.
+// ------------------------------------------------------------------------------------------
+
+/// No moving event brackets an anchor: the pair is clear and the step stays as it is.
+#[test]
+fn kink_step_bound_is_clear_when_no_anchor_lies_between_the_perturbed_events() {
+    let anchors = [0.25, 1.0, 2.0];
+    let base = [0.5];
+    assert_eq!(
+        kink_step_bound(&anchors, &base, &[0.515], &[0.485]),
+        KinkStepBound::Clear
+    );
+}
+
+/// An anchor between the two perturbed positions is a straddle, and the factor brings the
+/// excursion down to half the gap: gap 0.010, shift 0.015 → `0.5·0.010/0.015 = 1/3`.
+#[test]
+fn kink_step_bound_shrinks_to_half_the_gap_when_an_anchor_is_straddled() {
+    let anchors = [0.51, 1.0];
+    let base = [0.5];
+    match kink_step_bound(&anchors, &base, &[0.515], &[0.485]) {
+        KinkStepBound::Shrink(f) => assert!((f - 1.0 / 3.0).abs() < 1e-12, "{f}"),
+        other => panic!("expected Shrink, got {other:?}"),
+    }
+    // The interval is closed: an anchor exactly on a perturbed position still straddles.
+    assert!(matches!(
+        kink_step_bound(&[0.515], &base, &[0.515], &[0.485]),
+        KinkStepBound::Shrink(_)
+    ));
+}
+
+/// The worst event wins: two moving events, the tighter one sets the factor.
+#[test]
+fn kink_step_bound_takes_the_tightest_event() {
+    let anchors = [0.51, 12.52];
+    let base = [0.5, 12.5];
+    // Event 1: gap 0.010, shift 0.015 → 1/3. Event 2: gap 0.020, shift 0.030 → 1/3 too;
+    // move event 2's anchor closer so it binds: gap 0.005, shift 0.030 → 1/12.
+    let anchors_tight = [anchors[0], 12.505];
+    match kink_step_bound(&anchors_tight, &base, &[0.515, 12.53], &[0.485, 12.47]) {
+        KinkStepBound::Shrink(f) => assert!((f - 1.0 / 12.0).abs() < 1e-12, "{f}"),
+        other => panic!("expected Shrink, got {other:?}"),
+    }
+}
+
+/// An event that did not move cannot straddle, even when an anchor sits on it: an unlagged
+/// arrival lies on its own dose record by construction and is no kink in any parameter.
+/// Without this rule every unlagged ODE subject would decline.
+#[test]
+fn kink_step_bound_ignores_events_that_did_not_move() {
+    let anchors = [0.0, 1.0];
+    let base = [0.0, 0.5];
+    assert_eq!(
+        kink_step_bound(&anchors, &base, &[0.0, 0.515], &[0.0, 0.485]),
+        KinkStepBound::Clear
+    );
+}
+
+/// An anchor exactly on a moving event at the base point is a corner: no factor helps, so the
+/// bound declines. So does a break list whose length changed under the perturbation (a
+/// conditional break that came or went), and a non-finite event time.
+#[test]
+fn kink_step_bound_declines_a_corner_a_length_change_and_a_non_finite_event() {
+    assert_eq!(
+        kink_step_bound(&[0.5], &[0.5], &[0.515], &[0.485]),
+        KinkStepBound::Decline
+    );
+    assert_eq!(
+        kink_step_bound(&[0.7], &[0.5], &[0.515, 0.0], &[0.485]),
+        KinkStepBound::Decline
+    );
+    assert_eq!(
+        kink_step_bound(&[0.7], &[0.5], &[f64::NAN], &[0.485]),
+        KinkStepBound::Decline
+    );
+}

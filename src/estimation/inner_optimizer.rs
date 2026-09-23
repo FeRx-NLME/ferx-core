@@ -960,8 +960,69 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 /// model, or a purely analytic model — keeps the exact `gnorm < tol` behaviour and stays
 /// bit-identical to prior releases. (`effective_for` returns `self` without building the twin for
 /// those, so this adds no cost on the common path.)
+///
+/// **This is the subject-static half only** — [`inner_stall_enabled_at`] is what the non-IOV
+/// inner solve calls. This entry point remains for the IOV solve, where it is already exact:
+/// `n_kappa > 0` routes *every* transit/IG subject to its twin subject-statically (#814), so
+/// `effective_for` already returns an `ode_spec`-carrying model and the parameter-dependent
+/// reroute below cannot add one.
 fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
     model.effective_for(subject).ode_spec.is_some()
+}
+
+/// [`inner_stall_enabled`] extended with the **parameter-dependent** flip-flop reroute
+/// (#1519).
+///
+/// `effective_for` sees only the subject-static reroutes. A transit / IG closed form is *also*
+/// rerouted to its ODE twin whenever the individual parameters leave the exponential-tilting
+/// domain (`ke ≥ KTR` for transit, `ke ≥ 1/(2·MAT·CV²)` for IG) — the flip-flop regime, decided
+/// per `(θ, η)` by [`crate::pk::effective_model_for_eval`]. That reroute is the one the outer
+/// loop walks into: the fit starts in-domain and closed form, then `θ` drifts across the
+/// abscissa and every likelihood evaluation for the subject becomes an RK45 solve.
+///
+/// Keying the stall stop on `effective_for` alone left it `false` for exactly those subjects, so
+/// they were held to the exact `gnorm < tol` criterion against an objective carrying the RK45
+/// noise floor — a target they cannot reach. Measured on `examples/one_cpt_transit.ferx` +
+/// `data/datsim_oral.csv` (100 subjects, FOCEI, `inner_tol = 1e-5`), instrumenting every one of
+/// the fit's 19,924 inner solves:
+///
+/// | | n | exits on `gnorm < tol` | ‖∂l/∂η‖ median | analytic-vs-FD gradient |
+/// |---|---|---|---|---|
+/// | closed form (in domain) | 1,529 | **1,529 (100%)** | 1.3e-6 | 6.9e-9 |
+/// | flip-flop → ODE twin | 18,395 | 9,626 (52%) | up to 3.5e0 | 1.2e-4 … 4.0e-4 |
+///
+/// **Every** non-converged exit in the fit — 4,957 that exhausted `inner_maxiter = 200` and
+/// 3,812 whose line search found no representable decrease — was a flip-flop-rerouted solve, and
+/// none of the in-domain closed-form solves failed. Each of those 8,769 failures then bought a
+/// Nelder–Mead recovery of up to `5 · inner_maxiter` iterations, which is where the fit's wall
+/// clock went: 142.6 s before, 3.5 s after (41×), OFV 1215.9771 → 1215.9777.
+///
+/// **This is a predicate on one iterate, not a property of the solve.** The flip-flop regime
+/// is η-dependent and the search moves η, so a solve can start inside the closed form's domain
+/// and cross the abscissa partway through — at which point its objective is an RK45 integration
+/// and needs the stall stop just as much as one that started there. The first cut of this fix
+/// read the predicate once, at the start point, and missed exactly that case (PR #1521 review):
+/// on the fixture below, `TVCL = 4.0` starts at `ke = 0.0364 < KTR = 0.0417` and walks `η_CL` to
+/// `+0.255`, where `ke = 0.0470`, and the solve still bought the Nelder–Mead recovery. So
+/// [`dense_bfgs_core`] and [`lbfgs_core`] call this at the current iterate each pass and latch
+/// the result; see the latch comment there for why it is monotone rather than a fresh read. The
+/// value at the *start* point still decides the two policies that have to be fixed before the
+/// search runs (`short_line_search`, `certify_partial`).
+///
+/// Bit-identical wherever the flip-flop reroute cannot fire: `effective_model_for_eval` returns
+/// the structural model unchanged when the model has no `absorption_ode_equivalent` (every
+/// non-transit/IG model), when the subject is already on an ODE twin, and when the parameters
+/// are in domain — so only a subject that *is* being integrated numerically changes behaviour,
+/// which is the whole point.
+fn inner_stall_enabled_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> bool {
+    crate::pk::effective_model_for_eval(model, subject, theta, eta)
+        .ode_spec
+        .is_some()
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -1328,7 +1389,12 @@ fn find_ebe_impl(
     // model for this subject is ODE, which includes a closed-form transit/IG subject rerouted to
     // its ODE twin (TV-cov / `TIME`; #719/#814). Analytical/event-driven objectives are exact, so
     // they keep the pure `gnorm < tol` criterion and stay bit-identical to prior releases.
-    let enable_stall = inner_stall_enabled(model, subject);
+    // Evaluated at whatever iterate the search is standing on — see the latch in
+    // [`dense_bfgs_core`] / [`lbfgs_core`]. The value at the *start* point still drives the
+    // two pre-solve policies below (`short_line_search`, `certify_partial`), which have to
+    // be decided before the search runs.
+    let stall_at = |e: &[f64]| inner_stall_enabled_at(model, subject, &params.theta, e);
+    let enable_stall = stall_at(&eta);
     // Single gradient closure used by *both* the optimizer and the fallback's stationarity
     // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
     // one provider eval per step) when in scope with a per-point FD fallback, else FD
@@ -1429,7 +1495,7 @@ fn find_ebe_impl(
         precond.as_deref(),
         initial_hessian.as_ref(),
         stop_precond,
-        enable_stall,
+        &stall_at,
         short_line_search,
     );
 
@@ -1561,7 +1627,7 @@ fn find_ebe_impl(
                         precond.as_deref(),
                         None,
                         stop_precond,
-                        enable_stall,
+                        &stall_at,
                         false,
                     );
                     if cand.iter().all(|v| v.is_finite()) {
@@ -1800,6 +1866,10 @@ fn find_ebe_iov(
     // stop only for them — including a closed-form transit/IG + IOV subject, whose objective is
     // evaluated on the ODE twin (`effective_for`, #719/#814). See `inner_stall_enabled`/`find_ebe`.
     let enable_stall = inner_stall_enabled(model, subject);
+    // Constant for the whole solve: `n_kappa > 0` routes every transit/IG subject to its
+    // twin subject-statically (#814), so there is no boundary for an IOV iterate to cross
+    // and the latch in the cores has nothing to add here.
+    let stall_at = move |_: &[f64]| enable_stall;
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
@@ -1868,17 +1938,7 @@ fn find_ebe_iov(
     }
 
     let bfgs_converged = inner_minimize_with_grad(
-        &obj,
-        &agrad,
-        &mut x,
-        n_flat,
-        max_iter,
-        tol,
-        None,
-        None,
-        None,
-        enable_stall,
-        false,
+        &obj, &agrad, &mut x, n_flat, max_iter, tol, None, None, None, &stall_at, false,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -3328,7 +3388,7 @@ fn inner_minimize_with_grad(
     precond: Option<&[f64]>,
     hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
-    enable_stall: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
     if matches!(
@@ -3347,7 +3407,7 @@ fn inner_minimize_with_grad(
             tol,
             precond,
             stop_precond,
-            enable_stall,
+            stall_at,
             short_line_search,
         )
     } else {
@@ -3361,7 +3421,7 @@ fn inner_minimize_with_grad(
             precond,
             hessian_seed,
             stop_precond,
-            enable_stall,
+            stall_at,
             short_line_search,
         )
     }
@@ -3379,7 +3439,7 @@ fn lbfgs_core(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
-    enable_stall: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
@@ -3394,8 +3454,29 @@ fn lbfgs_core(
     // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`).
     let mut stall = 0u32;
     let mut best_gnorm = f64::INFINITY;
+    // The regime is a property of the *iterate*, not of the start point (#1521 review): a
+    // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
+    // abscissa partway through the search, at which point its objective becomes an RK45
+    // integration and picks up the solver's noise floor. `stall_at` is therefore evaluated
+    // at the current iterate each pass and **latched** monotonically rather than read fresh.
+    //
+    // Latched, not per-iterate, because everything the stall criterion reads is *history*:
+    // `stall` counts consecutive flat steps and `best_gnorm` is the best norm seen, so once
+    // any evaluated iterate has been on the twin that accumulated state carries the noise
+    // floor whether or not the current point happens to be back in domain. A fresh read
+    // would disarm the stop on exactly the iteration that re-enters the closed form while
+    // the counter feeding it is still noise-derived, and would let the flag flicker along a
+    // line search. The latch is monotone, so the answer does not depend on which side the
+    // solve started.
+    //
+    // Cost: one `pk_param_fn` evaluation and a scalar compare per iteration, and only for a
+    // closed-form transit/IG model that carries a twin — `effective_model_for_eval` returns
+    // the structural model by reference for everything else, and `AbsorptionTwin::built` is
+    // a field read, not a rebuild.
+    let mut enable_stall = false;
 
     for _iter in 0..max_iter {
+        enable_stall = enable_stall || stall_at(x);
         // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
         // L2 norm would be dominated by the sharp covariate pseudo-obs dims and
         // never fall below `tol` (issue #406), so the preconditioned (≈ Newton-
@@ -3488,7 +3569,7 @@ fn dense_bfgs_core(
     precond: Option<&[f64]>,
     hessian_seed: Option<&DMatrix<f64>>,
     stop_precond: Option<&[f64]>,
-    enable_stall: bool,
+    stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
     let seed_inv = seed_h_inv(n, hessian_seed);
@@ -3513,8 +3594,29 @@ fn dense_bfgs_core(
     // can't be accepted.
     let mut stall = 0u32;
     let mut best_gnorm = f64::INFINITY;
+    // The regime is a property of the *iterate*, not of the start point (#1521 review): a
+    // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
+    // abscissa partway through the search, at which point its objective becomes an RK45
+    // integration and picks up the solver's noise floor. `stall_at` is therefore evaluated
+    // at the current iterate each pass and **latched** monotonically rather than read fresh.
+    //
+    // Latched, not per-iterate, because everything the stall criterion reads is *history*:
+    // `stall` counts consecutive flat steps and `best_gnorm` is the best norm seen, so once
+    // any evaluated iterate has been on the twin that accumulated state carries the noise
+    // floor whether or not the current point happens to be back in domain. A fresh read
+    // would disarm the stop on exactly the iteration that re-enters the closed form while
+    // the counter feeding it is still noise-derived, and would let the flag flicker along a
+    // line search. The latch is monotone, so the answer does not depend on which side the
+    // solve started.
+    //
+    // Cost: one `pk_param_fn` evaluation and a scalar compare per iteration, and only for a
+    // closed-form transit/IG model that carries a twin — `effective_model_for_eval` returns
+    // the structural model by reference for everything else, and `AbsorptionTwin::built` is
+    // a field read, not a rebuild.
+    let mut enable_stall = false;
 
     for _iter in 0..max_iter {
+        enable_stall = enable_stall || stall_at(x);
         // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
         // on the raw L2 norm so the converged EBE is independent of the `precond`
         // H0 that accelerates the search.

@@ -19,7 +19,85 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Performance
+- **The per-subject finite-difference outer-gradient salvage is no longer bought at a
+  blown-up line-search trial.** A subject the analytic outer gradient declines is salvaged
+  with `2·n_free` warm EBE re-solves — and most of that cost went to trial points the
+  optimizer was about to reject, with individual objectives thousands to `1e15` units above
+  the incumbent. Under NLopt SLSQP and MMA such a subject now contributes nothing to the
+  outer gradient there instead, at points those optimizers' own acceptance tests reject —
+  the guard measures a trial against the point each test compares against, and stays off
+  where no such point is observable (NLopt L-BFGS, the default for analytic models, is
+  unchanged). At every other point the salvage runs exactly as before, and every bundled
+  SLSQP fit the guard fires on keeps its estimates, OFV, iteration count and sdtab
+  byte-identical. The "blown up" line is measured, not chosen: both the subject's and the
+  population's objective must exceed the reference by more than 12 units per observation,
+  which sits in the gap between the largest ordinary rejected trial (6.0) and the smallest
+  blown-up one (21.8) across the bundled examples. The per-subject FD-fallback warning now
+  says how many salvages were skipped (#1520).
+- **A transit / inverse-Gaussian absorption fit that leaves the closed form's domain no
+  longer grinds its inner EBE loop.** When the estimates drive `ke` past the absorption
+  abscissa (`ke ≥ KTR`, the flip-flop regime) ferx reroutes the subject to the model's ODE
+  twin, so its individual objective picks up the adaptive solver's noise floor — but the
+  inner loop's objective-stall stop, which exists for exactly that situation, was keyed
+  only on the subject-static reroutes (time-varying covariate / `TIME` / IOV) and stayed
+  off. Those subjects were held to an exact `gnorm < inner_tol` they cannot reach, ran out
+  of iterations or line-search steps, and each bought a Nelder-Mead recovery of up to
+  `5 × inner_maxiter` iterations. On `examples/one_cpt_transit.ferx` +
+  `data/datsim_oral.csv` (100 subjects, FOCEI) every one of the fit's 8,769 failed inner
+  solves was such a subject and none of its 1,529 in-domain closed-form solves failed;
+  the fit goes from **142.6 s to 3.5 s (41×)** with the OFV moving 6e-4 (1215.9771 →
+  1215.9777). Subjects that were never rerouted — every non-transit/IG model, and any
+  transit/IG fit that stays in domain — are bit-identical
+  ([#1519](https://github.com/FeRx-NLME/ferx-core/issues/1519)).
+- **The covariance step no longer abandons the exact analytic R-matrix for the whole
+  population when one subject is out of scope.** The observed information is the sum
+  `Σᵢ Rᵢ`, and each term is the second derivative of one subject's own marginal, so a
+  subject outside the analytic scope is now finite-differenced **on its own** — from the
+  same objective, at the same converged point, warm-started from the same modes — while
+  every other subject keeps its exact term. On a 55-subject 2-state ODE FOCEI fit with 13
+  free parameters where one subject declined, the covariance step went from 23.4 s to
+  2.0 s (**11.5×**, −38 % total wall) with estimates and OFV identical to every printed
+  digit. Standard errors move 8.4e-5 relative when one subject in ten is salvaged — 3.2×
+  below the gap between the whole-population FD and whole-population analytic routes that
+  ferx already ships as interchangeable. Model-level exclusions (`method = laplace`, a
+  mixture, `gradient = fd`, `analytic_cov_hessian = false`) are unchanged, and a
+  population where at least half the subjects decline still takes the whole-population
+  stencil ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
+### Changed
+- **New informational warning `W_COV_ANALYTIC_SALVAGE`,** emitted when the covariance step
+  assembled the analytic R-matrix for most of the population and finite-differenced the
+  rest. It names the salvaged subjects (the printed id list is deduplicated and capped at ten
+  with a count of the remainder; the counts are per subject) and the split.
+  `severity = info`, `code = covariance_step`: the parameter estimates and the OFV are
+  unaffected and the information matrix is complete, but the standard errors do move slightly,
+  because the salvaged subjects' terms come off a different estimator — measured at 3.7e-4
+  relative for one subject in ten, about a tenth of the gap between the two whole-population
+  estimators ferx already ships as interchangeable. That is what the note is for. It is not
+  emitted under `covariance_method = s`, which reports `S⁻¹` and never uses the R-matrix the
+  salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
+
 ### Fixed
+- **Analytic ODE covariance: the third-order sweep no longer differences across a
+  lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
+  R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and
+  non-monotone in the step: the sweep's `TVLAG` step (1 % of parameter scale) shifted every
+  arrival by more than the gap to the nearest early sample, so the pair differenced a
+  pre-/post-arrival jump instead of a derivative. The sweep now enumerates the subject's
+  dose events — lagged arrivals, infusion ends, per-route onsets, `zero_order` window edges
+  — at both perturbed points with the ODE engine's own break-time builder and shrinks the
+  step until no observation, `EVID=2`, reset or dose record changes sides of an event. A
+  subject whose mode sits *on* a moving event (a corner minimum of the inner objective,
+  which a lagged arrival at a dense early sample does produce) has no third derivative
+  there and declines to the #1514 per-subject salvage, named in the
+  `W_COV_ANALYTIC_SALVAGE` note. On the regression fixture the default-tolerance standard
+  errors are now within `5e-5` of the `ode_reltol = 1e-9` run and within `1.1e-2` of the
+  finite-difference covariance route. The mixed θ-θ third-order blocks are also
+  symmetrised — the two finite-difference estimates of each pair averaged, as the η pairs
+  already were — so a bounded step on one axis no longer leaves the natural Hessian
+  asymmetric at the `1e-7` level
+  ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)).
 - **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
   As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)
   units — during exploration γ = 1, so that is a full Newton step to a single draw's
@@ -699,6 +777,19 @@ section of the SDLC for the versioning policy).
   cold-restart self-consistency check a bare NLopt `Failure` does — including a latch
   on the last permitted evaluation — instead of being reported converged unconditionally
   ([#1530](https://github.com/FeRx-NLME/ferx-core/issues/1530)).
+- **FOCE/FOCEI: a subject the analytic outer gradient declines now follows
+  `reconverge_gradient_interval` instead of always paying for a reconverged gradient.**
+  Such a subject used to get a finite-difference gradient that re-solved its EBE at every
+  perturbed point (`2·n_free` inner solves) whatever the setting. Declines depend on the
+  trial point, so at a blown-up line-search trial most of a population could take that
+  path at once. With the default `reconverge_gradient_interval = 0`, a declined subject now
+  gets the gradient at its held EBE, as the rest of the fixed-EBE machinery does. On the
+  55-subject cyclophosphamide parent–metabolite ODE model (FOCEI, one thread) estimation
+  took 14.3 s instead of 30.5 s, and the final OFV moved from 3242.248 to 3242.281. That is
+  inside the 3241.96–3242.40 spread the same model shows across optimizer settings. The
+  outer-gradient fallback warning now names which gradient those subjects used. IOV
+  models are unchanged: they always reconverge (#1529).
+
 - **Laplace reuses its prepared Hessian factor and no longer allocates one-element grid
   vectors.** The objective hands the regularized Cholesky factor directly to the matching
   gradient, and the one-node rule reads its mode and unit weight without heap-backed node

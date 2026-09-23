@@ -354,8 +354,7 @@ ferx reproduces every dose **exactly** and every platelet value to
 ~25-unit margin from each decision to its rule threshold, so every dose decision
 is robust. The model is `examples/adaptive_platelet_ladder.ferx`; the mrgsolve
 model, R driver, and frozen output live in `tests/reference/platelet_mrgsolve/`,
-exercised by the slow-gated `tests/adaptive_platelet_anchor.rs` (nightly + on push
-to `main`).
+exercised on every PR by `tests/adaptive_platelet_anchor.rs`.
 
 ### The vancomycin AUC-TDM anchor
 
@@ -387,8 +386,8 @@ from each AUC₂₄ to the band edges, so the in/out classification — hence
 attainment — is identical. (The exact AUC-pass accuracy is pinned separately by an
 analytic unit test against the closed form `(D/k)(e^{-k a} − e^{-k b})`.) The
 model is `examples/adaptive_vanco_auc.ferx`; the mrgsolve model, R driver, and
-frozen output live in `tests/reference/vanco_mrgsolve/`, exercised by the
-slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
+frozen output live in `tests/reference/vanco_mrgsolve/`, exercised on every
+PR by `tests/adaptive_vanco_anchor.rs`.
 
 ## Current scope and limits
 

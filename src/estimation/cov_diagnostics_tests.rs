@@ -5,7 +5,7 @@
 //!
 //! | axis | values |
 //! |---|---|
-//! | route | analytic R-matrix, FD stencil |
+//! | route | analytic R-matrix, FD stencil, **hybrid** (#1514's per-subject salvage) |
 //! | severity | minor, moderate, severe |
 //! | which magnitude carried the grade | inflation only, indefiniteness only, both, neither |
 //! | declined clauses | none, one with a remedy, one without, **several** (mixed) |
@@ -1028,4 +1028,304 @@ fn the_exhaustive_walk_reports_every_clause_and_the_routing_walk_still_short_cir
     let in_scope = crate::parser::model_parser::parse_model_string(CLOSED_FORM_MODEL).unwrap();
     assert!(covariance_scope_declines(&in_scope, &subject, false).is_empty());
     assert_eq!(covariance_scope_decline(&in_scope, &subject, false), None);
+}
+
+// ── #1514: the hybrid route and the salvage note ────────────────────────────────────────
+
+#[test]
+fn the_message_names_the_hybrid_route_and_keeps_its_stencil_guidance() {
+    // Three routes, one test, because the two gates the route drives disagree about where the
+    // hybrid sits: the *label* must be its own (neither "the analytic R-matrix" — part of it
+    // was second-differenced — nor "the FD Hessian" — most of it was not), while the
+    // stencil-only tail must be **present**, because a stencil genuinely ran, over exactly the
+    // subjects the declined clause names. Collapsing the hybrid onto either neighbour breaks
+    // one of the two halves asserted here.
+    let mut analytic = measured_severe_facts();
+    analytic.declines = &[CovScopeDecline::ExpressionScale];
+    let mut fd = analytic;
+    fd.source = CovHessianSource::FdStencil;
+    let mut hybrid = analytic;
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    analytic.source = CovHessianSource::AnalyticRMatrix;
+
+    let (m_analytic, m_fd, m_hybrid) = (
+        format_regularized_warning(&analytic),
+        format_regularized_warning(&fd),
+        format_regularized_warning(&hybrid),
+    );
+
+    assert!(
+        m_hybrid.contains("the hybrid analytic/FD R-matrix"),
+        "{m_hybrid}"
+    );
+    assert!(!m_analytic.contains("hybrid"), "{m_analytic}");
+    assert!(!m_fd.contains("hybrid"), "{m_fd}");
+
+    // The tail: present on FD and hybrid, absent on the pure analytic route. The two routes
+    // word it differently (`the_decline_sentence_names_the_subjects_that_declined_not_the_
+    // whole_fit` owns that distinction), so the token asserted here is the clause itself —
+    // the part that is common to both and is the reason the tail exists.
+    let clause = "[scaling] obs_scale = ... is in use";
+    assert!(m_fd.contains("declined because"), "{m_fd}");
+    assert!(m_fd.contains(clause), "{m_fd}");
+    assert!(m_hybrid.contains(clause), "{m_hybrid}");
+    assert!(!m_analytic.contains(clause), "{m_analytic}");
+    assert!(!m_analytic.contains("declined"), "{m_analytic}");
+}
+
+#[test]
+fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
+    // #1516 review §2. The tail is *present* on both routes (asserted above), but its subject
+    // is not the same: on the population stencil the fit declined, on the hybrid route only the
+    // salvaged minority did. A 100-subject fit with three event-walk subjects told "the exact
+    // analytic covariance R-matrix was declined" reads it as a statement about all 100.
+    //
+    // Both routes in one test, and each asserts the *other* route's wording is absent, so a
+    // gate stuck on either branch reddens here rather than passing half.
+    let mut fd = measured_severe_facts();
+    fd.declines = &[CovScopeDecline::EventWalkSubject];
+    fd.source = CovHessianSource::FdStencil;
+    let mut hybrid = fd;
+    hybrid.source = CovHessianSource::HybridRMatrix;
+
+    let (m_fd, m_hybrid) = (
+        format_regularized_warning(&fd),
+        format_regularized_warning(&hybrid),
+    );
+    assert!(
+        m_fd.contains(
+            "The exact analytic covariance R-matrix was declined because at least one subject \
+             routes to the event-driven walk."
+        ),
+        "{m_fd}"
+    );
+    assert!(
+        m_hybrid.contains(
+            "The finite-differenced subjects declined the exact analytic covariance R-matrix \
+             because at least one subject routes to the event-driven walk."
+        ),
+        "{m_hybrid}"
+    );
+    assert!(
+        !m_hybrid.contains("R-matrix was declined"),
+        "the whole-fit wording must not survive on the hybrid route: {m_hybrid}"
+    );
+    assert!(
+        !m_fd.contains("The finite-differenced subjects declined"),
+        "the per-subject wording must not leak onto the population stencil: {m_fd}"
+    );
+}
+
+#[test]
+fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
+    // The other two sentences of the same tail, both cells, both routes. The promise ("moves
+    // X onto the analytic route") and the residual blocker ("so X stays on the finite-
+    // difference route") each name who X is, and on the hybrid route X is the salvaged
+    // subjects — the rest of the population is already analytic.
+    let mut hybrid = measured_severe_facts();
+    hybrid.declines = &[CovScopeDecline::GradientFd];
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    let mut fd = hybrid;
+    fd.source = CovHessianSource::FdStencil;
+
+    let m_hybrid = format_regularized_warning(&hybrid);
+    let m_fd = format_regularized_warning(&fd);
+    assert!(
+        m_hybrid.contains("Dropping gradient = fd moves those subjects onto the analytic route."),
+        "{m_hybrid}"
+    );
+    assert!(
+        m_fd.contains("Dropping gradient = fd moves the fit onto the analytic route."),
+        "{m_fd}"
+    );
+
+    // The unremedied cell: one action, one blocker with none.
+    let mut hybrid_mixed = hybrid;
+    hybrid_mixed.declines = &[
+        CovScopeDecline::GradientFd,
+        CovScopeDecline::EventWalkSubject,
+    ];
+    let mut fd_mixed = hybrid_mixed;
+    fd_mixed.source = CovHessianSource::FdStencil;
+
+    let m_hybrid_mixed = format_regularized_warning(&hybrid_mixed);
+    let m_fd_mixed = format_regularized_warning(&fd_mixed);
+    assert!(
+        m_hybrid_mixed.contains(
+            "so those subjects stay on the finite-difference route until all of them are cleared"
+        ),
+        "{m_hybrid_mixed}"
+    );
+    assert!(
+        m_fd_mixed.contains(
+            "so the fit stays on the finite-difference route until all of them are \
+                      cleared"
+        ),
+        "{m_fd_mixed}"
+    );
+}
+
+#[test]
+fn the_ode_tolerance_sentence_reaches_the_hybrid_route_too() {
+    // The `1/h²` amplification argument is about a mechanism, not a route name: on the hybrid
+    // route the salvaged subjects' terms *are* second differences of the objective, so a
+    // tolerance that is too loose for the stencil is still too loose for them. Both sides of
+    // the gate, same ODE facts.
+    let mut hybrid = measured_severe_facts();
+    hybrid.ode = Some(ode_facts(1e-4, 1e-6));
+    hybrid.source = CovHessianSource::HybridRMatrix;
+    let mut analytic = hybrid;
+    analytic.source = CovHessianSource::AnalyticRMatrix;
+
+    assert!(format_regularized_warning(&hybrid).contains("amplifies integration noise"));
+    assert!(!format_regularized_warning(&analytic).contains("amplifies integration noise"));
+}
+
+#[test]
+fn the_offdiag_nan_warning_says_what_each_route_actually_lost() {
+    // #1514 review §1. `hess += stencil.hess` means a non-finite cross-partial leaves behind
+    // whatever was already in the entry, and that differs by route: the zero initialisation on
+    // the population stencil (correlation wholly absent), the in-scope subjects' analytic term
+    // on the hybrid (only the declined subjects' share missing). Both sides of the gate in one
+    // test, with each asserted *not* to carry the other's claim — split across two tests, a
+    // gate stuck on one branch would still pass half.
+    let names = "TVCL, TVV";
+    let fd = format_offdiag_nan_warning(names, CovHessianSource::FdStencil);
+    let hybrid = format_offdiag_nan_warning(names, CovHessianSource::HybridRMatrix);
+
+    assert!(fd.contains("Cross-partial correlation set to 0"), "{fd}");
+    assert!(!fd.contains("analytically assembled"), "{fd}");
+
+    assert!(
+        hybrid.contains("keep only the analytically assembled subjects' contribution"),
+        "{hybrid}"
+    );
+    assert!(
+        hybrid.contains("the finite-differenced subjects' share of them is missing"),
+        "{hybrid}"
+    );
+    // The false claim this fix exists to remove. On the hybrid route the entry is not zero.
+    assert!(!hybrid.contains("set to 0"), "{hybrid}");
+
+    // What both routes must keep, because it is true on both and it is the actionable half:
+    // the named parameters, the over-optimism, and the knob. Deleting any of the three from
+    // either arm reddens here.
+    for (label, msg) in [("fd", &fd), ("hybrid", &hybrid)] {
+        assert!(msg.contains(names), "{label}: {msg}");
+        assert!(msg.contains("may be over-optimistic"), "{label}: {msg}");
+        assert!(msg.contains("Try tuning fd_hessian_step"), "{label}: {msg}");
+        // The token `classify_warning` keys on — a reworded message that dropped it would
+        // silently demote the warning out of `covariance_regularized`.
+        let entry = classify_warning(msg);
+        assert_eq!(
+            entry.category,
+            WarningCode::CovarianceRegularized,
+            "{label}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn the_salvage_note_is_absent_when_nothing_was_salvaged() {
+    // The note's *presence* is the whole statement that the hybrid route ran, so the empty
+    // cell has to be silent rather than say "0 of 10". Both degenerate inputs, because either
+    // one alone would be satisfied by a formatter that keyed off the other.
+    assert!(format_salvage_note(&[], 10).is_none());
+    assert!(format_salvage_note(&["a"], 0).is_none());
+}
+
+#[test]
+fn the_salvage_note_agrees_with_its_own_counts() {
+    // Singular and plural in one test: four nouns and a verb agree with `ids.len()`, and the
+    // "remaining" clause agrees with `n_total - ids.len()`, which is a *different* count.
+    // Keying both on one count is the agreement bug this shape invites.
+    let one = format_salvage_note(&["42"], 55).expect("one salvaged subject");
+    assert!(one.contains("W_COV_ANALYTIC_SALVAGE"), "{one}");
+    assert!(one.contains("1 of 55 subjects (ID 42) is outside"), "{one}");
+    assert!(one.contains("its information term was"), "{one}");
+    assert!(one.contains("its own marginal"), "{one}");
+    assert!(
+        one.contains("the remaining 54 subjects were assembled analytically"),
+        "{one}"
+    );
+
+    // The note's second sentence, which no count reaches: it is the answer to the question
+    // the first sentence provokes ("so are my standard errors a blend of two things?"), and
+    // without an assertion here deleting it would kill no test at all.
+    assert!(
+        one.contains("only the named subjects' terms use a different estimator"),
+        "{one}"
+    );
+
+    let many = format_salvage_note(&["7", "13", "42"], 10).expect("three salvaged subjects");
+    assert!(
+        many.contains("3 of 10 subjects (IDs 7, 13 and 42) are outside"),
+        "{many}"
+    );
+    assert!(many.contains("their information terms were"), "{many}");
+    assert!(many.contains("their own marginals"), "{many}");
+    assert!(
+        many.contains("the remaining 7 subjects were assembled analytically"),
+        "{many}"
+    );
+
+    // The one cell where "remaining" is singular while the salvaged count is plural — the pair
+    // that a single shared count gets wrong in one direction or the other.
+    let almost_all = format_salvage_note(&["a", "b"], 3).expect("two of three");
+    assert!(
+        almost_all.contains("the remaining subject was assembled analytically"),
+        "{almost_all}"
+    );
+}
+
+#[test]
+fn the_salvage_note_dedupes_ids_and_caps_the_list() {
+    // Two independent reductions of the id list, asserted separately because each can be
+    // deleted without the other reddening.
+    //
+    // Dedupe is a *printing* reduction only (#1516 review §3). The caller passes one id per
+    // population index, and each index carries its own information term, so three salvaged
+    // subjects two of which share an id string are still three salvaged terms and seventeen
+    // analytic ones. Deriving the count from the deduped list instead printed "2 of 20 … the
+    // remaining 18", under-reporting the salvage and over-reporting the analytic remainder by
+    // the same one subject — so both counts are asserted next to the list they disagree with.
+    let dup = format_salvage_note(&["4", "4", "9"], 20).expect("three salvaged subjects");
+    assert!(dup.contains("3 of 20 subjects (IDs 4 and 9)"), "{dup}");
+    assert!(
+        dup.contains("the remaining 17 subjects were assembled analytically"),
+        "{dup}"
+    );
+
+    // Cap: twelve ids print ten and summarise the rest, while the count stays the true one.
+    let ids: Vec<String> = (0..12).map(|i| i.to_string()).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let capped = format_salvage_note(&refs, 40).expect("twelve salvaged subjects");
+    assert!(capped.contains("12 of 40 subjects"), "{capped}");
+    assert!(
+        capped.contains("0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more"),
+        "{capped}"
+    );
+    assert!(
+        !capped.contains(", 10,"),
+        "the 11th id must not be printed: {capped}"
+    );
+
+    // Exactly at the cap nothing is summarised — the boundary the `>` above sits on.
+    let ten: Vec<&str> = refs[..10].to_vec();
+    let at_cap = format_salvage_note(&ten, 40).expect("ten salvaged subjects");
+    assert!(!at_cap.contains("more"), "{at_cap}");
+}
+
+#[test]
+fn the_salvage_note_classifies_as_an_informational_covariance_note() {
+    // The note is a route report, not a degradation: the information matrix is complete and
+    // the estimates and OFV are untouched. (The covariance itself does move a little — the
+    // salvaged subjects' terms come off a different estimator — which is why the note exists
+    // at all.) `CovarianceRegularized` asserts the eigenvalue floor fired, which is a
+    // different and more serious claim, so the classification is pinned here, next to the text
+    // it is keyed on.
+    let note = format_salvage_note(&["3"], 10).expect("one salvaged subject");
+    let entry = classify_warning(&note);
+    assert_eq!(entry.category, WarningCode::CovarianceStep);
+    assert_eq!(entry.severity, WarningSeverity::Info);
 }
