@@ -6,8 +6,8 @@
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
 use crate::estimation::cov_diagnostics::{
-    format_regularized_warning, CovHessianSource, CovRegularizationFacts, CovScopeDecline,
-    OdeToleranceFacts,
+    format_offdiag_nan_warning, format_regularized_warning, format_salvage_note, CovHessianSource,
+    CovRegularizationFacts, CovScopeDecline, OdeToleranceFacts,
 };
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -669,17 +669,77 @@ fn analytic_cov_declines(
 /// The estimator assembled from the Hessian `R` is selected by
 /// [`FitOptions::covariance_method`] — `R⁻¹` (default), the score cross-product
 /// `S⁻¹`, or the sandwich `R⁻¹SR⁻¹` (see [`assemble_score_cross_product`]).
-/// The exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, or `None` when
-/// **any** subject is outside the analytic scope.
+/// How much of the population the exact analytic R-matrix (#436) could assemble.
 ///
-/// All-or-nothing on purpose. Mixing an analytic block for some subjects with a
-/// finite-difference block for others would produce a matrix that is neither, and the
-/// resulting SEs would be silently method-dependent per subject. The finite-difference
-/// stencil is correct for everything, so it is the honest fallback.
+/// Returned instead of an `Option` because a declining subject is a *route*, not a failure
+/// (#1514). The observed information is `Σᵢ Rᵢ`, and every term in that sum is the second
+/// derivative of one subject's own marginal: a subject this assembly declines can have its own
+/// `Rⱼ` finite-differenced — from the same objective, at the same point, warm-started from the
+/// same modes — and added in, without any other subject's term changing.
+///
+/// That is not the thing the old all-or-nothing comment ruled out. "A Hessian half-assembled
+/// from two different approximations would be neither" describes averaging two estimates *of
+/// the same matrix*; here each term is an estimate of itself. The fit-side gradient has
+/// assembled the population exactly this way since #466 (`population_gradient_sens_mixed`).
+///
+/// Separability is what licenses it, and it holds for both halves of `cov_ofv`:
+/// `reconverge_point` warm-starts every perturbed point from the *fit's* modes (a constant
+/// across the whole stencil), so `x ↦ η̂ᵢ(x)` is a deterministic per-subject map; and `pop_nll`
+/// is a per-subject sum, as is the AGQ branch. The one non-separable objective, `mixture_ofv`,
+/// never reaches here — `compute_covariance` gates the whole analytic path on `!is_mixture`.
+pub(super) enum AnalyticCovAssembly {
+    /// Every subject assembled analytically: the complete `∂²OFV/∂x²`.
+    Full(DMatrix<f64>),
+    /// `hess` is the sum over the in-scope subjects only. `declined` holds the **population
+    /// indices** of the subjects whose terms still have to be finite-differenced and added.
+    /// Non-empty, and always a strict minority (see [`SALVAGE_MAX_DECLINED_FRACTION`]).
+    Partial {
+        hess: DMatrix<f64>,
+        declined: Vec<usize>,
+    },
+    /// The analytic route does not apply to this fit at all: the objective is not the one this
+    /// assembly differentiates (exact-anchor Laplace), the modes handed in do not match the
+    /// population, the step was cancelled, or so many subjects declined that the whole-
+    /// population stencil is the cheaper way to the same matrix.
+    Unavailable,
+}
+
+impl AnalyticCovAssembly {
+    /// The complete analytic Hessian, or `None` if *anything* declined.
+    ///
+    /// Test-facing only. Production reads the variants, because collapsing `Partial` into
+    /// `None` here is precisely the all-or-nothing behaviour #1514 removed — a helper that
+    /// made it a one-character change to reintroduce would not survive the next refactor.
+    #[cfg(test)]
+    pub(super) fn full(self) -> Option<DMatrix<f64>> {
+        match self {
+            AnalyticCovAssembly::Full(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
+/// At or above this fraction of declining subjects, take the whole-population stencil instead
+/// of salvaging (#1514).
+///
+/// The salvage is not free: the declined subjects get their own `select_fd_step` probe and
+/// their own `2·n_free²`-point stencil, on top of an analytic pass that assembled almost
+/// nothing. Measured on clofarabine (FOCEI, 3-state ODE, 56 subjects, **all 56** outside the
+/// analytic scope): 7.91 s on the population stencil against 8.22 s rebuilt as 56 per-subject
+/// stencils — 81/81 cells identical to 7 significant figures, +4 % wall for nothing. Half is
+/// the conservative cut: the salvage's win comes from the analytic majority carrying the
+/// population, and at parity there is no majority to carry it.
+///
+/// `>=`, so a single-subject population that declines takes the population stencil, which is
+/// the same matrix by one fewer route.
+const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
+
+/// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
+/// the OFV convention, for as much of the population as is in scope.
 ///
 /// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
 /// results while distributing the quadrature node sweeps across workers.
-pub(super) fn analytic_cov_hessian(
+pub(super) fn analytic_cov_assembly(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
@@ -687,10 +747,18 @@ pub(super) fn analytic_cov_hessian(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<DMatrix<f64>> {
+) -> AnalyticCovAssembly {
     use crate::estimation::sens_cov_hessian::{
         subject_packed_cov_hessian, subject_packed_cov_hessian_foce,
     };
+    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
+    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
+    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
+    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
+    // too; here it would additionally be reported as complete, so it is refused outright.
+    if eta_hats.len() != population.subjects.len() {
+        return AnalyticCovAssembly::Unavailable;
+    }
     // The objective this assembly differentiates is the FOCE/FOCEI marginal. When
     // `agq_nodes()` is `Some` — `method = laplace` at any node count, or `method = focei`
     // with `n_agq > 1` — the fit minimised the AGQ marginal instead, under an anchor that
@@ -714,7 +782,7 @@ pub(super) fn analytic_cov_hessian(
     //     bail was added for.
     let agq = if options.agq_nodes().is_some() {
         if options.hessian_anchor() != HessianAnchor::GaussNewton {
-            return None;
+            return AnalyticCovAssembly::Unavailable;
         }
         options.agq_nodes()
     } else {
@@ -791,10 +859,277 @@ pub(super) fn analytic_cov_hessian(
         })
         .collect();
     let mut acc = DMatrix::<f64>::zeros(n, n);
-    for h in per_subject {
-        acc += h?;
+    let mut declined: Vec<usize> = Vec::new();
+    for (i, h) in per_subject.into_iter().enumerate() {
+        match h {
+            Some(h) => acc += h,
+            None => declined.push(i),
+        }
     }
-    Some(acc)
+    // A cancel surfaces as a decline from every subject the flag caught. Salvaging those on
+    // the FD stencil would be precisely the work the cancel asked to stop, and the caller
+    // reads `Unavailable` + the flag as "cancelled" (PR #953 review finding 10).
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return AnalyticCovAssembly::Unavailable;
+    }
+    if declined.is_empty() {
+        return AnalyticCovAssembly::Full(acc);
+    }
+    if declined.len() as f64 >= SALVAGE_MAX_DECLINED_FRACTION * population.subjects.len() as f64 {
+        return AnalyticCovAssembly::Unavailable;
+    }
+    AnalyticCovAssembly::Partial {
+        hess: acc,
+        declined,
+    }
+}
+
+/// The subjects at `idx`, in `idx` order, as their own `Population`, together with the matching
+/// warm-start modes.
+///
+/// `pop_nll_opts` sums over whatever population it is handed, so this is all it takes to make
+/// the covariance objective evaluate one subset's share of itself (#1514). `warm` is indexed
+/// positionally against the returned subjects, which is why it is built here rather than at
+/// each call site: the two vectors have to be permuted by the same `idx` or the salvaged
+/// subject is warm-started from a different subject's modes.
+///
+/// `exclusions` and `covariate_names` are carried over unchanged and `warnings` is dropped —
+/// the first two are read by downstream consumers of a `Population`, the third is a record of
+/// how the dataset was parsed and would be duplicated into nothing here.
+pub(super) fn subset_population(
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    idx: &[usize],
+) -> (Population, Vec<DVector<f64>>) {
+    let pop = Population {
+        subjects: idx
+            .iter()
+            .map(|&i| population.subjects[i].clone())
+            .collect(),
+        covariate_names: population.covariate_names.clone(),
+        dv_column: population.dv_column.clone(),
+        input_columns: population.input_columns.clone(),
+        exclusions: population.exclusions.clone(),
+        warnings: Vec::new(),
+    };
+    let warm = idx.iter().map(|&i| eta_hats[i].clone()).collect();
+    (pop, warm)
+}
+
+/// The output of one reconverged-OFV second-difference stencil.
+///
+/// `pub(super)` so `sens_cov_hessian`'s tests can run the *production* stencil over an
+/// arbitrary subject set and check that the population's equals the sum of the per-subject
+/// ones — the premise #1514 rests on. A test that rebuilt the difference formulas to do that
+/// would be comparing two copies rather than one formula on two inputs.
+pub(super) struct FdStencil {
+    /// `n`×`n`, zero outside the `free_idx` block and at every entry whose stencil was
+    /// non-finite (those are reported through the two sets instead, because a stored zero is
+    /// indistinguishable from genuinely flat curvature).
+    pub(super) hess: DMatrix<f64>,
+    /// Free indices whose diagonal stencil was non-finite.
+    pub(super) diag_nan: HashSet<usize>,
+    /// Free indices appearing in a non-finite cross-partial stencil.
+    pub(super) offdiag_nan: HashSet<usize>,
+}
+
+/// Reconverged-OFV second-difference Hessian: 3-point diagonal, 4-point off-diagonal, over
+/// `free_idx`, of whatever objective `ofv` evaluates.
+///
+/// It recomputes the marginal curvature end-to-end (`a = ∂f/∂η` and the `log|H̃|` EBE response
+/// included) at every perturbed point, so it serves FOCE, FOCEI and IOV, and
+/// additive/proportional/combined error uniformly — no envelope approximation, no held-fixed
+/// `a`. `ofv` dispatches on the kappa count internally, so the same stencil is correct for the
+/// IOV (joint η, κ) and non-IOV (η-only) cases.
+///
+/// Extracted from `compute_covariance` by #1514 so the whole-population route and the
+/// per-subject salvage are **one** implementation. They differ only in which subjects `ofv`
+/// sums; a second copy of the difference formulas would be a second place for the `4·hᵢ·hⱼ` to
+/// go wrong, and the parity test between the two routes would then be comparing two copies
+/// rather than one formula on two inputs.
+///
+/// Returns `None` when the step was cancelled mid-stencil.
+///
+/// #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV points (subjects
+/// iterated serially inside `ofv`) instead of a serial loop firing a per-subject `par_iter` at
+/// every point — removing the fork/join overhead of a rayon barrier per point.
+pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
+    n: usize,
+    x_hat: &[f64],
+    free_idx: &[usize],
+    eps: f64,
+    f0: f64,
+    ofv: &F,
+    options: &FitOptions,
+) -> Option<FdStencil> {
+    let nf = free_idx.len();
+    let hsteps: Vec<f64> = free_idx
+        .iter()
+        .map(|&i| eps * (1.0 + x_hat[i].abs()))
+        .collect();
+    // Flat list of perturbation SPECS (not materialised x-vectors): 2 per diagonal (±hᵢ), then
+    // 4 per (a<b) off-diagonal pair. Each par_iter task clones `x_hat` once and applies its
+    // spec, so only ~n_threads vectors are live at a time instead of all ~2·nf² perturbed
+    // points held resident for the whole reduction (the pre-#298 O(nf²·np) footprint) (#298).
+    #[derive(Clone, Copy)]
+    enum Pert {
+        Single {
+            i: usize,
+            di: f64,
+        },
+        Pair {
+            i: usize,
+            di: f64,
+            j: usize,
+            dj: f64,
+        },
+    }
+    let mut specs: Vec<Pert> = Vec::with_capacity(2 * nf + 2 * nf * nf);
+    for a in 0..nf {
+        let (i, hi) = (free_idx[a], hsteps[a]);
+        specs.push(Pert::Single { i, di: hi });
+        specs.push(Pert::Single { i, di: -hi });
+    }
+    let n_diag = specs.len();
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for a in 0..nf {
+        for b in (a + 1)..nf {
+            let (i, j) = (free_idx[a], free_idx[b]);
+            let (hi, hj) = (hsteps[a], hsteps[b]);
+            for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
+                specs.push(Pert::Pair {
+                    i,
+                    di: si * hi,
+                    j,
+                    dj: sj * hj,
+                });
+            }
+            pairs.push((a, b));
+        }
+    }
+    let report = cov_progress("Hessian", specs.len(), options.verbose);
+    let vals: Vec<f64> = specs
+        .par_iter()
+        .map(|p| {
+            // Cooperative cancel: skip this point's EBE reconvergence and
+            // return NaN so the queue drains; bailed on below.
+            if crate::cancel::is_cancelled(&options.cancel) {
+                report();
+                return f64::NAN;
+            }
+            let mut xv = x_hat.to_vec();
+            match *p {
+                Pert::Single { i, di } => xv[i] += di,
+                Pert::Pair { i, di, j, dj } => {
+                    xv[i] += di;
+                    xv[j] += dj;
+                }
+            }
+            let v = ofv(&xv);
+            report();
+            v
+        })
+        .collect();
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    let mut hess = DMatrix::zeros(n, n);
+    let mut diag_nan: HashSet<usize> = HashSet::new();
+    let mut offdiag_nan: HashSet<usize> = HashSet::new();
+    // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
+    for a in 0..nf {
+        let i = free_idx[a];
+        let hi = hsteps[a];
+        let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
+        if h_ii.is_finite() {
+            hess[(i, i)] = h_ii;
+        } else {
+            diag_nan.insert(i);
+        }
+    }
+    // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
+    let mut off = n_diag;
+    for &(a, b) in &pairs {
+        let (i, j) = (free_idx[a], free_idx[b]);
+        let (hi, hj) = (hsteps[a], hsteps[b]);
+        let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
+        off += 4;
+        let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+        if h_ij.is_finite() {
+            hess[(i, j)] = h_ij;
+            hess[(j, i)] = h_ij;
+        } else {
+            offdiag_nan.insert(i);
+            offdiag_nan.insert(j);
+        }
+    }
+    Some(FdStencil {
+        hess,
+        diag_nan,
+        offdiag_nan,
+    })
+}
+
+/// Re-solve the inner EBE loop for every subject of `pop` at the packed point `xv`,
+/// warm-started from `warm[i]`, serially over subjects.
+///
+/// NONMEM reconverges the conditional estimates at every perturbed point in its covariance
+/// step; holding η̂/H fixed gives a Hessian with the wrong curvature — indefinite even on
+/// warfarin, which previously forced eigenvalue clipping (#129) and inflated the SEs.
+///
+/// Serial (not the parallel `run_inner_loop_warm`) because the covariance step parallelises
+/// over perturbed POINTS, not subjects; nested parallelism is what #256 removed. `find_ebe` is
+/// deterministic per subject, so the per-subject EBEs are bit-identical to the parallel loop.
+///
+/// The covariance step reconverges at its own tolerance (`cov_inner_tol`), decoupled from the
+/// fit's `inner_tol`: the second-difference-of-OFV R-matrix is far more sensitive to EBE
+/// precision than the fit, so LTBS tightens it by default (the `g = ln(f)` Hessian needs it)
+/// and any model can opt in. Defaults to `inner_tol` for non-LTBS (byte-identical). See
+/// [`FitOptions::effective_cov_inner_tol`].
+///
+/// **`pop` is a parameter, not `self`'s population**, because the per-subject salvage (#1514)
+/// runs this same reconvergence over the declined subjects alone. `warm` is indexed
+/// positionally against `pop.subjects`, so a subset must carry the matching subset of modes —
+/// and because the warm start is the *fit's* modes rather than the previous perturbed point,
+/// `x ↦ η̂ᵢ(x)` is the same deterministic map on either set. Had it been path-dependent, the
+/// population stencil could not have been decomposed per subject at all.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconverge_population(
+    xv: &[f64],
+    model: &CompiledModel,
+    pop: &Population,
+    template: &ModelParameters,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    cov_inner_tol: f64,
+) -> (
+    ModelParameters,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let params = unpack_params(xv, template);
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let n = pop.subjects.len();
+    let mut ehs = Vec::with_capacity(n);
+    let mut hms = Vec::with_capacity(n);
+    let mut kaps = Vec::with_capacity(n);
+    for i in 0..n {
+        let ebe = find_ebe(
+            model,
+            &pop.subjects[i],
+            &params,
+            options.inner_maxiter,
+            cov_inner_tol,
+            Some(warm[i].as_slice()),
+            Some(&mu_k),
+            0,
+        );
+        ehs.push(ebe.eta);
+        hms.push(ebe.h_matrix);
+        kaps.push(ebe.kappas);
+    }
+    (params, ehs, hms, kaps)
 }
 
 pub(crate) fn compute_covariance(
@@ -835,57 +1170,28 @@ pub(crate) fn compute_covariance(
     // It stays in the signature for symmetry with `eta_hats` (the reconvergence
     // warm-start) and with the other optimizers' call sites.
     let _ = h_matrices;
-    let n_subj_cov = population.subjects.len();
 
-    // Re-solve the inner EBE loop at a packed point, warm-started from the
-    // converged EBEs, serially over subjects. NONMEM reconverges the conditional
-    // estimates at every perturbed point in its covariance step; holding η̂/H
-    // fixed gives a Hessian with the wrong curvature — indefinite even on
-    // warfarin, which previously forced eigenvalue clipping (#129) and inflated
-    // the SEs.
-    //
-    // This single helper is the reconvergence used by both covariance-OFV
-    // evaluations — the base-OFV evaluation and the second-difference stencil's
-    // `serial_ofv` (which now serves the non-IOV and IOV cases alike, since the
-    // FD-of-OFV Hessian is the sole R stencil) — so they cannot drift apart
-    // (#298). It is
-    // serial (not the parallel `run_inner_loop_warm`) because the covariance step
-    // parallelises over perturbed POINTS, not subjects; nested parallelism is
-    // what #256 removed. `find_ebe` is deterministic per subject, so the
-    // per-subject EBEs are bit-identical to the parallel loop.
-    // The covariance step reconverges EBEs at its own tolerance (`cov_inner_tol`),
-    // decoupled from the fit's `inner_tol`: the second-difference-of-OFV R-matrix is
-    // far more sensitive to EBE precision than the fit, so LTBS tightens it by default
-    // (the `g = ln(f)` Hessian needs it) and any model can opt in. Defaults to
-    // `inner_tol` for non-LTBS (byte-identical). See `FitOptions::effective_cov_inner_tol`.
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
-    let reconverge_point = |xv: &[f64]| -> (
-        ModelParameters,
-        Vec<DVector<f64>>,
-        Vec<DMatrix<f64>>,
-        Vec<Vec<DVector<f64>>>,
-    ) {
-        let params = unpack_params(xv, template);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let mut ehs = Vec::with_capacity(n_subj_cov);
-        let mut hms = Vec::with_capacity(n_subj_cov);
-        let mut kaps = Vec::with_capacity(n_subj_cov);
-        for i in 0..n_subj_cov {
-            let ebe = find_ebe(
-                model,
-                &population.subjects[i],
-                &params,
-                options.inner_maxiter,
-                cov_inner_tol,
-                Some(eta_hats[i].as_slice()),
-                Some(&mu_k),
-                0,
-            );
-            ehs.push(ebe.eta);
-            hms.push(ebe.h_matrix);
-            kaps.push(ebe.kappas);
-        }
-        (params, ehs, hms, kaps)
+
+    // The covariance OFV = −2·logL over an arbitrary subject set, reconverged at `xv`.
+    //
+    // One implementation for both consumers — the whole-population stencil and the per-subject
+    // salvage of #1514 — so subject `i`'s term is the same number whichever route computes it,
+    // and the base-OFV evaluation cannot drift from the stencil's (#298).
+    //
+    // Covariance OFV = −2·logL = 2·pop_nll for both FOCE and FOCEI.
+    //
+    // FOCE uses the Sheiner–Beal linearised marginal `(y−f₀)ᵀR̃⁻¹(y−f₀) + log|R̃|` with
+    // R̃ = HΩHᵀ + R. By Woodbury that marginal *already* carries the Ω penalty (it equals the
+    // conditional form including η̂ᵀΩ⁻¹η̂ + log|Ω|), so its Ω-curvature is complete. An earlier
+    // version added the η̂ᵀΩ⁻¹η̂ + log|Ω| prior here for the FOCE branch, which double-counted Ω
+    // and flattened the Ω-block curvature — the source of the ~31%-low FOCE omega SEs (issue
+    // #243). FOCEI's Almquist–Laplace marginal likewise carries the prior internally. So
+    // neither method needs an add-back.
+    let subset_cov_ofv = |xv: &[f64], pop: &Population, warm: &[DVector<f64>]| -> f64 {
+        let (params, ehs, hms, kaps) =
+            reconverge_population(xv, model, pop, template, warm, options, cov_inner_tol);
+        2.0 * pop_nll_opts(model, pop, &params, &ehs, &hms, &kaps, options)
     };
 
     // Covariance OFV = −2·logL at a reconverged point. For FOCEI the per-subject
@@ -925,19 +1231,7 @@ pub(crate) fn compute_covariance(
             )
             .ofv;
         }
-        let (params, ehs, hms, kaps) = reconverge_point(xv);
-        let foce_nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options);
-        // Covariance OFV = −2·logL = 2·pop_nll for both FOCE and FOCEI.
-        //
-        // FOCE uses the Sheiner–Beal linearised marginal `(y−f₀)ᵀR̃⁻¹(y−f₀) +
-        // log|R̃|` with R̃ = HΩHᵀ + R. By Woodbury that marginal *already* carries
-        // the Ω penalty (it equals the conditional form including η̂ᵀΩ⁻¹η̂ +
-        // log|Ω|), so its Ω-curvature is complete. An earlier version added the
-        // η̂ᵀΩ⁻¹η̂ + log|Ω| prior here for the FOCE branch, which double-counted Ω
-        // and flattened the Ω-block curvature — the source of the ~31%-low FOCE
-        // omega SEs (issue #243). FOCEI's Almquist–Laplace marginal likewise
-        // carries the prior internally. So neither method needs an add-back.
-        2.0 * foce_nll
+        subset_cov_ofv(xv, population, eta_hats)
     };
 
     // Reconverge once at `x_hat` and keep the result. Both consumers need it: the base OFV
@@ -963,7 +1257,15 @@ pub(crate) fn compute_covariance(
             cov_ofv(x_hat),
         )
     } else {
-        let (p, e, h, k) = reconverge_point(x_hat);
+        let (p, e, h, k) = reconverge_population(
+            x_hat,
+            model,
+            population,
+            template,
+            eta_hats,
+            options,
+            cov_inner_tol,
+        );
         let o = 2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options);
         (p, e, h, k, o)
     };
@@ -1019,18 +1321,31 @@ pub(crate) fn compute_covariance(
     // same mask, so there is one gate, not a second structural filter here.
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
 
-    let f0 = base_ofv;
-
-    // The analytic attempt is made **before** `select_fd_step`, not after. That step probes
-    // `2·n_free` perturbed points, each of which reconverges every subject's inner loop, purely
-    // to size a finite-difference step the analytic route never uses. Running it first would
-    // have left the analytic path paying `2·n_free` reconverged population objectives for
-    // nothing — most of the cost it exists to remove, and a claim of "no inner re-solve" that
-    // the code did not honour.
-    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian && !is_mixture {
+    // ── The exact analytic R-matrix (#436), attempted before the FD stencil ─────────────
+    //
+    // Assembled per subject, and no longer all-or-nothing (#1514). The observed information is
+    // `Σᵢ Rᵢ`; a subject outside the analytic scope contributes one term of that sum, and that
+    // term can be second-differenced from the subject's *own* marginal — same objective, same
+    // point, same warm start — while every other subject keeps its exact term. Before #1514 one
+    // such subject dropped the whole population onto the `2·n_free²`-point population stencil:
+    // on the motivating fit, one subject of 55 turning a 2.0 s covariance step into 23.4 s.
+    //
+    // This is not the stencil #639 removed. That one finite-differenced a gradient that held
+    // `a = ∂f/∂η` fixed — an envelope approximation, which is why it biased weakly-identified
+    // structural SEs. This is the exact second derivative of the same marginal the outer loop
+    // minimises.
+    //
+    // The attempt is made **before** `select_fd_step`, not after. That step probes `2·n_free`
+    // perturbed points, each of which reconverges every subject's inner loop, purely to size a
+    // finite-difference step a fully-analytic route never uses. Running it first would have
+    // left the analytic path paying `2·n_free` reconverged population objectives for nothing —
+    // most of the cost it exists to remove, and a claim of "no inner re-solve" that the code
+    // did not honour. On the salvage route the probe still runs, but over the declined subjects
+    // only, which is the same reduction the stencil itself gets.
+    let assembly = if options.analytic_cov_hessian && !is_mixture {
         // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
-        analytic_cov_hessian(
+        analytic_cov_assembly(
             model,
             population,
             template,
@@ -1040,182 +1355,128 @@ pub(crate) fn compute_covariance(
             options,
         )
     } else {
-        None
+        AnalyticCovAssembly::Unavailable
     };
-    // A cancel during the analytic loop surfaces as `None`; without this the fallback would
-    // start the *more* expensive FD stencil instead of stopping.
-    if analytic_hess.is_none() && crate::cancel::is_cancelled(&options.cancel) {
+    // A cancel during the analytic loop surfaces as `Unavailable`; without this the fallback
+    // would start the *more* expensive FD stencil instead of stopping.
+    if matches!(assembly, AnalyticCovAssembly::Unavailable)
+        && crate::cancel::is_cancelled(&options.cancel)
+    {
         return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
     }
 
-    // Adaptively select the FD step: halve up to 8× until all free-parameter
-    // diagonal stencils are finite. Most models use the initial step; halving
-    // only kicks in when the OFV overflows at the default perturbation size.
-    // Skipped entirely when the analytic Hessian is available.
-    let (eps, n_halvings) = if analytic_hess.is_some() {
-        (initial_eps, 0)
-    } else {
-        select_fd_step(x_hat, &free_idx, initial_eps, f0, &cov_ofv)
-    };
-    if options.verbose && n_halvings > 0 {
-        eprintln!(
-            "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
-            initial_eps,
-            eps,
-            n_halvings,
-            if n_halvings == 1 { "" } else { "s" }
-        );
+    // Which subjects the objective stencil still has to cover.
+    enum FdScope {
+        /// The whole population, evaluated through `cov_ofv` — the only scope a mixture can
+        /// take, since `mixture_ofv` is not a per-subject sum.
+        Whole,
+        /// Only the subjects the analytic assembly declined, carried as their own `Population`
+        /// so `pop_nll_opts` sums exactly those terms and nothing else.
+        Subset {
+            pop: Population,
+            warm: Vec<DVector<f64>>,
+        },
     }
 
-    let mut hess = DMatrix::zeros(n, n);
+    // Population indices of the salvaged subjects, for the informational note. Empty on both
+    // pure routes, and its emptiness is what makes that note's presence a statement.
+    let mut salvaged: Vec<usize> = Vec::new();
+    let (mut hess, fd_scope): (DMatrix<f64>, Option<FdScope>) = match assembly {
+        AnalyticCovAssembly::Full(h) => {
+            if options.verbose {
+                eprintln!("  [covariance] analytic R-matrix (third-order sensitivities, #436)");
+            }
+            (h, None)
+        }
+        AnalyticCovAssembly::Partial { hess, declined } => {
+            if options.verbose {
+                eprintln!(
+                    "  [covariance] analytic R-matrix for {} of {} subjects; {} \
+                     finite-differenced from their own marginal (#1514)",
+                    population.subjects.len() - declined.len(),
+                    population.subjects.len(),
+                    declined.len(),
+                );
+            }
+            // The **fit's** modes, exactly what the whole-population stencil warm-starts from
+            // — not `base_eta_hats`, which the analytic assembly needs for its stationarity
+            // assumption. The two agree wherever the EBE is start-independent, which is why
+            // swapping them here kills no test in this PR's mutation sweep (cell `M16`), and
+            // the choice is not made on a measured difference: it is made so that subject `i`
+            // enters `find_ebe` with the same warm start on both routes *by construction*,
+            // rather than by an argument about how close two starts are. A start-dependent
+            // subject is a real thing here — `W_EBE_START_DEPENDENT` exists — and on one of
+            // those the salvaged term would otherwise stop being the term the population
+            // stencil computes for it.
+            let (pop, warm) = subset_population(population, eta_hats, &declined);
+            let scope = FdScope::Subset { pop, warm };
+            salvaged = declined;
+            (hess, Some(scope))
+        }
+        AnalyticCovAssembly::Unavailable => (DMatrix::zeros(n, n), Some(FdScope::Whole)),
+    };
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
-    // ── Analytic R-matrix (#436), attempted before the FD stencil ────────────────
-    //
-    // The exact observed information from third-order sensitivities, assembled per
-    // subject and summed. All-or-nothing: a single subject outside the analytic
-    // scope drops the whole population back to the finite-difference stencil below,
-    // because a Hessian half-assembled from two different approximations would be
-    // neither.
-    //
-    // This is not the stencil #639 removed. That one finite-differenced a gradient
-    // that held `a = ∂f/∂η` fixed — an envelope approximation, which is why it
-    // biased weakly-identified structural SEs. This is the exact second derivative
-    // of the same marginal the outer loop minimises.
-    if let Some(h) = analytic_hess.as_ref() {
-        hess.copy_from(h);
-        if options.verbose {
-            eprintln!("  [covariance] analytic R-matrix (third-order sensitivities, #436)");
-        }
-    }
-    if analytic_hess.is_none()
-    // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
-    // off-diagonal), reconverging the EBEs at each perturbed point. The sole
-    // covariance R stencil: it recomputes the marginal curvature end-to-end
-    // (`a = ∂f/∂η` and the `log|H̃|` EBE-response included) at every perturbed
-    // point, so it serves FOCE, FOCEI and IOV, and additive/proportional/combined
-    // error uniformly — no envelope approximation, no held-fixed `a`.
-    {
-        // `pop_nll` dispatches on the kappa count, so this stencil is correct for
-        // both the IOV (joint η, κ) and the non-IOV (η-only) cases.
-        //
-        // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
-        // points (subjects iterated serially inside `serial_ofv`) instead of the
-        // old serial loop that fired a per-subject `par_iter` at every point —
-        // removing the fork/join overhead of firing a rayon barrier per point.
-        // Bit-identical to the serial stencil: each point's OFV is the same
-        // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
-        // formulas/assembly are unchanged; only the scheduling differs.
-        let f0 = base_ofv;
-        // The FD stencil evaluates the same covariance OFV as `select_fd_step`
-        // and the base point — single-population (reconverge + pop_nll) or, for a
-        // mixture, the K-fold `mixture_ofv` — via the shared `cov_ofv`.
-        let serial_ofv = &cov_ofv;
+    if let Some(scope) = fd_scope.as_ref() {
+        // The objective this stencil differences: the whole population's covariance OFV, or —
+        // on the salvage route — only the declined subjects' share of it.
+        let fd_ofv = |xv: &[f64]| -> f64 {
+            match scope {
+                FdScope::Whole => cov_ofv(xv),
+                FdScope::Subset { pop, warm } => subset_cov_ofv(xv, pop, warm),
+            }
+        };
+        // The stencil's base point must be evaluated on the same subject set as its perturbed
+        // points: `(f₊ − 2f₀ + f₋)/h²` is the declined subjects' second difference only when
+        // all three points are theirs. On the subset route this costs one extra inner solve
+        // over those subjects — `find_ebe` is deterministic, so the value is exactly their
+        // share of `base_ofv`, recomputed rather than carried because `pop_nll` keeps no
+        // per-subject breakdown.
+        let f0_fd = match scope {
+            FdScope::Whole => base_ofv,
+            FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm),
+        };
 
-        let nf = free_idx.len();
-        let hsteps: Vec<f64> = free_idx
-            .iter()
-            .map(|&i| eps * (1.0 + x_hat[i].abs()))
-            .collect();
-        // Flat list of perturbation SPECS (not materialised x-vectors): 2 per
-        // diagonal (±hᵢ), then 4 per (a<b) off-diagonal pair. Each par_iter task
-        // clones `x_hat` once and applies its spec, so only ~n_threads vectors are
-        // live at a time instead of all ~2·nf² perturbed points held resident for
-        // the whole reduction (the pre-#298 O(nf²·np) footprint) (#298).
-        #[derive(Clone, Copy)]
-        enum Pert {
-            Single {
-                i: usize,
-                di: f64,
-            },
-            Pair {
-                i: usize,
-                di: f64,
-                j: usize,
-                dj: f64,
-            },
+        // Adaptively select the FD step: halve up to 8× until all free-parameter
+        // diagonal stencils are finite. Most models use the initial step; halving
+        // only kicks in when the OFV overflows at the default perturbation size.
+        let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0_fd, &fd_ofv);
+        if options.verbose && n_halvings > 0 {
+            eprintln!(
+                "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
+                initial_eps,
+                eps,
+                n_halvings,
+                if n_halvings == 1 { "" } else { "s" }
+            );
         }
-        let mut specs: Vec<Pert> = Vec::with_capacity(2 * nf + 2 * nf * nf);
-        for a in 0..nf {
-            let (i, hi) = (free_idx[a], hsteps[a]);
-            specs.push(Pert::Single { i, di: hi });
-            specs.push(Pert::Single { i, di: -hi });
-        }
-        let n_diag = specs.len();
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-        for a in 0..nf {
-            for b in (a + 1)..nf {
-                let (i, j) = (free_idx[a], free_idx[b]);
-                let (hi, hj) = (hsteps[a], hsteps[b]);
-                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
-                    specs.push(Pert::Pair {
-                        i,
-                        di: si * hi,
-                        j,
-                        dj: sj * hj,
-                    });
-                }
-                pairs.push((a, b));
-            }
-        }
-        let report = cov_progress("Hessian", specs.len(), options.verbose);
-        let vals: Vec<f64> = specs
-            .par_iter()
-            .map(|p| {
-                // Cooperative cancel: skip this point's EBE reconvergence and
-                // return NaN so the queue drains; bailed on below.
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return f64::NAN;
-                }
-                let mut xv = x_hat.to_vec();
-                match *p {
-                    Pert::Single { i, di } => xv[i] += di,
-                    Pert::Pair { i, di, j, dj } => {
-                        xv[i] += di;
-                        xv[j] += dj;
-                    }
-                }
-                let v = serial_ofv(&xv);
-                report();
-                v
-            })
-            .collect();
-        if crate::cancel::is_cancelled(&options.cancel) {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
-        }
-        // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
-        for a in 0..nf {
-            let i = free_idx[a];
-            let hi = hsteps[a];
-            let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
-            if h_ii.is_finite() {
-                hess[(i, i)] = h_ii;
-            } else {
-                fd_diag_nan.insert(i);
-            }
-        }
-        // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
-        let mut off = n_diag;
-        for &(a, b) in &pairs {
-            let (i, j) = (free_idx[a], free_idx[b]);
-            let (hi, hj) = (hsteps[a], hsteps[b]);
-            let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
-            off += 4;
-            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-            if h_ij.is_finite() {
-                hess[(i, j)] = h_ij;
-                hess[(j, i)] = h_ij;
-            } else {
-                fd_offdiag_nan.insert(i);
-                fd_offdiag_nan.insert(j);
-            }
-        }
+
+        let stencil = match fd_ofv_stencil(n, x_hat, &free_idx, eps, f0_fd, &fd_ofv, options) {
+            Some(stencil) => stencil,
+            None => return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string()),
+        };
+        // `+=`, not `copy_from`: on the salvage route `hess` already holds the analytic terms.
+        // On the `Whole` route it is the zero matrix, so this is the previous assignment.
+        hess += stencil.hess;
+        fd_diag_nan = stencil.diag_nan;
+        fd_offdiag_nan = stencil.offdiag_nan;
     }
+
+    // Which mechanism produced the matrix, for every message below. Three routes, three
+    // labels: no stencil ran at all; a stencil ran over the whole population; a stencil ran
+    // over the salvaged minority while the rest was exact. Derived from what actually happened
+    // rather than from `options.analytic_cov_hessian`, which says only what was asked for.
+    let source = if fd_scope.is_none() {
+        CovHessianSource::AnalyticRMatrix
+    } else if salvaged.is_empty() {
+        CovHessianSource::FdStencil
+    } else {
+        CovHessianSource::HybridRMatrix
+    };
 
     // ── Parameter-prior curvature (#254) ─────────────────────────────────────
     //
@@ -1239,15 +1500,19 @@ pub(crate) fn compute_covariance(
     let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
     cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
 
-    // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate
-    // cause labels — post-hoc checks on `hess` would always read 0 (finite) because
-    // non-finite FD results are never stored (only the zero initialisation remains).
+    // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate cause labels:
+    // a non-finite stencil result is never stored, so the entry keeps whatever was already
+    // there — the zero initialisation on the population-stencil route, the in-scope subjects'
+    // analytic term on the hybrid one — and a post-hoc check on `hess` would read that as
+    // genuine curvature (or, on the FD route, as a flat objective) either way.
     let mut problem_params: Vec<String> = Vec::new();
     for &i in &free_idx {
         let diag = hess[(i, i)];
         if fd_diag_nan.contains(&i) {
-            // Diagonal FD stencil overflowed; zero stored value does not mean flat
-            // objective. Adjust fd_hessian_step or check for model overflow.
+            // The diagonal stencil overflowed, so this coordinate's curvature is incomplete
+            // whatever `hess` now reads. Fatal on both routes — reported here and turned into
+            // an `Unusable` below — because a diagonal is what every SE divides through.
+            // Adjust fd_hessian_step or check for model overflow.
             problem_params.push(format!(
                 "{} (FD stencil non-finite; model may overflow at perturbation — \
                  try tuning fd_hessian_step)",
@@ -1386,6 +1651,48 @@ pub(crate) fn compute_covariance(
 
     let mut cov_warnings: Vec<String> = Vec::new();
 
+    // #1514: name the salvaged subjects, unconditionally — not only when the eigenvalue floor
+    // fired. The route is a property of the numbers on the page, and a user comparing two runs
+    // of the same model (or this model against its `analytic_cov_hessian = false` twin) has no
+    // other way to see that one subject's term came off a different estimator. Emitted here,
+    // after the estimator has been assembled, so a covariance step that failed earlier says
+    // nothing about a route whose result was discarded.
+    //
+    // Read off `source` rather than off `salvaged` directly, so the note and the
+    // regularization message's route label are **one** derived value with two consumers. That
+    // is not decoration: the label is only *observable* on a fit whose eigenvalue floor fired,
+    // so a mutation of the three-way derivation above went undetected by the whole suite until
+    // the note was routed through it (measured — the `M5` cell of this PR's mutation sweep
+    // killed nothing before this line, and kills `one_declining_subject_reproduces_the_pure_
+    // analytic_covariance` after). `format_salvage_note`'s own emptiness guard is what makes
+    // it total for the two non-hybrid arms, not a second gate on the same fact.
+    //
+    // Gated on the estimator for the same reason the eigen-floor warning twelve lines below is
+    // (#1516 review §1): under `covariance_method = s` the returned covariance is `S⁻¹` from
+    // `assemble_score_cross_product` alone and `R` is discarded, so *nothing* about the route
+    // that assembled `R` reaches the numbers on the page. The note's closing claim — that the
+    // named subjects' terms use a different estimator than the rest — would then be a
+    // statement about a matrix this step threw away.
+    let salvaged_ids: Vec<&str> = match source {
+        CovHessianSource::HybridRMatrix
+            if options.covariance_method != CovarianceMethod::CrossProduct =>
+        {
+            salvaged
+                .iter()
+                .map(|&i| population.subjects[i].id.as_str())
+                .collect()
+        }
+        CovHessianSource::HybridRMatrix
+        | CovHessianSource::AnalyticRMatrix
+        | CovHessianSource::FdStencil => Vec::new(),
+    };
+    if let Some(note) = format_salvage_note(&salvaged_ids, population.subjects.len()) {
+        if options.verbose {
+            eprintln!("  {}", note);
+        }
+        cov_warnings.push(note);
+    }
+
     // The Hessian eigenvalue-floor warning is about `R`. It is relevant only when
     // the returned covariance actually uses `R⁻¹` (Hessian and sandwich); the
     // cross-product path returns `S⁻¹` (with a full-rank `S` guaranteed above), so
@@ -1393,24 +1700,20 @@ pub(crate) fn compute_covariance(
     if inv.n_clipped > 0 && options.covariance_method != CovarianceMethod::CrossProduct {
         // #520 C1/C2 and the label fix. Severity is graded on magnitude (`|min λ| / λ_max` and
         // the variance inflation the floor caused), never on the clipped count; the route is
-        // named from `analytic_hess`, so "FD Hessian" is no longer printed on the analytic
-        // R-matrix route; and the FD-route-only sentences (which gate clause declined the
+        // named from what actually ran, so "FD Hessian" is no longer printed on the analytic
+        // R-matrix route; and the stencil-only sentences (which gate clause declined the
         // analytic route, what tolerance the ODEs integrate at) are attached here, where all of
         // those facts are in scope. The prose itself lives in `cov_diagnostics` and is
         // unit-tested cell by cell without a fit.
-        let source = if analytic_hess.is_some() {
-            CovHessianSource::AnalyticRMatrix
-        } else {
-            CovHessianSource::FdStencil
-        };
-        // Resolved only on the FD route, and only here: the walk is one predicate sweep per
+        //
+        // Resolved only where a stencil ran, and only here: the walk is one predicate sweep per
         // subject, which is nothing against the stencil that has just run, but it is not free
-        // on a fit that had no complaint to make.
-        let declines = match source {
-            CovHessianSource::FdStencil => {
-                analytic_cov_declines(model, population, options, is_mixture)
-            }
-            CovHessianSource::AnalyticRMatrix => Vec::new(),
+        // on a fit that had no complaint to make. On the hybrid route it is the *salvaged*
+        // subjects' clauses it names — the same walk, since every other subject passes it.
+        let declines = if source.emits_fd_guidance() {
+            analytic_cov_declines(model, population, options, is_mixture)
+        } else {
+            Vec::new()
         };
         let facts = CovRegularizationFacts {
             source,
@@ -1438,9 +1741,11 @@ pub(crate) fn compute_covariance(
         eprintln!("  Covariance step successful");
     }
 
-    // Soft warning: cross-partial FD stencils that returned NaN/Inf were stored as 0,
-    // so off-diagonal correlation is missing for these parameters. SEs for the named
-    // parameters may be over-optimistic (correlation with other parameters is absent).
+    // Soft warning: cross-partial stencils that returned NaN/Inf contributed nothing, so some
+    // off-diagonal correlation is missing for these parameters and their SEs may be
+    // over-optimistic. *How much* is missing depends on the route — the whole cross-partial on
+    // the population stencil, only the declined subjects' share of it on the hybrid — so the
+    // sentence is built from `source` rather than stated once (#1514 review §1).
     if !fd_offdiag_nan.is_empty() {
         // Sort by packed index so the warning message is deterministic regardless
         // of HashSet iteration order.
@@ -1450,12 +1755,7 @@ pub(crate) fn compute_covariance(
             .iter()
             .map(|&i| packed_param_label(i, template))
             .collect();
-        let msg = format!(
-            "Covariance step: off-diagonal FD stencil(s) non-finite for {}. \
-             Cross-partial correlation set to 0; SE for these parameter(s) \
-             may be over-optimistic. Try tuning fd_hessian_step.",
-            names.join(", ")
-        );
+        let msg = format_offdiag_nan_warning(&names.join(", "), source);
         if options.verbose {
             eprintln!("  {}", msg);
         }

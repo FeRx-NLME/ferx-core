@@ -202,7 +202,7 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 ///
 /// This passes because the warning reads a runtime log rather than a model-level
 /// predicate; a gate written against `gradient_method_outer` would have emitted
-/// "1 of 2 ... use finite-difference outer gradients" here.
+/// "1 of 2 ... could not be given the exact analytic outer gradient" here.
 #[test]
 fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let model = ferx_core::parse_model_string(MIXTURE_F).expect("mixture model parses");

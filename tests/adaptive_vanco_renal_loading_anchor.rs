@@ -76,11 +76,11 @@ const SIGNAL_TOL: f64 = 0.02;
 /// The pre-scheduled loading dose (mg), carried on the subject, not in the reactive ledger.
 const LOADING_DOSE_MG: f64 = 1500.0;
 
-/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs nightly, so
-/// without this a typo in `adaptive_vanco_renal_loading.ferx` or its subject CSV — which
-/// exercise the #930 base-regimen × time-varying-covariate surface — would slip past the
-/// per-PR job. `parse_full_model_file` runs the full `[adaptive_dosing]` `validate()`, and
-/// loading the CSV pins the base regimen and the time-varying covariate.
+/// Fast guard: a typo in `adaptive_vanco_renal_loading.ferx` or its subject CSV — which
+/// exercise the #930 base-regimen × time-varying-covariate surface — fails here, by name,
+/// rather than as a mismatch in the cross-engine check below. `parse_full_model_file` runs the
+/// full `[adaptive_dosing]` `validate()`, and loading the CSV pins the base regimen and the
+/// time-varying covariate.
 #[test]
 fn vanco_renal_loading_example_parses_and_pins_the_scenario() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_loading.ferx"))
@@ -127,10 +127,6 @@ fn vanco_renal_loading_example_parses_and_pins_the_scenario() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow + mrgsolve-anchored vanco renal-decline loading-dose base regimen (#930): opt in with --features slow-tests"
-)]
 fn vanco_renal_loading_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_loading.ferx"))
         .expect("vanco renal-loading model must parse");

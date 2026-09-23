@@ -3937,3 +3937,71 @@ fn w_cens_unexpected_is_reported_once_per_subject_for_each_sign() {
         lines[1]
     );
 }
+
+/// B6b, the leg that `a_cens_cell_holding_no_flag_is_an_error_only_on_a_row_that_reads_it`
+/// cannot reach: the row an **active** `[data_selection]` filter *keeps* (#1496).
+///
+/// That test pairs an unfiltered read that rejects with a filtered read whose clause
+/// removes the offending row — two reads that differ by the clause *and* by whether a
+/// filter is compiled at all. Both `CENS` sites sit after the filter's `continue`, so
+/// "the filter kept this row" is the condition they are meant to run under, and nothing
+/// pinned that: `CensCell::NotWhole(cell) if dv_missing || filter.is_some()` on the
+/// reject, and `filter.is_none() &&` on the warning's `if`, each leave the whole suite
+/// green (measured, 137 `io::datareader` tests). A dataset that fits with an `ignore`
+/// clause — which is most of them — would then be back to the silent `0` this issue is
+/// about.
+///
+/// So both legs here hold the filter fixed and vary only **which row the clause names**:
+/// `TIME == 2` removes the offending row, `TIME == 1` removes its clean neighbour and
+/// leaves the offending one in. The removing leg asserts the row really went, or the
+/// pair collapses to two reads of the same population. The message text itself is
+/// pinned by `cens_not_whole_message` and
+/// `w_cens_unexpected_quotes_the_cell_and_names_the_tail_its_sign_is_scored_on`; what is
+/// asserted here is only that the filter does not suppress it.
+#[test]
+fn a_cens_cell_is_still_read_on_an_observation_row_an_active_filter_keeps() {
+    let read = |cell: &str, clause: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+             1,0,.,1,1,100,1,\n\
+             1,1,5.0,0,0,.,1,0\n\
+             1,2,4.0,0,0,.,1,{cell}\n"
+        ));
+        let filter = SelectionFilter::from_opts(&[clause.to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter {clause:?}: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter)
+    };
+
+    // The reject. `TIME == 2` removes the cell, `TIME == 1` keeps it.
+    let removed = read("abc", "TIME == 2").unwrap_or_else(|e| panic!("removed row: {e}"));
+    assert_eq!(
+        removed.subjects[0].observations,
+        vec![5.0],
+        "the clause must remove the offending row, or the two legs read the same rows"
+    );
+    let err = read("abc", "TIME == 1").expect_err("the kept row is scored, so it is read");
+    assert!(err.contains("time 2: CENS=\"abc\""), "{err}");
+
+    // The warning, on the same pair of clauses.
+    let lines = |cell: &str, clause: &str| {
+        let pop = read(cell, clause).unwrap_or_else(|e| panic!("{cell} under {clause:?}: {e}"));
+        let lines: Vec<String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .cloned()
+            .collect();
+        (pop.subjects[0].cens.clone(), lines)
+    };
+    let (cens, quiet) = lines("7", "TIME == 2");
+    assert_eq!(cens, vec![0], "the clause must remove the flagged row");
+    assert!(quiet.is_empty(), "{quiet:?}");
+    let (cens, warned) = lines("7", "TIME == 1");
+    assert_eq!(cens, vec![7], "the clause must keep the flagged row");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(
+        warned[0].starts_with("W_CENS_UNEXPECTED subject 1: CENS=7 "),
+        "{}",
+        warned[0]
+    );
+}

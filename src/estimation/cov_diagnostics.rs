@@ -35,8 +35,9 @@ use crate::types::{CompiledModel, Population};
 ///
 /// The analytic route is not step-free everywhere — `third_order_fd_step` finite-differences
 /// the `Dual2` jet to assemble the third-order blocks, which is a step across a *smooth*
-/// sensitivity rather than across the objective, and #1505 records the one measured case where
-/// that distinction bites (a lagged-dose arrival kink). What the label asserts is narrower and
+/// sensitivity rather than across the objective, and #1505 measured the one case where that
+/// distinction bit (a lagged-dose arrival kink), which the sweep now bounds its step around
+/// (`kink_step_bound`). What the label asserts is narrower and
 /// stays true: this route never second-differences the objective, so neither `fd_hessian_step`
 /// nor a looser `ode_reltol` reaches it through the `1/h²` mechanism.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,6 +47,11 @@ pub(crate) enum CovHessianSource {
     AnalyticRMatrix,
     /// Central second differences of the reconverged objective. The `1/h²` route.
     FdStencil,
+    /// The per-subject salvage (#1514): `Σᵢ Rᵢ` with the in-scope subjects' terms assembled
+    /// analytically and the declining subjects' terms second-differenced from *their own*
+    /// marginal. Both mechanisms are present, so the label names both and the FD guidance
+    /// below still applies — to the salvaged subjects' share of the matrix.
+    HybridRMatrix,
 }
 
 impl CovHessianSource {
@@ -54,6 +60,23 @@ impl CovHessianSource {
         match self {
             CovHessianSource::AnalyticRMatrix => "the analytic R-matrix",
             CovHessianSource::FdStencil => "the FD Hessian",
+            CovHessianSource::HybridRMatrix => "the hybrid analytic/FD R-matrix",
+        }
+    }
+
+    /// Whether *any* part of this Hessian came through the `1/h²` objective stencil, and so
+    /// whether the message's finite-difference tail (which clause declined the analytic route,
+    /// what tolerance the ODEs integrate at) is true of it.
+    ///
+    /// Not `== FdStencil`. On the hybrid route the declined subjects' terms are genuinely
+    /// second differences of the objective, so suppressing the tail there would withhold the
+    /// one sentence that says *why* they declined — and the clause it names is exactly the
+    /// thing a user can act on. Gating on the mechanism rather than on the route keeps the
+    /// pure-analytic cell silent, which is what #520's label fix was about.
+    pub(crate) fn emits_fd_guidance(self) -> bool {
+        match self {
+            CovHessianSource::AnalyticRMatrix => false,
+            CovHessianSource::FdStencil | CovHessianSource::HybridRMatrix => true,
         }
     }
 }
@@ -601,15 +624,37 @@ fn sentence_case(s: String) -> String {
     }
 }
 
-fn decline_sentences(declines: &[CovScopeDecline]) -> String {
+/// Who declined, and what a remedy moves — the second truth condition of these sentences,
+/// added with #1514's hybrid route (#1516 review §2).
+///
+/// On [`CovHessianSource::FdStencil`] the decline is the whole fit's: no subject took the
+/// analytic route, so "the exact analytic covariance R-matrix was declined" and "the fit stays
+/// on the finite-difference route" are both true of the fit. On
+/// [`CovHessianSource::HybridRMatrix`] they are false — the *majority* of subjects were
+/// assembled analytically and only the salvaged minority was second-differenced — so the
+/// subject of every sentence becomes those subjects. Telling a 100-subject fit with three
+/// event-walk subjects that it "is on the finite-difference route" misnames 97 of them.
+///
+/// One `match`, read by all three sentences, so a future fourth route cannot leave one of them
+/// true and another false.
+fn decline_sentences(declines: &[CovScopeDecline], source: CovHessianSource) -> String {
     if declines.is_empty() {
         return String::new();
     }
+    let hybrid = matches!(source, CovHessianSource::HybridRMatrix);
     let clauses: Vec<&str> = declines.iter().map(|d| d.clause()).collect();
-    let mut out = format!(
-        " The exact analytic covariance R-matrix was declined because {}.",
-        join_and(&clauses)
-    );
+    let mut out = if hybrid {
+        format!(
+            " The finite-differenced subjects declined the exact analytic covariance R-matrix \
+             because {}.",
+            join_and(&clauses)
+        )
+    } else {
+        format!(
+            " The exact analytic covariance R-matrix was declined because {}.",
+            join_and(&clauses)
+        )
+    };
 
     let actions: Vec<&str> = declines.iter().filter_map(|d| d.remedy()).collect();
     if actions.is_empty() {
@@ -626,8 +671,9 @@ fn decline_sentences(declines: &[CovScopeDecline]) -> String {
         } else {
             "together move"
         };
+        let moved = if hybrid { "those subjects" } else { "the fit" };
         out.push_str(&format!(
-            " {} {verb} the fit onto the analytic route.",
+            " {} {verb} {moved} onto the analytic route.",
             sentence_case(join_and(&actions)),
         ));
     } else {
@@ -645,8 +691,13 @@ fn decline_sentences(declines: &[CovScopeDecline]) -> String {
         } else {
             "the remaining clauses have"
         };
+        let stays = if hybrid {
+            "those subjects stay"
+        } else {
+            "the fit stays"
+        };
         out.push_str(&format!(
-            " {} {cleared}, but {remaining} no one-line remedy, so the fit stays on the \
+            " {} {cleared}, but {remaining} no one-line remedy, so {stays} on the \
              finite-difference route until all of them are cleared.",
             sentence_case(join_and(&actions)),
         ));
@@ -678,12 +729,13 @@ pub(crate) fn format_regularized_warning(facts: &CovRegularizationFacts) -> Stri
 
     // Everything below is specific to the finite-difference stencil: it is the `1/h²` route,
     // the only one with an objective step size and the only one a tolerance moves through that
-    // mechanism. On the analytic route the message ends above.
-    if facts.source != CovHessianSource::FdStencil {
+    // mechanism. On the pure-analytic route the message ends above; on the hybrid route it does
+    // not, because a stencil did run — over the subjects the clauses below name.
+    if !facts.source.emits_fd_guidance() {
         return msg;
     }
 
-    msg.push_str(&decline_sentences(facts.declines));
+    msg.push_str(&decline_sentences(facts.declines, facts.source));
 
     if let Some(ode) = facts.ode {
         if ode.looser_than_cov_plateau() {
@@ -701,6 +753,124 @@ pub(crate) fn format_regularized_warning(facts: &CovRegularizationFacts) -> Stri
     }
 
     msg
+}
+
+/// The note for cross-partial stencils that returned `NaN`/`Inf`, worded for the route that
+/// produced the Hessian (#1514 review §1).
+///
+/// What survives in the matrix is route-dependent, and the difference is the whole content of
+/// the sentence:
+///
+/// * **Whole-population stencil** — the cross-partial *is* the stencil, so a non-finite result
+///   leaves the entry at its zero initialisation. Correlation between the named parameters is
+///   wholly absent.
+/// * **Hybrid** (#1514) — the entry already holds the in-scope subjects' cross-partial,
+///   assembled analytically, and the stencil's contribution is added to it. Only the declined
+///   subjects' share of that cross-partial is missing. Saying "set to 0" there overstates the
+///   damage and points the reader at the wrong quantity.
+///
+/// Both wordings keep the `off-diagonal FD stencil` token that `classify_warning` keys
+/// `WarningCode::CovarianceRegularized` on, and both keep the `fd_hessian_step` advice, which
+/// is the actionable half and is true on either route — the stencil that failed is a stencil
+/// either way.
+///
+/// [`CovHessianSource::AnalyticRMatrix`] shares the whole-population wording and is
+/// unreachable: no stencil runs on that route, so there are no non-finite cross-partials to
+/// name. It is written out rather than left to a catch-all so that a future fourth route has
+/// to choose.
+pub(crate) fn format_offdiag_nan_warning(names: &str, source: CovHessianSource) -> String {
+    match source {
+        CovHessianSource::HybridRMatrix => format!(
+            "Covariance step: off-diagonal FD stencil(s) non-finite for {names}. \
+             Those cross-partials keep only the analytically assembled subjects' \
+             contribution — the finite-differenced subjects' share of them is missing — so \
+             SE for these parameter(s) may be over-optimistic. Try tuning fd_hessian_step."
+        ),
+        CovHessianSource::FdStencil | CovHessianSource::AnalyticRMatrix => format!(
+            "Covariance step: off-diagonal FD stencil(s) non-finite for {names}. \
+             Cross-partial correlation set to 0; SE for these parameter(s) \
+             may be over-optimistic. Try tuning fd_hessian_step."
+        ),
+    }
+}
+
+/// How many salvaged subject ids the message prints before it summarises the rest.
+///
+/// The list is a *pointer*, not a record: a user who wants all of them reads the model's scope
+/// gate, and a 300-subject population that salvages 140 would otherwise put a paragraph of ids
+/// into a warning that has one actionable sentence. Ten is enough to recognise a pattern (all
+/// the sparse subjects, all of occasion 2) without the message becoming the id list.
+const SALVAGE_ID_LIST_CAP: usize = 10;
+
+/// The informational note naming the subjects whose covariance terms were finite-differenced
+/// while the rest of the population used the exact analytic R-matrix (#1514).
+///
+/// `ids` are the salvaged subjects' ids in population order — **one per population index**,
+/// which is what `n` counts. `n_total` is the whole population.
+///
+/// Returns `None` when nothing was salvaged — the pure-analytic and pure-FD routes both say
+/// nothing here, so the note's presence *is* the statement that the hybrid route ran.
+///
+/// Every sentence is gated on being true of the cell it prints in: the counts and the
+/// agreement come from `ids.len()` and `n_total`, and the "remaining" clause is only reachable
+/// with at least one analytically-assembled subject, which the caller's short-circuit
+/// guarantees (a full decline takes the population stencil instead).
+///
+/// Counting and *printing* are deliberately two different things here (#1516 review §3). A
+/// dataset may repeat an id across stacked occasions, and the same id printed twice reads as
+/// two subjects — so the printed list drops duplicates. It must not drop them from the counts:
+/// each population index carries its own information term, so two salvaged subjects sharing an
+/// id string are two salvaged terms, and deriving `n` (and with it `remaining`) from the
+/// deduped list under-reported the salvage and over-reported the analytic remainder by the
+/// same amount. On the usual unique-id population the dedupe is a no-op and nothing moves.
+pub(crate) fn format_salvage_note(ids: &[&str], n_total: usize) -> Option<String> {
+    let n = ids.len();
+    if n == 0 || n_total == 0 {
+        return None;
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(n);
+    for id in ids {
+        if !seen.contains(id) {
+            seen.push(id);
+        }
+    }
+    let listed: Vec<&str> = seen.iter().take(SALVAGE_ID_LIST_CAP).copied().collect();
+    // The "and N more" tail counts the ids the list did *not* print, so it is keyed off the
+    // distinct ids the list is drawn from — not off `n`, which may exceed them.
+    let id_list = if seen.len() > listed.len() {
+        format!(
+            "{} and {} more",
+            listed.join(", "),
+            seen.len() - listed.len()
+        )
+    } else {
+        join_and(&listed)
+    };
+    // Singular / plural agreement on three different nouns (subject, term, marginal) plus the
+    // verb, all keyed off the same count — written out rather than suffixed with "(s)", because
+    // the one-subject cell is the common one and is what the measurement in #1514 was made on.
+    let (id_label, verb, term, marginal) = if n == 1 {
+        ("ID", "is", "its information term was", "its own marginal")
+    } else {
+        (
+            "IDs",
+            "are",
+            "their information terms were",
+            "their own marginals",
+        )
+    };
+    let remaining = n_total.saturating_sub(n);
+    let rest = if remaining == 1 {
+        "the remaining subject was assembled analytically".to_string()
+    } else {
+        format!("the remaining {remaining} subjects were assembled analytically")
+    };
+    Some(format!(
+        "W_COV_ANALYTIC_SALVAGE: {n} of {n_total} subjects ({id_label} {id_list}) {verb} outside \
+         the exact analytic covariance R-matrix scope; {term} finite-differenced from \
+         {marginal}, and {rest}. Each subject contributes its own term to the information \
+         matrix, so only the named subjects' terms use a different estimator."
+    ))
 }
 
 /// The sentence appended to the "N of M subjects use finite-difference inner gradients"
