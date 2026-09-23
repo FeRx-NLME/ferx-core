@@ -85,6 +85,10 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
 mod dw_autocorrelation_warning_tests;
 
+#[cfg(test)]
+#[path = "tests/optimizer_label_tests.rs"]
+mod optimizer_label_tests;
+
 #[cfg(all(test, feature = "nn"))]
 #[path = "tests/nn_info_tests.rs"]
 mod nn_info_tests;
@@ -177,6 +181,49 @@ pub fn fit_from_files(
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
     Ok(result)
+}
+
+/// The outer optimizer reported on `FitResult::optimizer`.
+///
+/// For the FOCE/FOCEI path with the default `auto`, surface the concrete optimizer
+/// `auto` resolved to (e.g. `auto (nlopt_lbfgs)`) so the output records what actually
+/// ran (#490). The resolution is read off
+/// `estimation::outer_optimizer::resolve_outer_optimizer` — the function the outer loop
+/// itself dispatches on — and not a second copy of the rule: a mixture model downgrades
+/// `auto` to BOBYQA there, which `Optimizer::resolve_auto` alone does not know about
+/// (#1540). `has_mixture` is the same `init_params.mixture.is_some()` the outer loop keys on.
+pub(crate) fn reported_optimizer_label(
+    method: EstimationMethod,
+    options: &FitOptions,
+    model: &CompiledModel,
+    has_mixture: bool,
+) -> String {
+    match method {
+        EstimationMethod::Saem => "saem".to_string(),
+        EstimationMethod::FoceGn => "gn".to_string(),
+        EstimationMethod::FoceGnHybrid => "gn".to_string(),
+        // IMP/IMPMAP never run the outer optimizer — their M-step uses an
+        // internal BOBYQA regardless of `options.optimizer`, so report that
+        // rather than a setting that had no effect.
+        EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
+        EstimationMethod::Imp => "imp-bobyqa".to_string(),
+        _ => {
+            if options.optimizer == Optimizer::Auto {
+                let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+                    Optimizer::Auto,
+                    model,
+                    has_mixture,
+                    crate::sens::provider::analytic_outer_gradient_for_interaction(
+                        model,
+                        options.interaction,
+                    ),
+                );
+                format!("auto ({})", resolved.label())
+            } else {
+                options.optimizer.label().to_string()
+            }
+        }
+    }
 }
 
 /// Warning for an explicit `optimizer = bobyqa` on a problem too large for it
@@ -2703,32 +2750,8 @@ fn fit_inner(
         warnings.push(msg);
     }
 
-    // Reported outer optimizer. For the FOCE/FOCEI path with the default `auto`,
-    // surface the concrete optimizer `auto` resolved to (e.g. `auto (nlopt_lbfgs)`)
-    // so the output records what actually ran (#490).
-    let optimizer_label: String = match final_method {
-        EstimationMethod::Saem => "saem".to_string(),
-        EstimationMethod::FoceGn => "gn".to_string(),
-        EstimationMethod::FoceGnHybrid => "gn".to_string(),
-        // IMP/IMPMAP never run the outer optimizer — their M-step uses an
-        // internal BOBYQA regardless of `options.optimizer`, so report that
-        // rather than a setting that had no effect.
-        EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
-        EstimationMethod::Imp => "imp-bobyqa".to_string(),
-        _ => {
-            if options.optimizer == Optimizer::Auto {
-                format!(
-                    "auto ({})",
-                    options
-                        .optimizer
-                        .resolve_auto(model, options.interaction)
-                        .label()
-                )
-            } else {
-                options.optimizer.label().to_string()
-            }
-        }
-    };
+    let optimizer_label =
+        reported_optimizer_label(final_method, options, model, init_params.mixture.is_some());
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,

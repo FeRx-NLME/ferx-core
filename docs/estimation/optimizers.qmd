@@ -37,7 +37,7 @@ The default `optimizer = auto` picks the algorithm per model (see [`auto`](#the-
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
+| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
 
 ### NLopt algorithms
 
@@ -162,11 +162,12 @@ generous enough that the good start is allowed to settle.
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
 - **`nlopt_lbfgs`** — when the **exact analytic FOCE/FOCEI gradient** is available: an analytical PK model (or an in-scope user-`[odes]` model, see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) that is in the sensitivity provider's scope and is **not** forced onto finite differences via `gradient = fd`.
-- **`bobyqa`** — otherwise: out-of-scope ODE/PD models, log-transform-both-sides (LTBS), SDE models, or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+- **`bobyqa`** — otherwise: out-of-scope ODE/PD models (including the LTBS combinations listed above), SDE models, or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+- **`bobyqa`**, also, for every [mixture model](mixture.qmd), whatever its gradient scope: BOBYQA is robust against the mixture's label-switching multimodality. An NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) set explicitly is honoured.
 
 The choice mirrors the analytic-vs-FD decision the outer loop already makes, so `auto` lands on the gradient-based optimizer exactly when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin).
 
-The resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+The resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 

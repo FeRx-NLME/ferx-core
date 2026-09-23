@@ -79,6 +79,11 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **A mixture model left on `optimizer = auto` now reports `auto (bobyqa)`, the optimizer
+  that actually ran.** Mixture fits have always run BOBYQA under `auto`, but the fit output
+  reported the non-mixture pick (`auto (nlopt_lbfgs)` for a model in analytic scope), and
+  the build info reported an analytic outer gradient where none was used. Both now read
+  the outer loop's own resolution rule (#1540).
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every

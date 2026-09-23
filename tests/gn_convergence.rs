@@ -93,9 +93,11 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
 /// GN-hybrid trust-region on warfarin: the GN phase followed by FOCEI polish
 /// must reach the known-good minimum.
 ///
-/// Baseline -279.1243: the FOCEI polish (run with the default `bobyqa`
-/// optimizer since #155 — see `FitOptions::default`) improves on pure GN-TR by
-/// ~0.01 OFV.  SLSQP-driven polish only reaches -278.7336 (gap ~0.39 OFV),
+/// Baseline -279.1243: the FOCEI polish (then run with the `bobyqa` default of
+/// #155) improved on pure GN-TR by ~0.01 OFV. Since #490 the polish inherits
+/// `optimizer = auto`, which resolves to `nlopt_lbfgs` on warfarin, and reaches
+/// OFV -286.004 (measured on #1540, release, macOS) — well inside the one-sided
+/// bound below.  SLSQP-driven polish only reaches -278.7336 (gap ~0.39 OFV),
 /// so the pass threshold `KNOWN_GOOD_OFV + TOLERANCE` = -278.8743 is
 /// hardcoded below the SLSQP reference: any polish stage that regresses to
 /// SLSQP-level performance fails the assert.  Name says "beats_slsqp"
