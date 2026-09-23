@@ -35,8 +35,9 @@ use crate::types::{CompiledModel, Population};
 ///
 /// The analytic route is not step-free everywhere — `third_order_fd_step` finite-differences
 /// the `Dual2` jet to assemble the third-order blocks, which is a step across a *smooth*
-/// sensitivity rather than across the objective, and #1505 records the one measured case where
-/// that distinction bites (a lagged-dose arrival kink). What the label asserts is narrower and
+/// sensitivity rather than across the objective, and #1505 measured the one case where that
+/// distinction bit (a lagged-dose arrival kink), which the sweep now bounds its step around
+/// (`kink_step_bound`). What the label asserts is narrower and
 /// stays true: this route never second-differences the objective, so neither `fd_hessian_step`
 /// nor a looser `ode_reltol` reaches it through the `1/h²` mechanism.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

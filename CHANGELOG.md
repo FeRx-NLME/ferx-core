@@ -79,6 +79,25 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **Analytic ODE covariance: the third-order sweep no longer differences across a
+  lagged-dose arrival.** On a two-state depot + `ALAG1`-with-IIV model the exact analytic
+  R-matrix (#1291) returned `SE(TVLAG)` 27 % off at the default `ode_reltol` and
+  non-monotone in the step: the sweep's `TVLAG` step (1 % of parameter scale) shifted every
+  arrival by more than the gap to the nearest early sample, so the pair differenced a
+  pre-/post-arrival jump instead of a derivative. The sweep now enumerates the subject's
+  dose events — lagged arrivals, infusion ends, per-route onsets, `zero_order` window edges
+  — at both perturbed points with the ODE engine's own break-time builder and shrinks the
+  step until no observation, `EVID=2`, reset or dose record changes sides of an event. A
+  subject whose mode sits *on* a moving event (a corner minimum of the inner objective,
+  which a lagged arrival at a dense early sample does produce) has no third derivative
+  there and declines to the #1514 per-subject salvage, named in the
+  `W_COV_ANALYTIC_SALVAGE` note. On the regression fixture the default-tolerance standard
+  errors are now within `5e-5` of the `ode_reltol = 1e-9` run and within `1.1e-2` of the
+  finite-difference covariance route. The mixed θ-θ third-order blocks are also
+  symmetrised — the two finite-difference estimates of each pair averaged, as the η pairs
+  already were — so a bounded step on one axis no longer leaves the natural Hessian
+  asymmetric at the `1e-7` level
+  ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)).
 - **SAEM: `mstep_solver = score_sa` no longer re-opens the #1445 additive-σ collapse.**
   As #1458 shipped it, the score step moved σ at the same γ as θ and in packed (log σ)
   units — during exploration γ = 1, so that is a full Newton step to a single draw's

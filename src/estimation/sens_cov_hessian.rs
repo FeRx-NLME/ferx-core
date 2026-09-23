@@ -5677,4 +5677,790 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------------------------
+    // #1505 — the third-order sweep across a lagged-dose arrival kink.
+    // ------------------------------------------------------------------------------------
+
+    /// Two-state depot + `ALAG1` with IIV on the lag, combined error, `[scaling] y = …`
+    /// readout. The **indexed** `ALAG1` spelling is load-bearing: a bare `LAGTIME`/`ALAG` on a
+    /// `first_order` forcing is `mr_scope`-eligible and would be served in closed form, where
+    /// there is no solver step to bound and the sweep is trivially flat. The indexed spelling
+    /// populates `dose_attr_map`, which `mr_scope` declines, so the subject runs on the ODE
+    /// event-driven walk the issue is about.
+    const DEPOT_LAG_KINK_COV: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_KA ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma ADD_ERR ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA * exp(ETA_KA)
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - CL / V * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#;
+
+    /// Index of `TVLAG` in `theta` and of `ETA_LAG` in `eta` for [`DEPOT_LAG_KINK_COV`].
+    const KINK_THETA_LAG: usize = 3;
+    const KINK_ETA_LAG: usize = 2;
+
+    fn depot_lag_kink_model(fit_options: &str) -> CompiledModel {
+        let text = format!("{DEPOT_LAG_KINK_COV}\n[fit_options]\n{fit_options}\n");
+        parse_model_string(&text).expect("parse depot-lag kink fixture")
+    }
+
+    /// The lagged arrival of the single dose at `t = 0` under `eta`.
+    fn kink_arrival(model: &CompiledModel, eta: &[f64]) -> f64 {
+        model.default_params.theta[KINK_THETA_LAG] * eta[KINK_ETA_LAG].exp()
+    }
+
+    /// One subject of the kink fixture: a 100 mg dose at `t = 0`, nine post-absorption samples
+    /// whose DV is the prediction at `eta_true` under a deterministic ±3 % perturbation, and —
+    /// when `kink_offset` is given — one extra sample placed **`kink_offset` after the lagged
+    /// arrival at the subject's own EBE**, with a 2 % residual.
+    ///
+    /// The kink sample is placed relative to the EBE, not to `eta_true`, because the sweep runs
+    /// at the EBE: shrinkage moves the mode off the simulated η, and the whole point is where
+    /// the sample sits relative to the arrival *there*. Two passes: the EBE from the nine
+    /// samples fixes the arrival; the kink sample is inserted; the EBE is recomputed with it
+    /// (it moves by `O(1e-4)` in lag, the sample's residual being 2 % of a prediction that is
+    /// itself tiny), and the caller asserts the realised gap.
+    fn depot_lag_kink_subject(
+        model: &CompiledModel,
+        id: &str,
+        eta_true: &[f64],
+        kink_offset: Option<f64>,
+    ) -> Subject {
+        let base_times = vec![1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0];
+        let n = base_times.len();
+        let mut subject = Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: base_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_l2: Vec::new(),
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            model,
+            &subject,
+            &model.default_params.theta,
+            eta_true,
+        );
+        subject.observations = preds
+            .iter()
+            .enumerate()
+            .map(|(j, p)| p * (0.97 + 0.02 * (j % 4) as f64))
+            .collect();
+        let Some(offset) = kink_offset else {
+            return subject;
+        };
+        let eta_hat = precise_ebe(model, &subject, &model.default_params);
+        let t_kink = kink_arrival(model, &eta_hat) + offset;
+        let pred = crate::pk::compute_predictions_with_tv(
+            model,
+            &Subject {
+                obs_times: vec![t_kink],
+                observations: vec![0.0],
+                obs_cmts: vec![1],
+                cens: vec![0],
+                occasions: vec![1],
+                ..subject.clone()
+            },
+            &model.default_params.theta,
+            &eta_hat,
+        )[0];
+        subject.obs_times.insert(0, t_kink);
+        subject.observations.insert(0, 1.02 * pred);
+        subject.obs_cmts.insert(0, 1);
+        subject.cens.insert(0, 0);
+        subject.occasions.insert(0, 1);
+        subject
+    }
+
+    /// Gap from the kink sample (index 0) to the lagged arrival at `eta`.
+    fn kink_gap(model: &CompiledModel, subject: &Subject, eta: &[f64]) -> f64 {
+        (subject.obs_times[0] - kink_arrival(model, eta)).abs()
+    }
+
+    /// How far the **unbounded** `TVLAG` step of the sweep moves this subject's arrival:
+    /// `third_order_fd_step(TVLAG, reltol) · exp(η̂_lag)`. The straddle precondition of every
+    /// test below is `shift > gap`, asserted so the fixture cannot silently stop exercising
+    /// the bound.
+    fn unbounded_tvlag_arrival_shift(model: &CompiledModel, eta: &[f64]) -> f64 {
+        let reltol = model
+            .ode_spec
+            .as_ref()
+            .expect("ODE fixture")
+            .effective_solver_opts()
+            .reltol;
+        crate::sens::provider::third_order_fd_step(
+            model.default_params.theta[KINK_THETA_LAG],
+            reltol,
+        ) * eta[KINK_ETA_LAG].exp()
+    }
+
+    /// The sweep's kink bound is what makes the analytic ODE covariance Hessian match the
+    /// reconverged-gradient oracle when an observation sits inside the unbounded step's reach
+    /// of the lagged arrival (#1505).
+    ///
+    /// At `ode_reltol = 1e-10` the unbounded `TVLAG` step is `cbrt(1e-10)·(1 + 0.5) ≈ 7e-4`,
+    /// so a sample `4e-4` after the arrival changes sides of it between the two points of the
+    /// pair; the `ETA_LAG` step moves the arrival by `≈ 2.3e-4` and does not. The oracle's own
+    /// `1e-6·(1 + |x|)` differences move it by `1.5e-6` and are clear. Without the bound the
+    /// pair differences the `∂f/∂θ` and `∂²f/∂η∂θ` jumps (`≈ ka·D/V = 3`) as `3 / 2h ≈ 2100`
+    /// into the θ-θ and η-θ-θ blocks — measured with the bound removed: `Hessian[0,3]`
+    /// (`TVCL` × `TVLAG`) came back `7.7e-1` against the oracle's `-7.7e-4`, on a
+    /// `2e-3·(1 + |a|)` tolerance that passes with the bound (worst entry then within it).
+    #[test]
+    fn ode_lag_kink_cov_hessian_matches_reconverged_gradients_when_the_step_is_bounded() {
+        let model = depot_lag_kink_model("  ode_reltol = 1e-10\n  ode_abstol = 1e-12");
+        let subject = depot_lag_kink_subject(&model, "kink", &[0.12, -0.08, 0.10], Some(4e-4));
+        let eta = precise_ebe(&model, &subject, &model.default_params);
+        let gap = kink_gap(&model, &subject, &eta);
+        let shift = unbounded_tvlag_arrival_shift(&model, &eta);
+        assert!(
+            (2e-4..6e-4).contains(&gap) && shift > gap,
+            "fixture must straddle: gap {gap:.3e} must sit in (2e-4, 6e-4) and below the \
+             unbounded TVLAG arrival shift {shift:.3e}"
+        );
+        assert!(
+            subject_sensitivities_cov(&model, &subject, &model.default_params.theta, &eta)
+                .is_some(),
+            "an interior EBE near the kink must stay on the analytic route (the bound shrinks \
+             the step, it does not decline)"
+        );
+        check_full_natural(&model, &subject, &model.default_params);
+    }
+
+    /// A subject whose EBE sits **on** a moving event has no third derivative there, and the
+    /// sweep declines it (`None`) rather than differencing across the corner at the floor
+    /// step; the per-subject salvage (#1514) then finite-differences its own marginal. The
+    /// same subject with the sample an interior distance away is served.
+    ///
+    /// Not a hypothetical: on the population fixture behind #1505, two subjects in forty
+    /// converged to `η̂_lag = -4e-9` with the inner objective higher on *both* sides at
+    /// `±1e-5` — a V-shaped corner minimum, exactly where the arrival meets the `t = 0.5`
+    /// sample. Both cells are asserted here at the fixed `η` the sweep would receive.
+    #[test]
+    fn ode_lag_kink_sweep_declines_an_ebe_on_the_arrival_and_serves_one_beside_it() {
+        let model = depot_lag_kink_model("");
+        let theta = model.default_params.theta.clone();
+        let mut subject = depot_lag_kink_subject(&model, "corner", &[0.0, 0.0, 0.0], None);
+        // Put a sample exactly on the arrival at η = 0: `TVLAG·exp(0) = 0.5`.
+        subject.obs_times.insert(0, 0.5);
+        subject.observations.insert(0, 0.0);
+        subject.obs_cmts.insert(0, 1);
+        subject.cens.insert(0, 0);
+        subject.occasions.insert(0, 1);
+        let on_corner = [0.0, 0.0, 0.0];
+        assert_eq!(kink_gap(&model, &subject, &on_corner), 0.0);
+        assert!(
+            subject_sensitivities_cov(&model, &subject, &theta, &on_corner).is_none(),
+            "an EBE on the lagged arrival must decline the third-order sweep"
+        );
+        // A gap under the floor (`1e-6·(1 + |x|)` relative) is a corner to within the inner
+        // optimizer's resolution and declines the same way.
+        let sub_floor = [0.0, 0.0, (0.5 - 1e-8_f64) / 0.5];
+        let sub_floor = [0.0, 0.0, sub_floor[2].ln()];
+        assert!(kink_gap(&model, &subject, &sub_floor) < 2e-8);
+        assert!(
+            subject_sensitivities_cov(&model, &subject, &theta, &sub_floor).is_none(),
+            "a gap below the step floor must decline, not difference at the floor"
+        );
+        // Beside it — the arrival 1e-2 before the sample — is interior and served, with a
+        // step the bound has shrunk (the unbounded one reaches 1.5e-2).
+        let beside = [0.0, 0.0, (0.49_f64 / 0.5).ln()];
+        let gap = kink_gap(&model, &subject, &beside);
+        assert!((gap - 1e-2).abs() < 1e-9 && unbounded_tvlag_arrival_shift(&model, &beside) > gap);
+        assert!(
+            subject_sensitivities_cov(&model, &subject, &theta, &beside).is_some(),
+            "an interior EBE 1e-2 from the arrival must be served"
+        );
+    }
+
+    /// The regression test #520's review asked for, written as #1505 specified it: two-state
+    /// depot + `ALAG1` with IIV, analytic covariance route on, **default** tolerances, standard
+    /// errors at parity with the finite-difference covariance route and with the same analytic
+    /// route at `ode_reltol = 1e-9`.
+    ///
+    /// Six subjects, each with a sample `1e-2` after its own arrival. At the default the
+    /// unbounded `TVLAG` step is `1e-2·(1 + 0.5) = 1.5e-2` in θ, an arrival shift of
+    /// `1.5e-2·exp(η̂_lag)` that crosses every one of those samples; the `ETA_LAG` step
+    /// (`≈ 1e-2 · 0.5 = 5e-3`) and the FD route's `fd_hessian_step = 1e-2` in `log TVLAG`
+    /// (`≤ 5e-3`, less once the mode reconverges) do not, so the FD reference is clean and the
+    /// disagreement is the sweep's alone. Both preconditions are asserted, and so is that no
+    /// subject declined — a decline would move it onto the FD route on both sides and make the
+    /// comparison vacuous.
+    ///
+    /// Measured worst relative SE difference on this fixture: default-vs-`1e-9` analytic
+    /// `4.7e-5`; default analytic vs the FD route `1.1e-2` (the FD route itself moves: against
+    /// FD at `1e-6`/`1e-8` it is `6.6e-3`, at `1e-9` `6.5e-3`, so about half of that gap is the
+    /// stencil's own integration noise at the default, #520). Before the bound the `1e-9` gap
+    /// was `6.0e-1`, on `SE(log TVLAG)` = 0.042 against 0.105. Tolerances: `5e-4` (10× the
+    /// realised) and `3e-2` (2.7×).
+    #[test]
+    fn ode_lag_kink_default_tolerance_se_parity_with_fd_route_and_tight_run() {
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::types::{FitOptions, Population};
+
+        let loose = depot_lag_kink_model("");
+        let tight = depot_lag_kink_model("  ode_reltol = 1e-9\n  ode_abstol = 1e-11");
+        let etas_true: [[f64; 3]; 6] = [
+            [0.15, -0.10, 0.12],
+            [-0.20, 0.05, -0.15],
+            [0.05, 0.20, 0.03],
+            [-0.10, -0.15, 0.20],
+            [0.25, 0.10, -0.08],
+            [-0.05, 0.00, 0.06],
+        ];
+        let subjects: Vec<Subject> = etas_true
+            .iter()
+            .enumerate()
+            .map(|(i, e)| depot_lag_kink_subject(&loose, &format!("{}", i + 1), e, Some(1e-2)))
+            .collect();
+        let population = Population {
+            subjects,
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let p = &loose.default_params;
+        let x = pack_params(p);
+        let etas: Vec<DVector<f64>> = population
+            .subjects
+            .iter()
+            .map(|s| DVector::from_column_slice(&precise_ebe(&loose, s, p)))
+            .collect();
+        // Preconditions: every subject straddles under the unbounded step, and none is within
+        // reach of the FD route's stencil or of the η-axis step.
+        for (s, eta) in population.subjects.iter().zip(&etas) {
+            let eta: Vec<f64> = eta.iter().copied().collect();
+            let gap = kink_gap(&loose, s, &eta);
+            let theta_shift = unbounded_tvlag_arrival_shift(&loose, &eta);
+            let eta_shift = crate::sens::provider::third_order_fd_step(eta[KINK_ETA_LAG], 1e-4)
+                * kink_arrival(&loose, &eta);
+            let fd_shift = kink_arrival(&loose, &eta) * (0.01_f64.exp() - 1.0);
+            assert!(
+                (7e-3..1.3e-2).contains(&gap) && theta_shift > gap,
+                "subject {}: gap {gap:.3e} must be in (7e-3, 1.3e-2) and under the unbounded \
+                 TVLAG shift {theta_shift:.3e}",
+                s.id
+            );
+            assert!(
+                eta_shift < gap && fd_shift < gap,
+                "subject {}: the η-axis shift {eta_shift:.3e} and the FD-route shift \
+                 {fd_shift:.3e} must both stay under the gap {gap:.3e}",
+                s.id
+            );
+        }
+        let opts = FitOptions::default();
+        assert!(
+            matches!(
+                analytic_cov_assembly(&loose, &population, p, &x, &etas, &[], &opts),
+                AnalyticCovAssembly::Full(_)
+            ),
+            "no subject may decline: a salvaged term would sit on the FD route on both sides"
+        );
+
+        let se = |model: &CompiledModel, analytic: bool| -> Vec<f64> {
+            let opts = FitOptions {
+                analytic_cov_hessian: analytic,
+                ..FitOptions::default()
+            };
+            match compute_covariance(&x, p, model, &population, &etas, &[], &[], &opts) {
+                CovarianceStepResult::Success(out) => {
+                    assert!(
+                        !out.warnings.iter().any(|w| w.contains("regularized")),
+                        "covariance must not need the eigenvalue floor: {:?}",
+                        out.warnings
+                    );
+                    (0..out.matrix.nrows())
+                        .map(|i| out.matrix[(i, i)].sqrt())
+                        .collect()
+                }
+                CovarianceStepResult::Unusable(m) => panic!("unusable: {m}"),
+                CovarianceStepResult::FailedNonPd { reason, .. } => panic!("non-PD: {reason}"),
+            }
+        };
+        let se_default = se(&loose, true);
+        let se_tight = se(&tight, true);
+        let se_fd = se(&loose, false);
+        let worst = |a: &[f64], b: &[f64]| -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| {
+                    assert!(x.is_finite() && y.is_finite() && *y > 0.0);
+                    ((x - y) / y).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        let vs_tight = worst(&se_default, &se_tight);
+        let vs_fd = worst(&se_default, &se_fd);
+        eprintln!(
+            "#1505 parity: worst rel Δ vs 1e-9 = {vs_tight:.3e}, vs FD = {vs_fd:.3e}\n\
+             default {se_default:?}\ntight   {se_tight:?}\nfd      {se_fd:?}"
+        );
+        assert!(
+            vs_tight < 5e-4,
+            "default-tolerance analytic SEs must match the 1e-9 run: worst rel Δ {vs_tight:.3e}\n\
+             default {se_default:?}\ntight   {se_tight:?}"
+        );
+        assert!(
+            vs_fd < 3e-2,
+            "default-tolerance analytic SEs must match the FD covariance route: worst rel Δ \
+             {vs_fd:.3e}\nanalytic {se_default:?}\nfd       {se_fd:?}"
+        );
+    }
+
+    /// The bound reads each dose's lag from **that dose's own record snapshot** — the
+    /// event-driven walk's `pk_at_dose[k]` — not from the subject-level covariates. Here a
+    /// `FED` covariate scales the lag by `1 + FED`; the dose record carries `FED = 0.5` while
+    /// the subject-level value is `0`, so the arrival the walk actually applies is
+    /// `0.75·exp(η̂)` and a subject-level enumeration would guard `0.5·exp(η̂)` — where
+    /// nothing is sampled — leave the step unbounded at the real arrival, and fail the oracle
+    /// exactly as the unbounded sweep does (measured: this test is the one that dies when the
+    /// enumerator is fed `subject.covariates`).
+    #[test]
+    fn ode_lag_kink_bound_reads_the_dose_records_own_covariate_snapshot() {
+        let text = DEPOT_LAG_KINK_COV.replace(
+            "ALAG1 = TVLAG * exp(ETA_LAG)",
+            "ALAG1 = TVLAG * exp(ETA_LAG) * (1 + FED)",
+        );
+        let model = parse_model_string(&format!(
+            "{text}\n[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n"
+        ))
+        .expect("parse TV-covariate kink fixture");
+        let fed = |v: f64| HashMap::from([("FED".to_string(), v)]);
+        let base_times = vec![1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0];
+        let n = base_times.len();
+        let eta_true = [0.12, -0.08, 0.10];
+        let mut subject = Subject {
+            id: "tv".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: base_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: fed(0.0),
+            dose_covariates: vec![fed(0.5)],
+            obs_covariates: vec![fed(0.5); n],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_l2: Vec::new(),
+            obs_records: vec![],
+        };
+        assert!(subject.has_tv_covariates());
+        let theta = model.default_params.theta.clone();
+        let preds = crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &eta_true);
+        subject.observations = preds
+            .iter()
+            .enumerate()
+            .map(|(j, p)| p * (0.97 + 0.02 * (j % 4) as f64))
+            .collect();
+        let eta_hat = precise_ebe(&model, &subject, &model.default_params);
+        let arrival = |eta: &[f64]| 0.75 * theta[KINK_THETA_LAG] / 0.5 * eta[KINK_ETA_LAG].exp();
+        let t_kink = arrival(&eta_hat) + 4e-4;
+        let probe = Subject {
+            obs_times: vec![t_kink],
+            observations: vec![0.0],
+            obs_cmts: vec![1],
+            obs_covariates: vec![fed(0.5)],
+            cens: vec![0],
+            occasions: vec![1],
+            ..subject.clone()
+        };
+        let pred = crate::pk::compute_predictions_with_tv(&model, &probe, &theta, &eta_hat)[0];
+        subject.obs_times.insert(0, t_kink);
+        subject.observations.insert(0, 1.02 * pred);
+        subject.obs_cmts.insert(0, 1);
+        subject.obs_covariates.insert(0, fed(0.5));
+        subject.cens.insert(0, 0);
+        subject.occasions.insert(0, 1);
+
+        let eta = precise_ebe(&model, &subject, &model.default_params);
+        let gap = (subject.obs_times[0] - arrival(&eta)).abs();
+        let shift = unbounded_tvlag_arrival_shift(&model, &eta) * 1.5;
+        assert!(
+            (2e-4..6e-4).contains(&gap) && shift > gap,
+            "fixture must straddle at the record-snapshot arrival: gap {gap:.3e}, shift {shift:.3e}"
+        );
+        // …and must NOT be within reach of the subject-level snapshot's phantom arrival, so
+        // an enumerator reading `subject.covariates` sees nothing to bound.
+        let phantom = theta[KINK_THETA_LAG] * eta[KINK_ETA_LAG].exp();
+        assert!(subject
+            .obs_times
+            .iter()
+            .all(|&t| (t - phantom).abs() > 10.0 * shift));
+        assert!(
+            subject_sensitivities_cov(&model, &subject, &theta, &eta).is_some(),
+            "a TV-covariate lag subject must stay on the analytic route"
+        );
+        check_full_natural(&model, &subject, &model.default_params);
+    }
+
+    /// Second dose time of the multi-dose kink fixture.
+    const SECOND_DOSE: f64 = 12.0;
+
+    /// The multi-dose twin of [`depot_lag_kink_subject`]: 100 mg at `t = 0` and at
+    /// [`SECOND_DOSE`], nine samples across both intervals, and — when `kink_offset` is given —
+    /// one sample `kink_offset` after the **second** lagged arrival at the subject's own EBE,
+    /// inserted in time order with a 2 % residual. The second arrival lands on residual drug
+    /// from the first dose, which is the incoming side a single-dose fixture cannot exercise.
+    fn depot_lag_kink_multidose_subject(
+        model: &CompiledModel,
+        id: &str,
+        eta_true: &[f64],
+        kink_offset: Option<f64>,
+    ) -> Subject {
+        let theta = model.default_params.theta.clone();
+        let base_times = vec![1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 16.0, 20.0, 24.0];
+        let n = base_times.len();
+        let mut subject = Subject {
+            id: id.into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(SECOND_DOSE, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: base_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: vec![1, 1],
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_l2: Vec::new(),
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, &theta, eta_true);
+        subject.observations = preds
+            .iter()
+            .enumerate()
+            .map(|(j, p)| p * (0.97 + 0.02 * (j % 4) as f64))
+            .collect();
+        let Some(offset) = kink_offset else {
+            return subject;
+        };
+        // One difference from the single-dose builder: the kink sample's residual is 0.1 %,
+        // not 2 %. The second arrival lands on ~0.7 mg/L of residual drug where a first arrival
+        // lands on nothing, so a 2 % residual here is ~0.014 mg/L — enough to move the EBE's
+        // lag by ~2e-3 h — while 0.1 % is the same ~7e-4 mg/L the single-dose kink sample
+        // carries. The sample is placed once, against the nine-sample EBE, and the callers'
+        // straddle assertions certify the realised gap. (An offset of `4e-4` cannot be placed
+        // at all on this side: the DV cannot tell the pre- from the post-arrival prediction
+        // across a 1e-3 mg/L difference on that background, so the EBE is bistable across the
+        // kink and re-placing the sample against it flips it — measured, which is why the
+        // multi-dose oracle uses a `1e-2` offset at a tolerance whose unbounded step still
+        // reaches it.)
+        let eta_hat = precise_ebe(model, &subject, &model.default_params);
+        let t_kink = SECOND_DOSE + kink_arrival(model, &eta_hat) + offset;
+        let pred = crate::pk::compute_predictions_with_tv(
+            model,
+            &Subject {
+                obs_times: vec![t_kink],
+                observations: vec![0.0],
+                obs_cmts: vec![1],
+                cens: vec![0],
+                occasions: vec![1],
+                ..subject.clone()
+            },
+            &theta,
+            &eta_hat,
+        )[0];
+        let at = subject.obs_times.partition_point(|&t| t < t_kink);
+        subject.obs_times.insert(at, t_kink);
+        subject.observations.insert(at, 1.001 * pred);
+        subject.obs_cmts.insert(at, 1);
+        subject.cens.insert(at, 0);
+        subject.occasions.insert(at, 1);
+        subject
+    }
+
+    /// The multi-dose half of the kink anchor (CLAUDE.md's non-degeneracy rule for a
+    /// dose-event fixture). A single-dose subject cannot see a defect on the *incoming* side of
+    /// an arrival — the state is zero before a first dose, so the pre-arrival jet is zero and
+    /// any error there cancels — and it cannot see a defect in how the enumerator indexes a
+    /// **later** dose at all: an enumerator that only ever pushed dose 0's arrival passes
+    /// every single-dose test above. Here each subject takes 100 mg at `t = 0` and `t = 12`,
+    /// with the kink sample `1e-2` after the **second** lagged arrival, where drug from the
+    /// first dose is still present (asserted: the pre-arrival concentration is well above
+    /// zero), and the same three-way SE comparison as the single-dose test.
+    ///
+    /// Measured worst relative SE difference, four subjects: default-vs-`1e-9` analytic
+    /// `1.8e-4` (tolerance `1e-3`, 5.7×). With the bound bypassed (`if base_events.is_empty()`
+    /// → `if true`, the reviewer's mutation on PR #1524) it is `5.7e-1`; with the enumerator
+    /// truncated to dose 0's breaks alone it is `5.7e-1` — the mutation none of the
+    /// single-dose fixtures can see (they stay at `4.7e-5`).
+    ///
+    /// The FD covariance route is a weaker reference on this fixture: default analytic vs FD is
+    /// `5.5e-2`, and that gap is **not** the kink's — on the same four subjects with no kink
+    /// sample at all it is `4.8e-2`, with the sample moved to `5e-2` past the arrival `5.7e-2`,
+    /// and FD at `1e-6`/`1e-8` or `1e-9`/`1e-11` sits at `5.9e-2` (on `log TVV` and the two σ
+    /// entries; `TVLAG` agrees to `3e-3`). The analytic side is the one pinned by the exact
+    /// reconverged-gradient oracle
+    /// ([`ode_lag_kink_multidose_cov_hessian_matches_reconverged_gradients`]), so the residual
+    /// is the objective stencil's own multi-dose behaviour (#520's class), outside this test's
+    /// claim. The FD bound is kept at `2e-1` (3.6× the realised) because the kink regression
+    /// moves it to `5.7e-1` and it is the comparison #1505 asked for.
+    #[test]
+    fn ode_lag_kink_multidose_second_arrival_on_residual_drug_se_parity() {
+        use crate::estimation::covariance::{
+            analytic_cov_assembly, compute_covariance, AnalyticCovAssembly, CovarianceStepResult,
+        };
+        use crate::types::{FitOptions, Population};
+
+        let loose = depot_lag_kink_model("");
+        let tight = depot_lag_kink_model("  ode_reltol = 1e-9\n  ode_abstol = 1e-11");
+        let theta = loose.default_params.theta.clone();
+        let build = |id: &str, eta_true: &[f64]| -> Subject {
+            depot_lag_kink_multidose_subject(&loose, id, eta_true, Some(1e-2))
+        };
+        let etas_true: [[f64; 3]; 4] = [
+            [0.15, -0.10, 0.12],
+            [-0.20, 0.05, -0.15],
+            [0.05, 0.20, 0.03],
+            [-0.10, -0.15, 0.20],
+        ];
+        let subjects: Vec<Subject> = etas_true
+            .iter()
+            .enumerate()
+            .map(|(i, e)| build(&format!("{}", i + 1), e))
+            .collect();
+        let population = Population {
+            subjects,
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let p = &loose.default_params;
+        let x = pack_params(p);
+        let etas: Vec<DVector<f64>> = population
+            .subjects
+            .iter()
+            .map(|s| DVector::from_column_slice(&precise_ebe(&loose, s, p)))
+            .collect();
+        // Preconditions, per subject: the kink sample straddles the SECOND arrival under the
+        // unbounded θ step and nothing else reaches it; the first arrival (~0.5 h) is at least
+        // 0.4 h from every sample; and the state the second dose lands on is not empty.
+        for (s, eta) in population.subjects.iter().zip(&etas) {
+            let eta: Vec<f64> = eta.iter().copied().collect();
+            let arrival_1 = kink_arrival(&loose, &eta);
+            let arrival_2 = SECOND_DOSE + arrival_1;
+            let t_kink = s
+                .obs_times
+                .iter()
+                .copied()
+                .min_by(|a, b| (a - arrival_2).abs().total_cmp(&(b - arrival_2).abs()))
+                .unwrap();
+            let gap = (t_kink - arrival_2).abs();
+            let theta_shift = unbounded_tvlag_arrival_shift(&loose, &eta);
+            let eta_shift =
+                crate::sens::provider::third_order_fd_step(eta[KINK_ETA_LAG], 1e-4) * arrival_1;
+            let fd_shift = arrival_1 * (0.01_f64.exp() - 1.0);
+            assert!(
+                (7e-3..1.3e-2).contains(&gap) && theta_shift > gap,
+                "subject {}: gap to the second arrival {gap:.3e} must be in (7e-3, 1.3e-2) and \
+                 under the unbounded TVLAG shift {theta_shift:.3e}",
+                s.id
+            );
+            assert!(eta_shift < gap && fd_shift < gap, "subject {}", s.id);
+            let nearest_to_first = s
+                .obs_times
+                .iter()
+                .map(|t| (t - arrival_1).abs())
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest_to_first > 0.4,
+                "subject {}: {nearest_to_first}",
+                s.id
+            );
+            // Residual drug at the second arrival: concentration just before it, from dose 1.
+            let pre = crate::pk::compute_predictions_with_tv(
+                &loose,
+                &Subject {
+                    obs_times: vec![arrival_2 - 1e-3],
+                    observations: vec![0.0],
+                    obs_cmts: vec![1],
+                    cens: vec![0],
+                    occasions: vec![1],
+                    ..s.clone()
+                },
+                &theta,
+                &eta,
+            )[0];
+            assert!(
+                pre > 0.3,
+                "subject {}: the state before the second arrival must carry residual drug \
+                 (measured ~0.7 mg/L), got {pre:.3e}",
+                s.id
+            );
+        }
+        let opts = FitOptions::default();
+        assert!(
+            matches!(
+                analytic_cov_assembly(&loose, &population, p, &x, &etas, &[], &opts),
+                AnalyticCovAssembly::Full(_)
+            ),
+            "no subject may decline"
+        );
+        let se = |model: &CompiledModel, analytic: bool| -> Vec<f64> {
+            let opts = FitOptions {
+                analytic_cov_hessian: analytic,
+                ..FitOptions::default()
+            };
+            match compute_covariance(&x, p, model, &population, &etas, &[], &[], &opts) {
+                CovarianceStepResult::Success(out) => {
+                    assert!(
+                        !out.warnings.iter().any(|w| w.contains("regularized")),
+                        "{:?}",
+                        out.warnings
+                    );
+                    (0..out.matrix.nrows())
+                        .map(|i| out.matrix[(i, i)].sqrt())
+                        .collect()
+                }
+                CovarianceStepResult::Unusable(m) => panic!("unusable: {m}"),
+                CovarianceStepResult::FailedNonPd { reason, .. } => panic!("non-PD: {reason}"),
+            }
+        };
+        let se_default = se(&loose, true);
+        let se_tight = se(&tight, true);
+        let se_fd = se(&loose, false);
+        let worst = |a: &[f64], b: &[f64]| -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| {
+                    assert!(x.is_finite() && y.is_finite() && *y > 0.0);
+                    ((x - y) / y).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        let vs_tight = worst(&se_default, &se_tight);
+        let vs_fd = worst(&se_default, &se_fd);
+        eprintln!(
+            "#1505 multidose parity: worst rel Δ vs 1e-9 = {vs_tight:.3e}, vs FD = {vs_fd:.3e}\n\
+             default {se_default:?}\ntight   {se_tight:?}\nfd      {se_fd:?}"
+        );
+        assert!(
+            vs_tight < 1e-3,
+            "multi-dose: default-tolerance analytic SEs must match the 1e-9 run: worst rel Δ \
+             {vs_tight:.3e}\ndefault {se_default:?}\ntight   {se_tight:?}"
+        );
+        assert!(
+            vs_fd < 2e-1,
+            "multi-dose: default-tolerance analytic SEs must match the FD covariance route: \
+             worst rel Δ {vs_fd:.3e}\nanalytic {se_default:?}\nfd       {se_fd:?}"
+        );
+    }
+
+    /// The multi-dose oracle: with the kink sample `1e-2` after the **second** arrival — which
+    /// lands on residual drug from the first dose; the pre-arrival concentration is asserted
+    /// above zero — the bounded analytic Hessian matches the reconverged-gradient oracle in
+    /// natural and in packed space, on the same `2e-3·(1 + |a|)` tolerance as the single-dose
+    /// oracle.
+    ///
+    /// Why `ode_reltol = 1e-6` and a `1e-2` offset rather than the single-dose oracle's
+    /// `1e-10` / `4e-4`: on this side a `4e-4` sample cannot be placed — the DV cannot tell the
+    /// pre- from the post-arrival prediction across a `1e-3` mg/L difference on a 0.7 mg/L
+    /// background, so the EBE is bistable across the kink (measured: re-placing the sample
+    /// against the EBE it induces flipped it every pass). At `1e-6` the cap binds and the
+    /// unbounded `TVLAG` step is the shipping `1e-2·(1 + |x|)`, whose `1.6e-2` arrival shift
+    /// reaches a `7.9e-3` gap; the oracle's own `1e-6·(1 + |x|)` differences of the analytic
+    /// gradient, with a Newton-precise mode, are clean at that tolerance (both checks pass;
+    /// both fail with the bound bypassed). The control that the straddle assertion exists
+    /// for: at `1e-8` the unbounded step reaches only `3.5e-3` and both checks pass with or
+    /// without the bound — a green run there would certify nothing.
+    #[test]
+    fn ode_lag_kink_multidose_cov_hessian_matches_reconverged_gradients() {
+        let model = depot_lag_kink_model("  ode_reltol = 1e-6\n  ode_abstol = 1e-8");
+        let subject =
+            depot_lag_kink_multidose_subject(&model, "md", &[0.12, -0.08, 0.10], Some(1e-2));
+        let theta = model.default_params.theta.clone();
+        let eta = precise_ebe(&model, &subject, &model.default_params);
+        let arrival_2 = SECOND_DOSE + kink_arrival(&model, &eta);
+        let t_kink = subject
+            .obs_times
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - arrival_2).abs().total_cmp(&(b - arrival_2).abs()))
+            .unwrap();
+        let gap = t_kink - arrival_2;
+        let shift = unbounded_tvlag_arrival_shift(&model, &eta);
+        assert!(
+            (7e-3..1.3e-2).contains(&gap) && shift > gap,
+            "fixture must straddle the second arrival from the post side: gap {gap:.3e}, \
+             unbounded TVLAG shift {shift:.3e}"
+        );
+        let pre = crate::pk::compute_predictions_with_tv(
+            &model,
+            &Subject {
+                obs_times: vec![arrival_2 - 1e-3],
+                observations: vec![0.0],
+                obs_cmts: vec![1],
+                cens: vec![0],
+                occasions: vec![1],
+                ..subject.clone()
+            },
+            &theta,
+            &eta,
+        )[0];
+        assert!(
+            pre > 0.3,
+            "residual drug before the second arrival: {pre:.3e}"
+        );
+        assert!(subject_sensitivities_cov(&model, &subject, &theta, &eta).is_some());
+        check_full_natural(&model, &subject, &model.default_params);
+        check_packed(&model, &subject, &model.default_params);
+    }
 }

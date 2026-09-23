@@ -417,6 +417,10 @@ Two limits on the salvage. A **model-level** exclusion — `method = laplace`, a
 
 The measured effect where it does apply: on a 55-subject 2-state ODE FOCEI fit with 13 free parameters, one out-of-scope subject cost **23.4 s** of covariance under the old all-or-nothing rule and **2.0 s** under the salvage — 11.5× on the step, −38% total wall, with estimates and OFV identical to every printed digit. On warfarin, forcing one subject in ten to decline moves the standard errors by **8.4e-5** relative, against a **2.7e-4** gap between the whole-population FD and whole-population analytic routes the code already ships as interchangeable. A fit that salvages any subject reports a `W_COV_ANALYTIC_SALVAGE` note naming them. Everything outside the scope keeps the stencil below, subject to numerical convergence and step-size limits.
 
+##### Moving dose events
+
+Where an axis moves a dose event — an estimated lag, a `zero_order` duration, `F` on an infusion — the step is bounded further, so that no observation, `EVID=2`, reset or dose record changes sides of the event between the two points of the pair: the subject's events are enumerated by the ODE engine's own break-time builder at both perturbed points and the step is shrunk until the pair is clear. Before that bound, `SE(TVLAG)` on a lagged-dose fixture moved 27 % with the step. A subject whose mode sits exactly on a moving event — a corner minimum of the inner objective, which a lagged arrival at a dense early sample does produce — has no third derivative there and declines to the per-subject salvage above rather than differencing across the corner ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)).
+
 #### Finite-difference fallback
 
 The **finite-difference stencil** is the fallback, and remains the only route for every model outside that scope. Two details make its SEs match NONMEM's `$COVARIANCE`:

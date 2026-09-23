@@ -1089,8 +1089,10 @@ second-differencing the objective, so a loose tolerance no longer reaches the es
 that `1/h²` mechanism — every quantity in the table above is flat across the sweep. That is a
 statement about one mechanism, not a claim that the analytic route is step-free: its third-order
 assembly still finite-differences the `Dual2` jet, and
-[#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505) records a lagged-dose arrival kink
-where that step measures `SE(TVLAG)` 27 % low. Standard errors on the **finite-difference**
+[#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505) measured that step crossing a
+lagged-dose arrival (`SE(TVLAG)` 27 % low); the sweep now bounds the step by the
+observation-to-arrival gap, and a subject whose mode sits on the arrival declines to the
+per-subject salvage instead. Standard errors on the **finite-difference**
 covariance route are a separate question again — see the `ode_reltol` row in
 [fit options](fit-options.qmd#ode-solver-tolerances) and issue #520.
 :::
