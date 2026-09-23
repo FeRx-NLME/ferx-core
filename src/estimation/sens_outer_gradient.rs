@@ -2097,9 +2097,9 @@ fn population_sum(
 /// [`per_subject_packed_gradients`] / [`per_subject_packed_gradients_iov`] via
 /// `population_gradient_sens_mixed`, which keeps the exact analytic gradient for
 /// in-scope, finite subjects and fills only the `None`/non-finite ones with a
-/// per-subject reconverged FD. So a transiently non-PD inner Hessian (e.g. a
-/// degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose `h_inner` cholesky fails)
-/// degrades **that subject** to FD, not the whole population.
+/// per-subject held-EBE gradient (reconverged FD under IOV; #1529). So a transiently
+/// non-PD inner Hessian (e.g. a degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose
+/// `h_inner` cholesky fails) degrades **that subject**, not the whole population.
 pub fn population_gradient_sens(
     model: &CompiledModel,
     population: &Population,

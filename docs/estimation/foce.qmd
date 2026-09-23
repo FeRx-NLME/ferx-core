@@ -73,14 +73,19 @@ This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and
 
 The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
 
-The two can disagree. A subject the provider declines — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event, two modeled infusion windows that happen to coincide at the current estimates — is salvaged individually onto a reconverged finite-difference gradient, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. The results are correct; the fit is just slower on those subjects. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+The two can disagree. A subject the provider declines — a rate-defined infusion under `F ≠ 1`, an out-of-scope ODE dose event, two modeled infusion windows that happen to coincide at the current estimates, or any subject whose inner Hessian is not positive-definite at the trial point — is salvaged individually, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
 
 ```
 1 of 32 subjects fell outside the analytic sensitivity provider's scope during this fit
-(e.g. subject 7) and used finite-difference outer gradients; their results are correct
-but slower. The reported outer gradient method is the model-level route, not the
-per-subject one.
+(e.g. subject 7) and used fixed-EBE outer gradients, which omit the EBE-response term
+the analytic gradient carries. If the fit stalls, `reconverge_gradient_interval = N`
+restores the reconverged gradient every N-th evaluation. The reported outer gradient
+method is the model-level route, not the per-subject one.
 ```
+
+The salvage follows the [`reconverge_gradient_interval`](#gradient-accuracy-vs-cost-reconverged-ebes) schedule like every other fixed-EBE gradient (#1529): a declined subject gets the gradient at its **held** EBE — `2·n_free` evaluations of that one subject, no inner re-solve — and an evaluation the schedule reconverges re-solves every subject's EBE anyway. Before #1529 a declined subject was always charged a reconverged finite-difference gradient (`2·n_free` full EBE solves) whatever the setting. Because declines depend on the trial point, a blown-up line-search trial could send most of the population down that path at once: on a 55-subject parent–metabolite ODE model, 46 subjects declined at one such trial, about 1,200 EBE solves for a single gradient and 82% of the fit's wall time.
+
+IOV models (`kappa`/`block_kappa`) always reconverge and ignore `reconverge_gradient_interval`, so a declined IOV subject still takes the reconverged gradient, and the warning says so: `used reconverged finite-difference outer gradients; their results are correct but slower`.
 
 The count is **recorded as the fit runs**, from the gradient evaluations that actually happened — not predicted by probing the provider at some chosen parameter point. That distinction is load-bearing, because a decline is not purely a property of the subject's records: the separability check on modeled infusion windows reads the *resolved* durations and lag times, so a subject can decline at `η = 0` and be served at its EBE. A probe would announce a fallback that never occurred.
 

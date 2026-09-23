@@ -1,8 +1,8 @@
 //! #1154 — a runtime analytic-sensitivity decline must reach `FitResult::warnings`.
 //!
 //! A subject whose data shape falls out of the outer sensitivity provider's scope is
-//! salvaged onto a per-subject reconverged-FD gradient. That is correct, several times
-//! slower, and — before this — invisible: no warning code, no count, and
+//! salvaged onto a per-subject gradient (held-EBE since #1529; reconverged FD under IOV).
+//! Before #1154 that was invisible: no warning code, no count, and
 //! `FitResult::gradient_method_outer` keeps reporting `analytic (Dual2)` because it reads a
 //! **model**-level predicate. The Tier-1 tests in
 //! `estimation::outer_optimizer::tests::outer_fd_fallback` pin the recording; this pins the
@@ -87,13 +87,14 @@ const MIXTURE_F: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// The FD-fallback sentence `outer_fd_fallback_warning` emits. Matched on the phrase that
+/// The fallback sentence `outer_fd_fallback_warning` emits. Matched on the phrase that
 /// carries the signal rather than the whole sentence, so a wording change does not redden
-/// this while a dropped call does.
+/// this while a dropped call does. (Not on the salvage's name: since #1529 that differs
+/// between the non-IOV held-EBE and the IOV reconverged routes.)
 fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
     warnings
         .iter()
-        .find(|w| w.contains("finite-difference outer gradients"))
+        .find(|w| w.contains("fell outside the analytic sensitivity provider's scope"))
 }
 
 /// The same population with subject 0's bolus replaced by a rate-defined infusion — the

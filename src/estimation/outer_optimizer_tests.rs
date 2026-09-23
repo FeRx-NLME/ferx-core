@@ -4644,7 +4644,14 @@ mod outer_fd_fallback {
             ..FitOptions::default()
         };
         let log = OuterFdDeclineLog::new(pop.subjects.len());
-        let _ = population_gradient_sens_mixed(&x, params, model, pop, &ehs, &bounds, &opts, &log);
+        let hms: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DMatrix::zeros(s.observations.len(), model.n_eta))
+            .collect();
+        let _ = population_gradient_sens_mixed(
+            &x, params, model, pop, &ehs, &hms, &bounds, &opts, &log,
+        );
         log
     }
 
@@ -4676,13 +4683,53 @@ mod outer_fd_fallback {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
+        let w =
+            outer_fd_fallback_warning(&pop, &log, false).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
             w.contains("OUT_OF_SCOPE"),
             "must name the declining subject, not the in-scope one; got: {w}"
         );
         assert!(!w.contains("IN_SCOPE"), "got: {w}");
+        assert!(
+            w.contains("model-level route, not the per-subject one"),
+            "must reconcile the warning with `gradient_method_outer`; got: {w}"
+        );
+    }
+
+    /// #1529: the consequence sentence depends on which salvage the route takes, so both
+    /// sides of the `iov` gate are asserted in one test — a gate stuck on either branch
+    /// reddens it. Non-IOV declines take the held-EBE gradient, whose remedy is
+    /// `reconverge_gradient_interval`; IOV declines are still reconverged (the IOV route
+    /// ignores that knob), so pointing an IOV user at it would be false advice.
+    #[test]
+    fn consequence_sentence_follows_the_salvage_route() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+
+        let non_iov = outer_fd_fallback_warning(&pop, &log, false).expect("must warn");
+        assert!(
+            non_iov.contains("used fixed-EBE outer gradients")
+                && non_iov.contains("omit the EBE-response term"),
+            "non-IOV must name the held-EBE salvage; got: {non_iov}"
+        );
+        assert!(
+            non_iov.contains("`reconverge_gradient_interval = N`"),
+            "non-IOV must name the remedy; got: {non_iov}"
+        );
+        assert!(!non_iov.contains("correct but slower"), "got: {non_iov}");
+
+        let iov = outer_fd_fallback_warning(&pop, &log, true).expect("must warn");
+        assert!(
+            iov.contains("reconverged finite-difference outer gradients")
+                && iov.contains("correct but slower"),
+            "IOV must name the reconverged salvage; got: {iov}"
+        );
+        assert!(
+            !iov.contains("reconverge_gradient_interval") && !iov.contains("fixed-EBE"),
+            "IOV ignores the interval knob; got: {iov}"
+        );
     }
 
     /// An all-analytic population is silent.
@@ -4691,7 +4738,7 @@ mod outer_fd_fallback {
         let (model, analytic, _) = analytic_and_declining();
         let pop = mk_pop(vec![analytic]);
         let log = record_one_gradient_eval(&model, &pop);
-        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
+        assert!(outer_fd_fallback_warning(&pop, &log, false).is_none());
     }
 
     /// The case the *inner* warning deliberately suppresses and this one must not: a
@@ -4714,8 +4761,8 @@ mod outer_fd_fallback {
         );
         let pop = mk_pop(vec![declining.clone(), declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w =
-            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
+        let w = outer_fd_fallback_warning(&pop, &log, false)
+            .expect("an all-FD in-scope population must warn");
         assert!(w.contains("2 of 2"), "got: {w}");
     }
 
@@ -4729,7 +4776,7 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         assert!(
-            outer_fd_fallback_warning(&pop, &log).is_none(),
+            outer_fd_fallback_warning(&pop, &log, false).is_none(),
             "a fit that never evaluated an analytic outer gradient must not warn — even \
              with a subject the provider would decline"
         );

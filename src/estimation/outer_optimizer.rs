@@ -298,7 +298,7 @@ pub fn optimize_population(
     // the runtime log, rather than from a probe in `fit_inner`: only this scope knows
     // which evaluations ran, and the log is empty for every route that never reaches the
     // analytic branch — so no route gate is needed and none can go stale.
-    if let Some(w) = outer_fd_fallback_warning(population, &declines) {
+    if let Some(w) = outer_fd_fallback_warning(population, &declines, model.n_kappa > 0) {
         result.warnings.push(w);
     }
     result
@@ -4306,62 +4306,81 @@ fn central_diff_packed(
     grad
 }
 
-/// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges
-/// that one subject's EBE** (warm-started) at every perturbed point. The single-
-/// subject analog of [`reconverged_fd_gradient`], used to fill the handful of
-/// subjects the analytic provider can't handle (SS+reset, time-varying
-/// covariates, modeled-duration doses, EVID=2 reset) inside the otherwise-exact
-/// analytic population gradient. Because the EBEs are re-solved at each ±h, the
-/// Ω/σ EBE-response is included — the term the θ-only fixed-EBE fallback drops,
-/// whose absence stalled the gradient optimizers (focei-slsqp-fixed-ebe-gradient-bias).
-/// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes
-/// fixed coordinates, matching the analytic per-subject convention.
+/// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
+/// prediction Jacobian — the per-subject term of [`ad_population_gradient`], and the fill
+/// for a subject [`subject_analytic_outer_gradient`] declines inside
+/// [`population_gradient_sens_mixed`] (#1529).
+///
+/// It costs `2·n_free` objective evaluations of this one subject (or one closed-form
+/// Laplace / Sheiner–Beal pass where `subject_nll_pop_grad` has one) and **no** inner
+/// re-solve. For FOCEI the envelope theorem makes the held-η̂ data/prior gradient exact;
+/// what it omits is the `½·∂log|H̃|/∂η · dη̂/dx` EBE response, the same term the
+/// `reconverge_gradient_interval` schedule governs for every other fixed-EBE gradient.
+/// A declined subject therefore follows that schedule like the rest of the fit: an
+/// evaluation the schedule reconverges never reaches the mixed assembly (the whole
+/// population takes [`reconverged_fd_gradient`]), and the evaluations in between charge a
+/// declined subject the cheap gradient rather than `2·n_free` full `find_ebe` solves.
+///
+/// Returns `d(nllᵢ)/dx` (length `x.len()`); the caller scales by 2 and zeroes fixed
+/// coordinates, matching the analytic per-subject convention.
 #[allow(clippy::too_many_arguments)]
-fn subject_reconverged_fd_gradient(
+fn subject_fixed_ebe_gradient(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
-    subject: &Subject,
-    warm_eta: &DVector<f64>,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
-    // Subject marginal NLL at a packed point, re-solving this subject's EBE
-    // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite → NaN so the central
-    // difference drops to zero for that coordinate.
-    let eval = |xv: &[f64]| -> f64 {
-        let params = unpack_params(xv, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let ebe = find_ebe(
+    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
+    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
+    // full marginal gradient and reach the true minimum instead of stalling
+    // above it. Reuses the Laplace cache the gradient just formed (one extra
+    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
+    // error.
+    let (_, mut gi, cache) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+        x,
+        init_params,
+        model,
+        population,
+        subj_idx,
+        eta_hat,
+        h_matrix,
+        kappas,
+        bounds,
+        options,
+    );
+    if let Some(c) = cache.as_ref() {
+        if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
+            Some(c),
+            x,
+            init_params,
             model,
-            subject,
-            &params,
-            options.inner_maxiter,
-            options.inner_tol,
-            Some(warm_eta.as_slice()),
-            Some(&mu_k),
-            0,
-        );
-        crate::stats::likelihood::foce_subject_nll(
-            model,
-            subject,
-            &params.theta,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &params.omega,
-            &params.sigma.values,
-            &params.residual_correlations,
-            options.interaction,
-        )
-    };
-    central_diff_packed(x, &fixed, bounds, eval)
+            population,
+            subj_idx,
+            eta_hat,
+            h_matrix,
+            bounds,
+            options,
+        ) {
+            for (g, ti) in gi.iter_mut().zip(t.iter()) {
+                *g += *ti;
+            }
+        }
+    }
+    gi
 }
 
-/// Per-subject reconverged-FD packed gradient for an **IOV** subject — the IOV analogue of
-/// [`subject_reconverged_fd_gradient`], used to salvage subjects outside the analytic IOV
-/// scope without dropping the whole population to FD (#466 review round 2). `find_ebe`
+/// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
+/// one subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
+/// included. Used to salvage subjects outside the analytic IOV scope without dropping the
+/// whole population to FD (#466 review round 2). IOV fits reconverge unconditionally and
+/// ignore `reconverge_gradient_interval`, so unlike the non-IOV
+/// [`subject_fixed_ebe_gradient`] this salvage keeps the reconverged form (#1529). `find_ebe`
 /// dispatches to the IOV joint (η_bsv, κ) EBE for `n_kappa > 0`, and the marginal uses the
 /// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums).
 fn subject_reconverged_fd_gradient_iov(
@@ -4410,7 +4429,7 @@ fn subject_reconverged_fd_gradient_iov(
 /// `None` when this subject does not get one — either because the sensitivity provider
 /// (or the `prepare` assembly behind it) declined the subject's data shape at runtime,
 /// or because a component came back non-finite. Both cases route the subject to
-/// [`subject_reconverged_fd_gradient`], so they are one gate, not two.
+/// [`subject_fixed_ebe_gradient`], so they are one gate, not two.
 ///
 /// The single gate [`population_gradient_sens_mixed`] dispatches on, extracted so the
 /// FOCE/FOCEI entry-point choice and the finiteness backstop live in one place rather
@@ -4542,15 +4561,20 @@ impl OuterFdDeclineLog {
 /// ever evaluated (see the log's docs).
 ///
 /// The outer twin of `inner_optimizer::fd_fallback_warning` (#1154). Since #466 the
-/// salvage is per subject, so such a fit is correct and several times slower on those
-/// subjects — and was indistinguishable from a fit that is simply slow: no `W_*` code, no
-/// count, and a `gradient_method_outer` that keeps reporting `analytic (Dual2)` because it
-/// reads a **model**-level predicate. Any non-empty log is therefore already a mismatch
-/// with that label: the analytic branch had to have been selected for a decline to be
-/// recordable at all.
+/// salvage is per subject, and was indistinguishable from a fit that is simply slow: no
+/// `W_*` code, no count, and a `gradient_method_outer` that keeps reporting
+/// `analytic (Dual2)` because it reads a **model**-level predicate. Any non-empty log is
+/// therefore already a mismatch with that label: the analytic branch had to have been
+/// selected for a decline to be recordable at all.
+///
+/// What the salvage *is* depends on `iov` (#1529), so the consequence sentence does too:
+/// an IOV subject is reconverged (correct, slower); a non-IOV subject takes the held-EBE
+/// gradient (cheap, omits the EBE-response term), and the remedy is
+/// `reconverge_gradient_interval`, which the IOV route ignores.
 pub(crate) fn outer_fd_fallback_warning(
     population: &Population,
     log: &OuterFdDeclineLog,
+    iov: bool,
 ) -> Option<String> {
     let declined = log.declined_indices();
     if declined.is_empty() {
@@ -4563,25 +4587,43 @@ pub(crate) fn outer_fd_fallback_warning(
         .and_then(|&i| population.subjects.get(i))
         .map(|s| format!(" (e.g. subject {})", s.id))
         .unwrap_or_default();
+    let consequence = if iov {
+        "used reconverged finite-difference outer gradients; their results are correct but \
+         slower."
+    } else {
+        "used fixed-EBE outer gradients, which omit the EBE-response term the analytic \
+         gradient carries. If the fit stalls, `reconverge_gradient_interval = N` restores \
+         the reconverged gradient every N-th evaluation."
+    };
     Some(format!(
         "{n_fd} of {n_total} subjects fell outside the analytic sensitivity provider's \
-         scope during this fit{example} and used finite-difference outer gradients; their \
-         results are correct but slower. The reported outer gradient method is the \
-         model-level route, not the per-subject one."
+         scope during this fit{example} and {consequence} The reported outer gradient \
+         method is the model-level route, not the per-subject one."
     ))
 }
 
 /// Non-IOV population gradient assembled **per subject**: the exact analytic
 /// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
 /// every subject inside the provider's scope, and a per-subject
-/// [`subject_reconverged_fd_gradient`] for each subject outside it (or whose
-/// analytic gradient came back non-finite). This replaces the all-or-nothing
+/// [`subject_fixed_ebe_gradient`] for each subject outside it (or whose analytic
+/// gradient came back non-finite). This replaces the all-or-nothing
 /// [`population_gradient_sens`]: previously a single out-of-scope subject forced
 /// the whole population onto the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block left the variance components pinned at their start and stalled
 /// SLSQP/L-BFGS/MMA above the derivative-free optimum
-/// (focei-slsqp-fixed-ebe-gradient-bias). Returns the packed `2·Σᵢ dᵢ` with
-/// fixed coordinates zeroed.
+/// (focei-slsqp-fixed-ebe-gradient-bias). The in-scope subjects keep the exact
+/// gradient, so only the declined ones carry the fixed-EBE approximation.
+///
+/// A declined subject used to be filled with a per-subject *reconverged* FD
+/// gradient — `2·n_free` full `find_ebe` solves each — regardless of
+/// `reconverge_gradient_interval`. Decline rates are parameter-dependent (the
+/// assembly needs a positive-definite inner Hessian), and at a blown-up
+/// line-search trial most of a population can decline at once: on
+/// cyclophosphamide 46 of 55 subjects did, ~1200 inner re-solves for one gradient
+/// and 82% of the fit's wall time (#1529). Evaluations that the schedule
+/// reconverges never get here, so a declined subject now follows that schedule
+/// like every other fixed-EBE gradient. Returns the packed `2·Σᵢ dᵢ` with fixed
+/// coordinates zeroed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn population_gradient_sens_mixed(
     x: &[f64],
@@ -4589,6 +4631,7 @@ pub(crate) fn population_gradient_sens_mixed(
     model: &CompiledModel,
     population: &Population,
     ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
     bounds: &PackedBounds,
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
@@ -4611,15 +4654,18 @@ pub(crate) fn population_gradient_sens_mixed(
             ) {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
                 Some(g) => g,
-                // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
+                // Out-of-scope (or non-finite analytic) → held-EBE per-subject gradient.
                 None => {
                     declines.record(i);
-                    subject_reconverged_fd_gradient(
+                    subject_fixed_ebe_gradient(
                         x,
                         init_params,
                         model,
-                        subject,
+                        population,
+                        i,
                         &ehs[i],
+                        &hms[i],
+                        &[],
                         bounds,
                         options,
                     )
@@ -4732,48 +4778,24 @@ fn ad_population_gradient(
     debug_assert_eq!(hms.len(), n_subj);
     debug_assert_eq!(kappas.len(), n_subj);
     let np = x.len();
-    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
-    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
-    // full marginal gradient and reach the true minimum instead of stalling
-    // above it. Reuses the Laplace cache the gradient just formed (one extra
-    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
-    // error. IOV routes through the reconverged-FD gradient, not here, so this
-    // only affects non-IOV FOCEI gradient steps.
+    // IOV routes through the reconverged-FD gradient, not here, so the `log|H̃|`
+    // EBE-response term `subject_fixed_ebe_gradient` adds only affects non-IOV
+    // FOCEI gradient steps.
     let per_subj: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
-            let (_, mut gi, cache) =
-                crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
-                    x,
-                    init_params,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    kappas[i].as_slice(),
-                    bounds,
-                    options,
-                );
-            if let Some(c) = cache.as_ref() {
-                if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
-                    Some(c),
-                    x,
-                    init_params,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    bounds,
-                    options,
-                ) {
-                    for (g, ti) in gi.iter_mut().zip(t.iter()) {
-                        *g += *ti;
-                    }
-                }
-            }
-            gi
+            subject_fixed_ebe_gradient(
+                x,
+                init_params,
+                model,
+                population,
+                i,
+                &ehs[i],
+                &hms[i],
+                kappas[i].as_slice(),
+                bounds,
+                options,
+            )
         })
         .collect();
     assemble_population_gradient(&per_subj, np)
@@ -4966,7 +4988,7 @@ fn population_gradient_with_agq_evaluation(
             ))
         } else {
             // Non-IOV: assemble per subject — exact analytic for in-scope
-            // subjects, per-subject reconverged-FD for the few out-of-scope ones.
+            // subjects, held-EBE per-subject gradient for out-of-scope ones (#1529).
             // Always `Some`; the finiteness backstop below still guards it. This
             // is the fix for focei-slsqp-fixed-ebe-gradient-bias: one out-of-scope
             // subject no longer drops the whole population to the biased θ-only
@@ -4977,6 +4999,7 @@ fn population_gradient_with_agq_evaluation(
                 model,
                 population,
                 ehs,
+                hms,
                 bounds,
                 options,
                 declines,
