@@ -989,8 +989,9 @@ fn test_stagnation_window_sizes() {
     assert_eq!(stagnation_window(20, true), 21);
 }
 
-/// The short window needs both halves of its gate: a gradient optimizer, and a
-/// significant feasible improvement *after* the first feasible eval (#1530).
+/// The short window needs all three parts of its gate: a gradient optimizer,
+/// unreachable stops (not Laplace/AGQ), and a significant feasible improvement *after*
+/// the first feasible eval (#1530).
 #[test]
 fn test_use_short_stagnation_window_gate() {
     for algo in [
@@ -999,15 +1000,57 @@ fn test_use_short_stagnation_window_gate() {
         nlopt::Algorithm::Mma,
     ] {
         assert!(
-            use_short_stagnation_window(algo, 2),
+            use_short_stagnation_window(algo, false, 2),
             "{algo:?} after descent"
         );
         // Feasible eval 1 only sets the baseline; 0 = no feasible eval yet.
-        assert!(!use_short_stagnation_window(algo, 1), "{algo:?} at init");
-        assert!(!use_short_stagnation_window(algo, 0), "{algo:?} before any");
+        assert!(
+            !use_short_stagnation_window(algo, false, 1),
+            "{algo:?} at init"
+        );
+        assert!(
+            !use_short_stagnation_window(algo, false, 0),
+            "{algo:?} before any"
+        );
+        // Reachable xtol/ftol stops (Laplace/AGQ) are left to do their job.
+        assert!(
+            !use_short_stagnation_window(algo, true, 2),
+            "{algo:?} with reachable stops"
+        );
     }
     // BOBYQA's interpolation rebuilds legitimately run flat: never short.
-    assert!(!use_short_stagnation_window(nlopt::Algorithm::Bobyqa, 30));
+    assert!(!use_short_stagnation_window(
+        nlopt::Algorithm::Bobyqa,
+        false,
+        30
+    ));
+}
+
+/// The reachable-stops predicate is the quadrature dispatch: Laplace and FOCEI with
+/// `n_agq > 1` have reachable stops; plain FOCE/FOCEI do not.
+#[test]
+fn test_gradient_run_has_reachable_stops() {
+    let with = |method, n_agq| FitOptions {
+        method,
+        n_agq,
+        ..FitOptions::default()
+    };
+    assert!(!gradient_run_has_reachable_stops(&with(
+        EstimationMethod::FoceI,
+        1
+    )));
+    assert!(!gradient_run_has_reachable_stops(&with(
+        EstimationMethod::Foce,
+        1
+    )));
+    assert!(gradient_run_has_reachable_stops(&with(
+        EstimationMethod::FoceI,
+        3
+    )));
+    assert!(gradient_run_has_reachable_stops(&with(
+        EstimationMethod::Laplace,
+        1
+    )));
 }
 
 /// With the short window, `detect_stagnation` fires at `last_improvement + (n+1).max(10)`,
@@ -1347,7 +1390,7 @@ fn replay_stagnation(
             pt_ofv = ofv;
             pt_idx = k;
         }
-        if stagnation_after_eval(&mut state, n, true, algo, pt_idx, step) {
+        if stagnation_after_eval(&mut state, n, true, algo, false, pt_idx, step) {
             return Some((k, state.best_ofv));
         }
     }
@@ -1432,14 +1475,80 @@ fn test_step_is_expanding() {
     assert!(!step_is_expanding(&h(&[1e-6, 1e-5, f64::NAN])));
 }
 
-/// Only a `Success` the stagnation guard forced is re-examined; one NLopt reached on
-/// its own stands, and a non-converged verdict is never upgraded here (#1530).
+/// Only a stop the stagnation guard forced is re-examined — a `Success`, or a
+/// `MaxEvalReached` from a latch on the last permitted eval; a stop NLopt reached on
+/// its own stands, and nothing else is upgraded here (#1530).
 #[test]
-fn test_latched_success_needs_plateau_check() {
-    assert!(latched_success_needs_plateau_check(true, true));
-    assert!(!latched_success_needs_plateau_check(true, false));
-    assert!(!latched_success_needs_plateau_check(false, true));
-    assert!(!latched_success_needs_plateau_check(false, false));
+fn test_latched_stop_needs_plateau_check() {
+    // (converged, max_eval_reached, latched)
+    assert!(latched_stop_needs_plateau_check(true, false, true));
+    assert!(latched_stop_needs_plateau_check(false, true, true));
+    assert!(!latched_stop_needs_plateau_check(true, false, false));
+    assert!(!latched_stop_needs_plateau_check(false, true, false));
+    assert!(!latched_stop_needs_plateau_check(false, false, true));
+    assert!(!latched_stop_needs_plateau_check(false, false, false));
+}
+
+/// End to end through `optimize_nlopt_once`, the production wiring of #1530: on
+/// `examples/one_cpt_iv.ferx` FOCEI / L-BFGS the short window latches, and the
+/// latched stop's `converged` comes from the plateau check, not NLopt's forced
+/// `Success`. With the guard off the same fit runs to its own termination, which
+/// before #1530 the 50-eval window never cut short on this model (measured: no
+/// latch on main `2e04abba`) — so the eval-count straddle fails if the closure
+/// goes back to the long window, and `plateau_checked` fails if the verdict
+/// override is dropped.
+#[test]
+fn test_short_window_latch_is_wired_and_plateau_checked() {
+    use crate::estimation::outer_optimizer::{optimize_nlopt_once, OuterFdDeclineLog};
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run = |guard: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            stagnation_guard: guard,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        )
+    };
+    let (on, on_outcome) = run(true);
+    let (off, off_outcome) = run(false);
+
+    assert!(on_outcome.stagnation_latched, "the guard must latch");
+    assert!(
+        on_outcome.plateau_checked,
+        "a latched stop must be decided by the plateau check"
+    );
+    assert!(on.converged, "one_cpt_iv's latched optimum is consistent");
+    assert!(!off_outcome.stagnation_latched, "guard off never latches");
+    assert!(
+        on.n_iterations < off.n_iterations,
+        "short-window latch must stop before natural termination: {} vs {}",
+        on.n_iterations,
+        off.n_iterations
+    );
+    assert!(
+        (on.ofv - off.ofv).abs() < 1e-3,
+        "early stop within the guard's resolution: {} vs {}",
+        on.ofv,
+        off.ofv
+    );
 }
 
 #[test]

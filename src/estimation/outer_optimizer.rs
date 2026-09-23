@@ -1254,7 +1254,7 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool, short_wind
 /// Evals without a significant OFV improvement after which the stagnation
 /// guard latches.
 ///
-/// **Long window, `3*(n+1)` floored at 50.** Sized for the FD-gradient era: three
+/// **Long window, `max(3·(n+1), 50)`.** Sized for the FD-gradient era: three
 /// attempted descent steps with their gradient probes, and long enough that a
 /// line search at the start of a fit gets a real chance. It is what BOBYQA gets
 /// (its interpolation-model rebuilds legitimately spend many evals flat, and it has
@@ -1262,7 +1262,7 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool, short_wind
 /// has made any progress (#751's init-stall retry keys off the fit's position, not
 /// this guard, but there is no reason to cut such a fit short either).
 ///
-/// **Short window, `n+1` floored at 10, for a gradient fit that has already
+/// **Short window, `max(n+1, 10)`, for a gradient fit that has already
 /// descended (#1530).** A gradient optimizer's callback computes its gradient
 /// inside the same call (analytic, or FD without extra NLopt evals), so every
 /// callback is an iterate or a line-search probe, and `n+1` of them after real
@@ -1286,13 +1286,30 @@ fn stagnation_window(n: usize, short_window: bool) -> usize {
     }
 }
 
+/// Does a gradient-based NLopt run get reachable `xtol`/`ftol` stops?
+///
+/// Only the quadrature objectives (Laplace, FOCEI with `n_agq > 1`) do: their
+/// gradient is finite-difference-limited, so they stop on objective change and step
+/// size, like BOBYQA. FOCE/FOCEI get unreachable `1e-12` stops and rely on the
+/// gradient norm. One predicate, read both where the tolerances are set and by
+/// [`use_short_stagnation_window`], so the two cannot drift apart.
+fn gradient_run_has_reachable_stops(options: &FitOptions) -> bool {
+    options.agq_nodes().is_some()
+}
+
 /// Whether [`stagnation_window`]'s short window applies: a gradient optimizer
-/// (anything but BOBYQA) whose last significant *feasible* improvement
-/// (`last_sig_feasible_eval`, the plateau tracker's index) lies past the first
-/// feasible eval, which only sets the baseline. Feasible-only, so a guard
-/// penalty on eval 1 followed by a feasible eval cannot pass for descent.
-fn use_short_stagnation_window(algo: nlopt::Algorithm, last_sig_feasible_eval: usize) -> bool {
-    !matches!(algo, nlopt::Algorithm::Bobyqa) && last_sig_feasible_eval > 1
+/// (anything but BOBYQA) with unreachable stops (see
+/// [`gradient_run_has_reachable_stops`]; a run that has reachable ones is left to
+/// them), whose last significant *feasible* improvement (`last_sig_feasible_eval`,
+/// the plateau tracker's index) lies past the first feasible eval, which only sets
+/// the baseline. Feasible-only, so a guard penalty on eval 1 followed by a feasible
+/// eval cannot pass for descent.
+fn use_short_stagnation_window(
+    algo: nlopt::Algorithm,
+    reachable_stops: bool,
+    last_sig_feasible_eval: usize,
+) -> bool {
+    !matches!(algo, nlopt::Algorithm::Bobyqa) && !reachable_stops && last_sig_feasible_eval > 1
 }
 
 /// Steps [`step_is_expanding`] looks at: the latest and the two before it.
@@ -1334,6 +1351,7 @@ fn stagnation_after_eval(
     n: usize,
     enabled: bool,
     algo: nlopt::Algorithm,
+    reachable_stops: bool,
     last_sig_feasible_eval: usize,
     step: f64,
 ) -> bool {
@@ -1341,22 +1359,32 @@ fn stagnation_after_eval(
         state.recent_steps.pop_front();
     }
     state.recent_steps.push_back(step);
-    let short_window = use_short_stagnation_window(algo, last_sig_feasible_eval)
+    let short_window = use_short_stagnation_window(algo, reachable_stops, last_sig_feasible_eval)
         && !step_is_expanding(&state.recent_steps);
     detect_stagnation(state, n, enabled, short_window)
 }
 
-/// Does NLopt's `Success` need the plateau verdict a bare `Failure` gets?
+/// Does a run the stagnation guard stopped need the plateau verdict a bare
+/// `Failure` gets?
 ///
-/// A stagnation-guard latch hands NLopt a zero gradient at `best_ofv`, so a
-/// `Success` after one is forced, not found: it is the same "the OFV stopped
-/// moving" claim a `Failure` at a plateau makes, and gets the same check — the
-/// plateau length plus the cold-restart self-consistency test. Before #1530 a latch
-/// was reported converged unconditionally; the short window makes latches far more
-/// common, and on fluconazole the latched best-seen 738.05 re-solves cold to 741.60,
-/// the warm-start artifact that check exists to reject.
-fn latched_success_needs_plateau_check(converged: bool, latched: bool) -> bool {
-    converged && latched
+/// A latch hands NLopt a zero gradient at `best_ofv`, so what it returns next is
+/// forced, not found: the same "the OFV stopped moving" claim a `Failure` at a
+/// plateau makes, and it gets the same check — plateau length plus the cold-restart
+/// self-consistency test. That covers a `Success`-class return (`converged`) and a
+/// `MaxEvalReached` (`max_eval_reached`), which a latch on the last permitted eval
+/// produces; without the second, the same fit's verdict would depend on whether the
+/// budget allowed one more zero-gradient callback. A `Failure` after a latch is
+/// already pending and needs nothing here.
+///
+/// Before #1530 a latch was reported converged unconditionally. The short window
+/// makes latches far more common, and on fluconazole the latched best-seen 738.05
+/// re-solves cold to 741.60, the warm-start artifact the check exists to reject.
+fn latched_stop_needs_plateau_check(
+    converged: bool,
+    max_eval_reached: bool,
+    latched: bool,
+) -> bool {
+    latched && (converged || max_eval_reached)
 }
 
 /// Should this evaluation's EBEs become the warm start for the next one? (#1290)
@@ -2178,6 +2206,11 @@ pub(crate) struct AttemptOutcome {
     /// trace was still descending, at a point that is not a minimum. See
     /// [`resolve_mid_descent_restart`].
     pub(crate) mid_descent_stall: bool,
+    /// The stagnation guard latched during this attempt (#1530).
+    pub(crate) stagnation_latched: bool,
+    /// `converged` was decided by the plateau check ([`failure_is_converged_plateau`])
+    /// rather than read off NLopt's return code.
+    pub(crate) plateau_checked: bool,
 }
 
 /// Run the NLopt outer optimizer, with two guarded second attempts for the two
@@ -3109,6 +3142,7 @@ fn optimize_nlopt_once(
             n,
             options.stagnation_guard,
             algo,
+            gradient_run_has_reachable_stops(options),
             last_sig_feasible_eval,
             step,
         ) {
@@ -3116,10 +3150,9 @@ fn optimize_nlopt_once(
         }
         if state.stagnation_stopped && verbose {
             eprintln!(
-                "Eval {:>4}: stopping early — OFV has converged (no improvement \
-                 above 1e-3 in last window). This is normal convergence behaviour, \
-                 not an error: further evaluations are unlikely to find a better \
-                 solution.",
+                "Eval {:>4}: stopping early — no OFV improvement above 1e-3 in the \
+                 last window. Whether this is convergence is decided after the \
+                 final inner loop (plateau and cold-restart consistency check).",
                 state.n_evals,
             );
         }
@@ -3213,7 +3246,7 @@ fn optimize_nlopt_once(
         opt.set_initial_step(&init_step).unwrap();
     } else {
         opt.set_maxeval(max_eval).unwrap();
-        if options.agq_nodes().is_some() {
+        if gradient_run_has_reachable_stops(options) {
             // AGQ's gradient is exact but **finite-difference-limited**: the grid-response
             // term and the posterior Hessian are both central differences, so the gradient
             // carries a noise floor (~1e-4 relative). The 1e-12 stops below are therefore
@@ -3295,8 +3328,12 @@ fn optimize_nlopt_once(
             }
         }
     };
-    if latched_success_needs_plateau_check(converged, stagnation_latched.load(Ordering::Relaxed)) {
+    let latched = stagnation_latched.load(Ordering::Relaxed);
+    if latched_stop_needs_plateau_check(converged, max_eval_reached, latched) {
+        // The guard, not the budget, ended the run — even when its latch landed on
+        // the last permitted eval — so no "increase maxiter" warning either.
         converged = false;
+        max_eval_reached = false;
         stationarity_check_pending = true;
     }
 
@@ -3723,6 +3760,8 @@ fn optimize_nlopt_once(
                 final_ofv,
                 budget_left,
             ),
+            stagnation_latched: latched,
+            plateau_checked: stationarity_check_pending,
         },
     )
 }
