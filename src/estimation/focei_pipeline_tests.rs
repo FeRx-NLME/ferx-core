@@ -200,7 +200,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     inner_maxiter: 4,
                     ..Default::default()
                 };
-                let (etas, _, _, kappas) =
+                let (etas, hms, _, kappas) =
                     run_inner_loop_warm(&model, &pop, params, 4, opts.inner_tol, None, None, 0, 0);
                 let per_subject = if iov {
                     crate::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(
@@ -246,14 +246,8 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &bounds,
                             &opts,
                         ),
-                        _ => subject_reconverged_fd_gradient(
-                            &x,
-                            params,
-                            &model,
-                            &pop.subjects[i],
-                            &etas[i],
-                            &bounds,
-                            &opts,
+                        _ => held_ebe_salvage(
+                            &x, params, &model, &pop, i, &etas[i], &hms[i], &bounds, &opts,
                         ),
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {
@@ -287,6 +281,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                         &model,
                         &pop,
                         &etas,
+                        &hms,
                         &bounds,
                         &opts,
                         OuterTrial::unknown(),
@@ -326,7 +321,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                         )
                     } else {
                         population_gradient_sens_mixed(
-                            &x, params, &model, &pop, &etas, &bounds, &opts, blown, &declines,
+                            &x, params, &model, &pop, &etas, &hms, &bounds, &opts, blown, &declines,
                         )
                     };
                     // The assembly's own summation order with subject 0's term zero.

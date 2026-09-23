@@ -24,7 +24,7 @@ use std::path::Path;
 
 fn skipped_salvages_in(warnings: &[String]) -> Option<usize> {
     warnings.iter().find_map(|w| {
-        let marker = " of their finite-difference salvages were skipped";
+        let marker = " of their salvage gradients were skipped";
         let end = w.find(marker)?;
         let head = &w[..end];
         head.rsplit(' ').next()?.parse().ok()
@@ -50,7 +50,7 @@ fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() 
         let fd = result
             .warnings
             .iter()
-            .find(|w| w.contains("used finite-difference outer gradients"))
+            .find(|w| w.contains("could not be given the exact analytic outer gradient"))
             .unwrap_or_else(|| {
                 panic!(
                     "{optimizer:?}: the fixture must still decline a subject on this path, \

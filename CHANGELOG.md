@@ -764,6 +764,19 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 
+- **FOCE/FOCEI: a subject the analytic outer gradient declines now follows
+  `reconverge_gradient_interval` instead of always paying for a reconverged gradient.**
+  Such a subject used to get a finite-difference gradient that re-solved its EBE at every
+  perturbed point (`2·n_free` inner solves) whatever the setting. Declines depend on the
+  trial point, so at a blown-up line-search trial most of a population could take that
+  path at once. With the default `reconverge_gradient_interval = 0`, a declined subject now
+  gets the gradient at its held EBE, as the rest of the fixed-EBE machinery does. On the
+  55-subject cyclophosphamide parent–metabolite ODE model (FOCEI, one thread) estimation
+  took 14.3 s instead of 30.5 s, and the final OFV moved from 3242.248 to 3242.281. That is
+  inside the 3241.96–3242.40 spread the same model shows across optimizer settings. The
+  outer-gradient fallback warning now names which gradient those subjects used. IOV
+  models are unchanged: they always reconverge (#1529).
+
 - **Laplace reuses its prepared Hessian factor and no longer allocates one-element grid
   vectors.** The objective hands the regularized Cholesky factor directly to the matching
   gradient, and the one-node rule reads its mode and unit weight without heap-backed node

@@ -4656,12 +4656,18 @@ mod outer_fd_fallback {
             ..FitOptions::default()
         };
         let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let hms: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DMatrix::zeros(s.observations.len(), model.n_eta))
+            .collect();
         let _ = population_gradient_sens_mixed(
             &x,
             params,
             model,
             pop,
             &ehs,
+            &hms,
             &bounds,
             &opts,
             OuterTrial::unknown(),
@@ -4698,13 +4704,74 @@ mod outer_fd_fallback {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
+        let w =
+            outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
+        assert!(
+            w.contains("could not be given the exact analytic outer gradient")
+                && w.contains("a trial point where it could not be formed"),
+            "must not attribute every decline to the provider's scope; got: {w}"
+        );
         assert!(
             w.contains("OUT_OF_SCOPE"),
             "must name the declining subject, not the in-scope one; got: {w}"
         );
         assert!(!w.contains("IN_SCOPE"), "got: {w}");
+        assert!(
+            w.contains("model-level route, not the per-subject one"),
+            "must reconcile the warning with `gradient_method_outer`; got: {w}"
+        );
+    }
+
+    /// #1529: the consequence sentence depends on which salvage the route takes, so both
+    /// sides of the `iov` gate are asserted in one test — a gate stuck on either branch
+    /// reddens it. Non-IOV declines take the held-EBE gradient, whose remedy is
+    /// `reconverge_gradient_interval`; IOV declines are still reconverged (the IOV route
+    /// ignores that knob), so pointing an IOV user at it would be false advice.
+    #[test]
+    fn consequence_sentence_follows_the_salvage_route() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        // The IOV twin of the fixture model: same subjects, one `kappa` on CL. The route is
+        // read from the model inside the warning, so pairing the same log with each model
+        // is what exercises it — an `iov` hard-coded at the call site would redden one leg.
+        let iov_model = crate::parser::model_parser::parse_model_string(
+            &WARFARIN_F
+                .replace(
+                    "omega ETA_KA ~ 0.30",
+                    "omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02",
+                )
+                .replace("TVCL * exp(ETA_CL)", "TVCL * exp(ETA_CL + KAPPA_CL)"),
+        )
+        .expect("IOV twin parses");
+        assert!(
+            iov_model.n_kappa > 0 && model.n_kappa == 0,
+            "fixture precondition: the two models must straddle the IOV gate"
+        );
+
+        let non_iov = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        assert!(
+            non_iov.contains("used fixed-EBE outer gradients")
+                && non_iov.contains("omit the EBE-response term"),
+            "non-IOV must name the held-EBE salvage; got: {non_iov}"
+        );
+        assert!(
+            non_iov.contains("`reconverge_gradient_interval = N`"),
+            "non-IOV must name the remedy; got: {non_iov}"
+        );
+        assert!(!non_iov.contains("correct but slower"), "got: {non_iov}");
+
+        let iov = outer_fd_fallback_warning(&iov_model, &pop, &log).expect("must warn");
+        assert!(
+            iov.contains("reconverged finite-difference outer gradients")
+                && iov.contains("correct but slower"),
+            "IOV must name the reconverged salvage; got: {iov}"
+        );
+        assert!(
+            !iov.contains("reconverge_gradient_interval") && !iov.contains("fixed-EBE"),
+            "IOV ignores the interval knob; got: {iov}"
+        );
     }
 
     /// An all-analytic population is silent.
@@ -4713,7 +4780,7 @@ mod outer_fd_fallback {
         let (model, analytic, _) = analytic_and_declining();
         let pop = mk_pop(vec![analytic]);
         let log = record_one_gradient_eval(&model, &pop);
-        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
+        assert!(outer_fd_fallback_warning(&model, &pop, &log).is_none());
     }
 
     /// The case the *inner* warning deliberately suppresses and this one must not: a
@@ -4736,8 +4803,8 @@ mod outer_fd_fallback {
         );
         let pop = mk_pop(vec![declining.clone(), declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w =
-            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
+        let w = outer_fd_fallback_warning(&model, &pop, &log)
+            .expect("an all-FD in-scope population must warn");
         assert!(w.contains("2 of 2"), "got: {w}");
     }
 
@@ -4747,14 +4814,43 @@ mod outer_fd_fallback {
     /// without touching the analytic branch, so there is nothing to report.
     #[test]
     fn an_untouched_log_says_nothing() {
-        let (_, analytic, declining) = analytic_and_declining();
+        let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         assert!(
-            outer_fd_fallback_warning(&pop, &log).is_none(),
+            outer_fd_fallback_warning(&model, &pop, &log).is_none(),
             "a fit that never evaluated an analytic outer gradient must not warn — even \
              with a subject the provider would decline"
         );
+    }
+
+    /// #1529 review: the three fills of `declined_subject_gradient`, keyed on the held-EBE
+    /// objective and gradient. A repelled subject (the `1e20` sentinel, or NaN/∞) must
+    /// contribute zero rather than a sentinel-driven FD number *or* a reconverge — the
+    /// latter is the #1529 cost at blown-up trials; a usable objective with a non-finite
+    /// gradient must go to the reconverged fallback rather than leak `NaN` into the sum.
+    /// Each arm is pinned both ways so collapsing any two reddens it.
+    #[test]
+    fn declined_fill_keys_on_the_held_ebe_objective_and_gradient() {
+        let finite = [0.5, -1.0];
+        let nan = [0.5, f64::NAN];
+        assert_eq!(declined_fill(12.3, &finite), DeclinedFill::HeldEbe);
+        assert_eq!(declined_fill(12.3, &nan), DeclinedFill::Reconverge);
+        assert_eq!(
+            declined_fill(12.3, &[f64::INFINITY, 0.0]),
+            DeclinedFill::Reconverge
+        );
+        // Sentinel and non-finite objectives are repelled whatever the gradient says.
+        for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
+            assert_eq!(
+                declined_fill(nll, &finite),
+                DeclinedFill::Zero,
+                "nll = {nll}"
+            );
+            assert_eq!(declined_fill(nll, &nan), DeclinedFill::Zero, "nll = {nll}");
+        }
+        // Just under the sentinel is a real objective.
+        assert_eq!(declined_fill(9.99e19, &finite), DeclinedFill::HeldEbe);
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`
@@ -4830,11 +4926,11 @@ mod outer_fd_fallback {
     /// (or a sentence that is always emitted) reddens it.
     #[test]
     fn warning_names_skipped_salvages_only_when_there_were_any() {
-        let (_, analytic, declining) = analytic_and_declining();
+        let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         log.record(1);
-        let before = outer_fd_fallback_warning(&pop, &log).expect("a decline warns");
+        let before = outer_fd_fallback_warning(&model, &pop, &log).expect("a decline warns");
         assert!(
             !before.contains("skipped"),
             "no skipped salvage, no sentence about one; got: {before}"
@@ -4842,9 +4938,9 @@ mod outer_fd_fallback {
         log.record_skipped_salvage();
         log.record_skipped_salvage();
         assert_eq!(log.skipped_salvages(), 2);
-        let after = outer_fd_fallback_warning(&pop, &log).expect("a decline warns");
+        let after = outer_fd_fallback_warning(&model, &pop, &log).expect("a decline warns");
         assert!(
-            after.contains("2 of their finite-difference salvages were skipped"),
+            after.contains("2 of their salvage gradients were skipped"),
             "the sentence must carry the count; got: {after}"
         );
         assert!(
@@ -4973,7 +5069,7 @@ mod outer_fd_fallback {
         template: &ModelParameters,
         x: &[f64],
         opts: &FitOptions,
-    ) -> (Vec<DVector<f64>>, Vec<f64>) {
+    ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<f64>) {
         let params = unpack_params(x, template);
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (ehs, hms, _, kappas) = run_inner_loop_warm(
@@ -5003,7 +5099,7 @@ mod outer_fd_fallback {
                 )
             })
             .collect();
-        (ehs, contribs)
+        (ehs, hms, contribs)
     }
 
     /// The assembly-level straddle, on the fixture's real declining subject: at an ordinary
@@ -5031,7 +5127,7 @@ mod outer_fd_fallback {
             ..FitOptions::default()
         };
         // The incumbent: the model's own starting point.
-        let (ehs_inc, c_inc) = solve_at(&model, &pop, template, &x_inc, &opts);
+        let (ehs_inc, hms_inc, c_inc) = solve_at(&model, &pop, template, &x_inc, &opts);
         let ofv_inc: f64 = c_inc.iter().sum();
         // The blown-up trial: the proportional residual variance at 1/2500 of its value
         // (a 50× smaller SD), so every standardised residual is 50× larger. A θ move
@@ -5040,7 +5136,7 @@ mod outer_fd_fallback {
         let mut bad = template.clone();
         bad.sigma.values[0] /= 2500.0;
         let x_bad = pack_params(&bad);
-        let (ehs_bad, c_bad) = solve_at(&model, &pop, template, &x_bad, &opts);
+        let (ehs_bad, hms_bad, c_bad) = solve_at(&model, &pop, template, &x_bad, &opts);
         let ofv_bad: f64 = c_bad.iter().sum();
         let n_obs_1 = pop.subjects[1].observations.len();
         let n_total = population_n_obs(&pop);
@@ -5088,20 +5184,22 @@ mod outer_fd_fallback {
             );
         }
 
-        let assemble = |x: &[f64], ehs: &[DVector<f64>], trial| {
+        let assemble = |x: &[f64], (ehs, hms): (&[DVector<f64>], &[DMatrix<f64>]), trial| {
             let log = OuterFdDeclineLog::new(pop.subjects.len());
             let g = population_gradient_sens_mixed(
-                x, template, &model, &pop, ehs, &bounds, &opts, trial, &log,
+                x, template, &model, &pop, ehs, hms, &bounds, &opts, trial, &log,
             );
             (g, log)
         };
+        let at_inc = (ehs_inc.as_slice(), hms_inc.as_slice());
+        let at_bad = (ehs_bad.as_slice(), hms_bad.as_slice());
 
         // 1. Ordinary point (the incumbent itself): bit-identical to the unguarded
         //    assembly, salvage run, nothing skipped.
-        let (g_plain, log_plain) = assemble(&x_inc, &ehs_inc, OuterTrial::unknown());
+        let (g_plain, log_plain) = assemble(&x_inc, at_inc, OuterTrial::unknown());
         let (g_same, log_same) = assemble(
             &x_inc,
-            &ehs_inc,
+            at_inc,
             OuterTrial {
                 ofv: ofv_inc,
                 contribs: &c_inc,
@@ -5124,8 +5222,8 @@ mod outer_fd_fallback {
             contribs: &c_bad,
             incumbent: Some((ofv_inc, &c_inc)),
         };
-        let (g_unguarded, _) = assemble(&x_bad, &ehs_bad, OuterTrial::unknown());
-        let (g_guarded, log_guarded) = assemble(&x_bad, &ehs_bad, blown);
+        let (g_unguarded, _) = assemble(&x_bad, at_bad, OuterTrial::unknown());
+        let (g_guarded, log_guarded) = assemble(&x_bad, at_bad, blown);
         assert_eq!(log_guarded.declined_indices(), vec![1], "still a decline");
         assert_eq!(
             log_guarded.skipped_salvages(),
@@ -5175,7 +5273,7 @@ mod outer_fd_fallback {
             contribs: &c_bad,
             incumbent: Some((ofv_inc, &c_inc)),
         };
-        let (g_improving, log_improving) = assemble(&x_bad, &ehs_bad, improving);
+        let (g_improving, log_improving) = assemble(&x_bad, at_bad, improving);
         assert_eq!(log_improving.skipped_salvages(), 0, "population gate holds");
         assert_eq!(bits(&g_improving), bits(&g_unguarded));
 
@@ -5188,7 +5286,7 @@ mod outer_fd_fallback {
             contribs: &c_mild,
             incumbent: Some((ofv_inc, &c_inc)),
         };
-        let (g_mild, log_mild) = assemble(&x_bad, &ehs_bad, mild);
+        let (g_mild, log_mild) = assemble(&x_bad, at_bad, mild);
         assert_eq!(log_mild.skipped_salvages(), 0, "subject gate holds");
         assert_eq!(bits(&g_mild), bits(&g_unguarded));
     }

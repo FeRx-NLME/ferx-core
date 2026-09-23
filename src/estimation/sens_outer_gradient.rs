@@ -2155,10 +2155,10 @@ fn population_sum(
 /// [`per_subject_packed_gradients`] / [`per_subject_packed_gradients_iov`] via
 /// `population_gradient_sens_mixed`, which keeps the exact analytic gradient for
 /// in-scope, finite subjects and fills only the `None`/non-finite ones with a
-/// per-subject reconverged FD. So a subject the analytic path declines (e.g. a
-/// degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose `h_inner` is singular —
-/// merely indefinite is handled by `invert_inner_hessian`'s LU fallback, #1513)
-/// degrades **that subject** to FD, not the whole population.
+/// per-subject held-EBE gradient (reconverged FD under IOV; #1529). So a subject the
+/// analytic path declines (e.g. a degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose
+/// `h_inner` is singular — merely indefinite is handled by `invert_inner_hessian`'s LU
+/// fallback, #1513) degrades **that subject**, not the whole population.
 pub fn population_gradient_sens(
     model: &CompiledModel,
     population: &Population,
@@ -2178,7 +2178,7 @@ pub fn population_gradient_sens(
 /// which short-circuits the *whole* population to `None` on the first
 /// out-of-scope subject, this exposes the per-subject result so the caller can
 /// keep the exact analytic gradient for the in-scope subjects and fill only the
-/// out-of-scope ones with a reconverged-FD gradient. One out-of-scope subject no
+/// out-of-scope ones with a per-subject held-EBE gradient (#1529). One out-of-scope subject no
 /// longer disables the exact gradient for the other thousands — the all-or-
 /// nothing fallback dropped to the θ-only fixed-EBE gradient, whose biased Ω/σ
 /// block stalled SLSQP/L-BFGS/MMA well above the derivative-free optimum

@@ -1748,6 +1748,33 @@ pub(crate) fn subject_eta_response_correction(
     Some(t)
 }
 
+/// Whether a subject's fixed-EBE packed gradient may take one of the closed forms
+/// (Almquist Laplace / Sheiner–Beal) rather than central FD over `subject_nll_at`.
+///
+/// The **single** gate for both [`subject_nll_pop_grad`] and
+/// [`subject_nll_pop_grad_with_cache`] (#1529 review). They used to spell it out
+/// separately and had drifted: the cached twin omitted the θ-dependent-magnitude
+/// exclusion, so a θ-dependent `power(σ, θ)` / magnitude expression took a closed form
+/// that lacks the direct `∂R/∂θ` channel. Every exclusion here is a term the closed
+/// forms do not carry but `subject_nll_at` does:
+///
+/// - M3 censoring, IOV κ, IIV on residual error (`exp(2·η_ruv)` scaling + extra c̃ column);
+/// - a θ-dependent residual magnitude (direct `∂R/∂θ`, in both the data term and log|H̃|);
+/// - `block_sigma` residual correlations: the closed forms build a diagonal `R` from
+///   `variance_at` and leave the packed ρ coordinates at zero, while the objective uses
+///   the live correlations.
+pub(crate) fn closed_form_fixed_ebe_grad_ok(
+    model: &CompiledModel,
+    template: &ModelParameters,
+    kappas: &[DVector<f64>],
+) -> bool {
+    !matches!(model.bloq_method, BloqMethod::M3)
+        && kappas.is_empty()
+        && model.residual_error_eta.is_none()
+        && !model.has_theta_dependent_ruv_magnitude()
+        && template.residual_correlations.is_empty()
+}
+
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
 /// vector for a single subject, with ETAs fixed at their current EBE values.
 ///
@@ -1807,12 +1834,7 @@ pub(crate) fn subject_nll_pop_grad(
     // closed forms take `R`, `∂R/∂f` and `∂R/∂log σ` from `residual_error`'s
     // `_scaled` dispatch, which carries the `|f|^{2p}` loading. An exponent
     // that names a θ is θ-dependent like any other magnitude and goes to FD.
-    let no_theta_dep_magnitude = !model.has_theta_dependent_ruv_magnitude();
-    let no_ruv_eta = model.residual_error_eta.is_none();
-    let common_ok = !matches!(model.bloq_method, BloqMethod::M3)
-        && kappas.is_empty()
-        && no_ruv_eta
-        && no_theta_dep_magnitude;
+    let common_ok = closed_form_fixed_ebe_grad_ok(model, template, kappas);
     let sb_ok =
         common_ok && model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_));
     let laplace_ok = common_ok;
@@ -1853,13 +1875,8 @@ pub(crate) fn subject_nll_pop_grad(
     let n = x.len();
     let fixed_mask = packed_fixed_mask(template);
     let eps = 1e-4;
-    // The sentinel is the largest finite NLL likelihood.rs ever returns
-    // (~1e20). Anything ≥ that bound is treated as "ill-conditioned" and
-    // hidden from the FD difference; using `>=` keeps us robust to a future
-    // sentinel bump.
-    const NLL_SENTINEL_THRESHOLD: f64 = 1e20;
     fn mask_sentinel(nll: f64) -> f64 {
-        if nll.is_finite() && nll < NLL_SENTINEL_THRESHOLD {
+        if is_usable_subject_nll(nll) {
             nll
         } else {
             f64::INFINITY
@@ -1922,25 +1939,63 @@ pub(crate) fn subject_nll_pop_grad(
 
         x_work[j] = x[j];
 
-        let deriv = (nll_plus - nll_minus) / actual_2h;
-        grad[j] = if deriv.is_finite() {
-            deriv
-        } else if nll_plus.is_finite() && nll_base_masked.is_finite() {
-            // One-sided fallback: minus-side was non-finite or sentinel.
-            (nll_plus - nll_base_masked) / (xj_plus - x[j])
-        } else if nll_minus.is_finite() && nll_base_masked.is_finite() {
-            // One-sided fallback: plus-side was non-finite or sentinel.
-            (nll_base_masked - nll_minus) / (x[j] - xj_minus)
-        } else {
-            // Both sides ill-conditioned: gradient is undefined here. Returning
-            // 0 lets the outer optimiser step elsewhere instead of stalling on
-            // a ±1e24/h spike. NLL itself stays at the raw (unmasked) sentinel
-            // so the outer line search still knows the move was infeasible.
-            0.0
-        };
+        grad[j] = masked_fd_component(
+            nll_plus,
+            nll_minus,
+            nll_base_masked,
+            x[j],
+            xj_plus,
+            xj_minus,
+        );
     }
 
     (nll_base_raw, grad)
+}
+
+/// The sentinel is the largest finite NLL `stats::likelihood` ever returns (~1e20).
+/// Anything ≥ that bound is "ill-conditioned"; `>=` keeps the test robust to a future
+/// sentinel bump.
+pub(crate) const NLL_SENTINEL_THRESHOLD: f64 = 1e20;
+
+/// Whether a per-subject NLL is a real value rather than NaN/∞ or the `1e20` sentinel.
+pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
+    nll.is_finite() && nll < NLL_SENTINEL_THRESHOLD
+}
+
+/// One coordinate of the FD fallback in [`subject_nll_pop_grad`], given the
+/// sentinel-masked (`+∞` when unusable) objective at `x_j ± h` and at `x_j`, with the
+/// ± points already clamped to the bounds.
+///
+/// Central when both sides are usable; one-sided when only one is **and** its step is
+/// non-zero; otherwise 0. The step check matters at a bound: there the clamp makes
+/// `xp == x_j` (or `xm == x_j`), and the one-sided quotient was `0/0 = NaN`, which
+/// escaped into the population gradient (#1529 review).
+fn masked_fd_component(
+    nll_plus: f64,
+    nll_minus: f64,
+    nll_base: f64,
+    xj: f64,
+    xp: f64,
+    xm: f64,
+) -> f64 {
+    const MIN_STEP: f64 = 1e-16;
+    let deriv = (nll_plus - nll_minus) / (xp - xm);
+    if deriv.is_finite() {
+        deriv
+    } else if nll_plus.is_finite() && nll_base.is_finite() && xp - xj > MIN_STEP {
+        // One-sided fallback: minus-side was non-finite or sentinel.
+        (nll_plus - nll_base) / (xp - xj)
+    } else if nll_minus.is_finite() && nll_base.is_finite() && xj - xm > MIN_STEP {
+        // One-sided fallback: plus-side was non-finite or sentinel.
+        (nll_base - nll_minus) / (xj - xm)
+    } else {
+        // Both sides ill-conditioned (or the usable side has no step): the gradient
+        // is undefined here. Returning 0 lets the outer optimiser step elsewhere
+        // instead of stalling on a ±1e24/h spike. NLL itself stays at the raw
+        // (unmasked) sentinel so the outer line search still knows the move was
+        // infeasible.
+        0.0
+    }
 }
 
 /// [`subject_nll_pop_grad`] that additionally returns the [`LaplaceGradCache`]
@@ -1967,12 +2022,9 @@ pub(crate) fn subject_nll_pop_grad_with_cache(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (f64, Vec<f64>, Option<LaplaceGradCache>) {
-    // IIV on residual error (#409) is not handled by the analytical Laplace
-    // gradient/cache — route to the FD `subject_nll_pop_grad` (see there).
-    let laplace_ok = !matches!(model.bloq_method, BloqMethod::M3)
-        && kappas.is_empty()
-        && model.residual_error_eta.is_none();
-    if options.interaction && laplace_ok {
+    // Same gate as `subject_nll_pop_grad`'s Laplace arm; anything it excludes goes to
+    // the FD fallback there (see `closed_form_fixed_ebe_grad_ok`).
+    if options.interaction && closed_form_fixed_ebe_grad_ok(model, template, kappas) {
         if let Some((nll, grad, cache)) = subject_nll_pop_grad_analytical_laplace_cached(
             x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
         ) {
@@ -3892,7 +3944,20 @@ mod tests {
     /// path (analytic Laplace / analytic Sheiner–Beal / FD fallback) the
     /// dispatcher picks for this model.
     fn check_gn_grad_matches_fd(model: &CompiledModel, interaction: bool) {
-        let population = weighted_gn_population();
+        check_gn_grad_matches_fd_on(model, &weighted_gn_population(), interaction);
+    }
+
+    /// Checks **both** `subject_nll_pop_grad` and its cached twin
+    /// `subject_nll_pop_grad_with_cache` (the fixed-EBE gradient the outer loop charges a
+    /// declined subject, #1529). The two used to carry separate closed-form gates, and the
+    /// cached one lacked the θ-dependent-magnitude exclusion — green here while only the
+    /// uncached leg was checked.
+    fn check_gn_grad_matches_fd_on(
+        model: &CompiledModel,
+        population: &Population,
+        interaction: bool,
+    ) {
+        let population = population.clone();
         let template = &model.default_params;
         let x = pack_params(template);
         let bounds = compute_bounds(template);
@@ -3905,6 +3970,18 @@ mod tests {
         options.interaction = interaction;
 
         let (nll, grad) = subject_nll_pop_grad(
+            &x,
+            template,
+            model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
+        );
+        let (nll_c, grad_c, _) = subject_nll_pop_grad_with_cache(
             &x,
             template,
             model,
@@ -3959,16 +4036,76 @@ mod tests {
                 &options,
             );
             let fd = (nll_p - nll_m) / two_h;
-            let rel = (grad[j] - fd).abs() / fd.abs().max(1e-6);
-            assert!(
-                rel < 2e-3,
-                "weighted GN grad[{j}] (interaction={interaction}): analytic={:.6e}, \
-                 fd={:.6e}, rel={:.2e}",
-                grad[j],
-                fd,
-                rel
-            );
+            assert!(fd.is_finite(), "FD reference must be finite at grad[{j}]");
+            for (leg, g) in [("uncached", &grad), ("cached", &grad_c)] {
+                let rel = (g[j] - fd).abs() / fd.abs().max(1e-6);
+                assert!(
+                    rel < 2e-3,
+                    "{leg} GN grad[{j}] (interaction={interaction}): analytic={:.6e}, \
+                     fd={:.6e}, rel={:.2e}",
+                    g[j],
+                    fd,
+                    rel
+                );
+            }
         }
+        assert!(
+            (nll_c - nll_ref).abs() < 1e-9,
+            "cached GN NLL disagrees with the shared marginal: {nll_c} vs {nll_ref}"
+        );
+    }
+
+    /// `block_sigma` (#1529 review): the closed forms build a diagonal `R` from
+    /// `variance_at` and leave the packed ρ coordinate at zero, while `subject_nll_at`
+    /// uses the live correlation. So the gate must send a correlated model to the FD
+    /// fallback on **both** legs — the ρ coordinate is what fails otherwise. The
+    /// `combined` endpoint makes ρ live: its within-observation covariance adds
+    /// `2ρ·σ_prop·σ_add·f` to every observation's variance.
+    #[test]
+    fn block_sigma_gn_grad_matches_fd_via_fallback() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.1, 10.0)\n  theta TVV(10.0, 1.0, 100.0)\n  \
+             omega ETA_CL ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.01, 0.02, 0.25]\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ combined(PROP_ERR, ADD_ERR)\n",
+        )
+        .expect("block_sigma model parses");
+        assert!(
+            !model.default_params.residual_correlations.is_empty(),
+            "fixture precondition: the model must carry a live residual correlation"
+        );
+        assert!(!closed_form_fixed_ebe_grad_ok(
+            &model,
+            &model.default_params,
+            &[]
+        ));
+        let mut population = weighted_gn_population();
+        population.covariate_names.clear();
+        check_gn_grad_matches_fd_on(&model, &population, true);
+        check_gn_grad_matches_fd_on(&model, &population, false);
+    }
+
+    /// #1529 review: at a bound the clamp makes the step on that side zero, and the
+    /// one-sided quotient was `0/0 = NaN`. Both bounds, both sides — plus the in-range
+    /// one-sided cases, so a guard that returned 0 unconditionally also reddens this.
+    #[test]
+    fn masked_fd_component_is_finite_at_a_bound() {
+        let inf = f64::INFINITY;
+        // At the upper bound (xp == xj), minus side unusable: no usable step → 0, not NaN.
+        let g = masked_fd_component(10.0, inf, 9.0, 1.0, 1.0, 0.9);
+        assert_eq!(g, 0.0);
+        // At the lower bound (xm == xj), plus side unusable: same.
+        let g = masked_fd_component(inf, 10.0, 9.0, 1.0, 1.1, 1.0);
+        assert_eq!(g, 0.0);
+        // In range, one side unusable: the one-sided quotient on the usable side.
+        let g = masked_fd_component(10.0, inf, 9.0, 1.0, 1.1, 0.9);
+        assert!((g - 10.0).abs() < 1e-9, "forward difference, got {g}");
+        let g = masked_fd_component(inf, 8.0, 9.0, 1.0, 1.1, 0.9);
+        assert!((g - 10.0).abs() < 1e-9, "backward difference, got {g}");
+        // Both usable: central.
+        let g = masked_fd_component(10.0, 8.0, 9.0, 1.0, 1.1, 0.9);
+        assert!((g - 10.0).abs() < 1e-9, "central difference, got {g}");
     }
 
     /// Magnitudes on **both** slots: `weight =` scales the additive loading and

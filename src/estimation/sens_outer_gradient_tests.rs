@@ -2047,12 +2047,13 @@ fn ss_reset_subject_outer(
 /// Regression for focei-slsqp-fixed-ebe-gradient-bias: a population mixing
 /// in-scope subjects with a single out-of-scope (SS+reset) subject must still
 /// yield the exact analytic gradient for the in-scope subjects, filling only
-/// the out-of-scope one with a reconverged per-subject FD. Before the fix one
-/// such subject forced `population_gradient_sens` to `None`, dropping the
-/// whole population onto the θ-only fixed-EBE gradient whose biased Ω/σ block
-/// left the variance components pinned at their start and stalled SLSQP/
-/// L-BFGS/MMA. The assembled `population_gradient_sens_mixed` must match
-/// reconverged-FD of the FOCEI OFV across every packed coordinate.
+/// the out-of-scope one with a per-subject held-EBE gradient (#1529; it was a
+/// reconverged per-subject FD before). Before the fix one such subject forced
+/// `population_gradient_sens` to `None`, dropping the whole population onto the
+/// θ-only fixed-EBE gradient whose biased Ω/σ block left the variance components
+/// pinned at their start and stalled SLSQP/L-BFGS/MMA. The assembled
+/// `population_gradient_sens_mixed` must match FD of that split objective across
+/// every packed coordinate.
 #[test]
 fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
     use crate::estimation::outer_optimizer::population_gradient_sens_mixed;
@@ -2112,13 +2113,33 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
         "rate-defined infusion under F is out of analytic scope"
     );
 
-    // The assembled mixed gradient (analytic in-scope + per-subject FD for the
-    // out-of-scope subject) must match reconverged-FD of the FOCEI OFV.
+    // The assembled mixed gradient (analytic in-scope + per-subject held-EBE for the
+    // out-of-scope subject, #1529) must match FD of the same split objective: the
+    // in-scope subject's marginal with its EBE re-solved at every point, the
+    // out-of-scope subject's FOCEI objective at its *held* η̂ and prediction Jacobian.
     let options = FitOptions {
         interaction: true,
         ..Default::default()
     };
     let bounds = compute_bounds(&template);
+    let hms: Vec<DMatrix<f64>> = pop
+        .subjects
+        .iter()
+        .zip(&ehs)
+        .map(|(s, eta)| {
+            find_ebe(
+                &model,
+                s,
+                &params,
+                200,
+                1e-12,
+                Some(eta.as_slice()),
+                None,
+                0,
+            )
+            .h_matrix
+        })
+        .collect();
     let declines = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
     let mixed = population_gradient_sens_mixed(
         &x,
@@ -2126,40 +2147,39 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
         &model,
         &pop,
         &ehs,
+        &hms,
         &bounds,
         &options,
         crate::estimation::outer_optimizer::OuterTrial::unknown(),
         &declines,
     );
 
-    // FD reference, per subject mirroring the mixed assembly: in-scope
-    // subjects via the analytic-EBE `marginal_nll`, the out-of-scope one via
-    // the production reconverged EBE + `foce_subject_nll` (exactly what the
-    // mixed FD fallback computes internally).
-    let subj_marginal = |s: &Subject, p: &ModelParameters| -> f64 {
-        if in_scope(s) {
-            marginal_nll(&model, s, p)
-        } else {
-            let ebe = find_ebe(&model, s, p, 200, 1e-12, None, None, 0);
-            foce_subject_nll(
-                &model,
-                s,
-                &p.theta,
-                &ebe.eta,
-                &ebe.h_matrix,
-                &p.omega,
-                &p.sigma.values,
-                &p.residual_correlations,
-                true,
-            )
-        }
+    let held = |i: usize, p: &ModelParameters| -> f64 {
+        foce_subject_nll(
+            &model,
+            &pop.subjects[i],
+            &p.theta,
+            &ehs[i],
+            &hms[i],
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            true,
+        )
     };
     let ofv = |xv: &[f64]| -> f64 {
         let p = unpack_params(xv, &template);
         2.0 * pop
             .subjects
             .iter()
-            .map(|s| subj_marginal(s, &p))
+            .enumerate()
+            .map(|(i, s)| {
+                if in_scope(s) {
+                    marginal_nll(&model, s, &p)
+                } else {
+                    held(i, &p)
+                }
+            })
             .sum::<f64>()
     };
     assert_grad_matches_richardson_fd(&x, &mixed, ofv, 3e-3, 1e-5);
