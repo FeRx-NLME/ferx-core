@@ -87,7 +87,7 @@ additional doses.
 
 | Column | Must be | Read on |
 |--------|---------|---------|
-| `TIME`, `EVID` | a number; a non-negative whole number for `EVID` | every record |
+| `TIME`, `EVID` | a number; a whole number from 0 to 4294967295 for `EVID` | every record |
 | `AMT` | a number | a dose record — and every record when the dataset has no `EVID` column, since the record type is then [inferred from `AMT`](#inferring-doses-without-an-evid-column) |
 | `MDV` | a non-negative whole number | an `EVID=0` record |
 | `RATE`, `II`, `SS` | a number | a dose record (`SS` other than 0 or 1 is rejected as before) |
@@ -105,10 +105,13 @@ Three things are unchanged:
   table above; only a present cell that is not a number is an error.
 - **A record the `[data_selection]` block removes is not read**, so a cell on it
   is not checked — NONMEM behaves the same way with `IGNORE`. The rule that
-  removes the record must not read the unreadable column itself: `ignore = CENS
-  == 0` on `CENS = abc` would decide the record on a value the dataset does not
-  hold, so it is an error too, naming the rule. The same holds for a rule that
-  reads the column and keeps the record. NONMEM 7.5.1 agrees on both sides:
+  removes the record must not decide it on the unreadable column itself:
+  `ignore = CENS == 0` on `CENS = abc` would decide the record on a value the
+  dataset does not hold, so it is an error too, naming the rule. The same holds
+  for a rule that keeps the record on that column. A rule decides on the column
+  only when its other terms hold: `ignore = EVID == 2 && RATE == 0` on an
+  observation with `RATE = abc` is decided by `EVID` and reads without error.
+  NONMEM 7.5.1 agrees on both sides of the single-term case:
   `IGNORE=(TIME.EQ.2)` removes a `CENS = abc` record without error, while
   `IGNORE=(CENS.EQ.0)` on it is a `(DATA ERROR)`. See
   [missing and unreadable cells](model-file/data-selection.qmd#missing-and-unreadable-cells).

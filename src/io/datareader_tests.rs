@@ -4081,25 +4081,29 @@ fn read_unreadable(csv: &str, clause: Option<&str>) -> Result<Population, String
 fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
     use UnreadableCase as C;
     let num = "a number";
-    let count = "a non-negative whole number";
+    let u32_ = "a whole number from 0 to 4294967295";
+    let u16_ = "a whole number from 0 to 65535";
+    let usize_ = "a whole number from 0 to 18446744073709551615";
     #[rustfmt::skip]
     let cases = [
         C { col: "TIME", rec: 2, unread_rec: None, cell: "abc", what: num, at: "record 3 of the subject", remove: "DV == 4" },
-        C { col: "EVID", rec: 2, unread_rec: None, cell: "abc", what: count, at: "time 2", remove: "TIME == 2" },
-        C { col: "EVID", rec: 2, unread_rec: None, cell: "1.5", what: count, at: "time 2", remove: "TIME == 2" },
-        C { col: "EVID", rec: 2, unread_rec: None, cell: "-1", what: count, at: "time 2", remove: "TIME == 2" },
-        C { col: "MDV", rec: 2, unread_rec: Some(0), cell: "abc", what: count, at: "time 2", remove: "TIME == 2" },
-        C { col: "MDV", rec: 2, unread_rec: Some(0), cell: "1.5", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "abc", what: u32_, at: "time 2", remove: "TIME == 2" },
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "1.5", what: u32_, at: "time 2", remove: "TIME == 2" },
+        // Past `u32`, which EVID is read as.
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "4294967296", what: u32_, at: "time 2", remove: "TIME == 2" },
+        C { col: "EVID", rec: 2, unread_rec: None, cell: "-1", what: u32_, at: "time 2", remove: "TIME == 2" },
+        C { col: "MDV", rec: 2, unread_rec: Some(0), cell: "abc", what: usize_, at: "time 2", remove: "TIME == 2" },
+        C { col: "MDV", rec: 2, unread_rec: Some(0), cell: "1.5", what: usize_, at: "time 2", remove: "TIME == 2" },
         C { col: "DV", rec: 2, unread_rec: Some(0), cell: "abc", what: num, at: "time 2", remove: "TIME == 2" },
-        C { col: "FREMTYPE", rec: 2, unread_rec: Some(0), cell: "abc", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "FREMTYPE", rec: 2, unread_rec: Some(0), cell: "abc", what: u16_, at: "time 2", remove: "TIME == 2" },
         // Past `u16`, which FREMTYPE is read as: a whole number that read as 0.
-        C { col: "FREMTYPE", rec: 2, unread_rec: Some(0), cell: "70000", what: count, at: "time 2", remove: "TIME == 2" },
+        C { col: "FREMTYPE", rec: 2, unread_rec: Some(0), cell: "70000", what: u16_, at: "time 2", remove: "TIME == 2" },
         C { col: "AMT", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
         C { col: "RATE", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
         C { col: "II", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
         C { col: "SS", rec: 0, unread_rec: Some(2), cell: "abc", what: num, at: "time 0", remove: "TIME == 0" },
-        C { col: "ADDL", rec: 0, unread_rec: Some(2), cell: "abc", what: count, at: "time 0", remove: "TIME == 0" },
-        C { col: "ADDL", rec: 0, unread_rec: Some(2), cell: "1.5", what: count, at: "time 0", remove: "TIME == 0" },
+        C { col: "ADDL", rec: 0, unread_rec: Some(2), cell: "abc", what: usize_, at: "time 0", remove: "TIME == 0" },
+        C { col: "ADDL", rec: 0, unread_rec: Some(2), cell: "1.5", what: usize_, at: "time 0", remove: "TIME == 0" },
     ];
     for case in &cases {
         let UnreadableCase { col, rec, cell, .. } = *case;
@@ -4118,9 +4122,20 @@ fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
             "{tag}"
         );
 
-        // 2. A missing cell keeps its default.
-        read_unreadable(&unreadable_fixture(col, rec, "."), None)
+        // 2. A missing cell keeps its default, in every missing spelling: each
+        //    reads exactly as `.` does. `NaN` used to parse to IEEE NaN, so
+        //    `RATE=NaN` was rejected as non-finite (#1501 review).
+        let dot = read_unreadable(&unreadable_fixture(col, rec, "."), None)
             .unwrap_or_else(|e| panic!("{tag}: `.` must read as missing: {e}"));
+        for missing in ["", "NA", "NaN", "nan"] {
+            let pop = read_unreadable(&unreadable_fixture(col, rec, missing), None)
+                .unwrap_or_else(|e| panic!("{tag}: {missing:?} must read as missing: {e}"));
+            assert_eq!(
+                format!("{:?}", pop.subjects),
+                format!("{:?}", dot.subjects),
+                "{tag}: {missing:?} must read as `.` does"
+            );
+        }
 
         // 3. Removed by a clause that does not read the column: no error, and the
         //    record really went.
@@ -4141,10 +4156,11 @@ fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
 
         // 4. A clause that reads the column and keeps the record decided it on the
         //    fallback. `SS` in the filter context is read as a count, where the dose
-        //    record leaves `1.5` / `2` to `validate_ss`. `ADDL` and `FREMTYPE` are
-        //    not columns the filter context knows: a clause on either reads it as a
-        //    covariate.
-        if matches!(col, "ADDL" | "FREMTYPE") {
+        //    record leaves `1.5` / `2` to `validate_ss`. `FREMTYPE` has no
+        //    `RowContext` field; a clause reads it from the covariate map, where the
+        //    unparseable cell leaves the previous record's value (#1501 review).
+        //    `ADDL` is a documented inert filter target: a clause on it never fires.
+        if col == "ADDL" {
             continue;
         }
         let clause = format!("{col} == 12345");
@@ -4155,7 +4171,7 @@ fn an_unreadable_cell_is_an_error_on_a_kept_record_that_reads_it() {
                 "subject 1, {}: the [data_selection] rule \"ignore: {clause}\" decides \
                  this record on {col}=\"{cell}\", which is not {}. Correct the cell.",
                 case.at,
-                if col == "SS" { count } else { case.what }
+                if col == "SS" { usize_ } else { case.what }
             ),
             "{tag}"
         );
@@ -4220,6 +4236,160 @@ fn a_data_selection_rule_does_not_decide_a_record_on_an_unreadable_cell() {
     assert_eq!(removed.subjects[0].observations, vec![5.0]);
 }
 
+/// #1501 review, finding 1: a clause is a conjunction, so it decides a record on an
+/// unreadable cell only when every *other* sub-expression holds. Before, the check
+/// asked whether the clause *named* the column, and refused `EVID == 2 && RATE == 0`
+/// on an observation whose `RATE` is `abc` — a record `EVID` alone decides.
+///
+/// Each branch of the decider gets a twin pair that differs only in the guard, so
+/// the dependency test is straddled: the kept branch through `ignore`, the fired
+/// branch through `accept`.
+#[test]
+fn a_compound_rule_decides_on_an_unreadable_cell_only_when_its_other_terms_hold() {
+    // RATE is written 0 on the dose and the first observation, so the only cell the
+    // conjunct can trip on is the `abc` at TIME 2.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,RATE\n\
+               1,0,.,1,1,100,1,0\n\
+               1,1,5.0,0,0,.,1,0\n\
+               1,2,4.0,0,0,.,1,abc\n";
+    let read = |ignore: &[&str], accept: &[&str]| {
+        let f = write_csv(csv);
+        let own = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let filter = SelectionFilter::from_opts(&own(ignore), &own(accept), &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_filtered(f.path(), None, None, &filter)
+    };
+    let refused = |rule: &str| {
+        format!(
+            "subject 1, time 2: the [data_selection] rule \"{rule}\" decides this record on \
+             RATE=\"abc\", which is not a number. Correct the cell."
+        )
+    };
+
+    // Kept branch. `EVID == 2` is false on the record, so RATE cannot matter: kept.
+    let kept =
+        read(&["EVID == 2 && RATE == 0"], &[]).unwrap_or_else(|e| panic!("guard false, kept: {e}"));
+    assert_eq!(kept.subjects[0].observations, vec![5.0, 4.0]);
+    // Twin: `EVID == 0` holds, so RATE decides whether the record goes.
+    assert_eq!(
+        read(&["EVID == 0 && RATE == 0"], &[]).unwrap_err(),
+        refused("ignore: EVID == 0 && RATE == 0")
+    );
+
+    // Fired branch. `TIME != 2` is false on the record: `accept` removes it on TIME.
+    let removed = read(&[], &["TIME != 2 && RATE == 0"])
+        .unwrap_or_else(|e| panic!("guard false, removed: {e}"));
+    assert_eq!(removed.subjects[0].observations, vec![5.0]);
+    // Twin: `TIME != 1` holds, so the record goes on RATE's fallback.
+    assert_eq!(
+        read(&[], &["TIME != 1 && RATE == 0"]).unwrap_err(),
+        refused("accept: TIME != 1 && RATE == 0")
+    );
+}
+
+/// #1501 review, finding 2: `TENTRY` has no `RowContext` field. On the declared
+/// `[covariates]` path a clause on it injects it into the covariate map, where an
+/// unparseable cell leaves the previous record's value in place. Off a TTE row the
+/// reader never reads `TENTRY`, so without the filter check `ignore = TENTRY == 0`
+/// removed the `abc` record on the previous record's `0`, silently. (On the
+/// auto-detect path `TENTRY` is a reserved column and a clause on it never fires.)
+#[test]
+fn a_rule_does_not_decide_a_record_on_an_unreadable_tentry() {
+    let read = |cell: &str, clause: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY,WT\n\
+             1,0,.,1,1,100,1,0,70\n\
+             1,1,5.0,0,0,.,1,0,70\n\
+             1,2,4.0,0,0,.,1,{cell},70\n"
+        ));
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+            levels: None,
+        }];
+        let filter = SelectionFilter::from_opts(&[clause.to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_with_covariates_filtered(f.path(), &decls, &[], None, &filter)
+            .map(|(pop, _)| pop)
+    };
+    // Not a TTE row, so the cell is not read without a clause on it.
+    let plain = read("abc", "TIME == 99").unwrap_or_else(|e| panic!("plain: {e}"));
+    assert_eq!(plain.subjects[0].observations, vec![5.0, 4.0]);
+    assert_eq!(
+        read("abc", "TENTRY == 0").unwrap_err(),
+        "subject 1, time 2: the [data_selection] rule \"ignore: TENTRY == 0\" decides this \
+         record on TENTRY=\"abc\", which is not a number. Correct the cell."
+    );
+    // Straddle: the clause is live on this path — a real `1` is kept, a real `0`
+    // removed with the others.
+    let one = read("1", "TENTRY == 0").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(one.subjects[0].observations, vec![4.0]);
+    let zero = read("0", "TENTRY == 0").unwrap_or_else(|e| panic!("{e}"));
+    assert!(zero.subjects.is_empty(), "every record has TENTRY 0");
+}
+
+/// #1501 review, finding 3: the covariate table echoes every input record, one the
+/// filter removed included, and the reader does not check a removed record. Its
+/// unreadable `TIME` is echoed as `NaN`, the table's missing encoding, not as a
+/// fabricated `0`. The readable twin on the same removed record is echoed as written.
+#[test]
+fn the_covariate_table_echoes_an_unreadable_time_on_a_removed_record_as_nan() {
+    let read = |time: &str| {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,WT,STUDY\n\
+             1,0,.,1,1,100,1,70,1\n\
+             1,1,5.0,0,0,.,1,70,1\n\
+             1,{time},4.0,0,0,.,1,70,2\n"
+        ));
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+            levels: None,
+        }];
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[])
+            .unwrap_or_else(|e| panic!("filter: {e}"));
+        read_nonmem_csv_with_covariates_filtered(f.path(), &decls, &[], None, &filter)
+            .unwrap_or_else(|e| panic!("TIME={time}: {e}"))
+    };
+    let (pop, table) = read("abc");
+    assert_eq!(
+        pop.subjects[0].observations,
+        vec![5.0],
+        "STUDY 2 is removed"
+    );
+    let times: Vec<f64> = table.rows.iter().map(|r| r.time).collect();
+    assert_eq!(times.len(), 3, "the table echoes the removed record too");
+    assert_eq!(&times[..2], &[0.0, 1.0]);
+    assert!(times[2].is_nan(), "unreadable TIME echoed as {}", times[2]);
+    let (_, table) = read("2");
+    assert_eq!(table.rows[2].time, 2.0);
+}
+
+/// #1501 review, finding 5: the range each message names is the type the column is
+/// read in, so `70000` in `FREMTYPE` is not told it "is not a non-negative whole
+/// number". Tied to the type maxima so a type change reddens here.
+#[test]
+fn unsigned_range_phrases_name_the_type_maximum() {
+    assert_eq!(NOT_A_U32, format!("a whole number from 0 to {}", u32::MAX));
+    assert_eq!(NOT_A_U16, format!("a whole number from 0 to {}", u16::MAX));
+    assert_eq!(
+        NOT_A_USIZE,
+        format!("a whole number from 0 to {}", usize::MAX)
+    );
+    // The largest value in range reads; one past it is unreadable.
+    for (spec, max) in [
+        (&EVID_CELL, u64::from(u32::MAX)),
+        (&FREMTYPE_CELL, u64::from(u16::MAX)),
+    ] {
+        assert!((spec.holds)(&max.to_string()), "{} {max}", spec.name);
+        assert!(
+            !(spec.holds)(&(max + 1).to_string()),
+            "{} {max}+1",
+            spec.name
+        );
+    }
+}
+
 /// #1501, `SS` in the `[data_selection]` context, which reads it as a count: `1.5`
 /// read there as 0 (not steady state). On an observation record, which never
 /// reads `SS`, the cell is accepted; a clause that reads `SS` is refused.
@@ -4233,7 +4403,8 @@ fn a_fractional_ss_is_not_decided_on_by_a_data_selection_rule() {
     assert_eq!(
         read_unreadable(csv, Some("SS == 1")).unwrap_err(),
         "subject 1, time 1: the [data_selection] rule \"ignore: SS == 1\" decides this \
-         record on SS=\"1.5\", which is not a non-negative whole number. Correct the cell."
+         record on SS=\"1.5\", which is not a whole number from 0 to 18446744073709551615. \
+         Correct the cell."
     );
 }
 

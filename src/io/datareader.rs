@@ -130,19 +130,21 @@ impl SelectionFilter {
         None
     }
 
-    /// The first ignore/accept clause, in the documented order, that reads any of
-    /// `cols` (case-insensitive). A record the filter keeps was kept by every clause,
-    /// so this is the clause that first decided it on those columns (#1501).
-    pub(crate) fn first_clause_reading(&self, cols: &[&str]) -> Option<Excluder<'_>> {
-        let reads = |c: &&FilterClause| {
-            c.columns()
-                .any(|x| cols.iter().any(|col| x.eq_ignore_ascii_case(col)))
-        };
+    /// The first ignore/accept clause, in the documented order, whose outcome on
+    /// `ctx` rests on any of `cols` (`FilterClause::depends_on`). A record the
+    /// filter keeps was kept by every clause, so this is the clause that first
+    /// decided it on those columns (#1501).
+    pub(crate) fn first_clause_depending_on(
+        &self,
+        ctx: &RowContext<'_>,
+        cols: &[&str],
+    ) -> Option<Excluder<'_>> {
+        let depends = |c: &&FilterClause| c.depends_on(ctx, cols);
         self.ignore
             .iter()
-            .find(reads)
+            .find(depends)
             .map(Excluder::Ignore)
-            .or_else(|| self.accept.iter().find(reads).map(Excluder::Accept))
+            .or_else(|| self.accept.iter().find(depends).map(Excluder::Accept))
     }
 }
 
@@ -173,6 +175,16 @@ impl Excluder<'_> {
             Excluder::Ignore(c) | Excluder::Accept(c) => {
                 c.columns().any(|x| x.eq_ignore_ascii_case(col))
             }
+        }
+    }
+
+    /// Whether the rule's outcome on `ctx` rests on any of `cols`
+    /// (`FilterClause::depends_on`). The `ignore_subjects` shorthand reads no row
+    /// column.
+    pub(crate) fn depends_on(&self, ctx: &RowContext<'_>, cols: &[&str]) -> bool {
+        match self {
+            Excluder::Subject => false,
+            Excluder::Ignore(c) | Excluder::Accept(c) => c.depends_on(ctx, cols),
         }
     }
 
@@ -980,7 +992,18 @@ fn read_nonmem_csv_impl(
         let id = fields.get(id_col).cloned().unwrap_or_default();
 
         if build_table {
-            let time = parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
+            // The table echoes every input record, including one `[data_selection]`
+            // removes — which the reader never checks (#1501, NONMEM's `IGNORE`
+            // boundary). A `TIME` cell that is not a number is echoed as `NaN`, the
+            // table's missing encoding, rather than as a fabricated `0`; a record the
+            // filter keeps with such a cell fails the read, so it never gets here.
+            // `EVID` is an integer and has no such encoding: an unreadable one on a
+            // removed record is echoed as `effective_evid`'s fallback, 0.
+            let time = if unreadable_cell(&fields, Some(time_col), &TIME_CELL).is_some() {
+                f64::NAN
+            } else {
+                parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"))
+            };
             // Mirror `parse_subject`'s EVID computation (incl. AMT-based dose
             // inference when EVID is absent) so the table's EVID agrees with how
             // each row was classified. #262
@@ -1394,8 +1417,17 @@ fn read_nonmem_csv_impl(
     ))
 }
 
+/// A numeric cell, with every missing spelling (`.`, blank, `NA`, `NaN`) read as
+/// `0.0`, the default the numeric columns document. `NaN` used to parse to IEEE
+/// `NaN` here, so `RATE=NaN` was rejected as non-finite and `TIME=NaN` put the
+/// record at an undefined time, while `.` read as the default (#1501 review). A
+/// present cell that is not a number also reads as `0.0`; the caller rejects it
+/// first where the record reads the column (`unreadable_cell`).
 fn parse_f64(s: &str) -> f64 {
-    s.parse::<f64>().unwrap_or(0.0)
+    if is_missing_cell(s) {
+        return 0.0;
+    }
+    s.trim().parse::<f64>().unwrap_or(0.0)
 }
 
 /// Parse a numeric cell for the data-selection filter, mapping missing/blank
@@ -2148,7 +2180,15 @@ fn holds_whole(t: &str) -> bool {
 }
 
 const NOT_A_NUMBER: &str = "a number";
-const NOT_A_COUNT: &str = "a non-negative whole number";
+/// The range each unsigned column is read in, spelled out: a message saying
+/// `70000` "is not a non-negative whole number" would be false (#1501 review).
+/// `unsigned_range_phrases_name_the_type_maximum` pins each maximum to its type.
+const NOT_A_U32: &str = "a whole number from 0 to 4294967295";
+const NOT_A_U16: &str = "a whole number from 0 to 65535";
+/// `usize` on the 64-bit targets ferx builds for. A float-spelled
+/// `18446744073709551615.0` rounds to 2^64 and is rejected although the text names
+/// the maximum — the same measured edge [`parse_cmt_cell`] documents.
+const NOT_A_USIZE: &str = "a whole number from 0 to 18446744073709551615";
 
 const TIME_CELL: CellSpec = CellSpec {
     name: "TIME",
@@ -2185,27 +2225,27 @@ const SS_DOSE_CELL: CellSpec = CellSpec {
 /// `SS` as the `[data_selection]` context reads it (`parse_unsigned_cell`).
 const SS_FILTER_CELL: CellSpec = CellSpec {
     name: "SS",
-    what: NOT_A_COUNT,
+    what: NOT_A_USIZE,
     holds: holds_count,
 };
 const EVID_CELL: CellSpec = CellSpec {
     name: "EVID",
-    what: NOT_A_COUNT,
+    what: NOT_A_U32,
     holds: holds_evid,
 };
 const MDV_CELL: CellSpec = CellSpec {
     name: "MDV",
-    what: NOT_A_COUNT,
+    what: NOT_A_USIZE,
     holds: holds_count,
 };
 const ADDL_CELL: CellSpec = CellSpec {
     name: "ADDL",
-    what: NOT_A_COUNT,
+    what: NOT_A_USIZE,
     holds: holds_count,
 };
 const FREMTYPE_CELL: CellSpec = CellSpec {
     name: "FREMTYPE",
-    what: NOT_A_COUNT,
+    what: NOT_A_U16,
     holds: holds_fremtype,
 };
 /// `CENS` in the `[data_selection]` context. The observation row keeps its own
@@ -2215,7 +2255,6 @@ const CENS_FILTER_CELL: CellSpec = CellSpec {
     what: "a whole number",
     holds: holds_whole,
 };
-#[cfg(feature = "survival")]
 const TENTRY_CELL: CellSpec = CellSpec {
     name: "TENTRY",
     what: NOT_A_NUMBER,
@@ -2592,11 +2631,16 @@ fn parse_subject(
             // A rule must not decide a record on a cell the reader could not parse
             // (#1501): `ctx` holds the reader's fallback for it, not the dataset's
             // value. When a rule removed the record, that rule decided it; when the
-            // record survived, every clause did. A rule that reads none of these
-            // cells may still remove the record without error — NONMEM 7.6.0 checks
-            // only the records its `IGNORE` keeps. `CMT` is left to `W_CMT_DEFAULTED`
-            // (`record_filtered` below).
-            let filter_cells: [(&CellSpec, Option<&str>, &[&str]); 9] = [
+            // record survived, every clause did. A clause decided it *on* the cell
+            // only when its outcome rests on it (`FilterClause::depends_on`):
+            // `EVID == 2 && RATE == 0` on an observation is decided by `EVID`. A
+            // rule whose outcome does not rest on these cells may still remove the
+            // record without error — NONMEM checks only the records its `IGNORE`
+            // keeps. `CMT` is left to `W_CMT_DEFAULTED` (`record_filtered` below).
+            // `FREMTYPE` and `TENTRY` have no `RowContext` field: a clause reads them
+            // from the covariate map, where an unparseable cell leaves the previous
+            // record's value in place — a fallback all the same.
+            let filter_cells: [(&CellSpec, Option<&str>, &[&str]); 11] = [
                 (&TIME_CELL, time_unreadable, &["time"]),
                 (
                     &DV_CELL,
@@ -2626,15 +2670,24 @@ fn parse_subject(
                     unreadable_cell(row, cens_col, &CENS_FILTER_CELL),
                     &["cens"],
                 ),
+                (
+                    &FREMTYPE_CELL,
+                    unreadable_cell(row, fremtype_col, &FREMTYPE_CELL),
+                    &["fremtype"],
+                ),
+                (
+                    &TENTRY_CELL,
+                    unreadable_cell(row, _tentry_col, &TENTRY_CELL),
+                    &["tentry"],
+                ),
             ];
             for (spec, cell, cols) in filter_cells {
                 let Some(cell) = cell else { continue };
                 let decider = match &fired {
-                    Some(rule) => cols
-                        .iter()
-                        .any(|c| rule.reads_column(c))
-                        .then(|| rule.source(id)),
-                    None => sel.first_clause_reading(cols).map(|r| r.source(id)),
+                    Some(rule) => rule.depends_on(&ctx, cols).then(|| rule.source(id)),
+                    None => sel
+                        .first_clause_depending_on(&ctx, cols)
+                        .map(|r| r.source(id)),
                 };
                 if let Some(src) = decider {
                     return Err(filter_reads_unreadable_cell_error(

@@ -87,8 +87,9 @@ section of the SDLC for the versioning policy).
   reads the column and that `[data_selection]` keeps, naming the subject, time, column and
   cell — as NONMEM rejects it. A `[data_selection]` rule that would decide a record on such
   a cell (`ignore = CENS == 0` on `CENS = abc`) is an error naming the rule. Missing cells
-  (`.`, blank, `NA`) keep their defaults, and `CMT`, the occasion column and `L2` keep their
-  existing handling (#1501).
+  (`.`, blank, `NA`, `NaN`) keep their defaults — `RATE=NaN` and `SS=NaN` on a dose used to
+  be rejected as non-finite, and `TIME=NaN` read as an undefined time — and `CMT`, the
+  occasion column and `L2` keep their existing handling (#1501).
 - **FOCE/FOCEI: a subject with `block_sigma` residuals correlated across observation rows
   gets the reconverged outer gradient again.** Such a subject (for example, total and
   unbound assays paired at one time) is outside the analytic outer gradient at every

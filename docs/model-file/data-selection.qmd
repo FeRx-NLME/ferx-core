@@ -121,12 +121,14 @@ match a record whose `CENS` is `.`, exactly as it matches one whose `CENS` is
 `0`.
 
 A cell that is present but **not a number** (`abc`, or `1.5` in a whole-number
-column) is not read as anything. A rule that reads that column on that record —
-whether it would remove the record or keep it — is an error naming the rule, since
-it would otherwise decide the record on a value the dataset does not hold
-([#1501](https://github.com/FeRx-NLME/ferx-core/issues/1501)). A rule on another
-column may still remove the record, and then the cell is never read, as with
-NONMEM's `IGNORE`; see [A cell that is not a number](../data-format.qmd#a-cell-that-is-not-a-number).
+column) is not read as anything. A rule whose outcome on that record rests on that
+column — whether it would remove the record or keep it — is an error naming the
+rule, since it would otherwise decide the record on a value the dataset does not
+hold ([#1501](https://github.com/FeRx-NLME/ferx-core/issues/1501)). A rule's
+outcome rests on the column when the rule reads it and every other `&&` term
+holds: `ignore = EVID == 2 && RATE == 0` on an observation is decided by `EVID`,
+whatever its `RATE` cell says. A rule on another column may still remove the
+record, and then the cell is never read, as with NONMEM's `IGNORE`; see [A cell that is not a number](../data-format.qmd#a-cell-that-is-not-a-number).
 
 **`CMT` is the exception to both rules**, because it is the one column with a
 default. A missing (`.`/blank/`NA`) or unreadable cell — and an absent `CMT`
