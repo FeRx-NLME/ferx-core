@@ -79,6 +79,13 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **A mixture model left on `optimizer = auto` now reports `auto (bobyqa)`, the optimizer
+  that actually ran.** Mixture fits have always run BOBYQA under `auto`, but the fit output
+  reported the non-mixture pick (`auto (nlopt_lbfgs)` for a model in analytic scope), and
+  the build info reported an analytic outer gradient where none was used. An explicit
+  optimizer that a mixture replaces with BOBYQA (built-in BFGS/L-BFGS, trust-region) is
+  now reported as `bobyqa` too. Both reports now read the outer loop's own resolution
+  rule (#1540).
 - **A data cell that is not a number is an error instead of a silent `0`.** `DV = abc` used
   to be scored as a measured `0.0`, `EVID = abc` turned a dose into an observation, and
   `ADDL = abc` dropped the additional doses, all without a warning. A present cell that is

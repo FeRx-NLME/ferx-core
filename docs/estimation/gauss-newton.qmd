@@ -73,7 +73,7 @@ The algorithm converges when:
 When `method = gn_hybrid`, the algorithm runs in two phases:
 
 1. **GN phase**: Run Gauss-Newton iterations to quickly find the basin of the minimum
-2. **FOCEI polish**: Run up to 100 iterations of standard FOCEI optimization, warm-started from the GN result. The polish stage uses the configured outer optimizer (`optimizer` in `[fit_options]`), which defaults to `auto` — see [Outer Optimizers](optimizers.qmd) for the applicability matrix.
+2. **FOCEI polish**: Run up to 100 iterations of standard FOCEI optimization, warm-started from the GN result. The polish stage uses the configured outer optimizer (`optimizer` in `[fit_options]`), which defaults to `auto`: `nlopt_lbfgs` when the exact analytic gradient is available (e.g. warfarin), `bobyqa` otherwise — see [Outer Optimizers](optimizers.qmd#the-auto-default) for the full rule.
 
 The final result is whichever phase produced the lower OFV. This combines the fast convergence of Gauss-Newton with the refined accuracy of FOCEI.
 

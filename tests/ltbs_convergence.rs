@@ -106,13 +106,18 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
         result.theta[1]
     );
     // TVKA is the weakest-determined θ here (≈18% RSE, ETA_KA CV ≈ 58%), sitting
-    // on a flat OFV ridge. The default gradient-free BOBYQA outer false-converges
-    // slightly above the true minimum and lands ~0.2 SE from NONMEM (≈0.79 vs
-    // 0.811), within noise but outside a 2% band. The gradient-based analytic
-    // L-BFGS path (`ltbs_warfarin_analytic_lbfgs_matches_nonmem`) pins TVKA to
-    // NONMEM tightly (<1%); this band reflects the parameter's actual precision.
+    // on a flat OFV ridge. It had a 5% band while the default outer was
+    // derivative-free BOBYQA, which false-converged ~0.2 SE from NONMEM (≈0.79 vs
+    // 0.811). Since #490 the default `auto` resolves to `nlopt_lbfgs` on this
+    // in-scope model (asserted below) and lands TVKA at a relative error of
+    // 1.6e-5 (measured on #1540, release, macOS), so it now shares the 2% band of
+    // the other θ — over 1000× headroom on the measured error.
+    assert_eq!(
+        result.optimizer, "auto (nlopt_lbfgs)",
+        "the default arm this band was measured on"
+    );
     assert!(
-        rel(result.theta[2], NM_TVKA) < 0.05,
+        rel(result.theta[2], NM_TVKA) < 0.02,
         "TVKA {} vs NM {NM_TVKA}",
         result.theta[2]
     );
@@ -143,9 +148,9 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
 
 /// LTBS cross-check driven through the **analytic sensitivity provider**: the
 /// built-in L-BFGS outer optimizer consumes the provider's `g = ln(f)` jet
-/// (value + ∂g/∂η/∂θ + Hessian). This is the gradient path the default-BOBYQA
-/// test above does *not* exercise, so it guards the LTBS jet transform in
-/// `sens::provider` end-to-end against the same NONMEM 7.5.1 reference. (The
+/// (value + ∂g/∂η/∂θ + Hessian). The test above now runs the NLopt L-BFGS that
+/// `auto` resolves to; this one pins the built-in L-BFGS, so it guards the LTBS
+/// jet transform in `sens::provider` end-to-end against the same NONMEM 7.5.1 reference. (The
 /// inner EBE loop now also runs the analytic `g = ln(f)` gradient for plain LTBS;
 /// the covariance step reconverges those EBEs at the tighter `cov_inner_tol` so
 /// the covariance OFV-Hessian stays clean — see `FitOptions::effective_cov_inner_tol`.)

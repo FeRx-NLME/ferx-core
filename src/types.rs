@@ -7086,9 +7086,12 @@ pub struct FitResult {
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
     /// `optimizer = auto` default resolved the choice, the label is the compound
     /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
-    /// the setting and what actually ran. SAEM/GN/IMP report their own fixed
-    /// labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa"). Always populated;
-    /// the label is the same regardless of method chain length. Consumers that
+    /// the setting and what actually ran. An explicit choice is reported as what
+    /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
+    /// mixture objective with BOBYQA, reported `"bobyqa"` (#1540). SAEM/GN/IMP
+    /// report their own fixed labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa").
+    /// Always populated; the label is the same regardless of method chain length.
+    /// Consumers that
     /// match on the label should accept the `auto (...)` prefix (#490).
     pub optimizer: String,
     /// Number of random multi-starts attempted. 1 means a single fit from

@@ -37,7 +37,7 @@ The default `optimizer = auto` picks the algorithm per model (see [`auto`](#the-
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
+| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
 
 ### NLopt algorithms
 
@@ -171,7 +171,7 @@ Two cases override that rule:
 
 The choice mirrors the analytic-vs-FD decision the outer loop already makes, so `auto` lands on the gradient-based optimizer exactly when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin).
 
-For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)` — so a run records which algorithm actually executed. Two exceptions: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer, and a mixture model's label currently ignores the mixture override, so it can read `auto (nlopt_lbfgs)` while BOBYQA ran ([#1540](https://github.com/FeRx-NLME/ferx-core/issues/1540)). These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 

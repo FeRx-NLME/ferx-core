@@ -194,15 +194,17 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 }
 
 /// PR #1418 review, finding 2. A mixture model with `optimizer = auto` runs **BOBYQA**:
-/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`, a rule
-/// `build_info::gradient_method_outer` does not model — it still classifies the model as
-/// analytic. A derivative-free fit requests no outer gradient at all, so no subject can
-/// have taken an FD *outer* gradient and the warning must stay silent even with a subject
-/// the provider would decline.
+/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`. A
+/// derivative-free fit requests no outer gradient at all, so no subject can have taken an
+/// FD *outer* gradient and the warning must stay silent even with a subject the provider
+/// would decline.
 ///
-/// This passes because the warning reads a runtime log rather than a model-level
-/// predicate; a gate written against `gradient_method_outer` would have emitted
-/// "1 of 2 ... could not be given the exact analytic outer gradient" here.
+/// When this test was written `build_info::gradient_method_outer` did not model that
+/// downgrade and still reported `analytic (Dual2)` here, so a gate written against it
+/// would have emitted "1 of 2 ... could not be given the exact analytic outer gradient".
+/// Since #1540 the report resolves through `resolve_outer_optimizer` too and reads `N/A`,
+/// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
+/// comes from its runtime log, not from either report.
 #[test]
 fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let model = ferx_core::parse_model_string(MIXTURE_F).expect("mixture model parses");
@@ -222,10 +224,12 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let result = ferx_core::fit(&model, &population, &model.default_params, &options)
         .expect("mixture fit succeeds");
 
+    // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
+    // fit this test is about.
+    assert_eq!(result.optimizer, "auto (bobyqa)");
     assert_eq!(
-        result.gradient_method_outer, "analytic (Dual2)",
-        "fixture precondition: the model-level label must claim analytic, or this test \
-         does not reproduce the reported mismatch"
+        result.gradient_method_outer, "N/A",
+        "a derivative-free fit has no outer gradient to report"
     );
     assert!(
         outer_fd_warning(&result.warnings).is_none(),
