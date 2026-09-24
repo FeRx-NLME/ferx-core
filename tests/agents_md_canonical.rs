@@ -9,7 +9,8 @@
 //!
 //! Not feature-gated: must run in the base `--features ci` job.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::Command;
 
 /// Built at runtime so this file does not match its own scan.
 fn legacy_name() -> String {
@@ -20,38 +21,36 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Directories that are generated, vendored or per-machine, never authored.
-const SKIP_DIRS: &[&str] = &["target", ".git", ".claude", "_site", "node_modules"];
+/// The changelog is history: an entry recording the rename names the old file
+/// by necessity, and is not a pointer anyone follows.
+const HISTORY_FILES: &[&str] = &["CHANGELOG.md"];
 
-/// Extensions of the files that carry prose a reader follows.
-const TEXT_EXTS: &[&str] = &[
-    "rs", "md", "qmd", "toml", "yml", "yaml", "sh", "R", "ctl", "py", "txt",
-];
-
-fn text_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("readable directory") {
-        let path = entry.expect("readable dir entry").path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.is_dir() {
-            if !SKIP_DIRS.contains(&name) {
-                text_files(&path, out);
-            }
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| TEXT_EXTS.contains(&e))
-        {
-            out.push(path);
-        }
-    }
+/// Every tracked path, as git sees it. Tracked, not walked: a walk also sees
+/// untracked and gitignored files that exist only on one machine (local notes,
+/// rendered `docs/_site/`, `.claude/`) and follows symlinks out of the checkout,
+/// so it would redden locally on a clean tree.
+fn tracked_files() -> Vec<String> {
+    let out = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(repo_root())
+        .output()
+        .expect("git on PATH");
+    assert!(out.status.success(), "git ls-files failed: {out:?}");
+    String::from_utf8(out.stdout)
+        .expect("utf-8 paths")
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
 fn agents_md_is_the_only_guidance_file() {
     let root = repo_root();
     let agents = std::fs::read_to_string(root.join("AGENTS.md")).expect("AGENTS.md at repo root");
-    assert!(
-        agents.starts_with("# AGENTS.md\n"),
+    assert_eq!(
+        agents.lines().next(),
+        Some("# AGENTS.md"),
         "AGENTS.md must open with its own name as the title"
     );
     assert!(
@@ -65,23 +64,35 @@ fn agents_md_is_the_only_guidance_file() {
 fn nothing_points_at_the_legacy_guidance_file() {
     let root = repo_root();
     let needle = legacy_name();
-    let mut files = Vec::new();
-    text_files(&root, &mut files);
-    // A walk that found nothing would pass vacuously; the tree has hundreds.
+    let files = tracked_files();
+    // An empty listing would pass vacuously; the tree has thousands of files.
     assert!(
         files.len() > 100,
-        "scan found only {} files — the walk is broken",
+        "git ls-files listed only {} files — the listing is broken",
         files.len()
     );
     let mut hits = Vec::new();
-    for path in &files {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    for rel in &files {
+        if HISTORY_FILES.contains(&rel.as_str()) {
+            continue;
+        }
+        let path = root.join(rel);
+        // A tracked symlink (or a path deleted in the working tree) is not a
+        // file to scan; everything else must read, so a read failure cannot
+        // hide a stale reference.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        for (i, line) in text.lines().enumerate() {
-            if line.contains(&needle) {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                hits.push(format!("{}:{}", rel.display(), i + 1));
+        if !meta.is_file() {
+            continue;
+        }
+        // Bytes, not `read_to_string`: one invalid UTF-8 byte must not make the
+        // rest of the file invisible, and extensionless files (hooks, dotfiles)
+        // are scanned like any other.
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        for (i, line) in bytes.split(|&b| b == b'\n').enumerate() {
+            if line.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                hits.push(format!("{rel}:{}", i + 1));
             }
         }
     }
