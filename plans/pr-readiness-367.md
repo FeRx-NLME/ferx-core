@@ -83,7 +83,7 @@ realized; it is now fixed in **both** copies with an independent test, so the
   Tier-3 convergence, NONMEM cross-checks); a "Ron review resolution" summary;
   and the deferred follow-ups (#9 dedup; TV-cov + lagtime / ExpressionScale;
   ODE re-arm).
-- **NONMEM comparisons** (CLAUDE.md requires one per numerical feature): warfarin
+- **NONMEM comparisons** (AGENTS.md requires one per numerical feature): warfarin
   FOCEI/FOCE and IOV (307.8 vs 308.8) exist. TV-cov is currently
   simulated-recovery only — add a klebsiella NONMEM cross-check for a WT-on-CL
   model (FOCEI + FOCE, OFV + θ/Ω/σ) and commit the `.lst`. `NM_PASS` stays in

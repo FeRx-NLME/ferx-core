@@ -90,7 +90,7 @@ Keep the defensive `assert!(all_doses_fixed())` in `compute_predictions` /
 - Keep `test_compute_predictions_panics_on_modeled_dose` (direct-call tripwire).
 - Coverage: the new parser slot-routing + gate branches need diff coverage ≥90%.
 
-## NONMEM comparison (required by CLAUDE.md)
+## NONMEM comparison (required by AGENTS.md)
 
 Add a `RATE=-2` analytical example (1-cpt IV, modeled `D1`) and compare IPRED/OFV against
 a NONMEM `$PK D1=...` `ADVAN1`/`ADVAN3` run; record in `docs/faq.qmd` or the relevant

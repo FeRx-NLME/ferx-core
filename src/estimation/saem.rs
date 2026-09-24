@@ -10148,7 +10148,7 @@ DV ~ additive(EPS)
         let rate_int = synth_accept(d_int);
         let rate_rm = synth_accept(d_rm);
         // `f64::max`/`min` swallow NaN and `clamp` would propagate one, so check
-        // before comparing (CLAUDE.md's fold trap).
+        // before comparing (AGENTS.md's fold trap).
         assert!(
             rate_int.is_finite() && rate_rm.is_finite(),
             "non-finite realised rates: interval {rate_int}, rm {rate_rm}"
@@ -10418,7 +10418,7 @@ DV ~ additive(EPS)
 
     // ---- #1444: the rules, wired into `run_saem` ----
     //
-    // These four tests call `fit()`, which CLAUDE.md's Tier 1 says to avoid.
+    // These four tests call `fit()`, which AGENTS.md's Tier 1 says to avoid.
     // They stay in `--lib` deliberately (#1451 review), on three grounds.
     // First, cost: all four together run in **0.79 s** single-threaded
     // (`cargo test --lib -- --test-threads=1`, 11 fits of 60 iterations on 8

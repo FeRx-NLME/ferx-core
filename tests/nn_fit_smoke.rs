@@ -17,7 +17,7 @@
 //! For now we run a short fit (`maxiter = 5`) — enough to prove the
 //! pipeline doesn't crash and that NN-weight thetas move.
 //!
-//! Gated with `slow-tests` per CLAUDE.md: any test that calls `fit()` to
+//! Gated with `slow-tests` per AGENTS.md: any test that calls `fit()` to
 //! convergence is opt-in. This particular test has `maxiter = 5` so it's
 //! fast (~1–2 s) but still calls into the optimizer.
 //!

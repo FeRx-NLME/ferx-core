@@ -43,7 +43,7 @@
 #
 # Because this reference had been written to mirror ferx's behaviour rather than
 # NONMEM's rule, the two agreed BY CONSTRUCTION and this anchor could not see the
-# defect — the failure mode CLAUDE.md flags for fixtures, here in an external
+# defect — the failure mode AGENTS.md flags for fixtures, here in an external
 # reference. The convention above is the corrected one; `expected.md` and the
 # `REF_LADDER` in `tests/adaptive_vanco_renal_anchor.rs` were regenerated from it.
 #

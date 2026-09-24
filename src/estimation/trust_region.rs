@@ -1324,7 +1324,7 @@ mod tests {
     /// checks in `nn::` pin each penalty against its own value; this is the seam
     /// they cannot see: that the penalty gradient lands at the right *packed*
     /// index and in the right space (identity-packed weights, no scale factor),
-    /// as CLAUDE.md asks of "the provider that assembles them". The warfarin
+    /// as AGENTS.md asks of "the provider that assembles them". The warfarin
     /// test above builds its regularizer from `FitOptions::default()` (λ = 0),
     /// so without this the new arm was exercised only as a no-op.
     ///

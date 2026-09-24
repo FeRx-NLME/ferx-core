@@ -209,7 +209,7 @@ fn run_bits_with(model: &CompiledModel, pop: &Population, opts: &FitOptions) -> 
 
 /// How many subjects the shared gate actually hands a schedule. A fixture where
 /// this is zero cannot observe anything about the cache, which is the fast-path
-/// trap `CLAUDE.md` names: the code short-circuits before the thing under test.
+/// trap `AGENTS.md` names: the code short-circuits before the thing under test.
 fn n_cached(model: &CompiledModel, pop: &Population) -> usize {
     build_schedule_cache(model, pop)
         .iter()

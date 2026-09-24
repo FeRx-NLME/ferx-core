@@ -1,7 +1,7 @@
 //! Positive proof that the `debug_assert!` guards in this crate are LIVE (#344).
 //!
 //! Sibling test file rather than an inline `#[cfg(test)] mod`, for the ordinary
-//! reason (`CLAUDE.md`'s sibling-`*_tests.rs` pattern) and for one that used to be
+//! reason (`AGENTS.md`'s sibling-`*_tests.rs` pattern) and for one that used to be
 //! specific to what this module does: the interior of a `debug_assert!` is, by
 //! construction, unreachable under a release-derived profile, so inline in
 //! `src/lib.rs` those two lines were permanently-missed patch lines in every

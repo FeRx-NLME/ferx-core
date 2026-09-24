@@ -1293,7 +1293,7 @@ fn the_filter_note_does_not_claim_the_removed_rows_would_have_been_scored() {
 #[test]
 fn the_filter_note_agrees_in_number_with_the_compartments_it_names() {
     // Review r2, finding 3, and the first defect found by the rule this PR adds to
-    // CLAUDE.md: deleting the plural spelling killed no test, because both existing
+    // AGENTS.md: deleting the plural spelling killed no test, because both existing
     // filter tests put exactly one compartment in `blamed`. The old text read
     // "so those entry is exercised".
     //

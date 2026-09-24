@@ -3,7 +3,7 @@
 //!
 //! Runs ferx `[focei, imp]` on warfarin and asserts the converged estimates match
 //! NONMEM's `METHOD=IMP` reference on the same model/data. This is the
-//! cross-engine validation required for a new estimator (CLAUDE.md): IMP is
+//! cross-engine validation required for a new estimator (AGENTS.md): IMP is
 //! NONMEM's method, so the anchor is NONMEM itself.
 //!
 //! Gated behind `slow-tests`; skipped in the default PR job, run nightly.

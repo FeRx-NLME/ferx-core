@@ -185,7 +185,7 @@ fn tte_model_with_no_random_effects_and_no_sigma_fits() {
 // still produce a finite, plausible OFV.
 //
 // There is no NONMEM run to anchor a kappa-only fit against as a single object,
-// so this uses the **degenerate oracle** CLAUDE.md prescribes for that case.
+// so this uses the **degenerate oracle** AGENTS.md prescribes for that case.
 // Collapse the data to one occasion per subject and a kappa is, term for term, a
 // BSV eta: one draw per subject from one prior. The two objectives must therefore
 // agree exactly at a shared point, and they do — bit-for-bit, not to a tolerance.

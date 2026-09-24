@@ -10440,7 +10440,7 @@ mod break_collision_1186 {
     /// this pins the *diagnostic*, per engine, in its own `SolverStatsScope`. Per engine
     /// because each has its own guard and its own return, so a shared assertion would be
     /// satisfied by any one of them — and the failure message has to name which recorder
-    /// stopped recording, or the mutation cannot be attributed (CLAUDE.md: mutate each side
+    /// stopped recording, or the mutation cannot be attributed (AGENTS.md: mutate each side
     /// of a twin separately).
     ///
     /// The straddle is the second half of each arm: the same engine on the same fixture with

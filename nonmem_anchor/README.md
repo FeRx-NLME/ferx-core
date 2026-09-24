@@ -1,7 +1,7 @@
 # NONMEM anchor — built-in absorption models (transit / inverse-Gaussian)
 
 Reference NONMEM runs for the built-in absorption input-rate functions, to satisfy
-the CLAUDE.md "compare with NONMEM output" rule:
+the AGENTS.md "compare with NONMEM output" rule:
 
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|

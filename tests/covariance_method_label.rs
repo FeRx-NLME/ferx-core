@@ -12,7 +12,7 @@
 //! default is `RSR` and not `R`.
 //!
 //! **Tier 2, not Tier 1** (#1382 review): these call `fit()` / `run_covariance`
-//! across the public API and return after a single outer iteration — CLAUDE.md's
+//! across the public API and return after a single outer iteration — AGENTS.md's
 //! Tier-2 shape. The rule itself
 //! (`estimation::covariance::published_covariance_method`), the serde token, the
 //! warning payload and the per-site structural scan stay at Tier 1 in

@@ -1,7 +1,7 @@
 //! NONMEM anchor for additive (`+`) `[covariate_model]` relations (#1313).
 //!
 //! `CL = TVCL*EXP(ETA(1)) + THETA(6)*(WT - 70)` is an ordinary NONMEM model, so
-//! this feature gets an ordinary anchored comparison — none of the CLAUDE.md
+//! this feature gets an ordinary anchored comparison — none of the AGENTS.md
 //! exceptions applies. Two arms, four control streams, all
 //! `$EST MAXEVAL=0 POSTHOC INTERACTION` so nothing is estimated on either side
 //! and the comparison is of arithmetic rather than of where two optimizers

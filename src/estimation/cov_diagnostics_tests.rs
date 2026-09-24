@@ -91,7 +91,7 @@ fn severity_is_graded_on_magnitude_not_on_the_clipped_count() {
 fn a_negative_eigenvalue_alone_grades_severe() {
     // Kills the `neg_ratio` leg of `grade`. Variance inflation is pinned at 1.0, so
     // deleting the `neg_ratio` comparison leaves this at Minor. Paired with the test below,
-    // this is what stops the two legs covering for each other (CLAUDE.md's redundant-gate
+    // this is what stops the two legs covering for each other (AGENTS.md's redundant-gate
     // hole): each leg is asserted with the other one inert.
     assert_eq!(grade(1e-3, 1.0).severity, CovSeverity::Severe);
     assert_eq!(grade(1e-7, 1.0).severity, CovSeverity::Moderate);

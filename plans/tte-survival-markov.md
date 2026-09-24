@@ -2177,7 +2177,7 @@ definition of "done" for each feature.
    └── Reads expected values from expected.md; fails if ferx drifts
 
 7. Add comparison table to docs
-   ├── Required by CLAUDE.md policy for any numerical result
+   ├── Required by AGENTS.md policy for any numerical result
    ├── Table: dataset description | ferx OFV | reference OFV | key estimates side-by-side
    └── Note any known acceptable discrepancies (e.g., constant OFV offset due to
        normalizing constants that NONMEM omits)
@@ -2551,7 +2551,7 @@ differencing and remain; true elimination needs analytic CHZ η-sensitivities �
 - **Edge tests:** all-censored (hazard≈0 to horizon), all-immediate (huge hazard),
   `entry_time ≥ horizon` (empty risk window), no-horizon-set, and a negative-hazard model — each
   asserting the *specific* error/outcome, not just `is_err()`.
-- **External anchor (CLAUDE.md numerical-feature requirement):** KM / KS cross-check of
+- **External anchor (AGENTS.md numerical-feature requirement):** KM / KS cross-check of
   ferx-simulated event times vs. NONMEM `$SIM` (or rxode2 `rxSolve`) for one drug-driven hazard
   from identical (θ, PK profile); lands in `tests/reference/` + `docs/estimation/tte.qmd`.
 
@@ -2740,7 +2740,7 @@ Gate: `#[cfg(feature = "markov")]` initially.
   and an end-to-end mixed-effects fit to a finite OFV.
 - ✅ **Slice 4 — validation + example + docs.** A fresh NONMEM `$DES` anchor is impractical
   for a PK-coupled CTMM (continuous PK but per-observation occupancy reset; NONMEM's only
-  per-record reset, EVID=3, zeros the PK too — §3.4). Validated instead per the CLAUDE.md
+  per-record reset, EVID=3, zeros the PK too — §3.4). Validated instead per the AGENTS.md
   exception pattern: (a) an **exact closed-form anchor** — a commuting generator `Q(t)=C(t)·Q₀`
   matches `expm(Q₀·∫C)` to ~1e-5; (b) **reduction** — `SLOPE=0` reduces to the homogeneous CTMM,
   which is NONMEM-anchored (Phase 5); (c) a slow-gated **simulate→fit recovery** on the bundled

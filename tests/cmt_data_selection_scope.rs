@@ -30,7 +30,7 @@
 //! first version of this file tested only the first direction and used `ferx check`
 //! as its oracle; `validate_model_file` then read with `filter: None`, so that oracle
 //! could not observe the second direction at all, and the mirror case passed green
-//! against a reader that counted nothing (CLAUDE.md, "a green test is not evidence
+//! against a reader that counted nothing (AGENTS.md, "a green test is not evidence
 //! that it can fail"). The oracle is `fit()` and stays `fit()`: #1465 has since made
 //! check read through the same filter, so the two now agree — but an oracle that
 //! agrees *because it is the path under test* is no oracle, and it was exactly that
@@ -147,7 +147,7 @@ fn scored(src: &str, data: &str) -> (usize, f64) {
         // Folded with an explicit finiteness guard rather than through a running
         // `max`/`+` that would absorb a `NaN`: a non-finite objective is the
         // likeliest way to break what this measures, and a silent absorption would
-        // let the comparison below pass on the rows that worked (CLAUDE.md).
+        // let the comparison below pass on the rows that worked (AGENTS.md).
         assert!(
             v.is_finite(),
             "subject {} has a non-finite objective ({v}) — the comparison below \
@@ -167,7 +167,7 @@ fn scored(src: &str, data: &str) -> (usize, f64) {
 /// used to read with no filter at all (`validation.rs` passed `filter: None`), so it
 /// counted a row the fit never sees and reported the warning whether or not the fit
 /// did — which made the first version of the mirror case below pass green against a
-/// reader that counted nothing (CLAUDE.md: "a green test is not evidence that it can
+/// reader that counted nothing (AGENTS.md: "a green test is not evidence that it can
 /// fail"). #1465 closed that gap, and the last test in this file pins the agreement;
 /// the oracle stays `fit()` because a check-side oracle would now be the path under
 /// test rather than an independent reading of it.

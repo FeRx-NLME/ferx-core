@@ -162,7 +162,7 @@ mu-reference values already computed for FOCE) so iteration 1 starts the chain
 near the conditional mode. Lower priority than Phases 1–3 and interacts with the
 burn-in; gate behind its own decision. Skip if Phases 1–3 close the gap.
 
-## Phase 5 — Validation against NONMEM (required by CLAUDE.md)
+## Phase 5 — Validation against NONMEM (required by AGENTS.md)
 
 Re-run the Jasmine vanco-peds model (`ferx-testdata/jasmine_vanco_peds/run60.ferx`,
 `train_0416.csv`) with default settings after Phases 1–3 and compare Ω, σ, OFV to

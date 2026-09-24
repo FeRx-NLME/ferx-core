@@ -803,7 +803,7 @@ pub(crate) fn mr_scope<'a>(
 ///     stricter bound.
 ///   - **The subject's schedule.** Only `subject.id` is keyed, not the doses or
 ///     observation times, so a single-dose verdict is reused for a multi-dose
-///     regimen on the same id — the case CLAUDE.md's non-degeneracy rule says
+///     regimen on the same id — the case AGENTS.md's non-degeneracy rule says
 ///     must always be checked, and the one superposition most needs checked.
 ///
 /// The gate is `#[cfg(debug_assertions)]`. That used to mean it ran nowhere but a
@@ -2048,7 +2048,7 @@ mod tests {
         let mut s = evid2_static_subject(&analytical);
         s.reset_times = vec![4.0];
         // A second dose after the reset, so the later record lands with drug
-        // present rather than on a zero state (CLAUDE.md's non-degeneracy rule).
+        // present rather than on a zero state (AGENTS.md's non-degeneracy rule).
         s.doses.push(DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0));
         let out = crate::pk::compute_predictions_with_tv(&analytical, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());

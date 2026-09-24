@@ -3,7 +3,7 @@
 ; WHAT THIS ANCHORS. The SAEM estimate of the *additive* half of a
 ; `combined(PROP, ADD)` residual error on sparse data — the object #1445 is
 ; about. The equivalent NONMEM run is `METHOD=SAEM` with the same combined
-; error, so no CLAUDE.md anchor exception applies and none is claimed.
+; error, so no AGENTS.md anchor exception applies and none is claimed.
 ;
 ; DATA. `data/saem_sparse_combined.csv` is the byte-for-byte fixture the ferx
 ; Tier-3 test builds in-process (tests/saem_combined_error.rs, SPARSE_MODEL +
