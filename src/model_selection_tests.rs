@@ -948,3 +948,106 @@ fn strictness_serde_fills_missing_keys_from_default() {
     let none: Strictness = serde_json::from_str("{}").unwrap();
     assert_eq!(none, Strictness::default());
 }
+
+/// The `covariance_regularized` entry the covariance step leaves on a fit whose Hessian
+/// eigenvalue floor fired.
+///
+/// Built the way a real fit builds it, not by hand: the covariance step's own formatter
+/// (with warfarin `run1`'s measured spectrum), behind the `[FOCEI]` prefix a chained fit adds,
+/// through `classify_warning` — the function `fit()`, `run_covariance`'s rebuild and a
+/// `.fitrx` reload all use to turn the stored message back into an entry. So the gate is
+/// tested against the emitter, the chain prefix and the classifier together.
+fn regularized_warning() -> WarningEntry {
+    use crate::estimation::cov_diagnostics::{
+        format_regularized_warning, CovHessianSource, CovRegularizationFacts,
+    };
+    let msg = format_regularized_warning(&CovRegularizationFacts {
+        source: CovHessianSource::AnalyticRMatrix,
+        n_clipped: 1,
+        n_free: 9,
+        min_eigenvalue: 2.028e-7,
+        max_eigenvalue: 2.285e3,
+        floor: 2.285e-7,
+        variance_inflation: 1.190e3,
+        declines: &[],
+        ode: None,
+    });
+    let entry = crate::types::classify_warning(&format!("[FOCEI] {msg}"));
+    assert_eq!(entry.category, WarningCode::CovarianceRegularized);
+    assert_eq!(entry.source_method.as_deref(), Some("FOCEI"));
+    entry
+}
+
+/// The failure reason, pinned whole: every clause of it is a claim a search report prints.
+const REGULARIZED_FAILURE: &str = "covariance matrix regularized: the Hessian had a direction \
+     of negative or near-zero curvature that the covariance step's eigenvalue floor replaced, \
+     so the condition number and correlations read from it describe the floored matrix, not \
+     the fit (see the `covariance_regularized` warning)";
+
+/// #1512: a collapsed peripheral compartment (V2 → 0, Q free) leaves one flat Hessian
+/// direction, the eigenvalue floor replaces it, and the matrix the condition-number and
+/// correlation gates read no longer shows it — warfarin's one-peripheral candidate measured
+/// condition number 2.98 next to a TVQ RSE of 293519%, and passed.
+///
+/// The fixture is built so the straddle is explicit: its own condition number (5.0) and
+/// correlations (0) pass both thresholds, so the only thing that can fail it is the
+/// regularization. Both gates own the check — each alone must fail it — and a strictness
+/// with neither enabled must not, since then nothing reads the floored matrix.
+///
+/// Mutations: dropping the check, or gating it on only one of the two thresholds, reddens
+/// the matching `enabled` arm; matching any category instead of `CovarianceRegularized`
+/// reddens the `other_category` arm, and matching the category without the floor message's
+/// opening token reddens the `offdiag_note` arm.
+#[test]
+fn a_regularized_covariance_fails_the_matrix_reading_gates() {
+    let mut r = clean_fit();
+    let cond_only = Strictness {
+        max_condition_number: Some(1000.0),
+        ..Strictness::none()
+    };
+    let corr_only = Strictness {
+        max_correlation: Some(0.95),
+        ..Strictness::none()
+    };
+    // The premise: without the warning, both numeric gates pass this matrix.
+    assert!(check_strictness(&r, &cond_only).passed);
+    assert!(check_strictness(&r, &corr_only).passed);
+    assert!(check_strictness(&r, &Strictness::default()).passed);
+
+    // A different covariance-step note is not a floored Hessian — including the non-finite
+    // cross-partial note, which shares the `CovarianceRegularized` code but floors nothing.
+    r.warnings_structured.push(WarningEntry {
+        category: WarningCode::CovarianceStep,
+        ..regularized_warning()
+    });
+    r.warnings_structured.push(WarningEntry {
+        message: "Covariance step: off-diagonal FD stencil(s) non-finite for TVCL, TVV. \
+                  SE for these parameter(s) may be over-optimistic."
+            .into(),
+        ..regularized_warning()
+    });
+    assert!(
+        check_strictness(&r, &Strictness::default()).passed,
+        "other_category / offdiag_note"
+    );
+
+    r.warnings_structured.push(regularized_warning());
+    for (label, s) in [
+        ("cond_only", &cond_only),
+        ("corr_only", &corr_only),
+        ("default", &Strictness::default()),
+    ] {
+        let v = check_strictness(&r, s);
+        assert!(!v.passed, "{label} enabled: {v:?}");
+        assert_eq!(v.failures.len(), 1, "{label}: {v:?}");
+        assert_eq!(v.failures[0], REGULARIZED_FAILURE, "{label}");
+    }
+
+    // Neither matrix-reading gate enabled: nothing reads the floored matrix.
+    let others_on = Strictness {
+        max_condition_number: None,
+        max_correlation: None,
+        ..Strictness::default()
+    };
+    assert!(check_strictness(&r, &others_on).passed);
+}

@@ -518,6 +518,111 @@ fn a_resumed_run_matches_on_the_canonical_hash_not_the_id() {
 }
 
 #[test]
+fn a_resumed_row_is_rejudged_from_its_cached_fit_not_from_its_journalled_verdict() {
+    // The manifest refuses a resume whose gate *configuration* changed, but it
+    // cannot see a change in what the same configuration means: #1512 made the
+    // gate fail a regularized covariance step it used to pass, and a search
+    // interrupted on the old build and resumed on the new one would otherwise
+    // rank its collapsed candidate on the strength of a journalled
+    // `passed: true`. The verdict is a function of the fit and this run's
+    // options, so the cached fit is re-judged and the row is only a cache.
+    //
+    // Three rows, so the test straddles the choice both ways and pins the one
+    // case where the row *is* all there is:
+    //   `a`   — the row says failed, the cached fit passes   → passes
+    //   `bb`  — the row says passed, the cached fit now fails → fails
+    //   `ccc` — the row says failed and its fit file is gone  → the row stands
+    // A resume that kept every row agrees with the fix on `ccc` alone; one that
+    // re-judged every row agrees on `a` and `bb` alone and produces a verdict
+    // for `ccc` out of nothing.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![
+        candidate("a", "[parameters]\ntheta CL = 1\n"),
+        candidate("bb", "[parameters]\ntheta CL = 2\n"),
+        candidate("ccc", "[parameters]\ntheta CL = 3\n"),
+    ];
+    let options = RunOptions {
+        strictness: Strictness {
+            require_converged: true,
+            ..Strictness::none()
+        },
+        ..lenient()
+    };
+    let (first, fitted) = run_over(dir.path(), &candidates, &options);
+    assert_eq!(fitted, vec!["a", "bb", "ccc"]);
+    assert!(
+        first.results.iter().all(|r| r.verdict.passed),
+        "the premise: every fresh fit passes the gate"
+    );
+
+    // Age the journal: flip `a` and `ccc` to a failure the current gate does
+    // not produce, and leave `bb` as the pass it was.
+    let path = journal::journal_path(dir.path());
+    let stale = "converged: a verdict the previous build wrote".to_string();
+    let aged: Vec<String> = journal::read_records(&path)
+        .into_iter()
+        .map(|mut record| {
+            if record.id != "bb" {
+                record.passed = false;
+                record.failures = vec![stale.clone()];
+            }
+            serde_json::to_string(&record).expect("serialize")
+        })
+        .collect();
+    std::fs::write(&path, aged.join("\n") + "\n").expect("write journal");
+    // `bb`'s cached fit now fails the gate the row says it passed…
+    let bb_hash = &first.results[1].hash;
+    let mut unconverged = converged_fit(102.0);
+    unconverged.converged = false;
+    std::fs::write(
+        journal::fit_path(dir.path(), bb_hash),
+        serde_json::to_string(&unconverged).expect("serialize"),
+    )
+    .expect("write fit");
+    // …and `ccc` has no cached fit to re-judge.
+    std::fs::remove_file(journal::fit_path(dir.path(), &first.results[2].hash)).expect("rm");
+
+    let resumed_options = RunOptions {
+        resume: true,
+        ..options
+    };
+    let (resumed, fitted) = run_over(dir.path(), &candidates, &resumed_options);
+    assert!(
+        fitted.is_empty(),
+        "a journalled candidate was refitted: {fitted:?}"
+    );
+    assert_eq!((resumed.fitted, resumed.reused), (0, 3));
+
+    let [a, bb, ccc] = resumed.results.as_slice() else {
+        panic!("expected three results, got {}", resumed.results.len());
+    };
+    assert!(
+        a.fit.is_some() && bb.fit.is_some(),
+        "the cached fits came along"
+    );
+    assert!(
+        a.verdict.passed && a.verdict.failures.is_empty(),
+        "`a` carried its journalled verdict instead of its fit's: {:?}",
+        a.verdict.failures
+    );
+    assert!(
+        !bb.verdict.passed && bb.verdict.failures.iter().any(|f| f.contains("converged")),
+        "`bb` carried its journalled verdict instead of its fit's: {:?}",
+        bb.verdict.failures
+    );
+    assert!(bb.verdict.failures.iter().all(|f| f != &stale));
+    assert!(ccc.fit.is_none(), "`ccc`'s fit file was deleted");
+    assert!(
+        !ccc.verdict.passed && ccc.verdict.failures == vec![stale.clone()],
+        "`ccc` has no fit to re-judge, so its row is the verdict: {:?}",
+        ccc.verdict.failures
+    );
+    // The criterion is re-scored off the fit for the same reason.
+    assert_eq!(a.criterion, converged_fit(101.0).ofv);
+    assert_eq!(bb.criterion, unconverged.ofv);
+}
+
+#[test]
 fn a_truncated_final_journal_line_costs_one_refit_and_no_more() {
     let dir = tempfile::tempdir().expect("tempdir");
     let candidates = vec![

@@ -79,6 +79,15 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
+  The floor replaces a direction of negative or near-zero curvature with a finite one, so the
+  condition number and correlations the `max_condition_number` / `max_correlation` gates read
+  no longer showed the problem: on warfarin, `modelsearch`'s collapsed one-peripheral
+  candidate (V2 → 0, Q free, TVQ RSE 293519 %) read a condition number of 2.98 and passed.
+  While either gate is enabled, the `Covariance step regularized: eigenvalue floor applied`
+  warning now fails the fit with its own reason. A resumed search re-judges every journalled
+  candidate from its cached fit rather than trusting the verdict in the journal, so the gate
+  also reaches a run interrupted before this change (#1512).
 - **A mixture model left on `optimizer = auto` now reports `auto (bobyqa)`, the optimizer
   that actually ran.** Mixture fits have always run BOBYQA under `auto`, but the fit output
   reported the non-mixture pick (`auto (nlopt_lbfgs)` for a model in analytic scope), and
