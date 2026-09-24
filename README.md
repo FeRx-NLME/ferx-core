@@ -109,9 +109,8 @@ For FOCE/FOCEI, the outer optimizer can be set via `optimizer` in `[fit_options]
 |-----------|-------------|
 | `auto` | Per-model selection (default): L-BFGS when the exact analytic gradient is available, BOBYQA otherwise |
 | `slsqp` | NLopt Sequential Least Squares Programming |
-| `lbfgs` | NLopt L-BFGS |
+| `nlopt_lbfgs` | NLopt L-BFGS (`lbfgs` and `bfgs` are deprecated aliases) |
 | `mma` | NLopt Method of Moving Asymptotes |
-| `bfgs` | Built-in BFGS |
 | `bobyqa` | NLopt BOBYQA (derivative-free) |
 | `trust_region` | Newton trust-region (argmin + Steihaug CG) |
 

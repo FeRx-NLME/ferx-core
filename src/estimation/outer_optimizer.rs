@@ -1722,7 +1722,7 @@ fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
 /// (warfarin −286, tvcov −188.6 at truth, two_cpt_oral_cov −1165) and preserves
 /// SLSQP's warfarin_iov cold-start win (OFV 307.8, the #335 case).
 ///
-/// The derivative-free default `Bobyqa` is left unscaled — any per-coordinate
+/// The derivative-free `Bobyqa` is left unscaled — any per-coordinate
 /// scaling distorts its trust-region quadratic model and regresses multi-cpt / PD
 /// fits (e.g. emax_pkpd −36.8→−13.5, three_cpt_iv −730.6→−715.9). `Mma` /
 /// `TrustRegion` are left to the unscaled (legacy `scale_params` / IOV-auto)
@@ -2622,8 +2622,9 @@ fn optimize_nlopt_once(
     // (notably MMA, which scaling hurts here), so scope the auto-enable to the
     // IOV + SLSQP combination that actually needs it.
     //
-    // Scope note: as of #155 the default outer optimizer is `Bobyqa`, not
-    // `Slsqp` — so default-IOV fits no longer hit this branch. BOBYQA is
+    // Scope note: since #155 the default outer optimizer is no longer `Slsqp`
+    // (it is now `Auto` → `NloptLbfgs`/`Bobyqa`, #490) — so default-IOV fits no
+    // longer hit this branch. BOBYQA is
     // gradient-free and doesn't suffer the `cap_scaled_gradient` starvation that
     // motivates the scaling here, so leaving it disabled on the default path is
     // intentional. This auto-enable now only fires for an explicit
@@ -2871,7 +2872,7 @@ fn optimize_nlopt_once(
                 n_start_rejected: m.ebe_stats.n_start_rejected,
             };
             let ofv = m.ofv;
-            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA, the default)
+            // A derivative-free eval (`grad` is `None` — e.g. BOBYQA)
             // never touches `mixeval` or the analytic gradient, so avoid the full
             // per-class EBE cache clone: move `etas_by_class` straight into the
             // warm-start cache and the MIXEST EBEs into the result. When a gradient

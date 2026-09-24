@@ -297,7 +297,7 @@ To amortize that cost, `reconverge_gradient_interval = N` reconverges only every
 | `slsqp` + reconverge every 10 (`interval = 10`) | 66,118 | 633 s |
 | `slsqp` + reconverge every 5 (`interval = 5`) | 66,056 | 1,004 s |
 | `slsqp` + reconverge every eval (`interval = 1`) | **65,485** | 1,871 s |
-| `bobyqa` (derivative-free, **default**) | 65,598 | 315 s |
+| `bobyqa` (derivative-free) | 65,598 | 315 s |
 | ferx OFV evaluated at NONMEM's final estimates | 67,514 | — |
 
 The fixed-EBE gradient stalls `slsqp` ~2,650 OFV units above `bobyqa`. Reconverging the EBEs on every gradient evaluation closes the entire gap and reaches an optimum marginally below `bobyqa`'s — and below the point NONMEM converged to (NONMEM's estimates score 67,514 under ferx's likelihood), confirming the stall was a gradient-bias artifact, not a worse model.
@@ -378,7 +378,7 @@ Set via `[fit_options]`:
 ```
 [fit_options]
   method    = focei
-  optimizer = slsqp    # override the default (bobyqa)
+  optimizer = slsqp    # override the default (auto)
 ```
 
 ## Global Search
