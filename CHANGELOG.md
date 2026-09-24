@@ -79,6 +79,14 @@ section of the SDLC for the versioning policy).
   salvage assembled ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)).
 
 ### Fixed
+- **Uncertainty draws of a probability-scale theta are logit-normal and stay below 1.** A
+  theta used as `inv_logit(logit(THETA) + ETA)` was drawn log-normally by
+  `simulate_with_uncertainty()` (asymptotic method) and by the SIR proposal. With an upper
+  bound at or below 1 the draws above it were rejected, so the distribution came out
+  truncated and pulled low. With an upper bound above 1, or none, a draw above 1 was
+  accepted and the clamped `logit` turned it into `F = 1` for every subject. Such a theta is
+  now drawn on the logit scale with the delta-method covariance, and the SIR weights carry
+  the matching Jacobian ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)).
 - **The strictness gate excludes a fit whose covariance step floored a Hessian eigenvalue.**
   The floor replaces a direction of negative or near-zero curvature with a finite one, so the
   condition number and correlations the `max_condition_number` / `max_correlation` gates read

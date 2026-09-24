@@ -6,7 +6,9 @@
 //!
 //! * `UncertaintyMethod::Asymptotic` — multivariate normal in the packed
 //!   (log-theta, Cholesky-omega, log-sigma) parameter space, using
-//!   `FitResult.covariance_matrix` as the proposal covariance.
+//!   `FitResult.covariance_matrix` as the proposal covariance. A
+//!   `LogitProbability` θ is drawn on the logit scale instead (#1548, see
+//!   `LogitThetaCoord`).
 //! * `UncertaintyMethod::Sir` — sample with replacement from
 //!   `FitResult.sir_resamples_packed` (requires `sir = true` and
 //!   `sir_keep_samples = true` at fit time).
@@ -15,9 +17,9 @@
 //! perturbed coherently (they share one packed vector).
 
 use crate::estimation::parameterization::{
-    pack_with_bounds, unpack_params, PackedBounds, PackedStart,
+    pack_with_bounds, theta_packs_log, unpack_params, PackedBounds, PackedStart,
 };
-use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector};
+use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector, ThetaTransform};
 use nalgebra::{DMatrix, DVector};
 use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
@@ -137,6 +139,159 @@ pub(crate) fn regularised_cholesky(cov: &DMatrix<f64>) -> Result<DMatrix<f64>, S
         .ok_or_else(|| "Covariance could not be made positive definite".to_string())
 }
 
+/// Largest `|logit(θ)|` a logit-scale draw coordinate may take: `logit(1 −
+/// 1e-15)`, the clamp `Op::Logit` applies to its argument. Converting a
+/// declared bound of `θ ≥ 1` (a `LogitProbability` θ declared with an upper
+/// bound above 1, or with none — the parser defaults it to `1e9`) to the logit
+/// scale would otherwise give `+inf`.
+const LOGIT_DRAW_LIMIT: f64 = 34.538776394910684;
+
+/// A θ coordinate the uncertainty samplers draw on the **logit** scale (#1548).
+///
+/// A `LogitProbability` θ enters the model as `inv_logit(logit(θ) + η)`, so it
+/// lives on (0, 1). Its packed coordinate is `ln θ` (or `θ` itself when the
+/// declared lower bound is negative, see `theta_packs_log`), and a normal
+/// draw on that scale has no ceiling at 1: a draw above 1 is either rejected
+/// by the bounds check (truncating the distribution) or, when the declared
+/// upper bound is above 1, accepted and silently clamped to `F = 1` by
+/// `Op::Logit`. Drawing `y = logit(θ)` instead keeps every draw inside (0, 1).
+///
+/// The proposal covariance is carried onto the logit scale by the delta
+/// method, `Cov_y = D Cov_x D` with `D_ii = dy/dx` at the estimate — the same
+/// construction ferx-r uses for the reported CI of such a θ, so the draws and
+/// the interval agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LogitThetaCoord {
+    /// Packed index (θ occupies the first `n_theta` packed slots).
+    pub(crate) index: usize,
+    /// Whether the packed coordinate is `ln θ` (true) or `θ` (false).
+    pub(crate) log_packed: bool,
+}
+
+impl LogitThetaCoord {
+    fn theta_of(self, x: f64) -> f64 {
+        if self.log_packed {
+            x.exp()
+        } else {
+            x
+        }
+    }
+
+    /// Packed coordinate → logit scale.
+    pub(crate) fn x_to_y(self, x: f64) -> f64 {
+        let t = self.theta_of(x);
+        (t / (1.0 - t)).ln()
+    }
+
+    /// Logit scale → packed coordinate. `ln(inv_logit(y))` is written as
+    /// `−ln(1 + e^{−y})` so it stays accurate for a large negative `y`.
+    pub(crate) fn y_to_x(self, y: f64) -> f64 {
+        if self.log_packed {
+            -(-y).exp().ln_1p()
+        } else {
+            1.0 / (1.0 + (-y).exp())
+        }
+    }
+
+    /// `dx/dy` at packed coordinate `x`: `1 − θ` for `x = ln θ`, `θ(1 − θ)`
+    /// for `x = θ`.
+    pub(crate) fn dx_dy(self, x: f64) -> f64 {
+        let t = self.theta_of(x);
+        if self.log_packed {
+            1.0 - t
+        } else {
+            t * (1.0 - t)
+        }
+    }
+}
+
+/// The θ coordinates to draw on the logit scale: `LogitProbability`, not FIX,
+/// and with an estimate strictly inside (0, 1). An estimate outside (0, 1)
+/// has no logit and is left on its packed scale (the fit itself is then
+/// degenerate). An empty `theta_transform` — a `FitResult` written before the
+/// field existed — selects nothing, which is the pre-#1548 behaviour.
+pub(crate) fn logit_theta_coords(
+    template: &ModelParameters,
+    theta_transform: &[ThetaTransform],
+    fixed_mask: &[bool],
+) -> Vec<LogitThetaCoord> {
+    (0..template.theta.len())
+        .filter(|&i| {
+            let t = template.theta[i];
+            theta_transform.get(i) == Some(&ThetaTransform::LogitProbability)
+                && !fixed_mask[i]
+                && t > 0.0
+                && t < 1.0
+        })
+        .map(|i| LogitThetaCoord {
+            index: i,
+            log_packed: theta_packs_log(template.theta_lower[i]),
+        })
+        .collect()
+}
+
+/// Move a packed centre and its covariance onto the draw scale: each logit
+/// coordinate becomes `logit(θ̂)` and its row and column of `cov` are scaled by
+/// `dy/dx` at the estimate (the delta method). Other coordinates are untouched.
+pub(crate) fn to_draw_scale(
+    x_hat: &[f64],
+    cov: &DMatrix<f64>,
+    coords: &[LogitThetaCoord],
+) -> (Vec<f64>, DMatrix<f64>) {
+    let mut y_hat = x_hat.to_vec();
+    let mut cov_y = cov.clone();
+    for c in coords {
+        let i = c.index;
+        y_hat[i] = c.x_to_y(x_hat[i]);
+        let dy_dx = 1.0 / c.dx_dy(x_hat[i]);
+        cov_y.row_mut(i).scale_mut(dy_dx);
+        cov_y.column_mut(i).scale_mut(dy_dx);
+    }
+    (y_hat, cov_y)
+}
+
+/// Move packed bounds onto the draw scale. A θ bound at or beyond 0 / 1 maps
+/// to `∓LOGIT_DRAW_LIMIT` instead of `∓inf`.
+pub(crate) fn bounds_to_draw_scale(
+    bounds: &PackedBounds,
+    coords: &[LogitThetaCoord],
+) -> PackedBounds {
+    let mut lower = bounds.lower.clone();
+    let mut upper = bounds.upper.clone();
+    for c in coords {
+        let i = c.index;
+        // A bound outside (0, 1) has no logit (`x_to_y` is NaN there, or ±inf
+        // exactly at 0 / 1), so it becomes the limit on its own side.
+        let lo = c.x_to_y(lower[i]);
+        lower[i] = if lo.is_nan() {
+            -LOGIT_DRAW_LIMIT
+        } else {
+            lo.max(-LOGIT_DRAW_LIMIT)
+        };
+        let hi = c.x_to_y(upper[i]);
+        upper[i] = if hi.is_nan() {
+            LOGIT_DRAW_LIMIT
+        } else {
+            hi.min(LOGIT_DRAW_LIMIT)
+        };
+    }
+    PackedBounds { lower, upper }
+}
+
+/// Map a draw-scale vector back to the packed scale, in place.
+pub(crate) fn from_draw_scale(y: &mut [f64], coords: &[LogitThetaCoord]) {
+    for c in coords {
+        y[c.index] = c.y_to_x(y[c.index]);
+    }
+}
+
+/// `ln |dx/dy|` of the draw-scale change of variables at packed vector `x` —
+/// the Jacobian SIR adds to its importance weights so that drawing on the
+/// logit scale changes the proposal but not the target (#1548).
+pub(crate) fn log_abs_jacobian(x: &[f64], coords: &[LogitThetaCoord]) -> f64 {
+    coords.iter().map(|c| c.dx_dy(x[c.index]).abs().ln()).sum()
+}
+
 /// Clamp packed indices flagged as FIX to their pinned packed value (taken
 /// from `x_hat`). `compute_bounds()` already pins fixed indices via
 /// `lower == upper`, so a continuous MVN draw would otherwise fail the bounds
@@ -229,7 +384,11 @@ fn draw_asymptotic(
             n_packed
         ));
     }
-    let chol = regularised_cholesky(cov)?;
+    // Draw a `LogitProbability` θ on the logit scale (#1548); every other
+    // coordinate is drawn on its packed scale as before.
+    let logit_coords = logit_theta_coords(template, &fit_result.theta_transform, &fixed_mask);
+    let (y_hat, cov_y) = to_draw_scale(&x_hat, cov, &logit_coords);
+    let chol = regularised_cholesky(&cov_y)?;
 
     let max_tries = 10 * n_draws;
     let mut draws = Vec::with_capacity(n_draws);
@@ -248,7 +407,8 @@ fn draw_asymptotic(
         let z: Vec<f64> = (0..n_packed).map(|_| rng.sample(StandardNormal)).collect();
         let z_vec = DVector::from_column_slice(&z);
         let delta = &chol * z_vec;
-        let mut x_k: Vec<f64> = x_hat.iter().zip(delta.iter()).map(|(a, b)| a + b).collect();
+        let mut x_k: Vec<f64> = y_hat.iter().zip(delta.iter()).map(|(a, b)| a + b).collect();
+        from_draw_scale(&mut x_k, &logit_coords);
         // Fixed parameters carry no uncertainty — pin them to x_hat before
         // bounds-checking. Without this, `compute_bounds` (which sets
         // lower == upper for fixed indices) would reject every draw for any
@@ -338,6 +498,10 @@ mod tests {
     }
     use crate::types::{ErrorModel, OmegaMatrix, SigmaVector};
     use nalgebra::DMatrix;
+    // 4000 draws: SE(mean) = 1/sqrt(4000) = 0.016, SE(sd) = 0.011. Measured
+    // worst |error| over the two fixtures: 0.013 (mean), 0.016 (sd).
+    const MEAN_TOL: f64 = 0.06;
+    const SD_TOL: f64 = 0.05;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
@@ -665,6 +829,248 @@ mod tests {
         assert!(
             any_v_varies,
             "free parameter V was inadvertently pinned by the clamp"
+        );
+    }
+
+    /// `tiny_template()` plus a third θ, `F`, declared on (`lower`, `upper`),
+    /// and a `FitResult` whose covariance gives every coordinate variance
+    /// `1e-4` except `F`'s packed coordinate (index 2), which gets `var_f`.
+    fn logit_fixture(
+        f_hat: f64,
+        lower: f64,
+        upper: f64,
+        var_f: f64,
+        transform: ThetaTransform,
+    ) -> (ModelParameters, FitResult) {
+        let mut template = tiny_template();
+        template.theta.push(f_hat);
+        template.theta_names.push("F".to_string());
+        template.theta_lower.push(lower);
+        template.theta_upper.push(upper);
+        template.theta_fixed.push(false);
+        let n_packed = crate::estimation::parameterization::packed_len(&template);
+        let mut cov = DMatrix::identity(n_packed, n_packed) * 1e-4;
+        cov[(2, 2)] = var_f;
+        let mut fit = fit_with_cov(&template, cov);
+        fit.theta_transform = vec![ThetaTransform::Log, ThetaTransform::Log, transform];
+        (template, fit)
+    }
+
+    fn logit(p: f64) -> f64 {
+        (p / (1.0 - p)).ln()
+    }
+
+    fn mean_sd(v: &[f64]) -> (f64, f64) {
+        let n = v.len() as f64;
+        let m = v.iter().sum::<f64>() / n;
+        let var = v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1.0);
+        (m, var.sqrt())
+    }
+
+    fn draw_f(template: &ModelParameters, fit: &FitResult, n: usize, seed: u64) -> Vec<f64> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        draw_parameter_samples(fit, template, n, UncertaintyMethod::Asymptotic, &mut rng)
+            .expect("draws")
+            .iter()
+            .map(|p| p.theta[2])
+            .collect()
+    }
+
+    /// #1548: a `LogitProbability` θ packed as `ln θ` is drawn logit-normally,
+    /// with the delta-method SD `sd(ln θ) / (1 − θ̂)`. Fixture = the bundled
+    /// `bioavailability` declaration `THETA_F(0.70, 0.001, 0.999)`, with
+    /// `sd(ln θ) = 0.3` so the logit SD is exactly 1.
+    #[test]
+    fn asymptotic_logit_probability_draws_are_logit_normal() {
+        let (template, fit) =
+            logit_fixture(0.7, 0.001, 0.999, 0.09, ThetaTransform::LogitProbability);
+        let f = draw_f(&template, &fit, 4000, 11);
+        assert!(
+            f.iter().all(|&t| t > 0.0 && t < 0.999),
+            "draw left (0, 0.999)"
+        );
+        // The log-normal draw this replaces puts 12% of its mass above 0.999
+        // (all rejected) and piles the survivors against the bound: ~0.6% of
+        // draws land in (0.99, 0.999), vs `P(Z > (logit 0.99 − logit 0.7)) =
+        // 1e-4` for the logit-normal one — about 24 draws against 0.4.
+        let near_ceiling = f.iter().filter(|&&t| t > 0.99).count();
+        assert!(near_ceiling <= 4, "{near_ceiling}/4000 draws above 0.99");
+        let y: Vec<f64> = f.iter().map(|&t| logit(t)).collect();
+        let (m, sd) = mean_sd(&y);
+        assert!(
+            (m - logit(0.7)).abs() < MEAN_TOL,
+            "logit mean {m} vs {}",
+            logit(0.7)
+        );
+        assert!(
+            (sd - 1.0).abs() < SD_TOL,
+            "logit sd {sd} vs delta-method 1.0"
+        );
+    }
+
+    /// #1548: with the declared upper bound above 1 (here 5), a log-normal draw
+    /// above 1 was accepted and clamped to `F = 1` by `Op::Logit`. Drawn on the
+    /// logit scale none reaches 1. The same fixture with the θ marked `Log` is
+    /// the straddle: it keeps the log-normal draw and must reach past 1, or
+    /// this fixture could not see the defect at all.
+    #[test]
+    fn asymptotic_logit_probability_never_reaches_one_with_a_wide_upper_bound() {
+        let (template, fit) =
+            logit_fixture(0.7, 0.001, 5.0, 0.09, ThetaTransform::LogitProbability);
+        let f = draw_f(&template, &fit, 2000, 5);
+        let at_or_above_one = f.iter().filter(|&&t| t >= 1.0).count();
+        assert_eq!(at_or_above_one, 0, "logit draws reached F >= 1");
+
+        let (template_log, fit_log) = logit_fixture(0.7, 0.001, 5.0, 0.09, ThetaTransform::Log);
+        let f_log = draw_f(&template_log, &fit_log, 2000, 5);
+        let log_above_one = f_log.iter().filter(|&&t| t >= 1.0).count();
+        assert!(
+            log_above_one > 100,
+            "straddle: a log-normal draw must pass 1 on this fixture, got {log_above_one}/2000"
+        );
+    }
+
+    /// #1548: an identity-packed `LogitProbability` θ (declared lower bound
+    /// < 0) uses `dy/dx = 1 / (θ̂ (1 − θ̂))`. `sd(θ) = 0.21` at `θ̂ = 0.7` gives
+    /// a logit SD of exactly 1.
+    #[test]
+    fn asymptotic_identity_packed_logit_probability_uses_its_own_jacobian() {
+        let (template, fit) = logit_fixture(
+            0.7,
+            -1.0,
+            5.0,
+            0.21 * 0.21,
+            ThetaTransform::LogitProbability,
+        );
+        let f = draw_f(&template, &fit, 4000, 17);
+        assert!(f.iter().all(|&t| t > 0.0 && t < 1.0), "draw left (0, 1)");
+        let y: Vec<f64> = f.iter().map(|&t| logit(t)).collect();
+        let (m, sd) = mean_sd(&y);
+        assert!((m - logit(0.7)).abs() < MEAN_TOL, "logit mean {m}");
+        assert!(
+            (sd - 1.0).abs() < SD_TOL,
+            "logit sd {sd} vs delta-method 1.0"
+        );
+    }
+
+    /// `x_to_y` / `y_to_x` invert each other on both packings, `dx_dy` is the
+    /// derivative of `y_to_x`, and `log_abs_jacobian` sums its log.
+    #[test]
+    fn logit_theta_coord_round_trips_and_differentiates() {
+        for log_packed in [true, false] {
+            let c = LogitThetaCoord {
+                index: 0,
+                log_packed,
+            };
+            for t in [1e-6, 0.05, 0.5, 0.7, 0.999] {
+                let x = if log_packed { f64::ln(t) } else { t };
+                let y = c.x_to_y(x);
+                assert!((y - logit(t)).abs() < 1e-9, "x_to_y({x}) = {y}");
+                assert!((c.y_to_x(y) - x).abs() < 1e-12 * x.abs().max(1.0));
+                let h = 1e-6;
+                let fd = (c.y_to_x(y + h) - c.y_to_x(y - h)) / (2.0 * h);
+                assert!(
+                    (fd - c.dx_dy(x)).abs() < 1e-7,
+                    "log_packed={log_packed} t={t}: fd {fd} vs {}",
+                    c.dx_dy(x)
+                );
+                assert_eq!(log_abs_jacobian(&[x], &[c]), c.dx_dy(x).ln());
+            }
+        }
+        assert_eq!(log_abs_jacobian(&[0.3], &[]), 0.0);
+    }
+
+    /// A declared bound at or beyond 0 / 1 has no logit and maps to the limit
+    /// on its own side; one inside (0, 1) maps to its logit.
+    #[test]
+    fn bounds_to_draw_scale_maps_declared_bounds() {
+        let b = PackedBounds {
+            lower: vec![f64::ln(0.001), -1.0, 0.0],
+            upper: vec![f64::ln(0.999), 5.0, 1.0],
+        };
+        let coords = [
+            LogitThetaCoord {
+                index: 0,
+                log_packed: true,
+            },
+            LogitThetaCoord {
+                index: 1,
+                log_packed: false,
+            },
+            LogitThetaCoord {
+                index: 2,
+                log_packed: false,
+            },
+        ];
+        let y = bounds_to_draw_scale(&b, &coords);
+        assert!((y.lower[0] - logit(0.001)).abs() < 1e-9);
+        assert!((y.upper[0] - logit(0.999)).abs() < 1e-9);
+        assert_eq!(
+            (y.lower[1], y.upper[1]),
+            (-LOGIT_DRAW_LIMIT, LOGIT_DRAW_LIMIT)
+        );
+        assert_eq!(
+            (y.lower[2], y.upper[2]),
+            (-LOGIT_DRAW_LIMIT, LOGIT_DRAW_LIMIT)
+        );
+        assert!((LOGIT_DRAW_LIMIT - logit(1.0 - 1e-15)).abs() < 1e-3);
+    }
+
+    /// `to_draw_scale` scales row and column `i` by `dy/dx` at the estimate —
+    /// so the diagonal by its square and an off-diagonal once — and moves only
+    /// the logit coordinate's centre.
+    #[test]
+    fn to_draw_scale_applies_the_delta_method() {
+        let x_hat = [f64::ln(0.7), 2.0];
+        let cov = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.5]);
+        let c = LogitThetaCoord {
+            index: 0,
+            log_packed: true,
+        };
+        let (y_hat, cov_y) = to_draw_scale(&x_hat, &cov, &[c]);
+        let d = 1.0 / 0.3;
+        assert!((y_hat[0] - logit(0.7)).abs() < 1e-12);
+        assert_eq!(y_hat[1], 2.0);
+        assert!((cov_y[(0, 0)] - 0.09 * d * d).abs() < 1e-12);
+        assert!((cov_y[(0, 1)] - 0.02 * d).abs() < 1e-12);
+        assert!((cov_y[(1, 0)] - 0.02 * d).abs() < 1e-12);
+        assert_eq!(cov_y[(1, 1)], 0.5);
+    }
+
+    /// Only a free `LogitProbability` θ with an estimate inside (0, 1) is drawn
+    /// on the logit scale; an empty transform list (old `FitResult`) selects
+    /// nothing.
+    #[test]
+    fn logit_theta_coords_selects_free_in_range_logit_probability_thetas() {
+        let (mut template, _) =
+            logit_fixture(0.7, 0.001, 0.999, 0.09, ThetaTransform::LogitProbability);
+        let tt = [
+            ThetaTransform::Log,
+            ThetaTransform::Logit,
+            ThetaTransform::LogitProbability,
+        ];
+        let free = [false; 5];
+        assert_eq!(
+            logit_theta_coords(&template, &tt, &free),
+            vec![LogitThetaCoord {
+                index: 2,
+                log_packed: true
+            }]
+        );
+        assert!(logit_theta_coords(&template, &[], &free).is_empty());
+        let mut fixed = free;
+        fixed[2] = true;
+        assert!(logit_theta_coords(&template, &tt, &fixed).is_empty());
+        template.theta[2] = 1.0;
+        assert!(logit_theta_coords(&template, &tt, &free).is_empty());
+        template.theta[2] = 0.5;
+        template.theta_lower[2] = -1.0;
+        assert_eq!(
+            logit_theta_coords(&template, &tt, &free),
+            vec![LogitThetaCoord {
+                index: 2,
+                log_packed: false
+            }]
         );
     }
 }

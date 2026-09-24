@@ -23,6 +23,8 @@ SIR uses the maximum likelihood estimates and their covariance matrix as a propo
 
 The resampled vectors approximate the true parameter uncertainty distribution. Confidence intervals are derived from their empirical percentiles.
 
+A probability-scale theta (`inv_logit(logit(THETA) + ETA)`) is proposed on the logit scale rather than on its packed $\log\theta$ scale, whose proposal has no ceiling at 1. The covariance is carried over by the delta method, and each importance weight includes the Jacobian $|d\log\theta / d\operatorname{logit}\theta| = 1 - \theta$. Only the proposal changes; the target is still the likelihood over the packed parameter box, now without the region $\theta \ge 1$ where `logit` is clamped ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)).
+
 ## Enabling SIR
 
 Add `sir = true` to the `[fit_options]` block. The covariance step must also be enabled (it provides the proposal distribution):
